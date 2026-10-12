@@ -8,7 +8,16 @@ import { createLogger } from './log.js';
 import { loadOrCreateInstanceId } from './instance-id.js';
 import { createToolRegistry } from './tools/registry.js';
 import { statusTool } from './tools/status.js';
+import { hostsTool } from './tools/hosts.js';
+import { pingTool } from './tools/ping.js';
+import { deliveryStatusTool } from './tools/delivery-status.js';
 import { createMcpServer } from './server.js';
+import { createKnownHosts } from './net/known-hosts.js';
+import { createDiscovery } from './net/discovery.js';
+import { createTransport } from './net/transport.js';
+import { createDispatch } from './net/dispatch.js';
+import { createInbound } from './net/inbound.js';
+import { createNetStack } from './net/stack.js';
 
 // 版本单一来源：包元数据（不另设常量，避免与 package.json 漂移）
 const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
@@ -63,16 +72,42 @@ if (configCreated) {
     fatal(`配置文件无法写入：${error.message}——启动失败`);
   }
 }
+
+/* 网络层组合根：构造四组件、注入装配层（接线与生命周期归 stack——循环依赖在那里解除）。
+ * 钩子暂不注入：协作台账与投递适配器接入前，接收管线以安全默认占位（拒绝 / 不投递）。 */
+const self = { instanceId, identityName: config.identityName };
+const knownHosts = createKnownHosts({ dataDir, log });
+const discovery = createDiscovery({
+  port: config.port,
+  instanceId: self.instanceId,
+  identityName: self.identityName,
+  getCollabCount: () => 0,   // 协作台账接入后接真实计数：扫描列表要显示每台机器的忙闲
+  knownHosts,
+  log,
+});
+const transport = createTransport({ port: config.port, log });
+const dispatch = createDispatch({ dataDir, config, transport, self, log });
+const inbound = createInbound({ dataDir, config, self, dispatch, log });
+const net = createNetStack({ discovery, transport, dispatch, inbound, port: config.port, self, scanWindowMs: config.scanWindowMs, log });
+const bind = await net.start();
+if (!bind.ok) {
+  log.warn('局域网功能不可用（降级为本地 MCP 服务）', { reason: bind.reason, message: bind.message });
+}
+
 const registry = createToolRegistry();
 registry.register(statusTool());
+registry.register(hostsTool());
+registry.register(pingTool());
+registry.register(deliveryStatusTool());
 const context = {
   version,
   instanceId,
   dataDir,
   logDir,
   config,
+  net,
   startedAt: new Date().toISOString(),
 };
 const server = createMcpServer({ version, registry, context });
 await server.connect(new StdioServerTransport());
-log.info('waystation 启动完成', { version, dataDir, logDir, port: config.port });
+log.info('waystation 启动完成', { version, dataDir, logDir, port: config.port, netAvailable: bind.ok });

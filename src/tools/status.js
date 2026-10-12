@@ -7,7 +7,7 @@ import { CONFIG_FILE_NAME } from '../config.js';
 export function statusTool() {
   return {
     name: 'ws_status',
-    description: '查看本机驿站状态（版本、实例标识、数据目录、端口配置等）——会话期首检与排障使用',
+    description: '查看本机驿站状态（版本、实例标识、数据目录、端口配置、网络状态等）——会话期首检与排障使用',
     inputSchema: { type: 'object', properties: {} },
     handler: async (_args, context) => {
       const status = {
@@ -22,6 +22,7 @@ export function statusTool() {
         pid: process.pid,
         node: process.version,
         startedAt: context.startedAt,
+        net: context.net.status(),
       };
       return { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] };
     },
