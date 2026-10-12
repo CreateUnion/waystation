@@ -23,12 +23,20 @@ test('buildDefaults：标识名取传入主机名，形状完整', () => {
   const defaults = buildDefaults('主机甲');
   assert.deepEqual(Object.keys(defaults).sort(), [
     'autoDeliver',
+    'dialTimeoutMs',
+    'dispatchTickMs',
     'identityName',
     'logDir',
     'logMaxBytes',
     'logMaxFiles',
+    'messageTtlMs',
     'offlineQueue',
     'port',
+    'queueMaxPerCollab',
+    'retryFastCount',
+    'retryIntervalMs',
+    'retrySlowIntervalMs',
+    'scanWindowMs',
   ]);
   assert.equal(defaults.identityName, '主机甲');
 });
@@ -112,4 +120,41 @@ test('保留名键（toString/constructor/__proto__）：按未知字段处理�
   assert.equal({}.polluted, undefined);
   assert.equal(config.port, 7321);
   assert.deepEqual(warnings, []);
+});
+
+test('网络与消息参数默认值（设计 §5/§10 明文默认）', (t) => {
+  const dir = makeTempDir(t);
+  const { config } = loadConfig(dir);
+  assert.equal(config.scanWindowMs, 2000);
+  assert.equal(config.retryIntervalMs, 10000);
+  assert.equal(config.retrySlowIntervalMs, 60000);
+  assert.equal(config.retryFastCount, 3);
+  assert.equal(config.queueMaxPerCollab, 500);
+  assert.equal(config.messageTtlMs, 604800000);
+  assert.equal(config.dispatchTickMs, 1000);
+  assert.equal(config.dialTimeoutMs, 5000);
+});
+
+test('identityName 超长（>64 字符）：回落默认并告警', (t) => {
+  const dir = makeTempDir(t);
+  writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({ identityName: 'x'.repeat(65) }));
+  const warnings = [];
+  const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+  assert.equal(config.identityName, hostname());
+  assert.equal(warnings.length, 1);
+  assert.ok(warnings[0].includes('identityName'));
+});
+
+test('网络参数类型或范围非法：逐项回落默认并告警', (t) => {
+  const dir = makeTempDir(t);
+  writeFileSync(
+    join(dir, CONFIG_FILE_NAME),
+    JSON.stringify({ retryIntervalMs: -1, queueMaxPerCollab: 'many', scanWindowMs: 0 }),
+  );
+  const warnings = [];
+  const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+  assert.equal(config.retryIntervalMs, 10000);
+  assert.equal(config.queueMaxPerCollab, 500);
+  assert.equal(config.scanWindowMs, 2000);
+  assert.equal(warnings.length, 3);
 });

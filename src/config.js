@@ -1,21 +1,36 @@
 import { readFileSync, renameSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
+import { MAX_IDENTITY_NAME_CHARS } from './net/protocol.js';
 import { writeJsonAtomic } from './storage.js';
 
 export const CONFIG_FILE_NAME = 'config.json';
 
 // 字段校验规则表：键与 buildDefaults 一一对应。类型校验挡住手改配置的笔误；
-// 数值范围取「能用」的下限/上限，具体语义上限在消费方（日志/队列）表达
+// 数值范围取「能用」的边界（下界贴语义有效值、上界防荒唐值），具体语义上限在消费方表达
 const FIELD_RULES = {
-  identityName: { check: (value) => typeof value === 'string' && value.trim() !== '', reason: '需为非空字符串' },
+  identityName: {
+    check: (value) => typeof value === 'string' && value.trim() !== '' && value.length <= MAX_IDENTITY_NAME_CHARS,
+    reason: `需为非空字符串且不超过 ${MAX_IDENTITY_NAME_CHARS} 字符`,
+  },
   port: { check: (value) => Number.isInteger(value) && value >= 1 && value <= 65535, reason: '需为 1–65535 的整数' },
   offlineQueue: { check: (value) => typeof value === 'boolean', reason: '需为布尔值' },
   autoDeliver: { check: (value) => typeof value === 'boolean', reason: '需为布尔值' },
   logDir: { check: (value) => typeof value === 'string', reason: '需为字符串' },
   logMaxBytes: { check: (value) => Number.isInteger(value) && value >= 1024, reason: '需为不小于 1024 的整数' },
   logMaxFiles: { check: (value) => Number.isInteger(value) && value >= 1 && value <= 100, reason: '需为 1–100 的整数' },
+  // 网络与消息参数（设计 §5/§10「内部数值参数用内置默认值、支持配置文件修改」的落点）
+  scanWindowMs: { check: (value) => Number.isInteger(value) && value >= 100 && value <= 60000, reason: '需为 100–60000 的整数（毫秒）' },
+  retryIntervalMs: { check: (value) => Number.isInteger(value) && value >= 100 && value <= 3600000, reason: '需为 100–3600000 的整数（毫秒）' },
+  retrySlowIntervalMs: { check: (value) => Number.isInteger(value) && value >= 100 && value <= 86400000, reason: '需为 100–86400000 的整数（毫秒）' },
+  retryFastCount: { check: (value) => Number.isInteger(value) && value >= 1 && value <= 100, reason: '需为 1–100 的整数' },
+  queueMaxPerCollab: { check: (value) => Number.isInteger(value) && value >= 1 && value <= 100000, reason: '需为 1–100000 的整数' },
+  messageTtlMs: { check: (value) => Number.isInteger(value) && value >= 1000 && value <= 2592000000, reason: '需为 1000–2592000000 的整数（毫秒，上限 30 天）' },
+  dispatchTickMs: { check: (value) => Number.isInteger(value) && value >= 10 && value <= 60000, reason: '需为 10–60000 的整数（毫秒）' },
+  dialTimeoutMs: { check: (value) => Number.isInteger(value) && value >= 100 && value <= 120000, reason: '需为 100–120000 的整数（毫秒）' },
 };
+
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 /* 默认配置：设计 §14 参数表（开箱可用、一般不改）。
  * 协作端口 7321 的选择依据：PoC 全矩阵实测端口——UDP 广播/单播、TCP 直连、Linux ufw 放行均在 7321 上验证可达；
@@ -30,6 +45,18 @@ export function buildDefaults(hostName) {
     logDir: '',
     logMaxBytes: 1048576,
     logMaxFiles: 5,
+    // 网络与消息层默认值（设计 §5/§10 明文默认）：
+    // 扫描等待窗口 2s；重传恒定 10s、连续 3 次无 ack 后转 60s 低频直至送达/过期；
+    // 单协作队列上限 500 条；消息保留期 7 天（队列过期与接收端去重窗口共用——设计 §10「保留期同队列」）；
+    // 调度 tick 1s；拨号（含 ping 应答等待）超时 5s。
+    scanWindowMs: 2000,
+    retryIntervalMs: 10000,
+    retrySlowIntervalMs: 60000,
+    retryFastCount: 3,
+    queueMaxPerCollab: 500,
+    messageTtlMs: 7 * DAY_MS,
+    dispatchTickMs: 1000,
+    dialTimeoutMs: 5000,
   };
 }
 

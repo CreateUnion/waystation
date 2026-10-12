@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { COLLABS_DIR_NAME, LOGS_DIR_NAME, resolveDataDir, resolveLogDir, ensureDir } from '../src/paths.js';
+import { COLLABS_DIR_NAME, LOGS_DIR_NAME, collabDir, collabFilePath, resolveDataDir, resolveLogDir, ensureDir } from '../src/paths.js';
 import { makeTempDir } from './helpers.js';
 
 test('resolveDataDir：无环境变量时默认 ~/.waystation', () => {
@@ -35,4 +35,23 @@ test('ensureDir：递归创建且幂等', (t) => {
 
 test('目录名常量：collabs 为每协作目录的父级（设计 §15）', () => {
   assert.equal(COLLABS_DIR_NAME, 'collabs');
+});
+
+test('collabDir：协作目录按 collabId 拼接（每协作一个目录）', (t) => {
+  const dir = makeTempDir(t);
+  assert.equal(collabDir(dir, 'collab-1'), join(dir, COLLABS_DIR_NAME, 'collab-1'));
+});
+
+test('collabDir：非法 collabId 一律抛错——路径穿越的硬边界', () => {
+  for (const bad of ['../evil', 'a/b', 'a.b', '', 'x'.repeat(65), 'has space', 123, null]) {
+    assert.throws(() => collabDir('/data-root', bad), /collabId 非法/);
+  }
+});
+
+test('collabFilePath：协作目录内的具名文件', (t) => {
+  const dir = makeTempDir(t);
+  assert.equal(
+    collabFilePath(dir, 'collab-1', 'outbox.jsonl'),
+    join(dir, COLLABS_DIR_NAME, 'collab-1', 'outbox.jsonl'),
+  );
 });
