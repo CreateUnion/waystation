@@ -1,0 +1,192 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import net from 'node:net';
+import { randomUUID } from 'node:crypto';
+import { existsSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { makeTempDir, pickFreePort, repoRoot, waitFor, waitForRebindable } from './helpers.js';
+
+const INDEX_ENTRY = join(repoRoot, 'src', 'index.js');
+
+/* 治理验收预演（真实组合根 × 2 + 假会话收件箱）：交接 / 抢接与握手降级 / 离线拒绝，
+ * 走 ws_* 工具面全链——本机近似（真双机归 M7）。
+ * Linux 侧命名管道路径语义与本套件同型挂账（协作核心 e2e 的既有口径——Linux 全量归 M7/CI）。 */
+
+/* 假会话收件箱：命名管道上的真实 server（与 collab-e2e 同一形态）。 */
+async function startFakeSessionInbox(t) {
+  const path = `\\\\.\\pipe\\waystation-m5-e2e-${randomUUID()}`;
+  const chunks = [];
+  const server = net.createServer((socket) => {
+    socket.on('data', (chunk) => chunks.push(chunk));
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(path, resolve);
+  });
+  t.after(() => server.close());
+  return { path, token: `tok-${randomUUID()}`, receivedText: () => Buffer.concat(chunks).toString('utf8') };
+}
+
+/* 站点进程的统一收尾：先关客户端并等站点退出、后删目录（钩子注册序先于 makeTempDir，见 collab-e2e 注）。 */
+const clientsByTest = new WeakMap();
+
+function cleanupRegistryOf(t) {
+  let clients = clientsByTest.get(t);
+  if (clients === undefined) {
+    clients = [];
+    clientsByTest.set(t, clients);
+    t.after(async () => {
+      for (const client of clients) {
+        try {
+          await client.close();
+        } catch {
+          // 用例中已显式关闭：忽略重复关闭
+        }
+      }
+    });
+  }
+  return clients;
+}
+
+function makeStationDir(t) {
+  cleanupRegistryOf(t);
+  return makeTempDir(t);
+}
+
+/* 治理节奏：短探测 / 短窗口（探针与窗口节律压到秒级以内；行为语义与默认定案一致）。
+ * 显式端口写死：显式目录首跑不自动挑段内端口——测试要按预期端口寻址。 */
+function writeStationConfig(home, port, extra = {}) {
+  writeFileSync(join(home, 'config.json'), JSON.stringify({
+    port,
+    scanWindowMs: 300,
+    dialTimeoutMs: 1500,
+    dispatchTickMs: 100,
+    retryIntervalMs: 200,
+    retryFastCount: 100,
+    messageTtlMs: 3600000,
+    managerProbeIntervalMs: 100,
+    managerOfflineMs: 300,
+    takeoverWindowMs: 1500,
+    ...extra,
+  }));
+}
+
+async function startStation(t, { home, inbox }) {
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [INDEX_ENTRY],
+    cwd: repoRoot,
+    env: { ...process.env, WAYSTATION_HOME: home, CLAUDE_CODE_MESSAGING_SOCKET: inbox.path, CLAUDE_CODE_MESSAGING_TOKEN: inbox.token },
+  });
+  const client = new Client({ name: 'waystation-m5-e2e', version: '0.0.0' });
+  cleanupRegistryOf(t).push(client);
+  await client.connect(transport);
+  return client;
+}
+
+async function callTool(client, name, args = {}) {
+  const called = await client.callTool({ name, arguments: args });
+  const text = called.content[0].text;
+  return { isError: called.isError === true, payload: called.isError === true ? text : JSON.parse(text) };
+}
+
+async function createAndApprove(t, { a, b, portB }) {
+  const statusB = (await callTool(b, 'ws_status')).payload;
+  const created = await callTool(a, 'ws_create_collab', { name: '治理项目', topic: '主题', targets: [{ instanceId: statusB.instanceId, identityName: statusB.identityName, address: '127.0.0.1', port: portB }] });
+  assert.equal(created.isError, false, String(created.payload));
+  const collabId = created.payload.collabId;
+  await waitFor(async () => {
+    const listed = (await callTool(b, 'ws_list_collabs')).payload.collabs;
+    return listed.some((entry) => entry.collabId === collabId) ? true : null;
+  }, { timeoutMs: 20000 });
+  assert.equal((await callTool(b, 'ws_approve_invite', { collabId, approve: true })).isError, false);
+  for (const client of [a, b]) {
+    await waitFor(async () => {
+      const listed = (await callTool(client, 'ws_list_collabs')).payload.collabs;
+      return listed.some((entry) => entry.collabId === collabId && entry.state === 'active') ? true : null;
+    }, { timeoutMs: 20000 });
+  }
+  return { collabId };
+}
+
+async function startStudio(t, extraConfig = {}) {
+  const homeA = makeStationDir(t);
+  const homeB = makeStationDir(t);
+  const portA = await pickFreePort();
+  const portB = await pickFreePort();
+  const inboxA = await startFakeSessionInbox(t);
+  const inboxB = await startFakeSessionInbox(t);
+  writeStationConfig(homeA, portA, extraConfig);
+  writeStationConfig(homeB, portB, extraConfig);
+  const a = await startStation(t, { home: homeA, port: portA, inbox: inboxA });
+  const b = await startStation(t, { home: homeB, port: portB, inbox: inboxB });
+  const { collabId } = await createAndApprove(t, { a, b, portB });
+  return { homeA, homeB, portA, portB, inboxA, inboxB, a, b, collabId };
+}
+
+test('治理验收：显式交接（ws_handover 全链，先确认后删除）', { timeout: 120000 }, async (t) => {
+  const studio = await startStudio(t);
+  const { a, b, homeA, collabId } = studio;
+  const statusB = (await callTool(b, 'ws_status')).payload;
+  const handed = await callTool(a, 'ws_handover', { collabId, target: statusB.instanceId });
+  assert.equal(handed.isError, false, String(handed.payload));
+  assert.ok(handed.payload.message.includes('移交完成'));
+  const bListed = (await callTool(b, 'ws_list_collabs')).payload.collabs.find((entry) => entry.collabId === collabId);
+  assert.equal(bListed.role, 'manager');
+  const aListed = (await callTool(a, 'ws_list_collabs')).payload.collabs.find((entry) => entry.collabId === collabId);
+  assert.equal(aListed.role, 'member');
+  assert.equal(existsSync(join(homeA, 'collabs', collabId, 'ledger.jsonl')), false, '旧席位台账已清理');
+  const bLedger = await callTool(b, 'ws_view_ledger', { collabId });
+  assert.equal(bLedger.payload.source, 'local');
+  assert.equal(bLedger.payload.ledger.manager.instanceId, statusB.instanceId);
+});
+
+test('治理验收：失联抢接（ws_take_over 全链）+ 原驿丞重启握手降级', { timeout: 180000 }, async (t) => {
+  const studio = await startStudio(t);
+  const { a, b, homeA, portA, inboxA, collabId } = studio;
+  const statusA = (await callTool(a, 'ws_status')).payload;
+  await a.close();
+  await waitForRebindable(portA);
+  await waitFor(async () => {
+    const listed = (await callTool(b, 'ws_list_collabs')).payload.collabs;
+    const entry = listed.find((candidate) => candidate.collabId === collabId);
+    return entry !== undefined && entry.managerOffline === true ? true : null;
+  }, { timeoutMs: 30000 });
+  const verdict = await callTool(b, 'ws_take_over', { collabId });
+  assert.equal(verdict.isError, false, String(verdict.payload));
+  assert.equal(verdict.payload.phase, 'awaiting-confirm');
+  const applied = await callTool(b, 'ws_take_over', { collabId, confirm: true });
+  assert.equal(applied.isError, false, String(applied.payload));
+  const bListed = (await callTool(b, 'ws_list_collabs')).payload.collabs.find((entry) => entry.collabId === collabId);
+  assert.equal(bListed.role, 'manager');
+  const bLedger = await callTool(b, 'ws_view_ledger', { collabId });
+  assert.equal(bLedger.payload.ledger.manager.instanceId, (await callTool(b, 'ws_status')).payload.instanceId);
+  assert.equal(bLedger.payload.ledger.version, verdict.payload.baseVersion, '版本跨抢接延续');
+  /* 原驿丞重启：握手 / 通告送达识出已被替换 → 降级 */
+  const a2 = await startStation(t, { home: homeA, port: portA, inbox: inboxA });
+  await waitFor(async () => {
+    const listed = (await callTool(a2, 'ws_list_collabs')).payload.collabs;
+    const entry = listed.find((candidate) => candidate.collabId === collabId);
+    return entry !== undefined && entry.role === 'member' ? true : null;
+  }, { timeoutMs: 30000 });
+  const aStats = (await callTool(a2, 'ws_status')).payload.collab;
+  assert.equal(aStats.takeoverDowngrades >= 1, true, '降级计数留痕');
+  assert.equal(existsSync(join(homeA, 'collabs', collabId, 'ledger.jsonl')), false, '降级即清理本地台账');
+  assert.equal(statusA.instanceId.length > 0, true);
+});
+
+test('治理验收：交接目标离线 → 明确拒绝并指引（在线校验经即时探测通道）', { timeout: 120000 }, async (t) => {
+  const studio = await startStudio(t);
+  const { a, b, portB, collabId } = studio;
+  const statusB = (await callTool(b, 'ws_status')).payload;
+  await b.close();
+  await waitForRebindable(portB);
+  const handed = await callTool(a, 'ws_handover', { collabId, target: statusB.instanceId });
+  assert.equal(handed.isError, true);
+  assert.ok(handed.payload.includes('离线'), String(handed.payload));
+  assert.ok(handed.payload.includes('ws_take_over'), '应急指引');
+  const aListed = (await callTool(a, 'ws_list_collabs')).payload.collabs.find((entry) => entry.collabId === collabId);
+  assert.equal(aListed.role, 'manager', '未完成移交：席位保持');
+});
