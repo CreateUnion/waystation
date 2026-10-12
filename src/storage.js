@@ -5,14 +5,19 @@ import { randomUUID } from 'node:crypto';
  *   追加写——台账 / 队列 / 流水；整体替换——config.json / 快照。
  * 写入类接口失败向上抛错：是否兜底（绝不因写盘失败退出进程）由调用方按模块语境决定。 */
 
-/** 追加写：一次 appendFileSync 写入「序列化 + 换行」，单次调用把半行窗口压到最小；
- * 顶层只收非 null 对象（记录）：标量、undefined、函数等一律抛出——
- * 静默写 "undefined" 会变成下次读取的坏行，标量则不是本存储的条目形态 */
+/** 追加写：一次 appendFileSync 写入「序列化 + 换行」，单次调用把半行窗口压到最小。
+ * 两道写前守卫：顶层只收非 null 对象（标量、undefined、函数等一律抛出——静默写 "undefined"
+ * 会变成下次读取的坏行，标量则不是本存储的条目形态）；序列化结果再查 undefined / 字面 "null"
+ * （toJSON 能绕过形态守卫，而 "null" 行会被 loadLines 判为坏行）。序列化只做一次、结果复用 */
 export function appendLine(filePath, value) {
   if (typeof value !== 'object' || value === null) {
     throw new TypeError('appendLine：值必须是非 null 对象');
   }
-  appendFileSync(filePath, JSON.stringify(value) + '\n');
+  const json = JSON.stringify(value);
+  if (json === undefined || json === 'null') {
+    throw new TypeError('appendLine：序列化结果为 undefined 或 null——值必须可序列化为非 null JSON');
+  }
+  appendFileSync(filePath, json + '\n');
 }
 
 /**
@@ -75,13 +80,18 @@ export function replaceFile(filePath, content) {
 }
 
 /** 整体替换为 JSON 文本（config.json / 快照）。
- * 守卫顶层非 null 对象：JSON.stringify(undefined) 返回 undefined，拼上换行
- * 会把文件替换成字面 "undefined"——原子替换落盘即不可回头，必须写前拦截 */
+ * 两道写前守卫：顶层非 null 对象——JSON.stringify(undefined) 返回 undefined，拼上换行
+ * 会把文件替换成字面 "undefined"，原子替换落盘即不可回头，必须写前拦截；
+ * 序列化结果再查 undefined / 字面 "null"（toJSON 能绕过形态守卫）。序列化只做一次、结果复用 */
 export function writeJsonAtomic(filePath, value) {
   if (typeof value !== 'object' || value === null) {
     throw new TypeError('writeJsonAtomic：值必须是非 null 对象');
   }
-  replaceFile(filePath, JSON.stringify(value, null, 2) + '\n');
+  const json = JSON.stringify(value, null, 2);
+  if (json === undefined || json === 'null') {
+    throw new TypeError('writeJsonAtomic：序列化结果为 undefined 或 null——值必须可序列化为非 null JSON');
+  }
+  replaceFile(filePath, json + '\n');
 }
 
 function parseLine(text) {

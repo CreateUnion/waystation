@@ -29,6 +29,13 @@ test('appendLine：非对象值（undefined / null / 标量）抛出，不静默
   assert.equal(existsSync(file), false);
 });
 
+test('appendLine：toJSON 返回 undefined / null 的对象抛出，不落盘', (t) => {
+  const file = join(makeTempDir(t), 'stream.jsonl');
+  assert.throws(() => appendLine(file, { toJSON: () => undefined }), /序列化结果为 undefined 或 null/);
+  assert.throws(() => appendLine(file, { toJSON: () => null }), /序列化结果为 undefined 或 null/);
+  assert.equal(existsSync(file), false);
+});
+
 test('文件不存在：视为空存储', (t) => {
   const file = join(makeTempDir(t), 'missing.jsonl');
   const loaded = loadLines(file);
@@ -141,6 +148,18 @@ test('writeJsonAtomic：非对象值抛出，不把文件替换成 "undefined"',
   assert.throws(() => writeJsonAtomic(file, null), /必须是非 null 对象/);
   assert.throws(() => writeJsonAtomic(file, '文本'), /必须是非 null 对象/);
   assert.equal(existsSync(file), false);
+});
+
+test('writeJsonAtomic：toJSON 返回 undefined / null 的对象抛出，不覆盖既有文件', (t) => {
+  const dir = makeTempDir(t);
+  const file = join(dir, 'config.json');
+  assert.throws(() => writeJsonAtomic(file, { toJSON: () => undefined }), /序列化结果为 undefined 或 null/);
+  assert.throws(() => writeJsonAtomic(file, { toJSON: () => null }), /序列化结果为 undefined 或 null/);
+  assert.equal(existsSync(file), false);
+  writeJsonAtomic(file, { port: 7321 });
+  assert.throws(() => writeJsonAtomic(file, { toJSON: () => undefined }), /序列化结果为 undefined 或 null/);
+  assert.equal(readFileSync(file, 'utf8'), '{\n  "port": 7321\n}\n');
+  assert.deepEqual(readdirSync(dir).filter((name) => name.includes('.tmp')), []);
 });
 
 test('写入被拒时不落盘：既有内容不被改动、不留临时文件', (t) => {
