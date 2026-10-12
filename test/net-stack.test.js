@@ -13,6 +13,9 @@ function createFakeDiscovery(overrides = {}) {
     start: async () => {
       calls.push('start');
     },
+    announce: () => {
+      calls.push('announce');
+    },
     close: async () => {
       calls.push('close');
     },
@@ -71,7 +74,7 @@ function createFakeDispatch(overrides = {}) {
   };
 }
 
-function createFakeInbound() {
+function createFakeInbound(overrides = {}) {
   const calls = [];
   return {
     calls,
@@ -85,10 +88,11 @@ function createFakeInbound() {
       calls.push('stop');
     },
     stats: () => ({ inbound: true }),
+    ...overrides,
   };
 }
 
-function makeStack(t, { discovery, transport, dispatch, inbound, log, probeTimeoutMs = 50 } = {}) {
+function makeStack(t, { discovery, transport, dispatch, inbound, log, probeTimeoutMs = 50, degraded = null } = {}) {
   const logs = [];
   const logger = log ?? {
     info: (message) => logs.push({ level: 'info', message }),
@@ -105,6 +109,7 @@ function makeStack(t, { discovery, transport, dispatch, inbound, log, probeTimeo
     scanWindowMs: 250,
     log: logger,
     probeTimeoutMs,
+    degraded,
   });
   return { stack, logs };
 }
@@ -122,7 +127,7 @@ test('start 成功：按序启动、接线注入、可用', { timeout: 15000 }, 
   const { stack } = makeStack(t, { discovery, transport, dispatch, inbound });
   const result = await stack.start();
   assert.deepEqual(result, { ok: true });
-  assert.deepEqual(discovery.calls, ['start']);
+  assert.deepEqual(discovery.calls, ['start', 'announce']);
   assert.deepEqual(transport.calls, ['listen', 'setFrameHandler']);
   assert.equal(transport.getFrameHandler(), inbound.onFrame);
   assert.deepEqual(dispatch.calls, ['setClientFrameRouter', 'start']);
@@ -132,7 +137,7 @@ test('start 成功：按序启动、接线注入、可用', { timeout: 15000 }, 
   t.after(() => stack.close());
 });
 
-test('UDP 绑定失败 + 占用者应答 pong → local-instance（文案可区分、降级）', { timeout: 15000 }, async (t) => {
+test('UDP 绑定失败 + 占用者应答 pong → occupied-by-station（重启指引、降级）', { timeout: 15000 }, async (t) => {
   const discovery = createFakeDiscovery({
     start: async () => {
       throw Object.assign(new Error('address in use'), { code: 'EADDRINUSE' });
@@ -159,8 +164,8 @@ test('UDP 绑定失败 + 占用者应答 pong → local-instance（文案可区�
   const { stack } = makeStack(t, { discovery, transport });
   const result = await stack.start();
   assert.equal(result.ok, false);
-  assert.equal(result.reason, 'local-instance');
-  assert.ok(result.message.includes('本机已有驿站'));
+  assert.equal(result.reason, 'occupied-by-station');
+  assert.ok(result.message.includes('其他驿站站点占用'));
   assert.ok(!transport.calls.includes('listen'), '绑定失败后不得再建立 TCP 监听');
   assert.equal(stack.status().available, false);
 });
@@ -283,7 +288,7 @@ test('pingHost：地址非法 → 明确错误；可用时透传探测结果', {
   const bad = await stack.pingHost({ address: 'hostname-not-ip' });
   assert.equal(bad.ok, false);
   assert.ok(bad.message.includes('地址非法'));
-  const probed = await stack.pingHost({ address: '127.0.0.9' });
+  const probed = await stack.pingHost({ address: '127.0.0.9', port: 17321 });
   assert.equal(probed.ok, true);
   assert.equal(probed.reachable, false);
 });
@@ -356,7 +361,7 @@ test('start 幂等：重复调用不重启组件', { timeout: 15000 }, async (t)
   await stack.start();
   t.after(() => stack.close());
   await stack.start();
-  assert.deepEqual(discovery.calls, ['start']);
+  assert.deepEqual(discovery.calls, ['start', 'announce']);
 });
 
 test('降级（未 close 组件）后可重试：绑定条件修复后再次 start 成功', { timeout: 15000 }, async (t) => {
@@ -390,13 +395,13 @@ test('TCP 分支失败后重试：明确「需重建」语义（组件已随关�
   const { stack } = makeStack(t, { discovery, transport });
   const first = await stack.start();
   assert.equal(first.reason, 'port-taken');
-  assert.deepEqual(discovery.calls, ['start', 'close'], 'TCP 失败分支已撤下 discovery');
+  assert.deepEqual(discovery.calls, ['start', 'announce', 'close'], 'TCP 失败分支已撤下 discovery');
   const second = await stack.start();
   assert.equal(second.ok, false);
   assert.equal(second.reason, 'components-closed');
   assert.ok(second.message.includes('需重建'), '重试返回「需重建」语义而非绑定失败文案');
   assert.ok(!second.message.includes('监听失败'));
-  assert.deepEqual(discovery.calls, ['start', 'close'], '重试不再触达已关闭的组件');
+  assert.deepEqual(discovery.calls, ['start', 'announce', 'close'], '重试不再触达已关闭的组件');
   assert.equal(stack.status().reason, 'components-closed');
   t.after(() => stack.close());
 });
@@ -467,7 +472,7 @@ test('listHosts / pingHost：可用路径的组件 rejection 收敛为错误形�
   const listed = await stack.listHosts();
   assert.equal(listed.ok, false);
   assert.ok(listed.message.includes('套接字未运行'));
-  const probed = await stack.pingHost({ address: '127.0.0.1' });
+  const probed = await stack.pingHost({ address: '127.0.0.1', port: 17321 });
   assert.equal(probed.ok, false);
   assert.ok(probed.message.includes('拨号建立失败'));
   t.after(() => stack.close());
@@ -521,7 +526,7 @@ test('占用探测：ping 写失败 → port-taken，且不残留等待定时器
   t.after(() => stack.close());
 });
 
-test('占用探测：「已绑定未接线」窗口内首次 ping 被丢弃 → 重发后按 local-instance 分类', { timeout: 15000 }, async (t) => {
+test('占用探测：「已绑定未接线」窗口内首次 ping 被丢弃 → 重发后按 occupied-by-station 分类', { timeout: 15000 }, async (t) => {
   const discovery = createFakeDiscovery({
     start: async () => {
       throw Object.assign(new Error('address in use'), { code: 'EADDRINUSE' });
@@ -550,8 +555,130 @@ test('占用探测：「已绑定未接线」窗口内首次 ping 被丢弃 → 
   const { stack } = makeStack(t, { discovery, transport, probeTimeoutMs: 100 });
   const before = countTimeouts();
   const result = await stack.start();
-  assert.equal(result.reason, 'local-instance', '窗口内丢帧由重发覆盖，不再误判为无关程序占用');
+  assert.equal(result.reason, 'occupied-by-station', '窗口内丢帧由重发覆盖，不再误判为无关程序占用');
   assert.equal(pings, 2);
   assert.ok(countTimeouts() <= before, `应答路径同样不得残留等待定时器（before=${before} after=${countTimeouts()}）`);
+  t.after(() => stack.close());
+});
+
+test('预降级直通：站点解析结论直接降级（不触达组件）', { timeout: 15000 }, async (t) => {
+  const discovery = createFakeDiscovery();
+  const transport = createFakeTransport();
+  const { stack } = makeStack(t, { discovery, transport, degraded: { reason: 'segment-exhausted', message: '端口段全满——本地功能可用' } });
+  const result = await stack.start();
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'segment-exhausted');
+  assert.equal(result.message, '端口段全满——本地功能可用');
+  assert.deepEqual(discovery.calls, [], '不触达发现组件');
+  assert.deepEqual(transport.calls, [], '不触达传输组件');
+  assert.equal(stack.status().available, false);
+  assert.equal(stack.status().reason, 'segment-exhausted');
+});
+
+test('启动自介：discovery.start 成功后立即调用（不等 TCP、先于 transport.listen）', { timeout: 15000 }, async (t) => {
+  const order = [];
+  const { stack } = makeStack(t, {
+    discovery: {
+      start: async () => { order.push('discovery.start'); },
+      close: async () => {},
+      announce: () => order.push('discovery.announce'),
+      scan: async () => [],
+      stats: () => ({}),
+    },
+    transport: {
+      listen: async () => { order.push('transport.listen'); },
+      close: async () => {},
+      dial: async () => { throw new Error('本用例不拨号'); },
+      setFrameHandler() {},
+      stats: () => ({}),
+    },
+  });
+  const result = await stack.start();
+  assert.deepEqual(result, { ok: true });
+  assert.deepEqual(order, ['discovery.start', 'discovery.announce', 'transport.listen']);
+  t.after(() => stack.close());
+});
+
+test('启动自介抛错：隔离、不影响启动结论（留痕）', { timeout: 15000 }, async (t) => {
+  const discovery = createFakeDiscovery({
+    announce: () => { throw new Error('自介故障'); },
+  });
+  const { stack, logs } = makeStack(t, { discovery });
+  const result = await stack.start();
+  assert.deepEqual(result, { ok: true });
+  assert.ok(logs.some((entry) => entry.message.includes('启动自介异常')));
+  t.after(() => stack.close());
+});
+
+test('checkInbox：透传到接收管线（原样转发查询参数）', { timeout: 15000 }, async (t) => {
+  const queries = [];
+  const inbound = createFakeInbound({
+    checkInbox: (query) => {
+      queries.push(query);
+      return { collabId: query.collabId, total: 0, returned: 0, messages: [] };
+    },
+  });
+  const { stack } = makeStack(t, { inbound });
+  await stack.start();
+  const result = stack.checkInbox({ collabId: 'collab-1', limit: 2 });
+  assert.deepEqual(queries, [{ collabId: 'collab-1', limit: 2 }]);
+  assert.equal(result.total, 0);
+  t.after(() => stack.close());
+});
+
+test('绑定竞态分类：驿站占 → occupied-by-station（重启指引）；无关程序 → port-taken（无全网同步字样）', { timeout: 15000 }, async (t) => {
+  const boundDiscovery = () => createFakeDiscovery({
+    start: async () => {
+      throw Object.assign(new Error('address in use'), { code: 'EADDRINUSE' });
+    },
+  });
+  const answeringTransport = createFakeTransport({
+    dial: async () => {
+      let listener = null;
+      return {
+        remoteAddress: '127.0.0.1',
+        send(frame) {
+          if (listener !== null && frame.type === 'ping') {
+            listener({ v: 1, type: 'pong', msgId: 'pong-1', replyTo: frame.msgId, from: { instanceId: 'inst-a', identityName: '主机甲' }, ts: new Date().toISOString() });
+          }
+        },
+        onFrame(callback) { listener = callback; },
+        onClose() {},
+        close() {},
+      };
+    },
+  });
+  const { stack } = makeStack(t, { discovery: boundDiscovery(), transport: answeringTransport });
+  const station = await stack.start();
+  assert.equal(station.reason, 'occupied-by-station');
+  assert.ok(station.message.includes('重启本终端'));
+
+  const silentTransport = createFakeTransport({
+    dial: async () => ({ remoteAddress: '127.0.0.1', send() {}, onFrame() {}, onClose() {}, close() {} }),
+  });
+  const { stack: second } = makeStack(t, { discovery: boundDiscovery(), transport: silentTransport });
+  const taken = await second.start();
+  assert.equal(taken.reason, 'port-taken');
+  assert.ok(taken.message.includes('被其他程序占用'));
+  assert.ok(!taken.message.includes('全网同步'), '多站点模型下不存在全网同步的端口改动');
+});
+
+test('接线失败：先停调度（stop 异常不掩盖原接线错误）、撤下监听', { timeout: 15000 }, async (t) => {
+  const discovery = createFakeDiscovery();
+  const dispatch = createFakeDispatch({
+    stop() {
+      this.calls.push('stop');
+      throw new Error('停止故障');
+    },
+  });
+  const transport = createFakeTransport({
+    setFrameHandler() { throw new Error('接线器拒绝'); },
+  });
+  const { stack } = makeStack(t, { discovery, dispatch, transport });
+  const result = await stack.start();
+  assert.equal(result.reason, 'wiring-failed');
+  assert.ok(result.message.includes('接线器拒绝'), '原始接线错误不被停止异常掩盖');
+  assert.ok(dispatch.calls.includes('stop'), '在途投递收口先于撤下监听');
+  assert.ok(transport.calls.includes('close'));
   t.after(() => stack.close());
 });

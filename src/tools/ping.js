@@ -18,7 +18,7 @@ export function pingTool() {
       if (address === '' || isIP(address) === 0) {
         return { content: [{ type: 'text', text: '参数 address 非法：需要 IPv4/IPv6 字面量（不做域名解析）' }], isError: true };
       }
-      const probed = await context.net.pingHost({ address });
+      const probed = await context.net.pingHost({ address, port: args.port });
       if (!probed.ok) {
         return { content: [{ type: 'text', text: probed.message }], isError: true };
       }

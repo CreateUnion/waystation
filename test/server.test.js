@@ -164,14 +164,14 @@ test('ws_ping：自环可达（同端口监听服务自身）、不可达地址�
   const home = makeTempDir(t);
   const port = await pickFreePort();
   const client = await connectClient(t, INDEX_ENTRY, home, { port });
-  const selfPing = JSON.parse((await client.callTool({ name: 'ws_ping', arguments: { address: '127.0.0.1' } })).content[0].text);
+  const selfPing = JSON.parse((await client.callTool({ name: 'ws_ping', arguments: { address: '127.0.0.1', port } })).content[0].text);
   assert.equal(selfPing.reachable, true);
   assert.ok(Number.isInteger(selfPing.rttMs));
   // 不可达样本取 TEST-NET-1（RFC 5737 文档保留段，不可路由）：本机监听在 0.0.0.0 通配地址上，
   // 回环别名（如 127.0.0.3）会被自己的通配监听接住，不能当「不可达」用
-  const dead = JSON.parse((await client.callTool({ name: 'ws_ping', arguments: { address: '192.0.2.1' } })).content[0].text);
+  const dead = JSON.parse((await client.callTool({ name: 'ws_ping', arguments: { address: '192.0.2.1', port } })).content[0].text);
   assert.equal(dead.reachable, false);
-  const bad = await client.callTool({ name: 'ws_ping', arguments: { address: 'not-an-ip' } });
+  const bad = await client.callTool({ name: 'ws_ping', arguments: { address: 'not-an-ip', port } });
   assert.equal(bad.isError, true);
 });
 
@@ -182,19 +182,19 @@ test('ws_delivery_status：无已发消息返回空数组', { timeout: 30000 }, 
   assert.deepEqual(JSON.parse(called.content[0].text), []);
 });
 
-test('端口占用一：本机已有驿站 → 降级、local-instance 文案、LAN 工具明确报错', { timeout: 40000 }, async (t) => {
+test('端口占用一：本机已有驿站站点 → 降级、occupied-by-station 文案、LAN 工具明确报错', { timeout: 40000 }, async (t) => {
   const port = await pickFreePort();
   const clientA = await connectClient(t, INDEX_ENTRY, makeTempDir(t), { port });
   assert.equal((await fetchStatus(clientA)).net.available, true);
   const clientB = await connectClient(t, INDEX_ENTRY, makeTempDir(t), { port });
   const statusB = await fetchStatus(clientB);
   assert.equal(statusB.net.available, false);
-  assert.equal(statusB.net.reason, 'local-instance');
-  assert.ok(statusB.net.message.includes('本机已有驿站'));
+  assert.equal(statusB.net.reason, 'occupied-by-station');
+  assert.ok(statusB.net.message.includes('其他驿站站点占用'));
   const listed = await clientB.callTool({ name: 'ws_list_hosts', arguments: {} });
   assert.equal(listed.isError, true);
-  assert.ok(listed.content[0].text.includes('本机已有驿站'));
-  const probed = await clientB.callTool({ name: 'ws_ping', arguments: { address: '127.0.0.1' } });
+  assert.ok(listed.content[0].text.includes('其他驿站站点占用'));
+  const probed = await clientB.callTool({ name: 'ws_ping', arguments: { address: '127.0.0.1', port } });
   assert.equal(probed.isError, true);
 });
 

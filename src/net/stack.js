@@ -1,7 +1,6 @@
 import { isIP } from 'node:net';
+import { OCCUPIER_PROBE_TIMEOUT_MS } from '../site.js';
 import { PROTOCOL_VERSION, newMsgId } from './protocol.js';
-
-export const OCCUPIER_PROBE_TIMEOUT_MS = 1000;
 
 /* 组件已被 close 后重试 start 的固定结论：一次性生命周期下重试不可能成功，恢复途径是重建组件（组合根职责） */
 const COMPONENTS_CLOSED = {
@@ -13,13 +12,18 @@ const COMPONENTS_CLOSED = {
  * 分类绑定失败并降级（设计 §13 端口占用规程），聚合状态供诊断工具。
  * 组件以注入方式传入（本模块不 import 任何组件）：组合根负责构造，接线与生命周期归本模块——
  * 「接收管线的回程帧要走调度、调度的拨号帧要走接收管线」的循环依赖在此一处解除。
- * 降级不退出进程：进程继续作为该会话的本地 MCP 服务，LAN 工具返回明确错误文本（一机一会话规程）。
- * start() 永不拒绝：任何失败都以 {ok:false, reason, message} 返回。reason ∈ local-instance / port-taken /
- * bind-failed（绑定分类）、wiring-failed（接线失败，已撤下监听）、components-closed（组件已随关闭销毁）。
+ * 降级不退出进程：进程继续作为该会话的本地 MCP 服务，LAN 工具返回明确错误文本（多站点模型下
+ * 为站点级降级——只影响本进程的 LAN 面，同机其他站点不受影响）。
+ * start() 永不拒绝：任何失败都以 {ok:false, reason, message} 返回。reason ∈ occupied-by-station / port-taken /
+ * bind-failed（绑定分类）、wiring-failed（接线失败，已撤下监听）、components-closed（组件已随关闭销毁）；
+ * 站点解析已判不可用（degraded 入参）时直接以解析结论降级、不触达组件。
  * 重试语义（组件一次性生命周期）：组件未被 close 时（首次启动尝试失败）可重试；
  * 一旦有组件被 close（TCP 失败分支撤下 discovery、close()），重试返回 components-closed——
  * 恢复途径是重建组件（组合根职责），进程重启是正常恢复路径。 */
-export function createNetStack({ discovery, transport, dispatch, inbound, port, self, scanWindowMs, log, probeTimeoutMs = OCCUPIER_PROBE_TIMEOUT_MS }) {
+/**
+ * @param {{ discovery: any, transport: any, dispatch: any, inbound: any, port: number, self: any, scanWindowMs: number, log: any, probeTimeoutMs?: number, degraded?: { reason: string, message: string } | null }} options
+ */
+export function createNetStack({ discovery, transport, dispatch, inbound, port, self, scanWindowMs, log, probeTimeoutMs = OCCUPIER_PROBE_TIMEOUT_MS, degraded = null }) {
   const state = {
     discovery,
     transport,
@@ -30,6 +34,7 @@ export function createNetStack({ discovery, transport, dispatch, inbound, port, 
     scanWindowMs,
     log,
     probeTimeoutMs,
+    degraded,
     available: false,
     reason: null,
     message: '',
@@ -43,24 +48,41 @@ export function createNetStack({ discovery, transport, dispatch, inbound, port, 
     pingHost: (options) => pingHost(state, options),
     send: (message) => state.dispatch.send(message),
     deliveryStatus: (query) => state.dispatch.deliveryStatus(query ?? {}),
+    checkInbox: (query) => state.inbound.checkInbox(query),
     status: () => statusOf(state),
   };
+}
+
+/* 前置阻断结论（不触达组件的两类「不可启动」）：组件已销毁 / 站点解析判定不可用。
+ * 返回带归类与错误对象的结论，null 表示可继续启动。 */
+function blockedReasonOf(state) {
+  if (state.componentsClosed) {
+    /* 组件已被 close（一次性生命周期）：重试不可能成功，也不是绑定失败——已关闭套接字的错误
+     * （如 ERR_SOCKET_DGRAM_NOT_RUNNING）不得误分类为 bind-failed，直接给出「需重建」结论 */
+    return { classified: COMPONENTS_CLOSED, error: new Error('组件已关闭') };
+  }
+  if (state.degraded !== null) {
+    /* 站点解析已判不可用（槽位段耗尽 / 锚点被无关程序占 / 显式端口被占）：绑定必然失败，
+     * 不再触达组件——直接以解析结论降级（进程继续作为本地 MCP 服务，LAN 工具返回该文案）。 */
+    return { classified: state.degraded, error: new Error('站点解析判定不可用') };
+  }
+  return null;
 }
 
 async function start(state) {
   if (state.started) {
     return { ok: true };
   }
-  if (state.componentsClosed) {
-    /* 组件已被 close（一次性生命周期）：重试不可能成功，也不是绑定失败——已关闭套接字的错误
-     * （如 ERR_SOCKET_DGRAM_NOT_RUNNING）不得误分类为 bind-failed，直接给出「需重建」结论 */
-    return markUnavailable(state, COMPONENTS_CLOSED, new Error('组件已关闭'));
+  const blocked = blockedReasonOf(state);
+  if (blocked !== null) {
+    return markUnavailable(state, blocked.classified, blocked.error);
   }
   try {
     await state.discovery.start();
   } catch (error) {
     return markUnavailable(state, await classify(state, error), error);
   }
+  announceQuietly(state);   // 自介：UDP 监听就绪即发（不等 TCP）——设计 §5
   try {
     await state.transport.listen();
   } catch (error) {
@@ -88,8 +110,14 @@ async function start(state) {
   return { ok: true };
 }
 
-/* 接线失败：同生共死撤下两个监听并置「组件已销毁」，给出「需重建」结论（不把异常直穿给调用方） */
+/* 接线失败：先停调度（在途拨号收口——transport.close 兜不住 close 前未连上的拨号 socket），
+ * 再同生共死撤下两个监听。dispatch.stop 的异常不得掩盖原始接线错误——各自兜底后以原错误收口。 */
 async function tearDownWiring(state, error) {
+  try {
+    await state.dispatch.stop();
+  } catch (stopError) {
+    state.log.warn('接线失败后的调度停止异常（已忽略）', { reason: stopError.message });
+  }
   await closeQuietly(state, state.transport);
   await closeQuietly(state, state.discovery);
   state.componentsClosed = true;
@@ -128,15 +156,18 @@ async function listHosts(state) {
   }
 }
 
-async function pingHost(state, { address }) {
+async function pingHost(state, { address, port }) {
   if (!state.available) {
     return { ok: false, message: state.message };
   }
   if (typeof address !== 'string' || isIP(address) === 0) {
     return { ok: false, message: '地址非法：需要 IPv4/IPv6 字面量（不做域名解析）' };
   }
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return { ok: false, message: '端口非法：需要 1–65535 的整数（端口来源以扫描列表为准）' };
+  }
   try {
-    return { ok: true, ...(await state.dispatch.ping({ address, port: state.port })) };
+    return { ok: true, ...(await state.dispatch.ping({ address, port })) };
   } catch (error) {
     return { ok: false, message: `主机探测失败：${error.message}` };
   }
@@ -157,22 +188,23 @@ function statusOf(state) {
   };
 }
 
-/* 占用者分类（设计 §13）：拨本机端口发一个 ping——应答合法 pong = 本机已有驿站（一机一会话）；
- * 其余（拒连 / 沉默 / 非本协议）一律按无关程序占用处置，文案给改端口指引。 */
+/* 占用者分类（设计 §13 的绑定竞态路径）：拨本机端口发 ping——应答合法 pong = 端口被其他驿站站点占用
+ * （本终端在一次槽位竞选中落败：不换槽位，重启本终端即自动改取下一空闲槽位）；其余一律按无关程序占用
+ * （指引释放端口或改站点 config.json 的 port——端口按站点独立，无「全网同步」之说）。 */
 async function classify(state, error) {
   if (error.code !== 'EADDRINUSE') {
     return { reason: 'bind-failed', message: `端口 ${state.port} 监听失败（${error.message}）——局域网功能不可用` };
   }
   const occupier = await probeOccupier(state);
-  if (occupier === 'local-instance') {
+  if (occupier === 'station') {
     return {
-      reason: 'local-instance',
-      message: `本机已有驿站会话在监听端口 ${state.port}——本进程不建立局域网监听（一机一会话的既定行为），依赖局域网的工具暂不可用`,
+      reason: 'occupied-by-station',
+      message: `端口 ${state.port} 在启动瞬间被其他驿站站点占用（并发启动竞争）——本进程不建立局域网监听；重启本终端可自动改取下一空闲槽位`,
     };
   }
   return {
     reason: 'port-taken',
-    message: `端口 ${state.port} 被其他程序占用，无法建立局域网监听——请在数据目录的 config.json 中修改 port（改动需全网同步）后重启`,
+    message: `端口 ${state.port} 被其他程序占用，无法建立局域网监听——请释放该端口，或在站点数据目录的 config.json 中修改 port 后重启`,
   };
 }
 
@@ -201,16 +233,16 @@ async function probeOccupier(state) {
     });
     const ping = { v: PROTOCOL_VERSION, type: 'ping', msgId: replyTo, from: state.self, ts: new Date().toISOString() };
     /* 发两次：第二次覆盖「占用者已 bind、回程帧处理器尚未接线」的启动瞬间（该窗口内帧被丢弃），
-     * 使本机驿站实例的启动窗口收敛回 local-instance 语义；首次只等半个剩余预算，留一半给重发 */
+     * 使本机驿站实例的启动窗口收敛回「驿站占」分类；首次只等半个剩余预算，留一半给重发 */
     connection.send(ping);
     await Promise.race([pongArrived, waitPong(Math.max(1, Math.ceil((deadline - Date.now()) / 2)))]);
     if (!answered) {
       connection.send(ping);
       await Promise.race([pongArrived, waitPong(Math.max(1, deadline - Date.now()))]);
     }
-    return answered ? 'local-instance' : 'port-taken';
+    return answered ? 'station' : 'unrelated';
   } catch {
-    return 'port-taken';
+    return 'unrelated';
   } finally {
     if (waitTimer !== null) {
       clearTimeout(waitTimer);
@@ -234,5 +266,15 @@ async function closeQuietly(state, component) {
     await component.close();
   } catch (error) {
     state.log.warn('组件关闭异常（已忽略）', { reason: error.message });
+  }
+}
+
+/* 启动自介（设计 §5）：UDP 监听就绪即发、不等待 TCP。announce 内部已兜底不抛出；
+ * 这里再包一层是双保险——自介失败绝不改变启动结论（它是发现辅助、不是启动关键路径）。 */
+function announceQuietly(state) {
+  try {
+    state.discovery.announce();
+  } catch (error) {
+    state.log.warn('启动自介异常（已忽略）', { reason: error.message });
   }
 }
