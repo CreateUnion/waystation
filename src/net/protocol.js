@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 /* 协议契约（设计 §10）：帧/报文格式与入站校验的唯一权威。
  * 「帧」= TCP 通道上的一行 JSON（NDJSON）；「报文」= UDP 发现数据报。
  * 一切入站数据在使用前必须过本文件的校验器（字段完整性 / 类型 / 长度边界 / 数值范围），
- * 失败一律拒绝并计数留痕——局域网全信任模型不豁免（设计 §10 入站校验基线）。 */
+ * 失败一律拒绝，计数留痕由消费方执行——局域网全信任模型不豁免（设计 §10 入站校验基线）。 */
 
 export const PROTOCOL_VERSION = 1;
 
@@ -118,7 +118,8 @@ export function parseFrame(text) {
 }
 
 /* 类型专属字段（本版只定义传输类）：pong 的 replyTo、ack 的 ackFor、delivery-status 的载荷结构。
- * 协作域载荷结构（task / progress / …）归后续里程碑定义——本层只查信封与体积。 */
+ * 协作域载荷结构（task / progress / …）归后续里程碑定义——本层只做形态校验，不测量体积；
+ * 体积上限（MAX_FRAME_BYTES / MAX_DATAGRAM_BYTES）由消费方按 Buffer 字节数测量并执行。 */
 function validateTypeSpecific(frame) {
   if (frame.type === 'pong' && !isId(frame.replyTo)) {
     return refuse('pong 缺少合法的 replyTo');

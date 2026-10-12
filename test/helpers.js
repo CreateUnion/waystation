@@ -16,7 +16,8 @@ export function makeTempDir(t) {
 }
 
 /** 到期限轮询：等网络 I/O 与定时调度收敛用——固定 sleep 在慢机器上假红、快机器上白等。
- * check 返回真值即返回它；超时抛错（信息含超时值，便于定位假红来源）。 */
+ * check 返回真值即返回它；超时抛错（信息含超时值，便于定位假红来源）。
+ * 超时抛 Error，消息形如「waitFor 超时（<timeoutMs>ms）：条件未满足」；check 自身抛错立即传播，不重试。 */
 export async function waitFor(check, { timeoutMs = 5000, intervalMs = 25 } = {}) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {

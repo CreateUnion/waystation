@@ -41,6 +41,21 @@ export function collabDir(dataDir, collabId) {
   return join(dataDir, COLLABS_DIR_NAME, collabId);
 }
 
+/* 协作目录内文件名的段形态：字符类排除分隔符、冒号与控制字符，首/尾点另行排除——
+ * 首点堵 '.' 与 '..'，尾点堵 Windows 会折叠尾点的归一化形态（同一判据跨平台生效，不依赖 path 的平台行为）。
+ * 与 collabId 的守卫同一思路：非法段一律抛错，不做清洗。 */
+const COLLAB_FILE_NAME_PATTERN = /^[0-9a-zA-Z.-]+$/;
+
+/** 协作目录内的具名文件。fileName 只接受单段文件名（允许点分扩展名，如下游的 outbox.jsonl）——
+ * 与 collabId 同一硬边界：段形态不符一律抛错，不做清洗或拼接。 */
 export function collabFilePath(dataDir, collabId, fileName) {
+  if (
+    typeof fileName !== 'string' ||
+    !COLLAB_FILE_NAME_PATTERN.test(fileName) ||
+    fileName.startsWith('.') ||
+    fileName.endsWith('.')
+  ) {
+    throw new TypeError(`fileName 非法，不得用于路径拼接：${String(fileName).slice(0, 32)}`);
+  }
   return join(collabDir(dataDir, collabId), fileName);
 }

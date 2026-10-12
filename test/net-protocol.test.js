@@ -36,6 +36,14 @@ test('合法协作域消息：通过', () => {
   assert.equal(validateMessage(envelope()).ok, true);
 });
 
+test('消息根节点非对象（null / 数组 / 字符串 / 数字）：拒绝', () => {
+  for (const bad of [null, ['x'], 'text', 42]) {
+    const checked = validateMessage(bad);
+    assert.equal(checked.ok, false, String(bad));
+    assert.ok(checked.reason.includes('根节点'), String(bad));
+  }
+});
+
 test('协议版本不匹配：拒绝', () => {
   const checked = validateMessage(envelope({ v: 2 }));
   assert.equal(checked.ok, false);
@@ -110,6 +118,20 @@ test('parseFrame：非法 JSON / 非对象 / 合法帧', () => {
   assert.equal(parsed.frame.type, 'notice');
 });
 
+test('parseFrame：入参非字符串（消费方误传 Buffer）：拒绝', () => {
+  for (const bad of [null, 42, Buffer.from('{}')]) {
+    const checked = parseFrame(bad);
+    assert.equal(checked.ok, false, String(bad));
+    assert.ok(checked.reason.includes('文本'), String(bad));
+  }
+});
+
+test('parseFrame：合法 JSON 但信封非法：拒绝并带回原因', () => {
+  const checked = parseFrame(JSON.stringify(envelope({ v: 2 })));
+  assert.equal(checked.ok, false);
+  assert.ok(checked.reason.includes('版本'));
+});
+
 test('发现报文：探测/应答校验（含 collabCount 数值范围）', () => {
   const probe = { v: PROTOCOL_VERSION, type: 'probe', instanceId: SELF.instanceId, identityName: '主机甲' };
   assert.equal(validateProbe(probe).ok, true);
@@ -122,6 +144,17 @@ test('发现报文：探测/应答校验（含 collabCount 数值范围）', () 
   assert.equal(validateProbeAck({ ...ack, collabCount: 1.5 }).ok, false);
   assert.equal(validateProbeAck({ ...ack, collabCount: MAX_COLLAB_COUNT + 1 }).ok, false);
   assert.equal(validateProbeAck({ ...ack, collabCount: undefined }).ok, false);
+});
+
+test('发现报文根节点非对象（null / 字符串）：validateProbe / validateProbeAck 拒绝', () => {
+  assert.equal(validateProbe(null).ok, false);
+  assert.equal(validateProbeAck('text').ok, false);
+});
+
+test('发现报文类型不匹配（探测/应答互收）：拒绝', () => {
+  const ackShape = { v: PROTOCOL_VERSION, type: 'probe-ack', instanceId: SELF.instanceId, identityName: '主机甲' };
+  assert.equal(validateProbe(ackShape).ok, false);
+  assert.equal(validateProbeAck({ ...ackShape, type: 'probe' }).ok, false);
 });
 
 test('常量：版本、类型集、治理集、传输集与体积上限', () => {

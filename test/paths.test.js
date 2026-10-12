@@ -55,3 +55,12 @@ test('collabFilePath：协作目录内的具名文件', (t) => {
     join(dir, COLLABS_DIR_NAME, 'collab-1', 'outbox.jsonl'),
   );
 });
+
+test('collabFilePath：非法 fileName 段一律抛 TypeError——与 collabId 同一硬边界', () => {
+  for (const bad of ['../evil', 'a/b', 'a\\b', '..', '.', 'C:x', 'outbox.', '', 123, null]) {
+    assert.throws(() => collabFilePath('/data-root', 'collab-1', bad), {
+      name: 'TypeError',
+      message: /fileName 非法/,
+    });
+  }
+});
