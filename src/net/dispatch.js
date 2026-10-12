@@ -101,7 +101,9 @@ async function stop(state) {
   await Promise.allSettled([...state.pendingDials]);
 }
 
-function send(state, { collabId, to, type, payload }) {
+/* message.from（可选）：转达帧的原发身份——治理转达保留发起者身份（身份语义定义在 from 上），
+ * 缺省以本机身份盖章；预检、入队与投递（frameOf）三处同用这一份 from。 */
+function send(state, { collabId, to, type, payload, from }) {
   const rejection = sendRejection(collabId, to, type);
   if (rejection !== null) {
     state.counters.sendsRejected++;
@@ -123,13 +125,13 @@ function send(state, { collabId, to, type, payload }) {
   }
   const msgId = newMsgId();
   const ts = new Date().toISOString();
-  const payloadRejection = frameRejectionOf(frameOf(state, collabId, { msgId, type, payload, createdAt: ts }));
+  const payloadRejection = frameRejectionOf(frameOf(state, collabId, { msgId, type, payload, createdAt: ts, from }));
   if (payloadRejection !== null) {
     state.counters.sendsRejected++;
     return { ok: false, reason: payloadRejection };
   }
   const outbox = outboxFor(state, collabId);
-  const result = outbox.enqueue({ msgId, to: { instanceId: to.instanceId, address: to.address, port: to.port }, type, payload, ts });
+  const result = outbox.enqueue({ msgId, to: { instanceId: to.instanceId, address: to.address, port: to.port }, type, payload, ts, from });
   if (!result.ok) {
     state.counters.sendsRejected++;
     return result;
@@ -526,7 +528,7 @@ function frameOf(state, collabId, entry) {
     v: PROTOCOL_VERSION,
     msgId: entry.msgId,
     type: entry.type,
-    from: state.self,
+    from: entry.from ?? state.self,   // 转达帧携带原发身份；缺省以本机身份盖章
     collabId,
     ts: entry.createdAt,
   };

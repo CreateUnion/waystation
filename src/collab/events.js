@@ -63,11 +63,20 @@ function learnEndpoints(state, frame, meta) {
   if (address === '' || !isPort(frame.from?.port)) {
     return;
   }
-  applyEndpoint(state, local, frame.from, address, frame.from.port);
+  /* 转达副本的 from 是原发者、链路地址是转达者的——据此学习会把原发者端点记成转达者地址
+   * （错误寻址）：转达帧不作端点学习，仍作「任一成功接触」的可达性证据。 */
+  if (!isRelayedCopy(frame)) {
+    applyEndpoint(state, local, frame.from, address, frame.from.port);
+  }
   if (local.suspended !== null && local.suspended.reason === 'handshake-unresolved') {
     resumeLocal(state, local, 'handshake-contacted');
   }
   local.handshakeUnresolved = false;
+}
+
+/* 转达副本判别：转达出口在载荷里带 originMsgId（原生帧没有）。 */
+function isRelayedCopy(frame) {
+  return typeof frame.payload?.originMsgId === 'string' && frame.payload.originMsgId !== '';
 }
 
 export function applyEndpoint(state, local, peer, address, port) {

@@ -597,3 +597,104 @@ test('未知协作的普通帧：门控拒绝并计数（unknownCollab）', asyn
   assert.equal(admitted.ok, false);
   assert.equal(harness.service.stats().unknownCollab >= 1, true);
 });
+
+/* —— 转达归因与快照漂移（修复轮判别用例）—— */
+
+test('转达保原发身份：经转达的生效通告认候选不认转达者', async (t) => {
+  /* 判别性用例（源自对抗评审行为探针）：转达出口原样携带原发 from——身份语义定义在 from 上，
+   * 改写为转达者会让接收方把转达者当作新驿丞（归因错位、写路径随之外错）。 */
+  const relayNode = makeHarness(t, { self: { instanceId: 'inst-b', identityName: '主机乙', port: 17321 } });
+  const collabId = await memberActive(relayNode, { collabId: 'collab-relay' });
+  const digest = ledgerDigest(ledgerStub(collabId, 5, { instanceId: 'inst-c', identityName: '主机丙' }));
+  const incoming = collabFrame('takeover', collabId, peer('inst-c', '主机丙'), { baseVersion: 5, digest });
+  await receive(relayNode.service, incoming);
+  const relay = relayNode.sent.find((entry) => entry.type === 'takeover' && entry.to.instanceId === 'inst-a');
+  assert.equal(relay?.from?.instanceId, 'inst-c', '转达帧保留原发身份，不改写为转达者');
+  assert.equal(relay.payload.originMsgId, incoming.msgId, '转达幂等键沿用原帧标识');
+
+  const target = makeHarness(t);
+  await memberActive(target, { collabId });
+  await receive(target.service, collabFrame('takeover', collabId, relay.from, relay.payload), '127.0.0.9');
+  const member = JSON.parse(readFileSync(join(target.dir, 'collabs', collabId, 'member.json'), 'utf8'));
+  assert.equal(member.manager.instanceId, 'inst-c', '接收方采纳候选（转达者 inst-b 不得被当作新驿丞）');
+  assert.equal(member.endpoints['inst-c'], undefined, '转达帧不作端点学习：from 是原发者、链路地址是转达者的');
+});
+
+test('转达保原发身份：同版本下转达者字典序更小不压过真实新驿丞', async (t) => {
+  /* 判别性用例（源自对抗评审行为探针两态）：若转达把 from 改写为转达者（inst-b < inst-c），
+   * 接收方在同基准版本下按实例标识序会把转达者当更高优先——真实新驿丞被转达噪声压过。 */
+  const relayNode = makeHarness(t, { self: { instanceId: 'inst-b', identityName: '主机乙', port: 17321 } });
+  const collabId = await memberActive(relayNode, { collabId: 'collab-relay-rank' });
+  const digest = ledgerDigest(ledgerStub(collabId, 5, { instanceId: 'inst-c', identityName: '主机丙' }));
+  await receive(relayNode.service, collabFrame('takeover', collabId, peer('inst-c', '主机丙'), { baseVersion: 5, digest }));
+  const relay = relayNode.sent.find((entry) => entry.type === 'takeover' && entry.to.instanceId === 'inst-a');
+  assert.equal(relay?.from?.instanceId, 'inst-c', '转达帧保留原发身份');
+
+  const target = makeHarness(t);
+  await memberActive(target, { collabId });
+  await receive(target.service, collabFrame('takeover', collabId, peer('inst-c', '主机丙'), { baseVersion: 5, digest }));
+  await receive(target.service, collabFrame('takeover', collabId, relay.from, relay.payload));
+  const member = JSON.parse(readFileSync(join(target.dir, 'collabs', collabId, 'member.json'), 'utf8'));
+  assert.equal(member.manager.instanceId, 'inst-c', '同版本转达不改变现任（转达者不压过真实新驿丞）');
+  assert.equal(target.service.stats().takeoverSuperseded, 0, '同候选重复通告不走「弱优先取代」路径');
+});
+
+test('抢接生效：窗口内快照漂移——生效帧 baseVersion 取生效时台账真值', async (t) => {
+  /* 判别性用例（源自对抗评审行为探针）：收集窗口内到达更新的原驿丞快照（版本漂移）——
+   * 生效帧与恢复台账同源取真值，不沿用发起时宣布的旧基准（优先序与合流判定不被错值污染）。 */
+  const harness = makeHarness(t);
+  const collabId = await memberActive(harness);
+  harness.service.start();
+  await waitFor(() => (harness.service.list().collabs[0].managerOffline === true ? true : null), { timeoutMs: 3000 });
+  const verdict = await harness.service.takeOver({ collabId });
+  assert.equal(verdict.phase, 'awaiting-confirm');
+  assert.equal(verdict.baseVersion, 2, '宣布基准为发起时快照版本');
+  await deliverSnapshot(harness, collabId, 5);
+  harness.sent.length = 0;
+  const applied = await harness.service.takeOver({ collabId, confirm: true });
+  assert.equal(applied.ok, true, String(applied.message));
+  assert.ok(applied.message.includes('5'), '生效提示回报真值版本');
+  const viewed = await harness.service.view({ collabId });
+  assert.equal(viewed.ledger.version, 5, '恢复台账为窗口内收到的最新快照');
+  const broadcasts = sentOf(harness.sent, 'takeover', collabId);
+  assert.equal(broadcasts.length, 1);
+  assert.equal(broadcasts[0].payload.baseVersion, 5, '生效帧基准 = 生效时台账真值');
+  assert.equal(broadcasts[0].payload.digest, ledgerDigest(viewed.ledger), '通告摘要 = 恢复台账摘要');
+  harness.service.close();
+});
+
+test('计数断言：无端点成员被治理广播跳过（rosterSkipped）；端点学得后补发生效通告（takeoverResends）', async (t) => {
+  const harness = makeHarness(t);
+  const collabId = 'collab-counters';
+  const manager = peer('inst-a', '主机甲');
+  const invite = collabFrame('invite', collabId, manager, {
+    name: '联调项目',
+    topic: '发布联调',
+    members: [
+      { instanceId: 'inst-a', identityName: '主机甲' },
+      { instanceId: harness.self.instanceId, identityName: harness.self.identityName },
+      { instanceId: 'inst-d', identityName: '主机丁' },
+    ],
+  });
+  await receive(harness.service, invite);
+  await harness.service.approve({ collabId, approve: true });
+  await receive(harness.service, collabFrame('notice', collabId, manager, { event: 'established', version: 2 }));
+  await deliverSnapshot(harness, collabId, 2, manager);
+  harness.service.start();
+  await waitFor(() => (harness.service.list().collabs[0].managerOffline === true ? true : null), { timeoutMs: 3000 });
+  const skippedBefore = harness.service.stats().rosterSkipped;
+  const verdict = await harness.service.takeOver({ collabId });
+  assert.equal(verdict.phase, 'awaiting-confirm');
+  assert.equal(harness.service.stats().rosterSkipped > skippedBefore, true, '名册中端点未知的成员被跳过并计数');
+  const applied = await harness.service.takeOver({ collabId, confirm: true });
+  assert.equal(applied.ok, true, String(applied.message));
+  const resendsBefore = harness.service.stats().takeoverResends;
+  harness.sent.length = 0;
+  await receive(harness.service, collabFrame('reply', collabId, peer('inst-a', '主机甲', 17322), { text: '原驿丞换端口联系' }));
+  assert.equal(harness.service.stats().takeoverResends, resendsBefore + 1, '端点学得后补发生效通告');
+  const resent = sentOf(harness.sent, 'takeover', collabId);
+  assert.equal(resent.length, 1);
+  assert.equal(resent[0].to.instanceId, 'inst-a');
+  assert.equal(resent[0].payload.baseVersion, 2);
+  harness.service.close();
+});

@@ -529,9 +529,12 @@ async function finalizeTakeover(state, local, baseVersion) {
     state.counters.takeoversAborted++;
     return { ok: false, message: '生效前最后探测：原驿丞恢复应答——抢接中止' };
   }
+  /* 生效取生效时台账真值：收集窗口内可能收到更新的快照（版本漂移）——生效帧、优先序比较与
+   * 恢复台账同源，不沿用发起时宣布的旧基准（错值会污染对立抢接判定与合流递交的基准面）。 */
+  const appliedVersion = local.snapshot === null ? baseVersion : local.snapshot.version;
   const effective = state.effectiveTakeovers.get(local.collabId);
   if (effective !== undefined && effective.candidate.instanceId !== state.self.instanceId) {
-    const mine = { candidate: { instanceId: state.self.instanceId, identityName: state.self.identityName }, baseVersion };
+    const mine = { candidate: { instanceId: state.self.instanceId, identityName: state.self.identityName }, baseVersion: appliedVersion };
     if (comparePriority(effective, mine) > 0) {
       state.takeovers.delete(local.collabId);
       state.rearmedTakeovers.delete(local.collabId);
@@ -545,8 +548,8 @@ async function finalizeTakeover(state, local, baseVersion) {
   state.takeovers.delete(local.collabId);
   state.rearmedTakeovers.delete(local.collabId);
   state.awaitingTakeovers.delete(local.collabId);
-  applyTakeover(state, local, baseVersion);
-  return { ok: true, message: `抢接已生效：本机成为驿丞（基准版本 ${baseVersion}）` };
+  applyTakeover(state, local, appliedVersion);
+  return { ok: true, message: `抢接已生效：本机成为驿丞（基准版本 ${appliedVersion}）` };
 }
 
 /* 生效：从本机快照恢复（manager 换为本机、updatedAt 刷新、版本保持基准值——版本号跨抢接延续不重置），

@@ -644,3 +644,19 @@ test('reassignPeer：参数形态逐拒；无该协作队列按零条成功', { 
   }
   assert.deepEqual(dispatch.reassignPeer({ collabId: 'collab-none', fromInstanceId: 'inst-b', to: { instanceId: 'inst-c', address: '127.0.0.3', port: 7322 } }), { ok: true, moved: 0 });
 });
+
+test('send：携带原发身份（治理转达）时投递帧 from 为原发者，且原发身份随队列重启续投保留', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const { dispatch, dataDir } = makeDispatch(t, { transport });
+  const originFrom = { instanceId: 'inst-c', identityName: '主机丙', port: 7321 };
+  const sent = dispatch.send(target({ type: 'takeover-init', payload: { kind: 'cancel', reason: '让位' }, from: originFrom }));
+  assert.equal(sent.ok, true, sent.reason);
+  dispatch.stop();   // 未投递即中止：原发身份须随队列条目持久化，重启续投不改写
+  const revived = createDispatch({ dataDir, config: testConfig(), transport, self: { instanceId: 'inst-self', identityName: '本机', port: 7321 }, log: { info: () => {}, warn: () => {}, error: () => {} } });
+  t.after(() => revived.stop());
+  revived.start();
+  await waitFor(() => transport.connections.length >= 1 && transport.connections[0].frames.length === 1);
+  const frame = transport.connections[0].frames[0];
+  assert.equal(frame.msgId, sent.msgId);
+  assert.deepEqual(frame.from, originFrom, '转达帧的原发身份在重启续投后仍保留');
+});

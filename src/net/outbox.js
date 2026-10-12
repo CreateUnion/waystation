@@ -110,7 +110,7 @@ function headFor(state, peerInstanceId) {
   return head;
 }
 
-function enqueue(state, { msgId, to, type, payload, ts }) {
+function enqueue(state, { msgId, to, type, payload, ts, from }) {
   const governance = GOVERNANCE_TYPES.includes(type);
   // 配额只统计非治理类未完成条目：治理积压不得挤占普通消息的名额（治理类任何时刻可入队）
   if (!governance && unfinishedOf(state).filter((entry) => !entry.governance).length >= state.config.queueMaxPerCollab) {
@@ -128,6 +128,9 @@ function enqueue(state, { msgId, to, type, payload, ts }) {
     createdAt: ts,
     nextAttemptAt: Date.parse(ts),
   };
+  if (from !== undefined) {
+    entry.from = { instanceId: from.instanceId, identityName: from.identityName, port: from.port };
+  }
   state.entries.set(msgId, entry);
   if (!writeRecord(state, entry)) {
     state.entries.delete(msgId);   // 未落盘即不承诺：取消本次受理（重启后不会出现「幽灵发送」）
@@ -276,13 +279,29 @@ function validateRecord(record) {
     ackedAt: typeof record.ackedAt === 'string' ? record.ackedAt : undefined,
     deliveredAt: typeof record.deliveredAt === 'string' ? record.deliveredAt : undefined,
     expiredAt: typeof record.expiredAt === 'string' ? record.expiredAt : undefined,
+    from: record.from === undefined ? undefined : { instanceId: record.from.instanceId, identityName: record.from.identityName, port: record.from.port },
   };
 }
 
 /* 结构底线（字段形态）：不合形态的记录一律视同损坏，跳过并计数——内容语义不在此层裁定。
  * port 缺省（旧记录）可接受：归一为锚点端口在 validateRecord 里补；存在但非法 = 损坏（拒绝优于猜测）。 */
 function isRecordShape(record) {
-  return isPlainRecord(record) && hasCoreFields(record) && isPeerShape(record.to) && hasCounterFields(record);
+  return isPlainRecord(record) && hasCoreFields(record) && isPeerShape(record.to) && hasCounterFields(record) && isOptionalFromShape(record.from);
+}
+
+/* 原发身份（可选字段，转达帧保留发起者 from）：缺省 = 本机（普通发送）；存在则须合身份形态——
+ * 非法视同损坏记录（拒绝优于猜测：宁可不投也不冒名投递）。 */
+function isOptionalFromShape(from) {
+  if (from === undefined) {
+    return true;
+  }
+  if (typeof from !== 'object' || from === null) {
+    return false;
+  }
+  if (typeof from.instanceId !== 'string' || typeof from.identityName !== 'string') {
+    return false;
+  }
+  return from.port === undefined || isPort(from.port);
 }
 
 function isPlainRecord(record) {

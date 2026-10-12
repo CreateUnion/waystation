@@ -573,3 +573,67 @@ test('移交回执来源校验：非本次目标的 accept / reject 被忽略并
   assert.equal(result.ok, true, String(result.message));
   assert.equal(a.service.list().collabs[0].role, 'member');
 });
+
+/* —— 席位交回与挂起期语义（修复轮判别用例）—— */
+
+test('席位交回：A→B 移交后 role 位同步，B 可把席位交回 A', async (t) => {
+  /* 判别性用例（源自对抗评审行为探针）：席位变更须同步 members[].role（台账 manager 与 role 位
+   * 恒一致）——否则旧驿丞 role 仍为 manager，交回被移交前置（「需为已建立成员」）误拒。 */
+  const a = makeHarness(t, { probeResults: [{ reachable: true, rttMs: 1 }] });
+  const collabId = await managerActive(a);
+  const b = makeHarness(t, { self: { instanceId: 'inst-b', identityName: '主机乙', port: 17321 }, probeResults: [{ reachable: true, rttMs: 1 }] });
+  await memberActiveAt(b, collabId);
+  const pending = a.service.handover({ collabId, target: 'inst-b' });
+  const offer = await waitFor(() => a.sent.find((frame) => frame.type === 'handover' && frame.payload.kind === 'offer'), { timeoutMs: 2000 });
+  await receive(b.service, collabFrame('handover', collabId, peer('inst-a', '主机甲'), offer.payload));
+  const accept = await waitFor(() => b.sent.find((frame) => frame.type === 'handover' && frame.payload.kind === 'accept'), { timeoutMs: 2000 });
+  await receive(a.service, collabFrame('handover', collabId, peer('inst-b', '主机乙'), accept.payload));
+  const first = await pending;
+  assert.equal(first.ok, true, String(first.message));
+  const ledgerB = (await b.service.view({ collabId })).ledger;
+  assert.equal(ledgerB.manager.instanceId, 'inst-b');
+  assert.equal(ledgerB.members.find((member) => member.instanceId === 'inst-b').role, 'manager', '新驿丞 role=manager');
+  assert.equal(ledgerB.members.find((member) => member.instanceId === 'inst-self').role, 'member', '原驿丞 role=member');
+
+  /* B（现驿丞）把席位交回 A（原驿丞）：端点由「在册联系」学习，回执以 A 真实实例标识送达。 */
+  await receive(b.service, collabFrame('reply', collabId, peer('inst-self', '本机'), { text: '在册联系' }));
+  const pendingBack = b.service.handover({ collabId, target: 'inst-self' });
+  const offerBack = await waitFor(() => b.sent.find((frame) => frame.type === 'handover' && frame.payload.kind === 'offer'), { timeoutMs: 2000 });
+  await receive(a.service, collabFrame('handover', collabId, peer('inst-b', '主机乙'), offerBack.payload));
+  const acceptBack = await waitFor(() => a.sent.find((frame) => frame.type === 'handover' && frame.payload.kind === 'accept'), { timeoutMs: 2000 });
+  await receive(b.service, collabFrame('handover', collabId, peer('inst-self', '本机'), acceptBack.payload));
+  const back = await pendingBack;
+  assert.equal(back.ok, true, String(back.message));
+  assert.equal(b.service.list().collabs[0].role, 'member');
+  assert.equal(a.service.list().collabs[0].role, 'manager', '席位交回原驿丞');
+});
+
+test('挂起期明确拒绝：end / withdraw 不半执行（台账与记录均不动）', async (t) => {
+  /* 判别性用例（源自对抗评审行为探针）：收敛等待中的完成 / 撤回会与在途席位变更相互践踏
+   * （成员已归档、驿丞仍活跃的僵尸协作）——入口明确拒绝（与 sendMessage 同一口径）。 */
+  const harness = makeHarness(t);
+  const collabId = await managerActive(harness);
+  await receive(harness.service, collabFrame('takeover-init', collabId, peer('inst-b', '主机乙'), {
+    kind: 'announce', manager: { instanceId: 'inst-self', identityName: '本机' }, baseVersion: 3, windowEndsAt: new Date(Date.now() + 60000).toISOString(),
+  }));
+  assert.equal(harness.service.list().collabs[0].suspended, true);
+  const ended = harness.service.end({ collabId });
+  assert.equal(ended.ok, false);
+  assert.ok(ended.message.includes('暂停'));
+  assert.equal(harness.service.stats().ended, 0, '挂起期结束被拒（不半执行）');
+  const viewed = (await harness.service.view({ collabId })).ledger;
+  assert.equal(viewed.status, 'active', '台账未被改动');
+
+  const proposed = makeHarness(t);
+  const created = proposed.service.create({ name: '撤回项目', topic: '主题', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }] });
+  await receive(proposed.service, collabFrame('takeover-init', created.collabId, peer('inst-b', '主机乙'), {
+    kind: 'announce', manager: { instanceId: 'inst-self', identityName: '本机' }, baseVersion: 1, windowEndsAt: new Date(Date.now() + 60000).toISOString(),
+  }));
+  assert.equal(proposed.service.list().collabs[0].suspended, true);
+  const withdrawn = proposed.service.withdraw({ collabId: created.collabId });
+  assert.equal(withdrawn.ok, false);
+  assert.ok(withdrawn.message.includes('暂停'));
+  assert.equal(proposed.service.stats().withdrawn, 0, '挂起期撤回被拒（不半执行）');
+  const stillProposed = (await proposed.service.view({ collabId: created.collabId })).ledger;
+  assert.equal(stillProposed.status, 'proposed');
+});

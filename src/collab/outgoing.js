@@ -113,6 +113,11 @@ export function withdrawInvite(state, { collabId, target }) {
   if (local === undefined || local.role !== 'manager') {
     return { ok: false, message: '只有管理席位可以撤回邀请' };
   }
+  /* 挂起期明确拒绝（与 sendMessage 同一口径）：撤回含台账写 + 通告面，收敛等待中会被
+   * 暂停守卫截成半执行（撤回帧已发、台账未变）——待收敛后再试。 */
+  if (local.suspended !== null) {
+    return { ok: false, message: '协作对外写已暂停（在途抢接或未能对表）——收敛后恢复' };
+  }
   if (local.ledger.status !== 'proposed') {
     const hint = local.ledger.status === 'active' ? '协作已建立——结束请用 ws_end_collab' : '当前状态不可撤回';
     return { ok: false, message: hint };
@@ -209,6 +214,11 @@ export function endCollab(state, { collabId }) {
   const local = state.collabs.get(collabId);
   if (local === undefined || local.role !== 'manager') {
     return { ok: false, message: '只有管理席位可以结束协作' };
+  }
+  /* 挂起期明确拒绝（与 sendMessage 同一口径）：收敛等待中的结束会半执行——台账写被暂停守卫
+   * 拦下，成员记录与通告却照发，产出「成员已归档、驿丞仍活跃」的僵尸协作。 */
+  if (local.suspended !== null) {
+    return { ok: false, message: '协作对外写已暂停（在途抢接或未能对表）——收敛后恢复' };
   }
   const status = local.ledger.status;
   if (status === 'proposed') {
@@ -341,9 +351,15 @@ export function pushSnapshot(state, local) {
   }
 }
 
-/* 发送包装（注入的 dispatch.send 的统一入口）：结果只计数不抛出——协作操作不因单条入队失败而回滚。 */
-export function sendTo(state, collabId, instanceId, endpoint, type, payload) {
-  const result = state.send({ collabId, to: { instanceId, address: endpoint.address, port: endpoint.port }, type, payload });
+/* 发送包装（注入的 dispatch.send 的统一入口）：结果只计数不抛出——协作操作不因单条入队失败而回滚。
+ * options.from：转达帧的原发身份（治理转达原样携带发起者 from——身份语义定义在 from 上，
+ * 不得改写为转达者；普通发送不携带，由发送侧以本机身份盖章）。 */
+export function sendTo(state, collabId, instanceId, endpoint, type, payload, options = {}) {
+  const message = { collabId, to: { instanceId, address: endpoint.address, port: endpoint.port }, type, payload };
+  if (options.from !== undefined) {
+    message.from = options.from;
+  }
+  const result = state.send(message);
   if (result.ok === true) {
     state.counters.messagesSent++;
     return result;
@@ -413,12 +429,15 @@ export function relayGovernance(state, frame, targets) {
     return 0;
   }
   rememberRelayedOrigin(state, origin);
+  /* 转达原样携带原发身份（设计 §9）：帧的 from 是候选人 / 驿丞的权威身份——改写为转达者会让
+   * 接收方把转达者当作新驿丞（身份归因错位）；只取协议定义的三字段，不夹带来源帧其它字段。 */
+  const originFrom = { instanceId: frame.from.instanceId, identityName: frame.from.identityName, port: frame.from.port };
   let relayed = 0;
   for (const [instanceId, target] of targets) {
     if (instanceId === state.self.instanceId || instanceId === frame.from.instanceId) {
       continue;
     }
-    const result = sendTo(state, target.collabId, instanceId, { address: target.address, port: target.port }, frame.type, { ...frame.payload, originMsgId: origin });
+    const result = sendTo(state, target.collabId, instanceId, { address: target.address, port: target.port }, frame.type, { ...frame.payload, originMsgId: origin }, { from: originFrom });
     if (result.ok === true) {
       relayed++;
     }
@@ -513,6 +532,7 @@ export function countLiveCollabs(state) {
 /* 席位转移原语（接管生效 / 移交受让共用）：以给定台账承担管理席位——本地记录转管理、
  * 台账落盘（本机成为单一写者）、自身留存并推送当前视图（成员由此学习新驿丞端点）。 */
 export function promoteToManager(state, local, ledger) {
+  syncRosterRoles(ledger);
   local.role = 'manager';
   local.ledger = ledger;
   local.member = managerRecordOf(ledger);
@@ -522,6 +542,18 @@ export function promoteToManager(state, local, ledger) {
   persistMember(state, local);
   persistLedger(state, local);
   pushSnapshot(state, local);
+}
+
+/* 席位变更后的名册角色同步：台账 manager 与 members[].role 恒一致——新任驿丞置 manager、
+ * 其余旧 manager 位回落 member（否则旧驿丞被移交前置按 role 误拒，交回路径永久不可达）。 */
+function syncRosterRoles(ledger) {
+  for (const member of ledger.members) {
+    if (member.instanceId === ledger.manager.instanceId) {
+      member.role = 'manager';
+    } else if (member.role === 'manager') {
+      member.role = 'member';
+    }
+  }
 }
 
 /* 降级为成员（被替换 / 合流让位的落点）：管理席位——以台账定格名单转成员记录、删除本地台账
