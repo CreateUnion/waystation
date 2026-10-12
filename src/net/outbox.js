@@ -1,7 +1,7 @@
 import { collabDir, collabFilePath, ensureDir } from '../paths.js';
 import { ANCHOR_PORT } from '../site.js';
 import { appendLine, loadLines, replaceFile } from '../storage.js';
-import { GOVERNANCE_TYPES } from './protocol.js';
+import { GOVERNANCE_TYPES, isPort } from './protocol.js';
 
 export const OUTBOX_FILE_NAME = 'outbox.jsonl';
 const STATES = ['queued', 'acked', 'session', 'expired'];
@@ -288,11 +288,7 @@ function isPeerShape(peer) {
   if (typeof peer.instanceId !== 'string' || typeof peer.address !== 'string') {
     return false;
   }
-  return peer.port === undefined || isPortNumber(peer.port);
-}
-
-function isPortNumber(value) {
-  return Number.isInteger(value) && value >= 1 && value <= 65535;
+  return peer.port === undefined || isPort(peer.port);
 }
 
 function hasCounterFields(record) {

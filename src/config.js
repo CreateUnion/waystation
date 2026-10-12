@@ -1,7 +1,7 @@
 import { readFileSync, renameSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
-import { MAX_IDENTITY_NAME_CHARS, isIdentityName } from './net/protocol.js';
+import { MAX_IDENTITY_NAME_CHARS, isIdentityName, isPort } from './net/protocol.js';
 import { ANCHOR_PORT, SLOT_COUNT, slotDefaultPort } from './site.js';
 import { CONFIG_FILE_NAME } from './paths.js';
 import { writeJsonAtomic } from './storage.js';
@@ -18,7 +18,7 @@ const FIELD_RULES = {
     check: (value) => isIdentityName(value),
     reason: `需为非空字符串、不超过 ${MAX_IDENTITY_NAME_CHARS} 字符、且不含控制 / 不可见格式 / 行段分隔字符`,
   },
-  port: { check: (value) => Number.isInteger(value) && value >= 1 && value <= 65535, reason: '需为 1–65535 的整数' },
+  port: { check: (value) => isPort(value), reason: '需为 1–65535 的整数' },
   offlineQueue: { check: (value) => typeof value === 'boolean', reason: '需为布尔值' },
   autoDeliver: { check: (value) => typeof value === 'boolean', reason: '需为布尔值' },
   logDir: { check: (value) => typeof value === 'string', reason: '需为字符串' },

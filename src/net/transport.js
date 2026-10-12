@@ -1,5 +1,5 @@
 import net from 'node:net';
-import { MAX_FRAME_BYTES, parseFrame } from './protocol.js';
+import { MAX_FRAME_BYTES, isPort, parseFrame } from './protocol.js';
 
 export const MAX_INBOUND_CONNECTIONS = 64;
 const NEWLINE = 0x0a;
@@ -51,6 +51,12 @@ export function createTransport({ port, bindAddress = '0.0.0.0', log }) {
 }
 
 function listen(state) {
+  if (state.closed) {
+    /* 一次性生命周期（与装配层 components-closed 同口径）：close 即销毁，恢复路径是重建组件——
+     * 关闭后重新绑定会造出「已关闭却在监听」的僵尸面；空操作则让调用方误以为 LAN 已就绪（静默假成功），
+     * 故明确拒绝，异常通道与其余 listen 失败一致（向上抛、由装配侧归类）。 */
+    return Promise.reject(new Error('传输组件已关闭且不可复用（一次性生命周期）：需重建组件后重试（正常恢复路径为重启进程）'));
+  }
   if (state.listening) {
     return Promise.resolve();
   }
@@ -99,7 +105,7 @@ async function close(state) {
 
 function dial(state, { address, port: targetPort, timeoutMs }) {
   const legal = typeof address === 'string' && address !== ''
-    && Number.isInteger(targetPort) && targetPort >= 1 && targetPort <= 65535
+    && isPort(targetPort)
     && Number.isInteger(timeoutMs) && timeoutMs >= 1;
   if (!legal) {
     return Promise.reject(new TypeError('dial 参数非法（address / port / timeoutMs）'));
@@ -167,6 +173,11 @@ function attach(state, socket, countsAsInbound) {
   const connection = createConnection(socket, state.counters);
   if (state.closed) {
     state.counters.closedConnections++;
+    if (countsAsInbound) {
+      /* 守卫路径不会登记 'close' 处理，计数必须在此补回：入站计数在 onInboundSocket 已加，
+       * 漏补会让 activeInbound 永久滞留（入站上限闸门随之慢性失效）。 */
+      state.counters.activeInbound--;
+    }
     socket.destroy();
     return connection;
   }

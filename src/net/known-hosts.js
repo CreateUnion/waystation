@@ -1,6 +1,7 @@
 import { readFileSync, renameSync } from 'node:fs';
 import { isIP } from 'node:net';
 import { join } from 'node:path';
+import { isPort } from './protocol.js';
 import { ANCHOR_PORT } from '../site.js';
 import { writeJsonAtomic } from '../storage.js';
 
@@ -166,10 +167,6 @@ function validateEntry(entry) {
     identityName: boundedText(entry.identityName),
     lastSeenAt,
   };
-}
-
-function isPort(value) {
-  return Number.isInteger(value) && value >= 1 && value <= 65535;
 }
 
 function boundedText(value) {

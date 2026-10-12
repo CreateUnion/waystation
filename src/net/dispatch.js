@@ -116,7 +116,7 @@ function send(state, { collabId, to, type, payload }) {
     state.counters.sendsRejected++;
     return { ok: false, reason: '目标为本机实例，拒绝对自己投递' };
   }
-  if (!Number.isInteger(state.self.port) || state.self.port < 1 || state.self.port > 65535) {
+  if (!isPort(state.self.port)) {
     state.counters.sendsRejected++;
     return { ok: false, reason: 'from.port 非法（1–65535 的整数）：本机站点端口未就位（构造侧必填）' };
   }

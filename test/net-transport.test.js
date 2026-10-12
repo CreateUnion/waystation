@@ -333,3 +333,36 @@ test('close 后完成的拨号：入池即销毁（不给无主连接留活口�
   await waitFor(() => liveSockets.size === 0, { timeoutMs: 3000 });   // 对端观察到即时断开：连接确已被销毁
   connection.close();
 });
+
+test('close 后的入站连接（已关闭守卫路径）：activeInbound 同样归零', { timeout: 15000 }, async (t) => {
+  /* 竞态窗口：连接已被派发到 'connection' 事件、而 close 先落地——onInboundSocket 已加计数，
+   * attach 却走「已关闭」守卫提前返回（不登记 'close' 处理）——守卫路径必须把计数补回。
+   * 拦截 createServer 的监听回调直接驱动该路径：事件循环时序无法稳定复现，手工驱动才是确定性复现。 */
+  const originalCreateServer = net.createServer;
+  let acceptConnection = null;
+  net.createServer = (listener) => {
+    acceptConnection = listener;
+    return originalCreateServer(listener);
+  };
+  t.after(() => {
+    net.createServer = originalCreateServer;
+  });
+  const { transport } = await listenTransport(t, () => {});
+  await transport.close();
+  acceptConnection(new net.Socket());
+  assert.equal(transport.stats().activeInbound, 0, '守卫路径吞掉的计数必须补回');
+  assert.equal(transport.stats().closedConnections, 1);
+});
+
+test('close 后 listen：明确拒绝（一次性生命周期），不造「僵尸监听」', { timeout: 15000 }, async (t) => {
+  const port = await pickFreePort();
+  const transport = createTransport({ port, bindAddress: '127.0.0.1', log: quietLog() });
+  t.after(() => transport.close());   // 防御性收口：修复回退时僵尸监听会挂住整个测试进程（挂起即证据本身）
+  await transport.listen();
+  await transport.close();
+  await assert.rejects(transport.listen(), /已关闭/);
+  assert.equal(transport.stats().listening, false, '拒绝路径不得留下「已监听」状态');
+  const rebind = net.createServer();   // close 的端口释放语义不因拒绝路径回退：新组件仍可绑定
+  await new Promise((resolve) => rebind.listen({ port, host: '127.0.0.1' }, resolve));
+  await new Promise((resolve) => rebind.close(resolve));
+});

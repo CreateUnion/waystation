@@ -1,4 +1,5 @@
 import { isIP } from 'node:net';
+import { isPort } from '../net/protocol.js';
 
 /* ws_ping：可达性探测（TCP 拨入 + ping/pong 往返延迟）。目标端口取自扫描列表（多站点下端口按站点独立，
  * 本机端口不是对端端口）。可达与否都是探测结果（不可达是信息、不是工具错误）；工具错误只留给参数与降级。 */
@@ -19,7 +20,7 @@ export function pingTool() {
       if (address === '' || isIP(address) === 0) {
         return { content: [{ type: 'text', text: '参数 address 非法：需要 IPv4/IPv6 字面量（不做域名解析）' }], isError: true };
       }
-      if (!Number.isInteger(args.port) || args.port < 1 || args.port > 65535) {
+      if (!isPort(args.port)) {
         return { content: [{ type: 'text', text: '参数 port 非法：需要 1–65535 的整数（取自 ws_list_hosts 的端点）' }], isError: true };
       }
       const probed = await context.net.pingHost({ address, port: args.port });

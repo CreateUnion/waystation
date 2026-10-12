@@ -1,6 +1,6 @@
 import { isIP } from 'node:net';
 import { OCCUPIER_PROBE_TIMEOUT_MS } from '../site.js';
-import { PROTOCOL_VERSION, newMsgId } from './protocol.js';
+import { PROTOCOL_VERSION, isPort, newMsgId } from './protocol.js';
 
 /* 组件已被 close 后重试 start 的固定结论：一次性生命周期下重试不可能成功，恢复途径是重建组件（组合根职责） */
 const COMPONENTS_CLOSED = {
@@ -163,7 +163,7 @@ async function pingHost(state, { address, port }) {
   if (typeof address !== 'string' || isIP(address) === 0) {
     return { ok: false, message: '地址非法：需要 IPv4/IPv6 字面量（不做域名解析）' };
   }
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+  if (!isPort(port)) {
     return { ok: false, message: '端口非法：需要 1–65535 的整数（端口来源以扫描列表为准）' };
   }
   try {
