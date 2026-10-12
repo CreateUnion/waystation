@@ -16,6 +16,7 @@
 - 静态检查：`npm run lint`（ESLint）、`npm run typecheck`（tsc checkJs）
 - 提交前门禁：`npm run gate`（lint + typecheck + 覆盖率阈值）
 - 手工启动（开发调试）：`node src/index.js`——以 stdio 服务 MCP 客户端；直接在终端启动时无输出属正常（stdout 是协议通道）
+- 数据目录与多站点：默认 `~/.waystation/`；同一台机器开多个终端时自动取槽位——槽位 1 = 主目录（端口 7321），槽位 k≥2 = `<主目录>/sites/<k>/`（端口 7321 + k - 1）；需要固定目录或跨会话固定身份时，各终端分别以 `WAYSTATION_HOME` 指向独立数据目录（该模式为单站点、不参与槽位分配）
 
 ## 安全模型（待 M6 完整披露）
 
