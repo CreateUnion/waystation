@@ -1,0 +1,38 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { COLLABS_DIR_NAME, LOGS_DIR_NAME, resolveDataDir, resolveLogDir, ensureDir } from '../src/paths.js';
+import { makeTempDir } from './helpers.js';
+
+test('resolveDataDir：无环境变量时默认 ~/.waystation', () => {
+  assert.equal(resolveDataDir({}), join(homedir(), '.waystation'));
+  assert.equal(resolveDataDir({ WAYSTATION_HOME: '   ' }), join(homedir(), '.waystation'));
+});
+
+test('resolveDataDir：WAYSTATION_HOME 优先且完成规范化', () => {
+  assert.equal(resolveDataDir({ WAYSTATION_HOME: 'ws-data' }), resolve('ws-data'));
+  assert.equal(resolveDataDir({ WAYSTATION_HOME: '  ws-data  ' }), resolve('ws-data'));
+});
+
+test('resolveLogDir：默认 <dataDir>/logs，相对配置值以 dataDir 为锚（不随 CWD 漂移）', () => {
+  const dataDir = resolve('data-home');
+  assert.equal(resolveLogDir(dataDir, ''), join(dataDir, LOGS_DIR_NAME));
+  assert.equal(resolveLogDir(dataDir, undefined), join(dataDir, LOGS_DIR_NAME));
+  assert.equal(resolveLogDir(dataDir, 'my-logs'), join(dataDir, 'my-logs'));
+  const absolute = resolve('absolute-logs');
+  assert.equal(resolveLogDir(dataDir, absolute), absolute);
+});
+
+test('ensureDir：递归创建且幂等', (t) => {
+  const nested = join(makeTempDir(t), 'a', 'b', 'c');
+  ensureDir(nested);
+  assert.equal(statSync(nested).isDirectory(), true);
+  ensureDir(nested);
+  assert.equal(statSync(nested).isDirectory(), true);
+});
+
+test('目录名常量：collabs 为每协作目录的父级（设计 §15）', () => {
+  assert.equal(COLLABS_DIR_NAME, 'collabs');
+});
