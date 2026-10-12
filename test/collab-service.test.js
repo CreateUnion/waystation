@@ -161,7 +161,8 @@ test('create 参数拒绝：非法名 / 主题 / 目标形态（不发帧、不�
     assert.equal(result.ok, false, JSON.stringify(input).slice(0, 60));
   }
   assert.equal(sent.length, 0);
-  assert.equal(existsSync(join(dir, COLLABS_DIR_NAME, 'collab-1')), false);
+  const collabsDir = join(dir, COLLABS_DIR_NAME);
+  assert.deepEqual(existsSync(collabsDir) ? readdirSync(collabsDir) : [], [], '拒绝路径不落任何协作目录');
 });
 
 test('create：台账 v1 与成员记录落盘、invite 帧逐目标发出、目标记入清单', (t) => {
@@ -227,6 +228,19 @@ test('invite 到达：成员记录建立（proposed / decision null / 有效期�
   assert.ok(remembered.some((entry) => entry.instanceId === 'inst-a' && entry.address === '127.0.0.1'));
   const approved = await service.approve({ collabId: 'collab-9', approve: true });
   assert.equal(approved.ok, true);
+});
+
+test('邀请过期仅标注：状态与决策不变、过期后仍可回应', async (t) => {
+  const { service, sent } = makeService(t, { config: { inviteTtlMs: 1 } });
+  await receive(service, inviteFrame({ collabId: 'collab-exp' }));
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const entry = service.list().collabs[0];
+  assert.equal(entry.expired, true, '超过注入的有效期即标注过期');
+  assert.equal(entry.state, 'proposed', '过期不改状态（过期不算拒绝）');
+  assert.equal(entry.decision, null);
+  const approved = await service.approve({ collabId: 'collab-exp', approve: true });
+  assert.equal(approved.ok, true, '过期后仍可回应（只标注、不拦截）');
+  assert.equal(sentOf(sent, 'approve', 'collab-exp').length, 1);
 });
 
 test('invite：来源为本机 / 名单不含本机 / 来源不在名单 → admit 拒绝、不建记录', async (t) => {
@@ -350,6 +364,26 @@ test('全部 decline：保持提议中、不发建立通告（可整条撤回）
   assert.equal(sentOf(sent, 'notice', collabId).filter((frame) => frame.payload.event === 'established').length, 0);
 });
 
+test('同意门迟到守卫：已撤回 / 已回应的成员不被迟到回应翻转', async (t) => {
+  const withdrawn = managerWithTwoInvites(t);
+  await withdrawn.service.withdraw({ collabId: withdrawn.collabId, target: 'inst-b' });
+  const atWithdrawn = withdrawn.service.list().collabs[0].version;
+  await receive(withdrawn.service, collabFrame('approve', withdrawn.collabId, peer('inst-b', '主机乙'), {}));
+  assert.equal(withdrawn.service.list().collabs[0].version, atWithdrawn, '迟到同意零台账变更');
+  const afterWithdraw = (await withdrawn.service.view({ collabId: withdrawn.collabId })).ledger;
+  assert.equal(afterWithdraw.members.find((entry) => entry.instanceId === 'inst-b').state, 'withdrawn', '已撤回成员不被迟到同意翻转');
+  assert.equal(withdrawn.service.stats().eventMismatch, 1);
+
+  const decided = managerWithTwoInvites(t);
+  await receive(decided.service, collabFrame('approve', decided.collabId, peer('inst-b', '主机乙'), {}));
+  const atApproved = decided.service.list().collabs[0].version;
+  await receive(decided.service, collabFrame('decline', decided.collabId, peer('inst-b', '主机乙'), { reason: '改口' }));
+  assert.equal(decided.service.list().collabs[0].version, atApproved, '迟到拒绝零台账变更');
+  const afterDecline = (await decided.service.view({ collabId: decided.collabId })).ledger;
+  assert.equal(afterDecline.members.find((entry) => entry.instanceId === 'inst-b').state, 'approved', '已同意成员不被迟到拒绝翻转');
+  assert.equal(decided.service.stats().eventMismatch, 1);
+});
+
 /* —— 冲突检测与冻结 —— */
 
 async function activeTwoMemberCollab(t, service, { collabId = 'collab-x' } = {}) {
@@ -414,9 +448,12 @@ test('freeze 接收：匹配 → 冻结 + 转达（originMsgId 承载防环）�
   assert.equal(admitted.ok, true);
   assert.equal(service.list().collabs.find((entry) => entry.collabId === held).state, 'frozen');
   const relays = sent.filter((entry) => entry.type === 'freeze');
-  assert.equal(relays.length >= 1, true, '转达给匹配协作的其他端点');
+  assert.equal(relays.length, 1, '转达给匹配协作的其他端点（除本机与来源，逐目标一帧）');
   assert.equal(relays[0].payload.originMsgId, freeze.msgId);
-  assert.notEqual(relays[0].msgId, freeze.msgId, '转达为独立入队（队列条目以 msgId 为唯一键）');
+  assert.notEqual(relays[0].payload, freeze.payload, '转达载荷为独立副本（独立入队）');
+  assert.equal(relays[0].collabId, held, '转达归属被匹配的本地协作');
+  assert.equal(service.stats().freezeRelayed, 1);
+  assert.equal(service.stats().freezeApplied, 1);
   const before = sent.length;
   await receive(service, { ...freeze, msgId: 'msg-copy-1', payload: { ...freeze.payload, originMsgId: freeze.msgId } });
   assert.equal(sent.length, before, '同 originMsgId 的重复副本不再转达（本地冻结幂等仍生效）');
@@ -438,10 +475,20 @@ test('冻结期写拒绝：协作类消息与 send 均拒、白名单（snapshot
   const write = await receive(service, collabFrame('reply', held, peer('inst-a', '主机甲'), { text: '冻结期消息' }));
   assert.equal(write.ok, false);
   assert.ok(write.reason.includes('冻结'));
+  for (const type of ['topic', 'progress']) {
+    const rejected = await service.hooks.admit(collabFrame(type, held, peer('inst-a', '主机甲'), { text: '冻结期消息' }), { remoteAddress: '127.0.0.1' });
+    assert.equal(rejected.ok, false, `冻结期 ${type} 拒绝`);
+    assert.ok(rejected.reason.includes('冻结'));
+  }
+  assert.equal(service.stats().rejectedFrozen, 3, '被冻结拒绝的协作类消息逐条计数');
   const send = await service.send({ collabId: held, text: '冻结期外发', type: 'reply' });
   assert.equal(send.ok, false);
   const snapshot = await receive(service, collabFrame('snapshot', held, peer('inst-a', '主机甲'), { kind: 'request' }));
   assert.equal(snapshot.ok, true);
+  for (const type of ['notice', 'leave', 'end']) {
+    const allowed = await service.hooks.admit(collabFrame(type, held, peer('inst-a', '主机甲'), {}), { remoteAddress: '127.0.0.1' });
+    assert.equal(allowed.ok, true, `冻结期 ${type} 放行`);
+  }
 });
 
 /* —— 撤回 / 结束 / 退出 —— */
@@ -451,6 +498,10 @@ test('withdraw：single 单条撤回；已回应 / 未知目标 / 成员侧拒�
   const single = await service.withdraw({ collabId, target: 'inst-b' });
   assert.equal(single.ok, true);
   assert.deepEqual(sentOf(sent, 'withdraw', collabId).map((frame) => frame.payload.scope), ['single']);
+  const invalidTarget = await service.withdraw({ collabId, target: 42 });
+  assert.equal(invalidTarget.ok, false, '已提供但非法的 target：明确拒绝');
+  assert.equal(service.list().collabs[0].state, 'proposed', '非法 target 不静默归并整条撤回');
+  assert.deepEqual(sentOf(sent, 'withdraw', collabId).map((frame) => frame.payload.scope), ['single'], '非法 target 不发帧');
   await receive(service, collabFrame('approve', collabId, peer('inst-c', '主机丙'), {}));
   const responded = await service.withdraw({ collabId, target: 'inst-c' });
   assert.equal(responded.ok, false, '已回应的成员不可撤回');
@@ -572,6 +623,24 @@ test('快照接收：digest 校验通过即存储 + 回执；篡改 / 版本倒�
   assert.equal(service.stats().snapshotStale, 1);
 });
 
+test('快照接收：形态与交叉一致性校验（形态非法 / 版本灌高 / collabId 不符 → 拒绝计数）', async (t) => {
+  const { service, sent } = makeService(t);
+  const held = await activeTwoMemberCollab(t, service);
+  /* 形态非法（看板条目缺 text）：digest 自洽也不得进入内存 / 落盘（形态是接收侧第一关）。 */
+  const misshapen = ledgerStub(held, 6);
+  misshapen.board = [{ entryId: 'entry-1', ts: new Date().toISOString(), from: { instanceId: 'inst-a', identityName: '主机甲' }, kind: 'progress' }];
+  await receive(service, collabFrame('snapshot', held, peer('inst-a', '主机甲'), { kind: 'data', version: 6, digest: ledgerDigest(misshapen), ledger: misshapen }));
+  assert.equal(service.stats().snapshotCorrupt, 1);
+  /* 版本灌高：version 字段与内嵌台账不一致 → 拒绝（防伪造高版本把后续正常快照全部按倒退丢弃）。 */
+  await receive(service, collabFrame('snapshot', held, peer('inst-a', '主机甲'), { kind: 'data', version: 999, digest: ledgerDigest(ledgerStub(held, 5)), ledger: ledgerStub(held, 5) }));
+  assert.equal(service.stats().snapshotCorrupt, 2);
+  /* collabId 不符：内嵌台账属于别的协作 → 拒绝。 */
+  await receive(service, collabFrame('snapshot', held, peer('inst-a', '主机甲'), { kind: 'data', version: 5, digest: ledgerDigest(ledgerStub('collab-other', 5)), ledger: ledgerStub('collab-other', 5) }));
+  assert.equal(service.stats().snapshotCorrupt, 3);
+  assert.equal(service.stats().snapshotStored, 0, '三例均不得入存储');
+  assert.equal(sentOf(sent, 'notice', held).some((frame) => frame.payload.event === 'snapshot-stored'), false, '拒绝路径无回执');
+});
+
 test('快照载荷冻结：同批次两次变更的两帧 digest 各自自洽（活引用分叉的回归）', async (t) => {
   const { service, sent, collabId } = managerWithTwoInvites(t);
   await receive(service, collabFrame('approve', collabId, peer('inst-b', '主机乙'), {}));
@@ -582,6 +651,23 @@ test('快照载荷冻结：同批次两次变更的两帧 digest 各自自洽（
     assert.equal(ledgerDigest(frame.payload.ledger), frame.payload.digest, `v${frame.payload.version} 帧摘要与内容自洽`);
     assert.equal(frame.payload.ledger.version, frame.payload.version);
   }
+});
+
+test('快照应答载荷冻结：入队后台账再变更，帧摘要自洽且接收侧零「摘要不符」', async (t) => {
+  const manager = managerWithTwoInvites(t);
+  const member = makeService(t);
+  await receive(member.service, inviteFrame({ collabId: manager.collabId, manager: peer('inst-a', '主机甲'), members: [peer('inst-a', '主机甲'), peer('inst-self', '本机', 17321)] }));
+  await receive(manager.service, collabFrame('snapshot', manager.collabId, peer('inst-b', '主机乙'), { kind: 'request' }));
+  const answers = sentOf(manager.sent, 'snapshot', manager.collabId).filter((frame) => frame.payload.kind === 'data');
+  assert.equal(answers.length, 1, '请求应答一帧');
+  /* 假发送按引用留存捕获（同真实队列「入队之后才序列化」的活引用面）：回执前台账再变更一次。 */
+  await receive(manager.service, collabFrame('topic', manager.collabId, peer('inst-b', '主机乙'), { text: '主题更新' }));
+  assert.equal(manager.service.list().collabs[0].version, 2, '应答之后台账确已变更');
+  assert.equal(ledgerDigest(answers[0].payload.ledger), answers[0].payload.digest, '应答帧摘要与内容自洽（载荷已冻结）');
+  assert.equal(answers[0].payload.ledger.version, answers[0].payload.version);
+  await receive(member.service, collabFrame('snapshot', manager.collabId, peer('inst-a', '主机甲'), answers[0].payload));
+  assert.equal(member.service.stats().snapshotCorrupt, 0, '接收侧零「快照摘要不符」');
+  assert.equal(member.service.stats().snapshotStored, 1);
 });
 
 test('文本预校验：越界 topic 拒绝且本地台账零变更；stop / 拒绝原因同判据', async (t) => {

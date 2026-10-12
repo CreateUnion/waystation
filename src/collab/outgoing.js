@@ -99,8 +99,16 @@ export function withdrawInvite(state, { collabId, target }) {
     const hint = local.ledger.status === 'active' ? '协作已建立——结束请用 ws_end_collab' : '当前状态不可撤回';
     return { ok: false, message: hint };
   }
-  const targetId = typeof target === 'string' && target.trim() !== '' ? target.trim() : null;
-  return targetId === null ? withdrawAll(state, local) : withdrawOne(state, local, targetId);
+  /* 省略 target = 整条撤回；「已提供但非法」明确拒绝——不得静默归并到最具破坏性的整条撤回路径
+   * （服务会被夹具直调，形态把关不能只靠工具层）。 */
+  if (target === undefined || target === null) {
+    return withdrawAll(state, local);
+  }
+  const targetId = typeof target === 'string' ? target.trim() : '';
+  if (!ID_PATTERN.test(targetId)) {
+    return { ok: false, message: 'target 非法（1–64 位字母数字与连字符的实例标识）——整条撤回请省略 target' };
+  }
+  return withdrawOne(state, local, targetId);
 }
 
 export function sendMessage(state, { collabId, text, type, to }) {

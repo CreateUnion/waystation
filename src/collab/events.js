@@ -1,5 +1,5 @@
 import { isPort } from '../net/protocol.js';
-import { MAX_BOARD_ENTRIES } from './model.js';
+import { MAX_BOARD_ENTRIES, isSnapshotShape } from './model.js';
 import { ledgerDigest } from './store.js';
 import { isLocalArchivedState, persistMember, persistSnapshot, rememberKnownHost } from './local.js';
 import { matchConflictCollabs } from './gate.js';
@@ -148,6 +148,11 @@ function applyInviteResponse(state, frame, wanted) {
     return;
   }
   if (member.state === wanted) {
+    return;
+  }
+  if (member.state !== 'invited') {
+    state.counters.eventMismatch++;
+    state.log.warn('回应与既有终局不符（忽略——已撤回 / 已回应的成员不得被翻转）', { collabId: frame.collabId, from: frame.from.instanceId, state: member.state });
     return;
   }
   mutateLedger(state, local, () => {
@@ -342,34 +347,47 @@ function handleSnapshot(state, frame) {
   storeSnapshot(state, frame);
 }
 
-/* 快照接收（定案 4）：digest 重算 → 版本不倒退 → 落盘 + 回执 + 唤醒等待中的 view。 */
+/* 快照接收（定案 4）：形态 → 自洽（version ↔ 内嵌台账、collabId ↔ 帧 collabId）→ digest 重算 →
+ * 版本不倒退 → 落盘 + 回执 + 唤醒等待中的 view。摘要由发送方自算、对能对上 collabId 的参与者
+ * 不构成防伪——形态与交叉一致性是接收侧独立的一关（形态判据与本地快照文件同一权威）；
+ * 任一前置校验不过按摘要不符同一口径计数丢弃。 */
 function storeSnapshot(state, frame) {
   const local = state.collabs.get(frame.collabId);
   if (local === undefined) {
     state.counters.snapshotCorrupt++;
     return;
   }
-  const payload = frame.payload;
-  if (ledgerDigest(payload.ledger) !== payload.digest) {
+  const record = snapshotRecordOf(frame, frame.payload);
+  if (!isSnapshotShape(record) || record.version !== record.ledger.version || record.ledger.collabId !== frame.collabId) {
     state.counters.snapshotCorrupt++;
-    state.log.warn('快照摘要不符（已忽略）', { collabId: frame.collabId, version: payload.version });
+    state.log.warn('快照载荷不合形态或与帧不自洽（已忽略）', { collabId: frame.collabId, version: record.version });
     return;
   }
-  if (local.snapshot !== null && payload.version < local.snapshot.version) {
+  if (ledgerDigest(record.ledger) !== record.digest) {
+    state.counters.snapshotCorrupt++;
+    state.log.warn('快照摘要不符（已忽略）', { collabId: frame.collabId, version: record.version });
+    return;
+  }
+  if (local.snapshot !== null && record.version < local.snapshot.version) {
     state.counters.snapshotStale++;
     return;
   }
-  local.snapshot = {
-    version: payload.version,
-    digest: payload.digest,
-    receivedAt: new Date().toISOString(),
-    from: { instanceId: frame.from.instanceId, identityName: frame.from.identityName },
-    ledger: payload.ledger,
-  };
+  local.snapshot = record;
   persistSnapshot(state, local);
   state.counters.snapshotStored++;
   sendSnapshotReceipt(state, local, frame);
   resolvePendingView(state, local.collabId, local.snapshot);
+}
+
+/* 接收记录成形：与本地快照文件同一形态（同一份数据在接收侧与加载侧过同一校验）。 */
+function snapshotRecordOf(frame, payload) {
+  return {
+    version: payload?.version,
+    digest: payload?.digest,
+    receivedAt: new Date().toISOString(),
+    from: { instanceId: frame.from.instanceId, identityName: frame.from.identityName },
+    ledger: payload?.ledger,
+  };
 }
 
 /* 快照回执（「先确认后删除」的确认面，治理移交消费它）：发给快照来源；失败只计数。 */
@@ -394,7 +412,9 @@ function resolvePendingView(state, collabId, snapshot) {
   pending.resolve(snapshot);
 }
 
-/* 快照请求应答：管理席位把当前台账整份回给请求方（端点取请求帧来源；成员侧忽略）。 */
+/* 快照请求应答：管理席位把当前台账整份回给请求方（端点取请求帧来源；成员侧忽略）。
+ * 载荷冻结：入队的是台账副本——活引用在「应答入队与上线序列化」的间隙会被后续变更改写，
+ * 帧将以「摘要不符」被对端丢弃（与快照推送同一纪律）。 */
 function answerSnapshotRequest(state, frame) {
   const local = state.collabs.get(frame.collabId);
   if (local === undefined || local.role !== 'manager') {
@@ -405,7 +425,8 @@ function answerSnapshotRequest(state, frame) {
     state.counters.snapshotSkipped++;
     return;
   }
-  sendTo(state, local.collabId, frame.from.instanceId, endpoint, 'snapshot', { kind: 'data', version: local.ledger.version, digest: ledgerDigest(local.ledger), ledger: local.ledger });
+  const frozen = structuredClone(local.ledger);
+  sendTo(state, local.collabId, frame.from.instanceId, endpoint, 'snapshot', { kind: 'data', version: frozen.version, digest: ledgerDigest(frozen), ledger: frozen });
   state.counters.snapshotSent++;
 }
 
