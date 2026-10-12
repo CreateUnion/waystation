@@ -267,6 +267,28 @@ test('重启续投：重开调度器后未完成条目继续投递（队列与�
   assert.equal(transport.connections[0].frames[0].msgId, sent.msgId);
 });
 
+test('deliveryStatus 惰性载入：未 start 也能查到落盘的历史队列（只加载、不调度）', { timeout: 15000 }, async (t) => {
+  const dataDir = makeTempDir(t);
+  const self = { instanceId: 'inst-self', identityName: '本机' };
+  const log = { info: () => {}, warn: () => {}, error: () => {} };
+  const writer = createDispatch({ dataDir, config: testConfig(), transport: createFakeTransport(), self, log });
+  const sent = writer.send(target());
+  assert.equal(sent.ok, true, '未 start 也受理入队（离线排队语义）');
+  const transport = createFakeTransport();
+  const reader = createDispatch({ dataDir, config: testConfig(), transport, self, log });
+  t.after(() => reader.stop());
+  const first = reader.deliveryStatus({ msgId: sent.msgId });   // 未 start 直接查询
+  assert.equal(first.length, 1, '落盘的历史队列必须在查询时可见（降级态不丢可见性）');
+  assert.equal(first[0].tier, 'queued');
+  assert.equal(reader.deliveryStatus({ msgId: sent.msgId }).length, 1, '重复查询幂等（不重复载入、不重复计行）');
+  await new Promise((resolve) => setTimeout(resolve, 80));   // 数个 tick 的窗口：查询若启动了调度即会在此拨号
+  assert.equal(transport.dials.length, 0, '查询不得启动调度（无 tick、无拨号）');
+  assert.equal(transport.connections.length, 0);
+  reader.start();   // start 后行为不变：未完成条目照常续投
+  await waitFor(() => transport.connections.length >= 1 && transport.connections[0].frames.length === 1);
+  assert.equal(transport.connections[0].frames[0].msgId, sent.msgId);
+});
+
 test('过期：超保留期的未完成条目在调度中被标记 expired 并告警（提示发送方）', { timeout: 15000 }, async (t) => {
   const transport = createFakeTransport();
   transport.setNextDialFails(true);
@@ -368,6 +390,26 @@ test('stop 与 ping 在途拨号并发：探测中止、不发探测帧、连接
   assert.equal(transport.connections[0].closed, true);
 });
 
+test('stop 与拨号失败并发：停止期间的拨号失败不计尝试、不计投递失败（与成功拨号对称）', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const { dispatch } = makeDispatch(t, { transport });
+  t.after(() => dispatch.stop());
+  const sent = dispatch.send(target());
+  let failDial = null;
+  transport.dial = () => new Promise((resolve, reject) => {
+    failDial = () => reject(Object.assign(new Error('连接被拒'), { code: 'ECONNREFUSED' }));
+  });
+  dispatch.start();
+  await waitFor(() => failDial !== null);
+  const stopping = dispatch.stop();   // 停止时拨号仍在途
+  failDial();                          // 停止之后拨号才失败
+  await stopping;
+  const row = dispatch.deliveryStatus({ msgId: sent.msgId })[0];
+  assert.equal(row.tier, 'queued');
+  assert.equal(row.attempts, 0, '停止期间的拨号失败不得计尝试');
+  assert.equal(dispatch.stats().deliveryFailures, 0, '停止期间的拨号失败不得计入投递失败');
+});
+
 test('send 校验 payload：非对象 / 超体积 / 无法序列化一律拒绝且不入队', { timeout: 15000 }, async (t) => {
   const transport = createFakeTransport();
   const { dispatch } = makeDispatch(t, { transport });
@@ -385,6 +427,18 @@ test('send 校验 payload：非对象 / 超体积 / 无法序列化一律拒绝�
   assert.equal(unserializable.ok, false);
   assert.ok(unserializable.reason.includes('序列化'));
   assert.equal(dispatch.deliveryStatus({}).length, 0, '拒绝不产生任何队列条目');
+});
+
+test('send 校验 payload：toJSON 序列化后变标量同样拒绝（预检以上线形态为准）', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const { dispatch } = makeDispatch(t, { transport });
+  const sneaky = { toJSON: () => 'x' };
+  const rejected = dispatch.send(target({ payload: sneaky }));
+  assert.equal(rejected.ok, false, 'toJSON 会把上线载荷改写成标量：受理即造出必被对端拒收的队头');
+  assert.ok(rejected.reason.includes('payload'));
+  assert.equal(dispatch.deliveryStatus({}).length, 0, '拒绝不产生队列条目');
+  const reshaped = { toJSON: () => ({ text: '重写' }) };
+  assert.equal(dispatch.send(target({ payload: reshaped })).ok, true, '序列化后仍是 plain object：上线形态合法，照常受理');
 });
 
 test('投递 await 期间条目被 ack：不发帧、不计尝试（复查条目状态）', { timeout: 15000 }, async (t) => {

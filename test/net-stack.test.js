@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createDispatch } from '../src/net/dispatch.js';
 import { createNetStack } from '../src/net/stack.js';
+import { makeTempDir } from './helpers.js';
 
 const SELF = { instanceId: 'inst-self', identityName: '本机' };
 
@@ -237,6 +239,43 @@ test('降级行为：LAN 工具返回明确错误文本；send 仍受理；deliv
   assert.ok(!dispatch.calls.includes('start'), '降级时调度器不启动（不对外投递）');
 });
 
+test('降级态：deliveryStatus 惰性载入历史队列（未 start 也能查；查询不触发调度）', { timeout: 15000 }, async (t) => {
+  const dataDir = makeTempDir(t);
+  const config = { port: 17321, dispatchTickMs: 20, dialTimeoutMs: 100, retryIntervalMs: 60, retrySlowIntervalMs: 120, retryFastCount: 2, queueMaxPerCollab: 100, messageTtlMs: 600000 };
+  const log = { info: () => {}, warn: () => {}, error: () => {} };
+  const writer = createDispatch({ dataDir, config, transport: createFakeTransport(), self: SELF, log });
+  const sent = writer.send({ collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2' }, type: 'notice', payload: { text: '离线排队' } });
+  assert.equal(sent.ok, true, '写入方未 start 也受理入队（离线排队语义）');
+  const discovery = createFakeDiscovery({
+    start: async () => {
+      throw Object.assign(new Error('address in use'), { code: 'EADDRINUSE' });
+    },
+  });
+  const dials = [];
+  const transport = createFakeTransport({
+    dial: async ({ address, port }) => {
+      dials.push({ address, port });
+      throw Object.assign(new Error('连接被拒'), { code: 'ECONNREFUSED' });
+    },
+  });
+  const dispatch = createDispatch({ dataDir, config, transport, self: SELF, log });
+  const { stack } = makeStack(t, { discovery, transport, dispatch });
+  const idle = stack.deliveryStatus({ msgId: sent.msgId });
+  assert.equal(idle.length, 1, 'stack.start 都没调过也能看到落盘的历史队列');
+  const bind = await stack.start();   // 绑定失败 → 降级分支：dispatch 始终未 start
+  assert.equal(bind.ok, false);
+  assert.equal(bind.reason, 'port-taken');
+  const dialsAfterStart = dials.length;   // 开始时占用探测拨过一次；此后不应再有拨号
+  const rows = stack.deliveryStatus({ msgId: sent.msgId });
+  assert.equal(rows.length, 1, '降级态（调度器未启动）deliveryStatus 仍可见历史队列');
+  assert.equal(rows[0].tier, 'queued');
+  await new Promise((resolve) => setTimeout(resolve, 80));   // 数个 tick 的窗口
+  assert.equal(dials.length, dialsAfterStart, '查询不得触发调度（无拨号）');
+  assert.equal(stack.status().counters.dispatch.deliveryFailures, 0, '查询不得产生投递副作用');
+  assert.equal(stack.status().counters.dispatch.attempts, 0);
+  t.after(() => stack.close());
+});
+
 test('pingHost：地址非法 → 明确错误；可用时透传探测结果', { timeout: 15000 }, async (t) => {
   const { stack } = makeStack(t);
   await stack.start();
@@ -285,6 +324,28 @@ test('close：四组件关闭；组件抛错不阻断其余（幂等）', { time
   await stack.close();
   await stack.close();
   assert.ok(dispatch.calls.includes('stop'));
+  assert.ok(inbound.calls.includes('stop'));
+  assert.ok(transport.calls.includes('close'));
+});
+
+test('close：等待 dispatch.stop() 落地后再关闭其余组件（拨号收口）', { timeout: 15000 }, async (t) => {
+  let releaseStop = null;
+  const dispatch = createFakeDispatch({
+    stop: () => new Promise((resolve) => {
+      releaseStop = resolve;
+    }),
+  });
+  const transport = createFakeTransport();
+  const inbound = createFakeInbound();
+  const { stack } = makeStack(t, { dispatch, transport, inbound });
+  await stack.start();
+  const closing = stack.close();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(typeof releaseStop, 'function', 'stop 已被调用');
+  assert.ok(!inbound.calls.includes('stop'), 'stop 未落地前不得继续关闭其余组件');
+  assert.ok(!transport.calls.includes('close'));
+  releaseStop();
+  await closing;
   assert.ok(inbound.calls.includes('stop'));
   assert.ok(transport.calls.includes('close'));
 });

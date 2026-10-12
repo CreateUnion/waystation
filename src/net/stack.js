@@ -101,7 +101,7 @@ async function tearDownWiring(state, error) {
 
 async function close(state) {
   try {
-    state.dispatch.stop();
+    await state.dispatch.stop();   // stop 返回 promise：等到在途拨号收口落地后再关闭其余组件
   } catch (error) {
     state.log.error('调度停止异常（继续关闭其余组件）', { reason: error.message });
   }

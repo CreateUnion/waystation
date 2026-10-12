@@ -11,6 +11,8 @@ import { createOutbox } from './outbox.js';
  * 半开连接检测：重试必重拨（旧连接关闭）——应用层 ack 与超时是唯一判据（设计 §5/§10）。
  * 拨号连接上的回程帧（ack / pong / 投递回报）统一经 setClientFrameRouter 注入的路由器转交接收管线
  * （生产路径由装配层注入 inbound.onFrame）；未接线时帧计数丢弃。
+ * deliveryStatus 查询按需惰性载入协作目录（幂等）：未 start 的降级态也能看到落盘的历史队列——
+ * 查询只加载，不启 tick、不调度。
  * stop() 是发送截止点：停止后醒来的在途投递一律不发帧，在途拨号完成即关（连同探测在内一并收口）；
  * stop() 返回的 promise 在在途拨号全部落地后 resolve——resolve 即无无主连接。
  * 一切异常（拨号失败、写失败、调度循环内任何错误）都被捕获记录，绝不退出进程（健壮性硬性要求）。 */
@@ -134,16 +136,19 @@ function send(state, { collabId, to, type, payload }) {
 /* payload 预检（受理面）：形态与体积都以对端入站校验为准——非 plain object 的载荷会被对端按
  * 「payload 须为 JSON 对象」拒收；体积超限的帧会被对端直接销毁，重试多少次都是同一结果。
  * 这类条目恒为队头（headFor 只取最老 queued），后条永不发送：普通条目阻塞至过期，
- * 治理类条目豁免过期则把单元永久钉死。体积按「整帧序列化字节数」计——与 transport 的入站检查
- * 同一口径（载荷是唯一无界字段，但信封同样计入），保证本端受理的帧对端一定收得下。 */
+ * 治理类条目豁免过期则把单元永久钉死。形态与体积都按「序列化上线后的实际形态」计——
+ * toJSON 之类的序列化钩子会改写上线载荷，只查原对象形态会被绕过（如 toJSON 返回标量的对象）；
+ * 体积按整帧序列化字节数计，与 transport 的入站检查同一口径，保证本端受理的帧对端一定收得下。 */
 function payloadRejectionOf(frame) {
-  if (frame.payload !== undefined && !isPlainObject(frame.payload)) {
-    return 'payload 须为 JSON 对象（协议信封规则）：数组 / 字符串 / 数字 / null 会被对端拒收，本条永不送达';
-  }
   try {
-    const bytes = Buffer.byteLength(JSON.stringify(frame));
+    const line = JSON.stringify(frame);
+    const bytes = Buffer.byteLength(line);
     if (bytes > MAX_FRAME_BYTES) {
       return `帧体积 ${bytes} 字节超协议上限 ${MAX_FRAME_BYTES} 字节：对端会拒收并断开连接，本条永不送达`;
+    }
+    const wire = JSON.parse(line);   // 上限内才解析，解析不会失败；上线形态（toJSON 已生效）与对端实际收到的形态一致
+    if (wire.payload !== undefined && !isPlainObject(wire.payload)) {
+      return 'payload 须为 JSON 对象（协议信封规则）：序列化后为数组 / 字符串 / 数字 / null 的载荷会被对端拒收，本条永不送达';
     }
   } catch (error) {
     return `payload 无法序列化（${error.message}）：落盘与对端都无法处理，本条永不送达`;
@@ -238,7 +243,7 @@ async function ping(state, { address, port }) {
   try {
     connection = await dialPeer(state, { address, port, timeoutMs: state.config.dialTimeoutMs });
     if (connection === null) {
-      return { reachable: false, reason: '探测中止：调度器已停止（拨号完成即关，不发探测帧）' };
+      return { reachable: false, reason: '探测中止：调度器已停止（不发探测帧）' };
     }
     adopt(state, connection);
     const outcome = new Promise((resolve) => {
@@ -270,6 +275,7 @@ async function ping(state, { address, port }) {
 }
 
 function deliveryStatus(state, query = {}) {
+  ensureLoadedCollabs(state);   // 查询路径惰性载入（幂等）：未 start 也能看到落盘的历史队列；只加载，不启 tick、不调度
   const { msgId, collabId } = query;
   const rows = [];
   for (const [id, outbox] of state.outboxes) {
@@ -385,9 +391,11 @@ async function obtainConnection(state, key, collabId, entry) {
   return connection;
 }
 
-/* 拨号统一出口：在途拨号登记进 pendingDials，stop 之后完成的一律就地关闭并返回 null——
- * 每个拨号 socket 都有确定的有界清理路径（不留无主连接），发送截止点也随之成立：
- * 停止后完成的拨号走不到「登记 + 发帧」。调用方对 null 的约定是「不发帧、不计尝试」。 */
+/* 拨号统一出口：在途拨号登记进 pendingDials，stop 之后完成的一律按「中止」处理并返回 null——
+ * 成功的就地关闭（每个拨号 socket 都有确定的有界清理路径，不留无主连接），失败的不算投递失败
+ * （与「成功拨号不计尝试」对称：stop 是截止点，其后的拨号结果不再有投递语义）。
+ * 发送截止点也随之成立：停止后完成的拨号走不到「登记 + 发帧」。
+ * 调用方对 null 的约定是「不发帧、不计尝试」。 */
 async function dialPeer(state, options) {
   const pending = state.transport.dial(options);
   state.pendingDials.add(pending);
@@ -398,6 +406,11 @@ async function dialPeer(state, options) {
       return null;
     }
     return connection;
+  } catch (error) {
+    if (state.stopped) {
+      return null;   // 停止期间的拨号失败：无连接可留、不计尝试与失败计数（对称于成功路径的就地关闭）
+    }
+    throw error;
   } finally {
     state.pendingDials.delete(pending);
   }
