@@ -61,6 +61,8 @@ function loadFromDisk(state) {
     }
     state.hosts.set(checked.address, checked);
   }
+  // 载入同样受上限约束：超限文件（手改/旧版本残留）在起步时即按最近时间收敛，与 remember 同一淘汰口径
+  evictOverflow(state);
 }
 
 /* 损坏文件保留 .corrupt- 副本后按空清单起步：副本是排查依据，避免「静默清零」丢证据。 */

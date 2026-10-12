@@ -1,6 +1,6 @@
 import dgram from 'node:dgram';
 import { networkInterfaces } from 'node:os';
-import { MAX_DATAGRAM_BYTES, PROTOCOL_VERSION, validateProbe, validateProbeAck } from './protocol.js';
+import { MAX_COLLAB_COUNT, MAX_DATAGRAM_BYTES, PROTOCOL_VERSION, validateProbe, validateProbeAck } from './protocol.js';
 
 export const DISCOVERY_REPLY_MIN_INTERVAL_MS = 250;
 const MAX_THROTTLED_SOURCES = 64;
@@ -23,7 +23,9 @@ export function broadcastTargets(interfaces) {
 /* UDP 发现（设计 §5）：会话期间在全部网卡监听、按接口逐卡收发、应答探测；
  * 扫描 = 广播 + 已知主机单播兜底，窗口内收应答、按实例标识去重合并。
  * 入站校验基线：每次数据报都过体积/解析/字段校验，失败拒绝并计数（设计 §10）。
- * 独占绑定（reuseAddr 关闭）是「本机已有驿站」检测成立的前提——第二实例必须拿到 EADDRINUSE。 */
+ * 独占绑定（reuseAddr 关闭）是「本机已有驿站」检测成立的前提——第二实例必须拿到 EADDRINUSE。
+ * 生命周期一次性（start → scan* → close），调用时序由装配层保证：close 后套接字已关闭，
+ * 再次 start/scan 会以套接字错误失败（吵闹而非挂起）——失败即安全网，不属可依赖的语义。 */
 export function createDiscovery({ port, bindAddress = '0.0.0.0', instanceId, identityName, getCollabCount, knownHosts, log }) {
   const state = {
     port,
@@ -44,7 +46,7 @@ export function createDiscovery({ port, bindAddress = '0.0.0.0', instanceId, ide
       rejected: { oversize: 0, malformed: 0, invalid: 0 },
     },
     collectors: new Set(),
-    lastSourceAt: new Map(),   // 同源最小间隔的记账表：应答限流与清单落盘节流共用
+    lastSourceAt: new Map(),   // 同源最小间隔记账：探测应答限流与两路入站的清单落盘节流共用一张表
     bound: false,
     closed: false,
   };
@@ -92,6 +94,7 @@ async function close(state) {
   await /** @type {Promise<void>} */ (new Promise((resolve) => {
     state.socket.close(resolve);
   }));
+  state.bound = false;   // 绑定事实随关闭归位：状态面不得继续展示已失效的绑定
 }
 
 function statsOf(state) {
@@ -136,20 +139,30 @@ function handleProbe(state, datagram, rinfo) {
   }
   /* 同源最小间隔：窗口内同来源的探测不再应答、也不重复记入清单——
    * 伪造探测洪泛不放大为「清单整文件原子落盘」的写风暴（扫描只需一个应答即去重合并）。 */
-  const now = Date.now();
-  if (now - (state.lastSourceAt.get(rinfo.address) ?? 0) < DISCOVERY_REPLY_MIN_INTERVAL_MS) {
+  if (!withinMinInterval(state, rinfo.address)) {
     state.counters.rateLimited++;
     return;
-  }
-  state.lastSourceAt.delete(rinfo.address);
-  state.lastSourceAt.set(rinfo.address, now);
-  if (state.lastSourceAt.size > MAX_THROTTLED_SOURCES) {
-    state.lastSourceAt.delete(state.lastSourceAt.keys().next().value);
   }
   // 探测来源也是「历史见过地址」：广播单向盲区里对方能广播过来、我们回不去——记下它，下次扫描单播补上
   state.knownHosts.remember({ address: rinfo.address, instanceId: datagram.instanceId, identityName: datagram.identityName });
   sendDatagram(state, buildProbeAck(state), rinfo.port, rinfo.address, 'probe-ack');
   state.counters.probesAnswered++;
+}
+
+/* 同源最小间隔记账（唯一机制）：窗口内返回 false，窗口外刷新时间戳并放行。
+ * 刷新的键移到 Map 尾部、淘汰取首键 —— 表按「最近刷新」维护且容量有界；
+ * 首个包必然放行（表无记录时差值为「当前时间-0」）——合法扫描的首个探测/应答必经此路。 */
+function withinMinInterval(state, address) {
+  const now = Date.now();
+  if (now - (state.lastSourceAt.get(address) ?? 0) < DISCOVERY_REPLY_MIN_INTERVAL_MS) {
+    return false;
+  }
+  state.lastSourceAt.delete(address);
+  state.lastSourceAt.set(address, now);
+  if (state.lastSourceAt.size > MAX_THROTTLED_SOURCES) {
+    state.lastSourceAt.delete(state.lastSourceAt.keys().next().value);
+  }
+  return true;
 }
 
 function handleResponse(state, datagram, rinfo) {
@@ -164,7 +177,13 @@ function handleResponse(state, datagram, rinfo) {
     state.counters.selfObserved++;
     return;
   }
-  state.knownHosts.remember({ address: rinfo.address, instanceId: datagram.instanceId, identityName: datagram.identityName });
+  /* 同源节流同样罩住应答来源的清单写入：伪造应答洪泛与伪造探测洪泛共用同一张表，同样不放大为
+   * 整文件原子写的风暴。扫描合并不受限（内存态）：同一实例多地址的合并依赖逐应答处理。 */
+  if (withinMinInterval(state, rinfo.address)) {
+    state.knownHosts.remember({ address: rinfo.address, instanceId: datagram.instanceId, identityName: datagram.identityName });
+  } else {
+    state.counters.rateLimited++;
+  }
   for (const collector of state.collectors) {
     mergeResponse(collector, datagram, rinfo.address);
   }
@@ -197,16 +216,19 @@ function buildProbeAck(state) {
   }));
 }
 
+/* 报数值域与对端入站校验（protocol.js）对称：超上限钳制、非整数/负数归 0——
+ * 上游给出越界值不得让对端以「collabCount 非法」拒收本端应答。 */
 function currentCollabCount(state) {
   try {
     const count = state.getCollabCount();
     if (Number.isInteger(count) && count >= 0) {
-      return count;
+      return Math.min(count, MAX_COLLAB_COUNT);
     }
+    return 0;
   } catch (error) {
     state.log.warn('参与协作数取值失败，按 0 应答', { reason: error.message });
+    return 0;
   }
-  return 0;
 }
 
 function sendDatagram(state, buffer, targetPort, targetAddress, kind) {

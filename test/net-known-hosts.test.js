@@ -68,6 +68,22 @@ test('超过上限：淘汰最旧（按 lastSeenAt）', (t) => {
   assert.ok(!hosts.addresses().includes('10.1.0.0'), '应淘汰 lastSeenAt 最旧的条目');
 });
 
+test('载入超过上限：按最近时间裁剪（与 remember 淘汰口径一致）', (t) => {
+  const dir = makeTempDir(t);
+  const total = MAX_KNOWN_HOSTS + 6;
+  const seeded = Array.from({ length: total }, (_, index) => ({
+    address: `10.2.${Math.floor(index / 250)}.${index % 250}`,
+    instanceId: '',
+    identityName: '',
+    lastSeenAt: new Date(1700000000000 + index * 1000).toISOString(),
+  }));
+  writeFileSync(join(dir, KNOWN_HOSTS_FILE_NAME), JSON.stringify({ version: 1, hosts: seeded }));
+  const { hosts } = makeHosts(t, { dataDir: dir });
+  assert.equal(hosts.stats().entries, MAX_KNOWN_HOSTS);
+  assert.ok(hosts.addresses().includes('10.2.0.69'), '最新的条目应保留');
+  assert.ok(!hosts.addresses().includes('10.2.0.5'), '最旧的 6 条应在载入时被裁剪');
+});
+
 test('文件损坏：保留 .corrupt- 副本、空清单起步并告警', (t) => {
   const dir = makeTempDir(t);
   writeFileSync(join(dir, KNOWN_HOSTS_FILE_NAME), '{oops');
