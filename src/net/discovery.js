@@ -197,7 +197,7 @@ function handleProbe(state, datagram, rinfo) {
 }
 
 /* 同源最小间隔记账（两张表共用同一实现）：键 = 来源「地址:端口」——同机多站点互为合法不同源，不被互相的窗口吞掉。
- * 代价如实记录：同一 IP 每张表各可占 MAX_THROTTLED_SOURCES 个表项（防护评估见计划定案与计量用例）。
+ * 代价如实记录：同一 IP 每张表各可占 MAX_THROTTLED_SOURCES 个表项（防护评估见计量用例）。
  * 窗口内返回 false，窗口外刷新时间戳并放行；刷新的键移到 Map 尾部、淘汰取首键——表按「最近刷新」维护且容量有界；
  * 首个包必然放行（表无记录时差值为「当前时间-0」）——合法扫描的首个探测/应答必经此路。 */
 function withinMinInterval(table, rinfo) {
