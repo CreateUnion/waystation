@@ -120,7 +120,7 @@ const COMMANDS = {
   take_over_confirm: async (command) => collab.takeOver({ collabId: command.collabId, confirm: true }),
   take_over_decline: async (command) => collab.takeOver({ collabId: command.collabId, confirm: false }),
   handshake: async () => {
-    collab.handshake();
+    await collab.handshake();
     return { ok: true };
   },
   collab_stats: async () => ({ ok: true, stats: collab.stats() }),

@@ -779,7 +779,7 @@ test('治理预演：并发抢接（互见让位、确定性单一胜者、败�
 test('治理预演：离线错过通告 → 恢复后送达即让位（治理豁免过期）', { timeout: 180000 }, async (t) => {
   const port = await pickFreeSegment(2);
   const dirA = makeNodeDir(t);
-  const config = { ...GOVERNANCE_CONFIG, messageTtlMs: 600 };
+  const config = { ...GOVERNANCE_CONFIG, messageTtlMs: 1000 };
   const { a, b, collabId } = await establishPairWith(t, port, '让位项目', config, { dataDirA: dirA });
   await a.command({ cmd: 'exit' });
   await waitForRebindable(port);
@@ -788,7 +788,7 @@ test('治理预演：离线错过通告 → 恢复后送达即让位（治理豁
   assert.equal(verdict.phase, 'awaiting-confirm');
   assert.equal((await b.command({ cmd: 'take_over_confirm', collabId })).ok, true);
   /* 超保留期浸泡：治理通告（takeover）豁免过期，仍留在队列等待送达 */
-  await new Promise((resolve) => setTimeout(resolve, 900));
+  await new Promise((resolve) => setTimeout(resolve, 1300));
   const rows = await b.command({ cmd: 'status', collabId });
   const takeoverRow = rows.rows.find((row) => row.type === 'takeover');
   assert.equal(takeoverRow !== undefined, true, 'takeover 通告在队列中');
