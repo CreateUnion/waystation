@@ -56,6 +56,10 @@ test('状态迁移表：合法边通过、非法边拒绝（含终态无出边�
   assert.equal(canTransition('proposed', 'terminated'), true);
   assert.equal(canTransition('active', 'completed'), true);
   assert.equal(canTransition('frozen', 'proposed'), true);
+  assert.equal(canTransition('active', 'frozen'), true);
+  assert.equal(canTransition('frozen', 'active'), true);
+  assert.equal(canTransition('frozen', 'completed'), true);
+  assert.equal(canTransition('frozen', 'terminated'), true);
   assert.equal(canTransition('completed', 'active'), false);
   assert.equal(canTransition('terminated', 'proposed'), false);
   assert.equal(canTransition('proposed', 'completed'), false);
@@ -149,4 +153,19 @@ test('isLedgerShape 对空对象 / null / 数组一律拒（形态底线）', ()
   for (const candidate of [{}, null, [], 'ledger', 42]) {
     assert.equal(isLedgerShape(candidate), false, String(candidate));
   }
+});
+
+test('台账冻结标记：frozenAt / frozenFrom 缺省通过、合法值通过、非法拒', () => {
+  assert.equal(isLedgerShape(sampleLedger()), true, '缺省（旧数据）通过');
+  assert.equal(isLedgerShape(sampleLedger({ status: 'frozen', frozenAt: '2026-10-13T03:00:00.000Z', frozenFrom: 'active' })), true);
+  assert.equal(isLedgerShape(sampleLedger({ status: 'frozen', frozenAt: '2026-10-13T03:00:00.000Z', frozenFrom: 'proposed' })), true);
+  assert.equal(isLedgerShape(sampleLedger({ frozenAt: 42 })), false);
+  assert.equal(isLedgerShape(sampleLedger({ frozenFrom: 'completed' })), false);
+});
+
+test('成员记录冻结标记：frozenAt / frozenFrom 同判据（缺省兼容 + 枚举约束）', () => {
+  assert.equal(isMemberRecordShape(sampleMember()), true, '缺省（旧数据）通过');
+  assert.equal(isMemberRecordShape(sampleMember({ state: 'frozen', frozenAt: '2026-10-13T03:00:00.000Z', frozenFrom: 'proposed' })), true);
+  assert.equal(isMemberRecordShape(sampleMember({ frozenAt: 'x' })), false);
+  assert.equal(isMemberRecordShape(sampleMember({ frozenFrom: 'terminated' })), false);
 });

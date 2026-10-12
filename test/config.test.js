@@ -20,6 +20,10 @@ test('文件缺失：返回默认值且 created=true', (t) => {
   assert.equal(config.logMaxFiles, 5);
   assert.equal(config.probeTimeoutMs, 1000);
   assert.equal(config.inviteTtlMs, 24 * 60 * 60 * 1000);
+  assert.equal(config.managerProbeIntervalMs, 30000);
+  assert.equal(config.managerOfflineMs, 120000);
+  assert.equal(config.takeoverWindowMs, 30000);
+  assert.equal(config.freezeUnresolvedMs, 48 * 60 * 60 * 1000);
 });
 
 test('buildDefaults：标识名取传入主机名，形状完整', () => {
@@ -28,11 +32,14 @@ test('buildDefaults：标识名取传入主机名，形状完整', () => {
     'autoDeliver',
     'dialTimeoutMs',
     'dispatchTickMs',
+    'freezeUnresolvedMs',
     'identityName',
     'inviteTtlMs',
     'logDir',
     'logMaxBytes',
     'logMaxFiles',
+    'managerOfflineMs',
+    'managerProbeIntervalMs',
     'messageTtlMs',
     'offlineQueue',
     'port',
@@ -42,6 +49,7 @@ test('buildDefaults：标识名取传入主机名，形状完整', () => {
     'retryIntervalMs',
     'retrySlowIntervalMs',
     'scanWindowMs',
+    'takeoverWindowMs',
   ]);
   assert.equal(defaults.identityName, '主机甲');
 });
@@ -233,4 +241,48 @@ test('inviteTtlMs：默认 24 小时、越界回落默认并告警', (t) => {
   assert.equal(config.inviteTtlMs, 24 * 60 * 60 * 1000);
   assert.equal(warnings.length, 1);
   assert.ok(warnings[0].includes('inviteTtlMs'));
+});
+
+test('managerProbeIntervalMs：默认 30 秒、越界回落默认并告警', (t) => {
+  assert.equal(buildDefaults('主机甲').managerProbeIntervalMs, 30000);
+  const dir = makeTempDir(t);
+  writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({ managerProbeIntervalMs: 99 }));
+  const warnings = [];
+  const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+  assert.equal(config.managerProbeIntervalMs, 30000);
+  assert.equal(warnings.length, 1);
+  assert.ok(warnings[0].includes('managerProbeIntervalMs'));
+});
+
+test('managerOfflineMs：默认 2 分钟、越界回落默认并告警', (t) => {
+  assert.equal(buildDefaults('主机甲').managerOfflineMs, 120000);
+  const dir = makeTempDir(t);
+  writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({ managerOfflineMs: 100 }));
+  const warnings = [];
+  const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+  assert.equal(config.managerOfflineMs, 120000);
+  assert.equal(warnings.length, 1);
+  assert.ok(warnings[0].includes('managerOfflineMs'));
+});
+
+test('takeoverWindowMs：默认 30 秒、越界回落默认并告警', (t) => {
+  assert.equal(buildDefaults('主机甲').takeoverWindowMs, 30000);
+  const dir = makeTempDir(t);
+  writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({ takeoverWindowMs: 0 }));
+  const warnings = [];
+  const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+  assert.equal(config.takeoverWindowMs, 30000);
+  assert.equal(warnings.length, 1);
+  assert.ok(warnings[0].includes('takeoverWindowMs'));
+});
+
+test('freezeUnresolvedMs：默认 48 小时、越界回落默认并告警', (t) => {
+  assert.equal(buildDefaults('主机甲').freezeUnresolvedMs, 48 * 60 * 60 * 1000);
+  const dir = makeTempDir(t);
+  writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({ freezeUnresolvedMs: 1000 }));
+  const warnings = [];
+  const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+  assert.equal(config.freezeUnresolvedMs, 48 * 60 * 60 * 1000);
+  assert.equal(warnings.length, 1);
+  assert.ok(warnings[0].includes('freezeUnresolvedMs'));
 });

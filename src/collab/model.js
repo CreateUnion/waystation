@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { DIGEST_PATTERN, ID_PATTERN, MAX_COLLAB_MEMBERS, MAX_MESSAGE_TEXT_CHARS, MAX_TOPIC_CHARS, isIdentityName, isPresentationText } from '../net/protocol.js';
+import { DIGEST_PATTERN, ID_PATTERN, MAX_COLLAB_MEMBERS, MAX_MESSAGE_TEXT_CHARS, MAX_TOPIC_CHARS, isIdentityName, isPort, isPresentationText } from '../net/protocol.js';
 
 /* 协作实例模型（设计 §6/§11）：状态集、迁移表与本地记录形态校验。
  * 本地协作文件（member.json / 台账行 / 快照）是外部输入——手改与旧数据都可能出现；
@@ -11,6 +11,8 @@ export const LOCAL_LEFT_STATE = 'left';
 export const ARCHIVED_STATES = ['completed', 'terminated', 'left'];
 /* 同名冲突判据的参与状态集（设计 §6：不同名、或机器相同但项目不同都不算冲突） */
 export const CONFLICT_STATES = ['proposed', 'active', 'frozen'];
+/* 冻结前状态集（解除冻结「回冻结前状态」的取值域；抢接 / 降级后恢复的成员态由此映射） */
+export const FROZEN_FROM_STATES = ['proposed', 'active'];
 /* 协作域边界常量（服务内多模块共用；上界防失控，取值按人机协作量级）：待回应邀请上限、
  * 本机参与协作上限、任务板上限、邀请限频记录表容量。 */
 export const MAX_PENDING_INVITES = 16;
@@ -22,7 +24,7 @@ const MEMBER_STATES = ['invited', 'approved', 'declined', 'withdrawn', 'member',
 const ROLES = ['manager', 'member'];
 const DECISIONS = [null, 'approved', 'declined', 'withdrawn'];
 const BOARD_KINDS = ['progress', 'note'];
-/* 状态迁移表（设计 §11 状态流转的机器化；裁定流程归后续治理里程碑，本表是其调用面） */
+/* 状态迁移表（设计 §11 状态流转的机器化；裁定流程归治理里程碑，本表是其调用面） */
 const TRANSITIONS = /** @type {Record<string, string[]>} */ ({
   proposed: ['active', 'frozen', 'terminated'],
   active: ['frozen', 'completed'],
@@ -76,7 +78,19 @@ function isLedgerTailShape(ledger) {
   if (!isTimestamp(ledger.createdAt) || !isTimestamp(ledger.updatedAt)) {
     return false;
   }
-  return ledger.endedAt === undefined || isTimestamp(ledger.endedAt);
+  if (ledger.endedAt !== undefined && !isTimestamp(ledger.endedAt)) {
+    return false;
+  }
+  return isFrozenMarksShape(ledger);
+}
+
+/* 冻结标记（可选字段，旧数据缺省）：frozenAt = 进入冻结的时刻（48 小时无裁定提示的计时起点）；
+ * frozenFrom = 冻结前状态（解除冻结「回冻结前状态」的依据）。 */
+function isFrozenMarksShape(record) {
+  if (record.frozenAt !== undefined && !isTimestamp(record.frozenAt)) {
+    return false;
+  }
+  return record.frozenFrom === undefined || FROZEN_FROM_STATES.includes(record.frozenFrom);
 }
 
 /* 本地参与记录（member.json）：role 与 state 是本地视角；decision 缺省 null（旧字段缺失兼容）。
@@ -180,7 +194,10 @@ function isMemberMarksShape(record) {
   if (!DECISIONS.includes(record.decision ?? null)) {
     return false;
   }
-  return record.archivedAt === undefined || isTimestamp(record.archivedAt);
+  if (record.archivedAt !== undefined && !isTimestamp(record.archivedAt)) {
+    return false;
+  }
+  return isFrozenMarksShape(record);
 }
 
 function isEndpointsShape(endpoints) {
@@ -202,7 +219,7 @@ function isEndpointShape(endpoint) {
   if (typeof endpoint.address !== 'string' || endpoint.address === '') {
     return false;
   }
-  return Number.isInteger(endpoint.port) && endpoint.port >= 1 && endpoint.port <= 65535;
+  return isPort(endpoint.port);
 }
 
 function isPeerShape(peer) {

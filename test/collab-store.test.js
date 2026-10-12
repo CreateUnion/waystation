@@ -144,3 +144,21 @@ test('listLocalCollabIds：只收合法目录名（非法名与文件过滤）�
   writeFileSync(join(dir, COLLABS_DIR_NAME, 'stray.txt'), 'x');
   assert.deepEqual(listLocalCollabIds(dir), ['collab-1']);
 });
+
+test('ledgerDigest：64 位小写十六进制（与协议摘要形态同一约定）、内容敏改即变', () => {
+  const digest = ledgerDigest(ledgerOf(1));
+  assert.match(digest, /^[0-9a-f]{64}$/);
+  assert.equal(digest, ledgerDigest(ledgerOf(1)), '同内容同摘要（稳定）');
+  assert.notEqual(digest, ledgerDigest(ledgerOf(2)), '版本变化摘要变化');
+});
+
+test('quarantineLedger：文件缺失返回 false（失败不抛）；成功后改名保留副本', (t) => {
+  const dir = makeTempDir(t);
+  mkdirSync(collabDir(dir, 'collab-1'), { recursive: true });
+  assert.equal(quarantineLedger(dir, 'collab-1'), false);
+  writeFileSync(collabFilePath(dir, 'collab-1', LEDGER_FILE_NAME), '{}\n');
+  assert.equal(quarantineLedger(dir, 'collab-1'), true);
+  assert.equal(existsSync(collabFilePath(dir, 'collab-1', LEDGER_FILE_NAME)), false);
+  const backups = readdirSync(collabDir(dir, 'collab-1')).filter((name) => name.startsWith(`${LEDGER_FILE_NAME}.corrupt-`));
+  assert.equal(backups.length, 1);
+});

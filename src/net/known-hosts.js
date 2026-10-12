@@ -31,6 +31,7 @@ export function createKnownHosts({ dataDir, log }) {
     list: () => listOf(state),
     targets: () => targetsOf(state),
     remember: (entry) => remember(state, entry),
+    lookup: (instanceId) => lookup(state, instanceId),
     stats: () => ({ ...state.counters, entries: state.hosts.size }),
   };
 }
@@ -38,6 +39,16 @@ export function createKnownHosts({ dataDir, log }) {
 /* 按最近见过时间降序——扫描列表与单播兜底都优先最近活跃的地址 */
 function listOf(state) {
   return [...state.hosts.values()].sort((left, right) => Date.parse(right.lastSeenAt) - Date.parse(left.lastSeenAt));
+}
+
+/* 按站点实例标识取最近地址（治理转达 / 抢接广播的跨协作寻址回退面）：未见过返回 null。
+ * 清单是站点级全局视野（含其他协作学到的地址）——跨协作的治理触达由此闭合。 */
+function lookup(state, instanceId) {
+  if (typeof instanceId !== 'string' || instanceId === '') {
+    return null;
+  }
+  const entry = listOf(state).find((candidate) => candidate.instanceId === instanceId);
+  return entry === undefined ? null : { address: entry.address, port: entry.port };
 }
 
 /* 单播兜底的目标解析（择新口径）：按实例标识去重、取 lastSeenAt 最新条目——

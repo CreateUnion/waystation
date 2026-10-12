@@ -37,6 +37,13 @@ const FIELD_RULES = {
   probeTimeoutMs: { check: (value) => Number.isInteger(value) && value >= 100 && value <= 30000, reason: '需为 100–30000 的整数（毫秒）' },
   // 单条邀请的过期标注时限（设计 §6 默认 24 小时；过期仅标注、不改协作状态）
   inviteTtlMs: { check: (value) => Number.isInteger(value) && value >= 1000 && value <= 30 * DAY_MS, reason: '需为 1000–2592000000 的整数（毫秒，上限 30 天）' },
+  // 失联判定与抢接规程参数（设计 §9「默认 30s」「默认 2 分钟」「默认 30s，可配」的落点；
+  // 下界取「实用快节律」——测试与极小网络可用，防的是误配打爆探测定时器）
+  managerProbeIntervalMs: { check: (value) => Number.isInteger(value) && value >= 100 && value <= 600000, reason: '需为 100–600000 的整数（毫秒）' },
+  managerOfflineMs: { check: (value) => Number.isInteger(value) && value >= 200 && value <= 3600000, reason: '需为 200–3600000 的整数（毫秒）' },
+  takeoverWindowMs: { check: (value) => Number.isInteger(value) && value >= 200 && value <= 600000, reason: '需为 200–600000 的整数（毫秒）' },
+  // 冻结无裁定的单方处置提示时限（设计 §6 默认 48 小时）
+  freezeUnresolvedMs: { check: (value) => Number.isInteger(value) && value >= 60000 && value <= 30 * DAY_MS, reason: '需为 60000–2592000000 的整数（毫秒，上限 30 天）' },
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -83,6 +90,13 @@ export function buildDefaults(hostName, options = {}) {
     dialTimeoutMs: 5000,
     probeTimeoutMs: 1000,
     inviteTtlMs: DAY_MS,
+    // 失联判定与抢接规程默认值（设计 §9 明文默认）：
+    // 对管理者周期探测 30s；连续失败累计 2 分钟判失联；抢接收集窗口 30s（自广播起算）；
+    // 冻结无裁定 48 小时提示双方（单方处置时限）。
+    managerProbeIntervalMs: 30000,
+    managerOfflineMs: 120000,
+    takeoverWindowMs: 30000,
+    freezeUnresolvedMs: 48 * 60 * 60 * 1000,
   };
 }
 

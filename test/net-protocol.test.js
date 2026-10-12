@@ -384,3 +384,152 @@ test('isPresentationText：空 / 超限 / 控制与不可见字符拒、中文�
   assert.equal(DIGEST_PATTERN.test('a'.repeat(64)), true);
   assert.equal(DIGEST_PATTERN.test('A'.repeat(64)), false);
 });
+
+/* —— 治理与韧性载荷（协作域的治理五型与 notice 事件扩展） —— */
+
+const digestOf = 'a'.repeat(64);
+
+test('治理域 freeze：createdAt / manager 为可选参考字段（存在则校验）', () => {
+  const members = [{ instanceId: 'inst-a' }, { instanceId: 'inst-b' }];
+  assert.equal(validateMessage(frameWith({ type: 'freeze', payload: { name: '项目', members } })).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'freeze', payload: { name: '项目', members, createdAt: new Date().toISOString(), manager: { instanceId: 'inst-a', identityName: '主机甲' } } })).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'freeze', payload: { name: '项目', members, createdAt: 42 } })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'freeze', payload: { name: '项目', members, manager: { instanceId: 'inst-a' } } })).ok, false);
+});
+
+test('治理域 decision：choice 枚举、名单必填、执行型字段与 createdAt 逐项校验', () => {
+  const members = [{ instanceId: 'inst-a' }, { instanceId: 'inst-b' }];
+  const legal = { choice: 'merge', name: '项目', members };
+  assert.equal(validateMessage(frameWith({ type: 'decision', payload: legal })).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'decision', payload: { ...legal, winner: 'collab-1', collabId: 'collab-2', executed: true, createdAt: new Date().toISOString(), reason: '裁定' } })).ok, true);
+  for (const payload of [
+    { ...legal, choice: 'both' },
+    { choice: 'keep', members },
+    { ...legal, members: [{ instanceId: 'inst-a' }] },
+    { ...legal, winner: '../x' },
+    { ...legal, executed: 'yes' },
+    { ...legal, createdAt: 1 },
+    { ...legal, reason: 'x'.repeat(201) },
+  ]) {
+    assert.equal(validateMessage(frameWith({ type: 'decision', payload })).ok, false, JSON.stringify(payload).slice(0, 60));
+  }
+});
+
+test('治理域 unfreeze：name + members 必填、reason 可选（与 freeze 同判据）', () => {
+  const members = [{ instanceId: 'inst-a' }, { instanceId: 'inst-b' }];
+  assert.equal(validateMessage(frameWith({ type: 'unfreeze', payload: { name: '项目', members } })).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'unfreeze', payload: { name: '项目', members, reason: '保持两条' } })).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'unfreeze', payload: { name: '项目' } })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'unfreeze', payload: { name: '项目', members, reason: '坏\u0007字符' } })).ok, false);
+});
+
+test('治理域 handover：offer / accept / reject 三型与逐字段拒', () => {
+  assert.equal(validateMessage(frameWith({ type: 'handover', payload: { kind: 'offer', version: 3, digest: digestOf, ledger: {} } })).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'handover', payload: { kind: 'accept', version: 3, digest: digestOf } })).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'handover', payload: { kind: 'reject', reason: '忙' } })).ok, true);
+  for (const payload of [
+    { kind: 'offer', version: 0, digest: digestOf, ledger: {} },
+    { kind: 'offer', version: 3, digest: 'zz', ledger: {} },
+    { kind: 'offer', version: 3, digest: digestOf },
+    { kind: 'accept', version: 3 },
+    { kind: 'reject', reason: 42 },
+    { kind: 'later' },
+    'x',
+  ]) {
+    assert.equal(validateMessage(frameWith({ type: 'handover', payload })).ok, false, JSON.stringify(payload).slice(0, 60));
+  }
+});
+
+test('治理域 takeover-init announce：manager / baseVersion / windowEndsAt 逐字段拒', () => {
+  const legal = { kind: 'announce', manager: { instanceId: 'inst-a', identityName: '主机甲' }, baseVersion: 3, windowEndsAt: new Date().toISOString() };
+  assert.equal(validateMessage(frameWith({ type: 'takeover-init', payload: legal })).ok, true);
+  for (const payload of [
+    { ...legal, manager: { instanceId: 'inst-a' } },
+    { ...legal, baseVersion: 0 },
+    { ...legal, windowEndsAt: 'not-a-time' },
+    { kind: 'announce' },
+  ]) {
+    assert.equal(validateMessage(frameWith({ type: 'takeover-init', payload })).ok, false, JSON.stringify(payload).slice(0, 60));
+  }
+});
+
+test('治理域 takeover-init report：version 与 takeover 可空、记录形态逐字段拒', () => {
+  assert.equal(validateMessage(frameWith({ type: 'takeover-init', payload: { kind: 'report', version: null, takeover: null } })).ok, true);
+  const record = { phase: 'effective', candidate: { instanceId: 'inst-b', identityName: '主机乙' }, baseVersion: 2 };
+  assert.equal(validateMessage(frameWith({ type: 'takeover-init', payload: { kind: 'report', version: 2, takeover: record } })).ok, true);
+  for (const payload of [
+    { kind: 'report', version: 0, takeover: null },
+    { kind: 'report', version: null, takeover: { ...record, phase: 'waiting' } },
+    { kind: 'report', version: null, takeover: { ...record, candidate: { instanceId: 'inst-b' } } },
+  ]) {
+    assert.equal(validateMessage(frameWith({ type: 'takeover-init', payload })).ok, false, JSON.stringify(payload).slice(0, 60));
+  }
+});
+
+test('治理域 takeover-init cancel：reason 可选', () => {
+  assert.equal(validateMessage(frameWith({ type: 'takeover-init', payload: { kind: 'cancel' } })).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'takeover-init', payload: { kind: 'cancel', reason: '原驿丞恢复应答' } })).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'takeover-init', payload: { kind: 'cancel', reason: 'x'.repeat(201) } })).ok, false);
+});
+
+test('治理域 takeover：baseVersion 与 digest 必填、reason 可选', () => {
+  assert.equal(validateMessage(frameWith({ type: 'takeover', payload: { baseVersion: 3, digest: digestOf } })).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'takeover', payload: { baseVersion: 3, digest: digestOf, reason: '管理者失联' } })).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'takeover', payload: { baseVersion: 1.5, digest: digestOf } })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'takeover', payload: { baseVersion: 3 } })).ok, false);
+});
+
+test('治理域全类型覆盖：五个治理类型给非法 payload 必拒（防漏挂表）', () => {
+  const governanceTypes = ['unfreeze', 'decision', 'handover', 'takeover-init', 'takeover'];
+  const invalidPayload = {
+    unfreeze: {},
+    decision: { choice: 'merge' },
+    handover: { kind: 'offer' },
+    'takeover-init': { kind: 'report', version: 0, takeover: null },
+    takeover: {},
+  };
+  for (const type of governanceTypes) {
+    assert.equal(validateMessage(frameWith({ type, payload: invalidPayload[type] })).ok, false, type);
+  }
+});
+
+test('notice manager-changed：manager 与 version 必填', () => {
+  const manager = { instanceId: 'inst-b', identityName: '主机乙' };
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: { event: 'manager-changed', version: 3, manager } })).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: { event: 'manager-changed', version: 3 } })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: { event: 'manager-changed', version: 0, manager } })).ok, false);
+});
+
+test('notice handshake：role / version / takeover / reply 逐字段拒', () => {
+  const legal = { event: 'handshake', role: 'member', version: null, takeover: null, reply: false };
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: legal })).ok, true);
+  const record = { phase: 'inflight', candidate: { instanceId: 'inst-b', identityName: '主机乙' }, baseVersion: 2 };
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: { ...legal, role: 'manager', version: 3, takeover: record, reply: true } })).ok, true);
+  for (const payload of [
+    { ...legal, role: 'boss' },
+    { ...legal, version: 0 },
+    { ...legal, takeover: { phase: 'x', candidate: { instanceId: 'inst-b', identityName: '乙' }, baseVersion: 1 } },
+    { ...legal, reply: 'yes' },
+  ]) {
+    assert.equal(validateMessage(frameWith({ type: 'notice', payload })).ok, false, JSON.stringify(payload).slice(0, 60));
+  }
+});
+
+test('notice merge-request：baseVersion / version / digest / ledger 逐字段拒', () => {
+  const legal = { event: 'merge-request', baseVersion: 2, version: 5, digest: digestOf, ledger: {} };
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: legal })).ok, true);
+  for (const payload of [
+    { ...legal, baseVersion: 0 },
+    { ...legal, version: 0 },
+    { ...legal, digest: 'short' },
+    { ...legal, ledger: [] },
+  ]) {
+    assert.equal(validateMessage(frameWith({ type: 'notice', payload })).ok, false, JSON.stringify(payload).slice(0, 60));
+  }
+});
+
+test('notice merge-outcome：adopted 布尔必填', () => {
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: { event: 'merge-outcome', adopted: true } })).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: { event: 'merge-outcome', adopted: false } })).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: { event: 'merge-outcome' } })).ok, false);
+});

@@ -219,3 +219,11 @@ test('文件内条目 port 非法：跳过并计数（拒绝优于猜测）', (t
   assert.deepEqual(hosts.targets(), [{ address: '10.0.0.3', port: 7321 }]);
   assert.equal(hosts.stats().invalidEntries, 2);
 });
+
+test('lookup：按实例标识取最近地址（治理跨协作寻址回退面）；未见过 / 空参返回 null', (t) => {
+  const { hosts } = makeHosts(t);
+  assert.equal(hosts.lookup('inst-x'), null);
+  assert.equal(hosts.lookup(''), null);
+  hosts.remember({ address: '10.0.0.9', port: 7321, instanceId: 'inst-x', identityName: '主机X' });
+  assert.deepEqual(hosts.lookup('inst-x'), { address: '10.0.0.9', port: 7321 });
+});
