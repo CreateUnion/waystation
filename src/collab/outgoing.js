@@ -540,6 +540,7 @@ export function promoteToManager(state, local, ledger) {
   local.ledger = ledger;
   local.member = managerRecordOf(ledger);
   local.member.endpoints = Object.fromEntries(local.endpoints);
+  local.member.managerSinceVersion = ledger.version;   // 席位时钟：本次席位变更的台账基准版本
   local.suspended = null;
   local.staleManagerId = null;
   persistMember(state, local);
@@ -575,7 +576,7 @@ function invalidateEffectiveTakeovers(state, local, keepCandidateId) {
 /* 降级为成员（被替换 / 合流让位的落点）：管理席位——以台账定格名单转成员记录、删除本地台账
  * （单副本纪律：台账随后任驿丞走；本机快照保留为成员备份）；成员——仅更新驿丞引用。
  * 随后重定向陈旧出站队列（发往旧驿丞的未确认消息改投新驿丞——不静默丢弃）并拉取现任视图。
- * 席位变更（让位）作废本机生效抢接记录并记下本次变更的基准版本（陈旧主张判定的本机已知面）。 */
+ * 席位变更（让位）作废本机生效抢接记录并推进席位时钟（陈旧判据的本机已知面）。 */
 export function downgradeToMember(state, local, managerPeer, version) {
   invalidateEffectiveTakeovers(state, local, null);
   const formerManagerId = currentManagerIdOf(local);
@@ -654,8 +655,8 @@ export function adoptNewManager(state, local, managerPeer, remoteVersion) {
     return false;
   }
   /* 席位变更（采纳新驿丞）作废关于其它候选的生效记录（关于新驿丞本人的记录保留——它是
-   * 本机对「发生过抢接」的如实知识，继续随握手外传供他方收敛）；并记下本次变更的基准版本
-   * （陈旧主张判定的本机已知面：等于或更旧的主张不再回翻本机引用）。 */
+   * 本机对「发生过抢接」的如实知识，继续随握手外传供他方收敛）；并推进席位时钟
+   * （陈旧判据的本机已知面：早于或等于该次变更的席位主张与记录不再回翻本机引用）。 */
   invalidateEffectiveTakeovers(state, local, managerPeer.instanceId);
   local.member.manager = { instanceId: managerPeer.instanceId, identityName: managerPeer.identityName };
   if (Number.isInteger(remoteVersion)) {

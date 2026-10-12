@@ -302,7 +302,7 @@ function evaluateRemoteHandshake(state, local, frame) {
 
 function evaluateRemoteAsMember(state, local, frame, remote, takeover) {
   if (takeover !== null && takeover.candidate.instanceId !== state.self.instanceId) {
-    if (takeover.phase === 'effective' && !carriedRecordStale(state, local, takeover.baseVersion)) {
+    if (takeover.phase === 'effective' && !carriedRecordStale(local, takeover.baseVersion)) {
       convergeMemberOnEffective(state, local, takeover.candidate, takeover.baseVersion);
     }
     return;
@@ -325,40 +325,44 @@ function evaluateRemoteAsMember(state, local, frame, remote, takeover) {
   }
 }
 
-/* 管理席位对「他方携带的生效记录」的处置：候选资格校验——本机台账版本已越过记录基准
- * （席位已翻页：如本机经移交承接席位后又收到旧记录）即不收敛，否则新驿丞会被已翻页的
- * 记录拉下席位、删掉台账；校验通过才照常让位（合流 + 降级）。 */
+/* 管理席位对「他方携带的生效记录」的处置：候选资格校验（席位时钟判据）——记录基准早于或
+ * 等于本机席位时钟（本机已知的那次或更早的席位状态）即不收敛，否则新驿丞会被已翻页的记录
+ * 拉下席位、删掉台账；无席位变更知识（原始驿丞、未收敛的被替换者）或不陈旧（更高基准——
+ * 本地版本更高的合流腿）照常收敛：合流递交 + 让位降级（设计 §9 步骤 4 / 握手③）。 */
 function handleCarriedEffective(state, local, takeover) {
-  if (carriedRecordStale(state, local, takeover.baseVersion)) {
-    state.log.warn('收到已过时的生效抢接记录（本机版本已越过其基准）——不收敛', { collabId: local.collabId, candidate: takeover.candidate.instanceId, baseVersion: takeover.baseVersion });
+  if (carriedRecordStale(local, takeover.baseVersion)) {
+    state.log.warn('收到已过时的生效抢接记录（未越过本机席位时钟）——不收敛', { collabId: local.collabId, candidate: takeover.candidate.instanceId, baseVersion: takeover.baseVersion });
     return;
   }
   convergeOnReplaced(state, local, takeover.candidate, takeover.baseVersion);
 }
 
 /* 管理者主张的可学习性：本机现任驿丞本人的主张照常采纳（幂等对表）；他方主张须版本严格高于
- * 本机最近一次席位变更的基准（成员记录随采纳写入，缺省 0 = 无席位变更知识，均可学习）。
- * 版本未知（null / 非整数）的他方主张不可判新——按陈旧处理（保守不采纳）。 */
+ * 本机席位时钟（缺省 0 = 无席位变更知识，均可学习）。版本未知（null / 非整数）的他方主张
+ * 不可判新——按陈旧处理（保守不采纳）。 */
 function managerClaimAcceptable(state, local, frame, remote) {
   if (frame.from.instanceId === currentManagerIdOf(local)) {
     return true;
   }
-  return Number.isInteger(remote.version) && remote.version > managerSinceVersionOf(local);
+  return Number.isInteger(remote.version) && remote.version > (managerSinceVersionOf(local) ?? 0);
 }
 
-/* 本机已知的最近一次席位变更基准版本（成员侧记录；管理席位不适用——其席位权威即台账版本）。 */
+/* 本机席位时钟 = 最近一次席位变更（受让 / 接管 / 让位 / 采纳新驿丞）的台账基准版本；
+ * 无变更知识返回 null（原始驿丞未收敛 / 从未变更过驿丞引用的成员——不判陈旧）。 */
 function managerSinceVersionOf(local) {
-  return typeof local.member?.managerSinceVersion === 'number' ? local.member.managerSinceVersion : 0;
+  return typeof local.member?.managerSinceVersion === 'number' ? local.member.managerSinceVersion : null;
 }
 
-/* 携带的生效抢接记录是否相对本机知识已过时：记录基准早于本机已知版本（成员 = 快照版本与
- * 最近一次席位变更基准的较大者；管理席位 = 台账版本）——记录描述的是比本机已知更旧的席位
- * 状态，不以其收敛（陈旧记录不得回翻已收敛节点，也不得把新驿丞拉下席位）。 */
-function carriedRecordStale(state, local, baseVersion) {
-  const known = local.role === 'manager'
-    ? local.ledger.version
-    : Math.max(local.snapshot === null ? 0 : local.snapshot.version, managerSinceVersionOf(local));
-  return known > baseVersion;
+/* 携带的生效抢接记录是否已陈旧（席位时钟判据）：记录基准 ≤ 本机席位时钟即陈旧——移交不推
+ * 台账版本（「抢占于 v、移交于 v」是常态），按裸版本比对的严格大于会放过等版本遗留记录，
+ * 使新驿丞被拉下席位；时钟只在席位变更时推进，故等版本与更低基准一并判陈旧，而更高基准
+ * （本地版本更高的合流腿）不受影响。 */
+function carriedRecordStale(local, baseVersion) {
+  const clock = managerSinceVersionOf(local);
+  if (clock === null) {
+    return false;
+  }
+  return baseVersion <= clock;
 }
 
 /* —— 抢接（发起 / 汇总 / 让位 / 人确认 / 生效）—— */
