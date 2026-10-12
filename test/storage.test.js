@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { appendLine, loadLines, replaceFile, writeJsonAtomic } from '../src/storage.js';
 import { makeTempDir } from './helpers.js';
@@ -20,9 +20,13 @@ test('appendLine + loadLines：基本往返', (t) => {
   assert.deepEqual(loaded.corruptLines, []);
 });
 
-test('appendLine：不可序列化的值（undefined）抛出，不静默写坏行', (t) => {
+test('appendLine：非对象值（undefined / null / 标量）抛出，不静默写坏行', (t) => {
   const file = join(makeTempDir(t), 'stream.jsonl');
-  assert.throws(() => appendLine(file, undefined), /无法序列化为 JSON/);
+  assert.throws(() => appendLine(file, undefined), /必须是非 null 对象/);
+  assert.throws(() => appendLine(file, null), /必须是非 null 对象/);
+  assert.throws(() => appendLine(file, 42), /必须是非 null 对象/);
+  assert.throws(() => appendLine(file, '字符串'), /必须是非 null 对象/);
+  assert.equal(existsSync(file), false);
 });
 
 test('文件不存在：视为空存储', (t) => {
@@ -31,6 +35,16 @@ test('文件不存在：视为空存储', (t) => {
   assert.deepEqual(loaded.entries, []);
   assert.equal(loaded.tailDropped, false);
   assert.deepEqual(loaded.corruptLines, []);
+});
+
+test('既有空文件：等价于空存储，不算尾部半行', (t) => {
+  const file = join(makeTempDir(t), 'empty.jsonl');
+  writeFileSync(file, '');
+  const loaded = loadLines(file);
+  assert.deepEqual(loaded.entries, []);
+  assert.equal(loaded.tailDropped, false);
+  assert.deepEqual(loaded.corruptLines, []);
+  assert.equal(readFileSync(file, 'utf8'), '');
 });
 
 test('尾部半行：读取时截断至最后完整行（丢尾条）并修复文件', (t) => {
@@ -119,4 +133,25 @@ test('writeJsonAtomic：对象以可读格式落盘（config.json 用）', (t) =
   assert.ok(text.endsWith('\n'));
   assert.deepEqual(JSON.parse(text), { port: 7321, identityName: '驿站' });
   assert.ok(text.includes('\n  "port": 7321'));
+});
+
+test('writeJsonAtomic：非对象值抛出，不把文件替换成 "undefined"', (t) => {
+  const file = join(makeTempDir(t), 'config.json');
+  assert.throws(() => writeJsonAtomic(file, undefined), /必须是非 null 对象/);
+  assert.throws(() => writeJsonAtomic(file, null), /必须是非 null 对象/);
+  assert.throws(() => writeJsonAtomic(file, '文本'), /必须是非 null 对象/);
+  assert.equal(existsSync(file), false);
+});
+
+test('写入被拒时不落盘：既有内容不被改动、不留临时文件', (t) => {
+  const dir = makeTempDir(t);
+  const stream = join(dir, 'stream.jsonl');
+  writeFileSync(stream, '{"seq":1}\n');
+  assert.throws(() => appendLine(stream, undefined), /必须是非 null 对象/);
+  assert.equal(readFileSync(stream, 'utf8'), '{"seq":1}\n');
+  const config = join(dir, 'config.json');
+  writeJsonAtomic(config, { port: 7321 });
+  assert.throws(() => writeJsonAtomic(config, undefined), /必须是非 null 对象/);
+  assert.equal(readFileSync(config, 'utf8'), '{\n  "port": 7321\n}\n');
+  assert.deepEqual(readdirSync(dir).filter((name) => name.includes('.tmp')), []);
 });
