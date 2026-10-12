@@ -85,6 +85,25 @@ test('ws_delivery_status：透传查询参数并输出 JSON', async () => {
   assert.equal(rows[0].tier, 'at-peer');
 });
 
+test('ws_delivery_status：过滤参数形态非法 → isError（不发查询）', async () => {
+  let queried = 0;
+  const net = { deliveryStatus: () => { queried++; return []; } };
+  for (const args of [{ msgId: 42 }, { msgId: {} }, { collabId: 42 }, { collabId: null }, { msgId: '' }, { msgId: '   ' }]) {
+    const result = await callTool(deliveryStatusTool(), args, net);
+    assert.equal(result.isError, true, JSON.stringify(args));
+    assert.ok(result.content[0].text.includes('非空字符串'), JSON.stringify(args));
+  }
+  assert.equal(queried, 0);
+});
+
+test('ws_delivery_status：过滤参数缺省 → 正常查询（不过滤）', async () => {
+  const queries = [];
+  const net = { deliveryStatus: (query) => { queries.push(query); return []; } };
+  const result = await callTool(deliveryStatusTool(), {}, net);
+  assert.equal(result.isError, undefined);
+  assert.equal(queries.length, 1);
+});
+
 test('ws_status：输出含 net 状态块（可用性与计数器）', async () => {
   const net = { status: () => ({ available: true, reason: null, message: '', port: 17321, counters: { discovery: {}, transport: {}, dispatch: {}, inbound: {} } }) };
   const result = await callTool(statusTool(), {}, net);

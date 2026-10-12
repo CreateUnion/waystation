@@ -1,12 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { createServer } from 'node:net';
+import { connect, createServer } from 'node:net';
+import dgram from 'node:dgram';
 import { join, resolve } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { makeTempDir, pickFreePort, repoRoot } from './helpers.js';
+import { makeTempDir, pickFreePort, repoRoot, waitFor } from './helpers.js';
 
 const INDEX_ENTRY = join(repoRoot, 'src', 'index.js');
 const BIN_ENTRY = join(repoRoot, 'bin', 'waystation.js');
@@ -41,7 +42,51 @@ async function fetchStatus(client) {
   return JSON.parse(called.content[0].text);
 }
 
-test('stdio 骨架：进程可起、ws_status 可调、网络层就绪、首跑落盘数据目录', { timeout: 30000 }, async (t) => {
+// 就绪判据：TCP 拨入成功 = transport 已进入监听（正常监听态，排除降级）
+async function waitPortListening(port) {
+  await waitFor(() => new Promise((resolve) => {
+    const probe = connect({ host: '127.0.0.1', port });
+    probe.once('connect', () => {
+      probe.destroy();
+      resolve(true);
+    });
+    probe.once('error', () => {
+      probe.destroy();
+      resolve(false);
+    });
+  }), { timeoutMs: 15000 });
+}
+
+// 等进程退出；超时返回 null（由调用方断言报错，避免测试挂起占用后续用例时间）
+function waitProcessExit(child, timeoutMs) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      resolve(null);
+    }, timeoutMs);
+    child.once('exit', (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    });
+  });
+}
+
+// 端口释尽核验：进程持有的两个监听口（TCP 帧通道 / UDP 发现）都能重新独占绑定
+async function assertPortRebindable(port) {
+  const tcp = createServer();
+  await new Promise((resolve, reject) => {
+    tcp.once('error', reject);
+    tcp.listen({ port, host: '0.0.0.0' }, resolve);
+  });
+  await new Promise((resolve) => tcp.close(resolve));
+  const udp = dgram.createSocket({ type: 'udp4', reuseAddr: false });
+  await new Promise((resolve, reject) => {
+    udp.once('error', reject);
+    udp.bind({ port, address: '0.0.0.0', exclusive: true }, resolve);
+  });
+  await new Promise((resolve) => udp.close(resolve));
+}
+
+test('stdio 骨架：进程可起、ws_status 可调、网络层就绪、数据目录初始化（instance-id/logs/collabs）+ 预写配置读取生效', { timeout: 30000 }, async (t) => {
   const home = makeTempDir(t);
   const port = await pickFreePort();
   const client = await connectClient(t, INDEX_ENTRY, home, { port });
@@ -173,4 +218,31 @@ test('端口占用二：无关程序占用 → 降级、port-taken 文案与改�
   assert.equal(status.net.reason, 'port-taken');
   assert.ok(status.net.message.includes('被其他程序占用'));
   assert.ok(status.net.message.includes('config.json'));
+});
+
+test('会话关闭（stdin 关闭）→ 进程退出（退出码 0）并释放 TCP/UDP 端口', { timeout: 30000 }, async (t) => {
+  const home = makeTempDir(t);
+  const port = await pickFreePort();
+  writeFileSync(join(home, 'config.json'), JSON.stringify({ scanWindowMs: 300, dialTimeoutMs: 1500, port }));
+  const child = spawn(process.execPath, [INDEX_ENTRY], {
+    cwd: repoRoot,
+    env: { ...process.env, WAYSTATION_HOME: home },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk;
+  });
+  t.after(() => {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGKILL');
+    }
+  });
+  await waitPortListening(port);
+  child.stdin.end();
+  const exitResult = await waitProcessExit(child, 8000);
+  assert.notEqual(exitResult, null, `stdin 关闭后 8 秒进程未退出（疑似仍持端口 ${port}）；stderr：${stderr}`);
+  assert.equal(exitResult.code, 0);
+  assert.equal(exitResult.signal, null);
+  await assertPortRebindable(port);
 });

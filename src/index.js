@@ -110,4 +110,20 @@ const context = {
 };
 const server = createMcpServer({ version, registry, context });
 await server.connect(new StdioServerTransport());
+
+/* 会话关闭（stdin EOF）= 这台机器离线（设计 §13）：关闭网络栈释放 UDP/TCP 监听端口后进程自然退出
+ * （关闭后事件循环不再有活动句柄，退出码 0）。MCP SDK 的 stdio transport 只监听 stdin 的 data/error、
+ * 不报告 EOF（server/stdio.js），故在这个组合根接线；硬杀（SIGTERM/SIGKILL）保持「被外部终止」的
+ * 既有语义，不接信号事件。 */
+let sessionEnded = false;
+function closeOnSessionEnd() {
+  if (sessionEnded) {
+    return;
+  }
+  sessionEnded = true;
+  void net.close();
+}
+process.stdin.on('end', closeOnSessionEnd);     // 管道写端关闭（EOF）
+process.stdin.on('close', closeOnSessionEnd);   // 流销毁兜底：与 end 二选一先到先赢
+
 log.info('waystation 启动完成', { version, dataDir, logDir, port: config.port, netAvailable: bind.ok });
