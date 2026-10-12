@@ -34,8 +34,10 @@ export async function waitFor(check, { timeoutMs = 5000, intervalMs = 25 } = {})
 }
 
 /** 取一个此刻空闲的高位端口：需要真实监听的测试用（避开默认端口 7321 与系统保留段）。
- * 「关闭探测」与「真正监听」之间有毫秒级窗口，理论上可能被并发测试抢走——
- * 此时测试会以显式 EADDRINUSE 失败，而不是静默错测。 */
+ * 注意（Windows 实测）：不是「随机取一个」——临时端口分配是**机器级顺序游标**，本函数取走游标位 X 后，
+ * X+1、X+2… 就是接下来会发给任何进程的端口（出站连接、外部设备的长连接都可能落进 X 的邻位）。
+ * 故「取到 X = X 此刻空闲」只对 X 本身成立，不蕴含 X 的邻居在用例窗口内保持空闲——
+ * 依赖邻位空闲的断言须按容差口径写或做守卫式重试（详见 test/site.test.js 头注）。 */
 export async function pickFreePort() {
   const probe = createServer();
   await new Promise((resolve, reject) => {
@@ -55,6 +57,9 @@ export async function pickFreePort() {
 export async function pickFreeSegment(size = 8, attempts = 20) {
   for (let round = 0; round < attempts; round++) {
     const base = await pickFreePort();
+    if (base + size - 1 > 65535) {
+      continue;   // 段尾越界（游标贴近动态端口范围顶端）：不试绑——越界端口会让 bind 同步抛错
+    }
     if (await isRangeFree(base, size)) {
       return base;
     }

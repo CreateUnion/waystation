@@ -6,6 +6,12 @@ import { makeTempDir, pickFreeSegment, repoRoot, waitForRebindable } from './hel
 
 const FIXTURE = join(repoRoot, 'test', 'fixtures', 'site-resolve.mjs');
 
+/* 段基与邻位端口的实测事实（同 site.test.js 头注）：Windows 的临时端口分配是机器级顺序游标——
+ * pickFreeSegment 取到段基后，base+1、base+2… 会被任何进程逐步取走（并行的另一测试文件也会把
+ * 占位者绑到它自己段基的邻位，可能正好落进本文件的段基窗口）。故进程级序列按「守卫式重试 + 容差顺延」
+ * 写：序列前提（先启动者占槽位 1 等）不成立时换新段基整体重跑，重试仍不成立才把最后一次结果
+ * 交回断言判红——确定性缺陷不被掩盖，失败信息带完整结果 JSON 便于归因。 */
+
 /* 常驻解析进程（hold: true 时夹具持锁并以合法 probe-ack 应答）：等首行结果，保持进程存活。 */
 function startResolve(t, args) {
   const child = spawn(process.execPath, [FIXTURE, JSON.stringify(args)], {
@@ -71,44 +77,77 @@ function runResolve(t, args) {
   });
 }
 
+/* 并发启动竞争：先启动者持槽位 1；同一轮内后启动者也跑完，便于统一判红。段基窗口的残余碰撞
+ * （先启动者拿不到槽位 1、后启动者段满）按守卫式重试换新段基整体重跑；最后一轮结果原样交回。 */
+async function raceTwoStarters(t, mainDir, rounds = 3) {
+  for (let round = 0; ; round++) {
+    const base = await pickFreeSegment();
+    const first = startResolve(t, { mainDir, segmentBase: base, hold: true });
+    const firstResult = await first.result;
+    const second = await runResolve(t, { mainDir, segmentBase: base });
+    const healthy = firstResult.ok === true && firstResult.slot === 1 && second.ok === true;
+    if (healthy || round === rounds - 1) {
+      return { base, firstResult, second };
+    }
+    await stopResolve(first.child);
+  }
+}
+
+/* 崩溃 → 抢占 → 自愈序列：先启动者占槽位 1 后强杀（端口随进程退出释放），新终端就近继承槽位 1 与
+ * 站点身份，原会话重启改取后续空闲槽位。守卫口径同 raceTwoStarters（首段落不健康时最后一轮为空位）。 */
+async function crashAndHeal(t, mainDir, rounds = 3) {
+  for (let round = 0; ; round++) {
+    const base = await pickFreeSegment();
+    const first = startResolve(t, { mainDir, segmentBase: base, hold: true });
+    const firstResult = await first.result;
+    if (firstResult.ok !== true || firstResult.slot !== 1) {
+      if (round === rounds - 1) {
+        return { base, firstResult, reclaimed: null, healed: null };
+      }
+      await stopResolve(first.child);
+      continue;
+    }
+    await stopResolve(first.child);   // 故障注入：原终端崩溃（强杀）——端口随进程退出释放
+    await waitForRebindable(base);    // 实测 SIGKILL 后端口 1–4ms 即可重绑：轮询至可重绑，替代固定 sleep（定值会打偏）
+    const reclaimee = startResolve(t, { mainDir, segmentBase: base, hold: true });
+    const reclaimed = await reclaimee.result;
+    const healed = await runResolve(t, { mainDir, segmentBase: base });
+    const healthy = reclaimed.ok === true && reclaimed.slot === 1 && healed.ok === true;
+    if (healthy || round === rounds - 1) {
+      return { base, firstResult, reclaimed, healed };
+    }
+    await stopResolve(reclaimee.child);
+  }
+}
+
 test('并发启动竞争（进程级）：先启动者占据槽位 1，后启动者自动顺延下一空闲槽位', { timeout: 30000 }, async (t) => {
   const mainDir = makeTempDir(t);
-  const base = await pickFreeSegment();   // 八连空闲段基：段内相邻端口不得被系统临时端口等占用（槽位号漂移类假红的根因）
-  const first = startResolve(t, { mainDir, segmentBase: base, hold: true });
-  const firstResult = await first.result;
-  assert.equal(firstResult.ok, true);
-  assert.equal(firstResult.slot, 1);
-  assert.equal(firstResult.port, base);
-  const second = await runResolve(t, { mainDir, segmentBase: base });
-  assert.equal(second.ok, true);
+  const { base, firstResult, second } = await raceTwoStarters(t, mainDir);   // 八连空闲段基：段内相邻端口不得被系统临时端口等占用（槽位号漂移类假红的根因）
+  assert.equal(firstResult.ok, true, JSON.stringify(firstResult));
+  assert.equal(firstResult.slot, 1, JSON.stringify(firstResult));
+  assert.equal(firstResult.port, base, JSON.stringify(firstResult));
+  assert.equal(second.ok, true, JSON.stringify(second));
   /* 顺延语义 = 跳过被占槽位、取下一空闲；段内相邻端口在测试窗口内可能被系统临时端口等临时占用，
    * 此时顺延到 3 亦属设计内正确行为——断言锁定「发生了顺延且槽号/端口/目录自洽」，不锁死具体槽号。 */
   assert.ok(second.slot >= 2, '槽位 1 的占用者持有合法驿站应答：后启动者必须顺延（≥2）');
   assert.equal(second.port, base + second.slot - 1);
   assert.equal(second.dataDir, join(mainDir, 'sites', String(second.slot)));
-  await stopResolve(first.child);
 });
 
 test('崩溃 → 新终端抢占 → 自愈序列（进程级）：抢占者继承站点身份，自愈者改取下一空闲槽位', { timeout: 40000 }, async (t) => {
   const mainDir = makeTempDir(t);
-  const base = await pickFreeSegment();
-  const first = startResolve(t, { mainDir, segmentBase: base, hold: true });
-  const firstResult = await first.result;
-  assert.equal(firstResult.slot, 1);
-  assert.equal(firstResult.dataDir, mainDir);
-  await stopResolve(first.child);   // 故障注入：原终端崩溃（强杀）——端口随进程退出释放
-  await waitForRebindable(base);    // 实测 SIGKILL 后端口 1–4ms 即可重绑：轮询至可重绑，替代固定 sleep（定值会打偏）
-  const reclaimee = startResolve(t, { mainDir, segmentBase: base, hold: true });
-  const reclaimed = await reclaimee.result;
+  const { base, firstResult, reclaimed, healed } = await crashAndHeal(t, mainDir);
+  assert.equal(firstResult.ok, true, JSON.stringify(firstResult));
+  assert.equal(firstResult.slot, 1, JSON.stringify(firstResult));
+  assert.equal(firstResult.dataDir, mainDir, JSON.stringify(firstResult));
+  assert.equal(reclaimed.ok, true, JSON.stringify(reclaimed));
   assert.equal(reclaimed.slot, 1, '原终端崩溃后：槽位 1 空闲，新终端就近取得同一槽位与目录');
   assert.equal(reclaimed.dataDir, mainDir);
   assert.equal(reclaimed.instanceId, firstResult.instanceId, '同一数据目录 = 同一站点实例标识（身份被继承）');
-  const healed = await runResolve(t, { mainDir, segmentBase: base });
-  assert.equal(healed.ok, true);
+  assert.equal(healed.ok, true, JSON.stringify(healed));
   /* 同用例 1：自愈者必须改取「≥2 的下一空闲槽位」，但不锁死具体槽号（相邻端口临时被占 → 顺延属设计内）。 */
   assert.ok(healed.slot >= 2, '原会话自愈重启：原槽位已被抢占，改取下一空闲槽位（≥2）');
   assert.equal(healed.port, base + healed.slot - 1);
   assert.equal(healed.dataDir, join(mainDir, 'sites', String(healed.slot)));
   assert.notEqual(healed.instanceId, firstResult.instanceId, '新目录 = 新站点实例标识');
-  await stopResolve(reclaimee.child);
 });
