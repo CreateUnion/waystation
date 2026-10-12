@@ -289,7 +289,7 @@ function evaluateRemoteHandshake(state, local, frame) {
      * 视为继续（否则新驿丞会被自己的记录降级、删掉台账）。 */
     if (takeover !== null && takeover.candidate.instanceId !== state.self.instanceId) {
       if (takeover.phase === 'effective') {
-        convergeOnReplaced(state, local, takeover.candidate, takeover.baseVersion);
+        handleCarriedEffective(state, local, takeover);
         return;
       }
       suspendLocal(state, local, 'takeover-inflight', Date.now() + state.config.takeoverWindowMs);
@@ -302,19 +302,19 @@ function evaluateRemoteHandshake(state, local, frame) {
 
 function evaluateRemoteAsMember(state, local, frame, remote, takeover) {
   if (takeover !== null && takeover.candidate.instanceId !== state.self.instanceId) {
-    if (takeover.phase === 'effective') {
+    if (takeover.phase === 'effective' && !carriedRecordStale(state, local, takeover.baseVersion)) {
       convergeMemberOnEffective(state, local, takeover.candidate, takeover.baseVersion);
     }
     return;
   }
   if (remote.role === 'manager') {
-    /* 陈旧主张守卫：本机持有指向他方的生效抢接记录时，不采纳「自认驿丞」的 manager 主张——
-     * 被替换驿丞重启 / 其排队帧续投时携带的恰恰是 role=manager、takeover=null（其本地视角），
-     * 采纳会让本机引用回翻（出站改道、视图被快照来源守卫冻结、无自动纠正路径）。本机照常回帧
-     * 把生效记录带给对方，由对方收敛——握手对表的对称面。 */
-    const effective = state.effectiveTakeovers.get(local.collabId);
-    if (effective !== undefined && effective.candidate.instanceId !== frame.from.instanceId) {
-      state.log.warn('收到陈旧驿丞主张（本机已收敛到他方生效抢接）——不采纳', { collabId: local.collabId, claimed: frame.from.instanceId });
+    /* 陈旧主张守卫（对照本机已知）：发送方非本机现任驿丞时，须主张版本严格高于本机最近一次
+     * 席位变更的基准版本才可学习——被替换驿丞重启 / 其管理器时代排队帧续投携带的是等于或
+     * 更旧的主张（内部版本号），采纳会让本机引用回翻（出站改道、视图被快照来源守卫冻结、
+     * 无自动纠正路径）；更新的主张（真正的新驿丞）照常学习（不得过度收窄）。本机照常回帧
+     * 把本机生效记录带给对方，由对方收敛——握手对表的对称面。 */
+    if (!managerClaimAcceptable(state, local, frame, remote)) {
+      state.log.warn('收到陈旧驿丞主张（版本未越过本机已知的席位变更基准）——不采纳', { collabId: local.collabId, claimed: frame.from.instanceId, claimedVersion: remote.version });
       return;
     }
     adoptNewManager(state, local, { instanceId: frame.from.instanceId, identityName: frame.from.identityName }, remote.version);
@@ -323,6 +323,42 @@ function evaluateRemoteAsMember(state, local, frame, remote, takeover) {
       requestCurrentView(state, local);   // 常规对表：同步现任视图
     }
   }
+}
+
+/* 管理席位对「他方携带的生效记录」的处置：候选资格校验——本机台账版本已越过记录基准
+ * （席位已翻页：如本机经移交承接席位后又收到旧记录）即不收敛，否则新驿丞会被已翻页的
+ * 记录拉下席位、删掉台账；校验通过才照常让位（合流 + 降级）。 */
+function handleCarriedEffective(state, local, takeover) {
+  if (carriedRecordStale(state, local, takeover.baseVersion)) {
+    state.log.warn('收到已过时的生效抢接记录（本机版本已越过其基准）——不收敛', { collabId: local.collabId, candidate: takeover.candidate.instanceId, baseVersion: takeover.baseVersion });
+    return;
+  }
+  convergeOnReplaced(state, local, takeover.candidate, takeover.baseVersion);
+}
+
+/* 管理者主张的可学习性：本机现任驿丞本人的主张照常采纳（幂等对表）；他方主张须版本严格高于
+ * 本机最近一次席位变更的基准（成员记录随采纳写入，缺省 0 = 无席位变更知识，均可学习）。
+ * 版本未知（null / 非整数）的他方主张不可判新——按陈旧处理（保守不采纳）。 */
+function managerClaimAcceptable(state, local, frame, remote) {
+  if (frame.from.instanceId === currentManagerIdOf(local)) {
+    return true;
+  }
+  return Number.isInteger(remote.version) && remote.version > managerSinceVersionOf(local);
+}
+
+/* 本机已知的最近一次席位变更基准版本（成员侧记录；管理席位不适用——其席位权威即台账版本）。 */
+function managerSinceVersionOf(local) {
+  return typeof local.member?.managerSinceVersion === 'number' ? local.member.managerSinceVersion : 0;
+}
+
+/* 携带的生效抢接记录是否相对本机知识已过时：记录基准早于本机已知版本（成员 = 快照版本与
+ * 最近一次席位变更基准的较大者；管理席位 = 台账版本）——记录描述的是比本机已知更旧的席位
+ * 状态，不以其收敛（陈旧记录不得回翻已收敛节点，也不得把新驿丞拉下席位）。 */
+function carriedRecordStale(state, local, baseVersion) {
+  const known = local.role === 'manager'
+    ? local.ledger.version
+    : Math.max(local.snapshot === null ? 0 : local.snapshot.version, managerSinceVersionOf(local));
+  return known > baseVersion;
 }
 
 /* —— 抢接（发起 / 汇总 / 让位 / 人确认 / 生效）—— */
@@ -733,7 +769,7 @@ export function convergeOnReplaced(state, local, candidate, baseVersion) {
     }
   }
   const name = localNameOf(local);
-  downgradeToMember(state, local, candidate);
+  downgradeToMember(state, local, candidate, baseVersion);
   state.counters.takeoverDowngrades++;
   state.log.warn('本机让位——已降级为协作者', { collabId: local.collabId, newManager: candidate.instanceId, baseVersion });
   notifyLocal(state, local, `本机已被替换：协作「${name}」的驿丞现为「${candidate.identityName}」；本机已降为协作者。`);

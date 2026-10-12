@@ -138,7 +138,7 @@ export function completeHandover(state, local, accept) {
     to: accept.managerPeer.instanceId,
     digest: accept.digest,
   });
-  downgradeToMember(state, local, accept.managerPeer);
+  downgradeToMember(state, local, accept.managerPeer, accept.version);
   sendToRoster(state, local, 'notice', {
     event: 'manager-changed',
     version: accept.version,

@@ -747,3 +747,148 @@ test('治理面读数：成员握手无果在清单可见（handshakeUnresolved�
   assert.equal(harness.service.list().collabs[0].handshakeUnresolved, false, '接触即清除（读数与恢复面同步）');
   harness.service.close();
 });
+
+/* —— 席位变更作废语义与陈旧席位主张（期终复检裁定 R-1 / R-2）—— */
+
+/* 三节点建协（A 为原驿丞）：邀请 / 同意 / 建立通告 / 快照逐帧投递；B 与 C 互学端点。 */
+async function establishTriad(a, b, c, collabId) {
+  const peerA = peer('inst-a', '主机甲');
+  for (const node of [b, c]) {
+    const invite = a.sent.find((message) => message.type === 'invite' && message.to.instanceId === node.self.instanceId);
+    await receive(node.service, collabFrame('invite', collabId, peerA, invite.payload));
+    await node.service.approve({ collabId, approve: true });
+    const approve = node.sent.find((message) => message.type === 'approve');
+    await receive(a.service, collabFrame('approve', collabId, peer(node.self.instanceId, node.self.identityName), approve.payload));
+  }
+  for (const node of [b, c]) {
+    const established = a.sent.filter((message) => message.type === 'notice' && message.payload.event === 'established' && message.to.instanceId === node.self.instanceId).at(-1);
+    await receive(node.service, collabFrame('notice', collabId, peerA, established.payload));
+    const snapshot = a.sent.filter((message) => message.type === 'snapshot' && message.to.instanceId === node.self.instanceId).at(-1);
+    await receive(node.service, collabFrame('snapshot', collabId, peerA, snapshot.payload));
+  }
+  await receive(b.service, collabFrame('reply', collabId, peer('inst-c', '主机丙'), { text: '端点互识' }));
+  await receive(c.service, collabFrame('reply', collabId, peer('inst-b', '主机乙'), { text: '端点互识' }));
+}
+
+/* B 判 A 失联 → 抢接生效 → 生效广播逐帧投给 A 与 C（A 让位降级、C 采纳新驿丞）。 */
+async function bTakesOverSeat(a, b, c, collabId) {
+  b.service.start();
+  await waitFor(() => (b.service.list().collabs[0].managerOffline === true ? true : null), { timeoutMs: 3000 });
+  const verdict = await b.service.takeOver({ collabId });
+  assert.equal(verdict.phase, 'awaiting-confirm');
+  const applied = await b.service.takeOver({ collabId, confirm: true });
+  assert.equal(applied.ok, true, String(applied.message));
+  assert.equal(b.service.list().collabs[0].role, 'manager');
+  b.service.close();
+  for (const node of [a, c]) {
+    const news = b.sent.find((message) => message.type === 'takeover' && message.to.instanceId === node.self.instanceId);
+    assert.ok(news, '生效广播应逐一触达名册端点');
+    await receive(node.service, collabFrame('takeover', collabId, peer('inst-b', '主机乙'), news.payload));
+  }
+  assert.equal(a.service.list().collabs[0].role, 'member');
+  assert.equal(c.service.list().collabs[0].role, 'member');
+}
+
+/* B → C 显式移交（offer / accept 收口）→「驿丞已变更」通告投给 A。 */
+async function bHandsOverToC(a, b, c, collabId) {
+  b.script.push({ reachable: true, rttMs: 1 });
+  b.sent.length = 0;
+  const pendingHandover = b.service.handover({ collabId, target: 'inst-c' });
+  const offer = await waitFor(() => b.sent.find((message) => message.type === 'handover' && message.payload.kind === 'offer'), { timeoutMs: 2000 });
+  await receive(c.service, collabFrame('handover', collabId, peer('inst-b', '主机乙'), offer.payload));
+  const accept = await waitFor(() => c.sent.find((message) => message.type === 'handover' && message.payload.kind === 'accept'), { timeoutMs: 2000 });
+  await receive(b.service, collabFrame('handover', collabId, peer('inst-c', '主机丙'), accept.payload));
+  const handoverResult = await pendingHandover;
+  assert.equal(handoverResult.ok, true, String(handoverResult.message));
+  assert.equal(c.service.list().collabs[0].role, 'manager');
+  assert.equal(b.service.list().collabs[0].role, 'member');
+  const changed = b.sent.find((message) => message.type === 'notice' && message.payload.event === 'manager-changed');
+  assert.ok(changed);
+  await receive(a.service, collabFrame('notice', collabId, peer('inst-b', '主机乙'), changed.payload));
+}
+
+/* A 发起常规握手（网络恢复 / 重启触发面的等价物）→ C 回帧 → A 评估。 */
+async function regularHandshakeFromA(a, c, collabId) {
+  a.sent.length = 0;
+  c.sent.length = 0;
+  a.service.handshake({ collabId });
+  const handshakeOut = a.sent.find((message) => message.type === 'notice' && message.payload.event === 'handshake');
+  assert.ok(handshakeOut, 'A 的握手帧已发出');
+  await receive(c.service, collabFrame('notice', collabId, peer('inst-a', '主机甲'), handshakeOut.payload));
+  const replyOut = c.sent.find((message) => message.type === 'notice' && message.payload.event === 'handshake' && message.to.instanceId === 'inst-a');
+  assert.ok(replyOut, 'C 对发起帧必回一帧');
+  await receive(a.service, collabFrame('notice', collabId, peer('inst-c', '主机丙'), replyOut.payload));
+}
+
+test('三节点组合链：抢占 → 显式移交 → 常规握手——席位收敛一致、新驿丞不被旧记录拉下席位', async (t) => {
+  /* 判别性用例（期终复检三节点探针链转正）：抢占 × 移交互作的记录传播面——修复前：
+   * 新驿丞 C 收到携带旧生效记录的握手即自我降级并删台账，A 引用回翻，终态三节点互指成员、
+   * 无管理者。修复后：席位变更作废记录 + 接收侧候选资格校验 → 链条收敛一致。 */
+  const a = makeHarness(t, { self: { instanceId: 'inst-a', identityName: '主机甲', port: 17321 } });
+  const b = makeHarness(t, { self: { instanceId: 'inst-b', identityName: '主机乙', port: 17321 } });
+  const c = makeHarness(t, { self: { instanceId: 'inst-c', identityName: '主机丙', port: 17321 } });
+  const collabId = a.service.create({
+    name: '三段链项目',
+    topic: '联调',
+    targets: [
+      { instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 },
+      { instanceId: 'inst-c', identityName: '主机丙', address: '127.0.0.3', port: 17321 },
+    ],
+  }).collabId;
+  await establishTriad(a, b, c, collabId);
+  await bTakesOverSeat(a, b, c, collabId);
+  await bHandsOverToC(a, b, c, collabId);
+  await regularHandshakeFromA(a, c, collabId);
+  /* [4] 候选资格校验（防御面直投）：成员携带的旧记录 {inst-b, base 2} 打到 C——C 台账版本已越过基准，不收敛。 */
+  c.sent.length = 0;
+  await receive(c.service, collabFrame('notice', collabId, peer('inst-b', '主机乙'), {
+    event: 'handshake',
+    role: 'member',
+    version: 2,
+    takeover: { phase: 'effective', candidate: { instanceId: 'inst-b', identityName: '主机乙' }, baseVersion: 2 },
+    reply: true,
+  }));
+
+  /* 终态不变式：C 仍为驿丞（台账在、无降级），A / B 引用一致指向 C——有且仅有一个可收敛管理者。 */
+  assert.equal(c.service.list().collabs[0].role, 'manager', '新驿丞未被已翻页的记录拉下席位');
+  assert.equal(c.service.stats().takeoverDowngrades, 0);
+  assert.equal(existsSync(collabFilePath(c.dir, collabId, LEDGER_FILE_NAME)), true, '新驿丞台账未被删除');
+  assert.equal(b.service.list().collabs[0].role, 'member');
+  const memberA = JSON.parse(readFileSync(join(a.dir, 'collabs', collabId, 'member.json'), 'utf8'));
+  assert.equal(memberA.manager.instanceId, 'inst-c', 'A 引用指向现任驿丞（未回翻）');
+  const memberB = JSON.parse(readFileSync(join(b.dir, 'collabs', collabId, 'member.json'), 'utf8'));
+  assert.equal(memberB.manager.instanceId, 'inst-c');
+  a.service.close();
+  b.service.close();
+  c.service.close();
+});
+
+test('陈旧席位主张（移交面）：陈旧 manager 主张拒绝、正当新驿丞主张照常学习（R-2 两向）', async (t) => {
+  /* 判别性用例（期终复检探针②）：纯移交面不产生生效抢接记录——守卫须对照本机已知的
+   * 席位变更基准版本：等于 / 更旧的主张不采纳（防回翻），更新的主张照常学习（不过度收窄）。 */
+  const harness = makeHarness(t);
+  const collabId = await memberActive(harness);
+  await receive(harness.service, collabFrame('notice', collabId, peer('inst-a', '主机甲'), { event: 'manager-changed', version: 3, manager: { instanceId: 'inst-b', identityName: '主机乙' } }));
+  let member = JSON.parse(readFileSync(join(harness.dir, 'collabs', collabId, 'member.json'), 'utf8'));
+  assert.equal(member.manager.instanceId, 'inst-b', '先经驿丞变更采纳新驿丞（变更基准版本 3）');
+  await receive(harness.service, collabFrame('notice', collabId, peer('inst-a', '主机甲'), { event: 'handshake', role: 'manager', version: 3, takeover: null, reply: true }));
+  member = JSON.parse(readFileSync(join(harness.dir, 'collabs', collabId, 'member.json'), 'utf8'));
+  assert.equal(member.manager.instanceId, 'inst-b', '陈旧主张（版本未越过席位变更基准）不采纳');
+  await receive(harness.service, collabFrame('notice', collabId, peer('inst-a', '主机甲'), {
+    event: 'handshake',
+    role: 'member',
+    version: 2,
+    takeover: { phase: 'effective', candidate: { instanceId: 'inst-a', identityName: '主机甲' }, baseVersion: 2 },
+    reply: true,
+  }));
+  member = JSON.parse(readFileSync(join(harness.dir, 'collabs', collabId, 'member.json'), 'utf8'));
+  assert.equal(member.manager.instanceId, 'inst-b', '携带旧记录的握手同样不回翻');
+  assert.equal(harness.service.stats().takeoverDowngrades, 0);
+
+  /* 方向二：正当的新驿丞主张照常学习（未变更过席位的成员）。 */
+  const fresh = makeHarness(t);
+  const freshId = await memberActive(fresh);
+  await receive(fresh.service, collabFrame('notice', freshId, peer('inst-b', '主机乙'), { event: 'handshake', role: 'manager', version: 3, takeover: null, reply: true }));
+  const freshMember = JSON.parse(readFileSync(join(fresh.dir, 'collabs', freshId, 'member.json'), 'utf8'));
+  assert.equal(freshMember.manager.instanceId, 'inst-b', '更新的管理者主张照常学习（不得过度收窄）');
+});

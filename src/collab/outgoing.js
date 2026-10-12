@@ -533,6 +533,9 @@ export function countLiveCollabs(state) {
  * 台账落盘（本机成为单一写者）、自身留存并推送当前视图（成员由此学习新驿丞端点）。 */
 export function promoteToManager(state, local, ledger) {
   syncRosterRoles(ledger);
+  /* 席位变更（受让 / 接管）作废本机关于他方候选的生效抢接记录（指向本机自身的新记录
+   * 由抢接生效路径随后登记）——陈旧记录继续随握手外传会让对手方按已翻页的席位收敛。 */
+  invalidateEffectiveTakeovers(state, local, state.self.instanceId);
   local.role = 'manager';
   local.ledger = ledger;
   local.member = managerRecordOf(ledger);
@@ -556,10 +559,25 @@ function syncRosterRoles(ledger) {
   }
 }
 
+/* 生效抢接记录的席位翻页作废：keepCandidateId 指保留「关于该候选」的记录（传 null 清空全部）。
+ * 生效记录是进程内的席位主张面——任何本机席位变更（受让 / 让位 / 采纳新驿丞）即告翻页；
+ * 不清理会让组合链（抢占 × 移交）里已翻页的记录继续经握手传播，把新驿丞按旧记录拉下席位。 */
+function invalidateEffectiveTakeovers(state, local, keepCandidateId) {
+  const held = state.effectiveTakeovers.get(local.collabId);
+  if (held === undefined) {
+    return;
+  }
+  if (keepCandidateId === null || held.candidate.instanceId !== keepCandidateId) {
+    state.effectiveTakeovers.delete(local.collabId);
+  }
+}
+
 /* 降级为成员（被替换 / 合流让位的落点）：管理席位——以台账定格名单转成员记录、删除本地台账
  * （单副本纪律：台账随后任驿丞走；本机快照保留为成员备份）；成员——仅更新驿丞引用。
- * 随后重定向陈旧出站队列（发往旧驿丞的未确认消息改投新驿丞——不静默丢弃）并拉取现任视图。 */
-export function downgradeToMember(state, local, managerPeer) {
+ * 随后重定向陈旧出站队列（发往旧驿丞的未确认消息改投新驿丞——不静默丢弃）并拉取现任视图。
+ * 席位变更（让位）作废本机生效抢接记录并记下本次变更的基准版本（陈旧主张判定的本机已知面）。 */
+export function downgradeToMember(state, local, managerPeer, version) {
+  invalidateEffectiveTakeovers(state, local, null);
   const formerManagerId = currentManagerIdOf(local);
   if (local.role === 'manager') {
     local.member = memberRecordOf(local, managerPeer);
@@ -570,6 +588,9 @@ export function downgradeToMember(state, local, managerPeer) {
     }
   } else {
     local.member.manager = { instanceId: managerPeer.instanceId, identityName: managerPeer.identityName };
+  }
+  if (Number.isInteger(version)) {
+    local.member.managerSinceVersion = version;
   }
   local.suspended = null;
   persistMember(state, local);
@@ -632,7 +653,14 @@ export function adoptNewManager(state, local, managerPeer, remoteVersion) {
   if (oldId === managerPeer.instanceId) {
     return false;
   }
+  /* 席位变更（采纳新驿丞）作废关于其它候选的生效记录（关于新驿丞本人的记录保留——它是
+   * 本机对「发生过抢接」的如实知识，继续随握手外传供他方收敛）；并记下本次变更的基准版本
+   * （陈旧主张判定的本机已知面：等于或更旧的主张不再回翻本机引用）。 */
+  invalidateEffectiveTakeovers(state, local, managerPeer.instanceId);
   local.member.manager = { instanceId: managerPeer.instanceId, identityName: managerPeer.identityName };
+  if (Number.isInteger(remoteVersion)) {
+    local.member.managerSinceVersion = remoteVersion;
+  }
   persistMember(state, local);
   retargetStaleQueue(state, local, oldId, managerPeer.instanceId);
   state.counters.managerChangedIn++;
