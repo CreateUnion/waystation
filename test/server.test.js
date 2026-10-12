@@ -136,7 +136,7 @@ test('stdio 骨架：进程可起、ws_status 可调、网络层就绪、数据�
   const port = await pickFreePort();
   const client = await connectClient(t, INDEX_ENTRY, home, { port });
   const { tools } = await client.listTools();
-  assert.deepEqual(tools.map((tool) => tool.name), ['ws_status', 'ws_list_hosts', 'ws_ping', 'ws_delivery_status', 'ws_check_inbox']);
+  assert.deepEqual(tools.map((tool) => tool.name), ['ws_status', 'ws_list_hosts', 'ws_ping', 'ws_delivery_status', 'ws_check_inbox', 'ws_list_collabs', 'ws_create_collab', 'ws_approve_invite', 'ws_withdraw_invite', 'ws_view_ledger', 'ws_send_message', 'ws_leave_collab', 'ws_end_collab']);
   const status = await fetchStatus(client);
   assert.equal(status.name, 'waystation');
   assert.equal(status.version, '0.1.0');
@@ -152,6 +152,9 @@ test('stdio 骨架：进程可起、ws_status 可调、网络层就绪、数据�
   assert.equal(status.net.available, true);
   assert.equal(status.net.reason, null);
   assert.equal(status.net.port, port);
+  // 协作服务随组合根接线：状态块含协作计数（新装整机零协作）
+  assert.deepEqual(status.collab.byState, {});
+  assert.equal(status.collab.collabs, 0);
   // WAYSTATION_HOME + 预写 port = 显式接管站点（站点块随状态输出，供多站点排障）
   assert.deepEqual(status.site, { mode: 'explicit', slot: null, port, takeover: true });
   assert.equal(existsSync(join(home, 'config.json')), true);
@@ -307,4 +310,31 @@ test('会话关闭（stdin 关闭）→ 进程退出（退出码 0）并释放 T
   assert.equal(exitResult.code, 0);
   assert.equal(exitResult.signal, null);
   await assertPortRebindable(port);
+});
+
+test('ws_list_collabs：新装返回空清单（协作工具面已接线）', { timeout: 30000 }, async (t) => {
+  const home = makeTempDir(t);
+  const client = await connectClient(t, INDEX_ENTRY, home, { port: await pickFreePort() });
+  const called = await client.callTool({ name: 'ws_list_collabs', arguments: {} });
+  assert.equal(called.isError, undefined);
+  assert.deepEqual(JSON.parse(called.content[0].text), { collabs: [] });
+});
+
+test('ws_create_collab：参数非法 → isError（不建立任何协作）', { timeout: 30000 }, async (t) => {
+  const home = makeTempDir(t);
+  const client = await connectClient(t, INDEX_ENTRY, home, { port: await pickFreePort() });
+  const bad = await client.callTool({ name: 'ws_create_collab', arguments: { name: '项目', topic: '主题', targets: [] } });
+  assert.equal(bad.isError, true);
+  const listed = await client.callTool({ name: 'ws_list_collabs', arguments: {} });
+  assert.deepEqual(JSON.parse(listed.content[0].text), { collabs: [] });
+});
+
+test('ws_view_ledger / ws_send_message：未知协作 → isError（明确提示）', { timeout: 30000 }, async (t) => {
+  const home = makeTempDir(t);
+  const client = await connectClient(t, INDEX_ENTRY, home, { port: await pickFreePort() });
+  const viewed = await client.callTool({ name: 'ws_view_ledger', arguments: { collabId: 'collab-none' } });
+  assert.equal(viewed.isError, true);
+  assert.ok(viewed.content[0].text.includes('没有该协作'));
+  const sent = await client.callTool({ name: 'ws_send_message', arguments: { collabId: 'collab-none', text: '你好' } });
+  assert.equal(sent.isError, true);
 });

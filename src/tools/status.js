@@ -24,6 +24,7 @@ export function statusTool() {
         node: process.version,
         startedAt: context.startedAt,
         net: context.net.status(),
+        collab: context.collab.stats(),   // 协作服务计数（注册表状态分布 + 各类拒绝 / 丢弃计数）
       };
       return { content: [{ type: 'text', text: JSON.stringify(status, null, 2) }] };
     },
