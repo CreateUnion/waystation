@@ -44,12 +44,16 @@ const adapter = options.adapter === true
   : null;
 const transport = createTransport({ port, bindAddress, log });
 const dispatch = createDispatch({ dataDir, config, transport, self, log });
-/* 协作服务与生产组合根同参等价（除非显式注明的刻意差异）：发送经可靠队列、清单接入、描述器接线。 */
+/* 协作服务与生产组合根同参等价（除非显式注明的刻意差异）：发送经可靠队列、探测经即时通道、
+ * 队列改投经调度出口、清单接入、描述器接线、提示经注入口（适配器缺失时无提示面）。 */
 const collab = createCollabService({
   dataDir,
   config,
   self,
   send: (message) => dispatch.send(message),
+  probe: (address, port) => dispatch.ping({ address, port }),
+  reassign: (payload) => dispatch.reassignPeer(payload),
+  notify: adapter !== null ? (frame) => adapter.deliverFrame(frame) : null,
   knownHosts,
   log,
 });
@@ -78,6 +82,9 @@ const inbound = createInbound({
 const stack = createNetStack({ discovery, transport, dispatch, inbound, port, self, scanWindowMs: config.scanWindowMs, log });
 
 const bind = await stack.start();
+if (bind.ok) {
+  collab.start();   // 探测定时器 + 启动握手——与生产组合根同参（降级不启动）
+}
 write({ event: 'ready', instanceId, identityName: self.identityName, port, bind });
 
 /* 命令表（条件链改查表：新增命令不再抬升 handle 的圈复杂度；exit 自行退出、以 null 表示无应答）。 */
@@ -105,6 +112,17 @@ const COMMANDS = {
   list_collabs: async () => collab.list(),
   end_collab: async (command) => collab.end({ collabId: command.collabId }),
   leave_collab: async (command) => collab.leave({ collabId: command.collabId }),
+  // 治理命令（生产由 ws_decide / ws_handover / ws_take_over 工具承载）：
+  decide: async (command) => collab.decide({ collabId: command.collabId, choice: command.choice }),
+  decide_merge_offer: async (command) => collab.decideMerge({ collabId: command.collabId, mergeOffer: command.mergeOffer }),
+  handover: async (command) => collab.handover({ collabId: command.collabId, target: command.target }),
+  take_over: async (command) => collab.takeOver({ collabId: command.collabId }),
+  take_over_confirm: async (command) => collab.takeOver({ collabId: command.collabId, confirm: true }),
+  take_over_decline: async (command) => collab.takeOver({ collabId: command.collabId, confirm: false }),
+  handshake: async () => {
+    collab.handshake();
+    return { ok: true };
+  },
   collab_stats: async () => ({ ok: true, stats: collab.stats() }),
   exit: async () => {
     await shutdown();

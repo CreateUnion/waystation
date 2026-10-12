@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -596,4 +596,246 @@ test('协作预演：管理者离线 → view_ledger 回退快照并标注可能
   assert.equal(viewed.ok, true);
   assert.equal(viewed.source, 'snapshot');
   assert.ok(viewed.note.includes('可能非最新'));
+});
+
+/* —— 治理与韧性预演（本机近似；真实分区 / 双物理机归 M7）—— */
+
+/* 治理场景配置：短探测节律与短窗口压缩等待；治理帧与普通帧都走快速重试节律。 */
+const GOVERNANCE_CONFIG = {
+  managerProbeIntervalMs: 100,
+  managerOfflineMs: 300,
+  takeoverWindowMs: 600,
+  dispatchTickMs: 40,
+  retryIntervalMs: 200,
+  retrySlowIntervalMs: 300,
+  retryFastCount: 100,
+  dialTimeoutMs: 1000,
+  scanWindowMs: 300,
+};
+
+async function waitCollabState(node, collabId, wanted) {
+  return waitFor(async () => {
+    const result = await node.command({ cmd: 'list_collabs' });
+    const entry = result.collabs.find((candidate) => candidate.collabId === collabId);
+    return entry !== undefined && entry.state === wanted ? entry : null;
+  }, { timeoutMs: 20000 });
+}
+
+async function waitManagerOffline(node, collabId) {
+  await waitFor(async () => {
+    const listed = await node.command({ cmd: 'list_collabs' });
+    const entry = listed.collabs.find((candidate) => candidate.collabId === collabId);
+    return entry !== undefined && entry.managerOffline === true;
+  }, { timeoutMs: 20000 });
+}
+
+/* 等邀请到达并同意（多节点编排的公共步骤）。 */
+async function approveInto(node, collabId) {
+  await waitFor(async () => {
+    const listed = await node.command({ cmd: 'list_collabs' });
+    return listed.collabs.some((entry) => entry.collabId === collabId);
+  }, { timeoutMs: 15000 });
+  assert.equal((await node.command({ cmd: 'approve_invite', collabId, approve: true })).ok, true);
+}
+
+/* 三节点编排（并发抢接用）：先建乙丙协作接上彼此端点，再建甲管理的三人主协作。 */
+async function buildGovernedTriad(t, port, config) {
+  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, config });
+  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }], config });
+  const c = await startNode(t, { identityName: '主机丙', bindAddress: '127.0.0.1', port: port + 2, knownPeers: [{ address: '127.0.0.1', port }], config });
+  const y = await c.command({ cmd: 'create_collab', name: '接线项目', topic: '主题', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
+  await approveInto(b, y.collabId);
+  await waitCollabState(c, y.collabId, 'active');
+  await waitCollabState(b, y.collabId, 'active');
+  const x = await a.command({ cmd: 'create_collab', name: '并发项目', topic: '主题', targets: [
+    { instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 },
+    { instanceId: c.ready.instanceId, identityName: '主机丙', address: '127.0.0.1', port: port + 2 },
+  ] });
+  assert.equal(x.ok, true);
+  await approveInto(b, x.collabId);
+  await approveInto(c, x.collabId);
+  await waitCollabState(a, x.collabId, 'active');
+  await waitCollabState(b, x.collabId, 'active');
+  await waitCollabState(c, x.collabId, 'active');
+  return { a, b, c, collabId: x.collabId };
+}
+
+/* 双成员达成（甲管理、乙同意、建立并推过快照）；options.dataDirA 供重启复用目录的场景。 */
+async function establishPairWith(t, port, name, config, options = {}) {
+  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, dataDir: options.dataDirA, config });
+  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }], config });
+  const created = await a.command({ cmd: 'create_collab', name, topic: '主题', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
+  assert.equal(created.ok, true);
+  await waitFor(async () => {
+    const listed = await b.command({ cmd: 'list_collabs' });
+    return listed.collabs.some((entry) => entry.collabId === created.collabId);
+  }, { timeoutMs: 15000 });
+  assert.equal((await b.command({ cmd: 'approve_invite', collabId: created.collabId, approve: true })).ok, true);
+  await waitCollabState(a, created.collabId, 'active');
+  await waitCollabState(b, created.collabId, 'active');
+  return { a, b, collabId: created.collabId };
+}
+
+test('治理预演：显式交接全链（先确认后删除；受让方承担席位）', { timeout: 120000 }, async (t) => {
+  const port = await pickFreeSegment(2);
+  const dirA = makeNodeDir(t);
+  const { a, b, collabId } = await establishPairWith(t, port, '交接项目', GOVERNANCE_CONFIG, { dataDirA: dirA });
+  const handed = await a.command({ cmd: 'handover', collabId, target: b.ready.instanceId });
+  assert.equal(handed.ok, true, JSON.stringify(handed));
+  assert.ok(handed.message.includes('移交完成'));
+  const aEntry = await waitCollabState(a, collabId, 'active');
+  const bEntry = await waitCollabState(b, collabId, 'active');
+  assert.equal(aEntry.role, 'member');
+  assert.equal(bEntry.role, 'manager');
+  const bView = await b.command({ cmd: 'view_ledger', collabId });
+  assert.equal(bView.source, 'local');
+  assert.equal(bView.ledger.manager.instanceId, b.ready.instanceId);
+  assert.equal(existsSync(join(dirA, 'collabs', collabId, 'ledger.jsonl')), false, '先确认后删除：旧席位台账已清理');
+  assert.equal(existsSync(join(dirA, 'collabs', collabId, 'snapshot.json')), true, '成员备份保留');
+});
+
+test('治理预演：失联抢接全链 + 原驿丞重启握手降级', { timeout: 180000 }, async (t) => {
+  const port = await pickFreeSegment(2);
+  const dirA = makeNodeDir(t);
+  const { a, b, collabId } = await establishPairWith(t, port, '抢接项目', GOVERNANCE_CONFIG, { dataDirA: dirA });
+  await a.command({ cmd: 'exit' });
+  await waitForRebindable(port);
+  await waitManagerOffline(b, collabId);
+  const verdict = await b.command({ cmd: 'take_over', collabId });
+  assert.equal(verdict.ok, true, JSON.stringify(verdict));
+  assert.equal(verdict.phase, 'awaiting-confirm');
+  const applied = await b.command({ cmd: 'take_over_confirm', collabId });
+  assert.equal(applied.ok, true, JSON.stringify(applied));
+  const bManaged = await waitCollabState(b, collabId, 'active');
+  assert.equal(bManaged.role, 'manager');
+  const bView = await b.command({ cmd: 'view_ledger', collabId });
+  assert.equal(bView.ledger.manager.instanceId, b.ready.instanceId);
+  assert.equal(bView.ledger.version, verdict.baseVersion, '基准版本延续（不重置）');
+  /* 原驿丞重启：启动握手 / 补投的通告识出已被替换 → 降级为协作者并清理台账 */
+  const a2 = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, dataDir: dirA, knownPeers: [{ address: '127.0.0.1', port: port + 1 }], config: GOVERNANCE_CONFIG });
+  const aEntry = await waitFor(async () => {
+    const listed = await a2.command({ cmd: 'list_collabs' });
+    const entry = listed.collabs.find((candidate) => candidate.collabId === collabId);
+    return entry !== undefined && entry.role === 'member' ? entry : null;
+  }, { timeoutMs: 20000 });
+  assert.equal(aEntry.role, 'member');
+  const aStats = await a2.command({ cmd: 'collab_stats' });
+  assert.equal(aStats.stats.takeoverDowngrades >= 1, true, '降级计数留痕');
+  assert.equal(existsSync(join(dirA, 'collabs', collabId, 'ledger.jsonl')), false, '降级即清理本地台账');
+});
+
+test('治理预演：假失联中止（窗口内原驿丞复活 → 抢接中止）', { timeout: 120000 }, async (t) => {
+  const port = await pickFreeSegment(2);
+  const config = { ...GOVERNANCE_CONFIG, takeoverWindowMs: 4000 };
+  const { a, b, collabId } = await establishPairWith(t, port, '假失联项目', config);
+  await a.command({ cmd: 'exit' });
+  await waitForRebindable(port);
+  await waitManagerOffline(b, collabId);
+  const pending = b.command({ cmd: 'take_over', collabId });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const a2 = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: [{ address: '127.0.0.1', port: port + 1 }], config });
+  const verdict = await pending;
+  assert.equal(verdict.ok, false, JSON.stringify(verdict));
+  assert.ok(verdict.message.includes('中止'));
+  const bEntry = (await b.command({ cmd: 'list_collabs' })).collabs.find((entry) => entry.collabId === collabId);
+  assert.equal(bEntry.role, 'member', '中止不让位');
+  const bStats = await b.command({ cmd: 'collab_stats' });
+  const aStats = await a2.command({ cmd: 'collab_stats' });
+  assert.equal(bStats.stats.takeoversAborted >= 1, true);
+  assert.equal(aStats.stats.takeoverDowngrades, 0, '原驿丞未被替换');
+});
+
+test('治理预演：并发抢接（互见让位、确定性单一胜者、败方收敛）', { timeout: 180000 }, async (t) => {
+  const port = await pickFreeSegment(3);
+  const config = { ...GOVERNANCE_CONFIG, takeoverWindowMs: 1500 };
+  const { a, b, c, collabId } = await buildGovernedTriad(t, port, config);
+  await a.command({ cmd: 'exit' });
+  await waitForRebindable(port);
+  await waitManagerOffline(b, collabId);
+  await waitManagerOffline(c, collabId);
+  const [verdictB, verdictC] = await Promise.all([
+    b.command({ cmd: 'take_over', collabId }),
+    c.command({ cmd: 'take_over', collabId }),
+  ]);
+  const winnerIsB = b.ready.instanceId < c.ready.instanceId;
+  const winnerVerdict = winnerIsB ? verdictB : verdictC;
+  const loserVerdict = winnerIsB ? verdictC : verdictB;
+  assert.equal(winnerVerdict.phase, 'awaiting-confirm', JSON.stringify(winnerVerdict));
+  assert.equal(loserVerdict.ok, false, JSON.stringify(loserVerdict));
+  assert.ok(loserVerdict.message.includes('让位'));
+  const winnerNode = winnerIsB ? b : c;
+  const loserNode = winnerIsB ? c : b;
+  const confirmed = await winnerNode.command({ cmd: 'take_over_confirm', collabId });
+  assert.equal(confirmed.ok, true, JSON.stringify(confirmed));
+  const winnerEntry = await waitCollabState(winnerNode, collabId, 'active');
+  assert.equal(winnerEntry.role, 'manager');
+  const loserView = await waitFor(async () => {
+    const viewed = await loserNode.command({ cmd: 'view_ledger', collabId });
+    return viewed.ok === true && viewed.ledger.manager.instanceId === winnerNode.ready.instanceId ? viewed : null;
+  }, { timeoutMs: 20000 });
+  assert.equal(loserView.ledger.manager.instanceId, winnerNode.ready.instanceId, '败方收敛到新驿丞视图');
+});
+
+test('治理预演：离线错过通告 → 恢复后送达即让位（治理豁免过期）', { timeout: 180000 }, async (t) => {
+  const port = await pickFreeSegment(2);
+  const dirA = makeNodeDir(t);
+  const config = { ...GOVERNANCE_CONFIG, messageTtlMs: 600 };
+  const { a, b, collabId } = await establishPairWith(t, port, '让位项目', config, { dataDirA: dirA });
+  await a.command({ cmd: 'exit' });
+  await waitForRebindable(port);
+  await waitManagerOffline(b, collabId);
+  const verdict = await b.command({ cmd: 'take_over', collabId });
+  assert.equal(verdict.phase, 'awaiting-confirm');
+  assert.equal((await b.command({ cmd: 'take_over_confirm', collabId })).ok, true);
+  /* 超保留期浸泡：治理通告（takeover）豁免过期，仍留在队列等待送达 */
+  await new Promise((resolve) => setTimeout(resolve, 900));
+  const rows = await b.command({ cmd: 'status', collabId });
+  const takeoverRow = rows.rows.find((row) => row.type === 'takeover');
+  assert.equal(takeoverRow !== undefined, true, 'takeover 通告在队列中');
+  assert.equal(takeoverRow.expired, false, '治理类豁免过期');
+  assert.equal(takeoverRow.tier, 'queued', '离线者未送达，等待恢复');
+  const a2 = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, dataDir: dirA, knownPeers: [{ address: '127.0.0.1', port: port + 1 }], config });
+  const aEntry = await waitFor(async () => {
+    const listed = await a2.command({ cmd: 'list_collabs' });
+    const entry = listed.collabs.find((candidate) => candidate.collabId === collabId);
+    return entry !== undefined && entry.role === 'member' ? entry : null;
+  }, { timeoutMs: 30000 });
+  assert.equal(aEntry.role, 'member', '通告送达即让位降级');
+});
+
+test('治理预演：同名冲突双冻结 → 人裁定合并 → 三方收敛', { timeout: 180000 }, async (t) => {
+  const port = await pickFreeSegment(3);
+  const config = GOVERNANCE_CONFIG;
+  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, config });
+  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }], config });
+  const c = await startNode(t, { identityName: '主机丙', bindAddress: '127.0.0.1', port: port + 2, knownPeers: [{ address: '127.0.0.1', port }], config });
+  const x = await a.command({ cmd: 'create_collab', name: '合并项目', topic: '主题', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
+  await waitFor(async () => {
+    const listed = await b.command({ cmd: 'list_collabs' });
+    return listed.collabs.some((entry) => entry.collabId === x.collabId);
+  }, { timeoutMs: 15000 });
+  assert.equal((await b.command({ cmd: 'approve_invite', collabId: x.collabId, approve: true })).ok, true);
+  await waitCollabState(a, x.collabId, 'active');
+  await waitCollabState(b, x.collabId, 'active');
+  const y = await c.command({ cmd: 'create_collab', name: '合并项目', topic: '主题', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
+  assert.equal(y.ok, true);
+  await waitCollabState(a, x.collabId, 'frozen');
+  await waitCollabState(c, y.collabId, 'frozen');
+  await waitFor(async () => {
+    const listed = await b.command({ cmd: 'list_collabs' });
+    const first = listed.collabs.find((entry) => entry.collabId === x.collabId);
+    const rival = listed.collabs.find((entry) => entry.collabId === y.collabId);
+    return first !== undefined && rival !== undefined && first.state === 'frozen' && rival.state === 'frozen' ? true : null;
+  }, { timeoutMs: 20000 });
+  const merged = await a.command({ cmd: 'decide', collabId: x.collabId, choice: 'merge' });
+  assert.equal(merged.ok, true, JSON.stringify(merged));
+  const aEntry = await waitCollabState(a, x.collabId, 'active');
+  assert.equal(aEntry.role, 'manager');
+  await waitFor(async () => {
+    const listed = await b.command({ cmd: 'list_collabs' });
+    const first = listed.collabs.find((entry) => entry.collabId === x.collabId);
+    const rival = listed.collabs.find((entry) => entry.collabId === y.collabId);
+    return first !== undefined && rival !== undefined && first.state === 'active' && rival.state === 'terminated' ? true : null;
+  }, { timeoutMs: 20000 });
+  await waitCollabState(c, y.collabId, 'terminated');
 });
