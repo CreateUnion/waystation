@@ -1,19 +1,21 @@
 import { CONFLICT_STATES, INVITE_THROTTLE_TABLE_MAX, MAX_PENDING_INVITES } from './model.js';
 import { isLocalArchivedState, localNameOf, localRosterOf, localStateOf } from './local.js';
 
-/* 入站门控（admit 决策）：invite 与 freeze 不按 collabId 已知性判定（首个接触点 / 跨协作匹配）；
+/* 入站门控（admit 决策）：invite 与「冲突裁定族」（freeze / unfreeze / decision）不按 collabId
+ * 已知性判定（首个接触点 / 跨协作匹配——裁定帧的 collabId 是执行方那条，须按名匹配）；
  * 已知协作按本地状态查白名单；未知 collabId 一律拒绝（沿用接收管线的安全默认语义）。
  * 白名单是「冻结期允许的操作」与「归档后幂等 / 只读类」的机器化（设计 §6/§10）。 */
 
 const FROZEN_ALLOWED = new Set(['freeze', 'unfreeze', 'decision', 'takeover-init', 'takeover', 'notice', 'snapshot', 'end', 'leave']);
 const ARCHIVED_ALLOWED = new Set(['snapshot', 'notice', 'end', 'leave']);
+const CONFLICT_FRAME_TYPES = new Set(['freeze', 'unfreeze', 'decision']);
 
 export function decideAdmission(state, frame, meta) {
   if (frame.type === 'invite') {
     return admitInvite(state, frame, meta);
   }
-  if (frame.type === 'freeze') {
-    return admitFreeze(state, frame);
+  if (CONFLICT_FRAME_TYPES.has(frame.type)) {
+    return admitConflictFrame(state, frame);
   }
   const local = state.collabs.get(frame.collabId);
   if (local === undefined) {
@@ -85,11 +87,13 @@ function admitInvite(state, frame, meta) {
   return { ok: true };
 }
 
-function admitFreeze(state, frame) {
+/* 冲突裁定族（freeze / unfreeze / decision）的准入：同名 + 成员交集匹配本地在册协作
+ * （裁定帧的 collabId 是执行方那条——按名匹配，与冻结检出的判据同一权威）。 */
+function admitConflictFrame(state, frame) {
   const matched = matchConflictCollabs(state, frame.payload.name, frame.payload.members.map((member) => member.instanceId));
   if (matched.length === 0) {
     state.counters.freezeUnmatched++;
-    return { ok: false, reason: '冻结通告与本机协作无匹配（与己无关，忽略）' };
+    return { ok: false, reason: '冻结 / 裁定通告与本机协作无匹配（与己无关，忽略）' };
   }
   return { ok: true };
 }

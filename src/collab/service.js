@@ -4,39 +4,94 @@ import { decideAdmission } from './gate.js';
 import { handleEvent } from './events.js';
 import { localNameOf, localRosterOf, localStateOf, persistLedger } from './local.js';
 import { approveInvite, countLiveCollabs, createCollab, endCollab, leaveCollab, sendMessage, viewLedger, withdrawInvite } from './outgoing.js';
+import { HANDSHAKE_REPLY_TIMEOUT_MS, TAKEOVER_PROBE_INTERVAL_MS, runHandshake, startLiveness, stopLiveness, takeOver } from './takeover.js';
+import { decide, decideMergeOffer } from './freeze.js';
+import { HANDOVER_CONFIRM_TIMEOUT_MS, handover } from './handover.js';
 
-/* 协作服务（协作核心的门面）：注册表加载与恢复、公共 API、接收管线钩子（admit / consume）装配、
- * 计数器与生命周期。钩子与事件路径一律不抛出（健壮性硬性要求）——异常隔离为计数与告警。
- * 依赖全部经参数注入（send = dispatch.send；knownHosts 供「协作参与者地址」一源接入）。 */
+/* 协作服务（协作核心与治理的门面）：注册表加载与恢复、公共 API、接收管线钩子（admit / consume）装配、
+ * 探测定时器与握手生命周期、抢接 / 裁定 / 移交的等待面、计数器。
+ * 钩子、事件与定时器路径一律不抛出（健壮性硬性要求）——异常隔离为计数与告警。
+ * 依赖全部经参数注入（send = dispatch.send；probe = dispatch.ping；reassign = dispatch.reassignPeer；
+ * notify = 会话注入面；knownHosts 供「协作参与者地址」一源接入）。 */
 
 const LEDGER_FETCH_TIMEOUT_MS = 3000;
 const INVITE_MIN_INTERVAL_MS = 1000;
 
 /**
- * @param {{ dataDir: string, config: any, self: any, send: (message: object) => any, knownHosts: any, log: any, ledgerFetchTimeoutMs?: number, inviteMinIntervalMs?: number }} options
+ * @param {{ dataDir: string, config: any, self: any, send: (message: object) => any, knownHosts: any, log: any,
+ *   probe?: ((address: string, port: number) => Promise<{ reachable: boolean, rttMs?: number, reason?: string }>) | null,
+ *   reassign?: ((payload: object) => { ok: boolean, moved?: number, reason?: string }) | null,
+ *   notify?: ((frame: object) => unknown) | null,
+ *   ledgerFetchTimeoutMs?: number, inviteMinIntervalMs?: number, takeoverProbeIntervalMs?: number,
+ *   handshakeReplyTimeoutMs?: number, handoverConfirmTimeoutMs?: number }} options
  */
-export function createCollabService({ dataDir, config, self, send, knownHosts, log, ledgerFetchTimeoutMs = LEDGER_FETCH_TIMEOUT_MS, inviteMinIntervalMs = INVITE_MIN_INTERVAL_MS }) {
-  const state = {
+export function createCollabService(options) {
+  const state = buildState(options);
+  loadRegistry(state);
+  return apiOf(state);
+}
+
+function buildState(options) {
+  const {
+    dataDir, config, self, send, knownHosts, log,
+    probe = null, reassign = null, notify = null,
+    ledgerFetchTimeoutMs = LEDGER_FETCH_TIMEOUT_MS,
+    inviteMinIntervalMs = INVITE_MIN_INTERVAL_MS,
+    takeoverProbeIntervalMs = TAKEOVER_PROBE_INTERVAL_MS,
+    handshakeReplyTimeoutMs = HANDSHAKE_REPLY_TIMEOUT_MS,
+    handoverConfirmTimeoutMs = HANDOVER_CONFIRM_TIMEOUT_MS,
+  } = options;
+  return {
     dataDir,
     config,
     self,
     send,
     knownHosts,
     log,
+    probe,
+    reassign,
+    notify,
     ledgerFetchTimeoutMs,
     inviteMinIntervalMs,
+    takeoverProbeIntervalMs,
+    handshakeReplyTimeoutMs,
+    handoverConfirmTimeoutMs,
+    ...runtimeMaps(),
+    probeTimer: null,
+    started: false,
+    counters: emptyCounters(),
+  };
+}
+
+/* 运行期容器（注册表 / 限频 / 转达集 / 等待面 / 抢接与握手状态）。 */
+function runtimeMaps() {
+  return {
     collabs: new Map(),
     inviteWindow: new Map(),
     relayedOrigins: new Map(),
     pendingViews: new Map(),
-    counters: emptyCounters(),
+    probes: new Map(),
+    takeovers: new Map(),
+    rearmedTakeovers: new Map(),
+    awaitingTakeovers: new Map(),
+    effectiveTakeovers: new Map(),
+    handshakeWatch: new Map(),
+    pendingHandovers: new Map(),
   };
-  loadRegistry(state);
+}
+
+function apiOf(state) {
   return {
     hooks: {
       admit: (frame, meta) => gateFrame(state, frame, meta),
       consume: (frame, meta) => consumeFrame(state, frame, meta),
     },
+    start: () => startService(state),
+    handshake: (options) => runHandshake(state, options ?? {}),
+    takeOver: (input) => takeOver(state, input),
+    decide: (input) => decide(state, input),
+    decideMerge: (input) => decideMergeOffer(state, input),
+    handover: (input) => handover(state, input),
     list: () => listCollabs(state),
     create: (input) => createCollab(state, input),
     approve: (input) => approveInvite(state, input),
@@ -73,6 +128,17 @@ async function consumeFrame(state, frame, meta) {
   }
 }
 
+/* 服务启动（组合根在 net.start 成功后调用；降级不调用）：探测定时器 + 启动握手（常驻收敛机制）。
+ * 幂等；不调用 start 的服务无定时器——行为与协作核心期一致（既有单测路径零变化）。 */
+function startService(state) {
+  if (state.started) {
+    return;
+  }
+  state.started = true;
+  startLiveness(state);
+  runHandshake(state);
+}
+
 /* 注册表加载：collabs/ 目录逐协作恢复（成员记录必需、台账 / 快照可选）；单条加载失败只计数跳过，
  * 不阻塞进程（坏数据不得让服务起不来）。 */
 function loadRegistry(state) {
@@ -98,6 +164,8 @@ function loadOne(state, collabId) {
     member,
     endpoints: new Map(Object.entries(member.endpoints)),
     snapshot: loadSnapshot(state.dataDir, collabId),
+    suspended: null,
+    staleManagerId: null,
   };
   if (local.role === 'manager') {
     local.ledger = recoverLedger(state, collabId, local);
@@ -147,18 +215,21 @@ function ledgerFromSource(local, collabId) {
 }
 
 /* 本机参与清单（ws_list_collabs 的数据面）：状态取本地权威；expired = 提议中且未回应且已过
- * 有效期（仅标注，不改状态——设计 §6 的「过期不算拒绝」）。 */
+ * 有效期（仅标注，不改状态——设计 §6 的「过期不算拒绝」）。
+ * 治理面（成员侧）：managerOffline（失联判定）、frozenAt / frozenUnresolved（冻结时限）、
+ * suspended / handshakeUnresolved（收敛等待与未能对表）。 */
 function listCollabs(state) {
   const now = Date.now();
   const collabs = [];
   for (const local of state.collabs.values()) {
-    collabs.push(listEntryOf(local, now));
+    collabs.push(listEntryOf(state, local, now));
   }
   return { collabs };
 }
 
-function listEntryOf(local, now) {
+function listEntryOf(state, local, now) {
   const stateName = localStateOf(local);
+  const probeState = state.probes.get(local.collabId);
   return {
     collabId: local.collabId,
     name: localNameOf(local),
@@ -167,6 +238,9 @@ function listEntryOf(local, now) {
     version: local.role === 'manager' ? local.ledger.version : (local.snapshot === null ? null : local.snapshot.version),
     memberCount: localRosterOf(local).length,
     archived: isArchived(stateName),
+    managerOffline: local.role === 'manager' ? false : (probeState?.offline === true),
+    frozenUnresolved: local.freezeDeadlineNotified === true,
+    suspended: local.suspended !== null,
     ...inviteViewOf(local, now),
   };
 }
@@ -203,18 +277,39 @@ function statsOf(state) {
   return { collabs: state.collabs.size, byState, ...state.counters };
 }
 
+/* 收尾：定时器、等待面与在途流程统一解挂（闸门、快照拉取、握手观察、抢接窗口、移交回执）。 */
 function closeService(state) {
+  stopLiveness(state);
   for (const pending of state.pendingViews.values()) {
     clearTimeout(pending.timer);
     pending.resolve(null);
   }
   state.pendingViews.clear();
+  for (const held of state.handshakeWatch.values()) {
+    clearTimeout(held.timer);
+  }
+  state.handshakeWatch.clear();
+  for (const record of state.takeovers.values()) {
+    if (record.timer !== null) {
+      clearTimeout(record.timer);
+    }
+    record.resolveWindow?.({ ok: false, message: '服务已关闭——抢接流程中止' });
+  }
+  state.takeovers.clear();
+  state.rearmedTakeovers.clear();
+  state.awaitingTakeovers.clear();
+  for (const held of state.pendingHandovers.values()) {
+    clearTimeout(held.timer);
+    held.resolve(null);
+  }
+  state.pendingHandovers.clear();
 }
 
 function emptyCounters() {
   return {
     ...emptyFlowCounters(),
     ...emptyGuardCounters(),
+    ...emptyGovernanceCounters(),
   };
 }
 
@@ -263,6 +358,7 @@ function emptyGuardCounters() {
     snapshotCorrupt: 0,
     snapshotStale: 0,
     snapshotReceipts: 0,
+    snapshotFromNonManager: 0,
     messagesSent: 0,
     sendFailures: 0,
     eventsHandled: 0,
@@ -270,5 +366,76 @@ function emptyGuardCounters() {
     gateFailures: 0,
     loadFailures: 0,
     persistFailures: 0,
+  };
+}
+
+/* 治理与韧性计数（失联 / 握手 / 抢接 / 裁定 / 合流 / 移交 / 提示与队列重定向）。 */
+function emptyGovernanceCounters() {
+  return {
+    ...emptyLinkCounters(),
+    ...emptyAdjudicationCounters(),
+  };
+}
+
+/* 链路与收敛计数（失联判定 / 握手 / 暂停 / 抢接 / 席位变更与队列重定向）。 */
+function emptyLinkCounters() {
+  return {
+    probeAttempts: 0,
+    probeSuccesses: 0,
+    probeFailures: 0,
+    managerOffline: 0,
+    managerRecovered: 0,
+    handshakesSent: 0,
+    handshakesIn: 0,
+    handshakeUnresolved: 0,
+    handshakeResolved: 0,
+    suspensions: 0,
+    resumptions: 0,
+    suspensionExpired: 0,
+    mutationSuspended: 0,
+    takeoversInitiated: 0,
+    takeoversIn: 0,
+    takeoversRelayed: 0,
+    takeoversYielded: 0,
+    takeoversAborted: 0,
+    takeoversAwaiting: 0,
+    takeoversEffective: 0,
+    takeoversReportsIn: 0,
+    takeoversCancelsIn: 0,
+    takeoverSuperseded: 0,
+    takeoverDowngrades: 0,
+    takeoverResends: 0,
+    queueRetargeted: 0,
+    queueStaleKept: 0,
+    rosterSkipped: 0,
+    managerChangedIn: 0,
+    downgrades: 0,
+    notificationsSent: 0,
+    notificationsDropped: 0,
+  };
+}
+
+/* 裁定计数（冻结裁定 / 解冻 / 合流递交 / 移交）。 */
+function emptyAdjudicationCounters() {
+  return {
+    freezeDecisionsOut: 0,
+    freezeDecisionsIn: 0,
+    freezeIntentsIn: 0,
+    freezeDecisionConflicts: 0,
+    freezeTerminatedLocal: 0,
+    unfreezesIn: 0,
+    freezeUnresolved: 0,
+    mergeOffersSent: 0,
+    mergeRequestsIn: 0,
+    mergeAdopted: 0,
+    mergeDiscarded: 0,
+    mergeOutcomesIn: 0,
+    mergeCorrupt: 0,
+    mergeInviteSkipped: 0,
+    handoverOffered: 0,
+    handoverAccepted: 0,
+    handoverCompleted: 0,
+    handoverRejected: 0,
+    handoverTimeouts: 0,
   };
 }

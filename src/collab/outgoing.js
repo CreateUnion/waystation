@@ -1,8 +1,8 @@
 import { isIP } from 'node:net';
-import { ID_PATTERN, MAX_COLLAB_MEMBERS, MAX_MESSAGE_TEXT_CHARS, MAX_REASON_CHARS, MAX_TOPIC_CHARS, isIdentityName, isPresentationText } from '../net/protocol.js';
+import { ID_PATTERN, MAX_COLLAB_MEMBERS, MAX_MESSAGE_TEXT_CHARS, MAX_REASON_CHARS, MAX_TOPIC_CHARS, PROTOCOL_VERSION, isIdentityName, isPort, isPresentationText, newMsgId } from '../net/protocol.js';
 import { MAX_LOCAL_COLLABS, canTransition, isArchived, newCollabId } from './model.js';
-import { ledgerDigest } from './store.js';
-import { isLocalArchivedState, localNameOf, localRosterOf, localStateOf, persistLedger, persistMember, persistSnapshot, rememberKnownHost } from './local.js';
+import { ledgerDigest, removeLedgerFile } from './store.js';
+import { currentManagerIdOf, isLocalArchivedState, localNameOf, localRosterOf, localStateOf, memberStateFor, persistLedger, persistMember, persistSnapshot, rememberKnownHost } from './local.js';
 import { matchConflictCollabs } from './gate.js';
 
 /* 对外操作与协作态变更实现（服务公共 API 的落点）：请求来自本机会话（工具面）——
@@ -12,28 +12,26 @@ import { matchConflictCollabs } from './gate.js';
 /* 可投递成员状态集（消息广播与通告的收件人口径）。 */
 const MESSAGING_MEMBER_STATES = ['invited', 'approved', 'member'];
 
+/* 已转达 originMsgId 集上限：转达防环与防重复的记录面（进程内、插入序淘汰）——
+ * 每条治理通告的每跳只在首次收到时转达一次，重复副本不再向外扩散（本地应用仍幂等执行）。 */
+const RELAYED_ORIGINS_MAX = 256;
+
 export function createCollab(state, { name, topic, targets }) {
   const rejected = createRejection(state, name, topic, targets);
   if (rejected !== null) {
     return { ok: false, message: rejected };
   }
-  const now = new Date().toISOString();
-  const ledger = {
-    version: 1,
-    collabId: newCollabId(),
-    name,
-    topic,
-    status: 'proposed',
-    manager: { instanceId: state.self.instanceId, identityName: state.self.identityName },
-    members: [
-      { instanceId: state.self.instanceId, identityName: state.self.identityName, role: 'manager', state: 'member', joinedAt: now },
-      ...targets.map((target) => ({ instanceId: target.instanceId, identityName: target.identityName, role: 'member', state: 'invited', joinedAt: now })),
-    ],
-    board: [],
-    createdAt: now,
-    updatedAt: now,
+  const ledger = freshLedgerOf(state, name, topic, targets);
+  const local = {
+    collabId: ledger.collabId,
+    role: 'manager',
+    ledger,
+    member: managerRecordOf(ledger),
+    endpoints: new Map(),
+    snapshot: null,
+    suspended: null,
+    staleManagerId: null,
   };
-  const local = { collabId: ledger.collabId, role: 'manager', ledger, member: managerRecordOf(ledger), endpoints: new Map(), snapshot: null };
   for (const target of targets) {
     local.endpoints.set(target.instanceId, { address: target.address, port: target.port });
     rememberKnownHost(state, { address: target.address, port: target.port, instanceId: target.instanceId, identityName: target.identityName });
@@ -50,6 +48,26 @@ export function createCollab(state, { name, topic, targets }) {
   }
   state.counters.collabsCreated++;
   return { ok: true, collabId: ledger.collabId, invited };
+}
+
+/* 新建台账（v1 proposed；名单 = 本机〔manager〕+ 各目标〔invited〕）。 */
+function freshLedgerOf(state, name, topic, targets) {
+  const now = new Date().toISOString();
+  return {
+    version: 1,
+    collabId: newCollabId(),
+    name,
+    topic,
+    status: 'proposed',
+    manager: { instanceId: state.self.instanceId, identityName: state.self.identityName },
+    members: [
+      { instanceId: state.self.instanceId, identityName: state.self.identityName, role: 'manager', state: 'member', joinedAt: now },
+      ...targets.map((target) => ({ instanceId: target.instanceId, identityName: target.identityName, role: 'member', state: 'invited', joinedAt: now })),
+    ],
+    board: [],
+    createdAt: now,
+    updatedAt: now,
+  };
 }
 
 export function approveInvite(state, { collabId, approve, reason }) {
@@ -115,6 +133,9 @@ export function sendMessage(state, { collabId, text, type, to }) {
   const local = state.collabs.get(collabId);
   if (local === undefined) {
     return { ok: false, message: '本机没有该协作（先 ws_list_collabs）' };
+  }
+  if (local.suspended !== null) {
+    return { ok: false, message: '协作对外写已暂停（在途抢接或未能对表）——收敛后恢复' };
   }
   const messageType = type ?? 'reply';
   const stateName = localStateOf(local);
@@ -274,8 +295,15 @@ function waitForSnapshot(state, collabId) {
 }
 
 /* 台账变更的统一入口（单写者纪律）：打补丁 → version 自增 → updatedAt → 落盘 → 推快照。
- * 补丁函数直接改写台账字段（调用方可借闭包引用名单条目）；推快照失败不影响本地状态。 */
-export function mutateLedger(state, local, apply) {
+ * 补丁函数直接改写台账字段（调用方可借闭包引用名单条目）；推快照失败不影响本地状态。
+ * 暂停守卫：本机进入收敛等待（在途抢接 / 未对表）时拒绝一切非治理写——治理动作（冻结 / 解冻 /
+ * 裁定执行 / 席位恢复）经 options.governance 放行：收敛本身依赖这些写入，暂停不得阻断收敛。 */
+export function mutateLedger(state, local, apply, options = {}) {
+  if (local.suspended !== null && options.governance !== true) {
+    state.counters.mutationSuspended++;
+    state.log.warn('协作写被暂停（收敛等待中）', { collabId: local.collabId, reason: local.suspended.reason });
+    return null;
+  }
   apply(local.ledger);
   local.ledger.version++;
   local.ledger.updatedAt = new Date().toISOString();
@@ -325,14 +353,103 @@ export function sendTo(state, collabId, instanceId, endpoint, type, payload) {
   return result;
 }
 
+/* 治理寻址（跨协作回退）：协作内端点表优先；未学到时回退站点级已知主机清单（含其他协作与
+ * 发现链路学到的「实例标识 → 地址:端口」）——治理转达 / 席位转移的触达由此不局限于单一协作的
+ * 直接接触史（设计 §5 清单随协作参与关系更新的治理消费面）。未见过返回 undefined（调用方跳过）。 */
+export function endpointFor(state, local, instanceId) {
+  const held = local.endpoints.get(instanceId);
+  if (held !== undefined) {
+    return held;
+  }
+  if (typeof state.knownHosts?.lookup !== 'function') {
+    return undefined;
+  }
+  const fallback = state.knownHosts.lookup(instanceId);
+  return fallback ?? undefined;
+}
+
+/* 发给协作名册中全部已知端点的参与者（除本机与被排除者）：治理广播（抢接 / 裁定 / 握手 /
+ * 席位变更通告）的统一出口；端点未知者跳过——可见性由转达与对等回执机制兜底（设计 §9 步骤 1/5）。 */
+export function sendToRoster(state, local, type, payload, options = {}) {
+  const exclude = options.exclude ?? new Set();
+  let sent = 0;
+  for (const entry of localRosterOf(local)) {
+    const instanceId = entry.instanceId;
+    if (instanceId === state.self.instanceId || exclude.has(instanceId)) {
+      continue;
+    }
+    const endpoint = endpointFor(state, local, instanceId);
+    if (endpoint === undefined) {
+      state.counters.rosterSkipped++;   // 治理触达不可及的观测面（跳过不静默）
+      continue;
+    }
+    const result = sendTo(state, local.collabId, instanceId, endpoint, type, payload);
+    if (result.ok === true) {
+      sent++;
+    }
+  }
+  return sent;
+}
+
+/* 治理转达目标集：名册中全部端点可寻址的参与者（除本机与来源由 relayGovernance 过滤）；
+ * 逐目标归属的本地协作信息供转达帧寻址。 */
+export function governanceTargets(state, local) {
+  const targets = new Map();
+  for (const entry of localRosterOf(local)) {
+    const endpoint = endpointFor(state, local, entry.instanceId);
+    if (endpoint !== undefined) {
+      targets.set(entry.instanceId, { address: endpoint.address, port: endpoint.port, collabId: local.collabId });
+    }
+  }
+  return targets;
+}
+
+/* 治理转达（设计 §10 治理类例外）：逐目标独立入队——防环与防重复由 originMsgId 已转达集承载
+ * （同 originMsgId 的重复副本不再向外扩散；发送队列以 msgId 为唯一键，多目标无法共用同一 msgId）。
+ * targets：Map<instanceId, { address, port, collabId }>（逐目标归属的本地协作）。 */
+export function relayGovernance(state, frame, targets) {
+  const origin = typeof frame.payload.originMsgId === 'string' && frame.payload.originMsgId !== '' ? frame.payload.originMsgId : frame.msgId;
+  if (state.relayedOrigins.has(origin)) {
+    return 0;
+  }
+  rememberRelayedOrigin(state, origin);
+  let relayed = 0;
+  for (const [instanceId, target] of targets) {
+    if (instanceId === state.self.instanceId || instanceId === frame.from.instanceId) {
+      continue;
+    }
+    const result = sendTo(state, target.collabId, instanceId, { address: target.address, port: target.port }, frame.type, { ...frame.payload, originMsgId: origin });
+    if (result.ok === true) {
+      relayed++;
+    }
+  }
+  return relayed;
+}
+
+/* 已转达集登记（插入序淘汰——表满丢最旧）。 */
+export function rememberRelayedOrigin(state, origin) {
+  state.relayedOrigins.delete(origin);
+  state.relayedOrigins.set(origin, Date.now());
+  while (state.relayedOrigins.size > RELAYED_ORIGINS_MAX) {
+    const oldest = state.relayedOrigins.keys().next().value;
+    state.relayedOrigins.delete(oldest);
+  }
+}
+
 /* 冻结广播（设计 §6）：发给涉及两条协作的全部已知端点（除本机）——被冻那条的成员端点 ∪
- * 同名交集协作的成员端点；端点未知者跳过（转达与快照机制兜底可见性）。 */
+ * 同名交集协作的成员端点；端点未知者跳过（转达与快照机制兜底可见性）。
+ * 管理席位侧检出时随带被冻条的发起时间与管理者（合流并集与保留方判定的参考数据；
+ * 成员侧检出无从提供——接收侧按数据缺省保守处理）。 */
 export function broadcastFreeze(state, frozenLocal, reason) {
   const payload = {
     name: localNameOf(frozenLocal),
     members: localRosterOf(frozenLocal).map((entry) => ({ instanceId: entry.instanceId, identityName: entry.identityName })),
     reason,
   };
+  if (frozenLocal.role === 'manager') {
+    payload.createdAt = frozenLocal.ledger.createdAt;
+    payload.manager = { instanceId: frozenLocal.ledger.manager.instanceId, identityName: frozenLocal.ledger.manager.identityName };
+  }
   let sent = 0;
   for (const [instanceId, endpoint] of collectFreezeTargets(state, frozenLocal)) {
     const result = sendTo(state, frozenLocal.collabId, instanceId, endpoint, 'freeze', payload);
@@ -343,20 +460,28 @@ export function broadcastFreeze(state, frozenLocal, reason) {
   return sent;
 }
 
-/* 本地冻结：管理席位冻台账（version 推进 + 快照）、成员冻本地记录；已冻结或迁移不允许时幂等返回 false。 */
+/* 本地冻结：管理席位冻台账（version 推进 + 快照）、成员冻本地记录；已冻结或迁移不允许时幂等返回 false。
+ * 冻结标记（frozenAt / frozenFrom）随冻结写入——48 小时无裁定提示与「回冻结前状态」的依据。 */
 export function applyFreezeLocally(state, local, reason) {
   if (localStateOf(local) === 'frozen') {
     return false;
   }
+  const now = new Date().toISOString();
   if (local.role === 'manager') {
     if (!canTransition(local.ledger.status, 'frozen')) {
       return false;
     }
+    const from = local.ledger.status;
     mutateLedger(state, local, (ledger) => {
       ledger.status = 'frozen';
-    });
+      ledger.frozenAt = now;
+      ledger.frozenFrom = from;
+    }, { governance: true });
   } else {
+    const from = local.member.state;
     local.member.state = 'frozen';
+    local.member.frozenAt = now;
+    local.member.frozenFrom = memberStateFor(from);
     persistMember(state, local);
   }
   state.log.warn('协作已冻结（同名并发冲突）', { collabId: local.collabId, reason });
@@ -383,6 +508,148 @@ export function countLiveCollabs(state) {
     }
   }
   return count;
+}
+
+/* 席位转移原语（接管生效 / 移交受让共用）：以给定台账承担管理席位——本地记录转管理、
+ * 台账落盘（本机成为单一写者）、自身留存并推送当前视图（成员由此学习新驿丞端点）。 */
+export function promoteToManager(state, local, ledger) {
+  local.role = 'manager';
+  local.ledger = ledger;
+  local.member = managerRecordOf(ledger);
+  local.member.endpoints = Object.fromEntries(local.endpoints);
+  local.suspended = null;
+  local.staleManagerId = null;
+  persistMember(state, local);
+  persistLedger(state, local);
+  pushSnapshot(state, local);
+}
+
+/* 降级为成员（被替换 / 合流让位的落点）：管理席位——以台账定格名单转成员记录、删除本地台账
+ * （单副本纪律：台账随后任驿丞走；本机快照保留为成员备份）；成员——仅更新驿丞引用。
+ * 随后重定向陈旧出站队列（发往旧驿丞的未确认消息改投新驿丞——不静默丢弃）并拉取现任视图。 */
+export function downgradeToMember(state, local, managerPeer) {
+  const formerManagerId = currentManagerIdOf(local);
+  if (local.role === 'manager') {
+    local.member = memberRecordOf(local, managerPeer);
+    local.ledger = null;
+    local.role = 'member';
+    if (!removeLedgerFile(state.dataDir, local.collabId)) {
+      state.log.warn('台账文件删除失败（保守保留）', { collabId: local.collabId });
+    }
+  } else {
+    local.member.manager = { instanceId: managerPeer.instanceId, identityName: managerPeer.identityName };
+  }
+  local.suspended = null;
+  persistMember(state, local);
+  retargetStaleQueue(state, local, formerManagerId, managerPeer.instanceId);
+  requestCurrentView(state, local);
+  state.counters.downgrades++;
+}
+
+/* 陈旧出站队列重定向：发往旧驿丞的未确认条目改投新驿丞（同 msgId 保持——进行中消息在新席位
+ * 上等价有效且不产生重复投递）；新驿丞端点未知先暂存 staleManagerId、待端点学习后补投。 */
+export function retargetStaleQueue(state, local, fromInstanceId, toInstanceId) {
+  if (fromInstanceId === toInstanceId) {
+    return;
+  }
+  const endpoint = endpointFor(state, local, toInstanceId);
+  if (endpoint === undefined || typeof state.reassign !== 'function') {
+    local.staleManagerId = fromInstanceId;
+    state.counters.queueStaleKept++;
+    return;
+  }
+  const result = state.reassign({
+    collabId: local.collabId,
+    fromInstanceId,
+    to: { instanceId: toInstanceId, address: endpoint.address, port: endpoint.port },
+  });
+  if (result.ok === true) {
+    state.counters.queueRetargeted += result.moved;
+    local.staleManagerId = null;
+  } else {
+    local.staleManagerId = fromInstanceId;
+    state.counters.queueStaleKept++;
+  }
+}
+
+/* 端点学习后的补投（events.applyEndpoint 的挂点）：暂存的旧驿丞队列等到新驿丞端点即可重定向。 */
+export function resumeStaleRetarget(state, local) {
+  if (local.staleManagerId === null || local.staleManagerId === undefined) {
+    return;
+  }
+  retargetStaleQueue(state, local, local.staleManagerId, currentManagerIdOf(local));
+}
+
+/* 向现任驿丞拉取当前视图（快照请求；端点未知静默跳过——对方主动联系时端点自然学习）。 */
+export function requestCurrentView(state, local) {
+  const managerId = local.member.manager.instanceId;
+  const endpoint = endpointFor(state, local, managerId);
+  if (endpoint === undefined) {
+    return;
+  }
+  sendTo(state, local.collabId, managerId, endpoint, 'snapshot', { kind: 'request' });
+}
+
+/* 驿丞引用更新（成员侧；移交 / 抢接 / 握手共用）：更新记录、重定向陈旧队列并留痕；
+ * 是否拉取当前视图由调用方决定（对表路径按版本差决定）。 */
+export function adoptNewManager(state, local, managerPeer, remoteVersion) {
+  if (local.role !== 'member') {
+    return false;
+  }
+  const oldId = local.member.manager.instanceId;
+  if (oldId === managerPeer.instanceId) {
+    return false;
+  }
+  local.member.manager = { instanceId: managerPeer.instanceId, identityName: managerPeer.identityName };
+  persistMember(state, local);
+  retargetStaleQueue(state, local, oldId, managerPeer.instanceId);
+  state.counters.managerChangedIn++;
+  state.log.info('驿丞引用已更新', { collabId: local.collabId, from: oldId, to: managerPeer.instanceId, version: remoteVersion });
+  return true;
+}
+
+/* 合流递交（设计 §9 步骤 4）：把本地 diverged 台账整份发给现任驿丞、由其本机人裁定采纳 / 丢弃。
+ * 不走快照通道——快照通道的「版本不倒退即收」会让 diverged 内容静默覆盖（禁止静默覆盖）。 */
+export function sendMergeOffer(state, local, managerPeer, baseVersion) {
+  const source = local.role === 'manager' ? local.ledger : (local.snapshot === null ? null : local.snapshot.ledger);
+  if (source === null) {
+    return { ok: false, reason: '无可递交的台账' };
+  }
+  const endpoint = local.endpoints.get(managerPeer.instanceId);
+  if (endpoint === undefined) {
+    return { ok: false, reason: '端点未知' };
+  }
+  const frozen = structuredClone(source);
+  return sendTo(state, local.collabId, managerPeer.instanceId, endpoint, 'notice', {
+    event: 'merge-request',
+    baseVersion,
+    version: frozen.version,
+    digest: ledgerDigest(frozen),
+    ledger: frozen,
+  });
+}
+
+/* 本机提示（会话注入面；不经出站队列、不上网络）：notify 注入缺失或投递失败只计数与日志。
+ * 帧形态为 notice + event:'local-alert'——该事件不入协议表（外发不存在；伪造入站被协议拒收）。 */
+export function notifyLocal(state, local, text) {
+  if (typeof state.notify !== 'function') {
+    return;
+  }
+  try {
+    state.notify({
+      v: PROTOCOL_VERSION,
+      type: 'notice',
+      msgId: newMsgId(),
+      from: state.self,
+      collabId: local.collabId,
+      ts: new Date().toISOString(),
+      payload: { event: 'local-alert', text },
+    });
+    state.counters.notificationsSent++;
+  } catch (error) {
+    state.counters.notificationsDropped++;
+    state.log.warn('本机提示投递失败（已忽略）', { collabId: local.collabId, reason: error.message });
+  }
 }
 
 /* 星型路由（设计 §10）：成员只发给管理者（省略 to 或显式 = 管理者）；管理者发给任一人、
@@ -417,7 +684,8 @@ function payloadOf(type, text) {
   return { text };
 }
 
-function managerRecordOf(ledger) {
+/* 管理席位记录（含移交受让与接管恢复的构造面）：roster = 台账定格名单，endpoints 由调用方补。 */
+export function managerRecordOf(ledger) {
   return {
     collabId: ledger.collabId,
     role: 'manager',
@@ -430,7 +698,26 @@ function managerRecordOf(ledger) {
   };
 }
 
-function invitePayloadOf(ledger) {
+/* 成员记录（降级 / 让位的构造面）：以台账定格名单为 roster（不随台账逐次更新）。 */
+function memberRecordOf(local, managerPeer) {
+  const status = localStateOf(local);
+  const record = {
+    collabId: local.collabId,
+    role: 'member',
+    state: memberStateFor(status),
+    name: localNameOf(local),
+    manager: { instanceId: managerPeer.instanceId, identityName: managerPeer.identityName },
+    roster: localRosterOf(local).map((entry) => ({ instanceId: entry.instanceId, identityName: entry.identityName })),
+    endpoints: Object.fromEntries(local.endpoints),
+    decision: null,
+  };
+  if (record.state === 'completed' || record.state === 'terminated') {
+    record.archivedAt = new Date().toISOString();
+  }
+  return record;
+}
+
+export function invitePayloadOf(ledger) {
   return {
     name: ledger.name,
     topic: ledger.topic,
@@ -543,7 +830,7 @@ function isEndpointValue(target) {
   if (typeof target.address !== 'string' || isIP(target.address) === 0) {
     return false;
   }
-  return Number.isInteger(target.port) && target.port >= 1 && target.port <= 65535;
+  return isPort(target.port);
 }
 
 /* 冻结目标集：被冻协作成员端点 ∪ 同名交集协作成员端点（去重、除本机）。 */

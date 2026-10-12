@@ -1,17 +1,17 @@
 import { isPort } from '../net/protocol.js';
 import { MAX_BOARD_ENTRIES, isSnapshotShape } from './model.js';
 import { ledgerDigest } from './store.js';
-import { isLocalArchivedState, persistMember, persistSnapshot, rememberKnownHost } from './local.js';
+import { currentManagerIdOf, isLocalArchivedState, persistMember, persistSnapshot, rememberKnownHost } from './local.js';
 import { matchConflictCollabs } from './gate.js';
-import { applyFreezeLocally, broadcastFreeze, memberIdsOf, mutateLedger, sendTo } from './outgoing.js';
+import { applyFreezeLocally, broadcastFreeze, governanceTargets, memberIdsOf, mutateLedger, relayGovernance, resumeStaleRetarget, sendTo } from './outgoing.js';
+import { handleHandshake, handleTakeover, handleTakeoverInit, resendEffectiveTakeover, resumeLocal } from './takeover.js';
+import { handleDecision, handleMergeOutcome, handleMergeRequest, handleUnfreeze } from './freeze.js';
+import { handleHandover, handleManagerChanged } from './handover.js';
 
 /* 接收事件处理（consume 的落点）：端点学习、邀请建记录与冲突检测、回应与建立、撤回 / 退出 / 结束、
- * 主题与进度联动、冻结接收与转达、快照接收 / 回执 / 请求应答。异常由服务外层统一隔离（绝不穿出）。
+ * 主题与进度联动、冻结接收与转达、快照接收 / 回执 / 请求应答、治理与韧性五型（抢接 / 裁定 / 解冻 / 移交 /
+ * 握手与驿丞变更通告）。异常由服务外层统一隔离（绝不穿出）。
  * 事件处理发生在接收管线的「落盘 + ack 之后」——此处失败不回滚消息的受理承诺。 */
-
-/* 已转达 originMsgId 集上限：转达防环与防重复的记录面（进程内、插入序淘汰）——
- * 每条冻结通告的每跳只在首次收到时转达一次，重复副本不再向外扩散（本地冻结仍幂等执行）。 */
-const RELAYED_ORIGINS_MAX = 256;
 
 const EVENT_HANDLERS = {
   invite: handleInvite,
@@ -25,6 +25,20 @@ const EVENT_HANDLERS = {
   snapshot: handleSnapshot,
   end: handleEnd,
   leave: handleLeave,
+  'takeover-init': handleTakeoverInit,
+  takeover: handleTakeover,
+  decision: handleDecision,
+  unfreeze: handleUnfreeze,
+  handover: handleHandover,
+};
+
+/* notice 事件分发表（建协 / 协作 + 治理扩展）：未挂表事件只计数（前向兼容面）。 */
+const NOTICE_HANDLERS = {
+  established: handleEstablished,
+  'manager-changed': handleManagerChanged,
+  handshake: handleHandshake,
+  'merge-request': handleMergeRequest,
+  'merge-outcome': handleMergeOutcome,
 };
 
 export async function handleEvent(state, frame, meta) {
@@ -37,7 +51,9 @@ export async function handleEvent(state, frame, meta) {
 
 /* 端点学习（设计 §5「清单随协作参与关系更新」的接入面）：已受理帧的来源地址与端口记入
  * 对应协作的端点表（仅当本机在协作中——注册表命中），并同步 known-hosts（单播兜底目标）。
- * 仅在端点变化时写 member.json（避免每条消息一次写盘）。 */
+ * 仅在端点变化时写 member.json（避免每条消息一次写盘）；学习到现任驿丞端点时补做队列重定向、
+ * 学到生效抢接记录的成员端点时补发通告（「未入队即无重试」的盲区收窄）。
+ * 「任一成功接触」口径：任何已受理帧（不限于握手）都证明对端可达——顺手解除无法对表的挂起。 */
 function learnEndpoints(state, frame, meta) {
   const local = state.collabs.get(frame.collabId);
   if (local === undefined) {
@@ -48,6 +64,10 @@ function learnEndpoints(state, frame, meta) {
     return;
   }
   applyEndpoint(state, local, frame.from, address, frame.from.port);
+  if (local.suspended !== null && local.suspended.reason === 'handshake-unresolved') {
+    resumeLocal(state, local, 'handshake-contacted');
+  }
+  local.handshakeUnresolved = false;
 }
 
 export function applyEndpoint(state, local, peer, address, port) {
@@ -56,6 +76,10 @@ export function applyEndpoint(state, local, peer, address, port) {
     local.endpoints.set(peer.instanceId, { address, port });
     local.member.endpoints = Object.fromEntries(local.endpoints);
     persistMember(state, local);
+    if (peer.instanceId === currentManagerIdOf(local)) {
+      resumeStaleRetarget(state, local);
+    }
+    resendEffectiveTakeover(state, local, peer.instanceId);
   }
   rememberKnownHost(state, { address, port, instanceId: peer.instanceId, identityName: peer.identityName });
 }
@@ -68,7 +92,16 @@ function handleInvite(state, frame, meta) {
     return;
   }
   const member = inviteRecordOf(state, frame);
-  const local = { collabId: frame.collabId, role: 'member', ledger: null, member, endpoints: new Map(), snapshot: null };
+  const local = {
+    collabId: frame.collabId,
+    role: 'member',
+    ledger: null,
+    member,
+    endpoints: new Map(),
+    snapshot: null,
+    suspended: null,
+    staleManagerId: null,
+  };
   learnInviteSource(state, local, frame, meta);
   state.counters.invitesReceived++;
   const conflict = matchConflictCollabs(state, member.name, member.roster.map((entry) => entry.instanceId));
@@ -112,7 +145,10 @@ function learnInviteSource(state, local, frame, meta) {
  * 避免旧那条在检出机与另一机的副本形成分叉），随后广播。广播 reason 用固定短文案
  * （协议上限 200 字符——拼接多个实例标识会越界；明细在日志字段里）。 */
 function freezeOnInviteConflict(state, frame, local, conflict) {
+  const now = new Date().toISOString();
   local.member.state = 'frozen';
+  local.member.frozenAt = now;
+  local.member.frozenFrom = 'proposed';
   state.counters.freezeDetected++;
   state.collabs.set(frame.collabId, local);
   persistMember(state, local);
@@ -135,35 +171,66 @@ function handleDeclineResponse(state, frame) {
   applyInviteResponse(state, frame, 'declined');
 }
 
-/* 管理席位侧：把回应入账（幂等——同向重试帧不再推进），随后走建立判定点。 */
+/* 管理席位侧：把回应入账（幂等——同向重试帧不再推进）。提议中协作走建立判定点；
+ * 进行中协作的邀请回应（合并新增成员）直接定格：approved → member（同意效力范围：已过同意门）、
+ * declined → declined。冻结 / 归档态忽略（冻结期写被门控拦住，此处兜底语义一致）。 */
 function applyInviteResponse(state, frame, wanted) {
   const local = state.collabs.get(frame.collabId);
-  if (local === undefined || local.role !== 'manager' || local.ledger.status !== 'proposed') {
+  if (local === undefined || local.role !== 'manager') {
     return;
   }
+  const status = local.ledger.status;
+  if (status !== 'proposed' && status !== 'active') {
+    return;
+  }
+  const member = responseMemberOf(state, local, frame, wanted);
+  if (member === null) {
+    return;
+  }
+  const settledState = wanted === 'approved' && status === 'active' ? 'member' : wanted;
+  mutateLedger(state, local, () => {
+    member.state = settledState;
+  });
+  countResponse(state, wanted);
+  afterInviteResponse(state, local, status, settledState);
+}
+
+/* 回应入账后的两向收口：进行中协作的新成员定格（名单通告）；提议中协作走建立判定点。 */
+function afterInviteResponse(state, local, status, settledState) {
+  if (status === 'active' && settledState === 'member') {
+    broadcastRosterNotice(state, local);   // 合并新增成员：既有参与者知悉名单变更（不重复点头）
+    return;
+  }
+  if (status === 'proposed') {
+    maybeEstablish(state, local);
+  }
+}
+
+/* 回应的名单定位与合法态守卫（幂等重放与终局保护）：非法者计数告警并返回 null。 */
+function responseMemberOf(state, local, frame, wanted) {
   const member = local.ledger.members.find((entry) => entry.instanceId === frame.from.instanceId);
   if (member === undefined || member.role === 'manager') {
     state.counters.eventMismatch++;
-    state.log.warn('回应来源不在名单（忽略）', { collabId: frame.collabId, from: frame.from.instanceId });
-    return;
+    state.log.warn('回应来源不在名单（忽略）', { collabId: local.collabId, from: frame.from.instanceId });
+    return null;
   }
   if (member.state === wanted) {
-    return;
+    return null;
   }
   if (member.state !== 'invited') {
     state.counters.eventMismatch++;
-    state.log.warn('回应与既有终局不符（忽略——已撤回 / 已回应的成员不得被翻转）', { collabId: frame.collabId, from: frame.from.instanceId, state: member.state });
-    return;
+    state.log.warn('回应与既有终局不符（忽略——已撤回 / 已回应的成员不得被翻转）', { collabId: local.collabId, from: frame.from.instanceId, state: member.state });
+    return null;
   }
-  mutateLedger(state, local, () => {
-    member.state = wanted;
-  });
+  return member;
+}
+
+function countResponse(state, wanted) {
   if (wanted === 'approved') {
     state.counters.approvalsIn++;
   } else {
     state.counters.declinesIn++;
   }
-  maybeEstablish(state, local);
 }
 
 /* 建立判定点（定案 7）：全部应邀者有终局决策且同意 ≥1 → 建立前冲突复检（第二检测点）→
@@ -210,6 +277,15 @@ function establish(state, local) {
   }
 }
 
+function broadcastRosterNotice(state, local) {
+  for (const instanceId of memberIdsOf(state, local)) {
+    const endpoint = local.endpoints.get(instanceId);
+    if (endpoint !== undefined) {
+      sendTo(state, local.collabId, instanceId, endpoint, 'notice', { event: 'roster', version: local.ledger.version });
+    }
+  }
+}
+
 /* 撤回到达（成员侧）：single 定格 withdrawn；all 终止并归档（终态数据本地保留）。 */
 function handleWithdrawInbound(state, frame) {
   const local = state.collabs.get(frame.collabId);
@@ -230,13 +306,14 @@ function handleWithdrawInbound(state, frame) {
   state.counters.withdrawn++;
 }
 
-function handleNotice(state, frame) {
+async function handleNotice(state, frame) {
   const local = state.collabs.get(frame.collabId);
   if (local === undefined) {
     return;
   }
-  if (frame.payload.event === 'established') {
-    handleEstablished(state, local);
+  const handler = NOTICE_HANDLERS[frame.payload.event];
+  if (handler !== undefined) {
+    await handler(state, frame);
     return;
   }
   state.counters.noticesIn++;
@@ -244,8 +321,9 @@ function handleNotice(state, frame) {
 
 /* 建立通告（成员侧）：仅当本地已同意时定格 active——与本地决策矛盾的建立通告忽略并计数
  * （撤回 / 拒绝与建立的时序竞态面）。 */
-function handleEstablished(state, local) {
-  if (local.role !== 'member') {
+function handleEstablished(state, frame) {
+  const local = state.collabs.get(frame.collabId);
+  if (local === undefined || local.role !== 'member') {
     return;
   }
   if (local.member.state !== 'proposed' || (local.member.decision ?? null) !== 'approved') {
@@ -292,12 +370,22 @@ function handleProgress(state, frame) {
   state.counters.progressIn++;
 }
 
-/* 冻结接收（设计 §6）：匹配 → 本地冻结（幂等）→ 转达（每节点对同一原帧至多一次）。 */
+/* 冻结接收（设计 §6）：匹配 → 记下对端名单（合并并集的输入）→ 本地冻结（幂等）→ 转达
+ * （每节点对同一原帧至多一次）。 */
 function handleFreeze(state, frame) {
   const payload = frame.payload;
   const matched = matchConflictCollabs(state, payload.name, payload.members.map((entry) => entry.instanceId));
   let applied = 0;
   for (const local of matched) {
+    /* 帧描述的是「检出方的那条」——记录到本地其它匹配条上即对端数据（合并并集与保留方判定的输入）。 */
+    if (local.collabId !== frame.collabId) {
+      local.conflictRival = {
+        name: payload.name,
+        members: payload.members.map((entry) => ({ instanceId: entry.instanceId, identityName: entry.identityName })),
+        createdAt: payload.createdAt,
+        managerInstanceId: payload.manager?.instanceId,
+      };
+    }
     if (applyFreezeLocally(state, local, payload.reason)) {
       applied++;
     }
@@ -306,37 +394,18 @@ function handleFreeze(state, frame) {
   relayFreeze(state, frame, matched);
 }
 
-/* 转达（设计 §10 治理类例外；本计划的收敛见定案 11）：逐目标独立入队——防环与防重复由
- * originMsgId 已转达集承载（同 originMsgId 的重复副本不再向外扩散）。 */
+/* 转达：matched 协作的端点并集交给通用治理转达出口（逐目标独立入队 + originMsgId 防环）。 */
 function relayFreeze(state, frame, matched) {
-  const origin = typeof frame.payload.originMsgId === 'string' && frame.payload.originMsgId !== '' ? frame.payload.originMsgId : frame.msgId;
-  if (state.relayedOrigins.has(origin)) {
-    return;
-  }
-  rememberRelayedOrigin(state, origin);
-  let relayed = 0;
+  /* 寻址与其余治理帧同口径（协作端点表 + 站点级清单回退）——不因实现路径分裂转达面。 */
+  const targets = new Map();
   for (const local of matched) {
-    for (const [instanceId, endpoint] of local.endpoints) {
-      if (instanceId === state.self.instanceId || instanceId === frame.from.instanceId) {
-        continue;
-      }
-      const result = sendTo(state, local.collabId, instanceId, endpoint, 'freeze', { ...frame.payload, originMsgId: origin });
-      if (result.ok === true) {
-        relayed++;
+    for (const [instanceId, target] of governanceTargets(state, local)) {
+      if (!targets.has(instanceId)) {
+        targets.set(instanceId, target);
       }
     }
   }
-  state.counters.freezeRelayed += relayed;
-}
-
-/* 已转达集登记（插入序淘汰——表满丢最旧）。 */
-function rememberRelayedOrigin(state, origin) {
-  state.relayedOrigins.delete(origin);
-  state.relayedOrigins.set(origin, Date.now());
-  while (state.relayedOrigins.size > RELAYED_ORIGINS_MAX) {
-    const oldest = state.relayedOrigins.keys().next().value;
-    state.relayedOrigins.delete(oldest);
-  }
+  state.counters.freezeRelayed += relayGovernance(state, frame, targets);
 }
 
 function handleSnapshot(state, frame) {
@@ -347,14 +416,19 @@ function handleSnapshot(state, frame) {
   storeSnapshot(state, frame);
 }
 
-/* 快照接收（定案 4）：形态 → 自洽（version ↔ 内嵌台账、collabId ↔ 帧 collabId）→ digest 重算 →
- * 版本不倒退 → 落盘 + 回执 + 唤醒等待中的 view。摘要由发送方自算、对能对上 collabId 的参与者
- * 不构成防伪——形态与交叉一致性是接收侧独立的一关（形态判据与本地快照文件同一权威）；
- * 任一前置校验不过按摘要不符同一口径计数丢弃。 */
+/* 快照接收（定案 4 + 治理收紧）：来源必须为现任驿丞（换席后陈旧副本不得经快照通道覆盖——
+ * 版本号只保证单调，不保证来源正当）→ 形态 → 自洽（version ↔ 内嵌台账、collabId ↔ 帧 collabId）
+ * → digest 重算 → 版本不倒退 → 落盘 + 回执 + 唤醒等待中的 view。 */
 function storeSnapshot(state, frame) {
   const local = state.collabs.get(frame.collabId);
   if (local === undefined) {
     state.counters.snapshotCorrupt++;
+    return;
+  }
+  const currentManagerId = local.role === 'manager' ? state.self.instanceId : local.member.manager.instanceId;
+  if (frame.from.instanceId !== currentManagerId) {
+    state.counters.snapshotFromNonManager++;
+    state.log.warn('快照来源不是现任驿丞（拒绝：防陈旧副本经快照通道覆盖）', { collabId: frame.collabId, from: frame.from.instanceId });
     return;
   }
   const record = snapshotRecordOf(frame, frame.payload);
@@ -412,12 +486,17 @@ function resolvePendingView(state, collabId, snapshot) {
   pending.resolve(snapshot);
 }
 
-/* 快照请求应答：管理席位把当前台账整份回给请求方（端点取请求帧来源；成员侧忽略）。
+/* 快照请求应答：管理席位把当前台账整份回给请求方（端点取请求帧来源；成员侧忽略；
+ * 写暂停期间不服务——收敛等待中避免以未定身份对外供数）。
  * 载荷冻结：入队的是台账副本——活引用在「应答入队与上线序列化」的间隙会被后续变更改写，
  * 帧将以「摘要不符」被对端丢弃（与快照推送同一纪律）。 */
 function answerSnapshotRequest(state, frame) {
   const local = state.collabs.get(frame.collabId);
   if (local === undefined || local.role !== 'manager') {
+    return;
+  }
+  if (local.suspended !== null) {
+    state.counters.snapshotSkipped++;
     return;
   }
   const endpoint = local.endpoints.get(frame.from.instanceId);
@@ -461,10 +540,5 @@ function handleLeave(state, frame) {
     member.state = 'left';
   });
   state.counters.leftIn++;
-  for (const instanceId of memberIdsOf(state, local)) {
-    const endpoint = local.endpoints.get(instanceId);
-    if (endpoint !== undefined) {
-      sendTo(state, local.collabId, instanceId, endpoint, 'notice', { event: 'roster', version: local.ledger.version });
-    }
-  }
+  broadcastRosterNotice(state, local);
 }

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFileSync, readdirSync, renameSync } from 'node:fs';
+import { readFileSync, readdirSync, renameSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { COLLABS_DIR_NAME, collabDir, collabFilePath, ensureDir } from '../paths.js';
 import { ID_PATTERN } from '../net/protocol.js';
@@ -54,6 +54,18 @@ export function quarantineLedger(dataDir, collabId) {
   const file = collabFilePath(dataDir, collabId, LEDGER_FILE_NAME);
   try {
     renameSync(file, `${file}.corrupt-${Date.now()}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/* 删除本地台账文件（移交「先确认后删除」的删除面：确认回执到手后由旧席位执行）。
+ * force 语义——文件不存在不算失败；失败返回 false，由调用方计数告警（删除不成就保守保留，
+ * 不会造成数据错乱：本机已转成员，遗留台账文件仅在极端路径下被重建读取）。 */
+export function removeLedgerFile(dataDir, collabId) {
+  try {
+    rmSync(collabFilePath(dataDir, collabId, LEDGER_FILE_NAME), { force: true });
     return true;
   } catch {
     return false;

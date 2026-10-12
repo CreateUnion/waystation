@@ -1,5 +1,5 @@
-import { isArchived } from './model.js';
 import { appendLedger, ensureCollabDir, saveMember, saveSnapshot } from './store.js';
+import { isArchived } from './model.js';
 
 /* 本地协作态与持久化的共享原语（服务内多模块共用）：状态读法（管理席位以台账为权威、
  * 成员以本地记录为权威）与「只计数告警、绝不抛出」的写盘包装（健壮性硬性要求——
@@ -22,6 +22,23 @@ export function localRosterOf(local) {
     return local.ledger.members;
   }
   return local.member.roster ?? [];
+}
+
+/* 本机持有的当前汇报版本：管理席位取台账版本；成员取最近一次校验通过的快照版本（无快照为 null）。
+ * 抢接优先序与合流判定都以它为「本机版本」口径。 */
+export function localVersionOf(local) {
+  if (local.role === 'manager') {
+    return local.ledger.version;
+  }
+  return local.snapshot === null ? null : local.snapshot.version;
+}
+
+/* 现任驿丞标识（两侧视角统一读法）。 */
+export function currentManagerIdOf(local) {
+  if (local.role === 'manager') {
+    return local.ledger.manager.instanceId;
+  }
+  return local.member.manager.instanceId;
 }
 
 export function persistMember(state, local) {
@@ -64,4 +81,30 @@ export function rememberKnownHost(state, entry) {
     state.counters.persistFailures++;
     state.log.warn('已知主机清单更新失败（已忽略）', { reason: error.message });
   }
+}
+
+/* 由台账状态映射成员侧本地状态（席位转移——接管 / 移交 / 抢接降级——的共用量规）：
+ * 成员记录是本地视角，其 state 取当前公开状态的映射；left 是成员本地终态、不由映射产生。 */
+export function memberStateFor(status) {
+  if (status === 'completed' || status === 'terminated') {
+    return status;
+  }
+  if (status === 'frozen') {
+    return 'frozen';
+  }
+  if (status === 'active') {
+    return 'active';
+  }
+  return 'proposed';
+}
+
+/* 冻结前状态的兜底推测（旧数据缺 frozenFrom 标记时）：成员侧已回应过邀请即视为 active，
+ * 未回应视为 proposed；管理侧存在非邀请态成员即视为 active，否则 proposed。 */
+export function inferredFrozenFrom(local) {
+  if (local.role === 'manager') {
+    const settled = local.ledger.members.some((entry) => entry.role !== 'manager' && entry.state !== 'invited' && entry.state !== 'left');
+    return settled ? 'active' : 'proposed';
+  }
+  const decision = local.member.decision ?? null;
+  return decision === 'approved' || decision === 'withdrawn' ? 'active' : 'proposed';
 }
