@@ -136,7 +136,7 @@ test('stdio 骨架：进程可起、ws_status 可调、网络层就绪、数据�
   const port = await pickFreePort();
   const client = await connectClient(t, INDEX_ENTRY, home, { port });
   const { tools } = await client.listTools();
-  assert.deepEqual(tools.map((tool) => tool.name), ['ws_status', 'ws_list_hosts', 'ws_ping', 'ws_delivery_status', 'ws_check_inbox', 'ws_list_collabs', 'ws_create_collab', 'ws_approve_invite', 'ws_withdraw_invite', 'ws_view_ledger', 'ws_send_message', 'ws_leave_collab', 'ws_end_collab']);
+  assert.deepEqual(tools.map((tool) => tool.name), ['ws_status', 'ws_list_hosts', 'ws_ping', 'ws_delivery_status', 'ws_check_inbox', 'ws_list_collabs', 'ws_create_collab', 'ws_approve_invite', 'ws_withdraw_invite', 'ws_view_ledger', 'ws_send_message', 'ws_leave_collab', 'ws_end_collab', 'ws_decide', 'ws_handover', 'ws_take_over']);
   const status = await fetchStatus(client);
   assert.equal(status.name, 'waystation');
   assert.equal(status.version, '0.1.0');
@@ -337,4 +337,19 @@ test('ws_view_ledger / ws_send_message：未知协作 → isError（明确提示
   assert.ok(viewed.content[0].text.includes('没有该协作'));
   const sent = await client.callTool({ name: 'ws_send_message', arguments: { collabId: 'collab-none', text: '你好' } });
   assert.equal(sent.isError, true);
+});
+
+test('治理工具：未知协作的裁定 / 移交 / 抢接 → isError（明确提示，不触达网络）', { timeout: 30000 }, async (t) => {
+  const home = makeTempDir(t);
+  const client = await connectClient(t, INDEX_ENTRY, home, { port: await pickFreePort() });
+  const decided = await client.callTool({ name: 'ws_decide', arguments: { collabId: 'collab-none', choice: 'keep' } });
+  assert.equal(decided.isError, true);
+  assert.ok(decided.content[0].text.includes('没有该协作'));
+  const handed = await client.callTool({ name: 'ws_handover', arguments: { collabId: 'collab-none', target: 'inst-b' } });
+  assert.equal(handed.isError, true);
+  const taken = await client.callTool({ name: 'ws_take_over', arguments: { collabId: 'collab-none' } });
+  assert.equal(taken.isError, true);
+  const badChoice = await client.callTool({ name: 'ws_decide', arguments: { collabId: 'collab-none' } });
+  assert.equal(badChoice.isError, true, '两形态均缺 → 参数级错误');
+  assert.ok(badChoice.content[0].text.includes('一种形态'));
 });

@@ -15,6 +15,7 @@ import { pingTool } from './tools/ping.js';
 import { deliveryStatusTool } from './tools/delivery-status.js';
 import { checkInboxTool } from './tools/check-inbox.js';
 import { listCollabsTool, createCollabTool, approveInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, leaveCollabTool, endCollabTool } from './tools/collab.js';
+import { decideTool, handoverTool, takeOverTool } from './tools/governance.js';
 import { createMcpServer } from './server.js';
 import { createKnownHosts } from './net/known-hosts.js';
 import { createDiscovery } from './net/discovery.js';
@@ -105,21 +106,15 @@ if (configCreated || (site.ok && site.writeBackPort)) {
 }
 
 /* 网络层与协作层组合根：构造组件、注入装配层（接线与生命周期归 stack——循环依赖在那里解除）。
- * 协作服务在 dispatch 之后构造（发送经其可靠队列）、在 inbound 之前构造（admit/consume 注入）；
- * 适配器在协作服务之后构造（上下文头的「项目：」行经其描述器）、发现层经闭包取协作计数
- * （扫描列表显示真实忙闲；闭包在 start 时才调用，声明顺序无碍）。 */
+ * 适配器先于协作服务构造：协作服务的 notify（本机提示注入面）需要它；其 describeCollab 闭包
+ * 延迟引用协作服务（TDZ 安全——描述器只在投递渲染时调用，启动期不触达）。
+ * 协作服务在 dispatch 之后构造（发送经其可靠队列；探测经其即时通道；队列改投经其新出口）、
+ * 在 inbound 之前构造（admit/consume 注入）；发现层经闭包取协作计数（扫描列表显示真实忙闲；
+ * 闭包在 start 时才调用，声明顺序无碍）。 */
 const self = { instanceId, identityName: config.identityName, port: config.port };
 const knownHosts = createKnownHosts({ dataDir: activeDir, log });
 const transport = createTransport({ port: config.port, log });
 const dispatch = createDispatch({ dataDir: activeDir, config, transport, self, log });
-const collab = createCollabService({
-  dataDir: activeDir,
-  config,
-  self,
-  send: (message) => dispatch.send(message),
-  knownHosts,
-  log,
-});
 const adapter = createClaudeCodeAdapter({
   env: process.env,
   log,
@@ -128,6 +123,17 @@ const adapter = createClaudeCodeAdapter({
 if (!adapter.available()) {
   log.warn('会话投递适配器不可用（未检测到会话消息套接字）——投递降级为会话主动查');
 }
+const collab = createCollabService({
+  dataDir: activeDir,
+  config,
+  self,
+  send: (message) => dispatch.send(message),
+  probe: (address, port) => dispatch.ping({ address, port }),
+  reassign: (payload) => dispatch.reassignPeer(payload),
+  notify: (frame) => adapter.deliverFrame(frame),
+  knownHosts,
+  log,
+});
 const discovery = createDiscovery({
   port: config.port,
   instanceId: self.instanceId,
@@ -165,6 +171,8 @@ const net = createNetStack({
 const bind = await net.start();
 if (!bind.ok) {
   log.warn('局域网功能不可用（降级为本地 MCP 服务）', { reason: bind.reason, message: bind.message });
+} else {
+  collab.start();   // 探测定时器 + 启动握手（常驻收敛机制；降级不启动——无 LAN 面对表）
 }
 
 const registry = createToolRegistry();
@@ -181,6 +189,9 @@ registry.register(viewLedgerTool());
 registry.register(sendMessageTool());
 registry.register(leaveCollabTool());
 registry.register(endCollabTool());
+registry.register(decideTool());
+registry.register(handoverTool());
+registry.register(takeOverTool());
 const context = {
   version,
   instanceId,
@@ -195,10 +206,10 @@ const context = {
 const server = createMcpServer({ version, registry, context });
 await server.connect(new StdioServerTransport());
 
-/* 会话关闭（stdin EOF）= 这台机器离线（设计 §13）：先收协作层等待面（未决的拉取定时器），
- * 再关闭网络栈释放 UDP/TCP 监听端口，进程自然退出（退出码 0）。MCP SDK 的 stdio transport
- * 只监听 stdin 的 data/error、不报告 EOF（server/stdio.js），故在这个组合根接线；
- * 硬杀（SIGTERM/SIGKILL）保持「被外部终止」的既有语义，不接信号事件。
+/* 会话关闭（stdin EOF）= 这台机器离线（设计 §13）：先收协作层等待面（未决的拉取定时器、探测
+ * 定时器与抢接 / 移交等待面），再关闭网络栈释放 UDP/TCP 监听端口，进程自然退出（退出码 0）。
+ * MCP SDK 的 stdio transport 只监听 stdin 的 data/error、不报告 EOF（server/stdio.js），
+ * 故在这个组合根接线；硬杀（SIGTERM/SIGKILL）保持「被外部终止」的既有语义，不接信号事件。
  * 优雅退出是尽力而为：上界为在途拨号超时（生产默认 5000ms）——超出 SDK 客户端 2s 兜底窗时
  * 退化为 SIGTERM 收尾；在途消息仍在落盘队列，重试即新一轮调度。 */
 let sessionEnded = false;
