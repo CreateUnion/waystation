@@ -70,7 +70,7 @@ const COMMANDS = {
     return { ok: listed.ok, hosts: listed.hosts ?? [], message: listed.message ?? '' };
   },
   ping: async (command) => ({ ok: true, ...(await stack.pingHost({ address: command.address, port: command.port })) }),
-  send: async (command) => ({ ok: true, ...stack.send({ collabId: command.collabId, to: command.to, type: command.type ?? 'notice', payload: command.payload }) }),
+  send: async (command) => ({ ok: true, ...stack.send({ collabId: command.collabId, to: command.to, type: command.type ?? 'reply', payload: command.payload }) }),
   status: async (command) => ({ ok: true, rows: stack.deliveryStatus(command) }),
   inbox: async (command) => ({ ok: true, messages: loadLines(collabFilePath(dataDir, command.collabId, INBOX_FILE_NAME)).entries }),
   // 会话主动查路径（生产由 ws_check_inbox 工具承载）：
