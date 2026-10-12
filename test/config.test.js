@@ -4,6 +4,7 @@ import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { CONFIG_FILE_NAME, buildDefaults, loadConfig, saveConfig } from '../src/config.js';
+import { MAX_IDENTITY_NAME_CHARS, isIdentityName } from '../src/net/protocol.js';
 import { makeTempDir } from './helpers.js';
 
 test('文件缺失：返回默认值且 created=true', (t) => {
@@ -173,6 +174,25 @@ test('buildDefaults：槽位感知默认（身份名后缀与端口段）', () =
   for (const slot of [0, 9, '2', 2.5]) {
     assert.throws(() => buildDefaults('主机甲', { slot }), TypeError, String(slot));
   }
+});
+
+test('buildDefaults：长主机名的默认身份名按上限截断（槽位后缀优先保留）', () => {
+  /* 主机名可长到让「主机名-<k>」越过身份名上限（单标签上限 63 字符，加后缀即 65）——
+   * 越界默认值会让该站点全部出站帧被协议预检拒（LAN 整站不可用），故派生时截断主机名部分。 */
+  const boundaryHost = 'x'.repeat(MAX_IDENTITY_NAME_CHARS - 1);   // 63 字符：加「-2」即 65，必须截断
+  const derived = buildDefaults(boundaryHost, { slot: 2 }).identityName;
+  assert.ok(derived.length <= MAX_IDENTITY_NAME_CHARS, `${derived.length} 字符`);
+  assert.ok(derived.endsWith('-2'), '槽位后缀优先保留');
+  assert.equal(isIdentityName(derived), true, derived);
+  assert.equal(boundaryHost.startsWith(derived.slice(0, -2)), true, '主机名部分原样前缀');
+
+  const longHost = 'y'.repeat(MAX_IDENTITY_NAME_CHARS + 8);   // 主机名本身即越界：任何派生都必须落回上限内
+  for (const options of [{}, { slot: 1 }, { slot: 8 }]) {
+    const name = buildDefaults(longHost, options).identityName;
+    assert.ok(name.length <= MAX_IDENTITY_NAME_CHARS, `${JSON.stringify(options)} → ${name.length} 字符`);
+    assert.equal(isIdentityName(name), true, name);
+  }
+  assert.equal(buildDefaults('主机甲', { slot: 3 }).identityName, '主机甲-3', '常规长度不受截断影响');
 });
 
 test('loadConfig：defaults 参数指定站点默认（槽位目录首跑）', (t) => {

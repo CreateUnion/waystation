@@ -39,6 +39,15 @@ const FIELD_RULES = {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+/* 默认身份名的派生：槽位 ≥2 取 `<主机名>-<k>`（同机多站点在扫描列表默认可区分），槽位 1 / 省略即主机名本身。
+ * 主机名长度没有全局硬上界（单标签上限 63 字符、Linux 主机名字段可达 64），加后缀后可能越过身份名上限——
+ * 身份名由协议预检整串判定，越界会让该站点全部出站帧被拒（LAN 整站不可用），故按上限截断主机名部分、
+ * 槽位后缀优先保留；截断只缩短长度，不引入控制 / 格式字符（主机名原样截断）。 */
+function defaultIdentityName(hostName, slot) {
+  const suffix = slot !== null && slot >= 2 ? `-${slot}` : '';
+  return hostName.slice(0, MAX_IDENTITY_NAME_CHARS - suffix.length) + suffix;
+}
+
 /* 默认配置：设计 §14 参数表（开箱可用、一般不改）。
  * options.slot：站点槽位（1..SLOT_COUNT）——决定默认身份名（槽位 ≥2 取 `<主机名>-<k>`，
  * 同机多站点在扫描列表默认可区分）与默认端口（槽位默认端口 = 锚点 + k - 1）；省略 = 主站点。
@@ -51,7 +60,7 @@ export function buildDefaults(hostName, options = {}) {
     throw new TypeError(`槽位非法（应为 1–${SLOT_COUNT} 的整数或省略）：${String(slot)}`);
   }
   return {
-    identityName: slot !== null && slot >= 2 ? `${hostName}-${slot}` : hostName,
+    identityName: defaultIdentityName(hostName, slot),
     port: slot === null ? ANCHOR_PORT : slotDefaultPort(slot),
     offlineQueue: true,
     autoDeliver: true,
