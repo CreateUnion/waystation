@@ -9,8 +9,8 @@ function quietLog() {
   return { info: () => {}, warn: () => {}, error: () => {} };
 }
 
-function notice(text) {
-  return { v: 1, msgId: newMsgId(), type: 'notice', from: { instanceId: 'inst-a', identityName: '主机甲' }, collabId: 'collab-1', ts: new Date().toISOString(), payload: { text } };
+function collabFrame(text) {
+  return { v: 1, msgId: newMsgId(), type: 'reply', from: { instanceId: 'inst-a', identityName: '主机甲' }, collabId: 'collab-1', ts: new Date().toISOString(), payload: { text } };
 }
 
 async function listenTransport(t, onFrame) {
@@ -52,9 +52,9 @@ test('拨号 + 帧往返：监听侧处理器收到完整帧与来源地址', { 
   });
   const connection = await transport.dial({ address: '127.0.0.1', port, timeoutMs: 2000 });
   t.after(() => connection.close());
-  connection.send(notice('第一条'));
+  connection.send(collabFrame('第一条'));
   await waitFor(() => received.length === 1);
-  assert.equal(received[0].frame.type, 'notice');
+  assert.equal(received[0].frame.type, 'reply');
   assert.equal(received[0].frame.payload.text, '第一条');
   assert.equal(received[0].remoteAddress, '127.0.0.1');
 });
@@ -63,7 +63,7 @@ test('分片帧：一行分两次写入仍只回调一次', { timeout: 15000 }, 
   const received = [];
   const { port } = await listenTransport(t, (connection, frame) => received.push(frame));
   const socket = await rawConnect(t, port);
-  const line = JSON.stringify(notice('分片'));
+  const line = JSON.stringify(collabFrame('分片'));
   socket.write(line.slice(0, 10));
   await new Promise((resolve) => setTimeout(resolve, 30));
   socket.write(line.slice(10) + '\n');
@@ -76,7 +76,7 @@ test('粘包：一次写入两行按顺序回调两次', { timeout: 15000 }, asy
   const received = [];
   const { port } = await listenTransport(t, (connection, frame) => received.push(frame.payload.text));
   const socket = await rawConnect(t, port);
-  socket.write(JSON.stringify(notice('一')) + '\n' + JSON.stringify(notice('二')) + '\n');
+  socket.write(JSON.stringify(collabFrame('一')) + '\n' + JSON.stringify(collabFrame('二')) + '\n');
   await waitFor(() => received.length === 2);
   assert.deepEqual(received, ['一', '二']);
 });
@@ -117,7 +117,7 @@ test('坏帧后的同 chunk 合法行：不投递（连接已死，短路）', {
   const { transport, port } = await listenTransport(t, (connection, frame) => received.push(frame));
   const socket = await rawConnect(t, port);
   const closed = new Promise((resolve) => socket.on('close', resolve));
-  socket.write('{oops\n' + JSON.stringify(notice('紧随坏帧')) + '\n');
+  socket.write('{oops\n' + JSON.stringify(collabFrame('紧随坏帧')) + '\n');
   await closed;
   assert.equal(transport.stats().protocolViolations, 1);
   assert.equal(received.length, 0);
@@ -128,7 +128,7 @@ test('超限行后的同 chunk 合法行：不投递（连接已死，短路）'
   const { transport, port } = await listenTransport(t, (connection, frame) => received.push(frame));
   const socket = await rawConnect(t, port);
   const closed = new Promise((resolve) => socket.on('close', resolve));
-  socket.write('x'.repeat(MAX_FRAME_BYTES + 10) + '\n' + JSON.stringify(notice('紧随超限')) + '\n');
+  socket.write('x'.repeat(MAX_FRAME_BYTES + 10) + '\n' + JSON.stringify(collabFrame('紧随超限')) + '\n');
   await closed;
   assert.equal(transport.stats().oversizedFrames, 1);
   assert.equal(received.length, 0);
@@ -139,7 +139,7 @@ test('非法 UTF-8 字节：按坏帧计数并关闭连接（不静默替换投�
   const { transport, port } = await listenTransport(t, (connection, frame) => received.push(frame));
   const socket = await rawConnect(t, port);
   const closed = new Promise((resolve) => socket.on('close', resolve));
-  const frame = JSON.stringify(notice('X'));   // ASCII 占位字符，便于按字节定位替换点
+  const frame = JSON.stringify(collabFrame('X'));   // ASCII 占位字符，便于按字节定位替换点
   const at = frame.indexOf('X');
   socket.write(Buffer.concat([
     Buffer.from(frame.slice(0, at)),
@@ -203,7 +203,7 @@ test('拨号连接：本地 close 触发 onClose，监听侧不回帧', { timeou
   connection.onClose(() => {
     closed = true;
   });
-  connection.send(notice('触发对端回执'));
+  connection.send(collabFrame('触发对端回执'));
   assert.equal(frames.length, 0);
   connection.close();
   await waitFor(() => closed);
@@ -237,7 +237,7 @@ test('transport.close 级联关闭拨号连接：本端 onClose 触发、对端�
   await transport.close();
   await waitFor(() => closed);
   await peerClosed;
-  connection.send(notice('关闭之后'));   // 已销毁 socket：静默空写，不抛
+  connection.send(collabFrame('关闭之后'));   // 已销毁 socket：静默空写，不抛
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.equal(peerReceived.length, 0);
 });
@@ -251,8 +251,8 @@ test('帧处理器抛错：连接不被拖垮，后续帧仍到达', { timeout: 
     }
   });
   const socket = await rawConnect(t, port);
-  socket.write(JSON.stringify(notice('一')) + '\n');
-  socket.write(JSON.stringify(notice('二')) + '\n');
+  socket.write(JSON.stringify(collabFrame('一')) + '\n');
+  socket.write(JSON.stringify(collabFrame('二')) + '\n');
   await waitFor(() => handled === 2);
 });
 

@@ -1,15 +1,19 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  DIGEST_PATTERN,
   GOVERNANCE_TYPES,
   ID_PATTERN,
   MAX_COLLAB_COUNT,
+  MAX_COLLAB_MEMBERS,
   MAX_DATAGRAM_BYTES,
   MAX_FRAME_BYTES,
+  MAX_TOPIC_CHARS,
   MESSAGE_TYPES,
   PROTOCOL_VERSION,
   TRANSPORT_TYPES,
   isIdentityName,
+  isPresentationText,
   newMsgId,
   parseFrame,
   validateMessage,
@@ -24,7 +28,7 @@ function envelope(overrides = {}) {
   return {
     v: 1,
     msgId: newMsgId(),
-    type: 'notice',
+    type: 'reply',
     from: SELF,
     collabId: 'collab-1',
     ts: new Date().toISOString(),
@@ -116,7 +120,7 @@ test('parseFrame：非法 JSON / 非对象 / 合法帧', () => {
   assert.equal(parseFrame('[1,2]').ok, false);
   assert.equal(parseFrame(JSON.stringify(envelope())).ok, true);
   const parsed = parseFrame(JSON.stringify(envelope()));
-  assert.equal(parsed.frame.type, 'notice');
+  assert.equal(parsed.frame.type, 'reply');
 });
 
 test('parseFrame：入参非字符串（消费方误传 Buffer）：拒绝', () => {
@@ -184,10 +188,11 @@ function frameWith(overrides = {}) {
   return {
     v: 1,
     msgId: 'msg-1',
-    type: 'notice',
+    type: 'reply',
     from: { instanceId: 'inst-a', identityName: '主机甲' },
     collabId: 'collab-1',
     ts: new Date().toISOString(),
+    payload: { text: '你好' },
     ...overrides,
   };
 }
@@ -241,4 +246,141 @@ test('isIdentityName 边界：空串 / 仅空白 / 65 字符拒收，64 字符�
   assert.equal(isIdentityName('x'.repeat(65)), false);
   assert.equal(isIdentityName('x'.repeat(64)), true);
   assert.equal(isIdentityName(42), false);
+});
+
+/* 协作域载荷校验用例：骨架沿用既有 frameWith，payload 按类型注入。 */
+function collabFrame(type, payload) {
+  return frameWith({ type, payload });
+}
+
+test('协作域 invite：合法通过（中文名、主题、成员 2 项）', () => {
+  const members = [
+    { instanceId: 'inst-a', identityName: '主机甲' },
+    { instanceId: 'inst-b', identityName: '主机乙' },
+  ];
+  assert.equal(validateMessage(collabFrame('invite', { name: '联调项目', topic: '发布联调', members })).ok, true);
+});
+
+test('协作域 invite：name 非法逐拒（控制字符 / 超 64 字符 / 空串 / 缺字段）', () => {
+  const members = [{ instanceId: 'inst-a', identityName: '甲' }, { instanceId: 'inst-b', identityName: '乙' }];
+  for (const name of ['甲\n乙', 'x'.repeat(65), '', undefined]) {
+    const checked = validateMessage(collabFrame('invite', { name, topic: '主题', members }));
+    assert.equal(checked.ok, false, String(name));
+    assert.ok(checked.reason.includes('invite'), checked.reason);
+  }
+});
+
+test('协作域 invite：topic 非法逐拒（201 字符 / 零宽字符 / 缺字段）', () => {
+  const members = [{ instanceId: 'inst-a', identityName: '甲' }, { instanceId: 'inst-b', identityName: '乙' }];
+  for (const topic of ['x'.repeat(201), '主\u200b题', undefined]) {
+    assert.equal(validateMessage(collabFrame('invite', { name: '项目', topic, members })).ok, false, String(topic));
+  }
+});
+
+test('协作域 invite：members 形态逐拒（少于 2 / 超 32 / 重复实例标识 / 条目缺字段）', () => {
+  const two = [{ instanceId: 'inst-a', identityName: '甲' }, { instanceId: 'inst-b', identityName: '乙' }];
+  const many = Array.from({ length: 33 }, (raw, index) => ({ instanceId: `inst-${index}`, identityName: `主机-${index}` }));
+  const dup = [...two, { instanceId: 'inst-a', identityName: '别名' }];
+  const cases = [[two[0]], many, dup, [{ instanceId: 'inst-a' }, two[1]], 'not-an-array'];
+  for (const members of cases) {
+    assert.equal(validateMessage(collabFrame('invite', { name: '项目', topic: '主题', members })).ok, false, JSON.stringify(members).slice(0, 40));
+  }
+  assert.equal(MAX_COLLAB_MEMBERS, 32);
+});
+
+test('协作域 approve / end / leave：payload 省略或空对象通过、非对象拒', () => {
+  assert.equal(validateMessage(frameWith({ type: 'approve' })).ok, true);
+  assert.equal(validateMessage(collabFrame('approve', {})).ok, true);
+  assert.equal(validateMessage(collabFrame('end', {})).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'leave' })).ok, true);
+  assert.equal(validateMessage(collabFrame('approve', [])).ok, false);
+  assert.equal(validateMessage(collabFrame('end', 'x')).ok, false);
+});
+
+test('协作域 decline / stop：reason 可选（合法通过 / 超长拒 / 非对象拒）', () => {
+  assert.equal(validateMessage(frameWith({ type: 'decline' })).ok, true);
+  assert.equal(validateMessage(collabFrame('decline', { reason: '人手不足' })).ok, true);
+  assert.equal(validateMessage(collabFrame('stop', { reason: 'x'.repeat(201) })).ok, false);
+  assert.equal(validateMessage(collabFrame('decline', { reason: '带\u0007控制符' })).ok, false);
+});
+
+test('协作域 withdraw：scope 必填且枚举、reason 可选', () => {
+  assert.equal(validateMessage(collabFrame('withdraw', { scope: 'single' })).ok, true);
+  assert.equal(validateMessage(collabFrame('withdraw', { scope: 'all', reason: '项目取消' })).ok, true);
+  for (const payload of [undefined, {}, { scope: 'both' }, { scope: 'all', reason: 'x'.repeat(201) }]) {
+    assert.equal(validateMessage(collabFrame('withdraw', payload)).ok, false, JSON.stringify(payload));
+  }
+});
+
+test('协作域 topic / task：topic.text 呈现文本上限 200、task.taskId 形态', () => {
+  assert.equal(validateMessage(collabFrame('topic', { text: 'x'.repeat(200) })).ok, true);
+  assert.equal(validateMessage(collabFrame('topic', { text: 'x'.repeat(201) })).ok, false);
+  assert.equal(validateMessage(collabFrame('task', { taskId: 'task-1', text: '请执行' })).ok, true);
+  assert.equal(validateMessage(collabFrame('task', { taskId: 'bad id!', text: 'x' })).ok, false);
+});
+
+test('协作域 progress / issue / reply：正文判据（缺失拒 / 4001 拒 / 4000 与换行通过 / taskId 可选）', () => {
+  assert.equal(validateMessage(collabFrame('progress', { text: '过', taskId: 'task-1' })).ok, true);
+  assert.equal(validateMessage(collabFrame('progress', { text: '过' })).ok, true);
+  assert.equal(validateMessage(collabFrame('progress', { text: '过', taskId: 'bad id!' })).ok, false);
+  assert.equal(validateMessage(collabFrame('progress', {})).ok, false);
+  assert.equal(validateMessage(collabFrame('issue', { text: '第一行\n第二行' })).ok, true);
+  assert.equal(validateMessage(collabFrame('reply', { text: 'x'.repeat(4000) })).ok, true);
+  assert.equal(validateMessage(collabFrame('reply', { text: 'x'.repeat(4001) })).ok, false);
+  assert.equal(MAX_TOPIC_CHARS, 200);
+});
+
+test('协作域 notice：event 枚举（established / roster / snapshot-stored）、version 可选且 ≥1', () => {
+  assert.equal(validateMessage(collabFrame('notice', { event: 'established', version: 3 })).ok, true);
+  assert.equal(validateMessage(collabFrame('notice', { event: 'roster' })).ok, true);
+  assert.equal(validateMessage(collabFrame('notice', { event: 'snapshot-stored', version: 2 })).ok, true);
+  assert.equal(validateMessage(collabFrame('notice', { event: 'unknown' })).ok, false);
+  assert.equal(validateMessage(collabFrame('notice', { event: 'established', version: 0 })).ok, false);
+});
+
+test('协作域 freeze / snapshot：freeze 名单形态；snapshot request 通过、data 需 version+digest+ledger', () => {
+  const members = [{ instanceId: 'inst-a' }, { instanceId: 'inst-b' }];
+  assert.equal(validateMessage(collabFrame('freeze', { name: '项目', members })).ok, true);
+  assert.equal(validateMessage(collabFrame('freeze', { name: '项目', members: [{ instanceId: 'inst-a' }] })).ok, false);
+  assert.equal(validateMessage(collabFrame('freeze', { name: '项目', members: [{ identityName: '甲' }, { instanceId: 'inst-b' }] })).ok, false);
+  assert.equal(validateMessage(collabFrame('snapshot', { kind: 'request' })).ok, true);
+  const digest = 'a'.repeat(64);
+  assert.equal(validateMessage(collabFrame('snapshot', { kind: 'data', version: 2, digest, ledger: {} })).ok, true);
+  assert.equal(validateMessage(collabFrame('snapshot', { kind: 'data', version: 2, digest: 'zz', ledger: {} })).ok, false);
+  assert.equal(validateMessage(collabFrame('snapshot', { kind: 'data', version: 2, digest })).ok, false);
+  assert.equal(validateMessage(collabFrame('snapshot', { kind: 'push' })).ok, false);
+});
+
+test('协作域全类型覆盖：对每个协作域类型给非法 payload 必拒（防漏挂表）', () => {
+  const collabTypes = ['invite', 'approve', 'decline', 'withdraw', 'topic', 'task', 'progress', 'issue', 'stop', 'reply', 'notice', 'freeze', 'snapshot', 'end', 'leave'];
+  const invalidPayload = {
+    invite: { name: '项目' },
+    approve: 'x',
+    decline: 'x',
+    withdraw: {},
+    topic: {},
+    task: {},
+    progress: {},
+    issue: {},
+    stop: 'x',
+    reply: {},
+    notice: {},
+    freeze: {},
+    snapshot: {},
+    end: 'x',
+    leave: 'x',
+  };
+  for (const type of collabTypes) {
+    assert.equal(validateMessage(collabFrame(type, invalidPayload[type])).ok, false, type);
+  }
+});
+
+test('isPresentationText：空 / 超限 / 控制与不可见字符拒、中文与空格通过', () => {
+  assert.equal(isPresentationText('联调 主题', 200), true);
+  assert.equal(isPresentationText('   ', 200), false);
+  assert.equal(isPresentationText('x'.repeat(201), 200), false);
+  assert.equal(isPresentationText('甲\u200b乙', 200), false);
+  assert.equal(isPresentationText(42, 200), false);
+  assert.equal(DIGEST_PATTERN.test('a'.repeat(64)), true);
+  assert.equal(DIGEST_PATTERN.test('A'.repeat(64)), false);
 });

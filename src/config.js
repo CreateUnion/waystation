@@ -35,6 +35,8 @@ const FIELD_RULES = {
   dialTimeoutMs: { check: (value) => Number.isInteger(value) && value >= 100 && value <= 120000, reason: '需为 100–120000 的整数（毫秒）' },
   // 占用者探测总预算（槽位解析与绑定失败分类共用；测试可注入小值——数值语义见 site.js / stack.js 消费方）
   probeTimeoutMs: { check: (value) => Number.isInteger(value) && value >= 100 && value <= 30000, reason: '需为 100–30000 的整数（毫秒）' },
+  // 单条邀请的过期标注时限（设计 §6 默认 24 小时；过期仅标注、不改协作状态）
+  inviteTtlMs: { check: (value) => Number.isInteger(value) && value >= 1000 && value <= 30 * DAY_MS, reason: '需为 1000–2592000000 的整数（毫秒，上限 30 天）' },
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -80,6 +82,7 @@ export function buildDefaults(hostName, options = {}) {
     dispatchTickMs: 1000,
     dialTimeoutMs: 5000,
     probeTimeoutMs: 1000,
+    inviteTtlMs: DAY_MS,
   };
 }
 

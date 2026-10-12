@@ -238,7 +238,7 @@ test('降级行为：LAN 工具返回明确错误文本；send 仍受理；deliv
   const probed = await stack.pingHost({ address: '127.0.0.1' });
   assert.equal(probed.ok, false);
   assert.equal(probed.message, bind.message);
-  const sent = stack.send({ collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2' }, type: 'notice' });
+  const sent = stack.send({ collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2' }, type: 'reply', payload: { text: '离线排队' } });
   assert.equal(sent.ok, true, '降级时发送仍受理入队（离线排队语义）');
   assert.deepEqual(stack.deliveryStatus({}), []);
   assert.ok(!dispatch.calls.includes('start'), '降级时调度器不启动（不对外投递）');
@@ -249,7 +249,7 @@ test('降级态：deliveryStatus 惰性载入历史队列（未 start 也能查�
   const config = { port: 17321, dispatchTickMs: 20, dialTimeoutMs: 100, retryIntervalMs: 60, retrySlowIntervalMs: 120, retryFastCount: 2, queueMaxPerCollab: 100, messageTtlMs: 600000 };
   const log = { info: () => {}, warn: () => {}, error: () => {} };
   const writer = createDispatch({ dataDir, config, transport: createFakeTransport(), self: SELF, log });
-  const sent = writer.send({ collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 }, type: 'notice', payload: { text: '离线排队' } });
+  const sent = writer.send({ collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 }, type: 'reply', payload: { text: '离线排队' } });
   assert.equal(sent.ok, true, '写入方未 start 也受理入队（离线排队语义）');
   const discovery = createFakeDiscovery({
     start: async () => {

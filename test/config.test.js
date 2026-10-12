@@ -19,6 +19,7 @@ test('文件缺失：返回默认值且 created=true', (t) => {
   assert.equal(config.logMaxBytes, 1048576);
   assert.equal(config.logMaxFiles, 5);
   assert.equal(config.probeTimeoutMs, 1000);
+  assert.equal(config.inviteTtlMs, 24 * 60 * 60 * 1000);
 });
 
 test('buildDefaults：标识名取传入主机名，形状完整', () => {
@@ -28,6 +29,7 @@ test('buildDefaults：标识名取传入主机名，形状完整', () => {
     'dialTimeoutMs',
     'dispatchTickMs',
     'identityName',
+    'inviteTtlMs',
     'logDir',
     'logMaxBytes',
     'logMaxFiles',
@@ -220,4 +222,15 @@ test('probeTimeoutMs：范围非法回落默认并告警', (t) => {
   const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
   assert.equal(config.probeTimeoutMs, 1000);
   assert.equal(warnings.length, 1);
+});
+
+test('inviteTtlMs：默认 24 小时、越界回落默认并告警', (t) => {
+  assert.equal(buildDefaults('主机甲').inviteTtlMs, 24 * 60 * 60 * 1000);
+  const dir = makeTempDir(t);
+  writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({ inviteTtlMs: 10 }));
+  const warnings = [];
+  const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+  assert.equal(config.inviteTtlMs, 24 * 60 * 60 * 1000);
+  assert.equal(warnings.length, 1);
+  assert.ok(warnings[0].includes('inviteTtlMs'));
 });

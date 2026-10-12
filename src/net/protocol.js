@@ -135,6 +135,10 @@ function validateTypeSpecific(frame) {
       return refuse('delivery-status 的 tier 非法（本版仅定义 session）');
     }
   }
+  const collabRule = COLLAB_PAYLOAD_RULES[frame.type];
+  if (collabRule !== undefined) {
+    return collabRule(frame.payload);
+  }
   return { ok: true };
 }
 
@@ -216,6 +220,200 @@ function isTimestamp(value) {
 
 function isCollabCount(value) {
   return Number.isInteger(value) && value >= 0 && value <= MAX_COLLAB_COUNT;
+}
+
+/* —— 协作域载荷形态（协作核心）：本层只判形态（字段完整性 / 类型 / 长度边界 / 数值范围）；
+ * 语义裁定（名单含本机、状态是否允许）在协作层。上限值服务呈现链与会话注入链的稳健性。 */
+export const MAX_COLLAB_MEMBERS = 32;
+export const MAX_TOPIC_CHARS = 200;
+export const MAX_MESSAGE_TEXT_CHARS = 4000;
+export const MAX_REASON_CHARS = 200;
+export const DIGEST_PATTERN = /^[0-9a-f]{64}$/;
+
+/* 呈现面短文本：进扫描列表 / 同意门 / 台账 / 会话呈现的字段——空、超长或含不可见字符都会破坏呈现链；
+ * 与身份名同一字符类判据（Cc / Cf / Zl / Zp 拒绝）。 */
+export function isPresentationText(value, maxChars) {
+  return typeof value === 'string'
+    && value.trim() !== ''
+    && value.length <= maxChars
+    && !FORBIDDEN_IDENTITY_CHARS.test(value);
+}
+
+/* 正文判据（数据面）：只限类型与非空与长度——换行等可打印内容属于数据，由投递链的外
+ * 部数据警示承载；不含呈现面的不可见字符限制。 */
+function isMessageText(value) {
+  return typeof value === 'string' && value.trim() !== '' && value.length <= MAX_MESSAGE_TEXT_CHARS;
+}
+
+/* 协作域类型 → payload 校验函数（表驱动：新增类型只加一行；协作域类型全部挂表防漏，
+ * 未挂表的治理类型走「不校验载荷」的宽容路径）。 */
+const COLLAB_PAYLOAD_RULES = {
+  invite: validateInvitePayload,
+  approve: validateOptionalObjectPayload,
+  decline: validateReasonPayload,
+  withdraw: validateWithdrawPayload,
+  topic: validateTopicPayload,
+  task: validateTaskPayload,
+  progress: validateProgressPayload,
+  issue: validateBodyPayload,
+  stop: validateReasonPayload,
+  reply: validateBodyPayload,
+  notice: validateNoticePayload,
+  freeze: validateFreezePayload,
+  snapshot: validateSnapshotPayload,
+  end: validateOptionalObjectPayload,
+  leave: validateOptionalObjectPayload,
+};
+
+function validateInvitePayload(payload) {
+  if (!isPlainObject(payload)) {
+    return refuse('invite 缺少 payload');
+  }
+  if (!isIdentityName(payload.name)) {
+    return refuse('invite.name 非法（项目名，同身份名呈现判据）');
+  }
+  if (!isPresentationText(payload.topic, MAX_TOPIC_CHARS)) {
+    return refuse(`invite.topic 非法（≤${MAX_TOPIC_CHARS} 字符的呈现文本）`);
+  }
+  return validateMemberList(payload.members, 'invite.members');
+}
+
+/* 名单形态（invite 与 freeze 共用）：2–上限项、每项 instanceId 合法且唯一；
+ * freeze 场景只需实例标识（用于交集匹配），invite 场景额外要求身份名可呈现。 */
+function validateMemberList(members, label) {
+  if (!Array.isArray(members) || members.length < 2 || members.length > MAX_COLLAB_MEMBERS) {
+    return refuse(`${label} 须为 2–${MAX_COLLAB_MEMBERS} 项的名单`);
+  }
+  const seen = new Set();
+  for (const member of members) {
+    if (!isPlainObject(member) || !isId(member.instanceId)) {
+      return refuse(`${label} 条目非法（需 instanceId）`);
+    }
+    if (label === 'invite.members' && !isIdentityName(member.identityName)) {
+      return refuse('invite.members 条目非法（需 identityName）');
+    }
+    if (seen.has(member.instanceId)) {
+      return refuse(`${label} 名单含重复实例标识`);
+    }
+    seen.add(member.instanceId);
+  }
+  return { ok: true };
+}
+
+function validateOptionalObjectPayload(payload) {
+  if (payload !== undefined && !isPlainObject(payload)) {
+    return refuse('payload 须为 JSON 对象');
+  }
+  return { ok: true };
+}
+
+function validateReasonPayload(payload) {
+  if (payload === undefined) {
+    return { ok: true };
+  }
+  if (!isPlainObject(payload)) {
+    return refuse('payload 须为 JSON 对象');
+  }
+  if (payload.reason !== undefined && !isPresentationText(payload.reason, MAX_REASON_CHARS)) {
+    return refuse(`reason 非法（≤${MAX_REASON_CHARS} 字符的呈现文本）`);
+  }
+  return { ok: true };
+}
+
+function validateWithdrawPayload(payload) {
+  if (!isPlainObject(payload)) {
+    return refuse('withdraw 缺少 payload');
+  }
+  if (payload.scope !== 'single' && payload.scope !== 'all') {
+    return refuse('withdraw.scope 非法（single / all）');
+  }
+  return validateReasonPayload(payload);
+}
+
+function validateTopicPayload(payload) {
+  if (!isPlainObject(payload)) {
+    return refuse('topic 缺少 payload');
+  }
+  if (!isPresentationText(payload.text, MAX_TOPIC_CHARS)) {
+    return refuse(`topic.text 非法（≤${MAX_TOPIC_CHARS} 字符的呈现文本）`);
+  }
+  return { ok: true };
+}
+
+function validateBodyPayload(payload) {
+  if (!isPlainObject(payload)) {
+    return refuse('payload 须为 JSON 对象');
+  }
+  if (!isMessageText(payload.text)) {
+    return refuse(`text 非法（非空、≤${MAX_MESSAGE_TEXT_CHARS} 字符）`);
+  }
+  return { ok: true };
+}
+
+function validateTaskPayload(payload) {
+  if (!isPlainObject(payload) || !isId(payload.taskId)) {
+    return refuse('task.taskId 非法（1–64 位字母数字与连字符）');
+  }
+  return validateBodyPayload(payload);
+}
+
+function validateProgressPayload(payload) {
+  if (!isPlainObject(payload)) {
+    return refuse('payload 须为 JSON 对象');
+  }
+  if (payload.taskId !== undefined && !isId(payload.taskId)) {
+    return refuse('progress.taskId 非法（1–64 位字母数字与连字符）');
+  }
+  return validateBodyPayload(payload);
+}
+
+function validateNoticePayload(payload) {
+  if (!isPlainObject(payload)) {
+    return refuse('notice 缺少 payload');
+  }
+  if (payload.event !== 'established' && payload.event !== 'roster' && payload.event !== 'snapshot-stored') {
+    return refuse('notice.event 非法（本版：established / roster / snapshot-stored）');
+  }
+  if (payload.version !== undefined && (!Number.isInteger(payload.version) || payload.version < 1)) {
+    return refuse('notice.version 非法（≥1 的整数）');
+  }
+  return { ok: true };
+}
+
+function validateFreezePayload(payload) {
+  if (!isPlainObject(payload)) {
+    return refuse('freeze 缺少 payload');
+  }
+  if (!isIdentityName(payload.name)) {
+    return refuse('freeze.name 非法（项目名）');
+  }
+  const members = validateMemberList(payload.members, 'freeze.members');
+  if (!members.ok) {
+    return members;
+  }
+  return validateReasonPayload(payload);
+}
+
+function validateSnapshotPayload(payload) {
+  if (!isPlainObject(payload)) {
+    return refuse('snapshot 缺少 payload');
+  }
+  if (payload.kind === 'request') {
+    return { ok: true };
+  }
+  if (payload.kind !== 'data') {
+    return refuse('snapshot.kind 非法（request / data）');
+  }
+  if (!Number.isInteger(payload.version) || payload.version < 1) {
+    return refuse('snapshot.version 非法（≥1 的整数）');
+  }
+  if (typeof payload.digest !== 'string' || !DIGEST_PATTERN.test(payload.digest)) {
+    return refuse('snapshot.digest 非法（64 位小写十六进制）');
+  }
+  if (!isPlainObject(payload.ledger)) {
+    return refuse('snapshot.ledger 非法（须为台账对象）');
+  }
+  return { ok: true };
 }
 
 function refuse(reason) {

@@ -109,7 +109,7 @@ function makeDispatch(t, { transport, config, self } = {}) {
 }
 
 function target(overrides = {}) {
-  return { collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 }, type: 'notice', payload: { text: '你好' }, ...overrides };
+  return { collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 }, type: 'reply', payload: { text: '你好' }, ...overrides };
 }
 
 test('send：当场返回「已排队」，调度 tick 后帧写出（信封字段齐全）', { timeout: 15000 }, async (t) => {
@@ -124,7 +124,7 @@ test('send：当场返回「已排队」，调度 tick 后帧写出（信封字�
   const frame = transport.connections[0].frames[0];
   assert.equal(frame.v, 1);
   assert.equal(frame.msgId, sent.msgId);
-  assert.equal(frame.type, 'notice');
+  assert.equal(frame.type, 'reply');
   assert.equal(frame.collabId, 'collab-1');
   assert.deepEqual(frame.from, { instanceId: 'inst-self', identityName: '本机', port: 7321 });
   assert.equal(frame.payload.text, '你好');
@@ -527,7 +527,7 @@ test('索引回收：条目被队列回收后不再出现在状态查询，重�
   dispatch.start();
   await waitFor(() => dispatch.deliveryStatus({ msgId: first.msgId })[0]?.expired, { timeoutMs: 4000 });
   // 治理类条目豁免过期：回收事件发生时它仍存活，用于验证重建后的归属查找
-  const second = dispatch.send(target({ payload: { text: '二' }, type: 'freeze' }));
+  const second = dispatch.send(target({ type: 'freeze', payload: { name: '项目', members: [{ instanceId: 'inst-a', identityName: '主机甲' }, { instanceId: 'inst-b', identityName: '主机乙' }] } }));
   assert.equal(second.ok, true);
   await waitFor(() => dispatch.deliveryStatus({ msgId: first.msgId }).length === 0, { timeoutMs: 5000 });
   dispatch.onAck(second.msgId);
@@ -539,7 +539,7 @@ test('send：to.port 缺失 / 非法 → 统一参数拒绝、不入队', { time
   t.after(() => dispatch.stop());
   const variants = [undefined, 0, 65536, '7321', 1.5];
   for (const port of variants) {
-    const sent = dispatch.send({ collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2', port }, type: 'notice', payload: { text: 'x' } });
+    const sent = dispatch.send({ collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2', port }, type: 'reply', payload: { text: 'x' } });
     assert.equal(sent.ok, false, String(port));
     assert.ok(sent.reason.includes('to.port'), sent.reason);
   }
@@ -571,7 +571,7 @@ test('拨号端口 = 条目 to.port（多站点下拨错端口即投递失败）
   const transport = createFakeTransport();
   const { dispatch } = makeDispatch(t, { transport });
   t.after(() => dispatch.stop());
-  dispatch.send({ collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2', port: 17321 }, type: 'notice', payload: { text: 'x' } });
+  dispatch.send({ collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2', port: 17321 }, type: 'reply', payload: { text: 'x' } });
   dispatch.start();
   await waitFor(() => transport.dials.length >= 1);
   assert.deepEqual(transport.dials[0], { address: '127.0.0.2', port: 17321 });
@@ -593,7 +593,7 @@ test('旧队列记录续投：拨号回退锚点端口（缺 port 记录按默�
   const collabId = 'collab-1';
   ensureDir(collabDir(dataDir, collabId));
   const legacy = {
-    msgId: 'msg-legacy', collabId, to: { instanceId: 'inst-b', address: '127.0.0.2' }, type: 'notice', payload: { text: '旧' },
+    msgId: 'msg-legacy', collabId, to: { instanceId: 'inst-b', address: '127.0.0.2' }, type: 'reply', payload: { text: '旧' },
     governance: false, state: 'queued', attempts: 0, createdAt: new Date().toISOString(), nextAttemptAt: 0,   // 时间戳取当下：硬编码旧日期会被保留期在首个 tick 即判过期，拨号永不发生
   };
   appendFileSync(collabFilePath(dataDir, collabId, OUTBOX_FILE_NAME), JSON.stringify(legacy) + '\n');
