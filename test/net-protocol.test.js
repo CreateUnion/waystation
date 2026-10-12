@@ -533,3 +533,11 @@ test('notice merge-outcome：adopted 布尔必填', () => {
   assert.equal(validateMessage(frameWith({ type: 'notice', payload: { event: 'merge-outcome', adopted: false } })).ok, true);
   assert.equal(validateMessage(frameWith({ type: 'notice', payload: { event: 'merge-outcome' } })).ok, false);
 });
+
+test('notice event 为原型成员名（__proto__ / constructor / toString）：按未知事件拒绝，校验层不抛穿', () => {
+  for (const event of ['__proto__', 'constructor', 'toString', 'hasOwnProperty']) {
+    const checked = validateMessage(frameWith({ type: 'notice', payload: { event } }));
+    assert.equal(checked.ok, false, event);
+    assert.ok(checked.reason.includes('notice.event'), `${event}: ${checked.reason}`);
+  }
+});

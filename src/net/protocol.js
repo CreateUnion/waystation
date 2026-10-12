@@ -373,12 +373,15 @@ function validateProgressPayload(payload) {
   return validateBodyPayload(payload);
 }
 
-/* notice 事件集（建协 / 协作 + 治理与韧性扩展）：事件枚举 + 各事件字段形态。 */
+/* notice 事件集（建协 / 协作 + 治理与韧性扩展）：事件枚举 + 各事件字段形态。
+ * 事件名查表一律 Object.hasOwn：事件名是外来字符串，直接取值会命中 Object.prototype 上的
+ * 内置成员——constructor / toString 会调错函数返回非结果形态，__proto__ 更会因不可调用
+ * 抛出异常穿出校验层（调用链上无捕获点，恶意帧即进程级故障）。 */
 function validateNoticePayload(payload) {
   if (!isPlainObject(payload)) {
     return refuse('notice 缺少 payload');
   }
-  if (typeof payload.event !== 'string' || !NOTICE_EVENT_RULES[payload.event]) {
+  if (typeof payload.event !== 'string' || !Object.hasOwn(NOTICE_EVENT_RULES, payload.event)) {
     return refuse('notice.event 非法（本版：established / roster / snapshot-stored / manager-changed / handshake / merge-request / merge-outcome）');
   }
   return NOTICE_EVENT_RULES[payload.event](payload);
