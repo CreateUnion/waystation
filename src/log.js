@@ -44,7 +44,7 @@ function rotateIfNeeded({ filePath, maxBytes, maxFiles }) {
   try {
     size = statSync(filePath).size;
   } catch {
-    return; // 尚无日志文件
+    // 尚无日志文件：size 保持 0，等价于「不需要轮转」
   }
   if (size < maxBytes) {
     return;

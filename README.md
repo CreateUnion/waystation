@@ -11,8 +11,10 @@
 
 ## 开发
 
-- 运行环境：Node ≥ 20；唯一运行时依赖 `@modelcontextprotocol/sdk`
-- 跑测试：`npm test`
+- 运行环境：Node ≥ 20（**运行时下限**，依据锁定依赖树）；**跑测试与工具链需 Node ≥ 22**——测试命令使用 `node --test` 的 glob 参数（Node 21 起支持；Node 20 实测以「Could not find …」退出码 1 失败，不会静默假绿）
+- 跑测试：`npm test`；覆盖率（含阈值）：`npm run coverage`
+- 静态检查：`npm run lint`（ESLint）、`npm run typecheck`（tsc checkJs）
+- 提交前门禁：`npm run gate`（lint + typecheck + 覆盖率阈值）
 - 手工启动（开发调试）：`node src/index.js`——以 stdio 服务 MCP 客户端；直接在终端启动时无输出属正常（stdout 是协议通道）
 
 ## 安全模型（待 M6 完整披露）

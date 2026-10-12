@@ -19,7 +19,12 @@ test('package.json：npm 包骨架字段齐备', () => {
   assert.equal(pkg.bin.waystation, 'bin/waystation.js');
   assert.equal(pkg.scripts.test, 'node --test "test/**/*.test.js"');
   assert.deepEqual(Object.keys(pkg.dependencies), ['@modelcontextprotocol/sdk']);
-  assert.deepEqual(pkg.devDependencies ?? {}, {});
+  // 开发依赖恰为工具链五项：eslint（风格与 stdout 纪律）、@eslint/js（推荐规则集）、globals（运行环境变量集）、
+  // typescript 与 @types/node（类型检查）；版本由 npm 解析为当前稳定版，只断言键集合与 semver 形态
+  assert.deepEqual(Object.keys(pkg.devDependencies).sort(), ['@eslint/js', '@types/node', 'eslint', 'globals', 'typescript']);
+  for (const range of Object.values(pkg.devDependencies)) {
+    assert.match(range, /^[\^~]?\d+\.\d+\.\d+/);
+  }
 });
 
 test('package-lock.json：根版本与 package.json 保持一致，且依赖版本未被波及', () => {

@@ -28,18 +28,22 @@ export function appendLine(filePath, value) {
  * 并发约定：单写者（同一文件同一时刻只有一个写入者；使用流程为先 loadLines 后 appendLine）。
  */
 export function loadLines(filePath) {
+  /** @type {Buffer | null} */
   let raw = null;
   try {
     raw = readFileSync(filePath);
   } catch (error) {
-    if (error.code === 'ENOENT') {
-      return { entries: [], tailDropped: false, corruptLines: [] };
+    if (error.code !== 'ENOENT') {
+      throw error;
     }
-    throw error;
+  }
+  if (raw === null) {
+    return { entries: [], tailDropped: false, corruptLines: [] };
   }
   // 文件大小以原始字节为准（raw.length）：被截断的多字节字符在 utf8 解码后变成替换符（U+FFFD），
   // 重编码长度会变——不能用解码串换算，否则守卫永远判「文件已变」而放弃修复
   const content = raw.toString('utf8');
+  /** @type {{ entries: unknown[], tailDropped: boolean, corruptLines: Array<{ lineNumber: number, text: string }> }} */
   const loaded = { entries: [], tailDropped: false, corruptLines: [] };
   let complete = content;
   if (content !== '' && !content.endsWith('\n')) {

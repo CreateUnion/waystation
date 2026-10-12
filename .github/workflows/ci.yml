@@ -1,0 +1,16 @@
+# 门禁流水线：远端托管后自动生效；当前仓库无 remote，本地以 npm run gate 为强制口径
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run gate

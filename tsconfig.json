@@ -1,0 +1,20 @@
+{
+  // checkJs 类型检查：只查 src/ 与 bin/ 的产品代码（测试暂不纳入：测试无 JSDoc 注解、收益低噪声大，留待后续评估）
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "target": "es2023",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "strict": true,
+    // 存量基线（引入时实测）：既有代码无 JSDoc 注解，noImplicitAny 会产出 77 条纯注解型告警——
+    // 按「存量不追溯」保留关闭；catch 变量同理（既有代码大量 error.code 访问）。
+    // 其余 strict 组保留（strictNullChecks 等对新增代码仍生效）。
+    "noImplicitAny": false,
+    "useUnknownInCatchVariables": false,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.js", "bin/**/*.js"]
+}
