@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
+import { DISCOVERY_REPLY_MIN_INTERVAL_MS } from '../src/net/discovery.js';
 import { makeTempDir, pickFreePort, repoRoot, waitFor } from './helpers.js';
 
 const FIXTURE = join(repoRoot, 'test', 'fixtures', 'net-node.mjs');
@@ -75,12 +76,20 @@ function attachCommand(node) {
   });
 }
 
+/* 启动自介会刷新对端的同源应答限流窗口：双节点同时启动时，双方启动自介（探测）与紧随的互扫探测
+ * 来自同一「地址:端口」，立即扫描会被对端按设计吞掉（同源窗口内不再应答）——settle 等待窗口过期，
+ * 使互扫断言不依赖启动时序；产品行为不变（限流窗口自愈，人类尺度无感）。 */
+const PAIR_SETTLE_MS = DISCOVERY_REPLY_MIN_INTERVAL_MS + 100;   // 窗口 + 余量
+
 function startPair(t, port) {
   const ready = Promise.all([
     startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: [{ address: '127.0.0.2', port }] }),
     startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, knownPeers: [{ address: '127.0.0.1', port }] }),
   ]);
-  return ready.then(([a, b]) => ({ a, b }));
+  return ready.then(async ([a, b]) => {
+    await new Promise((resolve) => setTimeout(resolve, PAIR_SETTLE_MS));
+    return { a, b };
+  });
 }
 
 test('互扫可见（身份正确）+ ping 双向与不可达', { timeout: 40000 }, async (t) => {
