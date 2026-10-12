@@ -43,7 +43,8 @@ export function createClaudeCodeAdapter({ env = process.env, log, settleMs = DEL
 }
 
 /* 单次投递：新建连接 → 写入两帧（认证帧 + user 帧）→ settle 观察窗 → 判定。
- * 成功 = 窗口内未被对端关闭（成功路径无回执，PoC 实证）；失败 = 连接/写错误（failed）或窗口内被关闭（rejected）。
+ * 成功 = 窗口内未被对端关闭（成功路径无回执，PoC 实证）；失败 = 连接/写错误（failed）或对端已关（rejected——
+ * 含窗口内被关与 EPIPE/ECONNRESET 两个跨平台同义信号，见 isPeerClosedError）。
  * 全部失败只计数 + 告警、绝不抛出（调用方是接收管线的投递链，失败语义由 false 表达）。
  * 观察窗自「写入刷出」起算（本地缓冲已刷出才开始往坏处多等一步），窗口结束即销毁连接。 */
 async function deliver(state, text, options) {
@@ -63,7 +64,7 @@ async function deliver(state, text, options) {
   });
   try {
     if (!(await waitForWrite(socket, buildFrames(state.token, text, options?.priority)))) {
-      if (errored !== null) {
+      if (errored !== null && !isPeerClosedError(errored)) {
         state.counters.failed++;
         state.log.warn('会话注入口连接/写入失败（维持第二档）', { reason: /** @type {Error} */ (errored).message });
       } else {
@@ -85,8 +86,15 @@ async function deliver(state, text, options) {
   }
 }
 
+/* 对端已关的错误码（Linux 实测；Windows 同场景为静默关闭、无错误码）：EPIPE = 对端 destroy 后写入，
+ * ECONNRESET = 连接被复位。两者与「窗口内被关闭」同义——归 rejected 桶，两平台诊断分桶一致。 */
+function isPeerClosedError(error) {
+  const code = /** @type {NodeJS.ErrnoException} */ (error).code;
+  return code === 'EPIPE' || code === 'ECONNRESET';
+}
+
 /* 等「连接建立 + 两帧写入刷出」：连接错误 / 写错误 / 连接被关 → false；
- * 错误对象与「被关闭」两项事实由 deliver 的错误记录捕获，分别归类 failed / rejected。 */
+ * 错误对象与「被关闭」两项事实由 deliver 的错误记录捕获，按错误码与 closed 标记归类 failed / rejected。 */
 function waitForWrite(socket, payload) {
   return new Promise((resolve) => {
     let done = false;
