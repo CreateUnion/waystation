@@ -277,3 +277,30 @@ test('记录 to.port 非法：按损坏跳过并计数（拒绝优于猜测）',
   assert.equal(reopened.entries().length, 0);
   assert.equal(reopened.stats().corruptRecords, 4);
 });
+
+test('reassignPeer：未确认条目改投新端点（同 msgId 保持、重开后维持）；已确认条目不迁移', (t) => {
+  const { dir, outbox } = makeOutbox(t);
+  const first = sendInput();
+  const second = sendInput();
+  outbox.enqueue(first);
+  outbox.enqueue(second);
+  outbox.markAcked(first.msgId, Date.now());
+  const moved = outbox.reassignPeer('inst-b', { instanceId: 'inst-c', address: '127.0.0.3', port: 7322 });
+  assert.equal(moved.moved, 1);
+  const entries = outbox.entries();
+  assert.deepEqual(entries.find((entry) => entry.msgId === second.msgId).to, { instanceId: 'inst-c', address: '127.0.0.3', port: 7322 });
+  assert.deepEqual(entries.find((entry) => entry.msgId === first.msgId).to, { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 }, '已 ack 条目不迁移');
+  const reopened = createOutbox({ dataDir: dir, collabId: 'collab-1', config: testConfig(), log: quietLog() });
+  assert.deepEqual(reopened.entries().find((entry) => entry.msgId === second.msgId).to, { instanceId: 'inst-c', address: '127.0.0.3', port: 7322 }, '改投已落盘');
+});
+
+test('reassignPeer：改投后立即可投（不等旧退避）；无匹配条目按零条成功', (t) => {
+  const { outbox } = makeOutbox(t);
+  assert.equal(outbox.reassignPeer('inst-zz', { instanceId: 'inst-c', address: '127.0.0.3', port: 7322 }).moved, 0);
+  const entry = sendInput();
+  outbox.enqueue(entry);
+  outbox.markAttempt(entry.msgId, Date.now() + 60000);
+  assert.equal(outbox.headFor('inst-b').nextAttemptAt > Date.now(), true);
+  outbox.reassignPeer('inst-b', { instanceId: 'inst-c', address: '127.0.0.3', port: 7322 });
+  assert.equal(outbox.headFor('inst-c').nextAttemptAt <= Date.now(), true, '改投后立即可投');
+});

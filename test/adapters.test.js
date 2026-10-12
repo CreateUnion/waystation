@@ -115,6 +115,37 @@ test('连接失败（管道不存在）：false + 计数、不抛出', { timeout
   assert.ok(adapter.stats().failed >= 1);
 });
 
+test('连接/写入期限：挂起的写入按时限收口 → failed 桶（本地期限，不误报拒收）', { timeout: 15000 }, async (t) => {
+  /* 以桩 socket 驱动真实 deliver 路径：连接回调落到「写永不刷出」——期限必须兜住。
+   *（真实管道小载荷写入由内核缓冲吸收，无法稳定制造挂起；桩只替换传输、分类逻辑全走生产代码。） */
+  const realConnect = net.connect;
+  const fakeSocket = {
+    on() {},
+    once(event, callback) {
+      if (event === 'connect') {
+        setImmediate(callback);
+      }
+    },
+    write() {},
+    destroy() {},
+  };
+  net.connect = () => fakeSocket;
+  t.after(() => {
+    net.connect = realConnect;
+  });
+  const logs = [];
+  const adapter = createClaudeCodeAdapter({
+    env: { [MESSAGING_SOCKET_ENV]: pipePath(), [MESSAGING_TOKEN_ENV]: 'tok-1' },
+    log: { info: () => {}, warn: (message) => logs.push(message), error: () => {} },
+    connectTimeoutMs: 30,
+  });
+  assert.equal(await adapter.deliver('挂起探测'), false);
+  assert.equal(adapter.stats().failed, 1);
+  assert.equal(adapter.stats().rejected, 0, '超时不是对端拒收证据');
+  assert.equal(adapter.stats().delivered, 0);
+  assert.equal(logs.some((message) => message.includes('超时')), true);
+});
+
 test('上下文头：含协作 / 来源 / 类型 / 外部数据警示；describeCollab 命中含项目名、缺省省略、异常降级', () => {
   const frame = sampleFrame();
   const withName = renderSessionMessage(frame, { describeCollab: () => ({ name: '发布协作' }) });

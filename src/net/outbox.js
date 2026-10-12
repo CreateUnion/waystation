@@ -44,6 +44,7 @@ export function createOutbox({ dataDir, collabId, config, log }) {
     markAcked: (msgId, ts) => markAcked(state, msgId, ts),
     markSessionDelivered: (msgId, ts) => markSessionDelivered(state, msgId, ts),
     prune: (now) => prune(state, now),
+    reassignPeer: (peerInstanceId, to) => reassignPeer(state, peerInstanceId, to),
     size: () => state.entries.size,
     stats: () => ({ ...state.counters, size: state.entries.size, unfinished: unfinishedOf(state).length }),
   };
@@ -188,6 +189,23 @@ function prune(state, now) {
     compact(state);
   }
   return { expired, dropped };
+}
+
+/* 改投（协作层降级 / 移交时消费）：把发往某对端的未确认条目改投新端点——同 msgId 保持
+ * （进行中的消息在新目标上等价有效，且不产生第二条重复投递）；只动 queued（未确认）条目，
+ * ack 后 / 终态条目不属「陈旧未完成」语义；改投后立即可投（不等旧退避）。 */
+function reassignPeer(state, peerInstanceId, to) {
+  let moved = 0;
+  for (const entry of state.entries.values()) {
+    if (entry.state !== 'queued' || entry.to.instanceId !== peerInstanceId) {
+      continue;
+    }
+    entry.to = { instanceId: to.instanceId, address: to.address, port: to.port };
+    entry.nextAttemptAt = Date.now();
+    writeRecord(state, entry);
+    moved++;
+  }
+  return { moved };
 }
 
 /* 未完成条目超保留期 → 置 expired 并落盘（治理类在未终态前豁免）；返回是否本次转为过期。 */

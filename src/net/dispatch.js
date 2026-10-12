@@ -43,6 +43,7 @@ export function createDispatch({ dataDir, config, transport, self, log }) {
     resolvePong: (frame) => resolvePong(state, frame),
     ping: (options) => ping(state, options),
     deliveryStatus: (query) => deliveryStatus(state, query),
+    reassignPeer: (payload) => reassignPeer(state, payload),
     setClientFrameRouter: (router) => {
       state.clientFrameRouter = router;
     },
@@ -301,6 +302,32 @@ function deliveryStatus(state, query = {}) {
     }
   }
   return rows.sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt));
+}
+
+/* 队列改投（协作层在降级 / 移交时消费）：把该协作发往旧对端的未确认条目改投新对端。
+ * 只动既有队列（不新建协作目录——协作目录的创建归发送路径）；无该协作队列时按零条成功。 */
+function reassignPeer(state, { collabId, fromInstanceId, to }) {
+  const rejection = reassignRejection(collabId, fromInstanceId, to);
+  if (rejection !== null) {
+    return { ok: false, reason: rejection };
+  }
+  const outbox = state.outboxes.get(collabId);
+  if (outbox === undefined) {
+    return { ok: true, moved: 0 };
+  }
+  const result = outbox.reassignPeer(fromInstanceId, to);
+  return { ok: true, moved: result.moved };
+}
+
+/* 改投参数校验：与 send 同一形态判据（标识 / IP 字面量 / 端口范围）。 */
+function reassignRejection(collabId, fromInstanceId, to) {
+  if (!isIdLike(collabId) || !isIdLike(fromInstanceId)) {
+    return 'reassignPeer 参数非法（collabId / fromInstanceId 须为 1–64 位字母数字与连字符）';
+  }
+  if (typeof to !== 'object' || to === null || !isIdLike(to.instanceId) || !isAddressLike(to.address) || !isPort(to.port)) {
+    return 'reassignPeer 目标非法（instanceId / address / port：地址须为 IP 字面量、端口 1–65535 整数）';
+  }
+  return null;
 }
 
 function statsOf(state) {

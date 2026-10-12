@@ -615,3 +615,32 @@ test('send：自身 from.port 非法 → 受理面拒绝（构造侧必填的守
   assert.equal(dispatch.stats().sendsRejected, 1);
   assert.equal(dispatch.stats().collabs, 0, '未受理不得创建协作队列');
 });
+
+test('reassignPeer：把发往旧对端的未确认条目改投新对端（查询面可见、其余单元不动）', { timeout: 15000 }, async (t) => {
+  const { dispatch } = makeDispatch(t);
+  t.after(() => dispatch.stop());
+  const first = dispatch.send(target());
+  const second = dispatch.send(target({ collabId: 'collab-2', to: { instanceId: 'inst-x', address: '127.0.0.9', port: 7330 } }));
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  const moved = dispatch.reassignPeer({ collabId: 'collab-1', fromInstanceId: 'inst-b', to: { instanceId: 'inst-c', address: '127.0.0.3', port: 7322 } });
+  assert.deepEqual(moved, { ok: true, moved: 1 });
+  const rows = dispatch.deliveryStatus({ collabId: 'collab-1' });
+  assert.equal(rows[0].toInstanceId, 'inst-c');
+  assert.equal(dispatch.deliveryStatus({ collabId: 'collab-2' })[0].toInstanceId, 'inst-x', '其他单元不动');
+});
+
+test('reassignPeer：参数形态逐拒；无该协作队列按零条成功', { timeout: 15000 }, async (t) => {
+  const { dispatch } = makeDispatch(t);
+  t.after(() => dispatch.stop());
+  const cases = [
+    { collabId: '../x', fromInstanceId: 'inst-b', to: { instanceId: 'inst-c', address: '127.0.0.3', port: 7322 } },
+    { collabId: 'collab-1', fromInstanceId: 'bad id!', to: { instanceId: 'inst-c', address: '127.0.0.3', port: 7322 } },
+    { collabId: 'collab-1', fromInstanceId: 'inst-b', to: { instanceId: 'inst-c', address: 'not-an-ip', port: 7322 } },
+    { collabId: 'collab-1', fromInstanceId: 'inst-b', to: { instanceId: 'inst-c', address: '127.0.0.3', port: 70000 } },
+  ];
+  for (const payload of cases) {
+    assert.equal(dispatch.reassignPeer(payload).ok, false, JSON.stringify(payload).slice(0, 60));
+  }
+  assert.deepEqual(dispatch.reassignPeer({ collabId: 'collab-none', fromInstanceId: 'inst-b', to: { instanceId: 'inst-c', address: '127.0.0.3', port: 7322 } }), { ok: true, moved: 0 });
+});

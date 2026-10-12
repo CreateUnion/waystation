@@ -9,6 +9,11 @@ export const MESSAGING_TOKEN_ENV = 'CLAUDE_CODE_MESSAGING_TOKEN';
  * 足以覆盖拒收的即时关闭，又不给每条消息增加可感知延迟。 */
 export const DELIVERY_SETTLE_MS = 150;
 
+/* 连接与写入期限（模块默认值；构造注入缝 connectTimeoutMs 可覆盖、供测试收敛）：
+ * 管道在而接受队列 / 实例饱和时 connect 可无限挂起——期限覆盖「连接建立 + 写入刷出」全程；
+ * 超时是本地期限、不是对端拒收证据，失败分桶归 failed（维持第二档）。 */
+export const DELIVER_TIMEOUT_MS = 2000;
+
 /* 会话注入口客户端（Claude Code 适配器，设计 §4/§16-A）：
  * 真实协议 = 首行认证帧 + 一行 user 帧（PoC 实证；机制细节出自本机 CLI 实装二进制，行为学由阴性对照支持）。
  * 分层纪律：核心（发现/连接/路由/接收管线）不 import 本模块——组合根把它注入 inbound 的
@@ -21,9 +26,9 @@ export const DELIVERY_SETTLE_MS = 150;
 /** @typedef {(collabId: string) => { name?: string } | null} CollabDescriptor */
 
 /**
- * @param {{ env?: Record<string, string | undefined>, log: any, settleMs?: number, describeCollab?: CollabDescriptor | null }} options
+ * @param {{ env?: Record<string, string | undefined>, log: any, settleMs?: number, connectTimeoutMs?: number, describeCollab?: CollabDescriptor | null }} options
  */
-export function createClaudeCodeAdapter({ env = process.env, log, settleMs = DELIVERY_SETTLE_MS, describeCollab = null }) {
+export function createClaudeCodeAdapter({ env = process.env, log, settleMs = DELIVERY_SETTLE_MS, connectTimeoutMs = DELIVER_TIMEOUT_MS, describeCollab = null }) {
   const socketPath = typeof env[MESSAGING_SOCKET_ENV] === 'string' ? env[MESSAGING_SOCKET_ENV].trim() : '';
   const token = typeof env[MESSAGING_TOKEN_ENV] === 'string' ? env[MESSAGING_TOKEN_ENV] : '';
   const state = {
@@ -31,6 +36,7 @@ export function createClaudeCodeAdapter({ env = process.env, log, settleMs = DEL
     token,
     log,
     settleMs,
+    connectTimeoutMs,
     describeCollab,
     counters: { delivered: 0, unavailable: 0, failed: 0, rejected: 0 },
   };
@@ -63,14 +69,9 @@ async function deliver(state, text, options) {
     closed = true;
   });
   try {
-    if (!(await waitForWrite(socket, buildFrames(state.token, text, options?.priority)))) {
-      if (errored !== null && !isPeerClosedError(errored)) {
-        state.counters.failed++;
-        state.log.warn('会话注入口连接/写入失败（维持第二档）', { reason: /** @type {Error} */ (errored).message });
-      } else {
-        state.counters.rejected++;
-        state.log.warn('会话注入口在写入完成前被对端关闭（未写入，维持第二档）');
-      }
+    const outcome = await waitForWrite(socket, buildFrames(state.token, text, options?.priority), state.connectTimeoutMs);
+    if (outcome !== 'ok') {
+      classifyWriteFailure(state, outcome, errored);
       return false;
     }
     await new Promise((resolve) => setTimeout(resolve, state.settleMs));
@@ -86,6 +87,23 @@ async function deliver(state, text, options) {
   }
 }
 
+/* 失败分桶（两平台诊断口径一致）：超时是本地期限 → failed；连接 / 写入错误 → failed（对端已关类
+ * 错误码归 rejected）；写入完成前被关 → rejected。 */
+function classifyWriteFailure(state, outcome, errored) {
+  if (outcome === 'timeout') {
+    state.counters.failed++;
+    state.log.warn('会话注入口连接或写入超时（未写入，维持第二档）', { timeoutMs: state.connectTimeoutMs });
+    return;
+  }
+  if (outcome === 'error' && errored !== null && !isPeerClosedError(errored)) {
+    state.counters.failed++;
+    state.log.warn('会话注入口连接/写入失败（维持第二档）', { reason: /** @type {Error} */ (errored).message });
+    return;
+  }
+  state.counters.rejected++;
+  state.log.warn('会话注入口在写入完成前被对端关闭（未写入，维持第二档）');
+}
+
 /* 对端已关的错误码（Linux 实测；Windows 同场景为静默关闭、无错误码）：EPIPE = 对端 destroy 后写入，
  * ECONNRESET = 连接被复位。两者与「窗口内被关闭」同义——归 rejected 桶，两平台诊断分桶一致。 */
 function isPeerClosedError(error) {
@@ -93,22 +111,28 @@ function isPeerClosedError(error) {
   return code === 'EPIPE' || code === 'ECONNRESET';
 }
 
-/* 等「连接建立 + 两帧写入刷出」：连接错误 / 写错误 / 连接被关 → false；
- * 错误对象与「被关闭」两项事实由 deliver 的错误记录捕获，按错误码与 closed 标记归类 failed / rejected。 */
-function waitForWrite(socket, payload) {
+/* 等「连接建立 + 两帧写入刷出」：返回 'ok' / 'closed'（对端关闭）/ 'error'（错误）/ 'timeout'（期限到）。
+ * 错误对象与「被关闭」两项事实由 deliver 的错误记录捕获，按 outcome 与错误码归类 failed / rejected。 */
+function waitForWrite(socket, payload, timeoutMs) {
   return new Promise((resolve) => {
     let done = false;
-    const finish = (ok) => {
+    /** @type {ReturnType<typeof setTimeout> | null} */
+    let timer = null;
+    const finish = (outcome) => {
       if (!done) {
         done = true;
-        resolve(ok);
+        if (timer !== null) {
+          clearTimeout(timer);
+        }
+        resolve(outcome);
       }
     };
-    socket.once('error', () => finish(false));
-    socket.once('close', () => finish(false));
+    timer = setTimeout(() => finish('timeout'), timeoutMs);
+    socket.once('error', () => finish('error'));
+    socket.once('close', () => finish('closed'));
     socket.once('connect', () => {
       socket.write(payload, (error) => {
-        finish(error === undefined || error === null);
+        finish(error === undefined || error === null ? 'ok' : 'error');
       });
     });
   });
