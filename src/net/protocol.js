@@ -173,7 +173,7 @@ function validateDiscovery(datagram, expectedType) {
     if (!isCollabCount(datagram.collabCount)) {
       return refuse('扫描应答 collabCount 非法');
     }
-    /* port：存在则校验、缺失回退数据报来源端口（旧实现应答的宽容缺省——待裁定「宽容缺省」结论）。 */
+    /* port：宽容缺省（已定案）——缺 port 回退数据报来源端口；字段存在则校验 1–65535 且以字段为准。 */
     if (datagram.port !== undefined && !isPort(datagram.port)) {
       return refuse('扫描应答 port 非法（1–65535 的整数）');
     }
