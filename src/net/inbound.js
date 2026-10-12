@@ -1,6 +1,6 @@
 import { collabDir, collabFilePath, ensureDir } from '../paths.js';
 import { appendLine, loadLines, replaceFile } from '../storage.js';
-import { PROTOCOL_VERSION, newMsgId } from './protocol.js';
+import { ID_PATTERN, PROTOCOL_VERSION, newMsgId } from './protocol.js';
 
 export const INBOX_FILE_NAME = 'inbox.jsonl';
 
@@ -9,7 +9,7 @@ export const INBOX_FILE_NAME = 'inbox.jsonl';
 const COMPACT_LINE_FACTOR = 2;
 
 /* 可注入钩子的形状（全部可选，缺省即安全默认）：类型注解为类型检查服务——缺省值 {} 与属性访问需要明确形状。 */
-/** @typedef {{ admit?: (frame: object) => { ok: boolean, reason?: string } | null | undefined, consume?: (frame: object) => unknown, deliverToSession?: (frame: object) => unknown }} InboundHooks */
+/** @typedef {{ admit?: (frame: object) => { ok: boolean, reason?: string } | null | undefined | Promise<{ ok: boolean, reason?: string } | null | undefined>, consume?: (frame: object) => unknown, deliverToSession?: (frame: object) => unknown }} InboundHooks */
 
 /* 接收管线（设计 §10）：帧的类型路由（四类）——
  * ① 协作域（含治理类）：准入 → 幂等去重 → 落盘 → ack → 钩子 → 投递成功后回报；
@@ -43,6 +43,7 @@ export function createInbound({ dataDir, config, self, dispatch, hooks = {}, log
     start,
     stop,
     onFrame: (connection, frame) => onFrame(state, connection, frame),
+    checkInbox: (query) => checkInbox(state, query),
     stats: () => statsOf(state),
   };
 }
@@ -144,13 +145,16 @@ function applyReport(state, connection, frame) {
 }
 
 async function handleCollabMessage(state, connection, frame) {
-  const admitted = runAdmit(state, frame);
+  const admitted = await runAdmit(state, frame);
   if (admitted === null || admitted === undefined || admitted.ok !== true) {
     state.counters.rejected.admission++;
-    state.log.warn('协作域消息未通过准入，拒绝（不确认）', {
+    const reason = admitted?.reason ?? '未说明';
+    /* 原因随消息文本一并输出（不止 fields）：准入拒绝是消息被整体丢弃的路径，
+     * 只把原因放进字段会让「按消息文本订阅/检索日志」的通道看不到丢弃原因。 */
+    state.log.warn(`协作域消息未通过准入，拒绝（不确认）：${reason}`, {
       msgId: frame.msgId,
       collabId: frame.collabId,
-      reason: admitted?.reason ?? '未说明',
+      reason,
     });
     return;
   }
@@ -174,15 +178,16 @@ async function handleCollabMessage(state, connection, frame) {
   await runHook(state, state.consume, frame);
   if (await runDeliver(state, frame)) {
     state.counters.sessionDelivered++;
-    sendDeliveryReport(state, frame, connection.remoteAddress);
+    sendDeliveryReport(state, frame, connection);
   }
 }
 
 /* 准入钩子包装：钩子异常一律按「未通过准入」归类——拒绝方向不变（不落盘、不 ack），
- * 但必须有准入拒绝计数与告警：真台账的缺陷会让消息全部丢弃，观测面不能同时失效。 */
-function runAdmit(state, frame) {
+ * 但必须有准入拒绝计数与告警：真台账的缺陷会让消息全部丢弃，观测面不能同时失效。
+ * 契约硬化：钩子可为同步或异步——await 承接 thenable，异步实现（如查台账的 I/O）不再被误判为全量拒绝。 */
+async function runAdmit(state, frame) {
   try {
-    return state.admit(frame);
+    return await state.admit(frame);
   } catch (error) {
     return { ok: false, reason: `准入钩子异常：${error?.message ?? '未知原因'}` };
   }
@@ -207,17 +212,40 @@ function ackFrame(state, ackFor) {
   return { v: PROTOCOL_VERSION, type: 'ack', msgId: newMsgId(), ackFor, from: state.self, ts: new Date().toISOString() };
 }
 
-function sendDeliveryReport(state, frame, address) {
-  const result = state.dispatch.send({
-    collabId: frame.collabId,
-    to: { instanceId: frame.from.instanceId, address },
-    type: 'delivery-status',
-    payload: { refMsgId: frame.msgId, tier: 'session' },
-  });
-  if (result.ok) {
+/* 投递回报的寻址（设计 §5/§10，I2）：回拨目标 = 原文发送方 from 的实例标识 + 端口，
+ * 地址取对方拨入连接的来源地址（连接来源端口是临时端口，不可作回拨目标）。
+ * from.port 缺失（旧版本发送方发来的帧）：不猜端口、不发起新拨号——尽力沿原 TCP 连接原路回执；
+ * 写失败或连接已断只告警计数（维持第二档；链接确认已在先，不受影响）。 */
+function sendDeliveryReport(state, frame, connection) {
+  const port = frame.from.port;
+  if (Number.isInteger(port) && port >= 1 && port <= 65535) {
+    const result = state.dispatch.send({
+      collabId: frame.collabId,
+      to: { instanceId: frame.from.instanceId, address: connection.remoteAddress, port },
+      type: 'delivery-status',
+      payload: { refMsgId: frame.msgId, tier: 'session' },
+    });
+    if (result.ok) {
+      state.counters.reportsSent++;
+    } else {
+      state.log.warn('投递回报入队失败（维持第二档）', { refMsgId: frame.msgId, reason: result.reason });
+    }
+    return;
+  }
+  try {
+    connection.send({
+      v: PROTOCOL_VERSION,
+      type: 'delivery-status',
+      msgId: newMsgId(),
+      from: state.self,
+      collabId: frame.collabId,
+      ts: new Date().toISOString(),
+      payload: { refMsgId: frame.msgId, tier: 'session' },
+    });
     state.counters.reportsSent++;
-  } else {
-    state.log.warn('投递回报入队失败（维持第二档）', { refMsgId: frame.msgId, reason: result.reason });
+  } catch (error) {
+    state.counters.reportFailures++;
+    state.log.warn('投递回报原路回执失败（维持第二档）', { refMsgId: frame.msgId, reason: error.message });
   }
 }
 
@@ -355,3 +383,42 @@ async function defaultDeliver() {
 }
 
 function noop() {}
+
+export const CHECK_INBOX_DEFAULT_LIMIT = 50;
+export const CHECK_INBOX_MAX_LIMIT = 500;
+
+/* 会话主动查（设计 §4 的降级路径）：读取某协作收件流水按保留期窗口的投影（与判重窗口同一权威）。
+ * 只读：不投递、不改档位、不触发重投——适配器不可用（或写入未成功）期间，会话经工具主动查取（第二档的读出口）。
+ * 返回最近 limit 条（按到达序）；total = 窗口内总数——截断是显式信息，不是静默丢弃。
+ * 含已投递与未投递两类（去重按 msgId 由调用方自理）：不引入第二份投递账（单一权威源）。 */
+function checkInbox(state, query = {}) {
+  const { collabId, limit = CHECK_INBOX_DEFAULT_LIMIT } = query;
+  if (typeof collabId !== 'string' || !ID_PATTERN.test(collabId)) {
+    throw new TypeError('checkInbox 需要合法的 collabId（1–64 位字母数字与连字符）');
+  }
+  if (!Number.isInteger(limit) || limit < 1 || limit > CHECK_INBOX_MAX_LIMIT) {
+    throw new TypeError(`checkInbox 的 limit 需为 1–${CHECK_INBOX_MAX_LIMIT} 的整数`);
+  }
+  const records = inboxRecordsOf(state, collabId);
+  const messages = records.slice(Math.max(0, records.length - limit));
+  return { collabId, total: records.length, returned: messages.length, messages };
+}
+
+/* 窗口投影来源：已懒载入的 box 直接用内存态（与判重同一副本）；未载入的只读载入——不建目录、不建 box，
+ * 读路径不给任意合法 collabId 造副作用。读失败（EISDIR 等）计数留痕后向上抛：工具面归类为明确错误，
+ * 不得静默返回空列表（「没有消息」与「读不到」必须可区分）。 */
+function inboxRecordsOf(state, collabId) {
+  const box = state.boxes.get(collabId);
+  if (box !== undefined) {
+    return [...box.seen.values()].map((seen) => seen.record);
+  }
+  try {
+    const loaded = loadLines(collabFilePath(state.dataDir, collabId, INBOX_FILE_NAME));
+    const windowStart = Date.now() - state.config.messageTtlMs;
+    return loaded.entries.filter((record) => freshEntryOf(record, windowStart) !== null);
+  } catch (error) {
+    state.counters.persistFailures++;
+    state.log.warn('收件流水读取失败（查询路径）', { collabId, reason: error.message });
+    throw error;
+  }
+}

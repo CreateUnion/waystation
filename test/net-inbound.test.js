@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { COLLABS_DIR_NAME } from '../src/paths.js';
 import { newMsgId } from '../src/net/protocol.js';
@@ -66,12 +66,14 @@ function makeInbound(t, { dataDir, hooks, dispatch, config, log: logOverride } =
   return { inbound, dir, logs, dispatch: fakeDispatch };
 }
 
+/* 协作域帧的 from 携带端口（构造侧必填）：投递回报按 from.port 回拨。
+ * PEER 本体保持无端口——ping/pong/ack 等传输类帧不涉回报寻址。 */
 function messageFrame(overrides = {}) {
   return {
     v: 1,
     msgId: newMsgId(),
     type: 'notice',
-    from: PEER,
+    from: { ...PEER, port: 7321 },
     collabId: 'collab-1',
     ts: new Date().toISOString(),
     payload: { text: '你好' },
@@ -188,7 +190,7 @@ test('投递成功：回报 delivery-status（目标=来源地址、载荷=原 m
   await waitFor(() => dispatch.calls.sends.length === 1);
   assert.deepEqual(dispatch.calls.sends[0], {
     collabId: 'collab-1',
-    to: { instanceId: PEER.instanceId, address: '127.0.0.7' },
+    to: { instanceId: PEER.instanceId, address: '127.0.0.7', port: 7321 },
     type: 'delivery-status',
     payload: { refMsgId: frame.msgId, tier: 'session' },
   });
@@ -437,4 +439,117 @@ test('stats：计数齐备', async (t) => {
   assert.equal(counters.sessionDelivered, 1);
   assert.equal(counters.reportsSent, 1);
   assert.equal(counters.collabs, 1);
+});
+
+test('from.port 缺失：投递回报沿原连接原路回执（不发起新拨号、不猜端口）', { timeout: 15000 }, async (t) => {
+  const { inbound, dispatch } = makeInbound(t, {
+    hooks: { admit: () => ({ ok: true }), deliverToSession: () => true },
+  });
+  const connection = createFakeConnection('127.0.0.7');
+  const frame = messageFrame({ from: { instanceId: PEER.instanceId, identityName: PEER.identityName } });
+  inbound.onFrame(connection, frame);
+  await waitFor(() => connection.sent.some((sent) => sent.type === 'delivery-status'));
+  assert.deepEqual(dispatch.calls.sends, [], '缺端口不得发起新拨号');
+  const report = connection.sent.find((sent) => sent.type === 'delivery-status');
+  assert.deepEqual(report.payload, { refMsgId: frame.msgId, tier: 'session' });
+  assert.equal(report.collabId, 'collab-1');
+  assert.equal(inbound.stats().reportsSent, 1);
+});
+
+test('from.port 缺失且原路回执写失败：告警计数、不抛出（维持第二档）', { timeout: 15000 }, async (t) => {
+  const { inbound, logs } = makeInbound(t, {
+    hooks: { admit: () => ({ ok: true }), deliverToSession: () => true },
+  });
+  const connection = createFakeConnection();
+  connection.send = (frame) => {
+    if (frame.type === 'delivery-status') {
+      throw new Error('连接已断');
+    }
+  };
+  const frame = messageFrame({ from: { instanceId: PEER.instanceId, identityName: PEER.identityName } });
+  inbound.onFrame(connection, frame);
+  await waitFor(() => inbound.stats().reportFailures === 1);
+  assert.ok(logs.some((entry) => entry.message.includes('原路回执失败')));
+  assert.equal(inbound.stats().reportsSent, 0);
+});
+
+test('admit 异步钩子：async 实现正常通过（契约硬化——不再被误判为全量拒绝）', { timeout: 15000 }, async (t) => {
+  const { inbound, dir } = makeInbound(t, {
+    hooks: {
+      admit: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return { ok: true };
+      },
+      deliverToSession: () => false,
+    },
+  });
+  const connection = createFakeConnection();
+  const frame = messageFrame();
+  inbound.onFrame(connection, frame);
+  await waitFor(() => connection.sent.length === 1);
+  assert.equal(connection.sent[0].type, 'ack');
+  assert.deepEqual(readInbox(dir).map((entry) => entry.msgId), [frame.msgId], '异步准入通过：消息落盘');
+});
+
+test('admit 异步钩子：async 拒绝路径计数与告警', { timeout: 15000 }, async (t) => {
+  const { inbound, dir, logs } = makeInbound(t, {
+    hooks: {
+      admit: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return { ok: false, reason: '台账无此协作' };
+      },
+    },
+  });
+  const connection = createFakeConnection();
+  inbound.onFrame(connection, messageFrame());
+  await waitFor(() => inbound.stats().rejected.admission === 1);
+  assert.deepEqual(connection.sent, []);
+  assert.throws(() => readInbox(dir));
+  assert.ok(logs.some((entry) => entry.message.includes('台账无此协作')));
+});
+
+test('checkInbox：返回窗口投影（total/returned/最近 limit 条、按到达序）', { timeout: 15000 }, async (t) => {
+  const { inbound } = makeInbound(t, {
+    hooks: { admit: () => ({ ok: true }), deliverToSession: () => false },
+  });
+  const sentIds = [];
+  for (let index = 0; index < 3; index++) {
+    const frame = messageFrame({ payload: { text: `第${index}条` } });
+    sentIds.push(frame.msgId);
+    inbound.onFrame(createFakeConnection(), frame);
+    await waitFor(() => inbound.stats().accepted === index + 1);
+  }
+  const all = inbound.checkInbox({ collabId: 'collab-1' });
+  assert.equal(all.total, 3);
+  assert.equal(all.returned, 3);
+  assert.deepEqual(all.messages.map((entry) => entry.msgId), sentIds);
+  const page = inbound.checkInbox({ collabId: 'collab-1', limit: 2 });
+  assert.equal(page.total, 3);
+  assert.equal(page.returned, 2);
+  assert.deepEqual(page.messages.map((entry) => entry.msgId), sentIds.slice(1), '取最近 N 条、保持到达序');
+});
+
+test('checkInbox：limit 越界与 collabId 非法抛 TypeError（默认 50 / 上限 500）', { timeout: 15000 }, async (t) => {
+  const { inbound } = makeInbound(t);
+  assert.throws(() => inbound.checkInbox({ collabId: 'collab-1', limit: 0 }), TypeError);
+  assert.throws(() => inbound.checkInbox({ collabId: 'collab-1', limit: 501 }), TypeError);
+  assert.throws(() => inbound.checkInbox({ collabId: 'collab-1', limit: 1.5 }), TypeError);
+  assert.throws(() => inbound.checkInbox({ collabId: '../evil' }), TypeError);
+  assert.throws(() => inbound.checkInbox({}), TypeError);
+});
+
+test('checkInbox：未载入协作的只读读取（不建目录、不建判重盒）', { timeout: 15000 }, async (t) => {
+  const { inbound, dir } = makeInbound(t);
+  const empty = inbound.checkInbox({ collabId: 'collab-9' });
+  assert.deepEqual(empty, { collabId: 'collab-9', total: 0, returned: 0, messages: [] });
+  assert.equal(existsSync(join(dir, COLLABS_DIR_NAME, 'collab-9')), false, '读路径不得给未载入协作造目录副作用');
+  assert.equal(inbound.stats().collabs, 0);
+});
+
+test('checkInbox：读失败（路径为目录）抛错并计数留痕（不得静默返回空）', { timeout: 15000 }, async (t) => {
+  const { inbound, dir, logs } = makeInbound(t);
+  mkdirSync(inboxPath(dir, 'collab-1'), { recursive: true });   // EISDIR 的双平台构造：把 inbox.jsonl 做成目录
+  assert.throws(() => inbound.checkInbox({ collabId: 'collab-1' }));
+  assert.ok(inbound.stats().persistFailures >= 1);
+  assert.ok(logs.some((entry) => entry.message.includes('收件流水读取失败')));
 });
