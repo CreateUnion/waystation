@@ -1,17 +1,22 @@
 import { readFileSync, renameSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
-import { MAX_IDENTITY_NAME_CHARS } from './net/protocol.js';
+import { MAX_IDENTITY_NAME_CHARS, isIdentityName } from './net/protocol.js';
+import { ANCHOR_PORT, SLOT_COUNT, slotDefaultPort } from './site.js';
+import { CONFIG_FILE_NAME } from './paths.js';
 import { writeJsonAtomic } from './storage.js';
 
-export const CONFIG_FILE_NAME = 'config.json';
+/* 文件名的权威源在 paths.js：站点解析（site.js）在载入配置前要按目录直读 config 的 port，
+ * 与 config→site 的依赖方向（锚点常量的引用）共同决定了文件名不能留在本文件（会成环）。
+ * 此处重导出只为保持既有导入点（status 工具与测试）不变——不要回迁定义。 */
+export { CONFIG_FILE_NAME };
 
 // 字段校验规则表：键与 buildDefaults 一一对应。类型校验挡住手改配置的笔误；
 // 数值范围取「能用」的边界（下界贴语义有效值、上界防荒唐值），具体语义上限在消费方表达
 const FIELD_RULES = {
   identityName: {
-    check: (value) => typeof value === 'string' && value.trim() !== '' && value.length <= MAX_IDENTITY_NAME_CHARS,
-    reason: `需为非空字符串且不超过 ${MAX_IDENTITY_NAME_CHARS} 字符`,
+    check: (value) => isIdentityName(value),
+    reason: `需为非空字符串、不超过 ${MAX_IDENTITY_NAME_CHARS} 字符、且不含控制 / 不可见格式 / 行段分隔字符`,
   },
   port: { check: (value) => Number.isInteger(value) && value >= 1 && value <= 65535, reason: '需为 1–65535 的整数' },
   offlineQueue: { check: (value) => typeof value === 'boolean', reason: '需为布尔值' },
@@ -28,18 +33,26 @@ const FIELD_RULES = {
   messageTtlMs: { check: (value) => Number.isInteger(value) && value >= 1000 && value <= 2592000000, reason: '需为 1000–2592000000 的整数（毫秒，上限 30 天）' },
   dispatchTickMs: { check: (value) => Number.isInteger(value) && value >= 10 && value <= 60000, reason: '需为 10–60000 的整数（毫秒）' },
   dialTimeoutMs: { check: (value) => Number.isInteger(value) && value >= 100 && value <= 120000, reason: '需为 100–120000 的整数（毫秒）' },
+  // 占用者探测总预算（槽位解析与绑定失败分类共用；测试可注入小值——数值语义见 site.js / stack.js 消费方）
+  probeTimeoutMs: { check: (value) => Number.isInteger(value) && value >= 100 && value <= 30000, reason: '需为 100–30000 的整数（毫秒）' },
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /* 默认配置：设计 §14 参数表（开箱可用、一般不改）。
- * 协作端口 7321 的选择依据：PoC 全矩阵实测端口——UDP 广播/单播、TCP 直连、Linux ufw 放行均在 7321 上验证可达；
- * 且落在 1024–49151 静态区间，避开特权端口与动态端口段。登记与复核挂钩设计 §18（发布前），
+ * options.slot：站点槽位（1..SLOT_COUNT）——决定默认身份名（槽位 ≥2 取 `<主机名>-<k>`，
+ * 同机多站点在扫描列表默认可区分）与默认端口（槽位默认端口 = 锚点 + k - 1）；省略 = 主站点。
+ * 协作端口锚点（现 7321）的选择依据：PoC 全矩阵实测端口——UDP 广播/单播、TCP 直连、Linux ufw 放行均在 7321 上
+ * 验证可达；且落在 1024–49151 静态区间，避开特权端口与动态端口段。登记与复核挂钩设计 §18（发布前），
  * 实践冷门性说明：唯一公开关联是 IANA 的遗留注册名 swx（Swiss Exchange 旧协议，已无实际部署；UDP 侧未注册）。 */
-export function buildDefaults(hostName) {
+export function buildDefaults(hostName, options = {}) {
+  const slot = options.slot ?? null;
+  if (slot !== null && (!Number.isInteger(slot) || slot < 1 || slot > SLOT_COUNT)) {
+    throw new TypeError(`槽位非法（应为 1–${SLOT_COUNT} 的整数或省略）：${String(slot)}`);
+  }
   return {
-    identityName: hostName,
-    port: 7321,
+    identityName: slot !== null && slot >= 2 ? `${hostName}-${slot}` : hostName,
+    port: slot === null ? ANCHOR_PORT : slotDefaultPort(slot),
     offlineQueue: true,
     autoDeliver: true,
     logDir: '',
@@ -48,7 +61,7 @@ export function buildDefaults(hostName) {
     // 网络与消息层默认值（设计 §5/§10 明文默认）：
     // 扫描等待窗口 2s；重传恒定 10s、连续 3 次无 ack 后转 60s 低频直至送达/过期；
     // 单协作队列上限 500 条；消息保留期 7 天（队列过期与接收端去重窗口共用——设计 §10「保留期同队列」）；
-    // 调度 tick 1s；拨号（含 ping 应答等待）超时 5s。
+    // 调度 tick 1s；拨号（含 ping 应答等待）超时 5s；占用者探测总预算 1s。
     scanWindowMs: 2000,
     retryIntervalMs: 10000,
     retrySlowIntervalMs: 60000,
@@ -57,6 +70,7 @@ export function buildDefaults(hostName) {
     messageTtlMs: 7 * DAY_MS,
     dispatchTickMs: 1000,
     dialTimeoutMs: 5000,
+    probeTimeoutMs: 1000,
   };
 }
 
@@ -64,11 +78,13 @@ export function buildDefaults(hostName) {
  * 读配置。created=true 表示文件不存在或已损坏重建——调用方应把生效值落盘（首跑生成 config.json）。
  * 损坏处理遵循设计 §13 的「不静默覆盖」：原文件改名留副本后再按默认值重建。
  * 未知字段原样保留到生效配置里，saveConfig 写回时不丢（前后版本并存的安全带）。
+ * options.defaults：站点感知默认值对象（多站点槽位目录传 buildDefaults(hostname(), { slot })）；
+ * 缺省 = buildDefaults(hostname())（主站点语义）。
  */
 export function loadConfig(dataDir, options = {}) {
   const warn = options.warn ?? defaultWarn;
   const file = join(dataDir, CONFIG_FILE_NAME);
-  const defaults = buildDefaults(hostname());
+  const defaults = options.defaults ?? buildDefaults(hostname());
   const { raw, created } = readRawConfig(file, warn);
   const config = { ...defaults };
   // 用户可手改的文件是外部输入：自有键判定一律 Object.hasOwn——防 toString/constructor/__proto__

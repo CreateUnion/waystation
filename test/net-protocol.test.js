@@ -9,6 +9,7 @@ import {
   MESSAGE_TYPES,
   PROTOCOL_VERSION,
   TRANSPORT_TYPES,
+  isIdentityName,
   newMsgId,
   parseFrame,
   validateMessage,
@@ -176,4 +177,68 @@ test('newMsgId：UUID 形态且互不相同', () => {
   const second = newMsgId();
   assert.match(first, UUID_PATTERN);
   assert.notEqual(first, second);
+});
+
+/* 供 from.port / identityName 用例复用的合法帧骨架（校验器逐段检查，改动任一字段都会落到对应分支）。 */
+function frameWith(overrides = {}) {
+  return {
+    v: 1,
+    msgId: 'msg-1',
+    type: 'notice',
+    from: { instanceId: 'inst-a', identityName: '主机甲' },
+    collabId: 'collab-1',
+    ts: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+test('from.port：合法整数通过、缺失通过（构造侧必填、入站侧容忍缺省）', () => {
+  assert.equal(validateMessage(frameWith({ from: { instanceId: 'inst-a', identityName: '主机甲', port: 7321 } })).ok, true);
+  assert.equal(validateMessage(frameWith()).ok, true);
+  assert.equal(validateMessage(frameWith({ from: { instanceId: 'inst-a', identityName: '主机甲', port: 65535 } })).ok, true);
+});
+
+test('from.port：非法值拒收（0 / 65536 / 字符串 / 小数）', () => {
+  for (const port of [0, 65536, '7321', 1.5, -1]) {
+    const checked = validateMessage(frameWith({ from: { instanceId: 'inst-a', identityName: '主机甲', port } }));
+    assert.equal(checked.ok, false, String(port));
+    assert.ok(checked.reason.includes('from.port'), checked.reason);
+  }
+});
+
+test('probe-ack port：存在则校验、缺失回退来源端口（宽容缺省）', () => {
+  const base = { v: 1, type: 'probe-ack', instanceId: 'inst-b', identityName: '主机乙', collabCount: 0 };
+  assert.equal(validateProbeAck(base).ok, true, '缺 port 是合法形态（旧实现应答）');
+  assert.equal(validateProbeAck({ ...base, port: 7331 }).ok, true);
+});
+
+test('probe-ack port：存在但非法拒收（0 / 超界 / 字符串）', () => {
+  const base = { v: 1, type: 'probe-ack', instanceId: 'inst-b', identityName: '主机乙', collabCount: 0 };
+  for (const port of [0, 65536, '7331', 1.5]) {
+    const checked = validateProbeAck({ ...base, port });
+    assert.equal(checked.ok, false, String(port));
+    assert.ok(checked.reason.includes('port'), checked.reason);
+  }
+});
+
+test('identityName 白名单：控制字符 / 不可见格式（含 ZWJ）/ 行段分隔符一律拒收（协议入站）', () => {
+  const refused = ['甲\n乙', '甲\t乙', '甲\u0007', '甲\u200b乙', '甲\u202eb', '甲\u2028乙', '甲\u2029乙', '👨\u200d👩'];
+  for (const identityName of refused) {
+    assert.equal(validateProbe({ v: 1, type: 'probe', instanceId: 'inst-a', identityName }).ok, false, JSON.stringify(identityName));
+    assert.equal(validateMessage(frameWith({ from: { instanceId: 'inst-a', identityName } })).ok, false, JSON.stringify(identityName));
+  }
+});
+
+test('identityName 白名单：中文、单码位 emoji、可见符号与内部空格通过', () => {
+  for (const identityName of ['主机甲', '工位 🚀 三号', 'dev-box_A', '甲 乙']) {
+    assert.equal(validateProbe({ v: 1, type: 'probe', instanceId: 'inst-a', identityName }).ok, true, identityName);
+  }
+});
+
+test('isIdentityName 边界：空串 / 仅空白 / 65 字符拒收，64 字符通过', () => {
+  assert.equal(isIdentityName(''), false);
+  assert.equal(isIdentityName('   '), false);
+  assert.equal(isIdentityName('x'.repeat(65)), false);
+  assert.equal(isIdentityName('x'.repeat(64)), true);
+  assert.equal(isIdentityName(42), false);
 });

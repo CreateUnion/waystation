@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { COLLABS_DIR_NAME, LOGS_DIR_NAME, collabDir, collabFilePath, resolveDataDir, resolveLogDir, ensureDir } from '../src/paths.js';
+import { COLLABS_DIR_NAME, LOGS_DIR_NAME, collabDir, collabFilePath, resolveDataDir, resolveLogDir, ensureDir, siteDataDir } from '../src/paths.js';
 import { makeTempDir } from './helpers.js';
 
 test('resolveDataDir：无环境变量时默认 ~/.waystation', () => {
@@ -62,5 +62,18 @@ test('collabFilePath：非法 fileName 段一律抛 TypeError——与 collabId 
       name: 'TypeError',
       message: /fileName 非法/,
     });
+  }
+});
+
+test('siteDataDir：槽位 2 及以后映射到 <主目录>/sites/<k>', (t) => {
+  const dir = makeTempDir(t);
+  assert.equal(siteDataDir(dir, 2), join(dir, 'sites', '2'));
+  assert.equal(siteDataDir(dir, 8), join(dir, 'sites', '8'));
+});
+
+test('siteDataDir：槽位 1（主目录）与非法值抛 TypeError——不做清洗', (t) => {
+  const dir = makeTempDir(t);
+  for (const slot of [1, 0, -1, '2', 2.5, null]) {
+    assert.throws(() => siteDataDir(dir, slot), TypeError, String(slot));
   }
 });

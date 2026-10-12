@@ -6,6 +6,10 @@ import { ID_PATTERN } from './net/protocol.js';
 export const DATA_DIR_ENV = 'WAYSTATION_HOME';
 export const LOGS_DIR_NAME = 'logs';
 export const COLLABS_DIR_NAME = 'collabs';
+export const SITES_DIR_NAME = 'sites';
+/* 配置文件名归路径层：站点解析（site.js）在载入 config 前需要按「目录 → 原样读取 port」直接定位文件，
+ * 而 config.js 依赖 site.js 的锚点常量——文件名常量若留在 config 会形成循环依赖，故归位于路径层（各文件/目录名常量所在）。 */
+export const CONFIG_FILE_NAME = 'config.json';
 
 /* 数据目录：配置文件就住在数据目录里，所以目录位置只能由环境变量先定，不能在配置里配。
  * WAYSTATION_HOME 优先（设计 §14：数据目录可单独改），默认 ~/.waystation；
@@ -58,4 +62,14 @@ export function collabFilePath(dataDir, collabId, fileName) {
     throw new TypeError(`fileName 非法，不得用于路径拼接：${String(fileName).slice(0, 32)}`);
   }
   return join(collabDir(dataDir, collabId), fileName);
+}
+
+/** 槽位 k≥2 的站点数据目录（设计 §13：槽位 1 = 主数据目录本身，k≥2 = <主数据目录>/sites/<k>/，各自含独立 config.json）。
+ * 槽位上限由 site.js 的 SLOT_COUNT 约束（本函数只做路径层底线：≥2 的整数）——
+ * 与 collabId 同一硬边界：非法值一律抛错，不做清洗或拼接。 */
+export function siteDataDir(mainDataDir, slot) {
+  if (!Number.isInteger(slot) || slot < 2) {
+    throw new TypeError(`站点槽位非法，不得用于路径拼接：${String(slot).slice(0, 16)}`);
+  }
+  return join(mainDataDir, SITES_DIR_NAME, String(slot));
 }

@@ -145,6 +145,11 @@ function validateFrom(from) {
   if (!isIdentityName(from.identityName)) {
     return refuse('from.identityName 非法');
   }
+  /* from.port：构造侧必填；入站侧缺失不拒收——消息投递不因寻址信息缺失而废（回拨尽力而为）；
+   * 存在则必须合法（1–65535 整数）：非法值不得流入回拨寻址。 */
+  if (from.port !== undefined && !isPort(from.port)) {
+    return refuse('from.port 非法（1–65535 的整数）');
+  }
   return { ok: true };
 }
 
@@ -164,8 +169,14 @@ function validateDiscovery(datagram, expectedType) {
   if (!isIdentityName(datagram.identityName)) {
     return refuse('发现报文 identityName 非法');
   }
-  if (expectedType === 'probe-ack' && !isCollabCount(datagram.collabCount)) {
-    return refuse('扫描应答 collabCount 非法');
+  if (expectedType === 'probe-ack') {
+    if (!isCollabCount(datagram.collabCount)) {
+      return refuse('扫描应答 collabCount 非法');
+    }
+    /* port：存在则校验、缺失回退数据报来源端口（旧实现应答的宽容缺省——待裁定「宽容缺省」结论）。 */
+    if (datagram.port !== undefined && !isPort(datagram.port)) {
+      return refuse('扫描应答 port 非法（1–65535 的整数）');
+    }
   }
   return { ok: true };
 }
@@ -178,8 +189,22 @@ function isId(value) {
   return typeof value === 'string' && ID_PATTERN.test(value);
 }
 
-function isIdentityName(value) {
-  return typeof value === 'string' && value.trim() !== '' && value.length <= MAX_IDENTITY_NAME_CHARS;
+function isPort(value) {
+  return Number.isInteger(value) && value >= 1 && value <= 65535;
+}
+
+/* 身份名白名单（2026-10-12 用户裁定，语义事实）：拒绝控制字符（Cc，含换行 / Tab / ESC）、
+ * 不可见格式字符（Cf，含双向控制符、零宽、ZWJ）、行 / 段分隔符（Zl / Zp）——这些字符会破坏
+ * 扫描列表、日志与工具输出的呈现。其余放开：单码位可见符号与 emoji 均可；
+ * ZWJ 组合序列（U+200D∈Cf，如 👨‍👩‍👧）按 Cf 拒绝。
+ * 协议入站校验与本地配置写入共用本函数（同一规则，单一权威）。 */
+const FORBIDDEN_IDENTITY_CHARS = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+
+export function isIdentityName(value) {
+  return typeof value === 'string'
+    && value.trim() !== ''
+    && value.length <= MAX_IDENTITY_NAME_CHARS
+    && !FORBIDDEN_IDENTITY_CHARS.test(value);
 }
 
 function isTimestamp(value) {

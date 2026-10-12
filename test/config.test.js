@@ -17,6 +17,7 @@ test('文件缺失：返回默认值且 created=true', (t) => {
   assert.equal(config.logDir, '');
   assert.equal(config.logMaxBytes, 1048576);
   assert.equal(config.logMaxFiles, 5);
+  assert.equal(config.probeTimeoutMs, 1000);
 });
 
 test('buildDefaults：标识名取传入主机名，形状完整', () => {
@@ -32,6 +33,7 @@ test('buildDefaults：标识名取传入主机名，形状完整', () => {
     'messageTtlMs',
     'offlineQueue',
     'port',
+    'probeTimeoutMs',
     'queueMaxPerCollab',
     'retryFastCount',
     'retryIntervalMs',
@@ -157,4 +159,45 @@ test('网络参数类型或范围非法：逐项回落默认并告警', (t) => {
   assert.equal(config.queueMaxPerCollab, 500);
   assert.equal(config.scanWindowMs, 2000);
   assert.equal(warnings.length, 3);
+});
+
+test('buildDefaults：槽位感知默认（身份名后缀与端口段）', () => {
+  assert.deepEqual(buildDefaults('主机甲', { slot: 3 }), {
+    ...buildDefaults('主机甲'),
+    identityName: '主机甲-3',
+    port: 7323,
+  });
+  assert.equal(buildDefaults('主机甲', { slot: 1 }).identityName, '主机甲');
+  assert.equal(buildDefaults('主机甲', { slot: 1 }).port, 7321);
+  assert.equal(buildDefaults('主机甲').port, 7321);
+  for (const slot of [0, 9, '2', 2.5]) {
+    assert.throws(() => buildDefaults('主机甲', { slot }), TypeError, String(slot));
+  }
+});
+
+test('loadConfig：defaults 参数指定站点默认（槽位目录首跑）', (t) => {
+  const dir = makeTempDir(t);
+  const { config, created } = loadConfig(dir, { defaults: buildDefaults('主机甲', { slot: 2 }) });
+  assert.equal(created, true);
+  assert.equal(config.identityName, '主机甲-2');
+  assert.equal(config.port, 7322);
+});
+
+test('identityName 白名单：配置值含控制字符 / 零宽字符 → 回落默认并告警', (t) => {
+  const dir = makeTempDir(t);
+  writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({ identityName: '甲\u0007乙' }));
+  const warnings = [];
+  const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+  assert.equal(config.identityName, hostname());
+  assert.equal(warnings.length, 1);
+  assert.ok(warnings[0].includes('identityName'));
+});
+
+test('probeTimeoutMs：范围非法回落默认并告警', (t) => {
+  const dir = makeTempDir(t);
+  writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({ probeTimeoutMs: 10 }));
+  const warnings = [];
+  const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+  assert.equal(config.probeTimeoutMs, 1000);
+  assert.equal(warnings.length, 1);
 });
