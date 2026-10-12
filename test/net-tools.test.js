@@ -71,7 +71,7 @@ test('ws_ping：降级 → isError + 明确文案', async () => {
   assert.ok(result.content[0].text.includes('被其他程序占用'));
 });
 
-test('ws_delivery_status：透传查询参数并输出 JSON', async () => {
+test('ws_delivery_status：透传查询参数（首尾空白去除后）并输出 JSON', async () => {
   const queries = [];
   const net = {
     deliveryStatus: (query) => {
@@ -79,7 +79,7 @@ test('ws_delivery_status：透传查询参数并输出 JSON', async () => {
       return [{ msgId: 'msg-1', collabId: 'collab-1', type: 'notice', toInstanceId: 'inst-b', tier: 'at-peer', expired: false, attempts: 2, createdAt: '2026-10-12T00:00:00.000Z', nextAttemptAt: '2026-10-12T00:00:10.000Z', ackedAt: '2026-10-12T00:00:05.000Z', deliveredAt: null }];
     },
   };
-  const result = await callTool(deliveryStatusTool(), { msgId: 'msg-1', collabId: 'collab-1' }, net);
+  const result = await callTool(deliveryStatusTool(), { msgId: ' msg-1 ', collabId: ' collab-1 ' }, net);
   assert.deepEqual(queries, [{ msgId: 'msg-1', collabId: 'collab-1' }]);
   const rows = JSON.parse(result.content[0].text);
   assert.equal(rows[0].tier, 'at-peer');

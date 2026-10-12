@@ -23,7 +23,9 @@ export function deliveryStatusTool() {
       if (invalid.length > 0) {
         return { content: [{ type: 'text', text: `参数 ${invalid.join('、')} 非法：需要非空字符串（可选参数，不传则不过滤）` }], isError: true };
       }
-      const rows = context.net.deliveryStatus({ msgId: args.msgId, collabId: args.collabId });
+      /* 校验通过的值至多带首尾空白，透传前去除：查询按标识精确比对，带空白串会被当作不存在的标识、
+       * 静默返回空列表——「没匹配上」与「该标识不存在」将不可区分。 */
+      const rows = context.net.deliveryStatus({ msgId: args.msgId?.trim(), collabId: args.collabId?.trim() });
       return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] };
     },
   };

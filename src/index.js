@@ -114,7 +114,9 @@ await server.connect(new StdioServerTransport());
 /* 会话关闭（stdin EOF）= 这台机器离线（设计 §13）：关闭网络栈释放 UDP/TCP 监听端口后进程自然退出
  * （关闭后事件循环不再有活动句柄，退出码 0）。MCP SDK 的 stdio transport 只监听 stdin 的 data/error、
  * 不报告 EOF（server/stdio.js），故在这个组合根接线；硬杀（SIGTERM/SIGKILL）保持「被外部终止」的
- * 既有语义，不接信号事件。 */
+ * 既有语义，不接信号事件。
+ * 优雅退出是尽力而为：上界为在途拨号超时（生产默认 5000ms）——超出 SDK 客户端 2s 兜底窗时退化为
+ * SIGTERM 收尾；在途消息仍在落盘队列，重试即新一轮调度。 */
 let sessionEnded = false;
 function closeOnSessionEnd() {
   if (sessionEnded) {
