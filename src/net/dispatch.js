@@ -2,7 +2,7 @@ import { readdirSync } from 'node:fs';
 import { isIP } from 'node:net';
 import { join } from 'node:path';
 import { COLLABS_DIR_NAME } from '../paths.js';
-import { ID_PATTERN, MAX_FRAME_BYTES, MESSAGE_TYPES, PROTOCOL_VERSION, TRANSPORT_TYPES, newMsgId } from './protocol.js';
+import { ID_PATTERN, MAX_FRAME_BYTES, MESSAGE_TYPES, PROTOCOL_VERSION, TRANSPORT_TYPES, newMsgId, validateMessage } from './protocol.js';
 import { createOutbox } from './outbox.js';
 
 /* 发送调度（设计 §10）：按「协作 × 对端」单元串行投递（FIFO 保序），ack 推进，超时重传。
@@ -116,15 +116,19 @@ function send(state, { collabId, to, type, payload }) {
     state.counters.sendsRejected++;
     return { ok: false, reason: '目标为本机实例，拒绝对自己投递' };
   }
+  if (!Number.isInteger(state.self.port) || state.self.port < 1 || state.self.port > 65535) {
+    state.counters.sendsRejected++;
+    return { ok: false, reason: 'from.port 非法（1–65535 的整数）：本机站点端口未就位（构造侧必填）' };
+  }
   const msgId = newMsgId();
   const ts = new Date().toISOString();
-  const payloadRejection = payloadRejectionOf(frameOf(state, collabId, { msgId, type, payload, createdAt: ts }));
+  const payloadRejection = frameRejectionOf(frameOf(state, collabId, { msgId, type, payload, createdAt: ts }));
   if (payloadRejection !== null) {
     state.counters.sendsRejected++;
     return { ok: false, reason: payloadRejection };
   }
   const outbox = outboxFor(state, collabId);
-  const result = outbox.enqueue({ msgId, to: { instanceId: to.instanceId, address: to.address }, type, payload, ts });
+  const result = outbox.enqueue({ msgId, to: { instanceId: to.instanceId, address: to.address, port: to.port }, type, payload, ts });
   if (!result.ok) {
     state.counters.sendsRejected++;
     return result;
@@ -133,13 +137,13 @@ function send(state, { collabId, to, type, payload }) {
   return { ok: true, msgId, tier: 'queued' };
 }
 
-/* payload 预检（受理面）：形态与体积都以对端入站校验为准——非 plain object 的载荷会被对端按
- * 「payload 须为 JSON 对象」拒收；体积超限的帧会被对端直接销毁，重试多少次都是同一结果。
- * 这类条目恒为队头（headFor 只取最老 queued），后条永不发送：普通条目阻塞至过期，
- * 治理类条目豁免过期则把单元永久钉死。形态与体积都按「序列化上线后的实际形态」计——
- * toJSON 之类的序列化钩子会改写上线载荷，只查原对象形态会被绕过（如 toJSON 返回标量的对象）；
- * 体积按整帧序列化字节数计，与 transport 的入站检查同一口径，保证本端受理的帧对端一定收得下。 */
-function payloadRejectionOf(frame) {
+/* 终帧预检（受理面）：体积与协议两关都以「对端入站校验」为准——体积超限的帧会被对端直接销毁；
+ * 结构与协议不符的帧（含类型专属字段，如 delivery-status 的 refMsgId 形态）会被对端拒收——
+ * 两类条目重试多少次都是同一结果，且恒为队头（headFor 只取最老 queued）：普通条目阻塞至过期，
+ * 治理类条目豁免过期则把单元永久钉死，必须在受理面拒绝。
+ * 形态与体积都按「序列化上线后的实际形态」计——toJSON 之类的序列化钩子会改写上线载荷，
+ * 只查原对象形态会被绕过；validateMessage 跑在同一份上线形态上，与对端校验器同一实现。 */
+function frameRejectionOf(frame) {
   try {
     const line = JSON.stringify(frame);
     const bytes = Buffer.byteLength(line);
@@ -149,6 +153,10 @@ function payloadRejectionOf(frame) {
     const wire = JSON.parse(line);   // 上限内才解析，解析不会失败；上线形态（toJSON 已生效）与对端实际收到的形态一致
     if (wire.payload !== undefined && !isPlainObject(wire.payload)) {
       return 'payload 须为 JSON 对象（协议信封规则）：序列化后为数组 / 字符串 / 数字 / null 的载荷会被对端拒收，本条永不送达';
+    }
+    const checked = validateMessage(wire);
+    if (!checked.ok) {
+      return `帧与协议校验不符（${checked.reason}）：对端必拒收，本条永不送达`;
     }
   } catch (error) {
     return `payload 无法序列化（${error.message}）：落盘与对端都无法处理，本条永不送达`;
@@ -163,7 +171,7 @@ function isPlainObject(value) {
 
 /* send 参数校验：任一不合法即返回统一拒绝原因（点名参数清单），合法返回 null。 */
 function sendRejection(collabId, to, type) {
-  const argsReason = 'send 参数非法（collabId / to.instanceId / to.address / type，地址须为 IP 字面量）';
+  const argsReason = 'send 参数非法（collabId / to.instanceId / to.address / to.port / type，地址须为 IP 字面量、端口须为 1–65535 整数）';
   if (!isIdLike(collabId)) {
     return argsReason;
   }
@@ -177,6 +185,9 @@ function sendRejection(collabId, to, type) {
     return argsReason;
   }
   if (!isAddressLike(to.address)) {
+    return argsReason;
+  }
+  if (!Number.isInteger(to.port) || to.port < 1 || to.port > 65535) {
     return argsReason;
   }
   if (!isKnownType(type)) {
@@ -376,7 +387,7 @@ async function obtainConnection(state, key, collabId, entry) {
     held.connection.close();  // 重试 = 半开嫌疑：重拨后再发
     state.connections.delete(key);
   }
-  const connection = await dialPeer(state, { address: entry.to.address, port: state.config.port, timeoutMs: state.config.dialTimeoutMs });
+  const connection = await dialPeer(state, { address: entry.to.address, port: entry.to.port, timeoutMs: state.config.dialTimeoutMs });
   if (connection === null) {
     return null;   // 停止收口后才完成的拨号：连接已被收口关闭，不得登记、不得发帧
   }

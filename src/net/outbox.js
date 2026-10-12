@@ -1,4 +1,5 @@
 import { collabDir, collabFilePath, ensureDir } from '../paths.js';
+import { ANCHOR_PORT } from '../site.js';
 import { appendLine, loadLines, replaceFile } from '../storage.js';
 import { GOVERNANCE_TYPES } from './protocol.js';
 
@@ -15,6 +16,8 @@ const COMPACT_LINE_FACTOR = 2;
  * 折叠出的历史行在加载与清理后就地压缩（整体替换写回），文件增长有界。
  * 状态机：queued（未确认）→ acked（对方驿站已确认）→ session（已投进对方会话，终态）；
  * queued/acked 超保留期 → expired（终态，提示发送方）；治理类在未终态前豁免容量与过期（设计 §9/§10）。 */
+/* 记录 to 含「地址:端口」——多站点下拨号目标必须写全；旧记录无 port 字段按锚点端口解释：
+ * 本文件没有版本字段、历史上只可能来自单站点时代（那时站点都取默认端口），故按默认端口兜底而不做文件级迁移。 */
 export function createOutbox({ dataDir, collabId, config, log }) {
   const state = {
     collabId,
@@ -93,7 +96,7 @@ function unitsOf(state) {
 }
 
 function headFor(state, peerInstanceId) {
-  /** @type {undefined | { msgId: string, collabId: string, to: { instanceId: string, address: string }, type: string, payload?: unknown, governance: boolean, state: 'queued' | 'acked' | 'session' | 'expired', attempts: number, createdAt: string, nextAttemptAt: number, ackedAt?: string, deliveredAt?: string, expiredAt?: string }} */
+  /** @type {undefined | { msgId: string, collabId: string, to: { instanceId: string, address: string, port: number }, type: string, payload?: unknown, governance: boolean, state: 'queued' | 'acked' | 'session' | 'expired', attempts: number, createdAt: string, nextAttemptAt: number, ackedAt?: string, deliveredAt?: string, expiredAt?: string }} */
   let head = undefined;
   for (const entry of state.entries.values()) {
     if (entry.state !== 'queued' || entry.to.instanceId !== peerInstanceId) {
@@ -115,7 +118,7 @@ function enqueue(state, { msgId, to, type, payload, ts }) {
   const entry = {
     msgId,
     collabId: state.collabId,
-    to: { instanceId: to.instanceId, address: to.address },
+    to: { instanceId: to.instanceId, address: to.address, port: to.port },
     type,
     payload,
     governance,
@@ -244,7 +247,7 @@ function validateRecord(record) {
   return {
     msgId: record.msgId,
     collabId: record.collabId,
-    to: { instanceId: record.to.instanceId, address: record.to.address },
+    to: { instanceId: record.to.instanceId, address: record.to.address, port: record.to.port ?? ANCHOR_PORT },
     type: record.type,
     payload: record.payload,
     governance: record.governance === true,
@@ -258,7 +261,8 @@ function validateRecord(record) {
   };
 }
 
-/* 结构底线（字段形态）：不合形态的记录一律视同损坏，跳过并计数——内容语义不在此层裁定。 */
+/* 结构底线（字段形态）：不合形态的记录一律视同损坏，跳过并计数——内容语义不在此层裁定。
+ * port 缺省（旧记录）可接受：归一为锚点端口在 validateRecord 里补；存在但非法 = 损坏（拒绝优于猜测）。 */
 function isRecordShape(record) {
   return isPlainRecord(record) && hasCoreFields(record) && isPeerShape(record.to) && hasCounterFields(record);
 }
@@ -281,7 +285,14 @@ function isPeerShape(peer) {
   if (typeof peer !== 'object' || peer === null) {
     return false;
   }
-  return typeof peer.instanceId === 'string' && typeof peer.address === 'string';
+  if (typeof peer.instanceId !== 'string' || typeof peer.address !== 'string') {
+    return false;
+  }
+  return peer.port === undefined || isPortNumber(peer.port);
+}
+
+function isPortNumber(value) {
+  return Number.isInteger(value) && value >= 1 && value <= 65535;
 }
 
 function hasCounterFields(record) {

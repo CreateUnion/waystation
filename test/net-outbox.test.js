@@ -36,7 +36,7 @@ function makeOutbox(t, { dataDir, config } = {}) {
 function sendInput(overrides = {}) {
   return {
     msgId: newMsgId(),
-    to: { instanceId: 'inst-b', address: '127.0.0.2' },
+    to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 },
     type: 'notice',
     payload: { text: '你好' },
     ts: new Date().toISOString(),
@@ -56,7 +56,7 @@ test('enqueue：落盘为协作目录下 outbox.jsonl，重启可续读', (t) =>
   assert.equal(entry.state, 'queued');
   assert.equal(entry.attempts, 0);
   assert.equal(entry.governance, false);
-  assert.deepEqual(entry.to, { instanceId: 'inst-b', address: '127.0.0.2' });
+  assert.deepEqual(entry.to, { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 });
   assert.equal(entry.payload.text, '你好');
 });
 
@@ -165,7 +165,7 @@ test('units/headFor：按对端分单元；head 取最老 queued；acked 不阻�
   const newer = sendInput();
   outbox.enqueue(older);
   outbox.enqueue(newer);
-  outbox.enqueue(sendInput({ to: { instanceId: 'inst-c', address: '127.0.0.3' } }));
+  outbox.enqueue(sendInput({ to: { instanceId: 'inst-c', address: '127.0.0.3', port: 7321 } }));
   assert.deepEqual(outbox.units().sort(), ['inst-b', 'inst-c']);
   assert.equal(outbox.headFor('inst-b').msgId, older.msgId);
   outbox.markAcked(older.msgId, Date.now());
@@ -204,7 +204,7 @@ test('载入：非本协作/结构非法记录跳过并计数', (t) => {
   const file = join(dir, COLLABS_DIR_NAME, 'collab-1', OUTBOX_FILE_NAME);
   mkdirSync(join(dir, COLLABS_DIR_NAME, 'collab-1'), { recursive: true });   // 直接写文件前先建协作目录
   const good = {
-    msgId: newMsgId(), collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2' },
+    msgId: newMsgId(), collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 },
     type: 'notice', governance: false, state: 'queued', attempts: 0,
     createdAt: new Date().toISOString(), nextAttemptAt: Date.now(),
   };
@@ -244,4 +244,36 @@ test('入队：落盘失败即回滚（未落盘即不承诺），不留内存�
   assert.equal(outbox.size(), 0);
   assert.equal(outbox.headFor('inst-b'), undefined);
   assert.equal(outbox.stats().persistFailures, before + 1);
+});
+
+test('to.port：新记录写全（落盘行含 port）', (t) => {
+  const { outbox, file } = makeOutbox(t);
+  const input = sendInput({ to: { instanceId: 'inst-b', address: '127.0.0.2', port: 17321 } });
+  assert.equal(outbox.enqueue(input).ok, true);
+  assert.equal(outbox.entries()[0].to.port, 17321);
+  const lines = readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  assert.equal(lines[0].to.port, 17321);
+});
+
+test('旧记录迁移：to 缺 port 载入时按锚点端口解释（outbox 无版本字段，不引入文件级迁移）', (t) => {
+  const { dir, file } = makeOutbox(t);
+  const legacy = {
+    msgId: 'msg-legacy', collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2' }, type: 'notice', payload: { text: '旧' },
+    governance: false, state: 'queued', attempts: 0, createdAt: '2026-10-12T00:00:00.000Z', nextAttemptAt: 1700000000000,
+  };
+  mkdirSync(join(dir, COLLABS_DIR_NAME, 'collab-1'), { recursive: true });
+  writeFileSync(file, JSON.stringify(legacy) + '\n');
+  const reopened = createOutbox({ dataDir: dir, collabId: 'collab-1', config: testConfig(), log: quietLog() });
+  assert.equal(reopened.entries()[0].to.port, 7321, '缺 port = M2 时代记录：按锚点端口解释');
+});
+
+test('记录 to.port 非法：按损坏跳过并计数（拒绝优于猜测）', (t) => {
+  const { dir, file } = makeOutbox(t);
+  const base = { collabId: 'collab-1', type: 'notice', governance: false, state: 'queued', attempts: 0, createdAt: '2026-10-12T00:00:00.000Z', nextAttemptAt: 1700000000000 };
+  mkdirSync(join(dir, COLLABS_DIR_NAME, 'collab-1'), { recursive: true });
+  const lines = [0, 70000, '7321', 1.5].map((port, index) => JSON.stringify({ ...base, msgId: `msg-${index}`, to: { instanceId: 'inst-b', address: '127.0.0.2', port } }));
+  writeFileSync(file, lines.join('\n') + '\n');
+  const reopened = createOutbox({ dataDir: dir, collabId: 'collab-1', config: testConfig(), log: quietLog() });
+  assert.equal(reopened.entries().length, 0);
+  assert.equal(reopened.stats().corruptRecords, 4);
 });

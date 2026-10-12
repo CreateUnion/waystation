@@ -4,7 +4,7 @@ import { createDispatch } from '../src/net/dispatch.js';
 import { createNetStack } from '../src/net/stack.js';
 import { makeTempDir } from './helpers.js';
 
-const SELF = { instanceId: 'inst-self', identityName: '本机' };
+const SELF = { instanceId: 'inst-self', identityName: '本机', port: 17321 };
 
 function createFakeDiscovery(overrides = {}) {
   const calls = [];
@@ -244,7 +244,7 @@ test('降级态：deliveryStatus 惰性载入历史队列（未 start 也能查�
   const config = { port: 17321, dispatchTickMs: 20, dialTimeoutMs: 100, retryIntervalMs: 60, retrySlowIntervalMs: 120, retryFastCount: 2, queueMaxPerCollab: 100, messageTtlMs: 600000 };
   const log = { info: () => {}, warn: () => {}, error: () => {} };
   const writer = createDispatch({ dataDir, config, transport: createFakeTransport(), self: SELF, log });
-  const sent = writer.send({ collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2' }, type: 'notice', payload: { text: '离线排队' } });
+  const sent = writer.send({ collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 }, type: 'notice', payload: { text: '离线排队' } });
   assert.equal(sent.ok, true, '写入方未 start 也受理入队（离线排队语义）');
   const discovery = createFakeDiscovery({
     start: async () => {

@@ -1,7 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { appendFileSync } from 'node:fs';
 import { createDispatch } from '../src/net/dispatch.js';
 import { newMsgId } from '../src/net/protocol.js';
+import { OUTBOX_FILE_NAME } from '../src/net/outbox.js';
+import { collabDir, collabFilePath, ensureDir } from '../src/paths.js';
 import { makeTempDir, waitFor } from './helpers.js';
 
 function testConfig(overrides = {}) {
@@ -99,14 +102,14 @@ function makeDispatch(t, { transport, config, self } = {}) {
     dataDir,
     config: config ?? testConfig(),
     transport: transport ?? createFakeTransport(),
-    self: self ?? { instanceId: 'inst-self', identityName: '本机' },
+    self: self ?? { instanceId: 'inst-self', identityName: '本机', port: 7321 },
     log,
   });
   return { dispatch, dataDir, logs, log };
 }
 
 function target(overrides = {}) {
-  return { collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2' }, type: 'notice', payload: { text: '你好' }, ...overrides };
+  return { collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 }, type: 'notice', payload: { text: '你好' }, ...overrides };
 }
 
 test('send：当场返回「已排队」，调度 tick 后帧写出（信封字段齐全）', { timeout: 15000 }, async (t) => {
@@ -123,7 +126,7 @@ test('send：当场返回「已排队」，调度 tick 后帧写出（信封字�
   assert.equal(frame.msgId, sent.msgId);
   assert.equal(frame.type, 'notice');
   assert.equal(frame.collabId, 'collab-1');
-  assert.deepEqual(frame.from, { instanceId: 'inst-self', identityName: '本机' });
+  assert.deepEqual(frame.from, { instanceId: 'inst-self', identityName: '本机', port: 7321 });
   assert.equal(frame.payload.text, '你好');
 });
 
@@ -211,8 +214,8 @@ test('不同对端并行：两单元各自独立投递，互不阻塞', { timeou
   const transport = createFakeTransport();
   const { dispatch } = makeDispatch(t, { transport });
   t.after(() => dispatch.stop());
-  dispatch.send(target({ to: { instanceId: 'inst-b', address: '127.0.0.2' } }));
-  dispatch.send(target({ to: { instanceId: 'inst-c', address: '127.0.0.3' } }));
+  dispatch.send(target({ to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 } }));
+  dispatch.send(target({ to: { instanceId: 'inst-c', address: '127.0.0.3', port: 7321 } }));
   dispatch.start();
   await waitFor(() => transport.connections.length === 2);
   assert.deepEqual(transport.connections.map((connection) => connection.remoteAddress).sort(), ['127.0.0.2', '127.0.0.3']);
@@ -269,7 +272,7 @@ test('重启续投：重开调度器后未完成条目继续投递（队列与�
 
 test('deliveryStatus 惰性载入：未 start 也能查到落盘的历史队列（只加载、不调度）', { timeout: 15000 }, async (t) => {
   const dataDir = makeTempDir(t);
-  const self = { instanceId: 'inst-self', identityName: '本机' };
+  const self = { instanceId: 'inst-self', identityName: '本机', port: 7321 };
   const log = { info: () => {}, warn: () => {}, error: () => {} };
   const writer = createDispatch({ dataDir, config: testConfig(), transport: createFakeTransport(), self, log });
   const sent = writer.send(target());
@@ -303,10 +306,10 @@ test('过期：超保留期的未完成条目在调度中被标记 expired 并�
 test('send 参数非法 / 目标为本机：拒绝（不产生队列条目）', { timeout: 15000 }, async (t) => {
   const transport = createFakeTransport();
   const { dispatch } = makeDispatch(t, { transport });
-  assert.equal(dispatch.send({ collabId: '../x', to: { instanceId: 'inst-b', address: '127.0.0.2' }, type: 'notice' }).ok, false);
-  assert.equal(dispatch.send({ collabId: 'collab-1', to: { instanceId: 'inst-b', address: 'hostname' }, type: 'notice' }).ok, false);
-  assert.equal(dispatch.send({ collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2' }, type: '编造类型' }).ok, false);
-  assert.equal(dispatch.send({ collabId: 'collab-1', to: { instanceId: 'inst-self', address: '127.0.0.1' }, type: 'notice' }).ok, false);
+  assert.equal(dispatch.send({ collabId: '../x', to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 }, type: 'notice' }).ok, false);
+  assert.equal(dispatch.send({ collabId: 'collab-1', to: { instanceId: 'inst-b', address: 'hostname', port: 7321 }, type: 'notice' }).ok, false);
+  assert.equal(dispatch.send({ collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 }, type: '编造类型' }).ok, false);
+  assert.equal(dispatch.send({ collabId: 'collab-1', to: { instanceId: 'inst-self', address: '127.0.0.1', port: 7321 }, type: 'notice' }).ok, false);
   assert.equal(dispatch.deliveryStatus({}).length, 0);
 });
 
@@ -493,7 +496,7 @@ test('tick 异常隔离：调度循环内异常被捕获记录，调度继续运
     originalClose.call(this);
   };
   await waitFor(() => logs.some((entry) => entry.level === 'error' && entry.message.includes('调度循环异常')), { timeoutMs: 4000 });
-  const followUp = dispatch.send(target({ to: { instanceId: 'inst-c', address: '127.0.0.3' }, payload: { text: '丙' } }));
+  const followUp = dispatch.send(target({ to: { instanceId: 'inst-c', address: '127.0.0.3', port: 7321 }, payload: { text: '丙' } }));
   await waitFor(() => transport.connections.length === 2 && transport.connections[1].frames.length === 1, { timeoutMs: 2000 });
   assert.equal(transport.connections[1].frames[0].msgId, followUp.msgId, '异常被隔离：后续 tick 照常投递');
 });
@@ -529,4 +532,86 @@ test('索引回收：条目被队列回收后不再出现在状态查询，重�
   await waitFor(() => dispatch.deliveryStatus({ msgId: first.msgId }).length === 0, { timeoutMs: 5000 });
   dispatch.onAck(second.msgId);
   assert.equal(dispatch.deliveryStatus({ msgId: second.msgId })[0].tier, 'at-peer');
+});
+
+test('send：to.port 缺失 / 非法 → 统一参数拒绝、不入队', { timeout: 15000 }, async (t) => {
+  const { dispatch } = makeDispatch(t);
+  t.after(() => dispatch.stop());
+  const variants = [undefined, 0, 65536, '7321', 1.5];
+  for (const port of variants) {
+    const sent = dispatch.send({ collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2', port }, type: 'notice', payload: { text: 'x' } });
+    assert.equal(sent.ok, false, String(port));
+    assert.ok(sent.reason.includes('to.port'), sent.reason);
+  }
+  assert.equal(dispatch.stats().sendsRejected, variants.length);
+  assert.equal(dispatch.stats().collabs, 0, '未受理不得创建协作队列');
+});
+
+test('终帧预检：类型专属字段不符（delivery-status 的 refMsgId 形态）→ 受理面拒绝', { timeout: 15000 }, async (t) => {
+  const { dispatch } = makeDispatch(t);
+  t.after(() => dispatch.stop());
+  const bad = dispatch.send({
+    collabId: 'collab-1',
+    to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 },
+    type: 'delivery-status',
+    payload: { refMsgId: 'not a valid id!', tier: 'session' },
+  });
+  assert.equal(bad.ok, false);
+  assert.ok(bad.reason.includes('对端必拒收'), bad.reason);
+  const good = dispatch.send({
+    collabId: 'collab-1',
+    to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 },
+    type: 'delivery-status',
+    payload: { refMsgId: 'msg-1', tier: 'session' },
+  });
+  assert.equal(good.ok, true, '合法形态不被误杀');
+});
+
+test('拨号端口 = 条目 to.port（多站点下拨错端口即投递失败）', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const { dispatch } = makeDispatch(t, { transport });
+  t.after(() => dispatch.stop());
+  dispatch.send({ collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2', port: 17321 }, type: 'notice', payload: { text: 'x' } });
+  dispatch.start();
+  await waitFor(() => transport.dials.length >= 1);
+  assert.deepEqual(transport.dials[0], { address: '127.0.0.2', port: 17321 });
+});
+
+test('帧 from 携带端口（构造侧必填）', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const { dispatch } = makeDispatch(t, { transport, self: { instanceId: 'inst-self', identityName: '本机', port: 17322 } });
+  t.after(() => dispatch.stop());
+  dispatch.send(target());
+  dispatch.start();
+  await waitFor(() => transport.connections[0]?.frames.length === 1);
+  assert.equal(transport.connections[0].frames[0].from.port, 17322);
+});
+
+test('旧队列记录续投：拨号回退锚点端口（缺 port 记录按默认端口解释）', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const dataDir = makeTempDir(t);
+  const collabId = 'collab-1';
+  ensureDir(collabDir(dataDir, collabId));
+  const legacy = {
+    msgId: 'msg-legacy', collabId, to: { instanceId: 'inst-b', address: '127.0.0.2' }, type: 'notice', payload: { text: '旧' },
+    governance: false, state: 'queued', attempts: 0, createdAt: new Date().toISOString(), nextAttemptAt: 0,   // 时间戳取当下：硬编码旧日期会被保留期在首个 tick 即判过期，拨号永不发生
+  };
+  appendFileSync(collabFilePath(dataDir, collabId, OUTBOX_FILE_NAME), JSON.stringify(legacy) + '\n');
+  const logs = [];
+  const log = { info: () => {}, warn: (m, f) => logs.push({ m, f }), error: (m, f) => logs.push({ m, f }) };
+  const dispatch = createDispatch({ dataDir, config: testConfig(), transport, self: { instanceId: 'inst-self', identityName: '本机', port: 7321 }, log });
+  t.after(() => dispatch.stop());
+  dispatch.start();
+  await waitFor(() => transport.dials.length >= 1, { timeoutMs: 5000 });
+  assert.equal(transport.dials[0].port, 7321, '旧记录无 port：按锚点端口续投');
+});
+
+test('send：自身 from.port 非法 → 受理面拒绝（构造侧必填的守卫）', { timeout: 15000 }, async (t) => {
+  const { dispatch } = makeDispatch(t, { self: { instanceId: 'inst-self', identityName: '本机', port: 0 } });
+  t.after(() => dispatch.stop());
+  const sent = dispatch.send(target());
+  assert.equal(sent.ok, false);
+  assert.ok(sent.reason.includes('from.port'), sent.reason);
+  assert.equal(dispatch.stats().sendsRejected, 1);
+  assert.equal(dispatch.stats().collabs, 0, '未受理不得创建协作队列');
 });
