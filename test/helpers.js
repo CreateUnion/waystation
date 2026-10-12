@@ -1,3 +1,4 @@
+import dgram from 'node:dgram';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createServer } from 'node:net';
@@ -46,4 +47,64 @@ export async function pickFreePort() {
     probe.close(resolve);
   });
   return port;
+}
+
+/** 取一段 [base..base+size-1] 八连空闲端口（槽位段测试基准）：逐端口试绑（UDP+TCP 同号）成功后释放；
+ * 任一不可绑即整体重取，最多 attempts 次。单端口空闲不等于整段可用——系统临时端口区的其它套接字
+ * （以及同工序的探针/回执 socket）随时可能占用段内相邻端口，直接拿 pickFreePort 当段基会造成「槽位号漂移」类假红。 */
+export async function pickFreeSegment(size = 8, attempts = 20) {
+  for (let round = 0; round < attempts; round++) {
+    const base = await pickFreePort();
+    if (await isRangeFree(base, size)) {
+      return base;
+    }
+  }
+  throw new Error(`pickFreeSegment：连续 ${attempts} 次未取到 ${size} 连空闲端口段（端口环境异常）`);
+}
+
+/** 轮询至某端口可重新独占绑定（UDP+TCP 同号）——进程退出到端口可绑实测 1–4ms，固定 sleep 会在慢环境打偏；
+ * 超时由 waitFor 抛错（失败响亮，不静默继续）。 */
+export async function waitForRebindable(port, { timeoutMs = 3000 } = {}) {
+  await waitFor(async () => canBindPort(port), { timeoutMs });
+}
+
+/* 端口可独占绑定（UDP+TCP 同号）后立即释放；任一步失败即 false。 */
+async function canBindPort(port) {
+  const udp = dgram.createSocket({ type: 'udp4', reuseAddr: false });
+  const udpOk = await new Promise((resolve) => {
+    udp.once('error', () => resolve(false));
+    udp.bind({ port, address: '0.0.0.0', exclusive: true }, () => resolve(true));
+  });
+  try {
+    udp.close();
+  } catch {
+    // 未绑定成功：无需关闭
+  }
+  if (!udpOk) {
+    return false;
+  }
+  const tcp = createServer();
+  const tcpOk = await new Promise((resolve) => {
+    tcp.once('error', () => resolve(false));
+    tcp.listen({ port, host: '0.0.0.0' }, () => resolve(true));
+  });
+  if (tcpOk) {
+    await new Promise((resolve) => tcp.close(resolve));
+  } else {
+    try {
+      tcp.close();
+    } catch {
+      // 未监听成功：无需关闭
+    }
+  }
+  return tcpOk;
+}
+
+async function isRangeFree(base, size) {
+  for (let offset = 0; offset < size; offset++) {
+    if (!(await canBindPort(base + offset))) {
+      return false;
+    }
+  }
+  return true;
 }
