@@ -286,3 +286,50 @@ test('close 释放监听：端口可再次绑定', { timeout: 15000 }, async (t)
   await second.listen();
   await second.close();
 });
+
+test('并发 listen（同 tick 两次）：恰一次真实绑定；close 后端口可重绑（server 引用不被覆盖）', { timeout: 15000 }, async () => {
+  const port = await pickFreePort();
+  const transport = createTransport({ port, log: quietLog() });
+  const results = await Promise.allSettled([transport.listen(), transport.listen()]);
+  const fulfilled = results.filter((result) => result.status === 'fulfilled');
+  const rejected = results.filter((result) => result.status === 'rejected');
+  assert.equal(fulfilled.length, 1, '恰一次取得绑定');
+  assert.equal(rejected.length, 1);
+  assert.equal(rejected[0].reason.code, 'EADDRINUSE', '并发败者以端口占用落败（不得静默共存）');
+  await transport.close();
+  const again = createTransport({ port, log: quietLog() });
+  await again.listen();   // 旧实现下 server 引用被败者覆盖 → 真正绑定的监听泄漏、端口不可重绑
+  await again.close();
+});
+
+test('listen 失败可重试：失败不改变监听状态、不登记 server', { timeout: 15000 }, async (t) => {
+  const port = await pickFreePort();
+  const blocker = net.createServer();
+  await new Promise((resolve) => blocker.listen({ port, host: '0.0.0.0' }, resolve));
+  t.after(() => blocker.close());
+  const transport = createTransport({ port, log: quietLog() });
+  await assert.rejects(transport.listen(), (error) => error.code === 'EADDRINUSE');
+  assert.equal(transport.stats().listening, false, '失败不得留下「已监听」状态');
+  await new Promise((resolve) => blocker.close(resolve));
+  await transport.listen();   // 条件修复后首次失败仍可重试（组件一次性生命周期语义的起点）
+  t.after(() => transport.close());
+  assert.equal(transport.stats().listening, true);
+});
+
+test('close 后完成的拨号：入池即销毁（不给无主连接留活口）', { timeout: 15000 }, async (t) => {
+  const peer = net.createServer();
+  await new Promise((resolve) => peer.listen({ port: 0, host: '127.0.0.1' }, resolve));
+  t.after(() => peer.close());
+  const peerPort = peer.address().port;
+  const liveSockets = new Set();
+  peer.on('connection', (socket) => {
+    liveSockets.add(socket);
+    socket.on('close', () => liveSockets.delete(socket));
+  });
+  const transport = createTransport({ port: 0, log: quietLog() });
+  await transport.close();
+  const connection = await transport.dial({ address: '127.0.0.1', port: peerPort, timeoutMs: 1000 });
+  assert.equal(transport.stats().closedConnections, 1);
+  await waitFor(() => liveSockets.size === 0, { timeoutMs: 3000 });   // 对端观察到即时断开：连接确已被销毁
+  connection.close();
+});

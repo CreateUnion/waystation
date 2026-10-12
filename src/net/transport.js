@@ -27,11 +27,13 @@ export function createTransport({ port, bindAddress = '0.0.0.0', log }) {
       dialTotal: 0,
       dialFailures: 0,
       dialTimeouts: 0,
+      closedConnections: 0,
     },
     sockets: new Set(),
     frameHandler: null,
     server: null,
     listening: false,
+    closed: false,
   };
   return {
     /** 监听入站端口；失败向上抛（含 error.code，由装配侧分类）；已在监听时重复调用为空操作。
@@ -54,16 +56,19 @@ function listen(state) {
   }
   // resolve 无参调用：显式 Promise<void> 让类型检查接受 0 参 resolve
   return /** @type {Promise<void>} */ (new Promise((resolve, reject) => {
-    state.server = net.createServer((socket) => {
+    const server = net.createServer((socket) => {
       onInboundSocket(state, socket);
     });
-    state.server.once('error', reject);
-    state.server.listen({ port: state.port, host: state.bindAddress }, () => {
-      state.server.removeListener('error', reject);
-      state.server.on('error', (error) => {
+    server.once('error', reject);
+    server.listen({ port: state.port, host: state.bindAddress }, () => {
+      server.removeListener('error', reject);
+      server.on('error', (error) => {
         state.counters.socketErrors++;
         state.log.warn('监听套接字错误（不退出进程）', { reason: error.message });
       });
+      /* 绑成功才登记 server 引用：并发 / 失败的 listen 调用不得覆盖它——
+       * 覆盖会让 close() 关错对象，真正绑定的 server 泄漏端口（close 后端口不可重绑）。 */
+      state.server = server;
       state.listening = true;
       resolve();
     });
@@ -73,6 +78,7 @@ function listen(state) {
 /* 关闭全部监听与拨号连接：停监听、销毁连接集合里的每个 socket，再等各自的 'close' 事件落地。
  * 只等 server 的 'close' 不够——server drain 先于被销毁 socket 的事件，连接计数会滞后于本函数的返回。 */
 async function close(state) {
+  state.closed = true;
   state.listening = false;
   const server = state.server;
   state.server = null;
@@ -154,8 +160,16 @@ function dispatchFrame(state, connection, frame) {
   }
 }
 
+/* 关闭后才发现完成的拨号（dial 在 close 之前发起、连接在 close 之后建立）：不再有任何级联者
+ * （close 只遍历当时的连接集），入池即为无主连接——直接销毁（与「close 级联全部连接」的契约同源），
+ * 计数留痕后照常返回连接句柄（调用方各自持有确定的清理路径：dispatch 侧 stop 检查、探测侧 finally）。 */
 function attach(state, socket, countsAsInbound) {
   const connection = createConnection(socket, state.counters);
+  if (state.closed) {
+    state.counters.closedConnections++;
+    socket.destroy();
+    return connection;
+  }
   let buffered = Buffer.alloc(0);
   state.sockets.add(socket);   // 监听与拨号连接同池：close() 对两个方向都负责回收
   socket.on('data', (chunk) => {
