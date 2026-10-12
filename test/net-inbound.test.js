@@ -571,3 +571,42 @@ test('checkInbox：读失败（路径为目录）抛错并计数留痕（不得�
   assert.ok(inbound.stats().persistFailures >= 1);
   assert.ok(logs.some((entry) => entry.message.includes('收件流水读取失败')));
 });
+
+test('钩子 meta：admit 与 consume 均收到连接来源地址', { timeout: 15000 }, async (t) => {
+  const metas = { admit: [], consume: [] };
+  const { inbound } = makeInbound(t, {
+    hooks: {
+      admit: (frame, meta) => {
+        metas.admit.push(meta);
+        return { ok: true };
+      },
+      consume: (frame, meta) => {
+        metas.consume.push(meta);
+      },
+      deliverToSession: () => false,
+    },
+  });
+  const connection = createFakeConnection('127.0.0.7');
+  inbound.onFrame(connection, messageFrame());
+  await waitFor(() => inbound.stats().accepted === 1);
+  assert.deepEqual(metas.admit, [{ remoteAddress: '127.0.0.7' }]);
+  assert.deepEqual(metas.consume, [{ remoteAddress: '127.0.0.7' }]);
+});
+
+test('钩子 meta：连接无来源地址时为空串（不抛出）', { timeout: 15000 }, async (t) => {
+  const metas = [];
+  const { inbound } = makeInbound(t, {
+    hooks: {
+      admit: (frame, meta) => {
+        metas.push(meta);
+        return { ok: true };
+      },
+      deliverToSession: () => false,
+    },
+  });
+  const connection = createFakeConnection();
+  delete connection.remoteAddress;
+  inbound.onFrame(connection, messageFrame());
+  await waitFor(() => inbound.stats().accepted === 1);
+  assert.deepEqual(metas, [{ remoteAddress: '' }]);
+});

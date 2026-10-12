@@ -9,7 +9,7 @@ export const INBOX_FILE_NAME = 'inbox.jsonl';
 const COMPACT_LINE_FACTOR = 2;
 
 /* 可注入钩子的形状（全部可选，缺省即安全默认）：类型注解为类型检查服务——缺省值 {} 与属性访问需要明确形状。 */
-/** @typedef {{ admit?: (frame: object) => { ok: boolean, reason?: string } | null | undefined | Promise<{ ok: boolean, reason?: string } | null | undefined>, consume?: (frame: object) => unknown, deliverToSession?: (frame: object) => unknown }} InboundHooks */
+/** @typedef {{ admit?: (frame: object, meta: { remoteAddress: string }) => { ok: boolean, reason?: string } | null | undefined | Promise<{ ok: boolean, reason?: string } | null | undefined>, consume?: (frame: object, meta: { remoteAddress: string }) => unknown, deliverToSession?: (frame: object) => unknown }} InboundHooks */
 
 /* 接收管线（设计 §10）：帧的类型路由（四类）——
  * ① 协作域（含治理类）：准入 → 幂等去重 → 落盘 → ack → 钩子 → 投递成功后回报；
@@ -145,7 +145,8 @@ function applyReport(state, connection, frame) {
 }
 
 async function handleCollabMessage(state, connection, frame) {
-  const admitted = await runAdmit(state, frame);
+  const meta = metaOf(connection);
+  const admitted = await runAdmit(state, frame, meta);
   if (admitted === null || admitted === undefined || admitted.ok !== true) {
     state.counters.rejected.admission++;
     const reason = admitted?.reason ?? '未说明';
@@ -175,7 +176,7 @@ async function handleCollabMessage(state, connection, frame) {
   connection.send(ackFrame(state, frame.msgId));
   state.counters.acksSent++;
   compactIfDue(state, box);
-  await runHook(state, state.consume, frame);
+  await runHook(state, state.consume, frame, meta);
   if (await runDeliver(state, frame)) {
     state.counters.sessionDelivered++;
     sendDeliveryReport(state, frame, connection);
@@ -184,10 +185,11 @@ async function handleCollabMessage(state, connection, frame) {
 
 /* 准入钩子包装：钩子异常一律按「未通过准入」归类——拒绝方向不变（不落盘、不 ack），
  * 但必须有准入拒绝计数与告警：真台账的缺陷会让消息全部丢弃，观测面不能同时失效。
- * 契约硬化：钩子可为同步或异步——await 承接 thenable，异步实现（如查台账的 I/O）不再被误判为全量拒绝。 */
-async function runAdmit(state, frame) {
+ * 契约硬化：钩子可为同步或异步——await 承接 thenable；meta 携带连接来源地址
+ * （协作端点学习与邀请限频的「来源」依据）。 */
+async function runAdmit(state, frame, meta) {
   try {
-    return await state.admit(frame);
+    return await state.admit(frame, meta);
   } catch (error) {
     return { ok: false, reason: `准入钩子异常：${error?.message ?? '未知原因'}` };
   }
@@ -353,9 +355,9 @@ function persistInbound(state, box, frame) {
   }
 }
 
-async function runHook(state, hook, frame) {
+async function runHook(state, hook, frame, meta) {
   try {
-    await hook(frame);
+    await hook(frame, meta);
   } catch (error) {
     state.counters.hookFailures++;
     state.log.error('接收钩子异常（已隔离）', { msgId: frame.msgId, reason: error.message });
@@ -426,4 +428,10 @@ function inboxRecordsOf(state, collabId) {
     state.log.warn('收件流水读取失败（查询路径）', { collabId, reason: error.message });
     throw error;
   }
+}
+
+/* 钩子 meta（来源地址）：协作层用它学习成员端点与做邀请限频；测试假连接可能不带该字段，
+ * 缺失按空串（下游以空串为「未知来源」继续处理，不抛出）。 */
+function metaOf(connection) {
+  return { remoteAddress: typeof connection?.remoteAddress === 'string' ? connection.remoteAddress : '' };
 }
