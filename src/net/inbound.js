@@ -1,8 +1,12 @@
 import { collabDir, collabFilePath, ensureDir } from '../paths.js';
-import { appendLine, loadLines } from '../storage.js';
+import { appendLine, loadLines, replaceFile } from '../storage.js';
 import { PROTOCOL_VERSION, newMsgId } from './protocol.js';
 
 export const INBOX_FILE_NAME = 'inbox.jsonl';
+
+/* 收件流水压缩的行数触发阈值：自上次压缩以来的追加行数超过存活判重记录数 × 该倍率即重写文件。
+ * 与发送队列同一口径——长驻进程里没有「终态事件」可等，靠行数触发才能保证文件增长有界。 */
+const COMPACT_LINE_FACTOR = 2;
 
 /* 可注入钩子的形状（全部可选，缺省即安全默认）：类型注解为类型检查服务——缺省值 {} 与属性访问需要明确形状。 */
 /** @typedef {{ admit?: (frame: object) => { ok: boolean, reason?: string } | null | undefined, consume?: (frame: object) => unknown, deliverToSession?: (frame: object) => unknown }} InboundHooks */
@@ -31,7 +35,7 @@ export function createInbound({ dataDir, config, self, dispatch, hooks = {}, log
     consume: hooks.consume ?? noop,
     deliverToSession: hooks.deliverToSession ?? defaultDeliver,
     log,
-    boxes: new Map(),       // collabId → { path, seen: Set }（懒加载：首个消息到达时才建）
+    boxes: new Map(),       // collabId → { path, seen: Map, appendsSinceCompact }（懒加载：首个消息到达时才建）
     chains: new WeakMap(),  // connection → Promise（同连接串行）
     counters: emptyCounters(),
   };
@@ -57,6 +61,8 @@ function emptyCounters() {
     reportsIn: 0,
     persistFailures: 0,
     hookFailures: 0,
+    frameFailures: 0,
+    reportFailures: 0,
     rejected: { admission: 0 },
   };
 }
@@ -66,7 +72,16 @@ function start() {}
 function stop() {}
 
 function statsOf(state) {
-  return { ...state.counters, rejected: { ...state.counters.rejected }, collabs: state.boxes.size };
+  return { ...state.counters, rejected: { ...state.counters.rejected }, collabs: state.boxes.size, seen: seenTotal(state) };
+}
+
+/* 存活判重记录总数（跨协作求和）：窗口剪枝是否生效的直接观测量——不随进程运行时长增长即为有界。 */
+function seenTotal(state) {
+  let total = 0;
+  for (const box of state.boxes.values()) {
+    total += box.seen.size;
+  }
+  return total;
 }
 
 function onFrame(state, connection, frame) {
@@ -74,7 +89,15 @@ function onFrame(state, connection, frame) {
   const chained = (state.chains.get(connection) ?? Promise.resolve())
     .then(() => handleFrame(state, connection, frame))
     .catch((error) => {
-      state.log.error('入站帧处理异常（已隔离）', { type: frame.type, reason: error.message });
+      /* 这条链是模块唯一的异常隔离带，它自己必须抛不出去：一旦本回调抛出，
+       * 链条就以 rejected 落尾且无处理者，Node 按未处理的 rejection 终止进程——
+       * 「绝不因内部错误 / 日志异常退出进程」不能停在最后一步失效。 */
+      try {
+        state.counters.frameFailures++;
+        state.log.error('入站帧处理异常（已隔离）', { type: frame?.type, reason: error?.message });
+      } catch {
+        // 兜底现场已尽力：连计数与日志都失败时只剩静默——进程存活优先于留痕
+      }
     });
   state.chains.set(connection, chained);
 }
@@ -108,14 +131,20 @@ async function handleFrame(state, connection, frame) {
  * ack 是递归终端——不为回报再产生回报，也不落盘 inbox、不投会话。 */
 function applyReport(state, connection, frame) {
   state.counters.reportsIn++;
-  state.dispatch.onDeliveryReport(frame.payload);
+  try {
+    state.dispatch.onDeliveryReport(frame.payload);
+  } catch (error) {
+    // 应用异常不改变 ack 的发出：ack 漏发会让发送方该单元的队头滞留重试直至过期——隔离带在此处同样要兜住
+    state.counters.reportFailures++;
+    state.log.warn('投递回报应用异常（已隔离，照常确认）', { refMsgId: frame.payload?.refMsgId, reason: error?.message });
+  }
   // 回报一律回 ack——即使无法归属（refMsgId 未知，对端条目可能已过期）：不回会让发送方该单元队头滞留重试
   connection.send(ackFrame(state, frame.msgId));
   state.counters.acksSent++;
 }
 
 async function handleCollabMessage(state, connection, frame) {
-  const admitted = state.admit(frame);
+  const admitted = runAdmit(state, frame);
   if (admitted === null || admitted === undefined || admitted.ok !== true) {
     state.counters.rejected.admission++;
     state.log.warn('协作域消息未通过准入，拒绝（不确认）', {
@@ -126,23 +155,52 @@ async function handleCollabMessage(state, connection, frame) {
     return;
   }
   const box = boxFor(state, frame.collabId);
-  if (box.seen.has(frame.msgId)) {
+  if (isDuplicate(state, box, frame)) {
     state.counters.duplicates++;
     connection.send(ackFrame(state, frame.msgId));   // 重复 = 上次 ack 可能丢失：重确认、不重投
+    state.counters.acksSent++;
     return;
   }
-  if (!persistInbound(state, box, frame)) {
+  const stored = persistInbound(state, box, frame);
+  if (stored === null) {
     return;   // 未落盘不承诺：发送侧按重试 / 过期处理
   }
-  box.seen.add(frame.msgId);
+  box.seen.set(frame.msgId, { receivedAtMs: Date.now(), record: stored });
+  box.appendsSinceCompact++;
   state.counters.accepted++;
   connection.send(ackFrame(state, frame.msgId));
   state.counters.acksSent++;
+  compactIfDue(state, box);
   await runHook(state, state.consume, frame);
   if (await runDeliver(state, frame)) {
     state.counters.sessionDelivered++;
     sendDeliveryReport(state, frame, connection.remoteAddress);
   }
+}
+
+/* 准入钩子包装：钩子异常一律按「未通过准入」归类——拒绝方向不变（不落盘、不 ack），
+ * 但必须有准入拒绝计数与告警：真台账的缺陷会让消息全部丢弃，观测面不能同时失效。 */
+function runAdmit(state, frame) {
+  try {
+    return state.admit(frame);
+  } catch (error) {
+    return { ok: false, reason: `准入钩子异常：${error?.message ?? '未知原因'}` };
+  }
+}
+
+/* 判重检查（与载入路径同一窗口口径）：窗口内命中 = 重复；命中但已出窗 = 视为新消息。
+ * 出窗记录就地剪掉，seen 存活数因此约等于「窗口内收到的消息数」，不随运行时长增长。
+ * 检查与插入之间无 await（调用方在同一微任务内完成判重与落盘），并发判重不会交错。 */
+function isDuplicate(state, box, frame) {
+  const seen = box.seen.get(frame.msgId);
+  if (seen === undefined) {
+    return false;
+  }
+  if (Date.now() - seen.receivedAtMs < state.config.messageTtlMs) {
+    return true;
+  }
+  box.seen.delete(frame.msgId);
+  return false;
 }
 
 function ackFrame(state, ackFor) {
@@ -164,13 +222,14 @@ function sendDeliveryReport(state, frame, address) {
 }
 
 /* 幂等去重记录 = 收件流水按保留期窗口的投影（单一权威源，无需第二份文件）：
- * 窗口外（超保留期）的同 msgId 视为新消息——与设计「去重记录落盘、保留期同队列」等价。 */
+ * 窗口外（超保留期）的同 msgId 视为新消息——与设计「去重记录落盘、保留期同队列」等价。
+ * seen 的值就是落盘记录本身（原帧 + receivedAt）：运行期压实直接以它为重建来源，不再回读文件。 */
 function boxFor(state, collabId) {
   let box = state.boxes.get(collabId);
   if (box !== undefined) {
     return box;
   }
-  box = { path: collabFilePath(state.dataDir, collabId, INBOX_FILE_NAME), seen: new Set() };
+  box = { path: collabFilePath(state.dataDir, collabId, INBOX_FILE_NAME), seen: new Map(), appendsSinceCompact: 0 };
   try {
     ensureDir(collabDir(state.dataDir, collabId));
   } catch (error) {
@@ -182,7 +241,8 @@ function boxFor(state, collabId) {
 }
 
 /* 载入去重窗口：读取失败按「存储不可用」处理——计数 + 告警留痕后窗口置空继续，不把消息处理打成异常。
- * 窗口空窗期内重复消息可能重复投递会话（最坏影响），由会话侧的幂等消费兜底。 */
+ * 窗口空窗期内重复消息可能重复投递会话（最坏影响），由会话侧的幂等消费兜底。
+ * 载入行数多于存活记录数（存在出窗行或不可用记录）即压实一次：文件回到窗口投影，与内存口径一致。 */
 function loadSeenWindow(state, box, collabId) {
   /** @type {{ entries: unknown[], tailDropped: boolean, corruptLines: Array<{ lineNumber: number, text: string }> } | null} */
   let loaded = null;
@@ -200,15 +260,19 @@ function loadSeenWindow(state, box, collabId) {
   }
   const windowStart = Date.now() - state.config.messageTtlMs;
   for (const record of loaded.entries) {
-    const msgId = freshRecordId(record, windowStart);
-    if (msgId !== null) {
-      box.seen.add(msgId);
+    const fresh = freshEntryOf(record, windowStart);
+    if (fresh !== null) {
+      box.seen.set(fresh.msgId, { receivedAtMs: fresh.receivedAtMs, record });
     }
+  }
+  if (loaded.entries.length > box.seen.size) {
+    compactInbox(state, box);
   }
 }
 
-/* 去重窗口口径：保留期内收到的记录参与去重（窗口外的同 msgId 视为新消息）；返回可用的 msgId。 */
-function freshRecordId(record, windowStart) {
+/* 去重窗口口径：保留期内收到的记录参与去重（窗口外的同 msgId 视为新消息）；
+ * 返回可用的判重条目（msgId + 收到时刻），记录不可用或已出窗返回 null。 */
+function freshEntryOf(record, windowStart) {
   if (typeof record !== 'object' || record === null) {
     return null;
   }
@@ -216,17 +280,48 @@ function freshRecordId(record, windowStart) {
   if (typeof entry.msgId !== 'string' || typeof entry.receivedAt !== 'string') {
     return null;
   }
-  return Date.parse(entry.receivedAt) >= windowStart ? entry.msgId : null;
+  const receivedAtMs = Date.parse(entry.receivedAt);
+  return receivedAtMs >= windowStart ? { msgId: entry.msgId, receivedAtMs } : null;
 }
 
-function persistInbound(state, box, frame) {
+/* 运行期压实（对照发送队列的 prune / compact）：先按窗口剪掉过期判重记录，再按行数阈值决定是否重写文件。
+ * 每次受理顺带剪枝——不引入定时器（生命周期归后续里程碑），剪枝成本随窗口内消息数走，摊还极小。
+ * 未达阈值时出窗行留在文件里：整文件重写的代价只在超过阈值时付出。 */
+function compactIfDue(state, box) {
+  const windowStart = Date.now() - state.config.messageTtlMs;
+  for (const [msgId, seen] of box.seen) {
+    if (seen.receivedAtMs < windowStart) {
+      box.seen.delete(msgId);
+    }
+  }
+  if (box.appendsSinceCompact > box.seen.size * COMPACT_LINE_FACTOR) {
+    compactInbox(state, box);
+  }
+}
+
+/* 收件流水压实：把文件重写为「窗口内记录的投影」（存活判重记录即窗口投影，顺序 = 到达顺序）。
+ * 重写失败保留原文件，追加计数不归零——下一次受理再试。 */
+function compactInbox(state, box) {
+  const lines = [...box.seen.values()].map((seen) => JSON.stringify(seen.record) + '\n').join('');
   try {
-    appendLine(box.path, { ...frame, receivedAt: new Date().toISOString() });
-    return true;
+    replaceFile(box.path, lines);
+    box.appendsSinceCompact = 0;
+  } catch (error) {
+    state.counters.persistFailures++;
+    state.log.error('收件流水压缩失败（保留原文件）', { reason: error.message });
+  }
+}
+
+/* 落盘并返回写入的记录（判重窗口与压缩重写都以它为权威副本）；失败计数留痕并返回 null。 */
+function persistInbound(state, box, frame) {
+  const record = { ...frame, receivedAt: new Date().toISOString() };
+  try {
+    appendLine(box.path, record);
+    return record;
   } catch (error) {
     state.counters.persistFailures++;
     state.log.error('入站消息落盘失败（不确认，等待重投）', { msgId: frame.msgId, reason: error.message });
-    return false;
+    return null;
   }
 }
 

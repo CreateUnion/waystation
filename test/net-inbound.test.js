@@ -46,10 +46,10 @@ function createFakeConnection(remoteAddress = '127.0.0.2') {
   };
 }
 
-function makeInbound(t, { dataDir, hooks, dispatch, config } = {}) {
+function makeInbound(t, { dataDir, hooks, dispatch, config, log: logOverride } = {}) {
   const dir = dataDir ?? makeTempDir(t);
   const logs = [];
-  const log = {
+  const log = logOverride ?? {
     info: () => {},
     warn: (message, fields) => logs.push({ level: 'warn', message, fields }),
     error: (message, fields) => logs.push({ level: 'error', message, fields }),
@@ -135,6 +135,23 @@ test('delivery-status：应用回报（转交 onDeliveryReport）后回 ack，�
   assert.deepEqual(dispatch.calls.sends, [], '回报不投会话、不产生新发送');
 });
 
+test('delivery-status：应用回报抛错仍回 ack（隔离异常，不让对端队头滞留）', async (t) => {
+  const dispatch = createFakeDispatch();
+  dispatch.onDeliveryReport = () => {
+    throw new Error('回报应用故障');
+  };
+  const { inbound, logs } = makeInbound(t, { dispatch });
+  const connection = createFakeConnection();
+  inbound.onFrame(connection, {
+    v: 1, type: 'delivery-status', msgId: newMsgId(), from: PEER, collabId: 'collab-1',
+    ts: new Date().toISOString(), payload: { refMsgId: 'msg-99', tier: 'session' },
+  });
+  await waitFor(() => inbound.stats().reportFailures === 1);
+  assert.deepEqual(connection.sent.map((sent) => sent.type), ['ack'], 'ack 是递归终端：应用失败也不改变它的发出');
+  assert.equal(inbound.stats().reportsIn, 1);
+  assert.ok(logs.some((entry) => entry.message.includes('投递回报应用异常')), '隔离必须留痕');
+});
+
 test('协作消息：先落盘再 ack，钩子按 consume → deliver 顺序执行', async (t) => {
   const events = [];
   const { inbound, dir } = makeInbound(t, {
@@ -177,6 +194,23 @@ test('投递成功：回报 delivery-status（目标=来源地址、载荷=原 m
   });
 });
 
+test('投递成功但回报入队失败：维持第二档（告警、不计 reportsSent、消息留在流水）', async (t) => {
+  const dispatch = createFakeDispatch();
+  dispatch.send = () => ({ ok: false, reason: '该协作待投队列已满' });
+  const { inbound, dir, logs } = makeInbound(t, {
+    dispatch,
+    hooks: { admit: () => ({ ok: true }), deliverToSession: () => true },
+  });
+  const connection = createFakeConnection();
+  const frame = messageFrame();
+  inbound.onFrame(connection, frame);
+  await waitFor(() => logs.some((entry) => entry.message.includes('投递回报入队失败')));
+  assert.equal(inbound.stats().sessionDelivered, 1);
+  assert.equal(inbound.stats().reportsSent, 0, '未入队不算发出');
+  assert.deepEqual(connection.sent.map((sent) => sent.type), ['ack'], '回报失败不回退链路确认');
+  assert.deepEqual(readInbox(dir).map((entry) => entry.msgId), [frame.msgId], '消息留在收件流水（第二档）');
+});
+
 test('投递失败（返回 false / 抛错）：不发回报、仍 ack（维持第二档）', async (t) => {
   const { inbound, dispatch, logs } = makeInbound(t, {
     hooks: {
@@ -204,6 +238,26 @@ test('准入拒绝：不落盘、不 ack、计数与告警留痕', async (t) => 
   assert.ok(logs.some((entry) => entry.message.includes('未通过准入')));
 });
 
+test('准入钩子异常：归类为准入拒绝（计数 + 留痕、不落盘、不 ack）', async (t) => {
+  const { inbound, dir, logs } = makeInbound(t, {
+    hooks: {
+      admit: () => {
+        throw new Error('台账故障');
+      },
+    },
+  });
+  const connection = createFakeConnection();
+  inbound.onFrame(connection, messageFrame());
+  await waitFor(() => inbound.stats().rejected.admission === 1);
+  assert.deepEqual(connection.sent, [], '拒绝方向不变：不确认');
+  assert.throws(() => readInbox(dir));
+  assert.equal(inbound.stats().hookFailures, 0, '钩子异常在此按准入语义归类，不重复计入 hookFailures');
+  assert.ok(
+    logs.some((entry) => entry.message.includes('未通过准入') && entry.fields.reason.includes('台账故障')),
+    '异常原因必须进告警：台账故障时消息会全部丢弃，观测面不得同时失效'
+  );
+});
+
 test('钩子缺省（未注入）：协作消息按安全默认被拒，不产生副作用', async (t) => {
   const { inbound, dispatch } = makeInbound(t, { hooks: {} });
   const connection = createFakeConnection();
@@ -227,6 +281,7 @@ test('重复 msgId：重发 ack、不重复落盘、不重发回报', async (t) 
   assert.equal(connection.sent[1].ackFor, frame.msgId);
   assert.equal(readInbox(dir).length, 1);
   assert.equal(dispatch.calls.sends.length, 1, '重复投递不重发回报');
+  assert.equal(inbound.stats().acksSent, 2, '重复路径发出的 ack 与正常路径同口径计数');
 });
 
 test('去重窗口：保留期内的记录参与去重；超窗视为新消息', async (t) => {
@@ -245,7 +300,60 @@ test('去重窗口：保留期内的记录参与去重；超窗视为新消息',
   assert.equal(inbound.stats().accepted, 1, '超窗的同 msgId 视为新消息');
   inbound.onFrame(connection, freshFrame);
   await waitFor(() => inbound.stats().duplicates === 1);
-  assert.equal(readInbox(dir).length, 3);
+  // 载入即压实一次（出窗行被吸收）：3 = 载入后压实的 1 行（freshFrame）+ 新受理的 oldFrame
+  assert.equal(readInbox(dir).length, 2);
+});
+
+test('去重窗口运行期生效：超窗同 msgId 视为新消息（与载入路径同一口径）', async (t) => {
+  const { inbound, dir } = makeInbound(t, {
+    config: { messageTtlMs: 50 },
+    hooks: { admit: () => ({ ok: true }) },
+  });
+  const connection = createFakeConnection();
+  const frame = messageFrame();
+  inbound.onFrame(connection, frame);
+  await waitFor(() => inbound.stats().accepted === 1);
+  await new Promise((resolve) => setTimeout(resolve, 110));   // 等首条出窗（窗口 50ms）
+  inbound.onFrame(connection, frame);
+  await waitFor(() => inbound.stats().accepted === 2);
+  assert.equal(inbound.stats().duplicates, 0, '出窗后不再判重');
+  assert.equal(readInbox(dir).length, 2, '重投按新消息落盘');
+  assert.deepEqual(connection.sent.map((sent) => sent.type), ['ack', 'ack']);
+});
+
+test('去重窗口剪枝：seen 与收件流水不随历史总量增长（超窗记录被吸收）', async (t) => {
+  const { inbound, dir } = makeInbound(t, {
+    config: { messageTtlMs: 50 },
+    hooks: { admit: () => ({ ok: true }) },
+  });
+  const connection = createFakeConnection();
+  let accepted = 0;
+  for (let round = 0; round < 4; round++) {
+    for (let index = 0; index < 5; index++) {
+      accepted++;
+      inbound.onFrame(connection, messageFrame({ payload: { text: `第${round}轮-${index}` } }));
+    }
+    await waitFor(() => inbound.stats().accepted === accepted);   // 同连接串行：一批投完再等
+    await new Promise((resolve) => setTimeout(resolve, 110));     // 等本批全部出窗
+  }
+  inbound.onFrame(connection, messageFrame({ payload: { text: '收尾' } }));
+  await waitFor(() => inbound.stats().accepted === accepted + 1);
+  assert.equal(inbound.stats().seen, 1, '20 条历史记录的判重项全部剪掉，只剩窗口内的这一条');
+  const lines = readInbox(dir).length;
+  assert.ok(lines <= 2, `收件流水被重写为窗口投影（历史 20 条已吸收，实测 ${lines} 行）`);
+  assert.equal(inbound.stats().duplicates, 0);
+});
+
+test('去重窗口载入失败（存储不可用）：计数留痕后置空继续，不把处理打成异常', async (t) => {
+  const dir = makeTempDir(t);
+  mkdirSync(inboxPath(dir), { recursive: true });   // 以目录占据流水文件路径：读取失败（EISDIR，双平台一致）
+  const { inbound, logs } = makeInbound(t, { dataDir: dir });
+  const connection = createFakeConnection();
+  inbound.onFrame(connection, messageFrame());
+  await waitFor(() => logs.some((entry) => entry.message.includes('收件流水读取失败')));
+  assert.ok(inbound.stats().persistFailures >= 1);
+  await waitFor(() => logs.some((entry) => entry.message.includes('入站消息落盘失败')));
+  assert.deepEqual(connection.sent, [], '存储不可用即不承诺：不发 ack');
 });
 
 test('落盘失败（存储不可用）：不 ack、计数与留痕（两平台可达）', async (t) => {
@@ -289,6 +397,34 @@ test('同连接串行：慢钩子下第二帧等第一帧处理完（保序）',
   await waitFor(() => events.length === 2);
   assert.deepEqual(events, ['deliver:一', 'deliver:二']);
   assert.deepEqual(readInbox(dir).map((entry) => entry.payload.text), ['一', '二']);
+});
+
+test('链级兜底：处理器与日志双抛错都不逃逸（进程不退、计数、后续帧继续）', async (t) => {
+  // 日志可注入：生产 logger 全路径自吞异常，此处模拟「日志本身抛错」——隔离带自己的日志也在被兜底之列
+  const throwingLog = {
+    info: () => {},
+    warn: () => {},
+    error: () => {
+      throw new Error('日志盘故障');
+    },
+  };
+  const { inbound } = makeInbound(t, {
+    log: throwingLog,
+    hooks: {
+      admit: () => ({ ok: true }),
+      consume: () => {
+        throw new Error('钩子故障');
+      },
+    },
+  });
+  const connection = createFakeConnection();
+  inbound.onFrame(connection, messageFrame());
+  await waitFor(() => inbound.stats().frameFailures === 1);
+  assert.equal(inbound.stats().hookFailures, 1, '内层隔离先记钩子异常；随后日志异常升级到链级兜底');
+  assert.deepEqual(connection.sent.map((sent) => sent.type), ['ack'], 'ack 在钩子执行之前已发出');
+  inbound.onFrame(connection, { v: 1, type: 'ping', msgId: newMsgId(), from: PEER, ts: new Date().toISOString() });
+  await waitFor(() => connection.sent.length === 2);
+  assert.equal(connection.sent[1].type, 'pong', '链未进入 rejected 态：后续帧照常处理');
 });
 
 test('stats：计数齐备', async (t) => {
