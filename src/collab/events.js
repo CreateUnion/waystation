@@ -197,9 +197,14 @@ function applyInviteResponse(state, frame, wanted) {
     return;
   }
   const settledState = wanted === 'approved' && status === 'active' ? 'member' : wanted;
-  mutateLedger(state, local, () => {
+  const applied = mutateLedger(state, local, () => {
     member.state = settledState;
   });
+  if (applied === null) {
+    /* 挂起期写被拦（mutateLedger 已按 mutationSuspended 留痕）：本帧拒绝且不进入后续副作用——
+     * 不得虚增回应计数，也不得对未变更的名单发空名单通告。 */
+    return;
+  }
   countResponse(state, wanted);
   afterInviteResponse(state, local, status, settledState);
 }

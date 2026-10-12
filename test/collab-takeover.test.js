@@ -698,3 +698,52 @@ test('计数断言：无端点成员被治理广播跳过（rosterSkipped）；�
   assert.equal(resent[0].payload.baseVersion, 2);
   harness.service.close();
 });
+
+/* —— 成员侧陈旧驿丞主张守卫与治理面读数（期终审查裁定 I-1 / M-3）—— */
+
+test('握手陈旧主张：成员已收敛到新驿丞后，被替换驿丞的主张不回翻引用', async (t) => {
+  /* 判别性用例（期终审查行为探针实录）：被替换驿丞停机排队的握手帧 / 重启后的启动握手携带
+   * role=manager、takeover=null（其本地视角）——成员若采纳则引用回翻：出站静默改道旧驿丞、
+   * 快照被来源守卫拒收（视图冻结），且无自动纠正路径。 */
+  const harness = makeHarness(t);
+  const collabId = await memberActive(harness);
+  await receive(harness.service, collabFrame('takeover', collabId, peer('inst-b', '主机乙'), {
+    baseVersion: 2,
+    digest: ledgerDigest(ledgerStub(collabId, 2, { instanceId: 'inst-b', identityName: '主机乙' })),
+  }));
+  let member = JSON.parse(readFileSync(join(harness.dir, 'collabs', collabId, 'member.json'), 'utf8'));
+  assert.equal(member.manager.instanceId, 'inst-b', '先收敛到新驿丞');
+  await receive(harness.service, collabFrame('notice', collabId, peer('inst-a', '主机甲'), { event: 'handshake', role: 'manager', version: 2, takeover: null, reply: true }));
+  member = JSON.parse(readFileSync(join(harness.dir, 'collabs', collabId, 'member.json'), 'utf8'));
+  assert.equal(member.manager.instanceId, 'inst-b', '陈旧驿丞主张不得回翻已收敛引用');
+});
+
+test('握手陈旧主张：回升帧把本机生效记录带给旧驿丞（对称收敛面）', async (t) => {
+  /* 启动握手（reply=false 的发起帧）必回一帧：回帧携带本机生效抢接视图——旧驿丞据此收敛
+   * 降级（握手对表的对称面）；本机同时不采纳其 manager 主张。 */
+  const harness = makeHarness(t);
+  const collabId = await memberActive(harness);
+  await receive(harness.service, collabFrame('takeover', collabId, peer('inst-b', '主机乙'), {
+    baseVersion: 2,
+    digest: ledgerDigest(ledgerStub(collabId, 2, { instanceId: 'inst-b', identityName: '主机乙' })),
+  }));
+  harness.sent.length = 0;
+  await receive(harness.service, collabFrame('notice', collabId, peer('inst-a', '主机甲'), { event: 'handshake', role: 'manager', version: 2, takeover: null, reply: false }));
+  const member = JSON.parse(readFileSync(join(harness.dir, 'collabs', collabId, 'member.json'), 'utf8'));
+  assert.equal(member.manager.instanceId, 'inst-b', '启动握手主张不采纳');
+  const replies = harness.sent.filter((frame) => frame.type === 'notice' && frame.payload.event === 'handshake' && frame.to.instanceId === 'inst-a');
+  assert.equal(replies.length, 1, '发起帧必回一帧');
+  assert.equal(replies[0].payload.reply, true);
+  assert.equal(replies[0].payload.takeover.candidate.instanceId, 'inst-b', '回帧携带本机生效记录（对方据此收敛）');
+});
+
+test('治理面读数：成员握手无果在清单可见（handshakeUnresolved），任一已受理帧接触后清除', async (t) => {
+  const harness = makeHarness(t);
+  const collabId = await memberActive(harness);
+  harness.service.start();
+  await waitFor(() => (harness.service.list().collabs[0].handshakeUnresolved === true ? true : null), { timeoutMs: 3000 });
+  assert.equal(harness.service.stats().handshakeUnresolved >= 1, true);
+  await receive(harness.service, collabFrame('reply', collabId, peer('inst-a', '主机甲'), { text: '在册联系' }));
+  assert.equal(harness.service.list().collabs[0].handshakeUnresolved, false, '接触即清除（读数与恢复面同步）');
+  harness.service.close();
+});

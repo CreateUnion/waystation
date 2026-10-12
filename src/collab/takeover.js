@@ -308,6 +308,15 @@ function evaluateRemoteAsMember(state, local, frame, remote, takeover) {
     return;
   }
   if (remote.role === 'manager') {
+    /* 陈旧主张守卫：本机持有指向他方的生效抢接记录时，不采纳「自认驿丞」的 manager 主张——
+     * 被替换驿丞重启 / 其排队帧续投时携带的恰恰是 role=manager、takeover=null（其本地视角），
+     * 采纳会让本机引用回翻（出站改道、视图被快照来源守卫冻结、无自动纠正路径）。本机照常回帧
+     * 把生效记录带给对方，由对方收敛——握手对表的对称面。 */
+    const effective = state.effectiveTakeovers.get(local.collabId);
+    if (effective !== undefined && effective.candidate.instanceId !== frame.from.instanceId) {
+      state.log.warn('收到陈旧驿丞主张（本机已收敛到他方生效抢接）——不采纳', { collabId: local.collabId, claimed: frame.from.instanceId });
+      return;
+    }
     adoptNewManager(state, local, { instanceId: frame.from.instanceId, identityName: frame.from.identityName }, remote.version);
     const mine = localVersionOf(local);
     if (remote.version !== null && (mine === null || remote.version > mine)) {

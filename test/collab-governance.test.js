@@ -637,3 +637,34 @@ test('挂起期明确拒绝：end / withdraw 不半执行（台账与记录均�
   const stillProposed = (await proposed.service.view({ collabId: created.collabId })).ledger;
   assert.equal(stillProposed.status, 'proposed');
 });
+
+test('挂起期入站回应：拒绝且不虚增计数、不发名单通告（台账不动）', async (t) => {
+  /* 判别性用例（期终审查 Minor-4）：挂起期 approve 的台账写被写闸拦下——回应计数与名单通告
+   * 不得照常推进（否则计数虚增 + 对未变更名单发空通告）。 */
+  const harness = makeHarness(t);
+  const collabId = await managerActive(harness);
+  await freezeViaBroadcast(harness, collabId, {
+    extra: {
+      createdAt: new Date(Date.now() + 3600000).toISOString(),
+      manager: { instanceId: 'inst-c', identityName: '主机丙' },
+      members: [
+        { instanceId: 'inst-c', identityName: '主机丙' },
+        { instanceId: 'inst-b', identityName: '主机乙' },
+        { instanceId: 'inst-d', identityName: '主机丁' },
+      ],
+    },
+  });
+  harness.service.decide({ collabId, choice: 'merge' });
+  await receive(harness.service, collabFrame('takeover-init', collabId, peer('inst-b', '主机乙'), {
+    kind: 'announce', manager: { instanceId: 'inst-self', identityName: '本机' }, baseVersion: 4, windowEndsAt: new Date(Date.now() + 60000).toISOString(),
+  }));
+  assert.equal(harness.service.list().collabs[0].suspended, true);
+  const approvalsBefore = harness.service.stats().approvalsIn;
+  harness.sent.length = 0;
+  await receive(harness.service, collabFrame('approve', collabId, peer('inst-c', '主机丙'), {}));
+  assert.equal(harness.service.stats().approvalsIn, approvalsBefore, '挂起期回应不虚增计数');
+  assert.equal(harness.service.stats().mutationSuspended >= 1, true, '写闸拦截有留痕（mutationSuspended）');
+  assert.equal(sentOf(harness.sent, 'notice', collabId).some((frame) => frame.payload.event === 'roster'), false, '不发名单通告（名单未变更）');
+  const ledger = (await harness.service.view({ collabId })).ledger;
+  assert.equal(ledger.members.find((member) => member.instanceId === 'inst-c').state, 'invited', '成员状态未被写入');
+});

@@ -216,11 +216,14 @@ function ackFrame(state, ackFor) {
 
 /* 投递回报的寻址（设计 §5/§10）：回拨目标 = 原文发送方 from 的实例标识 + 端口，
  * 地址取对方拨入连接的来源地址（连接来源端口是临时端口，不可作回拨目标）。
- * from.port 缺失（旧版本发送方发来的帧）：不猜端口、不发起新拨号——尽力沿原 TCP 连接原路回执；
- * 写失败或连接已断只告警计数（维持第二档；链接确认已在先，不受影响）。 */
+ * from.port 缺失（旧版本发送方发来的帧）：不猜端口、不发起新拨号——尽力沿原 TCP 连接原路回执。
+ * 转达副本（载荷带 originMsgId）例外：其 from 是原发者、连接来源是转达者——按 from.port 回拨
+ * 必然错位（目标 = 转达者地址 × 原发者端口），错位条目还会随队列重试至 TTL；回报仅沿原连接
+ * 原路（归属键 = 本跳 msgId，连接对端即本跳接收者）。写失败或连接已断只告警计数
+ * （维持第二档；链接确认已在先，不受影响）。 */
 function sendDeliveryReport(state, frame, connection) {
   const port = frame.from.port;
-  if (isPort(port)) {
+  if (isPort(port) && !isRelayedCopy(frame)) {
     const result = state.dispatch.send({
       collabId: frame.collabId,
       to: { instanceId: frame.from.instanceId, address: connection.remoteAddress, port },
@@ -249,6 +252,12 @@ function sendDeliveryReport(state, frame, connection) {
     state.counters.reportFailures++;
     state.log.warn('投递回报原路回执失败（维持第二档）', { refMsgId: frame.msgId, reason: error.message });
   }
+}
+
+/* 转达副本判别：转达出口在载荷里带 originMsgId（原生帧没有）——回报寻址据此区分
+ * 「直接接触」与「经第三方转达」。 */
+function isRelayedCopy(frame) {
+  return typeof frame.payload?.originMsgId === 'string' && frame.payload.originMsgId !== '';
 }
 
 /* 幂等去重记录 = 收件流水按保留期窗口的投影（单一权威源，无需第二份文件）：

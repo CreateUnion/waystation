@@ -66,7 +66,8 @@ function makeInbound(t, { dataDir, hooks, dispatch, config, log: logOverride } =
   return { inbound, dir, logs, dispatch: fakeDispatch };
 }
 
-/* 协作域帧的 from 携带端口（构造侧必填）：投递回报按 from.port 回拨。
+/* 协作域帧的 from 携带端口（构造侧必填）：投递回报按 from.port 回拨（转达副本例外：仅沿
+ * 原连接原路——见转达帧回执用例）。
  * PEER 本体保持无端口——ping/pong/ack 等传输类帧不涉回报寻址。 */
 function messageFrame(overrides = {}) {
   return {
@@ -471,6 +472,21 @@ test('from.port 缺失且原路回执写失败：告警计数、不抛出（维�
   await waitFor(() => inbound.stats().reportFailures === 1);
   assert.ok(logs.some((entry) => entry.message.includes('原路回执失败')));
   assert.equal(inbound.stats().reportsSent, 0);
+});
+
+test('转达帧回执：回报仅沿原连接原路——不按原发者 from.port 新拨号（错位寻址 / 杂散重试条目的来源）', { timeout: 15000 }, async (t) => {
+  const { inbound, dispatch } = makeInbound(t, {
+    hooks: { admit: () => ({ ok: true }), deliverToSession: () => true },
+  });
+  const connection = createFakeConnection('127.0.0.7');   // 转达者的来源地址：与原发者地址无关
+  const origin = { instanceId: 'inst-origin', identityName: '主机丙', port: 7321 };
+  const frame = messageFrame({ from: origin, payload: { text: '转达副本', originMsgId: 'msg-origin-1' } });
+  inbound.onFrame(connection, frame);
+  await waitFor(() => connection.sent.some((sent) => sent.type === 'delivery-status'));
+  assert.deepEqual(dispatch.calls.sends, [], '转达副本不得按 from.port 向原发者新拨号（错位寻址与错位队列条目的来源）');
+  const report = connection.sent.find((sent) => sent.type === 'delivery-status');
+  assert.deepEqual(report.payload, { refMsgId: frame.msgId, tier: 'session' });
+  assert.equal(inbound.stats().reportsSent, 1);
 });
 
 test('admit 异步钩子：async 实现正常通过（契约硬化——不再被误判为全量拒绝）', { timeout: 15000 }, async (t) => {

@@ -216,8 +216,8 @@ function ledgerFromSource(local, collabId) {
 
 /* 本机参与清单（ws_list_collabs 的数据面）：状态取本地权威；expired = 提议中且未回应且已过
  * 有效期（仅标注，不改状态——设计 §6 的「过期不算拒绝」）。
- * 治理面（成员侧）：managerOffline（失联判定）、frozenAt / frozenUnresolved（冻结时限）、
- * suspended / handshakeUnresolved（收敛等待与未能对表）。 */
+ * 治理面读数：managerOffline（成员侧失联判定）、frozenUnresolved（冻结超时已提示一次）、
+ * suspended（收敛等待中的写暂停）、handshakeUnresolved（成员侧握手未能对表——只读保守运行）。 */
 function listCollabs(state) {
   const now = Date.now();
   const collabs = [];
@@ -241,6 +241,7 @@ function listEntryOf(state, local, now) {
     managerOffline: local.role === 'manager' ? false : (probeState?.offline === true),
     frozenUnresolved: local.freezeDeadlineNotified === true,
     suspended: local.suspended !== null,
+    handshakeUnresolved: local.handshakeUnresolved === true,
     ...inviteViewOf(local, now),
   };
 }
