@@ -33,12 +33,31 @@ export async function waitFor(check, { timeoutMs = 5000, intervalMs = 25 } = {})
   }
 }
 
-/** 取一个此刻空闲的高位端口：需要真实监听的测试用（避开默认端口 7321 与系统保留段）。
- * 注意（Windows 实测）：不是「随机取一个」——临时端口分配是**机器级顺序游标**，本函数取走游标位 X 后，
- * X+1、X+2… 就是接下来会发给任何进程的端口（出站连接、外部设备的长连接都可能落进 X 的邻位）。
- * 故「取到 X = X 此刻空闲」只对 X 本身成立，不蕴含 X 的邻居在用例窗口内保持空闲——
- * 依赖邻位空闲的断言须按容差口径写或做守卫式重试（详见 test/site.test.js 头注）。 */
+/* 端口探测候选段与尝试上限（模块私有）：[10000, 20000) 在系统临时端口区（Windows 实测 49152–65535；
+ * Linux 默认 32768–60999）之外，且避开 1–1023 保留段与站点槽位段 7321–7328。 */
+const PORT_PROBE_MIN = 10000;
+const PORT_PROBE_MAX = 20000;
+const PORT_PROBE_ATTEMPTS = 30;
+
+/** 取一个此刻空闲的端口：需要真实监听的测试用（避开默认端口 7321、站点槽位段与系统临时端口区）。
+ * 为什么不用「绑 0 端口拿系统临时端口」：临时端口分配是机器级顺序游标，并行全量测试下其它进程的
+ * 外向连接可在「探测释放 → 用例实际绑定」的窗口内取走该端口——按设计降级（端口被占 → 局域网
+ * 不可用）会被误判成用例红。候选段内随机试绑（UDP+TCP 同号，与站点实际占用面一致）；连续失败
+ * （候选段被本机服务大面积长占）回退临时端口法兜底。注意「取到即空闲」只对端口本身成立，不蕴含
+ * 其邻位保持空闲——依赖邻位空闲的断言须按容差口径写或做守卫式重试（详见 test/site.test.js 头注）。 */
 export async function pickFreePort() {
+  for (let attempt = 0; attempt < PORT_PROBE_ATTEMPTS; attempt++) {
+    const port = PORT_PROBE_MIN + Math.floor(Math.random() * (PORT_PROBE_MAX - PORT_PROBE_MIN));
+    if (await canBindPort(port)) {
+      return port;
+    }
+  }
+  return pickEphemeralPort();
+}
+
+/* 回退路径：绑 0 端口取系统临时端口（旧法）。候选段整体不可用时沿用——探测窗口竞态可能重现，
+ * 只作可用性兜底；用例侧的守卫式重试（site.test.js）覆盖此残余。 */
+async function pickEphemeralPort() {
   const probe = createServer();
   await new Promise((resolve, reject) => {
     probe.once('error', reject);
