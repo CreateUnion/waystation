@@ -86,6 +86,51 @@ async function assertPortRebindable(port) {
   await new Promise((resolve) => udp.close(resolve));
 }
 
+/* 探测取端口与实际绑定之间存在窗口（探测后即刻释放，环境流量可在此期间抢走该端口）：
+ * 占用类用例的 setup 实行守卫式重试——起步即被环境抢占（站点降级 / 占位监听报错）时换端口重取；
+ * 重试耗尽即判红（确定性缺陷照常暴露，守卫只吸收环境碰撞）。 */
+const PORT_SETUP_ATTEMPTS = 3;
+
+/* 端口占用一的前半段：起一个在显式端口上成功监听的站点（unavailable = 被环境抢占，换端口重试）。 */
+async function startExplicitPortStation(t) {
+  for (let attempt = 0; attempt < PORT_SETUP_ATTEMPTS; attempt++) {
+    const port = await pickFreePort();
+    const clientA = await connectClient(t, INDEX_ENTRY, makeTempDir(t), { port });
+    if ((await fetchStatus(clientA)).net.available) {
+      return { port, clientA };
+    }
+    await clientA.close();
+  }
+  throw new Error(`站点连续 ${PORT_SETUP_ATTEMPTS} 次未能监听选中端口（疑似确定性缺陷）`);
+}
+
+/* 端口占用二的前半段：占位 server 先手监听显式端口（listen 撞 EADDRINUSE = 被环境抢先，换端口重试）。 */
+async function startPortOccupier(t) {
+  for (let attempt = 0; attempt < PORT_SETUP_ATTEMPTS; attempt++) {
+    const port = await pickFreePort();
+    const held = new Set();
+    const occupier = createServer((socket) => {
+      held.add(socket);
+      socket.on('close', () => held.delete(socket));
+    });
+    const bound = await new Promise((resolve) => {
+      occupier.once('error', () => resolve(false));
+      occupier.listen({ port, host: '0.0.0.0' }, () => resolve(true));
+    });
+    if (!bound) {
+      continue;
+    }
+    t.after(async () => {
+      for (const socket of held) {
+        socket.destroy();
+      }
+      await new Promise((resolve) => occupier.close(resolve));
+    });
+    return port;
+  }
+  throw new Error(`占位 server 连续 ${PORT_SETUP_ATTEMPTS} 次未能监听选中端口（疑似确定性缺陷）`);
+}
+
 test('stdio 骨架：进程可起、ws_status 可调、网络层就绪、数据目录初始化（instance-id/logs/collabs）+ 预写配置读取生效', { timeout: 30000 }, async (t) => {
   const home = makeTempDir(t);
   const port = await pickFreePort();
@@ -185,8 +230,7 @@ test('ws_delivery_status：无已发消息返回空数组', { timeout: 30000 }, 
 });
 
 test('端口占用一：显式端口被另一驿站站点占 → 降级、takeover-taken 文案、LAN 工具明确报错', { timeout: 40000 }, async (t) => {
-  const port = await pickFreePort();
-  const clientA = await connectClient(t, INDEX_ENTRY, makeTempDir(t), { port });
+  const { port, clientA } = await startExplicitPortStation(t);
   assert.equal((await fetchStatus(clientA)).net.available, true);
   const clientB = await connectClient(t, INDEX_ENTRY, makeTempDir(t), { port });
   const statusB = await fetchStatus(clientB);
@@ -201,19 +245,7 @@ test('端口占用一：显式端口被另一驿站站点占 → 降级、takeov
 });
 
 test('端口占用二：显式端口被无关程序占 → 同一降级结论（不区分占用者）', { timeout: 40000 }, async (t) => {
-  const port = await pickFreePort();
-  const held = new Set();
-  const occupier = createServer((socket) => {
-    held.add(socket);
-    socket.on('close', () => held.delete(socket));
-  });
-  await new Promise((resolve) => occupier.listen({ port, host: '0.0.0.0' }, resolve));
-  t.after(async () => {
-    for (const socket of held) {
-      socket.destroy();
-    }
-    await new Promise((resolve) => occupier.close(resolve));
-  });
+  const port = await startPortOccupier(t);
   const client = await connectClient(t, INDEX_ENTRY, makeTempDir(t), { port });
   const status = await fetchStatus(client);
   assert.equal(status.net.available, false);

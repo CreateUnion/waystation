@@ -7,7 +7,7 @@ import net from 'node:net';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { DISCOVERY_REPLY_MIN_INTERVAL_MS } from '../src/net/discovery.js';
-import { makeTempDir, pickFreePort, repoRoot, waitFor } from './helpers.js';
+import { makeTempDir, pickFreePort, pickFreeSegment, repoRoot, waitFor } from './helpers.js';
 
 const FIXTURE = join(repoRoot, 'test', 'fixtures', 'net-node.mjs');
 
@@ -285,7 +285,7 @@ test('exit 干净退出（真实进程生命周期收尾）', { timeout: 40000 }
 });
 
 test('多站点同机预演：同地址两节点（端口 P 与 P+1）按站点端口独立投递', { timeout: 40000 }, async (t) => {
-  const port = await pickFreePort();
+  const port = await pickFreeSegment(2);   // 两站点占相邻端口：整段取（pickFreePort 只保证单端口空闲，邻位不保证）
   const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port });
   const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }] });
   const sent = await a.command({
