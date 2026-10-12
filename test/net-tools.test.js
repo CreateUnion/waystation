@@ -6,6 +6,7 @@ import { deliveryStatusTool } from '../src/tools/delivery-status.js';
 import { statusTool } from '../src/tools/status.js';
 import { checkInboxTool } from '../src/tools/check-inbox.js';
 import { listCollabsTool, createCollabTool, approveInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, leaveCollabTool, endCollabTool, SEND_MESSAGE_TYPES } from '../src/tools/collab.js';
+import { decideTool, handoverTool, takeOverTool } from '../src/tools/governance.js';
 
 function contextWith(net) {
   return { version: '0.1.0', instanceId: 'inst-self', dataDir: '/data', logDir: '/data/logs', config: { identityName: '本机', port: 17321 }, net, collab: { stats: () => ({ collabs: 0, byState: {} }) }, startedAt: '2026-10-12T00:00:00.000Z' };
@@ -400,4 +401,100 @@ test('ws_end_collab / ws_leave_collab：合法透传、拒绝路径 isError、�
   const denied = fakeService({ leave: { ok: false, message: '管理席位不可退出——请先结束协作或显式交接' } });
   assert.equal((await callCollabTool(leaveCollabTool(), { collabId: 'collab-1' }, denied)).isError, true);
   assert.equal(collab.calls.end.length, 1);
+});
+
+/* —— 治理工具集（ws_decide / ws_handover / ws_take_over） —— */
+
+/* 假治理服务：记录调用、按用例注入响应（参数形态与输出口径归本文件；业务判定归协作服务）。 */
+function fakeGovernanceService(responses = {}) {
+  const calls = { decide: [], decideMerge: [], handover: [], takeOver: [] };
+  return {
+    calls,
+    decide(input) {
+      calls.decide.push(input);
+      return responses.decide ?? { ok: true, choice: 'keep', message: '已解除冻结并广播' };
+    },
+    decideMerge(input) {
+      calls.decideMerge.push(input);
+      return responses.decideMerge ?? { ok: true, choice: 'accept', adopted: 2 };
+    },
+    async handover(input) {
+      calls.handover.push(input);
+      return responses.handover ?? { ok: true, message: '移交完成' };
+    },
+    async takeOver(input) {
+      calls.takeOver.push(input);
+      return responses.takeOver ?? { ok: true, phase: 'awaiting-confirm', message: '待确认' };
+    },
+  };
+}
+
+test('ws_decide：恰提供一种形态（choice / mergeOffer 二者必居其一）', async () => {
+  const collab = fakeGovernanceService();
+  const withoutForms = await callCollabTool(decideTool(), { collabId: 'collab-1' }, collab);
+  assert.equal(withoutForms.isError, true);
+  assert.ok(withoutForms.content[0].text.includes('一种形态'));
+  const bothForms = await callCollabTool(decideTool(), { collabId: 'collab-1', choice: 'keep', mergeOffer: 'accept' }, collab);
+  assert.equal(bothForms.isError, true);
+  const badCollab = await callCollabTool(decideTool(), { collabId: '  ' }, collab);
+  assert.equal(badCollab.isError, true);
+  assert.equal(collab.calls.decide.length, 0);
+  assert.equal(collab.calls.decideMerge.length, 0);
+});
+
+test('ws_decide：choice 合法透传、枚举外拒绝、服务拒绝 isError', async () => {
+  const collab = fakeGovernanceService();
+  const kept = await callCollabTool(decideTool(), { collabId: ' collab-1 ', choice: 'keep' }, collab);
+  assert.equal(kept.isError, undefined);
+  assert.deepEqual(collab.calls.decide, [{ collabId: 'collab-1', choice: 'keep' }]);
+  const bad = await callCollabTool(decideTool(), { collabId: 'collab-1', choice: 'maybe' }, collab);
+  assert.equal(bad.isError, true);
+  const denied = fakeGovernanceService({ decide: { ok: false, message: '只有冻结中的协作需要裁定（当前未冻结）' } });
+  assert.equal((await callCollabTool(decideTool(), { collabId: 'collab-1', choice: 'terminate' }, denied)).isError, true);
+  assert.equal(collab.calls.decide.length, 1);
+});
+
+test('ws_decide：mergeOffer 合法透传、枚举外拒绝', async () => {
+  const collab = fakeGovernanceService();
+  const accepted = await callCollabTool(decideTool(), { collabId: 'collab-1', mergeOffer: 'accept' }, collab);
+  assert.equal(accepted.isError, undefined);
+  assert.deepEqual(collab.calls.decideMerge, [{ collabId: 'collab-1', mergeOffer: 'accept' }]);
+  const bad = await callCollabTool(decideTool(), { collabId: 'collab-1', mergeOffer: 'later' }, collab);
+  assert.equal(bad.isError, true);
+  assert.equal(collab.calls.decideMerge.length, 1);
+});
+
+test('ws_handover：target 形态逐拒（缺 / 空 / 非法字符）、合法透传 trim 值', async () => {
+  const collab = fakeGovernanceService();
+  assert.equal((await callCollabTool(handoverTool(), { collabId: 'collab-1' }, collab)).isError, true);
+  assert.equal((await callCollabTool(handoverTool(), { collabId: 'collab-1', target: '  ' }, collab)).isError, true);
+  assert.equal((await callCollabTool(handoverTool(), { collabId: 'collab-1', target: 'bad id!' }, collab)).isError, true);
+  assert.equal(collab.calls.handover.length, 0);
+  const ok = await callCollabTool(handoverTool(), { collabId: ' collab-1 ', target: ' inst-b ' }, collab);
+  assert.equal(ok.isError, undefined);
+  assert.deepEqual(collab.calls.handover, [{ collabId: 'collab-1', target: 'inst-b' }]);
+});
+
+test('ws_take_over：confirm 非布尔拒；缺省发起 / true / false 三态透传', async () => {
+  const collab = fakeGovernanceService();
+  assert.equal((await callCollabTool(takeOverTool(), { collabId: 'collab-1', confirm: 'yes' }, collab)).isError, true);
+  assert.equal(collab.calls.takeOver.length, 0);
+  const begun = await callCollabTool(takeOverTool(), { collabId: 'collab-1' }, collab);
+  assert.equal(begun.isError, undefined);
+  assert.deepEqual(collab.calls.takeOver, [{ collabId: 'collab-1', confirm: undefined }]);
+  await callCollabTool(takeOverTool(), { collabId: 'collab-1', confirm: true }, collab);
+  await callCollabTool(takeOverTool(), { collabId: 'collab-1', confirm: false }, collab);
+  assert.deepEqual(collab.calls.takeOver.slice(1), [{ collabId: 'collab-1', confirm: true }, { collabId: 'collab-1', confirm: false }]);
+  const denied = fakeGovernanceService({ takeOver: { ok: false, message: '现任驿丞未被判定失联' } });
+  const refused = await callCollabTool(takeOverTool(), { collabId: 'collab-1' }, denied);
+  assert.equal(refused.isError, true);
+  assert.ok(refused.content[0].text.includes('失联'));
+});
+
+test('治理工具输出封装：ok 载荷 JSON 化输出（含仅 ok 的内建字段）', async () => {
+  const collab = fakeGovernanceService();
+  const decided = await callCollabTool(decideTool(), { collabId: 'collab-1', choice: 'keep' }, collab);
+  const payload = JSON.parse(decided.content[0].text);
+  assert.equal(payload.choice, 'keep');
+  assert.equal(payload.message, '已解除冻结并广播');
 });

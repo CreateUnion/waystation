@@ -211,23 +211,24 @@ export function endCollabTool() {
   };
 }
 
-function okResult(payload) {
+export function okResult(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
 }
 
-function errorResult(message) {
+export function errorResult(message) {
   return { content: [{ type: 'text', text: message }], isError: true };
 }
 
-/* 业务结果封装：{ ok: true, … } → 正常输出；{ ok: false, message } → isError 原文案。 */
-function resultOf(result) {
+/* 业务结果封装：{ ok: true, … } → 正常输出；{ ok: false, message } → isError 原文案。
+ * 导出供治理工具集复用——工具层的输出契约单一权威。 */
+export function resultOf(result) {
   if (result.ok === true) {
     return okResult(result);
   }
   return errorResult(result.message);
 }
 
-function trimmedString(args, name) {
+export function trimmedString(args, name) {
   const value = args[name];
   return typeof value === 'string' ? value.trim() : '';
 }
@@ -239,7 +240,7 @@ function optionalTextArg(args, name) {
   return trimmedString(args, name);
 }
 
-function collabIdArg(args) {
+export function collabIdArg(args) {
   const collabId = trimmedString(args, 'collabId');
   return collabId === '' ? null : collabId;
 }
