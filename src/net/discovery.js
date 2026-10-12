@@ -132,7 +132,7 @@ function probeDatagram(state) {
   return Buffer.from(JSON.stringify({ v: PROTOCOL_VERSION, type: 'probe', instanceId: state.instanceId, identityName: state.identityName }));
 }
 
-/* 启动自介（设计 §5，M10 契约）：UDP 监听就绪即发（不等 TCP）、与扫描同目标集、不收集应答、
+/* 启动自介（设计 §5）：UDP 监听就绪即发（不等 TCP）、与扫描同目标集、不收集应答、
  * 发送失败只告警不重试、每次进程启动各发一次（含崩溃自愈重启）。
  * 作用：段内监听者即时把本站点（地址:端口）记入清单——先启动方零动作即掌握后启动者。 */
 function announce(state) {

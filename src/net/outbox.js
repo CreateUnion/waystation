@@ -17,7 +17,7 @@ const COMPACT_LINE_FACTOR = 2;
  * 状态机：queued（未确认）→ acked（对方驿站已确认）→ session（已投进对方会话，终态）；
  * queued/acked 超保留期 → expired（终态，提示发送方）；治理类在未终态前豁免容量与过期（设计 §9/§10）。 */
 /* 记录 to 含「地址:端口」——多站点下拨号目标必须写全；旧记录无 port 字段按锚点端口解释：
- * 本文件没有版本字段、历史上只可能来自单站点时代（那时站点都取默认端口），故按默认端口兜底而不做文件级迁移。 */
+ * 本文件没有版本字段，旧记录来自单站点时代：默认配置下语义等价，故按默认端口兜底而不做文件级迁移。 */
 export function createOutbox({ dataDir, collabId, config, log }) {
   const state = {
     collabId,

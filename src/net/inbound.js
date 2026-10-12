@@ -1,6 +1,6 @@
 import { collabDir, collabFilePath, ensureDir } from '../paths.js';
 import { appendLine, loadLines, replaceFile } from '../storage.js';
-import { ID_PATTERN, PROTOCOL_VERSION, newMsgId } from './protocol.js';
+import { ID_PATTERN, PROTOCOL_VERSION, isPort, newMsgId } from './protocol.js';
 
 export const INBOX_FILE_NAME = 'inbox.jsonl';
 
@@ -212,13 +212,13 @@ function ackFrame(state, ackFor) {
   return { v: PROTOCOL_VERSION, type: 'ack', msgId: newMsgId(), ackFor, from: state.self, ts: new Date().toISOString() };
 }
 
-/* 投递回报的寻址（设计 §5/§10，I2）：回拨目标 = 原文发送方 from 的实例标识 + 端口，
+/* 投递回报的寻址（设计 §5/§10）：回拨目标 = 原文发送方 from 的实例标识 + 端口，
  * 地址取对方拨入连接的来源地址（连接来源端口是临时端口，不可作回拨目标）。
  * from.port 缺失（旧版本发送方发来的帧）：不猜端口、不发起新拨号——尽力沿原 TCP 连接原路回执；
  * 写失败或连接已断只告警计数（维持第二档；链接确认已在先，不受影响）。 */
 function sendDeliveryReport(state, frame, connection) {
   const port = frame.from.port;
-  if (Number.isInteger(port) && port >= 1 && port <= 65535) {
+  if (isPort(port)) {
     const result = state.dispatch.send({
       collabId: frame.collabId,
       to: { instanceId: frame.from.instanceId, address: connection.remoteAddress, port },
@@ -404,13 +404,18 @@ function checkInbox(state, query = {}) {
   return { collabId, total: records.length, returned: messages.length, messages };
 }
 
-/* 窗口投影来源：已懒载入的 box 直接用内存态（与判重同一副本）；未载入的只读载入——不建目录、不建 box，
- * 读路径不给任意合法 collabId 造副作用。读失败（EISDIR 等）计数留痕后向上抛：工具面归类为明确错误，
+/* 窗口投影来源：已懒载入的 box 用内存态并按同一窗口过滤（box.seen 只在受理与载入时剪枝，
+ * 空闲出窗的记录仍留在内存态——两条路径必须同口径，否则同一查询在进程内与重启后结果不同）；
+ * 未载入的只读载入——不建目录、不建 box，读路径不给任意合法 collabId 造副作用。
+ * 读失败（EISDIR 等）计数留痕后向上抛：工具面归类为明确错误，
  * 不得静默返回空列表（「没有消息」与「读不到」必须可区分）。 */
 function inboxRecordsOf(state, collabId) {
   const box = state.boxes.get(collabId);
   if (box !== undefined) {
-    return [...box.seen.values()].map((seen) => seen.record);
+    const windowStart = Date.now() - state.config.messageTtlMs;
+    return [...box.seen.values()]
+      .filter((seen) => seen.receivedAtMs >= windowStart)
+      .map((seen) => seen.record);
   }
   try {
     const loaded = loadLines(collabFilePath(state.dataDir, collabId, INBOX_FILE_NAME));

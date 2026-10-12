@@ -189,7 +189,10 @@ function isId(value) {
   return typeof value === 'string' && ID_PATTERN.test(value);
 }
 
-function isPort(value) {
+/** 端口范围判定（1–65535 整数）：协议入站校验与本地文件读取共用同一判据。
+ * @param {*} value
+ * @returns {value is number} */
+export function isPort(value) {
   return Number.isInteger(value) && value >= 1 && value <= 65535;
 }
 

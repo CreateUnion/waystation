@@ -5,7 +5,7 @@ import net from 'node:net';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { CONFIG_FILE_NAME, DATA_DIR_ENV, resolveDataDir, siteDataDir } from './paths.js';
-import { PROTOCOL_VERSION, validateProbeAck } from './net/protocol.js';
+import { PROTOCOL_VERSION, isPort, validateProbeAck } from './net/protocol.js';
 
 /* 站点域（设计 §13 多站点，模型 A）：一台机器上的每个驿站进程 = 一个站点——
  * 独立数据目录 + 独立站点实例标识 + 独立 LAN 端口。本模块含「锚点与槽位数学」与
@@ -169,7 +169,7 @@ function rawPortOf(dir) {
     return null;
   }
   const port = /** @type {Record<string, unknown>} */ (parsed).port;
-  if (typeof port !== 'number' || !Number.isInteger(port) || port < 1 || port > 65535) {
+  if (!isPort(port)) {
     return null;
   }
   return port;
@@ -255,6 +255,8 @@ async function udpEvidence({ port, budgetMs, warn }) {
     closeSocketQuietly(socket);
     return false;
   }
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let waitTimer = null;
   try {
     // 目标端口无 UDP 监听时，ICMP 端口不可达可能在套接字上异步反映为错误——它只意味着「无应答」，
     // 不改变证据结论（吞掉并保持等待定时器语义；不作为拒绝或告警，避免探测路径自身噪音）。
@@ -276,10 +278,13 @@ async function udpEvidence({ port, budgetMs, warn }) {
     socket.send(probe, port, '127.0.0.1', () => {});
     const got = await Promise.race([
       answered,
-      new Promise((resolve) => setTimeout(resolve, budgetMs)),
+      new Promise((resolve) => { waitTimer = setTimeout(resolve, budgetMs); }),
     ]);
     return got === true;
   } finally {
+    if (waitTimer !== null) {
+      clearTimeout(waitTimer);   // 应答先胜出时定时器仍挂起：清掉，不残留（泄漏的定时器会拖住进程退出）
+    }
     closeSocketQuietly(socket);
   }
 }
@@ -302,8 +307,8 @@ async function tcpEvidence({ port, budgetMs, warn }) {
   }
 }
 
-/* 等 pong：首轮用一半剩余预算，未应答则重发一次、用尽剩余预算；返回是否收到与本轮 ping 匹配的合法 pong。
- * 等待定时器在本函数内清理，不残留（泄漏的定时器会拖住进程退出）。 */
+/* 等 pong：首轮用一半剩余预算，未应答则重发一次、二轮用尽剩余预算（本轮等待上界 = 全预算）；
+ * 返回是否收到与本轮 ping 匹配的合法 pong。等待定时器在本函数内清理，不残留（泄漏的定时器会拖住进程退出）。 */
 async function waitPongReply(socket, budgetMs) {
   /** @type {ReturnType<typeof setTimeout> | null} */
   let waitTimer = null;
@@ -313,18 +318,18 @@ async function waitPongReply(socket, budgetMs) {
     const replyTo = randomUUID();
     const ping = pingFrame(replyTo);
     const answered = pongWatcher(socket, replyTo);
-    const wait = () => new Promise((resolve) => {
-      waitTimer = setTimeout(resolve, Math.max(1, Math.ceil((deadline - Date.now()) / 2)));
+    const wait = (ms) => new Promise((resolve) => {
+      waitTimer = setTimeout(resolve, Math.max(1, Math.ceil(ms)));
     });
     socket.write(ping);
-    if (await Promise.race([answered, wait()]) === true) {
+    if (await Promise.race([answered, wait((deadline - Date.now()) / 2)]) === true) {
       return true;
     }
     if (waitTimer !== null) {
       clearTimeout(waitTimer);   // 首轮以「连接关闭」而非计时器结束：清掉挂起的定时器，不残留下半轮
     }
     socket.write(ping);
-    return await Promise.race([answered, wait()]) === true;
+    return await Promise.race([answered, wait(deadline - Date.now())]) === true;
   } finally {
     if (waitTimer !== null) {
       clearTimeout(waitTimer);

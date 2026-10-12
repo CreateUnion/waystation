@@ -529,6 +529,24 @@ test('checkInbox：返回窗口投影（total/returned/最近 limit 条、按到
   assert.deepEqual(page.messages.map((entry) => entry.msgId), sentIds.slice(1), '取最近 N 条、保持到达序');
 });
 
+test('checkInbox：窗口口径一致——已载入 box 与重启后文件投影对出窗记录同判', { timeout: 15000 }, async (t) => {
+  const config = { messageTtlMs: 200 };
+  const { inbound, dir } = makeInbound(t, {
+    config,
+    hooks: { admit: () => ({ ok: true }), deliverToSession: () => false },
+  });
+  inbound.onFrame(createFakeConnection(), messageFrame());
+  await waitFor(() => inbound.stats().accepted === 1);
+  assert.equal(inbound.checkInbox({ collabId: 'collab-1' }).total, 1, '窗口内：记录应可见');
+  await new Promise((resolve) => setTimeout(resolve, 300));   // 等记录出窗（窗口 200ms）
+  /* 重启后投影：同一数据目录新建接收管线（判重盒为空）→ 查询走文件读取分支。 */
+  const restarted = makeInbound(t, { dataDir: dir, config, hooks: { admit: () => ({ ok: true }) } }).inbound;
+  const inProcess = inbound.checkInbox({ collabId: 'collab-1' });
+  const afterRestart = restarted.checkInbox({ collabId: 'collab-1' });
+  assert.equal(inProcess.total, 0, '出窗记录：已载入 box 路径不得返回');
+  assert.deepEqual(inProcess, afterRestart, '同一数据目录：两条路径对出窗记录同判');
+});
+
 test('checkInbox：limit 越界与 collabId 非法抛 TypeError（默认 50 / 上限 500）', { timeout: 15000 }, async (t) => {
   const { inbound } = makeInbound(t);
   assert.throws(() => inbound.checkInbox({ collabId: 'collab-1', limit: 0 }), TypeError);

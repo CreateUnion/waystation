@@ -2,7 +2,7 @@ import { readdirSync } from 'node:fs';
 import { isIP } from 'node:net';
 import { join } from 'node:path';
 import { COLLABS_DIR_NAME } from '../paths.js';
-import { ID_PATTERN, MAX_FRAME_BYTES, MESSAGE_TYPES, PROTOCOL_VERSION, TRANSPORT_TYPES, newMsgId, validateMessage } from './protocol.js';
+import { ID_PATTERN, MAX_FRAME_BYTES, MESSAGE_TYPES, PROTOCOL_VERSION, TRANSPORT_TYPES, isPort, newMsgId, validateMessage } from './protocol.js';
 import { createOutbox } from './outbox.js';
 
 /* 发送调度（设计 §10）：按「协作 × 对端」单元串行投递（FIFO 保序），ack 推进，超时重传。
@@ -187,7 +187,7 @@ function sendRejection(collabId, to, type) {
   if (!isAddressLike(to.address)) {
     return argsReason;
   }
-  if (!Number.isInteger(to.port) || to.port < 1 || to.port > 65535) {
+  if (!isPort(to.port)) {
     return argsReason;
   }
   if (!isKnownType(type)) {

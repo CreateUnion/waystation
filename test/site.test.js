@@ -47,10 +47,11 @@ function closeQuietly(handle) {
   }
 }
 
-/* 环境碰撞判定：setup 绑定撞上外部占用者（机器级游标把外部分配送进段基窗口）——换段基重来即可；
+/* 环境碰撞判定：setup 绑定撞上外部占用者（机器级游标把外部分配送进段基窗口），或游标贴近端口范围
+ * 顶端、base+offset 越界（ERR_SOCKET_BAD_PORT）——同属游标位置造成的环境噪音，换段基重来即可；
  * 其余错误（含断言失败）一律原样抛出，不掩盖实现缺陷。 */
 function isEnvironmentCollision(error) {
-  return error.code === 'EADDRINUSE';
+  return error.code === 'EADDRINUSE' || error.code === 'ERR_SOCKET_BAD_PORT';
 }
 
 /* 换段基重跑整个组合步骤：run(base) 的 setup 撞上外部占用者（EADDRINUSE）即判环境碰撞重来；
@@ -387,7 +388,15 @@ test('resolveSite：非 EADDRINUSE 的绑定失败 → bind-failed（立即报�
   /* 触发方式：段基准取 65535（合法边界端口），槽位 2 的默认端口即 65536（越界）——
    * 槽位 1 用驿站占位者占住，使搜索前进到槽位 2，绑定越界端口在 UDP 侧即抛 ERR_SOCKET_BAD_PORT
    * （非 EADDRINUSE），走 bind-error → bind-failed 分支（生产锚点段不会出现越界端口，此为分支专用触发）。 */
-  await startStationSquatter(t, { port: 65535 });
+  try {
+    await startStationSquatter(t, { port: 65535 });
+  } catch (error) {
+    if (!isEnvironmentCollision(error)) {
+      throw error;
+    }
+    t.skip('端口 65535 被外部占用——越界绑定夹具无法构造');
+    return;
+  }
   const site = await resolveSite({ env: {}, mainDir, segmentBase: 65535, warn: quietWarn, probeTimeoutMs: 300 });
   assert.equal(site.ok, false);
   assert.equal(site.reason, 'bind-failed');
