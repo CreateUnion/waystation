@@ -1,4 +1,4 @@
-// 双进程预演的驿站节点：以真实网络组件装配一个节点，用 stdin 的 JSON 行命令驱动。
+// 双进程预演的驿站节点：以真实网络组件 + 协作服务装配一个节点，用 stdin 的 JSON 行命令驱动。
 // stdout 只输出命令应答（本夹具自有命令行协议，非 MCP）；日志走文件与 stderr。
 import { createInterface } from 'node:readline';
 import { loadConfig } from '../../src/config.js';
@@ -7,6 +7,7 @@ import { createLogger } from '../../src/log.js';
 import { collabFilePath, resolveLogDir } from '../../src/paths.js';
 import { loadLines } from '../../src/storage.js';
 import { createClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
+import { createCollabService } from '../../src/collab/service.js';
 import { createDiscovery } from '../../src/net/discovery.js';
 import { createDispatch } from '../../src/net/dispatch.js';
 import { INBOX_FILE_NAME, createInbound } from '../../src/net/inbound.js';
@@ -16,6 +17,9 @@ import { createTransport } from '../../src/net/transport.js';
 
 const options = JSON.parse(process.argv[2]);
 const { dataDir, bindAddress, knownPeers = [] } = options;
+/* collab 门控开关（缺省 true = 与生产同参装配）：false = 纯传输层回归——无协作台账、门控回全准入，
+ * 供 M2/M3 存量消息用例保持「不建协作、直发直收」的定位（协作场景一律走缺省 true）。 */
+const collabEnabled = options.collab !== false;
 
 function write(payload) {
   process.stdout.write(JSON.stringify(payload) + '\n');
@@ -34,19 +38,30 @@ for (const peer of knownPeers) {
 }
 let sessionWriterOk = true;
 /* adapter: true = 走真适配器（读本进程环境变量——预演进程须在目标会话的 shell 下启动）；
- * 缺省 = set_writer 开关桩（自动预演用，不依赖真实会话）。 */
-const adapter = options.adapter === true ? createClaudeCodeAdapter({ env: process.env, log }) : null;
+ * 缺省 = set_writer 开关桩（自动预演用，不依赖真实会话）。描述器指向协作服务（与生产同参）。 */
+const adapter = options.adapter === true
+  ? createClaudeCodeAdapter({ env: process.env, log, describeCollab: (collabId) => collab.describe(collabId) })
+  : null;
+const transport = createTransport({ port, bindAddress, log });
+const dispatch = createDispatch({ dataDir, config, transport, self, log });
+/* 协作服务与生产组合根同参等价（除非显式注明的刻意差异）：发送经可靠队列、清单接入、描述器接线。 */
+const collab = createCollabService({
+  dataDir,
+  config,
+  self,
+  send: (message) => dispatch.send(message),
+  knownHosts,
+  log,
+});
 const discovery = createDiscovery({
   port,
   bindAddress,
   instanceId,
   identityName: self.identityName,
-  getCollabCount: () => 0,
+  getCollabCount: () => collab.count(),
   knownHosts,
   log,
 });
-const transport = createTransport({ port, bindAddress, log });
-const dispatch = createDispatch({ dataDir, config, transport, self, log });
 const inbound = createInbound({
   dataDir,
   config,
@@ -54,7 +69,9 @@ const inbound = createInbound({
   dispatch,
   log,
   hooks: {
-    admit: () => ({ ok: true }),              // 预演：无协作台账，全部准入
+    ...(collabEnabled
+      ? { admit: (frame, meta) => collab.hooks.admit(frame, meta), consume: (frame, meta) => collab.hooks.consume(frame, meta) }
+      : { admit: () => ({ ok: true }) }),   // collab:false = 纯传输层预演：全准入（M2/M3 既有形态）
     deliverToSession: adapter !== null ? (frame) => adapter.deliverFrame(frame) : () => sessionWriterOk,
   },
 });
@@ -79,6 +96,16 @@ const COMMANDS = {
     sessionWriterOk = command.ok === true;
     return { ok: true };
   },
+  // 协作服务命令（生产由 ws_* 工具承载；本夹具直调服务公共面）：
+  create_collab: async (command) => collab.create({ name: command.name, topic: command.topic, targets: command.targets }),
+  approve_invite: async (command) => collab.approve({ collabId: command.collabId, approve: command.approve, reason: command.reason }),
+  withdraw_invite: async (command) => collab.withdraw({ collabId: command.collabId, target: command.target }),
+  send_message: async (command) => collab.send({ collabId: command.collabId, text: command.text, type: command.type, to: command.to }),
+  view_ledger: async (command) => collab.view({ collabId: command.collabId }),
+  list_collabs: async () => collab.list(),
+  end_collab: async (command) => collab.end({ collabId: command.collabId }),
+  leave_collab: async (command) => collab.leave({ collabId: command.collabId }),
+  collab_stats: async () => ({ ok: true, stats: collab.stats() }),
   exit: async () => {
     await shutdown();
     return null;   // 退出应答由 shutdown 在冲刷回调里写出
@@ -98,9 +125,10 @@ async function handle(line) {
   }
 }
 
-/* 收尾：先撤下网络层，再等 stdout 冲刷完成后退出——process.exit 不等待写完成，
- * Linux 下应答会整包丢失（Windows 行为不同，会掩盖该缺陷），调用方 await 的 exit 应答将永不到达。 */
+/* 收尾：先收协作层等待面（与生产组合根同序），再撤下网络层，最后等 stdout 冲刷完成后退出——
+ * process.exit 不等待写完成，Linux 下应答会整包丢失（Windows 行为不同，会掩盖该缺陷）。 */
 async function shutdown() {
+  collab.close();
   await stack.close();
   process.stdout.write(JSON.stringify({ ok: true }) + '\n', () => {
     process.exit(0);

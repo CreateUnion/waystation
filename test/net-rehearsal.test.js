@@ -7,7 +7,7 @@ import net from 'node:net';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { DISCOVERY_REPLY_MIN_INTERVAL_MS } from '../src/net/discovery.js';
-import { makeTempDir, pickFreePort, pickFreeSegment, repoRoot, waitFor } from './helpers.js';
+import { makeTempDir, pickFreePort, pickFreeSegment, repoRoot, waitFor, waitForRebindable } from './helpers.js';
 
 const FIXTURE = join(repoRoot, 'test', 'fixtures', 'net-node.mjs');
 
@@ -71,12 +71,12 @@ function makeNodeDir(t) {
 /* 本机双进程预演（跨机的本机近似）：两个真实进程、真实套接字、回环双地址同端口。
  * 单播兜底的目标地址正是这样喂进「已知主机清单」的——与生产路径同一机制（PoC 实测：
  * 广播单向盲区正是靠清单里的地址反向补偿）。 */
-async function startNode(t, { identityName, bindAddress, port, knownPeers = [], dataDir: reusedDir, adapter = false, env = {} }) {
+async function startNode(t, { identityName, bindAddress, port, knownPeers = [], dataDir: reusedDir, adapter = false, env = {}, collab = true, config = {} }) {
   const node = { child: null, pending: [], ready: null, stderr: '' };
   cleanupRegistryOf(t).push(node);   // 先登记收尾（见 nodesByTest 注释），再让 makeTempDir 注册删除
   const dataDir = reusedDir ?? makeTempDir(t);   // 复用数据目录 = 同一实例标识（跨重启场景）
-  writeNodeConfig(dataDir, { identityName, port });
-  node.child = spawn(process.execPath, [FIXTURE, JSON.stringify({ dataDir, bindAddress, knownPeers, adapter })], {
+  writeNodeConfig(dataDir, { identityName, port, ...config });
+  node.child = spawn(process.execPath, [FIXTURE, JSON.stringify({ dataDir, bindAddress, knownPeers, adapter, collab })], {
     cwd: repoRoot,
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, ...env },
@@ -88,8 +88,9 @@ async function startNode(t, { identityName, bindAddress, port, knownPeers = [], 
   return node;
 }
 
-/* 预演节点的配置：随机高位端口 + 加速参数（扫描窗口 / 重传节律 / 调度周期），压缩整轮预演的等待时间。 */
-function writeNodeConfig(dataDir, { identityName, port }) {
+/* 预演节点的配置：随机高位端口 + 加速参数（扫描窗口 / 重传节律 / 调度周期），压缩整轮预演的等待时间；
+ * 用例可经 config 逐项透传覆盖（如拉高快重传次数加速离线续投）。 */
+function writeNodeConfig(dataDir, { identityName, port, ...overrides }) {
   writeFileSync(
     join(dataDir, 'config.json'),
     JSON.stringify({
@@ -101,6 +102,7 @@ function writeNodeConfig(dataDir, { identityName, port }) {
       retryFastCount: 2,
       dispatchTickMs: 40,
       dialTimeoutMs: 1000,
+      ...overrides,
     }),
   );
 }
@@ -146,10 +148,10 @@ function attachCommand(node) {
  * 使互扫断言不依赖启动时序；产品行为不变（限流窗口自愈，人类尺度无感）。 */
 const PAIR_SETTLE_MS = DISCOVERY_REPLY_MIN_INTERVAL_MS + 100;   // 窗口 + 余量
 
-function startPair(t, port) {
+function startPair(t, port, { collab = true } = {}) {
   const ready = Promise.all([
-    startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: [{ address: '127.0.0.2', port }] }),
-    startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, knownPeers: [{ address: '127.0.0.1', port }] }),
+    startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: [{ address: '127.0.0.2', port }], collab }),
+    startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, knownPeers: [{ address: '127.0.0.1', port }], collab }),
   ]);
   return ready.then(async ([a, b]) => {
     await new Promise((resolve) => setTimeout(resolve, PAIR_SETTLE_MS));
@@ -181,7 +183,7 @@ test('互扫可见（身份正确）+ ping 双向与不可达', { timeout: 40000
 
 test('消息可靠往返：A 发 B 收，会话投递成功后 A 侧见第三档', { timeout: 40000 }, async (t) => {
   const port = await pickFreePort();
-  const { a, b } = await startPair(t, port);
+  const { a, b } = await startPair(t, port, { collab: false });
   const sent = await a.command({
     cmd: 'send',
     collabId: 'rehearsal-1',
@@ -214,7 +216,7 @@ test('消息可靠往返：A 发 B 收，会话投递成功后 A 侧见第三档
 
 test('第二档语义：对端会话写入失败 → 维持「已到对方驿站」', { timeout: 40000 }, async (t) => {
   const port = await pickFreePort();
-  const { a, b } = await startPair(t, port);
+  const { a, b } = await startPair(t, port, { collab: false });
   await b.command({ cmd: 'set_writer', ok: false });
   const sent = await a.command({
     cmd: 'send',
@@ -241,11 +243,11 @@ test('离线排队 + 补投 + 保序：对端未启动时排队，启动后按�
   const port = await pickFreePort();
   const bDir = makeNodeDir(t);
   // 先起一次乙取实例标识与地址归属，再让它退出——重启时复用数据目录（实例标识不变）
-  const probe = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, dataDir: bDir });
+  const probe = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, dataDir: bDir, collab: false });
   const peerId = probe.ready.instanceId;
   await probe.command({ cmd: 'exit' });
   await new Promise((resolve) => setTimeout(resolve, 200));
-  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: [{ address: '127.0.0.2', port }] });
+  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: [{ address: '127.0.0.2', port }], collab: false });
   const sentIds = [];
   const messages = ['第一封', '第二封', '第三封'];
   for (const text of messages) {
@@ -257,7 +259,7 @@ test('离线排队 + 补投 + 保序：对端未启动时排队，启动后按�
   await new Promise((resolve) => setTimeout(resolve, 700));
   const queued = await a.command({ cmd: 'status', collabId: 'rehearsal-3' });
   assert.ok(queued.rows.every((row) => row.tier === 'queued' && row.expired === false), '对方离线期间全部保持已排队');
-  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, dataDir: bDir, knownPeers: [{ address: '127.0.0.1', port }] });
+  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, dataDir: bDir, knownPeers: [{ address: '127.0.0.1', port }], collab: false });
   assert.equal(b.ready.instanceId, peerId, '同一数据目录重启后实例标识不变');
   const received = await waitFor(async () => {
     const inbox = await b.command({ cmd: 'inbox', collabId: 'rehearsal-3' });
@@ -276,12 +278,12 @@ test('重启收敛（故障注入）：强杀不丢队列，以原数据目录�
   const aDir = makeNodeDir(t);
   const bDir = makeNodeDir(t);
   // 先起一次乙取实例标识，再让它退出——重启时复用数据目录（实例标识不变），仍是「同一个乙」
-  const probe = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, dataDir: bDir });
+  const probe = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, dataDir: bDir, collab: false });
   const peerId = probe.ready.instanceId;
   await probe.command({ cmd: 'exit' });
   await new Promise((resolve) => setTimeout(resolve, 200));
   // 乙不在线时甲发消息：离线入队（落盘承诺）——随后甲进程被强杀，队列只靠磁盘幸存
-  const a1 = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: [{ address: '127.0.0.2', port }], dataDir: aDir });
+  const a1 = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: [{ address: '127.0.0.2', port }], dataDir: aDir, collab: false });
   const sent = await a1.command({
     cmd: 'send',
     collabId: 'restart-1',
@@ -294,8 +296,8 @@ test('重启收敛（故障注入）：强杀不丢队列，以原数据目录�
   a1.child.kill('SIGKILL');   // 故障注入：进程被强杀（重启收敛验证的是队列落盘，不是优雅退出）
   await a1Exited;
   // 乙上线；甲以原数据目录重建 → 续投至乙的会话，甲侧推进到第三档
-  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, dataDir: bDir });
-  const a2 = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: [{ address: '127.0.0.2', port }], dataDir: aDir });
+  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, dataDir: bDir, collab: false });
+  const a2 = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: [{ address: '127.0.0.2', port }], dataDir: aDir, collab: false });
   assert.equal(a2.ready.instanceId, a1.ready.instanceId, '同一数据目录重建后实例标识不变');
   const received = await waitFor(async () => {
     const inbox = await b.command({ cmd: 'inbox', collabId: 'restart-1' });
@@ -321,8 +323,8 @@ test('exit 干净退出（真实进程生命周期收尾）', { timeout: 40000 }
 
 test('多站点同机预演：同地址两节点（端口 P 与 P+1）按站点端口独立投递', { timeout: 40000 }, async (t) => {
   const port = await pickFreeSegment(2);   // 两站点占相邻端口：整段取（pickFreePort 只保证单端口空闲，邻位不保证）
-  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port });
-  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }] });
+  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, collab: false });
+  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }], collab: false });
   const sent = await a.command({
     cmd: 'send',
     collabId: 'rehearsal-multi',
@@ -345,7 +347,7 @@ test('多站点同机预演：同地址两节点（端口 P 与 P+1）按站点�
 test('适配器端到端：乙经注入口投进假收件箱（内容含上下文头），甲侧推进第三档', { timeout: 40000 }, async (t) => {
   const port = await pickFreePort();
   const inbox = await startFakeSessionInbox(t);
-  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port });
+  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, collab: false });
   const b = await startNode(t, {
     identityName: '主机乙',
     bindAddress: '127.0.0.2',
@@ -353,6 +355,7 @@ test('适配器端到端：乙经注入口投进假收件箱（内容含上下�
     knownPeers: [{ address: '127.0.0.1', port }],
     adapter: true,
     env: { CLAUDE_CODE_MESSAGING_SOCKET: inbox.path, CLAUDE_CODE_MESSAGING_TOKEN: 'tok-1' },
+    collab: false,
   });
   const sent = await a.command({
     cmd: 'send',
@@ -374,7 +377,7 @@ test('适配器端到端：乙经注入口投进假收件箱（内容含上下�
 test('适配器拒收：注入口关闭 → 甲维持第二档（不误报第三档）', { timeout: 40000 }, async (t) => {
   const port = await pickFreePort();
   const inbox = await startFakeSessionInbox(t, { reject: true });
-  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port });
+  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, collab: false });
   const b = await startNode(t, {
     identityName: '主机乙',
     bindAddress: '127.0.0.2',
@@ -382,6 +385,7 @@ test('适配器拒收：注入口关闭 → 甲维持第二档（不误报第三
     knownPeers: [{ address: '127.0.0.1', port }],
     adapter: true,
     env: { CLAUDE_CODE_MESSAGING_SOCKET: inbox.path, CLAUDE_CODE_MESSAGING_TOKEN: 'tok-1' },
+    collab: false,
   });
   const sent = await a.command({
     cmd: 'send',
@@ -398,4 +402,198 @@ test('适配器拒收：注入口关闭 → 甲维持第二档（不误报第三
   await new Promise((resolve) => setTimeout(resolve, 700));   // 该条目已 ack、不在重试集：浸泡验证档位稳定
   const again = await a.command({ cmd: 'status', collabId: 'rehearsal-reject' });
   assert.equal(again.rows.find((candidate) => candidate.msgId === sent.msgId).tier, 'at-peer');
+});
+
+test('协作预演：建协全流程（邀请→同意→建立→对话→看台账）', { timeout: 60000 }, async (t) => {
+  const port = await pickFreeSegment(2);   // 两站点占相邻端口：整段取（pickFreePort 只保证单端口空闲，邻位不保证）
+  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port });
+  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }] });
+  const created = await a.command({
+    cmd: 'create_collab',
+    name: '联调项目',
+    topic: '发布联调',
+    targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }],
+  });
+  assert.equal(created.ok, true);
+  assert.equal(created.invited.length, 1);
+  const collabId = created.collabId;
+  await waitFor(async () => {
+    const listed = await b.command({ cmd: 'list_collabs' });
+    return listed.collabs.some((entry) => entry.collabId === collabId && entry.state === 'proposed');
+  }, { timeoutMs: 15000 });
+  const approved = await b.command({ cmd: 'approve_invite', collabId, approve: true });
+  assert.equal(approved.ok, true);
+  assert.equal(approved.decision, 'approved');
+  await waitFor(async () => {
+    const listed = await a.command({ cmd: 'list_collabs' });
+    return listed.collabs.some((entry) => entry.collabId === collabId && entry.state === 'active');
+  }, { timeoutMs: 15000 });
+  await waitFor(async () => {
+    const listed = await b.command({ cmd: 'list_collabs' });
+    return listed.collabs.some((entry) => entry.collabId === collabId && entry.state === 'active');
+  }, { timeoutMs: 15000 });
+  const sent = await a.command({ cmd: 'send_message', collabId, text: '请查收联调事项', type: 'reply' });
+  assert.equal(sent.ok, true);
+  const ledger = await b.command({ cmd: 'view_ledger', collabId });
+  assert.equal(ledger.source, 'live');
+  assert.equal(ledger.ledger.status, 'active');
+  assert.equal(ledger.ledger.members.length, 2);
+});
+
+test('协作预演：同名并发冲突（三节点双冻结 + 广播）', { timeout: 90000 }, async (t) => {
+  const port = await pickFreeSegment(3);   // 三站点占三连端口：整段取
+  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port });
+  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }] });
+  const c = await startNode(t, { identityName: '主机丙', bindAddress: '127.0.0.1', port: port + 2, knownPeers: [{ address: '127.0.0.1', port }] });
+  const first = await a.command({ cmd: 'create_collab', name: '重名项目', topic: '甲发起的联调', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
+  assert.equal(first.ok, true);
+  await waitFor(async () => {
+    const listed = await b.command({ cmd: 'list_collabs' });
+    return listed.collabs.some((entry) => entry.collabId === first.collabId && entry.state === 'proposed');
+  }, { timeoutMs: 15000 });
+  const approved = await b.command({ cmd: 'approve_invite', collabId: first.collabId, approve: true });
+  assert.equal(approved.ok, true);
+  await waitFor(async () => {
+    const listed = await a.command({ cmd: 'list_collabs' });
+    return listed.collabs.some((entry) => entry.collabId === first.collabId && entry.state === 'active');
+  }, { timeoutMs: 15000 });
+  const rival = await c.command({ cmd: 'create_collab', name: '重名项目', topic: '丙发起的联调', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
+  assert.equal(rival.ok, true);
+  await waitFor(async () => {
+    const listed = await a.command({ cmd: 'list_collabs' });
+    return listed.collabs.some((entry) => entry.collabId === first.collabId && entry.state === 'frozen');
+  }, { timeoutMs: 30000 });
+  await waitFor(async () => {
+    const listed = await c.command({ cmd: 'list_collabs' });
+    return listed.collabs.some((entry) => entry.collabId === rival.collabId && entry.state === 'frozen');
+  }, { timeoutMs: 30000 });
+  const bListed = await b.command({ cmd: 'list_collabs' });
+  assert.equal(bListed.collabs.find((entry) => entry.collabId === first.collabId).state, 'frozen');
+  assert.equal(bListed.collabs.find((entry) => entry.collabId === rival.collabId).state, 'frozen');
+  const stats = await b.command({ cmd: 'collab_stats' });
+  assert.equal(stats.stats.freezeDetected >= 1, true);
+});
+
+test('协作预演：撤回（single 定格 withdrawn → all 整条终止）', { timeout: 60000 }, async (t) => {
+  const port = await pickFreeSegment(2);
+  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port });
+  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }] });
+  const created = await a.command({ cmd: 'create_collab', name: '撤回项目', topic: '主题', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
+  await waitFor(async () => {
+    const listed = await b.command({ cmd: 'list_collabs' });
+    return listed.collabs.some((entry) => entry.collabId === created.collabId);
+  }, { timeoutMs: 15000 });
+  const single = await a.command({ cmd: 'withdraw_invite', collabId: created.collabId, target: b.ready.instanceId });
+  assert.equal(single.ok, true);
+  await waitFor(async () => {
+    const listed = await b.command({ cmd: 'list_collabs' });
+    return listed.collabs.some((entry) => entry.collabId === created.collabId && entry.decision === 'withdrawn');
+  }, { timeoutMs: 15000 });
+  const all = await a.command({ cmd: 'withdraw_invite', collabId: created.collabId });
+  assert.equal(all.ok, true);
+  await waitFor(async () => {
+    const listed = await b.command({ cmd: 'list_collabs' });
+    return listed.collabs.some((entry) => entry.collabId === created.collabId && entry.state === 'terminated' && entry.archived === true);
+  }, { timeoutMs: 15000 });
+});
+
+test('协作预演：离线续投（乙离线期间排队、重开后续投并推进第三档）', { timeout: 90000 }, async (t) => {
+  const port = await pickFreeSegment(2);
+  const nodeConfig = { retryIntervalMs: 200, retryFastCount: 100 };
+  const dirA = makeNodeDir(t);
+  const dirB = makeNodeDir(t);
+  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, dataDir: dirA, config: nodeConfig });
+  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }], dataDir: dirB, config: nodeConfig });
+  const created = await a.command({ cmd: 'create_collab', name: '续投项目', topic: '主题', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
+  await waitFor(async () => {
+    const listed = await b.command({ cmd: 'list_collabs' });
+    return listed.collabs.some((entry) => entry.collabId === created.collabId && entry.state === 'proposed');
+  }, { timeoutMs: 15000 });
+  const approved = await b.command({ cmd: 'approve_invite', collabId: created.collabId, approve: true });
+  assert.equal(approved.ok, true);
+  await waitFor(async () => {
+    const listed = await a.command({ cmd: 'list_collabs' });
+    return listed.collabs.some((entry) => entry.collabId === created.collabId && entry.state === 'active');
+  }, { timeoutMs: 15000 });
+  await b.command({ cmd: 'exit' });
+  await waitForRebindable(port + 1);
+  const sent = await a.command({ cmd: 'send_message', collabId: created.collabId, text: '乙离线期间的消息' });
+  assert.equal(sent.ok, true);
+  assert.equal(sent.tier, 'queued');
+  const b2 = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }], dataDir: dirB, config: nodeConfig });
+  await waitFor(async () => {
+    const status = await a.command({ cmd: 'status', collabId: created.collabId });
+    const row = status.rows.find((candidate) => candidate.msgId === sent.msgId);
+    return row !== undefined && row.tier === 'session' ? row : null;
+  }, { timeoutMs: 30000 });
+  const listed = await b2.command({ cmd: 'list_collabs' });
+  assert.equal(listed.collabs.find((entry) => entry.collabId === created.collabId).state, 'active');
+});
+
+test('协作预演：结束后迟到消息丢弃并计数 + 服务层门控拒绝', { timeout: 60000 }, async (t) => {
+  const port = await pickFreeSegment(2);
+  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port });
+  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }] });
+  const created = await a.command({ cmd: 'create_collab', name: '收尾项目', topic: '主题', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
+  await waitFor(async () => {
+    const listed = await b.command({ cmd: 'list_collabs' });
+    return listed.collabs.some((entry) => entry.collabId === created.collabId && entry.state === 'proposed');
+  }, { timeoutMs: 15000 });
+  const approved = await b.command({ cmd: 'approve_invite', collabId: created.collabId, approve: true });
+  assert.equal(approved.ok, true);
+  await waitFor(async () => {
+    const listed = await a.command({ cmd: 'list_collabs' });
+    return listed.collabs.some((entry) => entry.collabId === created.collabId && entry.state === 'active');
+  }, { timeoutMs: 15000 });
+  await waitFor(async () => {
+    const listed = await b.command({ cmd: 'list_collabs' });
+    return listed.collabs.some((entry) => entry.collabId === created.collabId && entry.state === 'active');
+  }, { timeoutMs: 15000 });
+  const ended = await a.command({ cmd: 'end_collab', collabId: created.collabId });
+  assert.equal(ended.ok, true);
+  await waitFor(async () => {
+    const listed = await b.command({ cmd: 'list_collabs' });
+    return listed.collabs.some((entry) => entry.collabId === created.collabId && entry.state === 'completed');
+  }, { timeoutMs: 15000 });
+  const gated = await b.command({ cmd: 'send_message', collabId: created.collabId, text: '结束后发送' });
+  assert.equal(gated.ok, false);
+  const late = await a.command({
+    cmd: 'send',
+    collabId: created.collabId,
+    to: { instanceId: b.ready.instanceId, address: '127.0.0.1', port: port + 1 },
+    type: 'reply',
+    payload: { text: '迟到的直投帧' },
+  });
+  assert.equal(late.ok, true, '底层直投绕过服务门控——用于造迟到帧');
+  await waitFor(async () => {
+    const stats = await b.command({ cmd: 'collab_stats' });
+    return stats.stats.lateDropped >= 1;
+  }, { timeoutMs: 15000 });
+});
+
+test('协作预演：管理者离线 → view_ledger 回退快照并标注可能非最新', { timeout: 90000 }, async (t) => {
+  const port = await pickFreeSegment(2);
+  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port });
+  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }] });
+  const created = await a.command({ cmd: 'create_collab', name: '回退项目', topic: '主题', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
+  await waitFor(async () => {
+    const listed = await b.command({ cmd: 'list_collabs' });
+    return listed.collabs.some((entry) => entry.collabId === created.collabId && entry.state === 'proposed');
+  }, { timeoutMs: 15000 });
+  const approved = await b.command({ cmd: 'approve_invite', collabId: created.collabId, approve: true });
+  assert.equal(approved.ok, true);
+  await waitFor(async () => {
+    const listed = await b.command({ cmd: 'list_collabs' });
+    return listed.collabs.some((entry) => entry.collabId === created.collabId && entry.state === 'active');
+  }, { timeoutMs: 15000 });
+  await waitFor(async () => {
+    const viewed = await b.command({ cmd: 'view_ledger', collabId: created.collabId });
+    return viewed.source === 'live' ? viewed : null;
+  }, { timeoutMs: 15000 });
+  await a.command({ cmd: 'exit' });
+  await waitForRebindable(port);
+  const viewed = await b.command({ cmd: 'view_ledger', collabId: created.collabId });
+  assert.equal(viewed.ok, true);
+  assert.equal(viewed.source, 'snapshot');
+  assert.ok(viewed.note.includes('可能非最新'));
 });
