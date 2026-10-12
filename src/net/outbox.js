@@ -5,6 +5,11 @@ import { GOVERNANCE_TYPES } from './protocol.js';
 export const OUTBOX_FILE_NAME = 'outbox.jsonl';
 const STATES = ['queued', 'acked', 'session', 'expired'];
 
+/* 压缩的行数触发阈值：自上次压缩以来的追加行数超过「存活条目数 × 该倍率」即压缩。
+ * 只在过期/回收事件压缩时，长会话里的重试追加要等终态事件才收敛——治理类条目永不入过期路径，
+ * 积压期间文件会无界增长；按行数触发保证「文件增长有界」对所有场景成立。 */
+const COMPACT_LINE_FACTOR = 2;
+
 /* 每协作发送队列（设计 §10 投递可靠性）：落盘、可重启续投。
  * 形态 = 追加写的状态快照流（每次状态推进追加一条完整条目），加载时按 msgId 折叠（后写胜）；
  * 折叠出的历史行在加载与清理后就地压缩（整体替换写回），文件增长有界。
@@ -18,6 +23,7 @@ export function createOutbox({ dataDir, collabId, config, log }) {
     file: collabFilePath(dataDir, collabId, OUTBOX_FILE_NAME),
     entries: new Map(),
     counters: { appended: 0, compactions: 0, expiredTotal: 0, corruptRecords: 0, persistFailures: 0 },
+    appendsSinceCompact: 0,
   };
   try {
     ensureDir(collabDir(dataDir, collabId));
@@ -41,7 +47,18 @@ export function createOutbox({ dataDir, collabId, config, log }) {
 }
 
 function load(state) {
-  const loaded = loadLines(state.file);
+  /** @type {{ entries: unknown[], tailDropped: boolean, corruptLines: Array<{ lineNumber: number, text: string }> } | null} */
+  let loaded = null;
+  try {
+    loaded = loadLines(state.file);
+  } catch (error) {
+    // 读失败按「存储不可用」处理：计数 + 告警留痕后按空队列继续——启动面不得因存储读失败而失败
+    state.counters.persistFailures++;
+    state.log.warn('发送队列读取失败（按空队列继续）', { collabId: state.collabId, reason: error.message });
+  }
+  if (loaded === null) {
+    return;
+  }
   if (loaded.tailDropped || loaded.corruptLines.length > 0) {
     state.log.warn('发送队列文件有残缺记录，按可解析条目载入', {
       tailDropped: loaded.tailDropped,
@@ -76,7 +93,7 @@ function unitsOf(state) {
 }
 
 function headFor(state, peerInstanceId) {
-  /** @type {undefined | { createdAt: string }} */
+  /** @type {undefined | { msgId: string, collabId: string, to: { instanceId: string, address: string }, type: string, payload?: unknown, governance: boolean, state: 'queued' | 'acked' | 'session' | 'expired', attempts: number, createdAt: string, nextAttemptAt: number, ackedAt?: string, deliveredAt?: string, expiredAt?: string }} */
   let head = undefined;
   for (const entry of state.entries.values()) {
     if (entry.state !== 'queued' || entry.to.instanceId !== peerInstanceId) {
@@ -91,7 +108,8 @@ function headFor(state, peerInstanceId) {
 
 function enqueue(state, { msgId, to, type, payload, ts }) {
   const governance = GOVERNANCE_TYPES.includes(type);
-  if (!governance && unfinishedOf(state).length >= state.config.queueMaxPerCollab) {
+  // 配额只统计非治理类未完成条目：治理积压不得挤占普通消息的名额（治理类任何时刻可入队）
+  if (!governance && unfinishedOf(state).filter((entry) => !entry.governance).length >= state.config.queueMaxPerCollab) {
     return { ok: false, reason: `该协作待投队列已满（上限 ${state.config.queueMaxPerCollab} 条），等待送达或过期后再试` };
   }
   const entry = {
@@ -162,7 +180,8 @@ function prune(state, now) {
       dropped++;
     }
   }
-  if (expired.length > 0 || dropped > 0) {
+  // 过期/回收事件会改变条目集；无终态事件时靠追加行数超阈值兜底压缩，保证文件增长有界
+  if (expired.length > 0 || dropped > 0 || state.appendsSinceCompact > state.entries.size * COMPACT_LINE_FACTOR) {
     compact(state);
   }
   return { expired, dropped };
@@ -197,6 +216,7 @@ function writeRecord(state, entry) {
   try {
     appendLine(state.file, entry);
     state.counters.appended++;
+    state.appendsSinceCompact++;
     return true;
   } catch (error) {
     state.counters.persistFailures++;
@@ -210,6 +230,7 @@ function compact(state) {
   try {
     replaceFile(state.file, lines);
     state.counters.compactions++;
+    state.appendsSinceCompact = 0;
   } catch (error) {
     state.counters.persistFailures++;
     state.log.error('发送队列压缩失败（保留原文件）', { reason: error.message });

@@ -75,6 +75,19 @@ test('状态推进历史：重开时折叠（文件行数收敛为条目数）',
   assert.equal(readFileSync(file, 'utf8').trim().split('\n').length, 1);
 });
 
+test('压缩触发：重试追加超「条目数 × 倍率」即压缩，长会话文件行数有界', (t) => {
+  const { outbox, file } = makeOutbox(t, { config: testConfig({ messageTtlMs: 600000 }) });
+  const input = sendInput();
+  outbox.enqueue(input);
+  for (let i = 0; i < 50; i++) {
+    outbox.markAttempt(input.msgId, Date.now() + i);
+    outbox.prune(Date.now() + i);   // 无过期/回收事件：压缩只能由追加行数阈值触发
+  }
+  const lines = readFileSync(file, 'utf8').trim().split('\n').length;
+  assert.ok(lines <= 4, `50 次重试后文件行数应保持有界，实际 ${lines} 行`);
+  assert.ok(outbox.stats().compactions >= 1);
+});
+
 test('容量：未完成条目达上限即拒绝；终态条目释放名额', (t) => {
   const { outbox } = makeOutbox(t);
   const first = sendInput();
@@ -96,6 +109,20 @@ test('容量：治理类通告豁免上限', (t) => {
   const takeover = sendInput({ type: 'takeover' });
   assert.deepEqual(outbox.enqueue(takeover), { ok: true });
   assert.equal(outbox.entries().find((entry) => entry.msgId === takeover.msgId).governance, true);
+});
+
+test('容量：上限只计非治理条目；治理类不占配额且随时可入', (t) => {
+  const { outbox } = makeOutbox(t);
+  for (let i = 0; i < 5; i++) {   // 治理条数超上限也不拒绝：治理类不受容量约束
+    assert.deepEqual(outbox.enqueue(sendInput({ type: 'takeover' })), { ok: true });
+  }
+  for (let i = 0; i < 3; i++) {   // 治理积压不占名额：普通消息仍可用满全部配额
+    assert.deepEqual(outbox.enqueue(sendInput()), { ok: true });
+  }
+  const rejected = outbox.enqueue(sendInput());
+  assert.equal(rejected.ok, false);
+  assert.ok(rejected.reason.includes('队列已满'));
+  assert.deepEqual(outbox.enqueue(sendInput({ type: 'freeze' })), { ok: true });   // 普通消息满额后治理仍可入
 });
 
 test('过期：超保留期的未完成条目在 prune 时标记 expired 并列入回报', (t) => {
@@ -190,4 +217,31 @@ test('载入：非本协作/结构非法记录跳过并计数', (t) => {
   const outbox = createOutbox({ dataDir: dir, collabId: 'collab-1', config: testConfig(), log: quietLog() });
   assert.equal(outbox.size(), 1);
   assert.ok(outbox.stats().corruptRecords >= 3);
+});
+
+test('载入：读失败按空队列继续（计数 + 告警，不向调用方抛出）', (t) => {
+  const dir = makeTempDir(t);
+  const file = join(dir, COLLABS_DIR_NAME, 'collab-1', OUTBOX_FILE_NAME);
+  mkdirSync(file, { recursive: true });   // 目录占位：读取必得非 ENOENT 错误（EISDIR，Windows/Linux 一致）
+  const warnings = [];
+  const log = { info: () => {}, warn: (message, detail) => warnings.push({ message, detail }), error: () => {} };
+  const outbox = createOutbox({ dataDir: dir, collabId: 'collab-1', config: testConfig(), log });
+  assert.equal(outbox.size(), 0);
+  assert.equal(outbox.stats().persistFailures, 1);
+  assert.equal(warnings.length, 1);
+  assert.ok(warnings[0].message.includes('读取失败'));
+  assert.equal(warnings[0].detail.collabId, 'collab-1');
+  assert.match(warnings[0].detail.reason, /EISDIR/);
+});
+
+test('入队：落盘失败即回滚（未落盘即不承诺），不留内存条目', (t) => {
+  const { outbox, file } = makeOutbox(t);
+  mkdirSync(file, { recursive: true });   // 目录占位：追加写必失败（EISDIR，Windows/Linux 一致）
+  const before = outbox.stats().persistFailures;
+  const result = outbox.enqueue(sendInput());
+  assert.equal(result.ok, false);
+  assert.ok(result.reason.includes('落盘失败'));
+  assert.equal(outbox.size(), 0);
+  assert.equal(outbox.headFor('inst-b'), undefined);
+  assert.equal(outbox.stats().persistFailures, before + 1);
 });
