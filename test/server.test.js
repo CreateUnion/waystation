@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { connect, createServer } from 'node:net';
 import dgram from 'node:dgram';
 import { join, resolve } from 'node:path';
@@ -91,7 +91,7 @@ test('stdio 骨架：进程可起、ws_status 可调、网络层就绪、数据�
   const port = await pickFreePort();
   const client = await connectClient(t, INDEX_ENTRY, home, { port });
   const { tools } = await client.listTools();
-  assert.deepEqual(tools.map((tool) => tool.name), ['ws_status', 'ws_list_hosts', 'ws_ping', 'ws_delivery_status']);
+  assert.deepEqual(tools.map((tool) => tool.name), ['ws_status', 'ws_list_hosts', 'ws_ping', 'ws_delivery_status', 'ws_check_inbox']);
   const status = await fetchStatus(client);
   assert.equal(status.name, 'waystation');
   assert.equal(status.version, '0.1.0');
@@ -107,6 +107,8 @@ test('stdio 骨架：进程可起、ws_status 可调、网络层就绪、数据�
   assert.equal(status.net.available, true);
   assert.equal(status.net.reason, null);
   assert.equal(status.net.port, port);
+  // WAYSTATION_HOME + 预写 port = 显式接管站点（站点块随状态输出，供多站点排障）
+  assert.deepEqual(status.site, { mode: 'explicit', slot: null, port, takeover: true });
   assert.equal(existsSync(join(home, 'config.json')), true);
   assert.equal(existsSync(join(home, 'instance-id')), true);
   assert.equal(existsSync(join(home, 'logs', 'waystation.log')), true);
@@ -182,23 +184,23 @@ test('ws_delivery_status：无已发消息返回空数组', { timeout: 30000 }, 
   assert.deepEqual(JSON.parse(called.content[0].text), []);
 });
 
-test('端口占用一：本机已有驿站站点 → 降级、occupied-by-station 文案、LAN 工具明确报错', { timeout: 40000 }, async (t) => {
+test('端口占用一：显式端口被另一驿站站点占 → 降级、takeover-taken 文案、LAN 工具明确报错', { timeout: 40000 }, async (t) => {
   const port = await pickFreePort();
   const clientA = await connectClient(t, INDEX_ENTRY, makeTempDir(t), { port });
   assert.equal((await fetchStatus(clientA)).net.available, true);
   const clientB = await connectClient(t, INDEX_ENTRY, makeTempDir(t), { port });
   const statusB = await fetchStatus(clientB);
   assert.equal(statusB.net.available, false);
-  assert.equal(statusB.net.reason, 'occupied-by-station');
-  assert.ok(statusB.net.message.includes('其他驿站站点占用'));
+  assert.equal(statusB.net.reason, 'takeover-taken');
+  assert.ok(statusB.net.message.includes('不自动改端口'));
   const listed = await clientB.callTool({ name: 'ws_list_hosts', arguments: {} });
   assert.equal(listed.isError, true);
-  assert.ok(listed.content[0].text.includes('其他驿站站点占用'));
+  assert.ok(listed.content[0].text.includes('不自动改端口'));
   const probed = await clientB.callTool({ name: 'ws_ping', arguments: { address: '127.0.0.1', port } });
   assert.equal(probed.isError, true);
 });
 
-test('端口占用二：无关程序占用 → 降级、port-taken 文案与改端口指引', { timeout: 40000 }, async (t) => {
+test('端口占用二：显式端口被无关程序占 → 同一降级结论（不区分占用者）', { timeout: 40000 }, async (t) => {
   const port = await pickFreePort();
   const held = new Set();
   const occupier = createServer((socket) => {
@@ -215,9 +217,37 @@ test('端口占用二：无关程序占用 → 降级、port-taken 文案与改�
   const client = await connectClient(t, INDEX_ENTRY, makeTempDir(t), { port });
   const status = await fetchStatus(client);
   assert.equal(status.net.available, false);
-  assert.equal(status.net.reason, 'port-taken');
-  assert.ok(status.net.message.includes('被其他程序占用'));
+  assert.equal(status.net.reason, 'takeover-taken');
+  assert.ok(status.net.message.includes('不自动改端口'));
   assert.ok(status.net.message.includes('config.json'));
+  const listed = await client.callTool({ name: 'ws_list_hosts', arguments: {} });
+  assert.equal(listed.isError, true);
+  assert.ok(listed.content[0].text.includes('不自动改端口'));
+  const probed = await client.callTool({ name: 'ws_ping', arguments: { address: '127.0.0.1', port } });
+  assert.equal(probed.isError, true);
+});
+
+test('ws_check_inbox：进程级读取收件流水（未投递消息的会话主动查出口）', { timeout: 30000 }, async (t) => {
+  const home = makeTempDir(t);
+  const client = await connectClient(t, INDEX_ENTRY, home, { port: await pickFreePort() });
+  mkdirSync(join(home, 'collabs', 'collab-1'), { recursive: true });
+  const record = {
+    msgId: 'msg-1',
+    type: 'notice',
+    from: { instanceId: 'inst-a', identityName: '主机甲', port: 7321 },
+    collabId: 'collab-1',
+    ts: new Date().toISOString(),
+    receivedAt: new Date().toISOString(),
+    payload: { text: '主动查可见' },
+  };
+  writeFileSync(join(home, 'collabs', 'collab-1', 'inbox.jsonl'), JSON.stringify(record) + '\n');
+  const called = await client.callTool({ name: 'ws_check_inbox', arguments: { collabId: 'collab-1' } });
+  assert.equal(called.isError, undefined);
+  const result = JSON.parse(called.content[0].text);
+  assert.equal(result.total, 1);
+  assert.equal(result.messages[0].payload.text, '主动查可见');
+  const bad = await client.callTool({ name: 'ws_check_inbox', arguments: { collabId: 'bad id!' } });
+  assert.equal(bad.isError, true);
 });
 
 test('会话关闭（stdin 关闭）→ 进程退出（退出码 0）并释放 TCP/UDP 端口', { timeout: 30000 }, async (t) => {

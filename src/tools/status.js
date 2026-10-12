@@ -19,6 +19,7 @@ export function statusTool() {
         logDir: context.logDir,
         configFile: join(context.dataDir, CONFIG_FILE_NAME),
         port: context.config.port,
+        site: context.site,   // { mode, slot, port, takeover }；站点解析失败降级时为 null
         pid: process.pid,
         node: process.version,
         startedAt: context.startedAt,
