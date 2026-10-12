@@ -24,10 +24,10 @@ function write(payload) {
 const { config } = loadConfig(dataDir);   // 端口与加速参数由测试预写 config.json
 const log = createLogger({ logDir: join(dataDir, 'logs'), maxBytes: config.logMaxBytes, maxFiles: config.logMaxFiles });
 const instanceId = loadOrCreateInstanceId(dataDir);
-const self = { instanceId, identityName: config.identityName };
+const self = { instanceId, identityName: config.identityName, port };
 const knownHosts = createKnownHosts({ dataDir, log });
-for (const address of knownPeers) {
-  knownHosts.remember({ address });
+for (const peer of knownPeers) {
+  knownHosts.remember({ address: peer.address, port: peer.port });
 }
 let sessionWriterOk = true;
 const discovery = createDiscovery({
@@ -83,7 +83,7 @@ async function handle(line) {
 /* 查询类命令的应答出口（ping / send / status / inbox 共用）。 */
 async function queryReply(command) {
   if (command.cmd === 'ping') {
-    return { ok: true, ...(await stack.pingHost({ address: command.address })) };
+    return { ok: true, ...(await stack.pingHost({ address: command.address, port: command.port })) };
   }
   if (command.cmd === 'send') {
     return { ok: true, ...stack.send({ collabId: command.collabId, to: command.to, type: command.type ?? 'notice', payload: command.payload }) };

@@ -77,8 +77,8 @@ function attachCommand(node) {
 
 function startPair(t, port) {
   const ready = Promise.all([
-    startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: ['127.0.0.2'] }),
-    startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, knownPeers: ['127.0.0.1'] }),
+    startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: [{ address: '127.0.0.2', port }] }),
+    startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, knownPeers: [{ address: '127.0.0.1', port }] }),
   ]);
   return ready.then(([a, b]) => ({ a, b }));
 }
@@ -90,17 +90,18 @@ test('互扫可见（身份正确）+ ping 双向与不可达', { timeout: 40000
   const peerSeenByA = listedByA.hosts.find((host) => host.instanceId === b.ready.instanceId);
   assert.ok(peerSeenByA, `甲应扫到乙，实际清单：${JSON.stringify(listedByA.hosts)}`);
   assert.equal(peerSeenByA.identityName, '主机乙');
-  assert.equal(peerSeenByA.addresses[0], '127.0.0.2', '首选地址 = 首个应答来源地址');
+  assert.equal(peerSeenByA.endpoints[0].address, '127.0.0.2', '首选地址 = 首个应答来源地址');
+  assert.equal(peerSeenByA.endpoints[0].port, port, '首选端点端口 = 应答来源端口（双方同端口）');
   const listedByB = await b.command({ cmd: 'list_hosts' });
   const peerSeenByB = listedByB.hosts.find((host) => host.instanceId === a.ready.instanceId);
   assert.ok(peerSeenByB, '乙应扫到甲');
   assert.equal(peerSeenByB.identityName, '主机甲');
-  const pingedByA = await a.command({ cmd: 'ping', address: '127.0.0.2' });
+  const pingedByA = await a.command({ cmd: 'ping', address: '127.0.0.2', port });
   assert.equal(pingedByA.reachable, true);
   assert.ok(Number.isInteger(pingedByA.rttMs));
-  const pingedByB = await b.command({ cmd: 'ping', address: '127.0.0.1' });
+  const pingedByB = await b.command({ cmd: 'ping', address: '127.0.0.1', port });
   assert.equal(pingedByB.reachable, true);
-  const dead = await a.command({ cmd: 'ping', address: '127.0.0.3' });
+  const dead = await a.command({ cmd: 'ping', address: '127.0.0.3', port });
   assert.equal(dead.reachable, false);
 });
 
@@ -110,7 +111,7 @@ test('消息可靠往返：A 发 B 收，会话投递成功后 A 侧见第三档
   const sent = await a.command({
     cmd: 'send',
     collabId: 'rehearsal-1',
-    to: { instanceId: b.ready.instanceId, address: '127.0.0.2' },
+    to: { instanceId: b.ready.instanceId, address: '127.0.0.2', port },
     payload: { text: '你好，乙' },
   });
   assert.equal(sent.ok, true);
@@ -144,7 +145,7 @@ test('第二档语义：对端会话写入失败 → 维持「已到对方驿站
   const sent = await a.command({
     cmd: 'send',
     collabId: 'rehearsal-2',
-    to: { instanceId: b.ready.instanceId, address: '127.0.0.2' },
+    to: { instanceId: b.ready.instanceId, address: '127.0.0.2', port },
     payload: { text: '写不进去' },
   });
   await waitFor(async () => {
@@ -170,11 +171,11 @@ test('离线排队 + 补投 + 保序：对端未启动时排队，启动后按�
   const peerId = probe.ready.instanceId;
   await probe.command({ cmd: 'exit' });
   await new Promise((resolve) => setTimeout(resolve, 200));
-  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: ['127.0.0.2'] });
+  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: [{ address: '127.0.0.2', port }] });
   const sentIds = [];
   const messages = ['第一封', '第二封', '第三封'];
   for (const text of messages) {
-    const sent = await a.command({ cmd: 'send', collabId: 'rehearsal-3', to: { instanceId: peerId, address: '127.0.0.2' }, payload: { text } });
+    const sent = await a.command({ cmd: 'send', collabId: 'rehearsal-3', to: { instanceId: peerId, address: '127.0.0.2', port }, payload: { text } });
     assert.equal(sent.ok, true);
     assert.equal(sent.tier, 'queued', '对方离线：当场返回已排队');
     sentIds.push(sent.msgId);
@@ -182,7 +183,7 @@ test('离线排队 + 补投 + 保序：对端未启动时排队，启动后按�
   await new Promise((resolve) => setTimeout(resolve, 700));
   const queued = await a.command({ cmd: 'status', collabId: 'rehearsal-3' });
   assert.ok(queued.rows.every((row) => row.tier === 'queued' && row.expired === false), '对方离线期间全部保持已排队');
-  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, dataDir: bDir, knownPeers: ['127.0.0.1'] });
+  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, dataDir: bDir, knownPeers: [{ address: '127.0.0.1', port }] });
   assert.equal(b.ready.instanceId, peerId, '同一数据目录重启后实例标识不变');
   const received = await waitFor(async () => {
     const inbox = await b.command({ cmd: 'inbox', collabId: 'rehearsal-3' });
@@ -206,11 +207,11 @@ test('重启收敛（故障注入）：强杀不丢队列，以原数据目录�
   await probe.command({ cmd: 'exit' });
   await new Promise((resolve) => setTimeout(resolve, 200));
   // 乙不在线时甲发消息：离线入队（落盘承诺）——随后甲进程被强杀，队列只靠磁盘幸存
-  const a1 = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: ['127.0.0.2'], dataDir: aDir });
+  const a1 = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: [{ address: '127.0.0.2', port }], dataDir: aDir });
   const sent = await a1.command({
     cmd: 'send',
     collabId: 'restart-1',
-    to: { instanceId: peerId, address: '127.0.0.2' },
+    to: { instanceId: peerId, address: '127.0.0.2', port },
     payload: { text: '重启前寄出' },
   });
   assert.equal(sent.ok, true);
@@ -220,7 +221,7 @@ test('重启收敛（故障注入）：强杀不丢队列，以原数据目录�
   await a1Exited;
   // 乙上线；甲以原数据目录重建 → 续投至乙的会话，甲侧推进到第三档
   const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, dataDir: bDir });
-  const a2 = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: ['127.0.0.2'], dataDir: aDir });
+  const a2 = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: [{ address: '127.0.0.2', port }], dataDir: aDir });
   assert.equal(a2.ready.instanceId, a1.ready.instanceId, '同一数据目录重建后实例标识不变');
   const received = await waitFor(async () => {
     const inbox = await b.command({ cmd: 'inbox', collabId: 'restart-1' });

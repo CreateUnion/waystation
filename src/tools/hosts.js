@@ -10,15 +10,28 @@ export function hostsTool() {
       if (!listed.ok) {
         return { content: [{ type: 'text', text: listed.message }], isError: true };
       }
-      const hosts = listed.hosts.map((host) => ({
-        instanceId: host.instanceId,
-        identityName: host.identityName,
-        address: host.addresses[0] ?? '',
-        addresses: host.addresses,
-        collabCount: host.collabCount,
-        lastSeenAt: host.lastSeenAt,
-      }));
+      const hosts = listed.hosts.map((host) => {
+        const endpoints = endpointsOf(host);
+        return {
+          instanceId: host.instanceId,
+          identityName: host.identityName,
+          address: endpoints[0]?.address ?? '',
+          addresses: endpoints.map((endpoint) => endpoint.address),
+          endpoints: endpoints.map((endpoint) => (endpoint.port === null ? endpoint.address : `${endpoint.address}:${endpoint.port}`)),
+          collabCount: host.collabCount,
+          lastSeenAt: host.lastSeenAt,
+        };
+      });
       return { content: [{ type: 'text', text: JSON.stringify(hosts, null, 2) }] };
     },
   };
+}
+
+/* 最小形状同步（完整形态随工具面任务收口）：扫描条目已改为 endpoints（地址:端口）；
+ * 对仍按旧形态投喂的调用方（单元测试假 net）保留 addresses 回退，避免跨任务波次窗口内的读数 TypeError。 */
+function endpointsOf(host) {
+  if (Array.isArray(host.endpoints)) {
+    return host.endpoints;
+  }
+  return (host.addresses ?? []).map((address) => ({ address, port: null }));
 }
