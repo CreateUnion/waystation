@@ -2,7 +2,7 @@ import { readdirSync } from 'node:fs';
 import { isIP } from 'node:net';
 import { join } from 'node:path';
 import { COLLABS_DIR_NAME } from '../paths.js';
-import { ID_PATTERN, MESSAGE_TYPES, PROTOCOL_VERSION, TRANSPORT_TYPES, newMsgId } from './protocol.js';
+import { ID_PATTERN, MAX_FRAME_BYTES, MESSAGE_TYPES, PROTOCOL_VERSION, TRANSPORT_TYPES, newMsgId } from './protocol.js';
 import { createOutbox } from './outbox.js';
 
 /* 发送调度（设计 §10）：按「协作 × 对端」单元串行投递（FIFO 保序），ack 推进，超时重传。
@@ -11,6 +11,8 @@ import { createOutbox } from './outbox.js';
  * 半开连接检测：重试必重拨（旧连接关闭）——应用层 ack 与超时是唯一判据（设计 §5/§10）。
  * 拨号连接上的回程帧（ack / pong / 投递回报）统一经 setClientFrameRouter 注入的路由器转交接收管线
  * （生产路径由装配层注入 inbound.onFrame）；未接线时帧计数丢弃。
+ * stop() 是发送截止点：停止后醒来的在途投递一律不发帧，在途拨号完成即关（连同探测在内一并收口）；
+ * stop() 返回的 promise 在在途拨号全部落地后 resolve——resolve 即无无主连接。
  * 一切异常（拨号失败、写失败、调度循环内任何错误）都被捕获记录，绝不退出进程（健壮性硬性要求）。 */
 export function createDispatch({ dataDir, config, transport, self, log }) {
   const state = {
@@ -22,11 +24,13 @@ export function createDispatch({ dataDir, config, transport, self, log }) {
     outboxes: new Map(),
     entryIndex: new Map(),     // msgId → collabId（ack / 回报的归属查找）
     inFlight: new Set(),       // 单元键（一次只投一条）
+    pendingDials: new Set(),   // 在途拨号 promise（stop 收口等它们落地，不留无主连接）
     connections: new Map(),    // 单元键 → { connection, collabId, peer }
     pendingPings: new Map(),   // ping msgId → { resolve, startedAt, timer }
     counters: emptyCounters(),
     clientFrameRouter: null,
     timer: null,
+    stopped: false,            // 发送截止点：stop 置位、start 复位
   };
   return {
     start: () => start(state),
@@ -60,6 +64,10 @@ function emptyCounters() {
 }
 
 function start(state) {
+  if (state.timer !== null) {
+    return;   // 幂等：重复 start 不叠挂 interval——叠挂的 interval 会逃过 stop 的清理，停止后仍继续投递
+  }
+  state.stopped = false;   // start 即重新开闸：stop 之后再次启动，投递恢复
   ensureLoadedCollabs(state);
   state.timer = setInterval(() => {
     tick(state);
@@ -69,7 +77,11 @@ function start(state) {
   }
 }
 
-function stop(state) {
+/* 停止 = 发送截止点：置位后醒来的在途投递一律不发帧（完成即关连接），在途拨号由本层收口——
+ * transport.close() 兜不住这个窗口：它只遍历「已连上」的连接集，close() 之前尚未连上的拨号 socket 收不到，
+ * 连上后会成为没人跟踪的活连接。返回的 promise 在全部在途拨号落地后 resolve。 */
+async function stop(state) {
+  state.stopped = true;
   if (state.timer !== null) {
     clearInterval(state.timer);
     state.timer = null;
@@ -83,6 +95,7 @@ function stop(state) {
     pending.resolve(null);
   }
   state.pendingPings.clear();
+  await Promise.allSettled([...state.pendingDials]);
 }
 
 function send(state, { collabId, to, type, payload }) {
@@ -102,14 +115,45 @@ function send(state, { collabId, to, type, payload }) {
     return { ok: false, reason: '目标为本机实例，拒绝对自己投递' };
   }
   const msgId = newMsgId();
+  const ts = new Date().toISOString();
+  const payloadRejection = payloadRejectionOf(frameOf(state, collabId, { msgId, type, payload, createdAt: ts }));
+  if (payloadRejection !== null) {
+    state.counters.sendsRejected++;
+    return { ok: false, reason: payloadRejection };
+  }
   const outbox = outboxFor(state, collabId);
-  const result = outbox.enqueue({ msgId, to: { instanceId: to.instanceId, address: to.address }, type, payload, ts: new Date().toISOString() });
+  const result = outbox.enqueue({ msgId, to: { instanceId: to.instanceId, address: to.address }, type, payload, ts });
   if (!result.ok) {
     state.counters.sendsRejected++;
     return result;
   }
   state.entryIndex.set(msgId, collabId);
   return { ok: true, msgId, tier: 'queued' };
+}
+
+/* payload 预检（受理面）：形态与体积都以对端入站校验为准——非 plain object 的载荷会被对端按
+ * 「payload 须为 JSON 对象」拒收；体积超限的帧会被对端直接销毁，重试多少次都是同一结果。
+ * 这类条目恒为队头（headFor 只取最老 queued），后条永不发送：普通条目阻塞至过期，
+ * 治理类条目豁免过期则把单元永久钉死。体积按「整帧序列化字节数」计——与 transport 的入站检查
+ * 同一口径（载荷是唯一无界字段，但信封同样计入），保证本端受理的帧对端一定收得下。 */
+function payloadRejectionOf(frame) {
+  if (frame.payload !== undefined && !isPlainObject(frame.payload)) {
+    return 'payload 须为 JSON 对象（协议信封规则）：数组 / 字符串 / 数字 / null 会被对端拒收，本条永不送达';
+  }
+  try {
+    const bytes = Buffer.byteLength(JSON.stringify(frame));
+    if (bytes > MAX_FRAME_BYTES) {
+      return `帧体积 ${bytes} 字节超协议上限 ${MAX_FRAME_BYTES} 字节：对端会拒收并断开连接，本条永不送达`;
+    }
+  } catch (error) {
+    return `payload 无法序列化（${error.message}）：落盘与对端都无法处理，本条永不送达`;
+  }
+  return null;
+}
+
+/* 与 protocol 信封校验的「payload 须为 JSON 对象」同一形态判据（对象、非 null、非数组）。 */
+function isPlainObject(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 /* send 参数校验：任一不合法即返回统一拒绝原因（点名参数清单），合法返回 null。 */
@@ -192,7 +236,10 @@ async function ping(state, { address, port }) {
   /** @type {any} */
   let connection = null;
   try {
-    connection = await state.transport.dial({ address, port, timeoutMs: state.config.dialTimeoutMs });
+    connection = await dialPeer(state, { address, port, timeoutMs: state.config.dialTimeoutMs });
+    if (connection === null) {
+      return { reachable: false, reason: '探测中止：调度器已停止（拨号完成即关，不发探测帧）' };
+    }
     adopt(state, connection);
     const outcome = new Promise((resolve) => {
       const waitTimer = setTimeout(() => {
@@ -289,16 +336,28 @@ function startDelivery(state, key, collabId, outbox, peer, now) {
 }
 
 async function deliverHead(state, collabId, outbox, entry) {
+  const key = `${collabId}:${entry.to.instanceId}`;
+  let attempted = false;
   try {
-    const key = `${collabId}:${entry.to.instanceId}`;
     const connection = await obtainConnection(state, key, collabId, entry);
+    if (connection === null || state.stopped) {
+      return;   // 停止收口后醒来的投递：新拨号连接已就地关闭、复用连接已被 stop 关闭——不发帧、不计尝试
+    }
+    if (entry.state !== 'queued') {
+      closeConnectionIfIdle(state, collabId, entry.to.instanceId);   // await 期间已被 ack / 过期：不发帧、不计尝试
+      return;
+    }
     connection.send(frameOf(state, collabId, entry));
     state.counters.attempts++;
+    attempted = true;
   } catch (error) {
     state.counters.deliveryFailures++;
     state.log.warn('投递失败，按节律重试', { msgId: entry.msgId, peer: entry.to.instanceId, reason: error.message });
+    attempted = true;
   } finally {
-    outbox.markAttempt(entry.msgId, Date.now());   // 成功与失败都计一次尝试：失败也要退避，不得每 tick 重拨
+    if (attempted) {
+      outbox.markAttempt(entry.msgId, Date.now());   // 成功与失败都计一次尝试：失败也要退避，不得每 tick 重拨
+    }
   }
 }
 
@@ -311,7 +370,10 @@ async function obtainConnection(state, key, collabId, entry) {
     held.connection.close();  // 重试 = 半开嫌疑：重拨后再发
     state.connections.delete(key);
   }
-  const connection = await state.transport.dial({ address: entry.to.address, port: state.config.port, timeoutMs: state.config.dialTimeoutMs });
+  const connection = await dialPeer(state, { address: entry.to.address, port: state.config.port, timeoutMs: state.config.dialTimeoutMs });
+  if (connection === null) {
+    return null;   // 停止收口后才完成的拨号：连接已被收口关闭，不得登记、不得发帧
+  }
   adopt(state, connection);
   connection.onClose(() => {
     const current = state.connections.get(key);
@@ -321,6 +383,24 @@ async function obtainConnection(state, key, collabId, entry) {
   });
   state.connections.set(key, { connection, collabId, peer: entry.to.instanceId });
   return connection;
+}
+
+/* 拨号统一出口：在途拨号登记进 pendingDials，stop 之后完成的一律就地关闭并返回 null——
+ * 每个拨号 socket 都有确定的有界清理路径（不留无主连接），发送截止点也随之成立：
+ * 停止后完成的拨号走不到「登记 + 发帧」。调用方对 null 的约定是「不发帧、不计尝试」。 */
+async function dialPeer(state, options) {
+  const pending = state.transport.dial(options);
+  state.pendingDials.add(pending);
+  try {
+    const connection = await pending;
+    if (state.stopped) {
+      connection.close();
+      return null;
+    }
+    return connection;
+  } finally {
+    state.pendingDials.delete(pending);
+  }
 }
 
 function adopt(state, connection) {
@@ -365,11 +445,27 @@ function closeIdleConnections(state) {
 }
 
 function pruneAll(state, now) {
+  let recycled = 0;
   for (const outbox of state.outboxes.values()) {
     const result = outbox.prune(now);
+    recycled += result.dropped;
     if (result.expired.length > 0) {
       state.counters.expiredTotal += result.expired.length;
       state.log.warn('发送队列条目过期（未送达，查询入口可查）', { expired: result.expired });
+    }
+  }
+  if (recycled > 0) {
+    rebuildEntryIndex(state);   // 有回收才重建：稳态零开销
+  }
+}
+
+/* 索引回收：条目被队列回收后 msgId 不再有用，长驻进程不能留「只增不删」的映射慢增长。
+ * 按当前存活条目集重建等价于剔除陈旧项——索引只会因 send 与载入而写入，两者写的都是存活条目。 */
+function rebuildEntryIndex(state) {
+  state.entryIndex.clear();
+  for (const [collabId, outbox] of state.outboxes) {
+    for (const entry of outbox.entries()) {
+      state.entryIndex.set(entry.msgId, collabId);
     }
   }
 }

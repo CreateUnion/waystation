@@ -51,6 +51,7 @@ function createFakeConnection(address) {
 
 function createFakeTransport() {
   let nextDialFails = false;
+  let deferred = null;   // 挂起拨号：构造「stop / ack / 重入检查与在途拨号并发」的时间窗口
   const dials = [];
   const connections = [];
   return {
@@ -58,6 +59,14 @@ function createFakeTransport() {
     connections,
     setNextDialFails(value) {
       nextDialFails = value;
+    },
+    deferNextDial() {
+      const gate = {};
+      gate.completed = new Promise((resolve) => {
+        gate.release = resolve;
+      });
+      deferred = gate;
+      return gate;
     },
     setFrameHandler() {},
     stats: () => ({ fake: true }),
@@ -68,6 +77,11 @@ function createFakeTransport() {
       }
       const connection = createFakeConnection(address);
       connections.push(connection);
+      if (deferred !== null) {
+        const gate = deferred;
+        deferred = null;
+        return gate.completed.then(() => connection);
+      }
       return Promise.resolve(connection);
     },
   };
@@ -316,4 +330,149 @@ test('stats：计数齐备（投递/确认/回报/拒绝）', { timeout: 15000 }
   assert.equal(counters.ackedTotal, 1);
   assert.equal(counters.deliveredTotal, 1);
   assert.equal(counters.collabs, 1);
+});
+
+test('stop 与在途拨号并发：发送截止（不发帧）、连接收口关闭、stop resolve 后无残留', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const { dispatch } = makeDispatch(t, { transport });
+  t.after(() => dispatch.stop());
+  const sent = dispatch.send(target());
+  const gate = transport.deferNextDial();
+  dispatch.start();
+  await waitFor(() => transport.dials.length === 1);
+  const stopping = dispatch.stop();   // 停止时拨号仍在途
+  gate.release();                     // 停止之后拨号才完成
+  await stopping;                     // stop resolve 即代表收口完成
+  assert.equal(transport.connections.length, 1);
+  assert.equal(transport.connections[0].frames.length, 0, 'stop 后不得发帧（发送截止点）');
+  assert.equal(transport.connections[0].closed, true, '停止后完成的拨号必须被关闭（不留无主 socket）');
+  assert.equal(dispatch.deliveryStatus({ msgId: sent.msgId })[0].tier, 'queued', '未发送的条目保持可续投');
+  await new Promise((resolve) => setTimeout(resolve, 80));   // 数个 tick 的窗口
+  assert.equal(transport.dials.length, 1, '停止后不得再拨号（无残留调度）');
+  assert.equal(transport.connections[0].frames.length, 0, '停止后不得再投递');
+});
+
+test('stop 与 ping 在途拨号并发：探测中止、不发探测帧、连接关闭', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const { dispatch } = makeDispatch(t, { transport });
+  t.after(() => dispatch.stop());
+  const gate = transport.deferNextDial();
+  const pinging = dispatch.ping({ address: '127.0.0.1', port: 7321 });
+  await waitFor(() => transport.dials.length === 1);
+  const stopping = dispatch.stop();
+  gate.release();
+  await stopping;
+  const outcome = await pinging;
+  assert.equal(outcome.reachable, false);
+  assert.equal(transport.connections[0].frames.length, 0, '停止后不得发探测帧');
+  assert.equal(transport.connections[0].closed, true);
+});
+
+test('send 校验 payload：非对象 / 超体积 / 无法序列化一律拒绝且不入队', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const { dispatch } = makeDispatch(t, { transport });
+  for (const payload of ['文本', 42, [], null, true]) {
+    const rejected = dispatch.send(target({ payload }));
+    assert.equal(rejected.ok, false, String(payload));
+    assert.ok(rejected.reason.includes('payload'), String(payload));
+  }
+  const oversize = dispatch.send(target({ payload: { blob: 'x'.repeat(2 * 1024 * 1024) } }));
+  assert.equal(oversize.ok, false);
+  assert.ok(oversize.reason.includes('上限'));
+  const circular = {};
+  circular.self = circular;
+  const unserializable = dispatch.send(target({ payload: circular }));
+  assert.equal(unserializable.ok, false);
+  assert.ok(unserializable.reason.includes('序列化'));
+  assert.equal(dispatch.deliveryStatus({}).length, 0, '拒绝不产生任何队列条目');
+});
+
+test('投递 await 期间条目被 ack：不发帧、不计尝试（复查条目状态）', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const { dispatch } = makeDispatch(t, { transport });
+  t.after(() => dispatch.stop());
+  const sent = dispatch.send(target());
+  const gate = transport.deferNextDial();
+  dispatch.start();
+  await waitFor(() => transport.dials.length === 1);
+  dispatch.onAck(sent.msgId);   // 拨号在途时对端确认到达
+  assert.equal(dispatch.deliveryStatus({ msgId: sent.msgId })[0].tier, 'at-peer');
+  gate.release();
+  await waitFor(() => transport.connections[0].closed === true);
+  assert.equal(transport.connections[0].frames.length, 0, '已 ack 的条目不得再发一帧');
+  assert.equal(dispatch.deliveryStatus({ msgId: sent.msgId })[0].attempts, 0, '未发送的投递不计尝试');
+  assert.equal(dispatch.stats().attempts, 0);
+});
+
+test('start 幂等：重复 start 不叠挂 interval，stop 后无残留投递', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const { dispatch } = makeDispatch(t, { transport });
+  t.after(() => dispatch.stop());
+  dispatch.send(target());
+  dispatch.start();
+  await waitFor(() => transport.connections.length === 1 && transport.connections[0].frames.length === 1);
+  dispatch.start();   // 重复 start：不得再叠挂一个 interval
+  dispatch.stop();
+  const dialsAtStop = transport.dials.length;
+  const framesAtStop = transport.connections[0].frames.length;
+  await new Promise((resolve) => setTimeout(resolve, 200));   // 重传节律（60ms）的数倍窗口：叠挂的 interval 会在此投递
+  assert.equal(transport.dials.length, dialsAtStop, 'stop 后不得再拨号（无残留调度）');
+  assert.equal(transport.connections.length, 1, 'stop 后不得再建连接');
+  assert.equal(transport.connections[0].frames.length, framesAtStop, 'stop 后不得再发帧');
+});
+
+test('tick 异常隔离：调度循环内异常被捕获记录，调度继续运行（不退出进程）', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  // 长重传间隔 + 短保留期：让「过期后回收连接」成为首投之后的第一次关连接，注入的异常正落在这个 tick 上
+  const { dispatch, logs } = makeDispatch(t, { transport, config: testConfig({ messageTtlMs: 300, retryIntervalMs: 5000, retrySlowIntervalMs: 6000 }) });
+  t.after(() => dispatch.stop());
+  dispatch.send(target());
+  dispatch.start();
+  await waitFor(() => transport.connections.length === 1 && transport.connections[0].frames.length === 1);
+  const originalClose = transport.connections[0].close;
+  let throwPending = true;
+  transport.connections[0].close = function () {
+    if (throwPending) {
+      throwPending = false;
+      throw new Error('注入：连接关闭异常');
+    }
+    originalClose.call(this);
+  };
+  await waitFor(() => logs.some((entry) => entry.level === 'error' && entry.message.includes('调度循环异常')), { timeoutMs: 4000 });
+  const followUp = dispatch.send(target({ to: { instanceId: 'inst-c', address: '127.0.0.3' }, payload: { text: '丙' } }));
+  await waitFor(() => transport.connections.length === 2 && transport.connections[1].frames.length === 1, { timeoutMs: 2000 });
+  assert.equal(transport.connections[1].frames[0].msgId, followUp.msgId, '异常被隔离：后续 tick 照常投递');
+});
+
+test('inFlight 重入守卫：单元投递在途时 tick 不重复拨号（一次只投一条）', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  // 长重传间隔：把「在途窗口内的重复调度」与「按节律的重传」区分开
+  const { dispatch } = makeDispatch(t, { transport, config: testConfig({ retryIntervalMs: 5000, retrySlowIntervalMs: 6000 }) });
+  t.after(() => dispatch.stop());
+  const sent = dispatch.send(target());
+  const gate = transport.deferNextDial();
+  dispatch.start();
+  await waitFor(() => transport.dials.length === 1);
+  await new Promise((resolve) => setTimeout(resolve, 80));   // 数个 tick（20ms）：在途单元必须被跳过
+  assert.equal(transport.dials.length, 1, '投递在途时不得重复拨号');
+  gate.release();
+  await waitFor(() => transport.connections[0]?.frames.length === 1);
+  assert.equal(transport.connections.length, 1);
+  assert.equal(transport.connections[0].frames[0].msgId, sent.msgId);
+});
+
+test('索引回收：条目被队列回收后不再出现在状态查询，重建后的索引照常归属', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  transport.setNextDialFails(true);   // 不投递：只观察队列的过期与回收
+  const { dispatch } = makeDispatch(t, { transport, config: testConfig({ messageTtlMs: 200 }) });
+  t.after(() => dispatch.stop());
+  const first = dispatch.send(target({ payload: { text: '一' } }));
+  dispatch.start();
+  await waitFor(() => dispatch.deliveryStatus({ msgId: first.msgId })[0]?.expired, { timeoutMs: 4000 });
+  // 治理类条目豁免过期：回收事件发生时它仍存活，用于验证重建后的归属查找
+  const second = dispatch.send(target({ payload: { text: '二' }, type: 'freeze' }));
+  assert.equal(second.ok, true);
+  await waitFor(() => dispatch.deliveryStatus({ msgId: first.msgId }).length === 0, { timeoutMs: 5000 });
+  dispatch.onAck(second.msgId);
+  assert.equal(dispatch.deliveryStatus({ msgId: second.msgId })[0].tier, 'at-peer');
 });
