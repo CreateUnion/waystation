@@ -26,6 +26,41 @@ async function startFakeSessionInbox(t) {
   return { path, token: `tok-${randomUUID()}`, receivedText: () => Buffer.concat(chunks).toString('utf8') };
 }
 
+/* 站点进程的统一收尾：node:test 的 after 钩子按注册序执行，而临时目录的删除钩子由 makeTempDir 在其
+ * 调用点先行注册——「先关客户端并等站点退出、后删目录」要求收尾钩子先于任何 makeTempDir 注册，否则删除
+ * 会与存活站点的写盘（collabs/*、日志）并发，Windows 下 rmdir 撞上新建文件即 ENOTEMPTY 假红。
+ * 每个测试实例一份客户端清单（WeakMap 随测试上下文回收），钩子只注册一次。 */
+const clientsByTest = new WeakMap();
+
+function cleanupRegistryOf(t) {
+  let clients = clientsByTest.get(t);
+  if (clients === undefined) {
+    clients = [];
+    clientsByTest.set(t, clients);
+    t.after(async () => {
+      for (const client of clients) {
+        await closeStation(client);
+      }
+    });
+  }
+  return clients;
+}
+
+/* 客户端已关（含用例中显式关闭）则忽略重复关闭；否则关闸并等站点进程退出——等完才轮到目录删除钩子。 */
+async function closeStation(client) {
+  try {
+    await client.close();
+  } catch {
+    // 用例中已显式关闭：忽略重复关闭
+  }
+}
+
+/* 站点数据目录：收尾钩子必须抢在 makeTempDir 的删除钩子前注册（见上）。 */
+function makeStationDir(t) {
+  cleanupRegistryOf(t);
+  return makeTempDir(t);
+}
+
 /* 真实组合根 + 假会话收件箱 + SDK 客户端：与生产装配同参（唯一差异 = 消息套接字指向假收件箱）。
  * 端口与数据目录经预写配置 + WAYSTATION_HOME 注入（显式目录模式，与 server.test.js 同法）。 */
 async function startStation(t, { home, port, inbox }) {
@@ -37,13 +72,7 @@ async function startStation(t, { home, port, inbox }) {
     env: { ...process.env, WAYSTATION_HOME: home, CLAUDE_CODE_MESSAGING_SOCKET: inbox.path, CLAUDE_CODE_MESSAGING_TOKEN: inbox.token },
   });
   const client = new Client({ name: 'waystation-m4-e2e', version: '0.0.0' });
-  t.after(async () => {
-    try {
-      await client.close();
-    } catch {
-      // 用例中已显式关闭：忽略重复关闭
-    }
-  });
+  cleanupRegistryOf(t).push(client);   // 清单先于 connect：启动中途失败的站点也纳管
   await client.connect(transport);
   return client;
 }
@@ -72,8 +101,8 @@ async function waitState(client, collabId, state) {
 }
 
 async function startTemporaryStudio(t, { name, topic }) {
-  const homeA = makeTempDir(t);
-  const homeB = makeTempDir(t);
+  const homeA = makeStationDir(t);
+  const homeB = makeStationDir(t);
   const portA = await pickFreePort();
   const portB = await pickFreePort();
   const inboxA = await startFakeSessionInbox(t);
@@ -99,10 +128,18 @@ test('验收预演：邀请→同意→对话→看台账（双真实实例全�
   assert.equal((await callTool(b, 'ws_approve_invite', { collabId, approve: true })).isError, false);
   await waitState(a, collabId, 'active');
   await waitState(b, collabId, 'active');
+  const preSendLength = inboxB.receivedText().length;   // 对话消息的增量边界：断言只锚发送后新增的帧
   const sent = await callTool(a, 'ws_send_message', { collabId, text: '请查收联调事项' });
-  assert.equal(sent.payload.tier, 'queued');
+  assert.equal(sent.isError, false, String(sent.payload));
+  assert.equal(sent.payload.results[0].ok, true, '目标在册：消息已受理入队');
   await waitFor(() => (inboxB.receivedText().includes('请查收联调事项') ? true : null), { timeoutMs: 20000 });
-  assert.ok(inboxB.receivedText().includes(`协作：${collabId}`));
+  const chatFrame = inboxB.receivedText().slice(preSendLength).split('【驿站｜另一会话发来的协作消息】').find((part) => part.includes('请查收联调事项'));
+  assert.ok(chatFrame !== undefined && chatFrame.includes(`协作：${collabId}`), '对话消息自身的上下文头含协作标识');
+  /* 档位真值（设计 §10 三档）：对方会话收到后投递回报回传，本侧档位由 queued 推进到 session */
+  await waitFor(async () => {
+    const row = (await callTool(a, 'ws_delivery_status', { msgId: sent.payload.msgId })).payload[0];
+    return row !== undefined && row.tier === 'session' ? true : null;
+  }, { timeoutMs: 20000 });
   assert.equal((await callTool(b, 'ws_send_message', { collabId, text: '收到，开始处理' })).isError, false);
   await waitFor(() => (inboxA.receivedText().includes('收到，开始处理') ? true : null), { timeoutMs: 20000 });
   const viewed = await callTool(b, 'ws_view_ledger', { collabId });
@@ -143,7 +180,8 @@ test('验收预演：离线续投（乙关会话 → 排队 → 重开续投至�
   await b.close();
   await waitForRebindable(portB);
   const sent = await callTool(a, 'ws_send_message', { collabId, text: '离线期间的事项' });
-  assert.equal(sent.payload.tier, 'queued');
+  assert.equal(sent.isError, false, String(sent.payload));
+  assert.equal(sent.payload.results[0].ok, true, '对方离线但端点已知：消息仍被受理入队');
   const queued = await callTool(a, 'ws_delivery_status', { msgId: sent.payload.msgId });
   assert.equal(queued.payload[0].tier, 'queued', '对方离线：维持在排队档，不误报');
   const inboxB2 = await startFakeSessionInbox(t);
