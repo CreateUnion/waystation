@@ -9,7 +9,7 @@ const STANDARD_FILE = join(repoRoot, 'docs', '编码规范.md');
 test('编码规范文档存在、非空、含必备章节', () => {
   const text = readFileSync(STANDARD_FILE, 'utf8');
   assert.ok(text.length > 1000, '编码规范文档不得为占位空壳');
-  for (const heading of ['样板文件', '命名', '函数结构', '注释', '错误处理', '数据结构', '测试', '工具化']) {
+  for (const heading of ['样板文件', '命名', '函数结构', '注释', '错误处理', '数据结构', '测试', '工具化', '分层边界', '空值惯例', '错误惯例', '命名后缀']) {
     assert.ok(text.includes(`## ${heading}`) || text.includes(`# ${heading}`) || text.includes(`## ${heading} `), `缺少必备章节：${heading}`);
   }
 });
