@@ -31,23 +31,58 @@ async function startFakeSessionInbox(t, { reject = false } = {}) {
   return { path, receivedText: () => Buffer.concat(chunks).toString('utf8') };
 }
 
+/* 站点进程的统一收尾：node:test 的 after 钩子按注册序执行，而临时目录的删除钩子由 makeTempDir 在其
+ * 调用点先行注册——「先终止站点并等其退出、后删目录」要求收尾钩子先于任何 makeTempDir 注册，否则删除
+ * 会与存活站点的写盘（collabs/*、日志）并发，Windows 下 rmdir 撞上新写入即 ENOTEMPTY 假红。
+ * 每个测试实例一份节点清单（WeakMap 随测试上下文回收），钩子只注册一次。 */
+const nodesByTest = new WeakMap();
+
+function cleanupRegistryOf(t) {
+  let nodes = nodesByTest.get(t);
+  if (nodes === undefined) {
+    nodes = [];
+    nodesByTest.set(t, nodes);
+    t.after(async () => {
+      for (const node of nodes) {
+        await stopNode(node);
+      }
+    });
+  }
+  return nodes;
+}
+
+/* 进程已退出（含被强杀）则无操作；否则终止并等 exit 落地——等完才轮到目录删除钩子。 */
+async function stopNode(node) {
+  const child = node.child;
+  if (child === null || child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+  const exited = new Promise((resolve) => child.once('exit', resolve));
+  child.kill();
+  await exited;
+}
+
+/* 复用目录的用例（离线补投 / 重启收敛）建目录也走这里：收尾钩子必须抢在 makeTempDir 的删除钩子前注册。 */
+function makeNodeDir(t) {
+  cleanupRegistryOf(t);
+  return makeTempDir(t);
+}
+
 /* 本机双进程预演（跨机的本机近似）：两个真实进程、真实套接字、回环双地址同端口。
  * 单播兜底的目标地址正是这样喂进「已知主机清单」的——与生产路径同一机制（PoC 实测：
  * 广播单向盲区正是靠清单里的地址反向补偿）。 */
 async function startNode(t, { identityName, bindAddress, port, knownPeers = [], dataDir: reusedDir, adapter = false, env = {} }) {
+  const node = { child: null, pending: [], ready: null, stderr: '' };
+  cleanupRegistryOf(t).push(node);   // 先登记收尾（见 nodesByTest 注释），再让 makeTempDir 注册删除
   const dataDir = reusedDir ?? makeTempDir(t);   // 复用数据目录 = 同一实例标识（跨重启场景）
   writeNodeConfig(dataDir, { identityName, port });
-  const child = spawn(process.execPath, [FIXTURE, JSON.stringify({ dataDir, bindAddress, knownPeers, adapter })], {
+  node.child = spawn(process.execPath, [FIXTURE, JSON.stringify({ dataDir, bindAddress, knownPeers, adapter })], {
     cwd: repoRoot,
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, ...env },
   });
-  const node = { child, pending: [], ready: null, stderr: '' };
   wireNodeOutput(node);
   attachCommand(node);
-  t.after(() => {
-    child.kill();
-  });
   await waitFor(() => node.ready !== null, { timeoutMs: 10000 });
   assert.equal(node.ready.bind.ok, true, JSON.stringify(node.ready.bind));
   return node;
@@ -204,7 +239,7 @@ test('第二档语义：对端会话写入失败 → 维持「已到对方驿站
 
 test('离线排队 + 补投 + 保序：对端未启动时排队，启动后按发送序送达', { timeout: 60000 }, async (t) => {
   const port = await pickFreePort();
-  const bDir = makeTempDir(t);
+  const bDir = makeNodeDir(t);
   // 先起一次乙取实例标识与地址归属，再让它退出——重启时复用数据目录（实例标识不变）
   const probe = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, dataDir: bDir });
   const peerId = probe.ready.instanceId;
@@ -238,8 +273,8 @@ test('离线排队 + 补投 + 保序：对端未启动时排队，启动后按�
 
 test('重启收敛（故障注入）：强杀不丢队列，以原数据目录重建后补投至终态', { timeout: 60000 }, async (t) => {
   const port = await pickFreePort();
-  const aDir = makeTempDir(t);
-  const bDir = makeTempDir(t);
+  const aDir = makeNodeDir(t);
+  const bDir = makeNodeDir(t);
   // 先起一次乙取实例标识，再让它退出——重启时复用数据目录（实例标识不变），仍是「同一个乙」
   const probe = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, dataDir: bDir });
   const peerId = probe.ready.instanceId;
