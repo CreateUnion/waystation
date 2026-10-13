@@ -209,6 +209,31 @@ export function sendMessageTool() {
   };
 }
 
+export function setMuteTool() {
+  return {
+    name: 'ws_set_mute',
+    description: '设置或取消某条协作 / 讨论的静音（纯本地行为开关、不广播、对端无感）：静音期实时内容（讨论帖、协作内容消息）不再注入本会话——经查看器 / ws_check_inbox / ws_view_ledger 补看；结束、邀请与治理等待办照常注入；取消静音时给一行「静音期间新增 N 条」摘要；静音状态持久（跨会话不丢）',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        collabId: { type: 'string', description: '本机参与的协作标识（取自 ws_list_collabs）' },
+        muted: { type: 'boolean', description: 'true 进入静音 / false 取消静音（必填）' },
+      },
+      required: ['collabId', 'muted'],
+    },
+    handler: async (args, context) => {
+      const collabId = collabIdArg(args);
+      if (collabId === null) {
+        return errorResult('参数 collabId 非法：需要非空白字符串');
+      }
+      if (typeof args.muted !== 'boolean') {
+        return errorResult('参数 muted 非法：需要布尔值（true 进入静音 / false 取消静音）');
+      }
+      return resultOf(await context.collab.setMute({ collabId, muted: args.muted }));
+    },
+  };
+}
+
 export function leaveCollabTool() {
   return {
     name: 'ws_leave_collab',
@@ -251,7 +276,7 @@ export function endCollabTool() {
   };
 }
 
-/* 工具返回口径（17 工具单一权威）：成功 = 顶层含 ok:true 的 JSON 对象（列表载荷用命名字段承载：
+/* 工具返回口径（18 工具单一权威）：成功 = 顶层含 ok:true 的 JSON 对象（列表载荷用命名字段承载：
  * hosts / rows / collabs）；失败 = errorResult 纯文案 + isError。新增工具一律照此。 */
 export function okResult(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
