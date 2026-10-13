@@ -1,8 +1,9 @@
-import { MAX_FRAME_BYTES } from '../net/protocol.js';
+import { MAX_FRAME_BYTES, MAX_TOPIC_CHARS, isPresentationText } from '../net/protocol.js';
 import { isPostEntryShape, displayOrderOf } from './posts.js';
 import { foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, persistMember, selfJoinedOf } from './local.js';
 import { applyEndpoint, checkRelayRecovery, endpointFor, mutateLedger, notifyLocal, startJoinReplay, stopJoinReplay, stopJoinReplays } from './outgoing.js';
 import { foldMemberEvents } from './members.js';
+import { isPeerShape, isTimestamp } from './model.js';
 
 /* 讨论模式的拉取机制（真对账）与成员收敛（设计 §5.3/§5.4/§5.5）：
  * - 同步游标只由拉取推进（直投到位的帖只进本地列表、不动游标——漏段不会被游标跳过）；
@@ -423,28 +424,45 @@ function mergeForumMeta(state, local, meta) {
   }
 }
 
+/* 元状态学习的逐字段判据 = 加载面同一权威（model.isPeerShape / model.isTimestamp /
+ * protocol.isPresentationText——端口与协作层的形态底线本就是同一套）：不满足不学入、不改写并
+ * 计数。为什么必须与加载面同口径：学习面若宽于加载面，一帧可达面内的 bundle 就能把坏值学入并
+ * 持久化，重启时该协作整条记录被按坏数据跳过（loadFailures），而「只补不覆」使坏值粘性不可
+ * 自愈——网络数据不得成为「重启即跳过」的源头。 */
 function mergeForumFacts(state, local, meta) {
   let changed = false;
-  if (local.member.topic === undefined && typeof meta.topic === 'string') {
-    local.member.topic = meta.topic;
+  if (local.member.topic === undefined && meta.topic !== undefined) {
+    if (isPresentationText(meta.topic, MAX_TOPIC_CHARS)) {
+      local.member.topic = meta.topic;
+      changed = true;
+    } else {
+      state.counters.forumMetaRejected++;
+    }
+  }
+  if (learnForumOriginator(state, local, meta)) {
     changed = true;
   }
-  if (learnForumOriginator(local, meta)) {
-    changed = true;
-  }
-  if (mergeForumStamps(local, meta)) {
+  if (mergeForumStamps(state, local, meta)) {
     changed = true;
   }
   return changed;
 }
 
-/* 成立/结束时刻的单调合并（取更早者——终态时刻取最早的既有口径）。 */
-function mergeForumStamps(local, meta) {
+/* 成立/结束时刻的单调合并（取更早者——终态时刻取最早的既有口径）；坏时间戳不学入并计数。 */
+function mergeForumStamps(state, local, meta) {
   const learned = { ...(local.member.forumMeta ?? {}) };
   let changed = false;
   for (const field of ['createdAt', 'establishedAt', 'endedAt']) {
-    if (typeof meta[field] === 'string' && (learned[field] === undefined || meta[field] < learned[field])) {
-      learned[field] = meta[field];
+    const value = meta[field];
+    if (value === undefined) {
+      continue;
+    }
+    if (!isTimestamp(value)) {
+      state.counters.forumMetaRejected++;
+      continue;
+    }
+    if (learned[field] === undefined || value < learned[field]) {
+      learned[field] = value;
       changed = true;
     }
   }
@@ -455,13 +473,16 @@ function mergeForumStamps(local, meta) {
 }
 
 /* 发起人实例标识（中继归属）只补不覆：发起人恒不随讨论变——已学得者不被后续来源改写；
- * 迟到成员与敲门入群者经 bundle 元状态补学中继归属（设计 §5.3 携带面）。 */
-function learnForumOriginator(local, meta) {
+ * 迟到成员与敲门入群者经 bundle 元状态补学中继归属（设计 §5.3 携带面）。形态与加载面同判据
+ * （isPeerShape）；自指值（instanceId === self）拒绝——发起人恒为他人他机，自指只可能来自
+ * 伪造或损坏，学入会让本机把自己当中继。 */
+function learnForumOriginator(state, local, meta) {
   const originator = meta.originator;
-  if (local.member.originator !== undefined || !isPlainObject(originator)) {
+  if (local.member.originator !== undefined || originator === undefined) {
     return false;
   }
-  if (typeof originator.instanceId !== 'string' || typeof originator.identityName !== 'string') {
+  if (!isPeerShape(originator) || originator.instanceId === state.self.instanceId) {
+    state.counters.forumMetaRejected++;
     return false;
   }
   local.member.originator = { instanceId: originator.instanceId, identityName: originator.identityName };

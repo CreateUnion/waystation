@@ -5,6 +5,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { collabDir, collabFilePath } from '../src/paths.js';
 import { makeTempDir, waitFor } from './helpers.js';
 import { createCollabService } from '../src/collab/service.js';
+import { MEMBERS_FILE_NAME } from '../src/collab/members.js';
 import { createDispatch } from '../src/net/dispatch.js';
 import { createInbound } from '../src/net/inbound.js';
 
@@ -783,3 +784,122 @@ test('聚合捎回：原作者端点未知 → 跳过并计数（不臆造地址
   a.service.relayReport({ collabId: 'collab-absent', originMsgId: 'origin-unknown', author: { instanceId: 'inst-ghost', identityName: '幽灵' } });
   assert.equal(a.service.stats().relayReportSkipped, 1, '非本机在册协作不臆造（防御面：跳过不计）');
 });
+
+/* —— 元状态学习面与加载面同判据（复评 Important-1：学习面宽于加载面 → 坏值落盘 → 重启跳过） —— */
+
+/* 拉取应答帧的最小合法形态（载荷过协议层；meta 只过 isPlainObject——正是坏值可乘之面）。 */
+function bundleFrameOfNet(collabId, from, meta, members = []) {
+  return collabFrame('history-bundle', collabId, from, { cursor: null, more: false, posts: [], overlap: [], meta, members, endpoints: {} });
+}
+
+test('元状态学习面：坏 originator/stamps 不学入不落盘——重启照常加载（loadFailures=0）', async (t) => {
+  const made = makeService(t, { self: SELF_B });
+  const collabId = `collab-learn-${randomUUID()}`;
+  await receive(made.service, collabFrame('invite', collabId, SELF_A, {
+    name: '讨论学', topic: '议题', mode: 'forum',
+    members: [SELF_A, SELF_B].map((seat) => ({ instanceId: seat.instanceId, identityName: seat.identityName })),
+  }));
+  await made.service.approve({ collabId, approve: true });
+  const admitted = await receive(made.service, bundleFrameOfNet(collabId, SELF_A, {
+    name: '讨论学', state: 'active', topic: '坏\u0007主题',
+    originator: { instanceId: 'bad id!', identityName: '主机甲' },
+    createdAt: 'not-a-time',
+  }));
+  assert.equal(admitted.ok, true, 'bundle 本身合法受理（坏值只在不学入）');
+  const member = JSON.parse(readFileSync(collabFilePath(made.dir, collabId, 'member.json'), 'utf8'));
+  assert.equal(member.originator, undefined, '坏 originator 不学入（不落盘）');
+  assert.equal(member.topic, '议题', '坏 topic 不改写既有值');
+  assert.equal(member.forumMeta, undefined, '坏时间戳不学入');
+  assert.equal(made.service.stats().forumMetaRejected, 2, '逐字段计数（originator + createdAt；topic 已有值不参与学习）');
+  const reloaded = makeLoadService(made.dir);
+  assert.equal(reloaded.stats().loadFailures, 0, '重启照常加载（网络坏值未成为「重启即跳过」的源头）');
+  assert.equal(reloaded.list().collabs.length, 1);
+});
+
+test('元状态学习面：坏 topic（记录缺省）不学入；自指 originator 拒绝；三者逐一计数', async (t) => {
+  const dir = makeTempDir(t);
+  const collabId = 'collab-legacy';
+  writeLegacyMemberRecord(dir, collabId);
+  const service = createCollabService({
+    dataDir: dir,
+    config: { inviteTtlMs: DAY },
+    self: SELF_B,
+    send: () => ({ ok: true, msgId: 'q-legacy' }),
+    sendDirect: null,
+    probe: null,
+    knownHosts: { remember: () => {} },
+    log: quietLog(),
+  });
+  await receive(service, bundleFrameOfNet(collabId, SELF_A, {
+    name: '讨论旧', state: 'active', topic: '坏\u0007主题',
+    originator: { instanceId: SELF_B.instanceId, identityName: SELF_B.identityName },
+    establishedAt: 42,
+  }));
+  const member = JSON.parse(readFileSync(collabFilePath(dir, collabId, 'member.json'), 'utf8'));
+  assert.equal(member.topic, undefined, '坏 topic 不学入（保持缺失）');
+  assert.equal(member.originator, undefined, '自指 originator 拒绝（发起人恒为他人他机）');
+  assert.equal(member.forumMeta, undefined, '坏时间戳不学入');
+  assert.equal(service.stats().forumMetaRejected, 3, '三个坏字段逐一计数');
+});
+
+test('元状态学习面：合法值照旧学入（只补不覆回归）；重启加载完整', async (t) => {
+  const dir = makeTempDir(t);
+  const collabId = 'collab-legacy';
+  writeLegacyMemberRecord(dir, collabId);
+  const service = createCollabService({
+    dataDir: dir,
+    config: { inviteTtlMs: DAY },
+    self: SELF_B,
+    send: () => ({ ok: true, msgId: 'q-legacy-ok' }),
+    sendDirect: null,
+    probe: null,
+    knownHosts: { remember: () => {} },
+    log: quietLog(),
+  });
+  const createdAt = '2026-10-13T00:00:00.000Z';
+  await receive(service, bundleFrameOfNet(collabId, SELF_A, {
+    name: '讨论旧', state: 'active', topic: '议题二',
+    originator: { instanceId: SELF_A.instanceId, identityName: SELF_A.identityName },
+    createdAt,
+    establishedAt: '2026-10-13T01:00:00.000Z',
+  }));
+  const member = JSON.parse(readFileSync(collabFilePath(dir, collabId, 'member.json'), 'utf8'));
+  assert.equal(member.topic, '议题二', '合法 topic 学入（记录缺省时补学）');
+  assert.deepEqual(member.originator, { instanceId: SELF_A.instanceId, identityName: SELF_A.identityName }, '合法 originator 学入');
+  assert.deepEqual(member.forumMeta, { createdAt, establishedAt: '2026-10-13T01:00:00.000Z' }, '合法时间戳学入');
+  assert.equal(service.stats().forumMetaRejected, 0, '合法值不计数');
+  /* 只补不覆：更晚的合法值不改写已学得字段。 */
+  await receive(service, bundleFrameOfNet(collabId, SELF_A, { name: '讨论旧', state: 'active', topic: '议题三', createdAt: '2026-10-14T00:00:00.000Z' }));
+  const again = JSON.parse(readFileSync(collabFilePath(dir, collabId, 'member.json'), 'utf8'));
+  assert.equal(again.topic, '议题二', '只补不覆：已学得 topic 不被后续来源改写');
+  assert.equal(again.forumMeta.createdAt, createdAt);
+  const reloaded = makeLoadService(dir);
+  assert.equal(reloaded.stats().loadFailures, 0, '合法记录重启加载完整');
+  assert.equal(reloaded.list().collabs.length, 1);
+});
+
+/* 旧形态成员记录（缺 topic/originator/forumMeta；本机已在折叠表内——写一条自己的 join 事件）。 */
+function writeLegacyMemberRecord(dir, collabId) {
+  mkdirSync(collabDir(dir, collabId), { recursive: true });
+  writeFileSync(collabFilePath(dir, collabId, 'member.json'), JSON.stringify({
+    collabId,
+    role: 'member',
+    state: 'active',
+    name: '讨论旧',
+    mode: 'forum',
+    manager: { instanceId: SELF_A.instanceId, identityName: SELF_A.identityName },
+    roster: [
+      { instanceId: SELF_A.instanceId, identityName: SELF_A.identityName },
+      { instanceId: SELF_B.instanceId, identityName: SELF_B.identityName },
+    ],
+    endpoints: {},
+    decision: 'approved',
+  }));
+  writeFileSync(collabFilePath(dir, collabId, MEMBERS_FILE_NAME), `${JSON.stringify({
+    eventId: randomUUID(),
+    kind: 'join',
+    instanceId: SELF_B.instanceId,
+    identityName: SELF_B.identityName,
+    ts: '2026-10-13T00:00:00.000Z',
+  })}\n`);
+}

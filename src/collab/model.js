@@ -304,7 +304,9 @@ function isEndpointShape(endpoint) {
   return isPort(endpoint.port);
 }
 
-function isPeerShape(peer) {
+/* 身份对 / 时间戳判据（导出：讨论元状态的学习面与加载面共用同一权威——学习面若宽于加载面，
+ * 网络数据会被学入并持久化，重启时整条协作记录按坏数据被跳过且无自愈）。 */
+export function isPeerShape(peer) {
   return isPlainObject(peer) && isIdLike(peer.instanceId) && isIdentityName(peer.identityName);
 }
 
@@ -316,6 +318,6 @@ function isIdLike(value) {
   return typeof value === 'string' && ID_PATTERN.test(value);
 }
 
-function isTimestamp(value) {
+export function isTimestamp(value) {
   return typeof value === 'string' && value.length <= 40 && !Number.isNaN(Date.parse(value));
 }

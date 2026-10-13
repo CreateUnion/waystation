@@ -425,6 +425,7 @@ function emptySyncCounters() {
     syncRollbacks: 0,
     syncPostsBackfilled: 0,
     syncPostsRejected: 0,
+    forumMetaRejected: 0,     // 学习面拒绝的坏元状态字段数（与加载面同判据——网络坏值不落盘）
     syncEventsIn: 0,
     syncTerminalsIn: 0,
     syncNoPeer: 0,
