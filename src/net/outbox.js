@@ -1,7 +1,7 @@
 import { collabDir, collabFilePath, ensureDir } from '../paths.js';
 import { ANCHOR_PORT } from '../site.js';
 import { appendLine, loadLines, replaceFile } from '../storage.js';
-import { GOVERNANCE_TYPES, isPort } from './protocol.js';
+import { DELIVERY_EXEMPT_TYPES, isPort } from './protocol.js';
 
 export const OUTBOX_FILE_NAME = 'outbox.jsonl';
 const STATES = ['queued', 'acked', 'session', 'expired'];
@@ -15,7 +15,8 @@ const COMPACT_LINE_FACTOR = 2;
  * 形态 = 追加写的状态快照流（每次状态推进追加一条完整条目），加载时按 msgId 折叠（后写胜）；
  * 折叠出的历史行在加载与清理后就地压缩（整体替换写回），文件增长有界。
  * 状态机：queued（未确认）→ acked（对方驿站已确认）→ session（已投进对方会话，终态）；
- * queued/acked 超保留期 → expired（终态，提示发送方）；治理类在未终态前豁免容量与过期（设计 §9/§10）。 */
+ * queued/acked 超保留期 → expired（终态，提示发送方）；豁免类（治理通告 + 讨论 end/join/leave，
+ * 设计 §5.5）在未终态前豁免容量与过期。 */
 /* 记录 to 含「地址:端口」——多站点下拨号目标必须写全；旧记录无 port 字段按锚点端口解释：
  * 本文件没有版本字段，旧记录来自单站点时代：默认配置下语义等价，故按默认端口兜底而不做文件级迁移。 */
 export function createOutbox({ dataDir, collabId, config, log }) {
@@ -111,8 +112,9 @@ function headFor(state, peerInstanceId) {
 }
 
 function enqueue(state, { msgId, to, type, payload, ts, from }) {
-  const governance = GOVERNANCE_TYPES.includes(type);
-  // 配额只统计非治理类未完成条目：治理积压不得挤占普通消息的名额（治理类任何时刻可入队）
+  /* governance = 投递豁免标记（持久化字段名沿用）：治理类 + 讨论的 end/join/leave（设计 §5.5）。 */
+  const governance = DELIVERY_EXEMPT_TYPES.includes(type);
+  // 配额只统计非豁免类未完成条目：豁免类积压不得挤占普通消息的名额（豁免类任何时刻可入队）
   if (!governance && unfinishedOf(state).filter((entry) => !entry.governance).length >= state.config.queueMaxPerCollab) {
     return { ok: false, reason: `该协作待投队列已满（上限 ${state.config.queueMaxPerCollab} 条），等待送达或过期后再试` };
   }
@@ -211,7 +213,7 @@ function reassignPeer(state, peerInstanceId, to) {
   return { moved };
 }
 
-/* 未完成条目超保留期 → 置 expired 并落盘（治理类在未终态前豁免）；返回是否本次转为过期。 */
+/* 未完成条目超保留期 → 置 expired 并落盘（豁免类在未终态前豁免）；返回是否本次转为过期。 */
 function expireIfStale(state, entry, now) {
   if (entry.governance) {
     return false;

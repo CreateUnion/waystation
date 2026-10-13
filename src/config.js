@@ -44,6 +44,8 @@ const FIELD_RULES = {
   takeoverWindowMs: { check: (value) => Number.isInteger(value) && value >= 200 && value <= 600000, reason: '需为 200–600000 的整数（毫秒）' },
   // 冻结无裁定的单方处置提示时限（设计 §6 默认 48 小时）
   freezeUnresolvedMs: { check: (value) => Number.isInteger(value) && value >= 60000 && value <= 30 * DAY_MS, reason: '需为 60000–2592000000 的整数（毫秒，上限 30 天）' },
+  // 讨论的周期对表节拍（设计 §5.4 anti-entropy 默认 60s 可配）
+  forumSyncIntervalMs: { check: (value) => Number.isInteger(value) && value >= 1000 && value <= 3600000, reason: '需为 1000–3600000 的整数（毫秒）' },
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -97,6 +99,8 @@ export function buildDefaults(hostName, options = {}) {
     managerOfflineMs: 120000,
     takeoverWindowMs: 30000,
     freezeUnresolvedMs: 48 * 60 * 60 * 1000,
+    // 讨论的周期对表节拍（设计 §5.4 明文默认 60s）：落后方按此节拍拉增量、对账与重播。
+    forumSyncIntervalMs: 60000,
   };
 }
 

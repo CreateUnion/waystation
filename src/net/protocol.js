@@ -32,7 +32,9 @@ export function isCollabMode(value) {
 /* 消息类型最小集（设计 §10）+ 投递可靠性所必需的确认帧 ack。
  * 类型集是两端契约：未知类型一律拒绝（版本不匹配或伪造）。
  * post = 讨论模式的帖通道（设计 §5.2：帧 type = 通道类别、kind = 语义徽标）——
- * 本表是 managed 与讨论两模式的并集（帖载荷只校并集形态，模式语义归协作层）。 */
+ * 本表是 managed 与讨论两模式的并集（帖载荷只校并集形态，模式语义归协作层）。
+ * join = 讨论模式的成员加入事件（成立/加入双义通告，设计 §5.1/§5.4）；
+ * history-request / history-bundle = 拉取两件套（回填与真对账同一机制，设计 §5.3）。 */
 export const MESSAGE_TYPES = [
   'invite', 'approve', 'decline', 'withdraw',
   'topic', 'task', 'progress', 'issue', 'stop', 'reply',
@@ -40,6 +42,7 @@ export const MESSAGE_TYPES = [
   'ping', 'pong', 'delivery-status',
   'snapshot',
   'post',
+  'join', 'history-request', 'history-bundle',
   'ack',
 ];
 
@@ -49,6 +52,11 @@ export const POST_KINDS = ['topic', 'task', 'progress', 'issue', 'stop', 'reply'
 
 /* 治理类通告（设计 §10 路由例外清单 + §9 takeover 豁免明示）：重试直至送达、豁免队列上限与过期。 */
 export const GOVERNANCE_TYPES = ['freeze', 'unfreeze', 'decision', 'takeover-init', 'takeover'];
+
+/* 投递豁免扩展（设计 §5.5）：讨论的 end / join / leave 是广播型控制事件，沿治理通告先例豁免
+ * TTL 与队列上限（离线者另经对表从 bundle 元状态 / 成员事件集学到——豁免保证在线的迟到者不丢）。
+ * 拉取两件套（history-*）为短生命周期请求-应答，明确**不泛化豁免**：无应答即换源或下轮对表。 */
+export const DELIVERY_EXEMPT_TYPES = [...GOVERNANCE_TYPES, 'end', 'join', 'leave'];
 
 /* 传输类帧不带 collabId（可达性探测与链路确认没有协作归属）；其余类型均属协作域、必须携带。 */
 export const TRANSPORT_TYPES = ['ping', 'pong', 'ack'];
@@ -285,8 +293,11 @@ const COLLAB_PAYLOAD_RULES = {
   takeover: validateTakeoverPayload,
   snapshot: validateSnapshotPayload,
   post: validatePostPayload,
+  join: validateMemberEventPayload,
+  'history-request': validateHistoryRequestPayload,
+  'history-bundle': validateHistoryBundlePayload,
   end: validateOptionalObjectPayload,
-  leave: validateOptionalObjectPayload,
+  leave: validateLeavePayload,
 };
 
 function validateInvitePayload(payload) {
@@ -302,7 +313,20 @@ function validateInvitePayload(payload) {
   if (!isPresentationText(payload.topic, MAX_TOPIC_CHARS)) {
     return refuse(`invite.topic 非法（≤${MAX_TOPIC_CHARS} 字符的呈现文本）`);
   }
-  return validateMemberList(payload.members, 'invite.members');
+  const members = validateMemberList(payload.members, 'invite.members');
+  if (!members.ok) {
+    return members;
+  }
+  /* endpoints（可选加法字段，讨论邀请携带）：现成员端点表，被邀者据此取得入群所需的寻址信息。
+   * 缺省不拒（managed 与旧版邀请不带）；存在则逐项过端点形态。 */
+  return optionalInviteEndpointsRejection(payload.endpoints);
+}
+
+function optionalInviteEndpointsRejection(endpoints) {
+  if (endpoints === undefined) {
+    return { ok: true };
+  }
+  return bundleEndpointsRejection(endpoints, 'invite.endpoints') ?? { ok: true };
 }
 
 /* 名单形态（invite / freeze / unfreeze / decision 共用）：2–上限项、每项 instanceId 合法且唯一；
@@ -417,6 +441,271 @@ function validatePostPayload(payload) {
     return refuse(`post.text 非法（非空、≤${MAX_MESSAGE_TEXT_CHARS} 字符）`);
   }
   return { ok: true };
+}
+
+/* —— 讨论模式的成员事件与拉取两件套（设计 §5.3/§5.4）—— */
+
+/* 成员事件载荷（join；leave 的可选扩展字段同形）：唯一事件 id + 成员自身单调时刻。
+ * 事件 id 是并集合并的去重键（重播/重复路径天然幂等）；时刻取成员侧分配的事件时刻
+ * （非帧 ts——重发/重播帧的 ts 会变，事件时刻必须稳定，否则折叠会翻转）。 */
+function validateMemberEventPayload(payload) {
+  if (!isPlainObject(payload) || !isId(payload.eventId) || !isTimestamp(payload.ts)) {
+    return refuse('缺少合法的 payload.eventId / payload.ts（成员事件形态）');
+  }
+  return { ok: true };
+}
+
+/* leave 载荷（managed 为空对象；讨论携成员事件字段 + 可选原因）：eventId 与 ts 成对出现。 */
+function validateLeavePayload(payload) {
+  if (payload !== undefined && !isPlainObject(payload)) {
+    return refuse('payload 须为 JSON 对象');
+  }
+  if (payload === undefined) {
+    return { ok: true };
+  }
+  if (payload.eventId !== undefined || payload.ts !== undefined) {
+    if (!isId(payload.eventId) || !isTimestamp(payload.ts)) {
+      return refuse('leave 的成员事件字段非法（eventId 与 ts 须成对且形态合法）');
+    }
+  }
+  return validateReasonPayload(payload);
+}
+
+/* 同步游标（排他语义的复合位置）：(ts, postId)——只由拉取推进；同刻按 postId 序兜底。 */
+function isCursorShape(value) {
+  return isPlainObject(value) && isTimestamp(value.ts) && isId(value.postId);
+}
+
+function optionalCursorRejection(value, label) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  return isCursorShape(value) ? null : refuse(`${label} 非法（需为 { ts, postId } 游标或 null）`);
+}
+
+/* 作者粒度摘要上界（形态防线）：条数与范围数都封顶——超限帧不可能是诚实实现所出。 */
+export const MAX_SUMMARY_AUTHORS = 64;
+export const MAX_SUMMARY_RANGES_PER_AUTHOR = 256;
+
+/* 作者粒度摘要（设计 §5.3 真对账）：每作者计数 + 作者内已见序号集（范围内联编码，可定位回退起点）。 */
+function summaryRejection(value, label) {
+  if (value === undefined) {
+    return null;   // 摘要为可选加法字段（普通拉取可不带；对表交换必须带）
+  }
+  if (!isPlainObject(value) || !Array.isArray(value.authors) || value.authors.length > MAX_SUMMARY_AUTHORS) {
+    return refuse(`${label} 非法（需为 { authors: [...] } 且不超过 ${MAX_SUMMARY_AUTHORS} 位作者）`);
+  }
+  for (const author of value.authors) {
+    const rejection = summaryAuthorRejection(author, label);
+    if (rejection !== null) {
+      return rejection;
+    }
+  }
+  return null;
+}
+
+function summaryAuthorRejection(author, label) {
+  if (!isPlainObject(author) || !isId(author.instanceId) || !Number.isInteger(author.count) || author.count < 1) {
+    return refuse(`${label} 条目非法（需 instanceId + count ≥ 1）`);
+  }
+  if (!Array.isArray(author.seqs) || author.seqs.length === 0 || author.seqs.length > MAX_SUMMARY_RANGES_PER_AUTHOR) {
+    return refuse(`${label}.seqs 非法（范围内联编码数组：非空且不超过 ${MAX_SUMMARY_RANGES_PER_AUTHOR} 段）`);
+  }
+  const rangesIssue = summaryRangesRejection(author.seqs, label);
+  if (rangesIssue !== null) {
+    return rangesIssue;
+  }
+  /* 计数与序号集自洽（计数 = 序号总数；纯算术、无展开循环）——摘要的完备性由它兜底。 */
+  if (summarySeqTotal(author.seqs) !== author.count) {
+    return refuse(`${label} 条目非法（count 与序号集不一致）`);
+  }
+  return null;
+}
+
+/* 序号段形态：二元组、正整数、升序且互不重叠（升序保证折叠与比对是同一读法）。 */
+function summaryRangesRejection(ranges, label) {
+  let lastTo = 0;
+  for (const range of ranges) {
+    if (!Array.isArray(range) || range.length !== 2) {
+      return refuse(`${label}.seqs 段非法（需 [起, 止] 二元组）`);
+    }
+    const from = range[0];
+    const to = range[1];
+    if (!Number.isInteger(from) || !Number.isInteger(to) || from < 1 || to < from) {
+      return refuse(`${label}.seqs 段非法（正整数、升序且互不重叠）`);
+    }
+    if (from <= lastTo) {
+      return refuse(`${label}.seqs 段非法（正整数、升序且互不重叠）`);
+    }
+    lastTo = to;
+  }
+  return null;
+}
+
+function summarySeqTotal(ranges) {
+  let total = 0;
+  for (const range of ranges) {
+    total += range[1] - range[0] + 1;
+  }
+  return total;
+}
+
+/* history-request（拉取/对表请求）：after = 拉取起点（排他；null/缺省 = 空游标全量）；
+ * summary = 请求方作者粒度摘要（对表交换用，可选）。 */
+function validateHistoryRequestPayload(payload) {
+  if (!isPlainObject(payload)) {
+    return refuse('history-request 缺少 payload');
+  }
+  const cursorRejection = optionalCursorRejection(payload.after, 'history-request.after');
+  if (cursorRejection !== null) {
+    return cursorRejection;
+  }
+  const summaryIssue = summaryRejection(payload.summary, 'history-request.summary');
+  if (summaryIssue !== null) {
+    return summaryIssue;
+  }
+  return { ok: true };
+}
+
+/* 拉取体量形态上界（帧体积 1 MiB 硬顶之下的第二道防线）：条目数与端点表条数封顶。 */
+export const MAX_BUNDLE_POSTS = 10000;
+export const MAX_BUNDLE_EVENTS = 1000;
+export const MAX_ENDPOINT_TABLE_ENTRIES = 64;
+
+/* history-bundle（拉取应答）：增量段 + 尾部重叠窗 + 元状态 + 成员事件集 + 端点表 + 对表交换面
+ * （应答方同步游标与摘要）+ 分段续拉面（more / nextAfter）。 */
+function validateHistoryBundlePayload(payload) {
+  if (!isPlainObject(payload)) {
+    return refuse('history-bundle 缺少 payload');
+  }
+  const shapeIssue = bundleExchangeRejection(payload);
+  if (shapeIssue !== null) {
+    return shapeIssue;
+  }
+  const postsIssue = bundlePostsRejection(payload.posts, 'history-bundle.posts');
+  if (postsIssue !== null) {
+    return postsIssue;
+  }
+  const overlapIssue = bundlePostsRejection(payload.overlap, 'history-bundle.overlap');
+  if (overlapIssue !== null) {
+    return overlapIssue;
+  }
+  const tailIssue = bundleTailRejection(payload);
+  if (tailIssue !== null) {
+    return tailIssue;
+  }
+  return { ok: true };
+}
+
+function bundleExchangeRejection(payload) {
+  const cursorRejection = optionalCursorRejection(payload.cursor, 'history-bundle.cursor');
+  if (cursorRejection !== null) {
+    return cursorRejection;
+  }
+  const summaryIssue = summaryRejection(payload.summary, 'history-bundle.summary');
+  if (summaryIssue !== null) {
+    return summaryIssue;
+  }
+  if (payload.more !== true && payload.more !== false) {
+    return refuse('history-bundle.more 非法（布尔）');
+  }
+  if (payload.more === true && !isCursorShape(payload.nextAfter)) {
+    return refuse('history-bundle.nextAfter 非法（more=true 时需为续拉游标）');
+  }
+  return null;
+}
+
+function bundlePostsRejection(posts, label) {
+  if (!Array.isArray(posts) || posts.length > MAX_BUNDLE_POSTS) {
+    return refuse(`${label} 非法（帖数组，不超过 ${MAX_BUNDLE_POSTS} 条）`);
+  }
+  for (const post of posts) {
+    const rejection = bundledPostRejection(post, label);
+    if (rejection !== null) {
+      return rejection;
+    }
+  }
+  return null;
+}
+
+function bundledPostRejection(post, label) {
+  if (!isPlainObject(post) || !isPlainObject(post.from)) {
+    return refuse(`${label} 条目非法（帖形态）`);
+  }
+  const fromIssue = postFromRejection(post.from, label);
+  if (fromIssue !== null) {
+    return fromIssue;
+  }
+  if (!isId(post.postId) || !Number.isInteger(post.seq) || post.seq < 1 || !isTimestamp(post.ts)) {
+    return refuse(`${label} 条目非法（postId / seq / ts）`);
+  }
+  return postBodyRejection(post, label);
+}
+
+function postFromRejection(from, label) {
+  if (!isId(from.instanceId) || !isIdentityName(from.identityName)) {
+    return refuse(`${label}.from 非法（需 instanceId + identityName）`);
+  }
+  return null;
+}
+
+function postBodyRejection(post, label) {
+  if (typeof post.kind !== 'string' || post.kind === '' || post.kind.length > 32) {
+    return refuse(`${label}.kind 非法（非空短字符串；词表归属由协作层判定）`);
+  }
+  if (!isMessageText(post.text)) {
+    return refuse(`${label}.text 非法（非空、≤${MAX_MESSAGE_TEXT_CHARS} 字符）`);
+  }
+  return null;
+}
+
+function bundleTailRejection(payload) {
+  if (!isPlainObject(payload.meta)) {
+    return refuse('history-bundle.meta 非法（须为讨论元状态对象）');
+  }
+  if (!Array.isArray(payload.members) || payload.members.length > MAX_BUNDLE_EVENTS) {
+    return refuse(`history-bundle.members 非法（成员事件数组，不超过 ${MAX_BUNDLE_EVENTS} 条）`);
+  }
+  for (const event of payload.members) {
+    const rejection = bundledMemberEventRejection(event);
+    if (rejection !== null) {
+      return rejection;
+    }
+  }
+  return bundleEndpointsRejection(payload.endpoints);
+}
+
+function bundledMemberEventRejection(event) {
+  if (!isPlainObject(event) || !isId(event.eventId)) {
+    return refuse('history-bundle.members 条目非法（需事件 id）');
+  }
+  if (event.kind !== 'join' && event.kind !== 'leave') {
+    return refuse('history-bundle.members 条目的 kind 非法（join / leave）');
+  }
+  if (!isId(event.instanceId) || !isIdentityName(event.identityName) || !isTimestamp(event.ts)) {
+    return refuse('history-bundle.members 条目非法（instanceId / identityName / ts）');
+  }
+  return null;
+}
+
+function bundleEndpointsRejection(endpoints, label = 'history-bundle.endpoints') {
+  if (!isPlainObject(endpoints)) {
+    return refuse(`${label} 非法（须为对象：实例标识 → { address, port }）`);
+  }
+  const entries = Object.entries(endpoints);
+  if (entries.length > MAX_ENDPOINT_TABLE_ENTRIES) {
+    return refuse(`${label} 非法（不超过 ${MAX_ENDPOINT_TABLE_ENTRIES} 项）`);
+  }
+  for (const [instanceId, endpoint] of entries) {
+    if (!isId(instanceId)) {
+      return refuse(`${label} 键非法（需 1–64 位字母数字与连字符的实例标识）`);
+    }
+    const rejection = endpointEntryRejection(endpoint, `${label} 项`);
+    if (!rejection.ok) {
+      return rejection;
+    }
+  }
+  return null;
 }
 
 /* notice 事件集（建协 / 协作 + 治理与韧性扩展）：事件枚举 + 各事件字段形态。

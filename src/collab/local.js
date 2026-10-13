@@ -1,13 +1,19 @@
 import { DEFAULT_COLLAB_MODE } from '../net/protocol.js';
 import { appendLedger, ensureCollabDir, saveMember, saveSnapshot } from './store.js';
 import { isArchived } from './model.js';
+import { newMemberEventId } from './members.js';
 
 /* 本地协作态与持久化的共享原语（服务内多模块共用）：状态读法（管理席位以台账为权威、
  * 成员以本地记录为权威）与「只计数告警、绝不抛出」的写盘包装（健壮性硬性要求——
  * 写盘失败不得让协作事件处理或消息主链中断）。写包装统一先确保协作目录存在（写路径自足）。 */
 
+/* 状态读法：管理席位以台账为权威；「已退出」是成员记录的本地终态，对**讨论的发起人**同样可达
+ * （发起人可退出——退出即放弃结束权，设计 §6），故管理席位以 member.state 的 left 标记优先。 */
 export function localStateOf(local) {
-  return local.role === 'manager' ? local.ledger.status : local.member.state;
+  if (local.role === 'manager' && local.member.state !== 'left') {
+    return local.ledger.status;
+  }
+  return local.member.state;
 }
 
 /* 模式读法（两侧视角统一）：管理席位取台账、成员取本地记录；缺省 managed（旧数据兼容，
@@ -30,6 +36,50 @@ export function localRosterOf(local) {
     return local.ledger.members;
   }
   return local.member.roster ?? [];
+}
+
+/* 讨论的当前成员表 = 成员事件日志按事件折叠（设计 §5.4；每成员取自身最新事件、join 者入表）。
+ * 这是讨论模式成员语义的单一取数面：邀请名额判定、帖扇出、控制事件广播都经它——
+ * managed 的 roster/台账名单不再是讨论成员关系的权威（被拒/被撤回者不占名额、退出者即时出表）。 */
+export function foldedMembersOf(local) {
+  return local.members.fold();
+}
+
+/* 本机是否已在折叠成员表内（讨论的「已加入」判据：发帖与发 join 重播的前置）。 */
+export function selfJoinedOf(local, selfId) {
+  return local.members.includes(selfId);
+}
+
+/* 主题读法（两侧视角统一）：管理席位取台账、成员取本地记录（邀请载荷/对表元状态写入）。 */
+export function localTopicOf(local) {
+  const raw = local.role === 'manager' ? local.ledger.topic : local.member.topic;
+  return typeof raw === 'string' ? raw : null;
+}
+
+/* 本机自播成员事件（设计 §5.4/§5.5）：join/leave 由成员本人发出——事件时刻取该作者的
+ * 单调基线（帖子与事件共用：与帖子序同源、跨重启落盘）。
+ * 返回事件（已并入本地日志）或 null（形态异常/重复——新事件 id 不会重复）。 */
+export function emitOwnMemberEvent(state, local, kind) {
+  const event = {
+    eventId: newMemberEventId(),
+    kind,
+    instanceId: state.self.instanceId,
+    identityName: state.self.identityName,
+    ts: allocateOwnEventStamp(state, local),
+  };
+  return local.members.apply(event) === 'added' ? event : null;
+}
+
+/* 作者局部单调 ts 分配：以本机已落盘的帖子 + 成员事件的最大 ts 为基线，回拨时取基线 + 1ms。 */
+function allocateOwnEventStamp(state, local) {
+  const postTs = local.posts.ownBaseline(state.self.instanceId).ts;
+  const eventTs = local.members.baselineTsOf(state.self.instanceId);
+  const postMs = typeof postTs === 'string' ? Date.parse(postTs) : Number.NEGATIVE_INFINITY;
+  const eventMs = typeof eventTs === 'string' ? Date.parse(eventTs) : Number.NEGATIVE_INFINITY;
+  const baseMs = Math.max(postMs, eventMs);
+  const nowMs = Date.now();
+  const stampMs = Number.isFinite(baseMs) ? Math.max(baseMs + 1, nowMs) : nowMs;
+  return new Date(stampMs).toISOString();
 }
 
 /* 本机持有的当前汇报版本：管理席位取台账版本；成员取最近一次校验通过的快照版本（无快照为 null）。

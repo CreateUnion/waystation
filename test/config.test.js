@@ -24,6 +24,7 @@ test('文件缺失：返回默认值且 created=true', (t) => {
   assert.equal(config.managerOfflineMs, 120000);
   assert.equal(config.takeoverWindowMs, 30000);
   assert.equal(config.freezeUnresolvedMs, 48 * 60 * 60 * 1000);
+  assert.equal(config.forumSyncIntervalMs, 60000);
 });
 
 test('buildDefaults：标识名取传入主机名，形状完整', () => {
@@ -32,6 +33,7 @@ test('buildDefaults：标识名取传入主机名，形状完整', () => {
     'autoDeliver',
     'dialTimeoutMs',
     'dispatchTickMs',
+    'forumSyncIntervalMs',
     'freezeUnresolvedMs',
     'identityName',
     'inviteTtlMs',

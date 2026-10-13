@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  DELIVERY_EXEMPT_TYPES,
   DIGEST_PATTERN,
   GOVERNANCE_TYPES,
   ID_PATTERN,
@@ -166,8 +167,8 @@ test('发现报文类型不匹配（探测/应答互收）：拒绝', () => {
 
 test('常量：版本、类型集、治理集、传输集与体积上限', () => {
   assert.equal(PROTOCOL_VERSION, 1);
-  assert.equal(MESSAGE_TYPES.length, 25);
-  for (const type of ['invite', 'approve', 'decline', 'withdraw', 'topic', 'task', 'progress', 'issue', 'stop', 'reply', 'freeze', 'unfreeze', 'decision', 'handover', 'takeover-init', 'takeover', 'notice', 'leave', 'end', 'ping', 'pong', 'delivery-status', 'snapshot', 'post', 'ack']) {
+  assert.equal(MESSAGE_TYPES.length, 28);
+  for (const type of ['invite', 'approve', 'decline', 'withdraw', 'topic', 'task', 'progress', 'issue', 'stop', 'reply', 'freeze', 'unfreeze', 'decision', 'handover', 'takeover-init', 'takeover', 'notice', 'leave', 'end', 'ping', 'pong', 'delivery-status', 'snapshot', 'post', 'join', 'history-request', 'history-bundle', 'ack']) {
     assert.ok(MESSAGE_TYPES.includes(type), type);
   }
   assert.deepEqual(GOVERNANCE_TYPES, ['freeze', 'unfreeze', 'decision', 'takeover-init', 'takeover']);
@@ -177,6 +178,12 @@ test('常量：版本、类型集、治理集、传输集与体积上限', () =>
   assert.equal(MAX_DATAGRAM_BYTES, 512);
   assert.equal(ID_PATTERN.test('../x'), false);
   assert.equal(ID_PATTERN.test('a/b'), false);
+});
+
+test('投递豁免集：治理五型 + 讨论 end/join/leave；拉取两件套不泛化豁免', () => {
+  assert.deepEqual(DELIVERY_EXEMPT_TYPES, ['freeze', 'unfreeze', 'decision', 'takeover-init', 'takeover', 'end', 'join', 'leave']);
+  assert.equal(DELIVERY_EXEMPT_TYPES.includes('history-request'), false, '短生命周期请求-应答不豁免');
+  assert.equal(DELIVERY_EXEMPT_TYPES.includes('history-bundle'), false);
 });
 
 test('newMsgId：UUID 形态且互不相同', () => {
@@ -363,6 +370,78 @@ test('协作域 post：帖形态判据（并集形态在协议层、kind 词表�
   assert.equal(validateMessage(collabFrame('post', { post: { ...post, kind: '飘' } })).ok, true, '词表越界的 kind 由协作层判定（协议层只判并集形态）');
 });
 
+test('协作域 join / leave（讨论成员事件）：事件 id 与事件时刻成对必填；leave 兼容既有空载荷', () => {
+  const stamp = { eventId: 'evt-1', ts: new Date().toISOString() };
+  assert.equal(validateMessage(collabFrame('join', stamp)).ok, true);
+  assert.equal(validateMessage(collabFrame('join', { eventId: 'evt-1' })).ok, false, '缺事件时刻');
+  assert.equal(validateMessage(collabFrame('join', { ts: stamp.ts })).ok, false, '缺事件 id');
+  assert.equal(validateMessage(collabFrame('join', { ...stamp, eventId: 'bad id!' })).ok, false);
+  assert.equal(validateMessage(collabFrame('join', { ...stamp, ts: '昨天' })).ok, false);
+  assert.equal(validateMessage(collabFrame('leave', stamp)).ok, true, 'leave 可携成员事件字段（讨论）');
+  assert.equal(validateMessage(collabFrame('leave', {})).ok, true, 'managed 的空载荷照旧');
+  assert.equal(validateMessage(collabFrame('leave', undefined)).ok, true);
+  assert.equal(validateMessage(collabFrame('leave', { eventId: 'evt-1' })).ok, false, 'eventId 与 ts 须成对');
+  assert.equal(validateMessage(collabFrame('leave', { ...stamp, reason: '退出' })).ok, true);
+});
+
+test('协作域 history-request：after 与 summary 均为可选加法字段（空载荷 = 全量拉取）', () => {
+  const cursor = { ts: new Date().toISOString(), postId: 'post-1' };
+  const summary = { authors: [{ instanceId: 'inst-a', count: 3, seqs: [[1, 2], [4, 4]] }] };
+  assert.equal(validateMessage(collabFrame('history-request', {})).ok, true);
+  assert.equal(validateMessage(collabFrame('history-request', { after: cursor })).ok, true);
+  assert.equal(validateMessage(collabFrame('history-request', { after: null, summary })).ok, true);
+  assert.equal(validateMessage(collabFrame('history-request', { after: { ts: cursor.ts } })).ok, false, '游标缺 postId');
+  assert.equal(validateMessage(collabFrame('history-request', { after: { ts: '昨天', postId: 'post-1' } })).ok, false);
+  assert.equal(validateMessage(collabFrame('history-request', { after: 'post-1' })).ok, false);
+  for (const bad of [
+    {},
+    { authors: 'x' },
+    { authors: [{ instanceId: 'inst-a', count: 0, seqs: [[1, 1]] }] },
+    { authors: [{ instanceId: 'inst-a', count: 1, seqs: [] }] },
+    { authors: [{ instanceId: 'inst-a', count: 2, seqs: [[2, 1]] }] },
+    { authors: [{ instanceId: 'inst-a', count: 2, seqs: [[1, 2], [2, 3]] }] },
+    { authors: [{ instanceId: 'inst-a', count: 2, seqs: [[1, 1], [0, 0]] }] },
+  ]) {
+    assert.equal(validateMessage(collabFrame('history-request', { summary: bad })).ok, false, JSON.stringify(bad).slice(0, 60));
+  }
+});
+
+test('协作域 history-bundle：交换面与尾部面逐字段校验（more=true 必须带续拉游标）', () => {
+  const post = { from: { instanceId: 'inst-a', identityName: '主机甲' }, postId: 'post-1', seq: 1, ts: new Date().toISOString(), kind: 'reply', text: '你好' };
+  const cursor = { ts: new Date().toISOString(), postId: 'post-1' };
+  const legal = {
+    cursor,
+    summary: { authors: [{ instanceId: 'inst-a', count: 1, seqs: [[1, 1]] }] },
+    more: false,
+    posts: [post],
+    overlap: [post],
+    meta: { state: 'active', name: '讨论甲', topic: '议题', createdAt: post.ts, establishedAt: post.ts, endedAt: undefined },
+    members: [{ eventId: 'evt-1', kind: 'join', instanceId: 'inst-a', identityName: '主机甲', ts: post.ts }],
+    endpoints: { 'inst-a': { address: '127.0.0.1', port: 7321 } },
+  };
+  assert.equal(validateMessage(collabFrame('history-bundle', legal)).ok, true);
+  assert.equal(validateMessage(collabFrame('history-bundle', { ...legal, cursor: null, more: true, nextAfter: cursor })).ok, true);
+  assert.equal(validateMessage(collabFrame('history-bundle', { ...legal, more: true })).ok, false, 'more=true 缺 nextAfter');
+  assert.equal(validateMessage(collabFrame('history-bundle', { ...legal, more: 'yes' })).ok, false);
+  assert.equal(validateMessage(collabFrame('history-bundle', { ...legal, posts: undefined })).ok, false);
+  assert.equal(validateMessage(collabFrame('history-bundle', { ...legal, posts: [{ ...post, from: { instanceId: 'bad id!', identityName: '甲' } }] })).ok, false);
+  assert.equal(validateMessage(collabFrame('history-bundle', { ...legal, posts: [{ ...post, seq: 0 }] })).ok, false);
+  assert.equal(validateMessage(collabFrame('history-bundle', { ...legal, posts: [{ ...post, text: 'x'.repeat(4001) }] })).ok, false);
+  assert.equal(validateMessage(collabFrame('history-bundle', { ...legal, members: [{ eventId: 'evt-1', kind: 'close', instanceId: 'inst-a', identityName: '甲', ts: post.ts }] })).ok, false);
+  assert.equal(validateMessage(collabFrame('history-bundle', { ...legal, endpoints: { 'inst-a': { address: '127.0.0.1', port: 0 } } })).ok, false);
+  assert.equal(validateMessage(collabFrame('history-bundle', { ...legal, endpoints: 'x' })).ok, false);
+  assert.equal(validateMessage(collabFrame('history-bundle', { ...legal, meta: 'x' })).ok, false);
+});
+
+test('协作域 invite：endpoints 为可选加法字段（讨论携带；形态同端点表）', () => {
+  const members = [{ instanceId: 'inst-a', identityName: '主机甲' }, { instanceId: 'inst-b', identityName: '主机乙' }];
+  const base = { name: '讨论甲', topic: '议题', members };
+  assert.equal(validateMessage(collabFrame('invite', base)).ok, true);
+  assert.equal(validateMessage(collabFrame('invite', { ...base, endpoints: { 'inst-a': { address: '127.0.0.1', port: 7321 } } })).ok, true);
+  assert.equal(validateMessage(collabFrame('invite', { ...base, endpoints: { 'inst-a': { address: '127.0.0.1', port: 0 } } })).ok, false);
+  assert.equal(validateMessage(collabFrame('invite', { ...base, endpoints: 'x' })).ok, false);
+});
+
 test('协作域 notice：event 枚举（established / roster / snapshot-stored）、version 可选且 ≥1', () => {
   assert.equal(validateMessage(collabFrame('notice', { event: 'established', version: 3 })).ok, true);
   assert.equal(validateMessage(collabFrame('notice', { event: 'roster' })).ok, true);
@@ -385,7 +464,7 @@ test('协作域 freeze / snapshot：freeze 名单形态；snapshot request 通�
 });
 
 test('协作域全类型覆盖：对每个协作域类型给非法 payload 必拒（防漏挂表）', () => {
-  const collabTypes = ['invite', 'approve', 'decline', 'withdraw', 'topic', 'task', 'progress', 'issue', 'stop', 'reply', 'notice', 'freeze', 'snapshot', 'post', 'end', 'leave'];
+  const collabTypes = ['invite', 'approve', 'decline', 'withdraw', 'topic', 'task', 'progress', 'issue', 'stop', 'reply', 'notice', 'freeze', 'snapshot', 'post', 'join', 'history-request', 'history-bundle', 'end', 'leave'];
   const invalidPayload = {
     invite: { name: '项目' },
     approve: 'x',
@@ -401,6 +480,9 @@ test('协作域全类型覆盖：对每个协作域类型给非法 payload 必�
     freeze: {},
     snapshot: {},
     post: { post: { postId: 'post-1' } },
+    join: {},
+    'history-request': 'x',
+    'history-bundle': {},
     end: 'x',
     leave: 'x',
   };

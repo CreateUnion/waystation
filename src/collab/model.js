@@ -108,6 +108,10 @@ function isLedgerTailShape(ledger) {
   if (ledger.endedAt !== undefined && !isTimestamp(ledger.endedAt)) {
     return false;
   }
+  /* 讨论的成立时刻（首个他方 join 的落账时刻，可选字段——managed 台账不携带）。 */
+  if (ledger.establishedAt !== undefined && !isTimestamp(ledger.establishedAt)) {
+    return false;
+  }
   return isFrozenMarksShape(ledger);
 }
 
@@ -218,22 +222,60 @@ function isBoardEntryShape(entry) {
 }
 
 function isMemberMarksShape(record) {
-  if (!isModeShape(record)) {
+  if (!isModeShape(record) || !isMemberTimestampsShape(record)) {
     return false;
   }
+  if (!DECISIONS.includes(record.decision ?? null)) {
+    return false;
+  }
+  if (!isForumMemberMarksShape(record)) {
+    return false;
+  }
+  return isFrozenMarksShape(record);
+}
+
+/* 邀请簿记与归档时刻（可选字段，出现即须为时间戳）。 */
+function isMemberTimestampsShape(record) {
   if (record.invitedAt !== undefined && !isTimestamp(record.invitedAt)) {
     return false;
   }
   if (record.expiresAt !== undefined && !isTimestamp(record.expiresAt)) {
     return false;
   }
-  if (!DECISIONS.includes(record.decision ?? null)) {
+  return record.archivedAt === undefined || isTimestamp(record.archivedAt);
+}
+
+/* 讨论专用可选字段（旧记录缺省）：topic = 邀请/元状态学得的主题（成员侧发起邀请的取数面）；
+ * forumMeta = 学得的讨论元状态时刻（成立/结束/创建）；syncCursor = 专用同步游标（只由拉取推进）。 */
+function isForumMemberMarksShape(record) {
+  if (record.topic !== undefined && !isPresentationText(record.topic, MAX_TOPIC_CHARS)) {
     return false;
   }
-  if (record.archivedAt !== undefined && !isTimestamp(record.archivedAt)) {
+  if (!isForumMetaShape(record.forumMeta)) {
     return false;
   }
-  return isFrozenMarksShape(record);
+  return isSyncCursorShape(record.syncCursor);
+}
+
+function isForumMetaShape(meta) {
+  if (meta === undefined) {
+    return true;
+  }
+  if (!isPlainObject(meta)) {
+    return false;
+  }
+  return ['createdAt', 'establishedAt', 'endedAt'].every((field) => meta[field] === undefined || isTimestamp(meta[field]));
+}
+
+/* 同步游标（可选字段，旧记录缺省）：{ ts, postId } 复合位置或 null（空游标 = 全量拉取起点）。 */
+function isSyncCursorShape(cursor) {
+  if (cursor === undefined || cursor === null) {
+    return true;
+  }
+  if (!isPlainObject(cursor)) {
+    return false;
+  }
+  return isTimestamp(cursor.ts) && typeof cursor.postId === 'string' && ID_PATTERN.test(cursor.postId);
 }
 
 function isEndpointsShape(endpoints) {
