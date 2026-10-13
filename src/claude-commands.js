@@ -46,14 +46,14 @@ export function planInstallCommands({ home, sourceDir, dryRun = false }) {
  * @param {ReturnType<typeof planInstallCommands>} plan
  */
 export function applyInstallCommands(plan) {
-  /** @type {{ createdDir: boolean, written: string[], failures: string[] }} */
-  const result = { createdDir: false, written: [], failures: [] };
+  /** @type {{ createdDir: boolean, written: string[], cleaned: string[], failures: string[] }} */
+  const applied = { createdDir: false, written: [], cleaned: [], failures: [] };
   if (plan.dryRun) {
-    return result;
+    return applied;
   }
   if (!plan.dirExists) {
     mkdirSync(plan.commandsDir, { recursive: true });
-    result.createdDir = true;
+    applied.createdDir = true;
   }
   for (const entry of plan.files) {
     if (entry.action === 'skip') {
@@ -61,19 +61,20 @@ export function applyInstallCommands(plan) {
     }
     try {
       copyFileSync(entry.sourcePath, entry.targetPath);
-      result.written.push(entry.fileName);
+      applied.written.push(entry.fileName);
     } catch (error) {
-      result.failures.push(`写入失败：${entry.fileName}——${error?.message}`);
+      applied.failures.push(`写入失败：${entry.fileName}——${error?.message}`);
     }
   }
   for (const entry of plan.stale) {
     try {
       rmSync(entry.targetPath, { force: true });
+      applied.cleaned.push(entry.fileName);
     } catch (error) {
-      result.failures.push(`清理失败：${entry.fileName}——${error?.message}`);
+      applied.failures.push(`清理失败：${entry.fileName}——${error?.message}`);
     }
   }
-  return result;
+  return applied;
 }
 
 /**
@@ -93,19 +94,19 @@ export function planRemoveCommands({ home, dryRun = false }) {
  */
 export function applyRemoveCommands(plan) {
   /** @type {{ removed: string[], failures: string[] }} */
-  const result = { removed: [], failures: [] };
+  const applied = { removed: [], failures: [] };
   if (plan.dryRun || !plan.dirExists) {
-    return result;
+    return applied;
   }
   for (const entry of plan.files) {
     try {
       rmSync(entry.targetPath, { force: true });
-      result.removed.push(entry.fileName);
+      applied.removed.push(entry.fileName);
     } catch (error) {
-      result.failures.push(`删除失败：${entry.fileName}——${error?.message}`);
+      applied.failures.push(`删除失败：${entry.fileName}——${error?.message}`);
     }
   }
-  return result;
+  return applied;
 }
 
 /** 脚本入口（install / remove；输出中文人话行到 stdout）。退出码 0 = 正常（含「无操作」），1 = 参数或执行失败。
@@ -128,16 +129,16 @@ export function runCli(argv) {
 
 function runInstallCommand(options) {
   const plan = planInstallCommands(options);
-  const result = applyInstallCommands(plan);
-  reportInstall(plan, result);
-  return result.failures.length > 0 ? 1 : 0;
+  const applied = applyInstallCommands(plan);
+  reportInstall(plan, applied);
+  return applied.failures.length > 0 ? 1 : 0;
 }
 
 function runRemoveCommand(options) {
   const plan = planRemoveCommands(options);
-  const result = applyRemoveCommands(plan);
-  reportRemove(plan, result);
-  return result.failures.length > 0 ? 1 : 0;
+  const applied = applyRemoveCommands(plan);
+  reportRemove(plan, applied);
+  return applied.failures.length > 0 ? 1 : 0;
 }
 
 /* 参数解析：--home/--source 必须带取值且 home 必填——绝不隐式回落真实家目录（防误触）。 */
@@ -222,38 +223,41 @@ function hasManagedMarker(content) {
   return content.split('\n').some((line) => line.trim() === MANAGED_MARKER);
 }
 
-function reportInstall(plan, result) {
+function reportInstall(plan, applied) {
   if (!plan.dirExists) {
     write(plan.dryRun ? `目录不存在，将创建：${plan.commandsDir}` : `目录不存在，已创建：${plan.commandsDir}`);
   }
   for (const entry of plan.files) {
-    const line = installEntryLine(entry, plan, result);
+    const line = installEntryLine(entry, plan, applied);
     if (line !== null) {
       write(line);
     }
   }
   for (const entry of plan.stale) {
+    if (!plan.dryRun && !applied.cleaned.includes(entry.fileName)) {
+      continue;   // 清理失败的条目由 failures 行承担，不误报「已清理」
+    }
     write(`${plan.dryRun ? '将' : '已'}清理陈旧受管命令：${entry.fileName}`);
   }
-  for (const failure of result.failures) {
+  for (const failure of applied.failures) {
     write(failure);
   }
 }
 
 /* 计划条目 → 输出行；写入失败的条目由 failures 行承担，返回 null 不误报「已安装」。 */
-function installEntryLine(entry, plan, result) {
+function installEntryLine(entry, plan, applied) {
   if (entry.action === 'skip') {
     const notice = `同名非受管文件未覆盖（如系旧手工副本，请手工删除后重跑，或手工替换）：${entry.fileName}`;
     return plan.dryRun ? `将跳过——${notice}` : notice;
   }
-  if (!plan.dryRun && !result.written.includes(entry.fileName)) {
+  if (!plan.dryRun && !applied.written.includes(entry.fileName)) {
     return null;
   }
   const verb = entry.action === 'install' ? '安装' : '更新';
   return `${plan.dryRun ? '将' : '已'}${verb}：${entry.fileName}`;
 }
 
-function reportRemove(plan, result) {
+function reportRemove(plan, applied) {
   if (!plan.dirExists) {
     write(`不存在，跳过：${plan.commandsDir}`);
     return;
@@ -265,11 +269,11 @@ function reportRemove(plan, result) {
   for (const entry of plan.files) {
     if (plan.dryRun) {
       write(`将删除：${entry.targetPath}`);
-    } else if (result.removed.includes(entry.fileName)) {
+    } else if (applied.removed.includes(entry.fileName)) {
       write(`已删除：${entry.targetPath}`);
     }
   }
-  for (const failure of result.failures) {
+  for (const failure of applied.failures) {
     write(failure);
   }
 }

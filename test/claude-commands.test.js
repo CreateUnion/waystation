@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   MANAGED_MARKER,
@@ -102,6 +102,45 @@ test('install：陈旧受管命令清理，外来文件保留', (t) => {
   assert.ok(output.includes('已清理陈旧受管命令：ws-old.md'));
   assert.equal(existsSync(join(commandsDir, 'ws-old.md')), false);
   assert.equal(existsSync(join(commandsDir, 'note.md')), true, '无标记的异名文件一律不动');
+});
+
+test('install：陈旧清理失败逐文件记账（失败项不列入已清理）', (t) => {
+  const home = makeTempDir(t);
+  const sourceDir = makeSourceDir(t);
+  const commandsDir = makeCommandsDir(home, { 'ws-old.md': managedCommand('old') });
+  const plan = planInstallCommands({ home, sourceDir });
+  assert.equal(plan.stale.length, 1);
+  /* 计划后把待清理目标换成同名目录使删除必失败：目录在扫描期被 isFile 过滤，只能计划后注入。 */
+  rmSync(join(commandsDir, 'ws-old.md'));
+  mkdirSync(join(commandsDir, 'ws-old.md'));
+  const applied = applyInstallCommands(plan);
+  assert.deepEqual(applied.cleaned, [], '清理失败的条目不得计入已清理名单');
+  assert.ok(
+    applied.failures.some((line) => line.startsWith('清理失败：ws-old.md')),
+    `failures 应含清理失败记账：${applied.failures.join('；')}`,
+  );
+});
+
+test('install 输出：陈旧清理失败时只打印失败行、不打印「已清理」', (t) => {
+  if (process.platform === 'win32') {
+    /* Windows 没有单次调用内可复现的 unlink 失败注入（只读属性会被强删的 chmod 重试化解），
+     * 执行层记账由上一个用例覆盖；本用例在 POSIX（CI）跑，直接验输出层不误报。 */
+    t.skip('Windows 无单次调用内可复现的删除失败注入；输出层断言在 POSIX 跑');
+    return;
+  }
+  const home = makeTempDir(t);
+  const sourceDir = makeSourceDir(t);
+  const commandsDir = makeCommandsDir(home, { 'ws-old.md': managedCommand('old') });
+  /* POSIX 下 unlink 取决于父目录写权限——撤掉写权限，清理必失败（比换成目录更贴近真实故障）。 */
+  chmodSync(commandsDir, 0o555);
+  try {
+    const { code, output } = runWithCapture(() => runCli(['install', '--home', home, '--source', sourceDir]));
+    assert.equal(code, 1, `失败应计入退出码；输出：${output}`);
+    assert.ok(output.includes('清理失败：ws-old.md'), `应打印清理失败行：${output}`);
+    assert.ok(!output.includes('已清理陈旧受管命令：ws-old.md'), `清理失败不得打印「已清理」：${output}`);
+  } finally {
+    chmodSync(commandsDir, 0o755);
+  }
 });
 
 test('install --dry-run：目录缺失 → 打印将创建/将安装、目录不创建', (t) => {

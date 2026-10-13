@@ -336,6 +336,8 @@ self_check() {
   local cmd_src="" cmd_name=""
   if command -v claude >/dev/null 2>&1; then
     for cmd_src in "${REPO_ROOT}"/scripts/claude-commands/*.md; do
+      # 源目录为空时 glob 保留字面量 *.md，跳过以免把通配符当文件名误报（与 ps1 臂的 -Filter 零迭代对齐）
+      [ -e "$cmd_src" ] || continue
       cmd_name="$(basename "$cmd_src")"
       if [ -f "${HOME}/.claude/commands/${cmd_name}" ]; then
         note "斜杠命令就位：${cmd_name}"
