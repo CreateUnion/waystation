@@ -166,8 +166,9 @@ function receiveRepeatInvite(state, existing, frame, meta) {
   /* 邀请者引用随最新邀请定格（换人二次邀请的重入者）：join 广播、对表候选与 approve/decline
    * 簿记都以它为准——旧引用指向已退出/长期离线的邀请者时，重入者会再次被孤立。 */
   existing.member.manager = { instanceId: frame.from.instanceId, identityName: frame.from.identityName };
-  /* 发起人标识（中继归属）随最新邀请补学；载荷未携带时保留既有知识（发起人不随邀请者变）。 */
-  const originator = payloadOriginatorOf(frame);
+  /* 发起人标识（中继归属）随最新邀请补学；载荷未携带或值被拒（自指）时保留既有知识
+   * （发起人不随邀请者变——构造性邀请也不得把受邀者自身改写成中继）。 */
+  const originator = payloadOriginatorOf(state, frame);
   if (originator !== undefined) {
     existing.member.originator = originator;
   }
@@ -189,7 +190,7 @@ function inviteRecordOf(state, frame) {
     topic: frame.payload.topic,
     mode: frame.payload.mode ?? DEFAULT_COLLAB_MODE,
     manager: { instanceId: frame.from.instanceId, identityName: frame.from.identityName },
-    originator: payloadOriginatorOf(frame),
+    originator: payloadOriginatorOf(state, frame),
     roster: inviteRosterOf(frame),
     endpoints: {},
     invitedAt: now,
@@ -198,10 +199,17 @@ function inviteRecordOf(state, frame) {
   };
 }
 
-/* 邀请载荷的发起人标识（协议层已过身份对形态；缺省 undefined = 未学到）。 */
-function payloadOriginatorOf(frame) {
+/* 邀请载荷的发起人标识（协议层已过身份对形态；缺省 undefined = 未学到）。
+ * 自指值（instanceId = 本机）拒绝并计数：发起人恒为他人他机（本机若为发起人则不经邀请路径
+ * 收帧），自指只可能来自伪造或损坏，学入会让本机把自己当中继、把该讨论的转发职责错判给己
+ * （与 bundle 元状态学习面 learnForumOriginator 同判据同计数）。 */
+function payloadOriginatorOf(state, frame) {
   const originator = frame.payload.originator;
   if (originator === undefined) {
+    return undefined;
+  }
+  if (originator.instanceId === state.self.instanceId) {
+    state.counters.forumMetaRejected++;
     return undefined;
   }
   return { instanceId: originator.instanceId, identityName: originator.identityName };
@@ -675,7 +683,7 @@ function answerSnapshotRequest(state, frame) {
 }
 
 /* 结束到达（成员侧）：归档；重复通告幂等；管理席位收到结束通告忽略（结束只能由本机发起）。
- * 讨论实例的发起人同样收不到合法的 end（仅发起人可 end——本批状态面经归档守卫，守卫面归后续）；
+ * 讨论实例的发起人同样收不到合法的 end（仅发起人可 end——发送侧守卫在 outgoing.js 的 endCollab）；
  * 成员侧归档即停 join 重播与对表（end 双通道之一：在线广播；离线者经 bundle 元状态学到）。 */
 function handleEnd(state, frame) {
   const local = state.collabs.get(frame.collabId);

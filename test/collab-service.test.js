@@ -1008,6 +1008,160 @@ test('讨论收冻结族帧：受理 + ack + 忽略计数、状态不变、不�
   assert.equal((await receive(service, unrelated)).ok, false, '与讨论也无关的冻结帧照旧拒绝（不滥 ack）');
 });
 
+test('治理工具守卫：讨论实例四入口（裁定 / 合流裁定 / 移交 / 抢接）一律拒绝并给指引；managed 与未知照旧', async (t) => {
+  const made = makeService(t);
+  const collabId = createForum(made.service);
+  advanceForumToActive(made, collabId);
+  const service = reloadService(made);
+  const calls = [
+    { name: 'decide', invoke: () => service.decide({ collabId, choice: 'terminate' }) },
+    { name: 'decideMerge', invoke: () => service.decideMerge({ collabId, mergeOffer: 'accept' }) },
+    { name: 'handover', invoke: () => service.handover({ collabId, target: 'inst-b' }) },
+    { name: 'takeOver', invoke: () => service.takeOver({ collabId }) },
+  ];
+  for (const call of calls) {
+    const result = await call.invoke();
+    assert.equal(result.ok, false, call.name);
+    assert.ok(result.message.includes('讨论模式无此操作'), `${call.name}: ${result.message}`);
+  }
+  /* 提议中的讨论同判据（守卫先于状态判定，四入口同文案）。 */
+  const fresh = makeService(t);
+  const proposedId = createForum(fresh.service, { name: '讨论乙' });
+  const early = await fresh.service.takeOver({ collabId: proposedId });
+  assert.ok(early.message.includes('讨论模式无此操作'), early.message);
+
+  /* managed 直通：原逻辑照旧执行（不误报讨论文案）。 */
+  const managed = service.create({ name: '协作甲', topic: '主题', targets: [targetOf('b')] });
+  const decided = await service.decide({ collabId: managed.collabId, choice: 'terminate' });
+  assert.equal(decided.ok, false);
+  assert.ok(decided.message.includes('冻结'), decided.message);
+  assert.ok(!decided.message.includes('讨论模式无此操作'));
+  const merged = await service.decideMerge({ collabId: managed.collabId, mergeOffer: 'accept' });
+  assert.ok(merged.message.includes('合流'), merged.message);
+  const handed = await service.handover({ collabId: managed.collabId, target: 'inst-b' });
+  assert.ok(handed.message.includes('移交'), handed.message);
+  const taken = await service.takeOver({ collabId: managed.collabId });
+  assert.ok(taken.message.includes('无需抢接'), taken.message);
+
+  /* 未知 collabId 照旧（守卫不臆造协作）。 */
+  const unknown = await service.decide({ collabId: 'collab-none', choice: 'terminate' });
+  assert.ok(unknown.message.includes('没有该协作'), unknown.message);
+});
+
+test('结束守卫：非发起人一律拒绝并指引 ws_leave_collab；发起人退出后结束不再受理；发起人照常可结束', async (t) => {
+  /* 非发起人（成员侧记录）：拒绝并给替代动作。 */
+  const memberSide = makeService(t);
+  await receive(memberSide.service, inviteFrame({ collabId: 'collab-f-end', mode: 'forum' }));
+  const memberEnd = await memberSide.service.end({ collabId: 'collab-f-end' });
+  assert.equal(memberEnd.ok, false);
+  assert.ok(memberEnd.message.includes('只有发起人可以结束讨论'), memberEnd.message);
+  assert.ok(memberEnd.message.includes('ws_leave_collab'), memberEnd.message);
+  assert.equal(memberSide.service.list().collabs[0].state, 'proposed', '拒绝路径零状态变更');
+
+  /* 发起人（进行中）照常可结束。 */
+  const initiator = makeService(t);
+  const collabId = createForum(initiator.service);
+  advanceForumToActive(initiator, collabId);
+  const active = reloadService(initiator);
+  const ended = await active.end({ collabId });
+  assert.equal(ended.ok, true, ended.message);
+  assert.equal(active.list().collabs[0].state, 'completed');
+
+  /* 发起人退出后再结束：拒绝（退出即放弃结束权——讨论存续，结束不再受理）。 */
+  const leaving = makeService(t);
+  const leftId = createForum(leaving.service, { name: '讨论乙' });
+  advanceForumToActive(leaving, leftId);
+  const left = reloadService(leaving);
+  const leaveResult = await left.leave({ collabId: leftId });
+  assert.equal(leaveResult.ok, true, leaveResult.message);
+  const lateEnd = await left.end({ collabId: leftId });
+  assert.equal(lateEnd.ok, false);
+  assert.ok(lateEnd.message.includes('已退出该讨论'), lateEnd.message);
+  assert.ok(lateEnd.message.includes('结束不再受理'), lateEnd.message);
+});
+
+test('入站类型白名单（发起人侧）：managed 专属类型到讨论一律拒绝并计数——名单通告（roster）是唯一例外', async (t) => {
+  const made = makeService(t);
+  const collabId = createForum(made.service);
+  const before = loadLedger(made.dir, collabId).ledger;
+  const sentBefore = made.sent.length;
+  const sender = peer('inst-b', '主机乙');
+  for (const type of ['topic', 'task', 'progress', 'issue', 'stop', 'reply']) {
+    const admitted = await receive(made.service, collabFrame(type, collabId, sender, { text: `伪造 ${type}` }));
+    assert.equal(admitted.ok, false, type);
+    assert.ok(admitted.reason.includes('类型语义不符'), `${type}: ${admitted.reason}`);
+  }
+  for (const type of ['snapshot', 'takeover-init', 'takeover', 'handover']) {
+    const admitted = await receive(made.service, collabFrame(type, collabId, sender, {}));
+    assert.equal(admitted.ok, false, type);
+    assert.ok(admitted.reason.includes('类型语义不符'), `${type}: ${admitted.reason}`);
+  }
+  for (const event of ['established', 'handshake', 'manager-changed', 'merge-outcome']) {
+    const admitted = await receive(made.service, collabFrame('notice', collabId, sender, { event, version: 1 }));
+    assert.equal(admitted.ok, false, `notice/${event}`);
+    assert.ok(admitted.reason.includes('类型语义不符'), `notice/${event}: ${admitted.reason}`);
+  }
+  assert.equal(made.service.stats().forumTypeRejected, 14, '协作六类流 + notice 治理事件四条 + snapshot / 抢接两型 / 移交逐一计数');
+  const roster = await receive(made.service, collabFrame('notice', collabId, sender, { event: 'roster', version: 1 }));
+  assert.equal(roster.ok, true, '名单通告是讨论加入链在用的事件——照旧受理 + ack（拒收会让对端重试钉死）');
+  assert.equal(made.service.stats().noticesIn, 1, '名单通告照旧入账（无挂表处理器，计数一条）');
+  assert.equal(made.service.stats().topicsIn, 0, '主题未被域外帧改写');
+  assert.equal(made.service.stats().progressIn, 0, '看板未被域外帧追加');
+  const after = loadLedger(made.dir, collabId).ledger;
+  assert.deepEqual(after, before, '拒绝路径零台账变更（主题 / 版本 / 看板全部不动）');
+  assert.equal(after.topic, '议题');
+  assert.equal(after.board.length, 0);
+  assert.equal(made.sent.length, sentBefore, '拒绝路径零出站（不转达、不推送快照）');
+  assert.equal(made.service.list().collabs[0].state, 'proposed', '讨论状态不变');
+});
+
+test('入站类型白名单（成员侧）：受邀记录收同类型同样拒绝并计数', async (t) => {
+  const { service } = makeService(t);
+  await receive(service, inviteFrame({ collabId: 'collab-f-type', mode: 'forum' }));
+  for (const type of ['topic', 'task', 'progress', 'issue', 'stop', 'reply']) {
+    const refused = await receive(service, collabFrame(type, 'collab-f-type', peer('inst-a', '主机甲'), { text: 'x' }));
+    assert.equal(refused.ok, false, type);
+  }
+  assert.equal(service.stats().forumTypeRejected, 6);
+  const roster = await receive(service, collabFrame('notice', 'collab-f-type', peer('inst-a', '主机甲'), { event: 'roster', version: 1 }));
+  assert.equal(roster.ok, true, '名单通告到成员侧照旧受理（加入链在用）');
+  assert.equal(service.stats().forumTypeRejected, 6, '名单通告不计入拒绝');
+  assert.equal(service.list().collabs[0].state, 'proposed');
+});
+
+test('入站类型白名单（managed 对称回归）：协作六类流在 managed 实例照旧受理并联动台账', async (t) => {
+  const { service, dir } = makeService(t);
+  const managedId = service.create({ name: '协作甲', topic: '主题', targets: [targetOf('b')] }).collabId;
+  const sender = peer('inst-b', '主机乙');
+  const topicIn = await receive(service, collabFrame('topic', managedId, sender, { text: '新主题' }));
+  assert.equal(topicIn.ok, true, topicIn.reason);
+  const progressIn = await receive(service, collabFrame('progress', managedId, sender, { text: '进度一条' }));
+  assert.equal(progressIn.ok, true, progressIn.reason);
+  assert.equal(service.stats().forumTypeRejected, 0);
+  assert.equal(loadLedger(dir, managedId).ledger.topic, '新主题', 'managed 照旧受理并联动台账');
+  assert.equal(loadLedger(dir, managedId).ledger.board.length, 1);
+});
+
+test('入站类型白名单：邀请家族（approve / decline / withdraw）到讨论照常受理并计数（拒的不是它）', async (t) => {
+  const { service } = makeService(t);
+  const collabId = createForum(service, { targets: [targetOf('b'), targetOf('c')] });
+  const approved = await receive(service, collabFrame('approve', collabId, peer('inst-b', '主机乙'), {}));
+  assert.equal(approved.ok, true, approved.reason);
+  assert.equal(service.stats().approvalsIn, 1);
+  const declined = await receive(service, collabFrame('decline', collabId, peer('inst-c', '主机丙'), {}));
+  assert.equal(declined.ok, true, declined.reason);
+  assert.equal(service.stats().declinesIn, 1);
+  assert.equal(service.stats().forumTypeRejected, 0, '邀请家族不被类型白名单误伤');
+
+  const memberSide = makeService(t);
+  await receive(memberSide.service, inviteFrame({ collabId: 'collab-f-wd', mode: 'forum' }));
+  const withdrawn = await receive(memberSide.service, collabFrame('withdraw', 'collab-f-wd', peer('inst-a', '主机甲'), {}));
+  assert.equal(withdrawn.ok, true, withdrawn.reason);
+  assert.equal(memberSide.service.stats().withdrawn, 1);
+  assert.equal(memberSide.service.list().collabs[0].decision, 'withdrawn');
+  assert.equal(memberSide.service.stats().forumTypeRejected, 0);
+});
+
 test('冲突隔离①：managed 检出（邀请到达 / 建立前复检）不命中同名讨论', async (t) => {
   const { service } = makeService(t);
   createForum(service);

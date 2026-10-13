@@ -132,10 +132,10 @@ function apiOf(state) {
     },
     start: () => startService(state),
     handshake: (options) => runHandshake(state, options ?? {}),
-    takeOver: (input) => takeOver(state, input),
-    decide: (input) => decide(state, input),
-    decideMerge: (input) => decideMergeOffer(state, input),
-    handover: (input) => handover(state, input),
+    takeOver: (input) => forumGovernanceRejection(state, input?.collabId) ?? takeOver(state, input),
+    decide: (input) => forumGovernanceRejection(state, input?.collabId) ?? decide(state, input),
+    decideMerge: (input) => forumGovernanceRejection(state, input?.collabId) ?? decideMergeOffer(state, input),
+    handover: (input) => forumGovernanceRejection(state, input?.collabId) ?? handover(state, input),
     list: () => listCollabs(state),
     indicators: () => indicators(state),
     create: (input) => createCollab(state, input),
@@ -164,6 +164,17 @@ function gateFrame(state, frame, meta) {
     state.counters.gateFailures++;
     return { ok: false, reason: `协作门控异常：${error?.message ?? '未知原因'}` };
   }
+}
+
+/* 治理工具对讨论的拒绝面（设计 §6/§7「一律拒绝」）：四入口（裁定 / 合流裁定 / 移交 / 抢接）
+ * 共用同一判据与同一文案——讨论无冻结、无席位，该治理面在讨论模式不可达。返回 null =
+ * 非讨论实例（managed 与未知 collabId），照旧走各自实现（拦截只针对 discussion）。 */
+function forumGovernanceRejection(state, collabId) {
+  const local = state.collabs.get(collabId);
+  if (local === undefined || localModeOf(local) !== 'forum') {
+    return null;
+  }
+  return { ok: false, message: '讨论模式无此操作：讨论没有冻结 / 裁定 / 移交 / 抢接（该能力仅协作者（managed）模式可用）' };
 }
 
 /* 事件包装：异常隔离为计数与告警——协作事件绝不因内部错误穿出接收管线（健壮性硬性要求）。
@@ -601,6 +612,7 @@ function emptyGuardCounters() {
     freezeRelayed: 0,
     freezeUnmatched: 0,
     forumGovernanceIgnored: 0,
+    forumTypeRejected: 0,     // 讨论实例收到 managed 专属类型的入站拒绝数（冻结面隔离）
     lateDropped: 0,
     rejectedFrozen: 0,
     unknownCollab: 0,

@@ -12,6 +12,26 @@ const ARCHIVED_ALLOWED = new Set(['snapshot', 'notice', 'end', 'leave', 'history
 /* 冻结族词表导出：静音栅栏的「被忽略治理帧」判定（mute.js）取自同一权威——词表分叉即判据分叉。 */
 export const CONFLICT_FRAME_TYPES = new Set(['freeze', 'unfreeze', 'decision']);
 const FORUM_CHANNEL_TYPES = new Set(['join', 'history-request', 'history-bundle']);
+/* 讨论域类型白名单（冻结面隔离，设计 §5.5/§6）：forum 实例只受理其域内类型——邀请家族
+ * （invite 经 admitInvite、approve/decline/withdraw 经本白名单）、帖通道（post）与
+ * 控制事件（leave/end）；join/拉取两件套、冻结族在更前分支。managed 专属类型
+ * （协作六类 topic/task/progress/issue/stop/reply、snapshot、takeover/handover 族）到达讨论
+ * 一律拒绝并计数——六类在 managed 有处理器且以 role=manager 分派，讨论发起人恰是 manager：
+ * 受理即让台账主题 / 任务板被域外帧改写（设计 §3「主题创建时定死」，本白名单的由来）。
+ * notice 按事件再分（见 forumTypeAllowed）。 */
+const FORUM_ALLOWED_TYPES = new Set(['post', 'approve', 'decline', 'withdraw', 'leave', 'end']);
+
+/* notice 的讨论侧受理面：仅名单通告（roster）。它是讨论加入链在用的事件——管理席位收齐
+ * 新成员回应后广播名单变更（afterInviteResponse 的 active 分支对讨论同样生效），既有链路按
+ * 「受理 + ack」走；拒收会让对端的重试队列停摆（join 重播的投递回报被钉死在这一帧之后）。
+ * 其余事件（established / snapshot-stored / handshake / manager-changed / merge 系）是
+ * managed 治理扩展，到达讨论一律拒绝并计数。 */
+function forumTypeAllowed(frame) {
+  if (frame.type === 'notice') {
+    return frame.payload?.event === 'roster';
+  }
+  return FORUM_ALLOWED_TYPES.has(frame.type);
+}
 
 /* 请求类入站限流（设计 §5.3「请求类入站限流需新增」，计划 §4：同源 10s 内 2 次）：
  * 协作域现无通用入站限流器——沿同源记账思路新增（来源可见面为地址；拨入连接端口是临时端口，
@@ -34,6 +54,10 @@ export function decideAdmission(state, frame, meta) {
   }
   if (FORUM_CHANNEL_TYPES.has(frame.type)) {
     return admitForumChannel(state, local, frame, meta);
+  }
+  if (localModeOf(local) === 'forum' && !forumTypeAllowed(frame)) {
+    state.counters.forumTypeRejected++;
+    return { ok: false, reason: `${frame.type} 属于协作模式——本机该实例为讨论（forum），类型语义不符` };
   }
   const stateGate = admitByLocalState(state, local, frame);
   if (stateGate !== null) {

@@ -684,7 +684,12 @@ function deliverPostTo(state, local, instanceId, post) {
 export function endCollab(state, { collabId }) {
   const local = state.collabs.get(collabId);
   if (local === undefined || local.role !== 'manager') {
-    return { ok: false, message: '只有管理席位可以结束协作' };
+    /* 讨论的发起人 = 本机管理席位（role 创建时定死）；非发起人（成员记录）一律拒绝并给
+     * 替代动作——成员想离开讨论走 ws_leave_collab（设计 §6「结束权归发起人」）。 */
+    const message = local !== undefined && localModeOf(local) === 'forum'
+      ? '只有发起人可以结束讨论（结束权归发起人）——成员退出请用 ws_leave_collab'
+      : '只有管理席位可以结束协作';
+    return { ok: false, message };
   }
   /* 讨论的发起人退出即放弃结束权（设计 §6）：本机已退出该讨论 → end 不再受理（状态面）。 */
   if (local.member.state === 'left') {

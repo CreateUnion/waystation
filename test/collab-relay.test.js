@@ -503,6 +503,42 @@ test('⑧端点就绪检查：发起人标识已学、端点未知 → 降级直
   assert.equal(madeE.service.stats().relayRecoveries, 0, '端点未知无从探测——保持降级');
 });
 
+test('⑧邀请载荷自指发起人：拒绝学入并计数——不学入 / 不改写；受邀者不因构造性邀请被置为中继', async (t) => {
+  /* 行为腿：自指值未学入 → 本机不把自己当中继（发帖降级直投）。 */
+  const made = makeService(t, { self: SELF_B });
+  const collabId = `collab-selforigin-${randomUUID()}`;
+  const payload = {
+    name: '讨论自指', topic: '议题', mode: 'forum',
+    members: [SELF_A, SELF_B].map((seat) => ({ instanceId: seat.instanceId, identityName: seat.identityName })),
+    originator: { instanceId: SELF_B.instanceId, identityName: SELF_B.identityName },
+  };
+  const admitted = await receive(made.service, collabFrame('invite', collabId, SELF_A, payload), addressOf(SELF_A));
+  assert.equal(admitted.ok, true, '邀请本身照常受理（自指值只在不学入）');
+  assert.equal(made.service.stats().forumMetaRejected, 1, '自指发起人标识拒绝并计数');
+  const memberOf = () => JSON.parse(readFileSync(collabFilePath(made.dir, collabId, 'member.json'), 'utf8'));
+  assert.equal(memberOf().originator, undefined, '自指发起人标识不学入（不落盘）');
+  const approved = await made.service.approve({ collabId, approve: true });
+  assert.equal(approved.ok, true, approved.message);
+  const posted = await made.service.send({ collabId, text: '乙的帖（中继未知）' });
+  assert.equal(posted.route, 'degraded', '自指未被学入：本机不把自己当中继（降级直投）');
+  assert.ok(posted.note.includes('中继未知'), posted.note);
+
+  /* 学习腿：合法值照旧学入；其后的自指重邀不改写已学得标识（逐次计数）。 */
+  const learner = makeService(t, { self: SELF_B });
+  const learnId = `collab-selforigin-${randomUUID()}`;
+  await receive(learner.service, collabFrame('invite', learnId, SELF_A, payload), addressOf(SELF_A));
+  const learnedOf = () => JSON.parse(readFileSync(collabFilePath(learner.dir, learnId, 'member.json'), 'utf8'));
+  assert.equal(learnedOf().originator, undefined, '首次自指不学入');
+  await receive(learner.service, collabFrame('invite', learnId, SELF_A, {
+    ...payload,
+    originator: { instanceId: SELF_A.instanceId, identityName: SELF_A.identityName },
+  }), addressOf(SELF_A));
+  assert.deepEqual(learnedOf().originator, { instanceId: SELF_A.instanceId, identityName: SELF_A.identityName }, '合法发起人标识学入（正对照）');
+  await receive(learner.service, collabFrame('invite', learnId, SELF_A, payload), addressOf(SELF_A));
+  assert.deepEqual(learnedOf().originator, { instanceId: SELF_A.instanceId, identityName: SELF_A.identityName }, '自指重邀不改写已学得标识');
+  assert.equal(learner.service.stats().forumMetaRejected, 2, '自指两次逐一计数');
+});
+
 test('生命周期：发起人退出（leave）= 永久放弃中继职责——成员转常态直投兜底（非探测失败）', async (t) => {
   const { wire, collabId, a, b, c } = await makeStudio(t);
   await a.service.leave({ collabId });   // 自播 leave（入队广播）
