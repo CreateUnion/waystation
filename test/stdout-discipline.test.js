@@ -49,6 +49,9 @@ test('stdout 纪律：src/ 与 bin/ 中不得出现写 stdout 的 console 方法
   const scanned = [...listSourceFiles('src'), ...listSourceFiles('bin')];
   assert.ok(scanned.length >= 1, '未扫描到任何源码文件——扫描根缺失或路径写错，测试不得静默通过');
   const exempt = new Set(STDOUT_EXEMPT_FILES.map((rel) => join(repoRoot, rel)));
+  for (const file of exempt) {
+    assert.equal(existsSync(file), true, `豁免条目必须指向存在的文件（防清单腐化）：${file}`);
+  }
   const offenders = scanned
     .filter((file) => !exempt.has(file))
     .filter((file) => STDOUT_PATTERN.test(readFileSync(file, 'utf8')));

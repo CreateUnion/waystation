@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { parseUninstallArgs, runUninstallCli } from '../src/uninstall.js';
+import { defaultRunCommand, parseUninstallArgs, runUninstallCli } from '../src/uninstall.js';
 import { makeTempDir, repoRoot } from './helpers.js';
 
 const BIN_ENTRY = join(repoRoot, 'bin', 'waystation.js');
@@ -58,6 +58,20 @@ test('参数解析：三开关组合与未知参数收集', () => {
   assert.deepEqual(parseUninstallArgs(['--dry-run', '--purge-data']), { dryRun: true, purgeData: true, help: false, unknown: [] });
   const bad = parseUninstallArgs(['--bogus', 'extra']);
   assert.deepEqual(bad.unknown, ['--bogus', 'extra']);
+});
+
+test('默认命令执行器：真实进程映射（成功 / 非零退出 / 可执行缺失绝不抛出）', () => {
+  const ok = defaultRunCommand(process.execPath, ['-e', 'process.exit(0)']);
+  assert.equal(ok.ok, true);
+  assert.equal(ok.missing, false);
+  const failed = defaultRunCommand(process.execPath, ['-e', 'process.stderr.write("boom"); process.exit(2)']);
+  assert.equal(failed.ok, false);
+  assert.equal(failed.code, 2);
+  assert.equal(failed.output, 'boom', 'stderr 汇入 output 并去除首尾空白');
+  const missing = defaultRunCommand('waystation-definitely-missing-command', []);
+  assert.equal(missing.ok, false);
+  assert.equal(missing.code, null);
+  assert.equal(missing.missing, true, '可执行缺失映射为 missing（承载「未找到 claude CLI」UX 分支）');
 });
 
 test('dry-run：只打印、不执行命令、不删任何文件', async (t) => {
@@ -117,6 +131,23 @@ test('--purge-data 守卫：家目录本身 / 非数据目录内容形态 → �
   assert.equal(alien.code, 1);
   assert.ok(alien.output.includes('不像驿站数据目录'));
   assert.equal(existsSync(plainDir), true, '内容形态不符：整目录原样保留');
+});
+
+/* 守卫按监听器身份幂等：重复调用不叠加；监听被移除后按身份重装（旧式一次性布尔守卫此处不会重装）。 */
+test('EPIPE 守卫：按监听器身份幂等（重复调用不叠加、被移除后重装）', async (t) => {
+  const home = makeTempDir(t);
+  const { runner } = recordingRunner();
+  const dryRun = () => runWithCapture(() => runUninstallCli({ argv: ['--dry-run'], env: { WAYSTATION_HOME: home }, runCommand: runner, home }));
+  await dryRun();
+  const guard = process.stdout.listeners('error').find((fn) => fn.name === 'onStdoutError');
+  assert.ok(guard, '调用后守卫可按具名函数身份辨认');
+  const installed = process.stdout.listenerCount('error');
+  await dryRun();
+  await dryRun();
+  assert.equal(process.stdout.listenerCount('error'), installed, '重复调用不叠加监听器');
+  process.stdout.removeListener('error', guard);
+  await dryRun();
+  assert.equal(process.stdout.listenerCount('error'), installed, '监听被移除后按身份重装（数量复原）');
 });
 
 test('进程级：bin 分派 uninstall --dry-run（退出码 0）；未知参数 → 退出码 1', { timeout: 20000 }, async (t) => {

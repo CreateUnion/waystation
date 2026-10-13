@@ -9,8 +9,9 @@ import { resolveDataDir } from './paths.js';
  * **安装面与数据目录可能不同位**：两安装脚本恒把 app/shim 装到 <HOME>/.waystation 布局
  * （不读 WAYSTATION_HOME），数据目录则经 resolveDataDir 解析（尊重 WAYSTATION_HOME）——
  * 故 app/shim 按安装布局定位、purge 目标按数据目录解析（见 runUninstallCli 与 USAGE）。
- * 与安装脚本的 --uninstall / -Uninstall 开关等价共存（脚本整目录删除更直接；本命令从安装
- * 副本内运行时删除自身目录可能失败——失败原样给手动指引，不重试、不吞错）。
+ * 与安装脚本的 --uninstall / -Uninstall 开关在默认布局下等价共存（脚本不读 WAYSTATION_HOME，
+ * 自定义数据目录场景以本命令为准；脚本整目录删除更直接；本命令从安装副本内运行时删除自身目录
+ * 可能失败——失败原样给手动指引，不重试、不吞错）。
  * 输出走 stdout：它是 CLI 的用户输出通道、不参与 MCP 服务路径（stdout 纪律扫描对该文件显式豁免，
  * 见 test/stdout-discipline.test.js 的豁免清单）；bin 只在 uninstall 分支动态导入本模块。
  * 命令执行与家目录经注入缝：单测不触真实 claude CLI 与真实家目录。 */
@@ -21,7 +22,7 @@ const USAGE_LINES = [
   '  waystation uninstall --purge-data 连数据目录一起删除（含全部协作数据）',
   '  waystation uninstall --dry-run    预览：只打印将执行的动作，不改动任何文件与系统设置',
   '',
-  '（与安装脚本的 --uninstall / -Uninstall 开关等价，二选一即可。）',
+  '（默认布局下与安装脚本的 --uninstall / -Uninstall 开关等价；自定义 WAYSTATION_HOME 时以本命令为准，脚本不读该变量。）',
   '（安装面按 HOME 布局定位：<HOME>/.waystation 与 ~/.local/bin；数据目录按 WAYSTATION_HOME 环境变量解析。）',
 ];
 
@@ -83,7 +84,7 @@ function removeRegistration(parsed, runCommand) {
     write('    已注销：waystation');
     return;
   }
-  write(`    未注销（多为本来就没注册）：${firstLineOf(removed.output)}`);
+  write(`    未注销（多为本来就没注册）：${String(removed.output).split('\n')[0]}`);
 }
 
 /* 两平台安装脚本的可执行放置点都在候选内：Windows shim 在 <HOME>/.waystation/bin 下、Linux shim 在家目录 .local/bin。 */
@@ -148,7 +149,8 @@ function handleDataDir(parsed, dataDir, home) {
     write(`    不存在，跳过：${resolved}`);
     return 0;
   }
-  if (!looksLikeDataDir(resolved)) {
+  /* 内容形态判据：config.json / collabs / sessions 任一存在即认作驿站数据目录。 */
+  if (!['config.json', 'collabs', 'sessions'].some((name) => existsSync(join(resolved, name)))) {
     write(`    拒绝删除：目录内容不像驿站数据目录（无 config.json / collabs / sessions）：${resolved}`);
     return 1;
   }
@@ -166,7 +168,7 @@ function handleDataDir(parsed, dataDir, home) {
   }
 }
 
-/* 路径层守卫：文件系统根与用户家目录本身一律拒绝（内容形态另由 looksLikeDataDir 承担）。 */
+/* 路径层守卫：文件系统根与用户家目录本身一律拒绝（内容形态判据在 handleDataDir 内联处说明）。 */
 function purgePathRefusal(resolved, home) {
   if (resolve(resolved, '..') === resolved) {
     return `疑似文件系统根：${resolved}`;
@@ -177,36 +179,27 @@ function purgePathRefusal(resolved, home) {
   return null;
 }
 
-/* 数据目录的内容形态判据：config.json / collabs / sessions 任一存在即认作驿站数据目录。 */
-function looksLikeDataDir(resolved) {
-  return ['config.json', 'collabs', 'sessions'].some((name) => existsSync(join(resolved, name)));
-}
-
-function firstLineOf(text) {
-  return String(text).split('\n')[0];
-}
-
 function write(text) {
   process.stdout.write(`${text}\n`);
 }
 
 /* 输出被截断（如管道到 head）时 stdout 的 EPIPE 默认冒泡为未捕获异常——CLI 输出属尽力而为，
- * 管道断开按正常结束处理；只装一次（进程内多次调用不叠加监听器）。 */
-let pipeGuardInstalled = false;
-function guardBrokenPipe() {
-  if (pipeGuardInstalled) {
-    return;
+ * 管道断开按正常结束处理；按监听器身份幂等，重复调用不叠加。 */
+function onStdoutError(error) {
+  if (error?.code === 'EPIPE') {
+    process.exit(0);
   }
-  pipeGuardInstalled = true;
-  process.stdout.on('error', (error) => {
-    if (error?.code === 'EPIPE') {
-      process.exit(0);
-    }
-  });
 }
 
-/* 默认命令执行器：同步执行、只以退出码与输出为准（spawn 失败折算为 missing / 错误文本，绝不抛出）。 */
-function defaultRunCommand(command, args) {
+function guardBrokenPipe() {
+  if (!process.stdout.listeners('error').includes(onStdoutError)) {
+    process.stdout.on('error', onStdoutError);
+  }
+}
+
+/* 默认命令执行器：同步执行、只以退出码与输出为准（spawn 失败折算为 missing / 错误文本，绝不抛出）。
+ * 导出供单测直测真实进程映射（missing 分支承载「未找到 claude CLI」UX，注入执行器的用例覆盖不到它）。 */
+export function defaultRunCommand(command, args) {
   try {
     const result = spawnSync(command, args, { encoding: 'utf8' });
     if (result.error) {
