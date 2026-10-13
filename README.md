@@ -12,18 +12,18 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
 - Windows：`powershell -File scripts\install.ps1`（预览不改动任何东西：加 `-DryRun`；若本机执行策略禁止运行脚本，先按你的安全策略处理，脚本可全文审读）
 - Linux：`bash scripts/install.sh`（预览：`--dry-run`）
 
-脚本按设计流程执行，幂等、可重复运行：检测 Node（下限实读 `package.json` 的 engines，缺失时给安装指引、**不自动安装**）→ 安装到 `~/.waystation/app/`（`npm ci --omit=dev` 就位运行依赖）→ 放置可执行（Windows `waystation.cmd` / Linux `~/.local/bin/waystation`）→ 注册 Claude Code MCP（Windows 以 `node` + 安装目录入口的绝对路径注册——Claude Code 不经 shell 直接拉起 MCP 子进程，`.cmd` 不可靠；Linux 注册为 PATH 上的 `waystation`，`~/.local/bin` 不在 PATH 时注册该 shim 的绝对路径；机器上没有 Claude Code 则跳过并打印手工步骤，不影响安装的其他部分）→ 自检并打印**防火墙放行指引**、其他 MCP 客户端配置片段与会话期首检清单。
+脚本按设计流程执行，幂等、可重复运行：检测 Node（下限实读 `package.json` 的 engines，缺失时给安装指引、**不自动安装**）→ 安装到 `~/.waystation/app/`（`npm ci --omit=dev` 就位运行依赖）→ 放置可执行（Windows `waystation.cmd` / Linux `~/.local/bin/waystation`）→ 注册 Claude Code MCP（Windows 以 `node` + 安装目录入口的绝对路径注册——Claude Code 不经 shell 直接拉起 MCP 子进程，`.cmd` 不可靠；Linux 注册为 PATH 上的 `waystation`，`~/.local/bin` 不在 PATH 时注册该 shim 的绝对路径；机器上没有 Claude Code 则跳过并打印手工步骤，不影响安装的其他部分）→ 安装斜杠命令到 `~/.claude/commands/`（`/ws-collab`、`/ws-list` 随装；重跑覆盖已装版本、同名手工文件不覆盖、安装目录下已移除命令的陈旧副本会清理；没有 Claude Code 则跳过并打印手工步骤）→ 自检并打印**防火墙放行指引**、其他 MCP 客户端配置片段与会话期首检清单。
 
 - **防火墙**：脚本只打印放行指引、**不自动修改**系统设置。Windows 用 `Get-NetFirewallProfile` 检测各配置状态并给出 `New-NetFirewallRule` 示例；Linux 免 root 读取 ufw 启用态（`/etc/ufw/ufw.conf`）或检测 firewalld 服务，给出 `ufw allow` / `firewall-cmd` 示例。（Windows 防火墙开启场景的规则形态尚未实测验收。）
-- **卸载**：`waystation uninstall`——注销 MCP 注册、删除可执行与安装目录；数据目录默认保留，加 `--purge-data` 连数据一起删（先加 `--dry-run` 可预览）。与安装脚本的 `-Uninstall` / `--uninstall` 开关在默认布局下等价，二选一即可；**自定义 `WAYSTATION_HOME` 时以本命令为准**（安装脚本不读该变量）。
+- **卸载**：`waystation uninstall`——注销 MCP 注册、移除随装的斜杠命令（只删带受管标记的文件，手工放入的同名文件不动）、删除可执行与安装目录；数据目录默认保留，加 `--purge-data` 连数据一起删（先加 `--dry-run` 可预览）。与安装脚本的 `-Uninstall` / `--uninstall` 开关在默认布局下等价，二选一即可；**自定义 `WAYSTATION_HOME` 时以本命令为准**（安装脚本不读该变量）。
 - 第二台及以后的机器：同样流程、独立安装即可。
 - 刚安装或升级过 Node 时，重启 Claude Code 与终端让 PATH 生效，再进会话首检。
 
 ## 快速上手
 
 1. 新开一个 Claude Code 会话（会话启动时会拉起驿站进程）；`/mcp` 里 waystation 应显示已连接。
-2. 让 Claude 调用 `ws_status` 查看本站点状态、`ws_list_hosts` 扫局域网在线驿站（列出身份名与 地址:端口）。
-3. 发起协作：`ws_create_collab`（项目名 / 主题 / 目标取自扫描列表）→ 对方在同意门 `ws_approve_invite` → 双向 `ws_send_message`、`ws_view_ledger` 看台账。
+2. 让 Claude 调用 `ws_status` 查看本站点状态、`ws_list_hosts` 扫局域网在线驿站（列出身份名与 地址:端口）；装了随安装分发的斜杠命令时，等价形态是 `/ws-list`。
+3. 发起协作：`ws_create_collab`（项目名 / 主题 / 目标取自扫描列表）——斜杠命令等价形态 `/ws-collab <对方> <项目名> <主题>`；对方在同意门 `ws_approve_invite` → 双向 `ws_send_message`、`ws_view_ledger` 看台账。
 4. 可选：配置状态栏「协作中」指示（见下节）——进入协作后状态栏显示当前协作。
 5. 可选：其他 MCP 客户端（如 opencode）见下节配置片段。
 
