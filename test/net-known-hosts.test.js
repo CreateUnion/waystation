@@ -240,6 +240,7 @@ test('落盘节流：同键刷新按窗口合并（内存即时、磁盘滞后�
   hosts.remember({ address: '10.0.0.10', port: 7321, instanceId: 'inst-b', identityName: '乙' });
   const onDisk = JSON.parse(readFileSync(join(dir, KNOWN_HOSTS_FILE_NAME), 'utf8'));
   assert.deepEqual(onDisk.hosts.map((entry) => entry.address).sort(), ['10.0.0.10', '10.0.0.9'], '新键落盘时带出窗口内的同键更新');
+  assert.equal(onDisk.hosts.find((entry) => entry.address === '10.0.0.9').identityName, '甲改名', '带出的是内存最新版（非窗口前的旧版）');
 
   const immediateDir = makeTempDir(t);
   const immediate = createKnownHosts({ dataDir: immediateDir, log, persistMinIntervalMs: 0 });

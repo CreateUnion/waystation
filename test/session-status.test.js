@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createSessionStatusWriter } from '../src/session-status.js';
 import { sessionFilePath } from '../src/paths.js';
@@ -92,6 +92,29 @@ test('close：删除文件并停表（不再复写）、幂等可重入', async 
   assert.equal(existsSync(file), false, '停表后不再复写');
   assert.equal(writer.stats().writes, writesAfterClose);
   writer.close();
+});
+
+test('close 后刷新与启动：终态守卫——不复活文件、不产生新写入、active 报停用', (t) => {
+  const { dir, writer } = makeWriter(t);
+  writer.start();
+  const file = sessionFilePath(dir, 'session-abc-1');
+  assert.equal(existsSync(file), true);
+  writer.close();
+  const writesAfterClose = writer.stats().writes;
+  writer.refresh();
+  writer.start();
+  assert.equal(existsSync(file), false, 'close 为终态：其后 refresh / start 不复活文件');
+  assert.equal(writer.stats().writes, writesAfterClose, '不产生新写入');
+  assert.equal(writer.stats().active, false, 'close 后 active 报停用');
+});
+
+test('关闭删文件失败：路径被目录占位 → 告警不抛出、占位物原样保留', (t) => {
+  const { dir, entries, writer } = makeWriter(t);
+  const file = sessionFilePath(dir, 'session-abc-1');
+  mkdirSync(file, { recursive: true });
+  writer.close();
+  assert.equal(entries.some((entry) => entry.level === 'warn' && entry.message.includes('会话状态文件清除失败')), true);
+  assert.equal(existsSync(file), true, '删除失败不重试、不清空（读取端按时间判陈旧兜底）');
 });
 
 test('会话标识缺失或非法：不落盘、计数跳过（info 留痕，非每次告警）', (t) => {

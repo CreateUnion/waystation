@@ -826,6 +826,32 @@ test('并发 view：同一协作的两个等待面各自解挂（先到者不再
   assert.equal(secondView.version, 5);
 });
 
+test('并发 view：先到者超时只摘自己（等待面部分摘除），后到者仍被在线回应解挂', async (t) => {
+  const { service } = makeService(t, { ledgerFetchTimeoutMs: 600 });
+  const held = await activeTwoMemberCollab(t, service);
+  const first = service.view({ collabId: held });
+  /* 错开两个等待面的起点：先到者先超时（此时后到者仍在等待面列表里——摘除必须只摘自己）。 */
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  const second = service.view({ collabId: held });
+  const firstView = await first;
+  assert.equal(firstView.ok, false, '先到者超时回退：本机无快照、如实拒绝');
+  assert.equal(firstView.message, '管理者离线且本机无快照——没有可读台账');
+  await receive(service, snapshotFrame(held, peer('inst-a', '主机甲'), 5));
+  const secondView = await second;
+  assert.equal(secondView.source, 'live', '回应仍能解挂后到者（先到者的超时未摘掉整条等待面）');
+  assert.equal(secondView.version, 5);
+});
+
+test('close：在途 view 等待面被统一解挂（按无快照回退、不悬置到超时）', { timeout: 5000 }, async (t) => {
+  const { service } = makeService(t, { ledgerFetchTimeoutMs: 60000 });
+  const held = await activeTwoMemberCollab(t, service);
+  const pending = service.view({ collabId: held });
+  service.close();
+  const view = await pending;
+  assert.equal(view.ok, false, 'close 解挂等待面：本机无快照、如实拒绝');
+  assert.equal(view.message, '管理者离线且本机无快照——没有可读台账');
+});
+
 test('观测计数：未知协作拒绝 / 快照回执 / 未匹配冻结（运营观测面断言）', async (t) => {
   const manager = managerWithTwoInvites(t);
   await receive(manager.service, collabFrame('approve', manager.collabId, peer('inst-b', '主机乙'), {}));

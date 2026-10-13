@@ -27,6 +27,9 @@ export function createSessionStatusWriter({ mainDataDir, sessionId, collect, log
     log,
     heartbeatMs,
     now,
+    /* 关闭为终态：置位后 refresh / start 一律空转——防关闭后的误调用复活文件
+     * （会话关了这台机器就离线，复活出的文件会与真实状态相悖）。 */
+    stopped: false,
     /** @type {string | null} */
     filePath: null,
     /** @type {ReturnType<typeof setInterval> | null} */
@@ -43,13 +46,14 @@ export function createSessionStatusWriter({ mainDataDir, sessionId, collect, log
     start: () => start(state),
     refresh: () => refresh(state),
     close: () => close(state),
-    stats: () => ({ ...state.counters, active: state.filePath !== null }),
+    stats: () => ({ ...state.counters, active: state.filePath !== null && !state.stopped }),
   };
 }
 
-/* 启动 = 立即写一次 + 周期心跳；定时器 unref（后台刷新不阻进程退出——会话关闭路径另有显式 close）。 */
+/* 启动 = 立即写一次 + 周期心跳；定时器 unref（后台刷新不阻进程退出——会话关闭路径另有显式 close）。
+ * 已关闭（终态）的写入端不再重启。 */
 function start(state) {
-  if (state.filePath === null || state.timer !== null) {
+  if (state.stopped || state.filePath === null || state.timer !== null) {
     return;
   }
   refresh(state);
@@ -68,9 +72,9 @@ function collectOrNull(state) {
   }
 }
 
-/* 单步刷新（幂等，可独立于 start 调用——供测试与异常路径复用）。 */
+/* 单步刷新（幂等，可独立于 start 调用——供测试与异常路径复用）；已关闭（终态）时空转。 */
 function refresh(state) {
-  if (state.filePath === null) {
+  if (state.stopped || state.filePath === null) {
     return;
   }
   const snapshot = collectOrNull(state);
@@ -98,8 +102,9 @@ function refresh(state) {
   }
 }
 
-/* 关闭 = 停表 + 删除本会话文件（陈旧残留由读取端按时间判据兜底不可见）。 */
+/* 关闭 = 置终态 + 停表 + 删除本会话文件（陈旧残留由读取端按时间判据兜底不可见）。 */
 function close(state) {
+  state.stopped = true;
   if (state.timer !== null) {
     clearInterval(state.timer);
     state.timer = null;

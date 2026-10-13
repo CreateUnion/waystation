@@ -199,7 +199,7 @@ test('ws_check_inbox：limit 越界与类型错误 → isError（不发查询）
   assert.equal(queried, 0);
 });
 
-test('ws_check_inbox：透传查询并输出 {total, returned, messages}', async () => {
+test('ws_check_inbox：透传查询并输出 {ok, total, returned, messages}', async () => {
   const queries = [];
   const net = {
     checkInbox: (query) => {
@@ -527,6 +527,16 @@ test('ws_delivery_status：系统回报条目折叠为 reportRows、不进 rows�
   assert.ok(Array.isArray(payload.rows));
   assert.deepEqual(payload.rows.map((row) => row.msgId), ['msg-1'], '回报条目折叠后其余行原样');
   assert.equal(payload.reportRows, 1, '折叠条数以计数报出（不静默）');
+});
+
+test('ws_delivery_status：全部条目均为系统回报 → rows 为空数组、reportRows 如实计数（全折叠边界）', async () => {
+  const reportRow = (msgId) => ({ msgId, collabId: 'collab-1', type: 'delivery-status', toInstanceId: 'inst-b', tier: 'at-peer', expired: false, attempts: 1, createdAt: '2026-10-13T00:00:00.000Z', nextAttemptAt: '2026-10-13T00:00:10.000Z', ackedAt: null, deliveredAt: null });
+  const net = { deliveryStatus: () => [reportRow('msg-r1'), reportRow('msg-r2')] };
+  const result = await callTool(deliveryStatusTool(), {}, net);
+  const payload = JSON.parse(result.content[0].text);
+  assert.ok(Array.isArray(payload.rows));
+  assert.deepEqual(payload.rows, [], '全部回报条目折叠后 rows 为空数组');
+  assert.equal(payload.reportRows, 2, '折叠条数与查询总数一致（不静默）');
 });
 
 test('ws_create_collab：目标上限随 MAX_COLLAB_MEMBERS 派生（上限内合法、越限拒绝）', async () => {
