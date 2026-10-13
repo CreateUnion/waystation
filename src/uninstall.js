@@ -2,10 +2,11 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { MANAGED_MARKER, applyRemoveCommands, planRemoveCommands } from './claude-commands.js';
 import { resolveDataDir } from './paths.js';
 
 /* `waystation uninstall` 子命令（设计「安装与配置」节的卸载命令形态）：注销 MCP 注册 →
- * 删除可执行 shim → 尽力删除安装目录 → 数据目录默认保留（--purge-data 才删）。
+ * 移除随装的斜杠命令 → 删除可执行 shim → 尽力删除安装目录 → 数据目录默认保留（--purge-data 才删）。
  * **安装面与数据目录可能不同位**：两安装脚本恒把 app/shim 装到 <HOME>/.waystation 布局
  * （不读 WAYSTATION_HOME），数据目录则经 resolveDataDir 解析（尊重 WAYSTATION_HOME）——
  * 故 app/shim 按安装布局定位、purge 目标按数据目录解析（见 runUninstallCli 与 USAGE）。
@@ -18,7 +19,7 @@ import { resolveDataDir } from './paths.js';
 
 const USAGE_LINES = [
   '用法：',
-  '  waystation uninstall              卸载（注销 MCP 注册、删可执行与安装目录；保留数据目录）',
+  '  waystation uninstall              卸载（注销 MCP 注册、移除斜杠命令、删可执行与安装目录；保留数据目录）',
   '  waystation uninstall --purge-data 连数据目录一起删除（含全部协作数据）',
   '  waystation uninstall --dry-run    预览：只打印将执行的动作，不改动任何文件与系统设置',
   '',
@@ -64,13 +65,14 @@ export async function runUninstallCli({ argv = [], env = process.env, home = hom
   const installDir = join(home, '.waystation');
   write(parsed.dryRun ? '=== waystation 卸载（dry-run：只打印，不改动）===' : '=== waystation 卸载 ===');
   removeRegistration(parsed, runCommand);
+  removeCommands(parsed, home);
   removeExecutables(parsed, installDir, home);
   removeAppDir(parsed, join(installDir, 'app'));
   return handleDataDir(parsed, dataDir, home);
 }
 
 function removeRegistration(parsed, runCommand) {
-  write('1/4 注销 MCP 注册（claude mcp remove -s user waystation）');
+  write('1/5 注销 MCP 注册（claude mcp remove -s user waystation）');
   if (parsed.dryRun) {
     write('    将执行：claude mcp remove -s user waystation（未注册时该命令报错，属预期）');
     return;
@@ -87,9 +89,40 @@ function removeRegistration(parsed, runCommand) {
   write(`    未注销（多为本来就没注册）：${String(removed.output).split('\n')[0]}`);
 }
 
+/* 斜杠命令是安装时写入用户级命令目录的受管文件——删除面只认受管标记（判定与删除动作都落在
+ * src/claude-commands.js 的单一权威），用户自放的同名/异名文件一律不动；目录读取异常不中断
+ * 卸载，给手工指引后继续其余清理。 */
+function removeCommands(parsed, home) {
+  write('2/5 删除斜杠命令');
+  try {
+    const plan = planRemoveCommands({ home, dryRun: parsed.dryRun });
+    if (!plan.dirExists) {
+      write(`    不存在，跳过：${plan.commandsDir}`);
+      return;
+    }
+    if (plan.files.length === 0) {
+      write(`    无受管文件，跳过：${plan.commandsDir}`);
+      return;
+    }
+    const removed = applyRemoveCommands(plan);
+    for (const entry of plan.files) {
+      if (parsed.dryRun) {
+        write(`    将删除：${entry.targetPath}`);
+      } else if (removed.removed.includes(entry.fileName)) {
+        write(`    已删除：${entry.targetPath}`);
+      }
+    }
+    for (const failure of removed.failures) {
+      write(`    ${failure}`);
+    }
+  } catch (error) {
+    write(`    失败：${error?.message}——请手动删除 ~/.claude/commands/ 下带 ${MANAGED_MARKER} 标记的文件`);
+  }
+}
+
 /* 两平台安装脚本的可执行放置点都在候选内：Windows shim 在 <HOME>/.waystation/bin 下、Linux shim 在家目录 .local/bin。 */
 function removeExecutables(parsed, installDir, home) {
-  write('2/4 删除可执行');
+  write('3/5 删除可执行');
   const shims = [join(installDir, 'bin', 'waystation.cmd'), join(home, '.local', 'bin', 'waystation')];
   for (const shim of shims) {
     if (parsed.dryRun) {
@@ -111,7 +144,7 @@ function removeExecutables(parsed, installDir, home) {
 
 /* 删除自身安装目录：从安装副本内运行时可能被占用（如 Windows 文件锁）——失败给手动指引。 */
 function removeAppDir(parsed, appDir) {
-  write('3/4 删除安装目录');
+  write('4/5 删除安装目录');
   if (parsed.dryRun) {
     write(`    将删除：${appDir}`);
     return;
@@ -130,7 +163,7 @@ function removeAppDir(parsed, appDir) {
 }
 
 function handleDataDir(parsed, dataDir, home) {
-  write('4/4 数据目录');
+  write('5/5 数据目录');
   if (!parsed.purgeData) {
     write(`    按默认保留（含协作数据）：${dataDir}`);
     write('    如确认不再需要，加 --purge-data 重跑即可删除');

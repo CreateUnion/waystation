@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { MANAGED_MARKER } from '../src/claude-commands.js';
 import { defaultRunCommand, parseUninstallArgs, runUninstallCli } from '../src/uninstall.js';
 import { makeTempDir, repoRoot } from './helpers.js';
 
@@ -37,20 +38,24 @@ async function runWithCapture(run) {
 
 /* 「已安装」现场：**安装面按 HOME 布局**（<home>/.waystation 的 app 与 bin shim）、**数据目录另位**
  * （WAYSTATION_HOME 指向 <home>/data，含 config.json 以过 purge 内容形态检查）——全部删除面落在
- * 临时目录内，绝不触碰真实家目录。 */
+ * 临时目录内，绝不触碰真实家目录。命令目录含一个受管命令与一个外来文件：删除面只应命中前者。 */
 function makeInstalledHome(t) {
   const home = makeTempDir(t);
   const installDir = join(home, '.waystation');
   const dataDir = join(home, 'data');
+  const commandsDir = join(home, '.claude', 'commands');
   mkdirSync(join(installDir, 'app', 'src'), { recursive: true });
   writeFileSync(join(installDir, 'app', 'src', 'index.js'), '// 占位');
   mkdirSync(join(installDir, 'bin'), { recursive: true });
   writeFileSync(join(installDir, 'bin', 'waystation.cmd'), '@echo off');
   mkdirSync(join(home, '.local', 'bin'), { recursive: true });
   writeFileSync(join(home, '.local', 'bin', 'waystation'), '#!/bin/sh');
+  mkdirSync(commandsDir, { recursive: true });
+  writeFileSync(join(commandsDir, 'ws-list.md'), `---\ndescription: 列表\n---\n${MANAGED_MARKER}\n正文\n`);
+  writeFileSync(join(commandsDir, 'note.md'), '用户手工文件\n');
   mkdirSync(dataDir, { recursive: true });
   writeFileSync(join(dataDir, 'config.json'), '{}');
-  return { home, installDir, dataDir };
+  return { home, installDir, dataDir, commandsDir };
 }
 
 test('参数解析：三开关组合与未知参数收集', () => {
@@ -75,24 +80,29 @@ test('默认命令执行器：真实进程映射（成功 / 非零退出 / 可�
 });
 
 test('dry-run：只打印、不执行命令、不删任何文件', async (t) => {
-  const { home, installDir, dataDir } = makeInstalledHome(t);
+  const { home, installDir, dataDir, commandsDir } = makeInstalledHome(t);
   const { calls, runner } = recordingRunner();
   const { code, output } = await runWithCapture(() => runUninstallCli({ argv: ['--dry-run'], env: { WAYSTATION_HOME: dataDir }, runCommand: runner, home }));
   assert.equal(code, 0);
   assert.equal(calls.length, 0);
   assert.ok(output.includes('将执行：claude mcp remove -s user waystation'));
-  assert.ok(output.includes('将删除'));
+  assert.ok(output.includes('斜杠命令'));
+  assert.ok(output.includes(`将删除：${join(commandsDir, 'ws-list.md')}`));
   assert.equal(existsSync(join(installDir, 'app')), true);
   assert.equal(existsSync(join(installDir, 'bin', 'waystation.cmd')), true);
+  assert.equal(existsSync(join(commandsDir, 'ws-list.md')), true, 'dry-run 不删受管斜杠命令');
 });
 
 test('真实路径：注销注册、删两平台 shim 与安装目录、数据目录保留（安装面按 HOME 布局）', async (t) => {
-  const { home, installDir, dataDir } = makeInstalledHome(t);
+  const { home, installDir, dataDir, commandsDir } = makeInstalledHome(t);
   const { calls, runner } = recordingRunner();
   const { code, output } = await runWithCapture(() => runUninstallCli({ argv: [], env: { WAYSTATION_HOME: dataDir }, runCommand: runner, home }));
   assert.equal(code, 0);
   assert.deepEqual(calls, ['claude mcp remove -s user waystation']);
   assert.ok(output.includes('已注销：waystation'));
+  assert.ok(output.includes('2/5 删除斜杠命令'));
+  assert.equal(existsSync(join(commandsDir, 'ws-list.md')), false, '受管斜杠命令随卸载删除');
+  assert.equal(existsSync(join(commandsDir, 'note.md')), true, '无标记文件一律不动');
   assert.equal(existsSync(join(installDir, 'app')), false);
   assert.equal(existsSync(join(installDir, 'bin', 'waystation.cmd')), false);
   assert.equal(existsSync(join(home, '.local', 'bin', 'waystation')), false, 'Linux shim 同删');

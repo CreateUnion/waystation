@@ -8,13 +8,14 @@
       2) 拷贝运行所需文件到 %USERPROFILE%\.waystation\app\ 并用 npm ci --omit=dev 就位依赖
       3) 放置可执行 %USERPROFILE%\.waystation\bin\waystation.cmd
       4) 注册 Claude Code MCP（未装 claude CLI 时打印手工步骤、不视为失败）
-      5) 自检 + 打印防火墙放行指引与会话期首检清单
+      5) 安装斜杠命令到 ~/.claude/commands/（未装 claude CLI 时打印手工步骤、不视为失败）
+      6) 自检 + 打印防火墙放行指引与会话期首检清单
 
     特性与边界：
       - 幂等：重复运行安全（重新拷贝、重装依赖、重新注册）。
       - -DryRun：只做只读检测并打印将执行的动作，不改动任何文件或系统设置。
       - 防火墙只打印指引、绝不自动修改。
-      - 卸载：-Uninstall（注销 MCP、删安装目录与可执行）；数据目录默认保留，
+      - 卸载：-Uninstall（注销 MCP、删斜杠命令、删安装目录与可执行）；数据目录默认保留，
         加 -PurgeData 才连数据目录一起删。「waystation uninstall」命令（驿站本体提供：
         注销注册 + 清理 + 数据可选保留）在默认布局下与之等价可选——已装驿站二选一即可；
         自定义 WAYSTATION_HOME 时以该命令为准（本脚本不读该变量）。
@@ -105,6 +106,10 @@ function Assert-RepoTree {
     }
     if (-not (Test-Path (Join-Path $RepoRoot 'src'))) {
         Fail "找不到 $(Join-Path $RepoRoot 'src')"
+    }
+    $commandsDir = Join-Path $RepoRoot 'scripts\claude-commands'
+    if (-not (Test-Path $commandsDir)) {
+        Fail "找不到 $commandsDir"
     }
 }
 
@@ -220,7 +225,7 @@ function Test-PathOnPath([string]$Dir) {
 }
 
 function Install-Files {
-    Write-Step '2/5' "安装运行文件到 $AppDir"
+    Write-Step '2/6' "安装运行文件到 $AppDir"
     if ($DryRun) {
         Write-Note '将清理并重新拷贝：bin\ src\ scripts\statusline.js package.json package-lock.json'
         Write-Note '将在安装目录执行：npm ci --omit=dev --no-audit --no-fund'
@@ -259,7 +264,7 @@ function Install-Files {
 }
 
 function Install-Shim {
-    Write-Step '3/5' "放置可执行：$ShimPath"
+    Write-Step '3/6' "放置可执行：$ShimPath"
     if ($DryRun) {
         Write-Note "将写入 $ShimPath（内容：调用 node 运行 $AppDir\bin\waystation.js）"
         return
@@ -279,7 +284,7 @@ function Install-Shim {
 }
 
 function Register-Mcp {
-    Write-Step '4/5' '注册 Claude Code MCP（claude mcp add -s user waystation -- ...）'
+    Write-Step '4/6' '注册 Claude Code MCP（claude mcp add -s user waystation -- ...）'
     # Windows 上注册命令用 node + 入口 .js 的绝对路径：Claude Code 以 shell:false 直接 spawn MCP 子进程，
     # .cmd shim 不经 shell 不可靠（本机 CLI 内嵌实现证实）；旁边的 .cmd 只供人工在终端使用。
     $script:McpCommandArgs = @('node', (Join-Path $AppDir 'bin\waystation.js'))
@@ -318,8 +323,37 @@ function Register-Mcp {
     }
 }
 
+function Install-ClaudeCommands {
+    # 受管命令的「哪些文件/怎么判定」全部在 src/claude-commands.js（唯一权威）；本步只调入口并转发输出
+    Write-Step '5/6' '安装斜杠命令到 ~/.claude/commands/'
+    $commandsSourceDir = Join-Path $RepoRoot 'scripts\claude-commands'
+    if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
+        if ($DryRun) {
+            Write-Note '未找到 claude CLI——真实运行时将跳过安装（不视为失败）并打印手工步骤'
+        } else {
+            Write-Note '未找到 claude CLI——跳过安装（不影响安装的其他部分）'
+        }
+        Write-Note '手工步骤（安装 Claude Code 后执行）：'
+        Write-Note "  把 $commandsSourceDir 下两个文件拷到 ~\.claude\commands\"
+        return
+    }
+    $modulePath = Join-Path $RepoRoot 'src\claude-commands.js'
+    $commandArgs = @($modulePath, 'install', '--home', $HOME, '--source', $commandsSourceDir)
+    if ($DryRun) {
+        $commandArgs += '--dry-run'
+    }
+    $run = Invoke-Native -Command 'node' -CommandArgs $commandArgs
+    foreach ($line in $run.Output) {
+        Write-Note "$line"
+    }
+    if ($run.ExitCode -ne 0) {
+        Write-Warn '斜杠命令安装失败（退出码非 0，不中断安装——重跑本脚本即可重试）'
+        Write-Note "  或手工执行：把 $commandsSourceDir 下两个文件拷到 ~\.claude\commands\"
+    }
+}
+
 function Invoke-SelfCheck {
-    Write-Step '5/5' '自检'
+    Write-Step '6/6' '自检'
     $problems = 0
     $entry = Join-Path $AppDir 'bin\waystation.js'
     if (Test-Path $entry) {
@@ -347,6 +381,21 @@ function Invoke-SelfCheck {
     } else {
         Write-Warn "状态栏脚本缺失：$statusline"
         $problems++
+    }
+    # 只核对源集合文件名就位（不判受管标记——标记判定属模块单一权威，不在脚本里复刻）
+    if (Get-Command claude -ErrorAction SilentlyContinue) {
+        $commandsSourceDir = Join-Path $RepoRoot 'scripts\claude-commands'
+        foreach ($sourceFile in (Get-ChildItem -Path $commandsSourceDir -Filter '*.md' -File)) {
+            $commandTarget = Join-Path (Join-Path $HOME '.claude\commands') $sourceFile.Name
+            if (Test-Path $commandTarget) {
+                Write-Note "斜杠命令就位：$($sourceFile.Name)"
+            } else {
+                Write-Warn "斜杠命令缺失：$commandTarget"
+                $problems++
+            }
+        }
+    } else {
+        Write-Note '斜杠命令：跳过（未装 claude CLI）'
     }
     switch ($script:McpState) {
         'registered' { Write-Note 'MCP 注册：已写入（claude mcp add 退出码 0）' }
@@ -439,7 +488,7 @@ function Invoke-Uninstall {
         Write-Say '=== waystation 卸载 ==='
     }
 
-    Write-Step '1/4' '注销 MCP 注册'
+    Write-Step '1/5' '注销 MCP 注册'
     if ($DryRun) {
         Write-Note '将执行：claude mcp remove -s user waystation（未注册时该命令报错，属预期；未安装 claude CLI 时改为提示手工步骤）'
     } elseif (Get-Command claude -ErrorAction SilentlyContinue) {
@@ -453,7 +502,28 @@ function Invoke-Uninstall {
         Write-Note '未找到 claude CLI；如以后需要，可手工执行：claude mcp remove -s user waystation'
     }
 
-    Write-Step '2/4' '删除可执行'
+    # 只删受管文件（标记判定在 src/claude-commands.js 模块内）；node 缺失或入口失败只提示手工删除，不中断卸载
+    Write-Step '2/5' '删除斜杠命令'
+    if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+        Write-Warn '未找到 node——跳过自动删除（不中断卸载）'
+        Write-Note '手工删除：删除 ~\.claude\commands\ 下带 <!-- waystation-managed-command --> 标记的文件'
+    } else {
+        $modulePath = Join-Path $RepoRoot 'src\claude-commands.js'
+        $commandArgs = @($modulePath, 'remove', '--home', $HOME)
+        if ($DryRun) {
+            $commandArgs += '--dry-run'
+        }
+        $run = Invoke-Native -Command 'node' -CommandArgs $commandArgs
+        foreach ($line in $run.Output) {
+            Write-Note "$line"
+        }
+        if ($run.ExitCode -ne 0) {
+            Write-Warn '斜杠命令删除失败（不中断卸载）'
+            Write-Note '手工删除：删除 ~\.claude\commands\ 下带 <!-- waystation-managed-command --> 标记的文件'
+        }
+    }
+
+    Write-Step '3/5' '删除可执行'
     if ($DryRun) {
         Write-Note "将删除：$ShimPath"
     } elseif (Test-Path $ShimPath) {
@@ -463,7 +533,7 @@ function Invoke-Uninstall {
         Write-Note "不存在，跳过：$ShimPath"
     }
 
-    Write-Step '3/4' '删除安装目录'
+    Write-Step '4/5' '删除安装目录'
     if ($DryRun) {
         Write-Note "将删除：$AppDir"
     } elseif (Test-Path $AppDir) {
@@ -473,7 +543,7 @@ function Invoke-Uninstall {
         Write-Note "不存在，跳过：$AppDir"
     }
 
-    Write-Step '4/4' '数据目录'
+    Write-Step '5/5' '数据目录'
     if ($PurgeData) {
         # 数据目录位置由 HOME 派生、不接受参数覆盖——这才是防护的真正来源；本守卫只作纵深防御
         if ((Split-Path -Leaf $DataDir) -ne '.waystation') {
@@ -516,7 +586,7 @@ if ($DryRun) {
 
 Assert-RepoTree
 
-Write-Step '1/5' '环境检测'
+Write-Step '1/6' '环境检测'
 Assert-Node
 Read-PortAnchor
 Test-PortAvailability
@@ -524,8 +594,9 @@ Test-PortAvailability
 Install-Files
 Install-Shim
 Register-Mcp
+Install-ClaudeCommands
 if ($DryRun) {
-    Write-Note '（dry-run：自检从略——真实运行时将核对入口、运行依赖、可执行、状态栏脚本与 MCP 注册五项）'
+    Write-Note '（dry-run：自检从略——真实运行时将核对入口、运行依赖、可执行、状态栏脚本、斜杠命令与 MCP 注册六项）'
 } else {
     Invoke-SelfCheck
 }

@@ -6,13 +6,14 @@
 #   2) 拷贝运行所需文件到 ~/.waystation/app/ 并用 npm ci --omit=dev 就位依赖
 #   3) 放置可执行到 ~/.local/bin/waystation（符号链接到安装目录的入口）
 #   4) 注册 Claude Code MCP（未装 claude CLI 时打印手工步骤、不视为失败）
-#   5) 自检 + 打印防火墙放行指引与会话期首检清单
+#   5) 安装斜杠命令到 ~/.claude/commands/（未装 claude CLI 时打印手工步骤、不视为失败）
+#   6) 自检 + 打印防火墙放行指引与会话期首检清单
 #
 # 特性与边界：
 #   - 幂等：重复运行安全（重新拷贝、重装依赖、重新注册）。
 #   - --dry-run：只做只读检测并打印将执行的动作，不改动任何文件或系统设置。
 #   - 防火墙只打印指引、绝不自动修改。
-#   - 卸载：--uninstall（注销 MCP、删安装目录与可执行）；数据目录默认保留，
+#   - 卸载：--uninstall（注销 MCP、删斜杠命令、删安装目录与可执行）；数据目录默认保留，
 #     加 --purge-data 才连数据目录一起删。「waystation uninstall」命令（驿站本体提供：
 #     注销注册 + 清理 + 数据可选保留）在默认布局下与之等价可选——已装驿站二选一即可；
 #     自定义 WAYSTATION_HOME 时以该命令为准（本脚本不读该变量）。
@@ -52,6 +53,15 @@ step() { printf '\n[%s] %s\n' "$1" "$2"; }
 note() { printf '    %s\n' "$*"; }
 warn() { printf '  ！%s\n' "$*"; }
 fail() { printf '\n错误：%s\n' "$*" >&2; exit 1; }
+note_lines() {
+  # 把斜杠命令模块的 stdout 行按 note 缩进口径逐行转发（空行不打印）
+  local line=""
+  while IFS= read -r line; do
+    if [ -n "$line" ]; then
+      note "$line"
+    fi
+  done <<< "$1"
+}
 
 usage() {
   cat <<'EOF'
@@ -60,7 +70,7 @@ waystation 安装脚本（Linux）
 用法：
   bash scripts/install.sh                            安装（幂等，可重复运行）
   bash scripts/install.sh --dry-run                  预览：只做只读检测并打印将执行的动作
-  bash scripts/install.sh --uninstall                卸载（注销 MCP、删安装目录与可执行；保留数据目录）
+  bash scripts/install.sh --uninstall                卸载（注销 MCP、删斜杠命令、删安装目录与可执行；保留数据目录）
   bash scripts/install.sh --uninstall --purge-data   卸载并删除数据目录（含全部协作数据）
   bash scripts/install.sh --help                     显示本帮助
 
@@ -92,6 +102,7 @@ check_repo_tree() {
   [ -f "${REPO_ROOT}/package-lock.json" ] || fail "找不到 ${REPO_ROOT}/package-lock.json（依赖就位需要它）"
   [ -f "${REPO_ROOT}/bin/waystation.js" ] || fail "找不到 ${REPO_ROOT}/bin/waystation.js"
   [ -d "${REPO_ROOT}/src" ] || fail "找不到 ${REPO_ROOT}/src"
+  [ -d "${REPO_ROOT}/scripts/claude-commands" ] || fail "找不到 ${REPO_ROOT}/scripts/claude-commands"
 }
 
 read_engines_node() {
@@ -185,7 +196,7 @@ check_port() {
 # ---- 安装 ------------------------------------------------------------------
 
 install_files() {
-  step "2/5" "安装运行文件到 ${APP_DIR}"
+  step "2/6" "安装运行文件到 ${APP_DIR}"
   if [ "$DRY_RUN" = 1 ]; then
     note "将清理并重新拷贝：bin/ src/ scripts/statusline.js package.json package-lock.json"
     note "将在安装目录执行：npm ci --omit=dev --no-audit --no-fund"
@@ -207,7 +218,7 @@ install_files() {
 }
 
 place_executable() {
-  step "3/5" "放置可执行：${SHIM_PATH}"
+  step "3/6" "放置可执行：${SHIM_PATH}"
   if [ "$DRY_RUN" = 1 ]; then
     note "将创建目录 ${BIN_DIR} 并建立符号链接：${SHIM_PATH} -> ${APP_DIR}/bin/waystation.js"
     return 0
@@ -227,7 +238,7 @@ place_executable() {
 }
 
 register_mcp() {
-  step "4/5" "注册 Claude Code MCP（claude mcp add -s user waystation -- ...）"
+  step "4/6" "注册 Claude Code MCP（claude mcp add -s user waystation -- ...）"
   # 注册目标 = PATH 上的可执行名，不在 PATH 时退化为绝对路径；两者都是 shebang 脚本，POSIX 下可直接 spawn
   case ":${PATH}:" in
     *":${BIN_DIR}:"*) MCP_TARGET="waystation" ;;
@@ -263,8 +274,36 @@ register_mcp() {
   fi
 }
 
+install_claude_commands() {
+  # 受管命令的「哪些文件/怎么判定」全部在 src/claude-commands.js（唯一权威）；本步只调入口并转发输出
+  step "5/6" "安装斜杠命令到 ~/.claude/commands/"
+  local source_dir="${REPO_ROOT}/scripts/claude-commands"
+  if ! command -v claude >/dev/null 2>&1; then
+    if [ "$DRY_RUN" = 1 ]; then
+      note "未找到 claude CLI——真实运行时将跳过安装（不视为失败）并打印手工步骤"
+    else
+      note "未找到 claude CLI——跳过安装（不影响安装的其他部分）"
+    fi
+    note "手工步骤（安装 Claude Code 后执行）："
+    note "  把 ${source_dir}/ 下两个文件拷到 ~/.claude/commands/"
+    return 0
+  fi
+  local args=(install --home "$HOME" --source "$source_dir")
+  if [ "$DRY_RUN" = 1 ]; then
+    args+=(--dry-run)
+  fi
+  local output=""
+  if output="$(node "${REPO_ROOT}/src/claude-commands.js" "${args[@]}" 2>&1)"; then
+    note_lines "$output"
+  else
+    note_lines "$output"
+    warn "斜杠命令安装失败（退出码非 0，不中断安装——重跑本脚本即可重试）"
+    note "  或手工执行：把 ${source_dir}/ 下两个文件拷到 ~/.claude/commands/"
+  fi
+}
+
 self_check() {
-  step "5/5" "自检"
+  step "6/6" "自检"
   local problems=0
   if [ -f "${APP_DIR}/bin/waystation.js" ]; then
     note "入口就位：${APP_DIR}/bin/waystation.js"
@@ -292,6 +331,21 @@ self_check() {
   else
     warn "状态栏脚本缺失：${APP_DIR}/scripts/statusline.js"
     problems=$((problems + 1))
+  fi
+  # 只核对源集合文件名就位（不判受管标记——标记判定属模块单一权威，不在脚本里复刻）
+  local cmd_src="" cmd_name=""
+  if command -v claude >/dev/null 2>&1; then
+    for cmd_src in "${REPO_ROOT}"/scripts/claude-commands/*.md; do
+      cmd_name="$(basename "$cmd_src")"
+      if [ -f "${HOME}/.claude/commands/${cmd_name}" ]; then
+        note "斜杠命令就位：${cmd_name}"
+      else
+        warn "斜杠命令缺失：${HOME}/.claude/commands/${cmd_name}"
+        problems=$((problems + 1))
+      fi
+    done
+  else
+    note "斜杠命令：跳过（未装 claude CLI）"
   fi
   case "$MCP_STATE" in
     registered) note "MCP 注册：已写入（claude mcp add 退出码 0）" ;;
@@ -377,6 +431,28 @@ show_client_snippets() {
 
 # ---- 卸载 ------------------------------------------------------------------
 
+remove_claude_commands() {
+  # 只删受管文件（标记判定在 src/claude-commands.js 模块内）；node 缺失或入口失败只提示手工删除，不中断卸载
+  step "2/5" "删除斜杠命令"
+  if ! command -v node >/dev/null 2>&1; then
+    warn "未找到 node——跳过自动删除（不中断卸载）"
+    note "手工删除：删除 ~/.claude/commands/ 下带 <!-- waystation-managed-command --> 标记的文件"
+    return 0
+  fi
+  local args=(remove --home "$HOME")
+  if [ "$DRY_RUN" = 1 ]; then
+    args+=(--dry-run)
+  fi
+  local output=""
+  if output="$(node "${REPO_ROOT}/src/claude-commands.js" "${args[@]}" 2>&1)"; then
+    note_lines "$output"
+  else
+    note_lines "$output"
+    warn "斜杠命令删除失败（不中断卸载）"
+    note "手工删除：删除 ~/.claude/commands/ 下带 <!-- waystation-managed-command --> 标记的文件"
+  fi
+}
+
 do_uninstall() {
   local title="=== waystation 卸载 ==="
   if [ "$DRY_RUN" = 1 ]; then
@@ -384,7 +460,7 @@ do_uninstall() {
   fi
   say "$title"
 
-  step "1/4" "注销 MCP 注册"
+  step "1/5" "注销 MCP 注册"
   if [ "$DRY_RUN" = 1 ]; then
     note "将执行：claude mcp remove -s user waystation（未注册时该命令报错，属预期；未安装 claude CLI 时改为提示手工步骤）"
   elif command -v claude >/dev/null 2>&1; then
@@ -397,7 +473,9 @@ do_uninstall() {
     note "未找到 claude CLI；如以后需要，可手工执行：claude mcp remove -s user waystation"
   fi
 
-  step "2/4" "删除可执行"
+  remove_claude_commands
+
+  step "3/5" "删除可执行"
   if [ "$DRY_RUN" = 1 ]; then
     note "将删除：${SHIM_PATH}"
   elif [ -e "$SHIM_PATH" ]; then
@@ -407,7 +485,7 @@ do_uninstall() {
     note "不存在，跳过：${SHIM_PATH}"
   fi
 
-  step "3/4" "删除安装目录"
+  step "4/5" "删除安装目录"
   if [ "$DRY_RUN" = 1 ]; then
     note "将删除：${APP_DIR}"
   elif [ -d "$APP_DIR" ]; then
@@ -417,7 +495,7 @@ do_uninstall() {
     note "不存在，跳过：${APP_DIR}"
   fi
 
-  step "4/4" "数据目录"
+  step "5/5" "数据目录"
   if [ "$PURGE_DATA" = 1 ]; then
     # 数据目录位置由 HOME 派生、不接受参数覆盖——这才是防护的真正来源；本守卫只作纵深防御
     case "$DATA_DIR" in
@@ -459,7 +537,7 @@ fi
 
 check_repo_tree
 
-step "1/5" "环境检测"
+step "1/6" "环境检测"
 check_node
 read_port_anchor
 check_port
@@ -467,8 +545,9 @@ check_port
 install_files
 place_executable
 register_mcp
+install_claude_commands
 if [ "$DRY_RUN" = 1 ]; then
-  note "（dry-run：自检从略——真实运行时将核对入口、运行依赖、可执行、状态栏脚本与 MCP 注册五项）"
+  note "（dry-run：自检从略——真实运行时将核对入口、运行依赖、可执行、状态栏脚本、斜杠命令与 MCP 注册六项）"
 else
   self_check
 fi
