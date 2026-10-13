@@ -37,4 +37,11 @@ export default [
     languageOptions: { ecmaVersion: 2023, sourceType: 'module', globals: globals.node },
     rules: { ...STYLE_RULES, 'no-console': 'off' },
   },
+  {
+    // 运维脚本（状态栏读取等）：stdout 是脚本自身的输出通道（与 test/** 夹具同先例），
+    // 不属 src/bin 的 stdio 协议通道面——no-console 关闭、风格规则照全仓
+    files: ['scripts/**/*.js', 'scripts/**/*.mjs'],
+    languageOptions: { ecmaVersion: 2023, sourceType: 'module', globals: globals.node },
+    rules: { ...STYLE_RULES, 'no-console': 'off' },
+  },
 ];
