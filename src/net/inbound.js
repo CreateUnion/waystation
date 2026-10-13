@@ -430,6 +430,9 @@ function inboxRecordsOf(state, collabId) {
   }
   try {
     const loaded = loadLines(collabFilePath(state.dataDir, collabId, INBOX_FILE_NAME));
+    if (loaded.tailDropped || loaded.corruptLines.length > 0) {
+      state.log.warn('收件流水查询：残缺记录按可解析条目返回', { collabId, tailDropped: loaded.tailDropped, corruptLines: loaded.corruptLines.length });
+    }
     const windowStart = Date.now() - state.config.messageTtlMs;
     return loaded.entries.filter((record) => freshEntryOf(record, windowStart) !== null);
   } catch (error) {

@@ -227,3 +227,23 @@ test('lookup：按实例标识取最近地址（治理跨协作寻址回退面�
   hosts.remember({ address: '10.0.0.9', port: 7321, instanceId: 'inst-x', identityName: '主机X' });
   assert.deepEqual(hosts.lookup('inst-x'), { address: '10.0.0.9', port: 7321 });
 });
+
+test('落盘节流：同键刷新按窗口合并（内存即时、磁盘滞后）、新键立即落盘', (t) => {
+  const dir = makeTempDir(t);
+  const log = { info: () => {}, error: () => {}, warn: () => {} };
+  const hosts = createKnownHosts({ dataDir: dir, log, persistMinIntervalMs: 60000 });
+  hosts.remember({ address: '10.0.0.9', port: 7321, instanceId: 'inst-a', identityName: '甲' });
+  assert.equal(JSON.parse(readFileSync(join(dir, KNOWN_HOSTS_FILE_NAME), 'utf8')).hosts.length, 1, '新键立即落盘');
+  hosts.remember({ address: '10.0.0.9', port: 7321, instanceId: 'inst-a', identityName: '甲改名' });
+  assert.equal(hosts.list()[0].identityName, '甲改名', '内存态即时更新（择新排序不受节流影响）');
+  assert.equal(JSON.parse(readFileSync(join(dir, KNOWN_HOSTS_FILE_NAME), 'utf8')).hosts[0].identityName, '甲', '窗口内磁盘保持前一版');
+  hosts.remember({ address: '10.0.0.10', port: 7321, instanceId: 'inst-b', identityName: '乙' });
+  const onDisk = JSON.parse(readFileSync(join(dir, KNOWN_HOSTS_FILE_NAME), 'utf8'));
+  assert.deepEqual(onDisk.hosts.map((entry) => entry.address).sort(), ['10.0.0.10', '10.0.0.9'], '新键落盘时带出窗口内的同键更新');
+
+  const immediateDir = makeTempDir(t);
+  const immediate = createKnownHosts({ dataDir: immediateDir, log, persistMinIntervalMs: 0 });
+  immediate.remember({ address: '10.0.0.9', port: 7321, instanceId: 'inst-a', identityName: '甲' });
+  immediate.remember({ address: '10.0.0.9', port: 7321, instanceId: 'inst-a', identityName: '甲改名' });
+  assert.equal(JSON.parse(readFileSync(join(immediateDir, KNOWN_HOSTS_FILE_NAME), 'utf8')).hosts[0].identityName, '甲改名', '窗口注入 0 = 每次都落盘（既有直测口径）');
+});

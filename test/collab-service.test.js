@@ -812,3 +812,37 @@ test('门控健壮性：畸形帧不抛出（异常隔离为拒绝）', async (t
   assert.equal(service.stats().eventFailures, 1, 'consume 异常被隔离为计数，进程不退出');
   assert.equal(service.list().collabs.length, 0, '畸形邀请不建记录');
 });
+
+test('并发 view：同一协作的两个等待面各自解挂（先到者不再被后来者顶掉）', async (t) => {
+  const { service } = makeService(t, { ledgerFetchTimeoutMs: 200 });
+  const held = await activeTwoMemberCollab(t, service);
+  const first = service.view({ collabId: held });
+  const second = service.view({ collabId: held });
+  await receive(service, snapshotFrame(held, peer('inst-a', '主机甲'), 5));
+  const [firstView, secondView] = await Promise.all([first, second]);
+  assert.equal(firstView.source, 'live', '先发起的等待面同样拿到在线回应');
+  assert.equal(secondView.source, 'live');
+  assert.equal(firstView.version, 5);
+  assert.equal(secondView.version, 5);
+});
+
+test('观测计数：未知协作拒绝 / 快照回执 / 未匹配冻结（运营观测面断言）', async (t) => {
+  const manager = managerWithTwoInvites(t);
+  await receive(manager.service, collabFrame('approve', manager.collabId, peer('inst-b', '主机乙'), {}));
+  assert.equal(manager.service.stats().unknownCollab, 0);
+  const refused = await receive(manager.service, collabFrame('topic', 'collab-unknown', peer('inst-b', '主机乙'), { text: '越界' }));
+  assert.equal(refused.ok, false);
+  assert.equal(manager.service.stats().unknownCollab, 1);
+
+  const member = makeService(t);
+  const held = await activeTwoMemberCollab(t, member.service);
+  member.sent.length = 0;
+  await receive(member.service, snapshotFrame(held, peer('inst-a', '主机甲'), 5));
+  assert.equal(member.service.stats().snapshotReceipts, 1, '快照回执成功计数');
+  assert.equal(sentOf(member.sent, 'notice', held).some((frame) => frame.payload.event === 'snapshot-stored'), true);
+
+  const freezeBefore = member.service.stats().freezeUnmatched;
+  const freezeRefused = await receive(member.service, collabFrame('freeze', 'collab-none', peer('inst-a', '主机甲'), { name: '不存在的项目', members: [{ instanceId: 'inst-a' }, { instanceId: 'inst-self' }] }));
+  assert.equal(freezeRefused.ok, false);
+  assert.equal(member.service.stats().freezeUnmatched, freezeBefore + 1, '与己无关的冻结通告拒绝并计数');
+});

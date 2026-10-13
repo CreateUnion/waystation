@@ -69,7 +69,7 @@ function runtimeMaps() {
     collabs: new Map(),
     inviteWindow: new Map(),
     relayedOrigins: new Map(),
-    pendingViews: new Map(),
+    pendingViews: new Map(),   // 值 = 该协作的等待面列表
     probes: new Map(),
     takeovers: new Map(),
     rearmedTakeovers: new Map(),
@@ -281,9 +281,11 @@ function statsOf(state) {
 /* 收尾：定时器、等待面与在途流程统一解挂（闸门、快照拉取、握手观察、抢接窗口、移交回执）。 */
 function closeService(state) {
   stopLiveness(state);
-  for (const pending of state.pendingViews.values()) {
-    clearTimeout(pending.timer);
-    pending.resolve(null);
+  for (const held of state.pendingViews.values()) {
+    for (const waiter of held) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(null);
+    }
   }
   state.pendingViews.clear();
   for (const held of state.handshakeWatch.values()) {

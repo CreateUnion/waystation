@@ -626,3 +626,13 @@ test('钩子 meta：连接无来源地址时为空串（不抛出）', { timeout
   await waitFor(() => inbound.stats().accepted === 1);
   assert.deepEqual(metas, [{ remoteAddress: '' }]);
 });
+
+test('查询路径：收件流水残缺记录留痕（warn，与载入路径同口径）', (t) => {
+  const { inbound, dir, logs } = makeInbound(t);
+  const now = new Date().toISOString();
+  mkdirSync(join(dir, COLLABS_DIR_NAME, 'collab-corrupt'), { recursive: true });
+  writeFileSync(inboxPath(dir, 'collab-corrupt'), `{"msgId":"m-1","receivedAt":"${now}"}\n{oops\n`);
+  const records = inbound.checkInbox({ collabId: 'collab-corrupt', limit: 10 });
+  assert.equal(records.total, 1, '残缺行不计：可解析条目照常返回');
+  assert.equal(logs.some((entry) => entry.level === 'warn' && entry.message.includes('残缺记录')), true, '查询路径同样留痕');
+});

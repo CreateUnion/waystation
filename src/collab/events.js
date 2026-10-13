@@ -53,6 +53,8 @@ export async function handleEvent(state, frame, meta) {
  * 对应协作的端点表（仅当本机在协作中——注册表命中），并同步 known-hosts（单播兜底目标）。
  * 仅在端点变化时写 member.json（避免每条消息一次写盘）；学习到现任驿丞端点时补做队列重定向、
  * 学到生效抢接记录的成员端点时补发通告（「未入队即无重试」的盲区收窄）。
+ * known-hosts 清单的 lastSeenAt 逐帧刷新（供单播兜底择新），其落盘由清单自身的节流窗口
+ * 合并（见 net/known-hosts.js）——「避免每条消息一次写盘」在此按两处口径各自成立。
  * 「任一成功接触」口径：任何已受理帧（不限于握手）都证明对端可达——顺手解除无法对表的挂起。 */
 function learnEndpoints(state, frame, meta) {
   const local = state.collabs.get(frame.collabId);
@@ -491,13 +493,15 @@ function sendSnapshotReceipt(state, local, frame) {
 }
 
 function resolvePendingView(state, collabId, snapshot) {
-  const pending = state.pendingViews.get(collabId);
-  if (pending === undefined) {
+  const held = state.pendingViews.get(collabId);
+  if (held === undefined) {
     return;
   }
   state.pendingViews.delete(collabId);
-  clearTimeout(pending.timer);
-  pending.resolve(snapshot);
+  for (const waiter of held) {
+    clearTimeout(waiter.timer);
+    waiter.resolve(snapshot);   // 全部等待面拿到同一份应答（并发 view 互不顶替）
+  }
 }
 
 /* 快照请求应答：管理席位把当前台账整份回给请求方（端点取请求帧来源；成员侧忽略；

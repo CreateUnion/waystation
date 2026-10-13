@@ -13,16 +13,23 @@ export const MAX_KNOWN_HOSTS = 64;
 const MAX_TEXT_CHARS = 128;
 const STORAGE_VERSION = 2;
 
+/* 落盘节流窗口（模块私有）：协作域逐帧的端点学习会走到 remember——同键的 lastSeenAt 刷新
+ * 按窗口合并写盘（内存态仍逐帧新鲜、择新排序不受影响）；新键（新站点）立即落盘，
+ * 保证崩溃重启不至于丢掉刚认识的目标。清单是发现辅助、写失败可容忍，窗口内合并的代价可接受。 */
+const PERSIST_MIN_INTERVAL_MS = 5000;
+
 /* 已知主机清单（设计 §5，模型 A）：单播兜底扫描的目标来源 = 历史见过的「地址:端口」。
  * 探测来源与扫描应答都会写入它——广播单向盲区（实测：桥接 VM→宿主广播未达、单播可达）靠它反向补偿；
  * 同机多站点各占「地址:端口」一条，键即该组合。
  * 存储 1→2 版：旧条目（键=地址、无 port）按锚点端口解释——旧版站点全部取默认端口，默认配置下语义等价；
  * 不引入文件级迁移（下一次写入即 v2 形态）。
  * 写入失败只告警不抛出：清单是发现辅助，丢失不得影响主流程（健壮性硬性要求）。 */
-export function createKnownHosts({ dataDir, log }) {
+export function createKnownHosts({ dataDir, log, persistMinIntervalMs = PERSIST_MIN_INTERVAL_MS }) {
   const state = {
     file: join(dataDir, KNOWN_HOSTS_FILE_NAME),
     log,
+    persistMinIntervalMs,
+    lastPersistMs: 0,
     hosts: new Map(),   // 键 = 「地址:端口」
     counters: { invalidEntries: 0, writeFailures: 0, remembered: 0 },
   };
@@ -126,10 +133,14 @@ function remember(state, entry) {
     identityName: boundedText(identityName),
     lastSeenAt: new Date().toISOString(),
   };
-  state.hosts.delete(keyOf(stored));
-  state.hosts.set(keyOf(stored), stored);
+  const key = keyOf(stored);
+  const isNewKey = !state.hosts.has(key);
+  state.hosts.delete(key);
+  state.hosts.set(key, stored);
   evictOverflow(state);
-  persist(state);
+  if (isNewKey || Date.now() - state.lastPersistMs >= state.persistMinIntervalMs) {
+    persist(state);
+  }
 }
 
 function evictOverflow(state) {
@@ -150,6 +161,7 @@ function evictOverflow(state) {
 function persist(state) {
   try {
     writeJsonAtomic(state.file, { version: STORAGE_VERSION, hosts: [...state.hosts.values()] });
+    state.lastPersistMs = Date.now();
   } catch (error) {
     state.counters.writeFailures++;
     state.log.warn('已知主机清单写入失败（内存态继续可用）', { reason: error.message });

@@ -293,15 +293,37 @@ export async function viewLedger(state, { collabId }) {
 }
 
 /* 在线拉取的等待面：回应经接收管线到达（快照接收路径统一 resolve）；超时按快照回退。
+ * 等待面按协作持列表——并发 view 各自解挂（先到者不被后来者顶掉、定时器到期只摘自己）；
  * 定时器保持引用（等待面是调用链的一环，事件循环留存至判定完成），服务 close 时统一清理。 */
 function waitForSnapshot(state, collabId) {
   return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      state.pendingViews.delete(collabId);
-      resolve(null);
-    }, state.ledgerFetchTimeoutMs);
-    state.pendingViews.set(collabId, { resolve, timer });
+    const waiter = {
+      resolve,
+      timer: setTimeout(() => {
+        dropSnapshotWaiter(state, collabId, waiter);
+        resolve(null);
+      }, state.ledgerFetchTimeoutMs),
+    };
+    const held = state.pendingViews.get(collabId);
+    if (held === undefined) {
+      state.pendingViews.set(collabId, [waiter]);
+    } else {
+      held.push(waiter);
+    }
   });
+}
+
+function dropSnapshotWaiter(state, collabId, waiter) {
+  const held = state.pendingViews.get(collabId);
+  if (held === undefined) {
+    return;
+  }
+  const rest = held.filter((candidate) => candidate !== waiter);
+  if (rest.length === 0) {
+    state.pendingViews.delete(collabId);
+  } else {
+    state.pendingViews.set(collabId, rest);
+  }
 }
 
 /* 台账变更的统一入口（单写者纪律）：打补丁 → version 自增 → updatedAt → 落盘 → 推快照。
