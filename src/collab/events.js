@@ -3,6 +3,8 @@ import { MAX_BOARD_ENTRIES, isSnapshotShape } from './model.js';
 import { createPostsStore } from './posts.js';
 import { createMembersStore } from './members.js';
 import { createCounterStore, notifyIndicatorChange } from './counter.js';
+import { createMuteStore } from './mute.js';
+import { createInjectedStore } from './injected.js';
 import { ledgerDigest } from './store.js';
 import { isLocalArchivedState, localModeOf, persistMember, persistSnapshot, rememberKnownHost, selfJoinedOf } from './local.js';
 import { matchConflictCollabs, noteForumGovernanceIgnored } from './gate.js';
@@ -121,6 +123,8 @@ function handleInvite(state, frame, meta) {
     posts: createPostsStore({ dataDir: state.dataDir, collabId: frame.collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
     members: createMembersStore({ dataDir: state.dataDir, collabId: frame.collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
     counter: createCounterStore({ dataDir: state.dataDir, collabId: frame.collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
+    mute: createMuteStore({ dataDir: state.dataDir, collabId: frame.collabId, log: state.log }),
+    injected: createInjectedStore({ dataDir: state.dataDir, collabId: frame.collabId, log: state.log }),
     suspended: null,
     staleManagerId: null,
   };
@@ -399,6 +403,7 @@ function handleWithdrawInbound(state, frame) {
     local.member.state = 'terminated';
     local.member.archivedAt = new Date().toISOString();
     persistMember(state, local);
+    local.mute.clear();
     state.counters.terminatedIn++;
     return;
   }
@@ -482,7 +487,9 @@ function handleProgress(state, frame) {
  * 非中继节点与未标记的直投副本只入列、不转达——见 relayRedistribute 的两可项选定）。
  * 注入栅栏（限帖通道、不泛化）：去重命中的副本以 sessionDeliver:false 声明不重复注入会话
  * （`(作者, postId)` 去重结果参与投递判定）——不同 msgId 的重复路径副本由此不再二次通知；
- * managed 的「受理帧仍注入」行为不受影响（本声明只由帖通道发出，接收管线只在该类型采信）。 */
+ * managed 的「受理帧仍注入」行为不受影响（本声明只由帖通道发出，接收管线只在该类型采信）。
+ * 去重命中同时带回 wasInjected（（作者, postId）是否曾实际注入会话）：接收管线以它为
+ * 「已受理（重复）」终态回报的前件——静音期未注入的首份副本，其重复副本不回报终态。 */
 function handlePost(state, frame) {
   const local = state.collabs.get(frame.collabId);
   if (local === undefined || localModeOf(local) !== 'forum') {
@@ -499,7 +506,7 @@ function handlePost(state, frame) {
   });
   if (!added) {
     state.counters.postsDuplicated++;
-    return { sessionDeliver: false };
+    return { sessionDeliver: false, wasInjected: local.injected.has(frame.from.instanceId, post.postId) };
   }
   state.counters.postsIn++;
   handleRelaySubmission(state, local, frame);
@@ -683,6 +690,7 @@ function handleEnd(state, frame) {
   local.member.state = 'completed';
   local.member.archivedAt = new Date().toISOString();
   persistMember(state, local);
+  local.mute.clear();
   stopJoinReplay(state, local);
   state.counters.endedIn++;
 }

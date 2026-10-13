@@ -9,7 +9,8 @@ import { forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localR
 
 const FROZEN_ALLOWED = new Set(['freeze', 'unfreeze', 'decision', 'takeover-init', 'takeover', 'notice', 'snapshot', 'end', 'leave']);
 const ARCHIVED_ALLOWED = new Set(['snapshot', 'notice', 'end', 'leave', 'history-request', 'history-bundle']);
-const CONFLICT_FRAME_TYPES = new Set(['freeze', 'unfreeze', 'decision']);
+/* 冻结族词表导出：静音栅栏的「被忽略治理帧」判定（mute.js）取自同一权威——词表分叉即判据分叉。 */
+export const CONFLICT_FRAME_TYPES = new Set(['freeze', 'unfreeze', 'decision']);
 const FORUM_CHANNEL_TYPES = new Set(['join', 'history-request', 'history-bundle']);
 
 /* 请求类入站限流（设计 §5.3「请求类入站限流需新增」，计划 §4：同源 10s 内 2 次）：

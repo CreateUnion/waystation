@@ -158,8 +158,9 @@ const discovery = createDiscovery({
   knownHosts,
   log,
 });
-/* 协作门控与投递适配器均经钩子注入（分层纪律：核心模块不 import 协作层 / 适配层）；
- * autoDeliver 关闭 = 不注入投递钩子，消息停留在第二档、由会话主动查（ws_check_inbox）承接。 */
+/* 协作门控、静音栅栏（sessionGate）与注入标记通知（sessionDelivered）与投递适配器均经钩子注入
+ * （分层纪律：核心模块不 import 协作层 / 适配层）；autoDeliver 关闭 = 不注入投递钩子，
+ * 消息停留在第二档、由会话主动查（ws_check_inbox）承接。 */
 const inbound = createInbound({
   dataDir: activeDir,
   config,
@@ -169,6 +170,8 @@ const inbound = createInbound({
   hooks: {
     admit: (frame, meta) => collab.hooks.admit(frame, meta),
     consume: (frame, meta) => collab.hooks.consume(frame, meta),
+    sessionGate: (frame) => collab.hooks.sessionGate(frame),
+    sessionDelivered: (frame) => collab.hooks.sessionDelivered(frame),
     ...(config.autoDeliver ? { deliverToSession: (frame) => adapter.deliverFrame(frame) } : {}),
   },
 });

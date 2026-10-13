@@ -4,6 +4,8 @@ import { MAX_FORUM_MEMBERS, MAX_LOCAL_COLLABS, canTransition, isArchived, newCol
 import { createPostsStore, displayOrderOf, newPostId } from './posts.js';
 import { createMembersStore } from './members.js';
 import { createCounterStore, notifyIndicatorChange } from './counter.js';
+import { createMuteStore } from './mute.js';
+import { createInjectedStore } from './injected.js';
 import { ledgerDigest, removeLedgerFile } from './store.js';
 import { currentManagerIdOf, emitOwnMemberEvent, foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, localTopicOf, memberStateFor, persistLedger, persistMember, persistSnapshot, relayDepartedOf, relayPeerOf, rememberKnownHost, selfJoinedOf } from './local.js';
 import { matchConflictCollabs } from './gate.js';
@@ -36,6 +38,8 @@ export function createCollab(state, { name, topic, targets, mode }) {
     posts: createPostsStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
     members: createMembersStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
     counter: createCounterStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
+    mute: createMuteStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log }),
+    injected: createInjectedStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log }),
     suspended: null,
     staleManagerId: null,
   };
@@ -705,6 +709,7 @@ export function endCollab(state, { collabId }) {
   local.member.state = 'completed';
   local.member.archivedAt = new Date().toISOString();
   persistMember(state, local);
+  local.mute.clear();
   stopJoinReplay(state, local);
   broadcastCollabEnd(state, local, collabId);   // 双通道之一：在线广播（豁免 TTL/上限）
   state.counters.ended++;
@@ -748,6 +753,7 @@ export function leaveCollab(state, { collabId }) {
   local.member.state = 'left';
   local.member.archivedAt = new Date().toISOString();
   persistMember(state, local);
+  local.mute.clear();
   state.counters.left++;
   return { ok: true, delivered: endpoint !== undefined };
 }
@@ -768,6 +774,7 @@ function leaveForum(state, local) {
   local.member.state = 'left';
   local.member.archivedAt = new Date().toISOString();
   persistMember(state, local);
+  local.mute.clear();
   state.counters.left++;
   return { ok: true, delivered, eventId: event?.eventId ?? null };
 }
@@ -1505,6 +1512,7 @@ function withdrawAll(state, local) {
   local.member.state = 'terminated';
   local.member.archivedAt = new Date().toISOString();
   persistMember(state, local);
+  local.mute.clear();
   for (const member of recipients) {
     const endpoint = local.endpoints.get(member.instanceId);
     if (endpoint !== undefined) {

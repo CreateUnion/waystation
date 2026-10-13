@@ -8,8 +8,10 @@ export const INBOX_FILE_NAME = 'inbox.jsonl';
  * 与发送队列同一口径——长驻进程里没有「终态事件」可等，靠行数触发才能保证文件增长有界。 */
 const COMPACT_LINE_FACTOR = 2;
 
-/* 可注入钩子的形状（全部可选，缺省即安全默认）：类型注解为类型检查服务——缺省值 {} 与属性访问需要明确形状。 */
-/** @typedef {{ admit?: (frame: object, meta: { remoteAddress: string }) => { ok: boolean, reason?: string } | null | undefined | Promise<{ ok: boolean, reason?: string } | null | undefined>, consume?: (frame: object, meta: { remoteAddress: string }) => unknown, deliverToSession?: (frame: object) => unknown }} InboundHooks */
+/* 可注入钩子的形状（全部可选，缺省即安全默认）：类型注解为类型检查服务——缺省值 {} 与属性访问需要明确形状。
+ * sessionGate = 投递前的静音栅栏（返回 { suppress: true } 即本帧不进会话）；sessionDelivered = 投递成功后的
+ * 事实通知（已注入标记的记真挂点——本层不掌握标记归属，只报「这帧进了会话」）。 */
+/** @typedef {{ admit?: (frame: object, meta: { remoteAddress: string }) => { ok: boolean, reason?: string } | null | undefined | Promise<{ ok: boolean, reason?: string } | null | undefined>, consume?: (frame: object, meta: { remoteAddress: string }) => unknown, deliverToSession?: (frame: object) => unknown, sessionGate?: (frame: object, meta: { remoteAddress: string }) => { suppress?: boolean } | null | undefined | Promise<{ suppress?: boolean } | null | undefined>, sessionDelivered?: (frame: object, meta: { remoteAddress: string }) => unknown }} InboundHooks */
 
 /* 接收管线（设计 §10）：帧的类型路由（四类）——
  * ① 协作域（含治理类）：准入 → 幂等去重 → 落盘 → ack → 钩子 → 投递成功后回报
@@ -22,8 +24,9 @@ const COMPACT_LINE_FACTOR = 2;
  * 「重放不乱序」由此闭合；不同连接之间互不阻塞。
  * ack 语义 = 「已到对方驿站」：先落盘再确认（确认即承诺已持久化）；准入拒绝 / 落盘失败一律不 ack，
  * 由发送侧按重试与过期收敛（设计 §10 拒绝并计数留痕，协议无 NACK）。
- * 会话注入有两条分流（见 isSessionSuppressed）：拉取两件套按类型从不注入；帖去重命中的副本
- * 由 consume 声明抑制——managed 的既有「受理帧仍注入」行为不受影响（栅栏限帖通道、不泛化）。
+ * 会话注入有三条分流（两条见 isSessionSuppressed，第三条是 runDeliver 里的静音栅栏）：拉取两件套
+ * 按类型从不注入；帖去重命中的副本由 consume 声明抑制——managed 的既有「受理帧仍注入」行为不受
+ * 影响（栅栏限帖通道、不泛化）；静音抑制由服务钩子 sessionGate 声明（本层不掌握模式与静音态）。
  * 准入与「写入会话收件箱」都是可注入钩子：协作台账与投递适配器接入前，以安全默认（拒绝 / 不投递）占位。 */
 /**
  * @param {{ dataDir: string, config: any, self: any, dispatch: any, hooks?: InboundHooks, log: any }} options
@@ -37,6 +40,8 @@ export function createInbound({ dataDir, config, self, dispatch, hooks = {}, log
     admit: hooks.admit ?? defaultAdmit,
     consume: hooks.consume ?? noop,
     deliverToSession: hooks.deliverToSession ?? defaultDeliver,
+    sessionGate: hooks.sessionGate ?? noop,
+    sessionDelivered: hooks.sessionDelivered ?? noop,
     log,
     boxes: new Map(),       // collabId → { path, seen: Map, appendsSinceCompact }（懒加载：首个消息到达时才建）
     chains: new WeakMap(),  // connection → Promise（同连接串行）
@@ -58,6 +63,7 @@ function emptyCounters() {
     duplicates: 0,
     sessionDelivered: 0,
     sessionSuppressed: 0,
+    sessionGated: 0,
     acksSent: 0,
     reportsSent: 0,
     pingsAnswered: 0,
@@ -181,9 +187,8 @@ async function handleCollabMessage(state, connection, frame) {
   state.counters.acksSent++;
   compactIfDue(state, box);
   const consumed = await runHook(state, state.consume, frame, meta);
-  if (await runDeliver(state, frame, consumed)) {
-    state.counters.sessionDelivered++;
-    sendDeliveryReport(state, frame, connection);
+  if (await runDeliver(state, frame, consumed, meta)) {
+    await noteDelivered(state, frame, connection, meta);
     return;
   }
   if (isAbsorbedDuplicate(frame, consumed)) {
@@ -194,18 +199,34 @@ async function handleCollabMessage(state, connection, frame) {
   }
 }
 
+/* 投递成功分支的收尾：计数 → 记真通知 → 终态回报。顺序即语义——已注入标记必须落定在终态
+ * 回报之前（回报即承诺第三档，标记是它的事后凭据）。 */
+async function noteDelivered(state, frame, connection, meta) {
+  state.counters.sessionDelivered++;
+  await runHook(state, state.sessionDelivered, frame, meta);
+  sendDeliveryReport(state, frame, connection);
+}
+
 /* 「已受理（重复）」判定：consume 声明不注入会话的抑制副本——只认帖与 join 两类通道的声明
- * （拉取两件套的通道分流不在此回报：请求-应答经发送侧的换源 / 下轮节拍收敛，不给终态回报）。 */
+ * （拉取两件套的通道分流不在此回报：请求-应答经发送侧的换源 / 下轮节拍收敛，不给终态回报）。
+ * 帖支的终态回执另设前件「该帖曾实际注入会话」（consume 依服务域持久标记给出 wasInjected）：
+ * 静音期到达的首份副本未注入，其重复副本若照旧回报终态，就绕过了「未注入 + 会话主动查」的兜底。
+ * join 支维持「重复副本仍回报终态」现状（join 按重播轮次按条重发，首份副本的处置已在先）。 */
 function isAbsorbedDuplicate(frame, consumed) {
+  if (frame.type === 'post') {
+    return consumed?.sessionDeliver === false && consumed?.wasInjected === true;
+  }
   return SESSION_GATED_TYPES.has(frame.type) && consumed?.sessionDeliver === false;
 }
 
-/* 会话注入的分流面（讨论模式的两条机制，互不越界）：
+/* 会话注入的分流面（讨论模式的机制，互不越界）：
  * ① 通道分流：拉取两件套是站间协议帧（bundle 内容经协作层落本地列表、以汇总行呈现），
  *    从不注入会话——按类型判定，与 consume 结果无关；
  * ② 去重栅栏（限帖通道、不泛化）：帖的（作者, postId）去重命中时抑制再次注入——由 consume
- *    以 { sessionDeliver: false } 显式声明（处理链的唯一知情方），本层只在该类型上采信。
- * 其余类型一律照旧注入——managed 的「受理帧（含被忽略的治理帧）仍注入」行为不变。 */
+ *    以 { sessionDeliver: false } 显式声明（处理链的唯一知情方），本层只在该类型上采信；
+ * ③ 静音栅栏（runDeliver 内的独立分支）：由服务钩子 sessionGate 声明——本层不掌握模式与
+ *    静音态，只认 { suppress: true }；被抑制帧不进会话也不回报（维持第二档，会话主动查兜底）。
+ * 非静音期其余类型一律照旧注入——managed 的「受理帧（含被忽略的治理帧）仍注入」行为不变。 */
 const SESSION_GATED_TYPES = new Set(['post', 'join']);
 const CHANNEL_ROUTED_TYPES = new Set(['history-request', 'history-bundle']);
 
@@ -397,7 +418,8 @@ function persistInbound(state, box, frame) {
   }
 }
 
-/* 钩子返回值透传（consume 的注入处置声明经它到达投递判定；异常隔离为 undefined = 保持照旧注入）。 */
+/* 钩子返回值透传（consume 的注入处置声明经它到达投递判定；sessionGate / sessionDelivered 同经它；
+ * 异常隔离为 undefined = 保持照旧注入 / 不记真——栅栏与记号都是附属机制，主链不因它们失败）。 */
 async function runHook(state, hook, frame, meta) {
   try {
     return await hook(frame, meta);
@@ -408,9 +430,16 @@ async function runHook(state, hook, frame, meta) {
   }
 }
 
-async function runDeliver(state, frame, consumed) {
+async function runDeliver(state, frame, consumed, meta) {
   if (isSessionSuppressed(frame, consumed)) {
     state.counters.sessionSuppressed++;
+    return false;
+  }
+  /* 静音栅栏（独立分支，不与吸收路径混用）：被抑制帧返回 false 后不落入 isAbsorbedDuplicate——
+   * consume 对它的声明自然非 { sessionDeliver: false }，不会误发终态回报。 */
+  const gate = await runHook(state, state.sessionGate, frame, meta);
+  if (gate?.suppress === true) {
+    state.counters.sessionGated++;
     return false;
   }
   try {

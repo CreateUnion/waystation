@@ -3,18 +3,21 @@ import { isArchived, withDefaultMode } from './model.js';
 import { createPostsStore } from './posts.js';
 import { createMembersStore } from './members.js';
 import { createCounterStore, notifyIndicatorChange } from './counter.js';
+import { createMuteStore, muteSuppresses } from './mute.js';
+import { createInjectedStore } from './injected.js';
 import { POST_KINDS } from '../net/protocol.js';
 import { decideAdmission, SYNC_REQUEST_MAX, SYNC_REQUEST_WINDOW_MS } from './gate.js';
 import { handleEvent } from './events.js';
 import { localModeOf, localNameOf, localRosterOf, localStateOf, persistLedger } from './local.js';
-import { applyRelayedReport, approveInvite, countLiveCollabs, createCollab, endCollab, inviteMembers, leaveCollab, sendMessage, viewLedger, withdrawInvite } from './outgoing.js';
+import { applyRelayedReport, approveInvite, countLiveCollabs, createCollab, endCollab, inviteMembers, leaveCollab, notifyLocal, sendMessage, viewLedger, withdrawInvite } from './outgoing.js';
 import { JOIN_REPLAY_INTERVALS_MS, SYNC_MAX_REQUESTS_PER_CYCLE, SYNC_MAX_SOURCES_PER_CYCLE, SYNC_REPLY_TIMEOUT_MS, SYNC_SOFT_BUNDLE_BYTES, SYNC_TAIL_POSTS, SYNC_TAIL_WINDOW_MS, runSyncCycle, runSyncSweep, startSyncEngine, stopSyncEngine, triggerSync } from './sync.js';
 import { HANDSHAKE_REPLY_TIMEOUT_MS, TAKEOVER_PROBE_INTERVAL_MS, runHandshake, startLiveness, stopLiveness, takeOver } from './takeover.js';
 import { decide, decideMergeOffer } from './freeze.js';
 import { HANDOVER_CONFIRM_TIMEOUT_MS, handover } from './handover.js';
 
-/* 协作服务（协作核心与治理的门面）：注册表加载与恢复、公共 API、接收管线钩子（admit / consume）装配、
- * 探测定时器与握手生命周期、抢接 / 裁定 / 移交的等待面、计数器。
+/* 协作服务（协作核心与治理的门面）：注册表加载与恢复、公共 API、接收管线钩子
+ * （admit / consume / sessionGate / sessionDelivered）装配、探测定时器与握手生命周期、
+ * 抢接 / 裁定 / 移交的等待面、计数器。
  * 钩子、事件与定时器路径一律不抛出（健壮性硬性要求）——异常隔离为计数与告警。
  * 依赖全部经参数注入（send = dispatch.send；probe = dispatch.ping；reassign = dispatch.reassignPeer；
  * notify = 会话注入面；knownHosts 供「协作参与者地址」一源接入）。 */
@@ -124,6 +127,8 @@ function apiOf(state) {
     hooks: {
       admit: (frame, meta) => gateFrame(state, frame, meta),
       consume: (frame, meta) => consumeFrame(state, frame, meta),
+      sessionGate: (frame) => sessionGateFrame(state, frame),
+      sessionDelivered: (frame) => noteSessionDelivered(state, frame),
     },
     start: () => startService(state),
     handshake: (options) => runHandshake(state, options ?? {}),
@@ -141,6 +146,7 @@ function apiOf(state) {
     send: (input) => sendMessage(state, input),
     end: (input) => endCollab(state, input),
     leave: (input) => leaveCollab(state, input),
+    setMute: (input) => setMuteNow(state, input),
     view: (input) => viewLedger(state, input),
     describe: (collabId) => describeCollab(state, collabId),
     count: () => countLiveCollabs(state),
@@ -172,6 +178,33 @@ async function consumeFrame(state, frame, meta) {
     state.log.error('协作事件处理异常（已隔离）', { type: frame?.type, collabId: frame?.collabId, reason: error?.message });
     return undefined;
   }
+}
+
+/* 静音栅栏的判定面（sessionGate 钩子）：判定归服务域（本层掌握模式与静音态），
+ * 接收管线只采信 { suppress: true }。异常隔离为不抑制——栅栏是附属机制，判定失败按照旧注入。 */
+function sessionGateFrame(state, frame) {
+  try {
+    return { suppress: muteSuppresses(state, frame) };
+  } catch (error) {
+    state.counters.sessionGateFailures++;
+    state.log.warn('静音栅栏判定异常（按照旧注入）', { type: frame?.type, collabId: frame?.collabId, reason: error?.message });
+    return null;
+  }
+}
+
+/* 已注入事实的记真面（sessionDelivered 钩子）：只记帖——吸收路径的终态回执以该标记为前件
+ * （（作者, postId）曾实际注入会话）；其余类型无标记面（join 的回执语义不依赖标记）。
+ * 标记写失败只留痕（injected store 内部处理），不改变投递已成功的事实。 */
+function noteSessionDelivered(state, frame) {
+  if (frame.type !== 'post') {
+    return;
+  }
+  const local = state.collabs.get(frame.collabId);
+  const postId = frame.payload?.post?.postId;
+  if (local === undefined || typeof postId !== 'string') {
+    return;
+  }
+  local.injected.mark(frame.from.instanceId, postId);
 }
 
 /* 内容类入站消息计数（状态栏「N 条」的口径：累计收到的六类内容消息）：消费钩子每帧至多一次、
@@ -235,6 +268,8 @@ function loadOne(state, collabId) {
     posts: createPostsStore({ dataDir: state.dataDir, collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
     members: createMembersStore({ dataDir: state.dataDir, collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
     counter: createCounterStore({ dataDir: state.dataDir, collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
+    mute: createMuteStore({ dataDir: state.dataDir, collabId, log: state.log }),
+    injected: createInjectedStore({ dataDir: state.dataDir, collabId, log: state.log }),
     suspended: null,
     staleManagerId: null,
   };
@@ -407,6 +442,41 @@ async function syncNow(state, input = {}) {
   return runSyncCycle(state, local, { reason: 'manual', ...options });
 }
 
+/* 静音开关的驱动面（ws_set_mute；纯本地行为开关：无外发帧、不广播——对端无感）。
+ * 校验：muted 须布尔（工具层同校验，此处仍是权威面——直调 API 的路径同样要挡）、collabId 须本机存在。
+ * 取消时（真翻转）经 notifyLocal 投一行错过内容摘要——N = 当前累计 − 基线（基线随静音状态文件持久，
+ * 跨重启不丢）；累计面：讨论 = 帖子列表 size（含回填帖）、协作 = 内容消息计数（与状态栏读数同一取数面）。
+ * 基线缺失（设静音时为旧数据 / 累计面不可用）时摘要降级为不带 N 的表述——宁可不给数、不给错数。 */
+function setMuteNow(state, input) {
+  const collabId = input?.collabId;
+  const muted = input?.muted;
+  if (typeof muted !== 'boolean') {
+    return { ok: false, message: 'muted 须为布尔值（true 进入静音 / false 取消静音）' };
+  }
+  const local = state.collabs.get(collabId);
+  if (local === undefined) {
+    return { ok: false, message: '本机没有该协作（collabId 不存在）——先看 ws_list_collabs' };
+  }
+  const countNow = localModeOf(local) === 'forum' ? local.posts.size() : local.counter.count();
+  const before = local.mute.setMuted(muted, countNow);
+  if (muted === false && before.wasMuted) {
+    notifyLocal(state, local, resumeNoticeText(local, countNow, before.baseline));
+  }
+  return { ok: true, collabId, muted };
+}
+
+/* 取消静音的摘要文案（设计 §5.7）：讨论与协作各一句，直达补看工具名（讨论另点查看器——经查看器
+ * 补看即浏览帖子列表；讨论的补看面是台账视图工具，协作的补看面是收件箱工具）。 */
+function resumeNoticeText(local, countNow, baseline) {
+  const delta = baseline === null ? null : Math.max(0, countNow - baseline);
+  if (localModeOf(local) === 'forum') {
+    const head = delta === null ? '静音期间本讨论可能有新内容' : `静音期间本讨论新增 ${delta} 条`;
+    return `${head}——静音期与回填内容不进注入，经查看器/ws_view_ledger 补看`;
+  }
+  const head = delta === null ? '静音期间本协作可能有新内容' : `静音期间本协作新增 ${delta} 条`;
+  return `${head}——经 ws_check_inbox 补看`;
+}
+
 /* 收尾：定时器、等待面与在途流程统一解挂（闸门、快照拉取、握手观察、抢接窗口、移交回执、
  * 对表等待面与 join 重播）。 */
 function closeService(state) {
@@ -550,6 +620,7 @@ function emptyGuardCounters() {
     eventsHandled: 0,
     eventFailures: 0,
     gateFailures: 0,
+    sessionGateFailures: 0,
     indicatorChangeFailures: 0,
     loadFailures: 0,
     persistFailures: 0,

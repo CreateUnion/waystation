@@ -304,6 +304,110 @@ test('重复 msgId：consume 钩子只回调一次（受理后的去重语义）
   assert.deepEqual(consumed, [frame.msgId]);
 });
 
+/* 静音栅栏与注入标记（讨论模式 §5.7）的接收管线面：本层不掌握模式与静音态，只认服务钩子的
+ * 声明（sessionGate 的 { suppress: true } / consume 的 wasInjected 前件）。 */
+
+/* 吸收路径用例的构造：consume 声明 { sessionDeliver: false, ... }，观察终态回执与投递面。 */
+async function absorbedCase(t, type, consumed) {
+  const deliveries = [];
+  const { inbound, dispatch } = makeInbound(t, {
+    hooks: {
+      admit: () => ({ ok: true }),
+      consume: () => consumed,
+      deliverToSession: (frame) => { deliveries.push(frame.msgId); return true; },
+    },
+  });
+  const connection = createFakeConnection();
+  const frame = messageFrame({ type });
+  inbound.onFrame(connection, frame);
+  await waitFor(() => inbound.stats().sessionSuppressed === 1);
+  return { inbound, dispatch, deliveries, frame };
+}
+
+test('静音栅栏（sessionGate）：suppress 帧不投递、不回报；落盘与 ack 照旧（只做减法）', async (t) => {
+  const { inbound, dir, dispatch } = makeInbound(t, {
+    hooks: { admit: () => ({ ok: true }), sessionGate: () => ({ suppress: true }), deliverToSession: () => true },
+  });
+  const connection = createFakeConnection();
+  const frame = messageFrame();
+  inbound.onFrame(connection, frame);
+  await waitFor(() => inbound.stats().sessionGated === 1);
+  assert.equal(inbound.stats().sessionDelivered, 0, '被抑制帧不进会话');
+  assert.deepEqual(dispatch.calls.sends, [], '被抑制帧不发终态回报（发送侧维持第二档）');
+  assert.deepEqual(connection.sent.map((sent) => sent.type), ['ack'], '链路口径不变：照常 ack');
+  assert.deepEqual(readInbox(dir).map((entry) => entry.msgId), [frame.msgId], '抑制不落差别：照常落盘');
+});
+
+test('静音栅栏放行：未声明 suppress（{} / null / 钩子缺省）一律照旧投递', async (t) => {
+  const delivered = [];
+  let gateResult = {};
+  const { inbound } = makeInbound(t, {
+    hooks: { admit: () => ({ ok: true }), sessionGate: () => gateResult, deliverToSession: (frame) => { delivered.push(frame.msgId); return true; } },
+  });
+  inbound.onFrame(createFakeConnection(), messageFrame());
+  await waitFor(() => delivered.length === 1);
+  gateResult = null;
+  inbound.onFrame(createFakeConnection(), messageFrame());
+  await waitFor(() => delivered.length === 2);
+  assert.equal(inbound.stats().sessionGated, 0);
+  assert.equal(inbound.stats().sessionDelivered, 2);
+});
+
+test('静音栅栏异常：计入 hookFailures 并照旧投递（栅栏是附属机制，判定失败不改变注入）', async (t) => {
+  const delivered = [];
+  const { inbound, logs } = makeInbound(t, {
+    hooks: {
+      admit: () => ({ ok: true }),
+      sessionGate: () => { throw new Error('静音判定故障'); },
+      deliverToSession: (frame) => { delivered.push(frame.msgId); return true; },
+    },
+  });
+  inbound.onFrame(createFakeConnection(), messageFrame());
+  await waitFor(() => delivered.length === 1);
+  assert.equal(inbound.stats().hookFailures, 1);
+  assert.equal(inbound.stats().sessionDelivered, 1, '异常 → 按照旧注入');
+  assert.ok(logs.some((entry) => entry.message.includes('接收钩子异常')), '异常必须留痕');
+});
+
+test('投递成功路径顺序：投递 → sessionDelivered 记真通知 → 终态回报（先记真后回报）', async (t) => {
+  const order = [];
+  const dispatch = createFakeDispatch();
+  const send = dispatch.send;
+  dispatch.send = (message) => { order.push('report'); return send(message); };
+  const { inbound } = makeInbound(t, {
+    dispatch,
+    hooks: {
+      admit: () => ({ ok: true }),
+      deliverToSession: () => { order.push('deliver'); return true; },
+      sessionDelivered: () => { order.push('delivered-notice'); },
+    },
+  });
+  inbound.onFrame(createFakeConnection(), messageFrame());
+  await waitFor(() => order.length === 3);
+  assert.deepEqual(order, ['deliver', 'delivered-notice', 'report'], '标记落定必须发生在终态回报之前');
+});
+
+test('吸收路径终态回执（帖支）：wasInjected 为真才回报；假 / 缺失不回报（维持第二档）', async (t) => {
+  const hit = await absorbedCase(t, 'post', { sessionDeliver: false, wasInjected: true });
+  await waitFor(() => hit.dispatch.calls.sends.length === 1);
+  assert.equal(hit.dispatch.calls.sends[0].payload.refMsgId, hit.frame.msgId);
+  assert.equal(hit.dispatch.calls.sends[0].payload.tier, 'session');
+  assert.deepEqual(hit.deliveries, [], '吸收路径不重复注入');
+  const miss = await absorbedCase(t, 'post', { sessionDeliver: false, wasInjected: false });
+  const missing = await absorbedCase(t, 'post', { sessionDeliver: false });
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.deepEqual(miss.dispatch.calls.sends, [], '未注入过：不回报终态');
+  assert.deepEqual(missing.dispatch.calls.sends, [], '前件缺失（旧声明）：不回报终态');
+  assert.deepEqual(miss.deliveries, [], '不注入');
+});
+
+test('join 通道吸收路径维持现状：重复副本仍回报终态（不受帖支前件约束）', async (t) => {
+  const made = await absorbedCase(t, 'join', { sessionDeliver: false });
+  await waitFor(() => made.dispatch.calls.sends.length === 1);
+  assert.equal(made.dispatch.calls.sends[0].payload.refMsgId, made.frame.msgId);
+  assert.deepEqual(made.deliveries, [], '不重复注入');
+});
+
 test('去重窗口：保留期内的记录参与去重；超窗视为新消息', async (t) => {
   const dir = makeTempDir(t);
   mkdirSync(join(dir, COLLABS_DIR_NAME, 'collab-1'), { recursive: true });

@@ -74,7 +74,12 @@ const inbound = createInbound({
   log,
   hooks: {
     ...(collabEnabled
-      ? { admit: (frame, meta) => collab.hooks.admit(frame, meta), consume: (frame, meta) => collab.hooks.consume(frame, meta) }
+      ? {
+          admit: (frame, meta) => collab.hooks.admit(frame, meta),
+          consume: (frame, meta) => collab.hooks.consume(frame, meta),
+          sessionGate: (frame) => collab.hooks.sessionGate(frame),
+          sessionDelivered: (frame) => collab.hooks.sessionDelivered(frame),
+        }
       : { admit: () => ({ ok: true }) }),   // collab:false = 纯传输层预演：全准入（M2/M3 既有形态）
     deliverToSession: adapter !== null ? (frame) => adapter.deliverFrame(frame) : () => sessionWriterOk,
   },

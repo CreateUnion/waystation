@@ -91,6 +91,7 @@ export function terminateLocalCopy(state, local, reason) {
     delete local.member.frozenFrom;
     persistMember(state, local);
   }
+  local.mute.clear();
   state.counters.freezeTerminatedLocal++;
   state.log.warn('本机该条协作已终止', { collabId: local.collabId, reason });
   return true;
