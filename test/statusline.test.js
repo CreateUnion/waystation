@@ -112,3 +112,28 @@ test('输入守卫：无 session_id / 非法 session_id（路径穿越形态）�
   assert.equal(brokenInput.code, 0);
   assert.equal(brokenInput.stdout, '');
 });
+
+test('写通道：读端提前关闭（EPIPE）→ 退出码 0、不写 stderr', async (t) => {
+  const home = makeTempDir(t);
+  writeSessionFile(home, 'session-abc-1', sessionFileOf());
+  const child = spawn(process.execPath, [STATUSLINE], {
+    cwd: repoRoot,
+    env: { ...process.env, WAYSTATION_HOME: home },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  t.after(() => {
+    child.kill('SIGKILL');
+  });
+  let stderr = '';
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk.toString();
+  });
+  child.stdout.destroy();   // 先关读端再送 stdin：脚本读完输入才写输出，写入时读端必已关闭
+  child.stdin.end(JSON.stringify({ session_id: 'session-abc-1' }));
+  const code = await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', (childCode) => resolve(childCode));
+  });
+  assert.equal(code, 0);
+  assert.equal(stderr, '');
+});

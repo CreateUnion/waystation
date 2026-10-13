@@ -1,5 +1,4 @@
-﻿#Requires -Version 5.1
-<#
+﻿<#
 .SYNOPSIS
     waystation 安装脚本（Windows）。
 
@@ -39,6 +38,7 @@
       另有 waystation uninstall 命令（由驿站本体提供）：默认布局下与脚本开关等价，
       自定义 WAYSTATION_HOME 时以该命令为准——本脚本不读该变量）
 #>
+#Requires -Version 5.1
 [CmdletBinding()]
 param(
     [switch]$DryRun,
@@ -405,8 +405,8 @@ function Show-SessionChecklist {
 function Show-ClientSnippets {
     Write-Step '指引' '其他 MCP 客户端（stdio 形态，以 opencode 为例）'
     Write-Note '在 opencode 配置文件（opencode.json）的 mcp 段加入：'
-    # 片段逐行拼装（路径折成正斜杠——直接手拼 "C:\\Users\\…" 在 JSON 里是非法转义（\\U 等），
-    # 且 \\b 一类会把路径静默损坏）并回读 ConvertFrom-Json 自校验，未过则退单行形态
+    # 片段逐行拼装（路径折成正斜杠——直接手拼 "C:\Users\…" 在 JSON 里是非法转义（\U 等），
+    # 且 \b 一类会把路径静默损坏）并回读 ConvertFrom-Json 自校验，未过则退单行形态
     $commandPath = ($AppDir -replace '\\', '/') + '/bin/waystation.js'
     $snippet = @(
         '  {',

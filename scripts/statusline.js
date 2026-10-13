@@ -6,7 +6,8 @@ import { ID_PATTERN } from '../src/net/protocol.js';
 /* statusline 读取脚本（状态栏「协作中」指示的读取端）：Claude Code 每次刷新把会话 JSON 经 stdin 送来，
  * 本脚本取其中的会话标识命中会话状态文件、渲染一行指示。
  * 契约：任何异常一律空输出 + 退出码 0——状态栏是观察面，绝不因指示失败干扰界面；
- * 无协作 / 无文件 / 文件陈旧 / 解析失败 都输出空串（状态行没有「错误态」语义）。
+ * 无协作 / 无文件 / 文件陈旧 / 解析失败 都输出空串（状态行没有「错误态」语义），故障一律静默、
+ * 无留痕通道（不写日志、不写 stderr）——「故障与无协作在输出上不可区分」属明示设计，非缺陷。
  * 集成属客户端配置（两条路径都不改本脚本）：独立 statusLine 直接指定本脚本；claude-hud 等
  * 组合式状态栏经其扩展能力对接（组合形态由客户端能力决定，端到端未实测——README 如实标注）。 */
 
@@ -88,4 +89,20 @@ async function main() {
   }
 }
 
+/* 读端提前关闭（状态栏放弃读取）时 stdout 的 EPIPE 默认冒泡为未捕获异常——
+ * 状态栏是观察面：管道断开按正常结束处理，写通道同样守「空输出 + 退出码 0」契约；
+ * 按监听器身份幂等，重复调用不叠加。 */
+function onStdoutError(error) {
+  if (error?.code === 'EPIPE') {
+    process.exit(0);
+  }
+}
+
+function guardBrokenPipe() {
+  if (!process.stdout.listeners('error').includes(onStdoutError)) {
+    process.stdout.on('error', onStdoutError);
+  }
+}
+
+guardBrokenPipe();
 process.stdout.write(await main());

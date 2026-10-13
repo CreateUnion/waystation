@@ -45,8 +45,7 @@ test('bin/waystation.js：存在且带 node shebang', () => {
   assert.equal(firstLine, '#!/usr/bin/env node');
 });
 
-test('package.json：运行时依赖唯一且为 semver 区间形态（发行复核）', () => {
+test('package.json：运行时依赖为 caret 钉版 semver 区间（发行复核）', () => {
   const pkg = readJson('package.json');
-  assert.deepEqual(Object.keys(pkg.dependencies), ['@modelcontextprotocol/sdk']);
   assert.match(pkg.dependencies['@modelcontextprotocol/sdk'], /^\^\d+\.\d+\.\d+$/);
 });

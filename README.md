@@ -74,7 +74,7 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
 
 ## 开发
 
-- 运行环境：Node ≥ 20（**运行时下限**，依据锁定依赖树）；**跑测试与工具链需 Node ≥ 22**——测试命令使用 `node --test` 的 glob 参数（Node 21 起支持；Node 20 实测以「Could not find …」退出码 1 失败，不会静默假绿）
+- 运行环境：Node ≥ 20（**运行时下限**，取 `package.json` 的 `engines`）；**跑测试与工具链需 Node ≥ 21（本项目固定 22）**——测试命令使用 `node --test` 的 glob 参数（Node 21 起支持；Node 20 实测以「Could not find …」退出码 1 失败，不会静默假绿）
 - 跑测试：`npm test`；覆盖率（含阈值）：`npm run coverage`
 - 静态检查：`npm run lint`（ESLint）、`npm run typecheck`（tsc checkJs）
 - 提交前门禁：`npm run gate`（lint + typecheck + 覆盖率阈值）

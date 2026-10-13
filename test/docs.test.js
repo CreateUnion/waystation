@@ -30,5 +30,6 @@ test('README：披露锚句与安装/状态栏/卸载/迁移文档面齐备（�
   assert.ok(text.includes('建议仅在可信网络使用'), '安全披露锚句保持（发布义务）');
   assert.ok(text.includes('statusline.js'), '状态栏配置段指向读取脚本');
   assert.ok(text.includes('waystation uninstall'), '卸载命令面写入文档');
+  assert.ok(text.includes('以本命令为准'), '卸载命令交付口径在文档（自定义 WAYSTATION_HOME 时以本命令为准，非「设计中」措辞）');
   assert.ok(text.includes('自介') && text.includes('升级与迁移'), '改端口旧站点的迁移注意在文档');
 });
