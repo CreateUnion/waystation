@@ -1,4 +1,8 @@
 const FILTER_PARAMS = ['msgId', 'collabId'];
+/* 系统内部回报帧（第三档回执）自身也经发送队列、同样出现在查询行集里：每条送达消息因此多出
+ * 一行自身回报（约 14 天可见、量级≈消息数）。回报是系统内部往返、对发送侧无信息增量——
+ * 折叠为计数不逐行列出行集，字段恒在（reportRows）——「不静默」由字段 + 描述双重承载。 */
+const REPORT_ROW_TYPE = 'delivery-status';
 
 /* ws_delivery_status：发送侧三档投递状态查询入口（设计 §10）。
  * 语义边界：「已投进对方会话」≠「对方模型已读 / 已执行」——措辞不得暗示已被阅读。
@@ -7,7 +11,7 @@ const FILTER_PARAMS = ['msgId', 'collabId'];
 export function deliveryStatusTool() {
   return {
     name: 'ws_delivery_status',
-    description: '查询已发消息的投递状态（已排队 / 已到对方驿站 / 已投进对方会话——「已投进会话」不等于已被阅读）',
+    description: '查询已发消息的投递状态（已排队 / 已到对方驿站 / 已投进对方会话——「已投进会话」不等于已被阅读）；系统内部回报条目不逐行列出（其条数见 reportRows）',
     inputSchema: {
       type: 'object',
       properties: {
@@ -25,8 +29,9 @@ export function deliveryStatusTool() {
       }
       /* 校验通过的值至多带首尾空白，透传前去除：查询按标识精确比对，带空白串会被当作不存在的标识、
        * 静默返回空列表——「没匹配上」与「该标识不存在」将不可区分。 */
-      const rows = context.net.deliveryStatus({ msgId: args.msgId?.trim(), collabId: args.collabId?.trim() });
-      return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] };
+      const queried = context.net.deliveryStatus({ msgId: args.msgId?.trim(), collabId: args.collabId?.trim() });
+      const rows = queried.filter((row) => row.type !== REPORT_ROW_TYPE);
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, rows, reportRows: queried.length - rows.length }, null, 2) }] };
     },
   };
 }

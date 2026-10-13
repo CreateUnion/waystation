@@ -205,9 +205,9 @@ test('ws_list_hosts：扫描可用、排除自答（自播自答不产生条目�
   const status = await fetchStatus(client);
   const called = await client.callTool({ name: 'ws_list_hosts', arguments: {} });
   assert.equal(called.isError, undefined);
-  const hosts = JSON.parse(called.content[0].text);
-  assert.ok(Array.isArray(hosts));
-  assert.equal(hosts.some((host) => host.instanceId === status.instanceId), false, '排除自答');
+  const payload = JSON.parse(called.content[0].text);
+  assert.equal(payload.ok, true);
+  assert.equal(payload.hosts.some((host) => host.instanceId === status.instanceId), false, '排除自答');
 });
 
 test('ws_ping：自环可达（同端口监听服务自身）、不可达地址与非法地址', { timeout: 30000 }, async (t) => {
@@ -225,11 +225,11 @@ test('ws_ping：自环可达（同端口监听服务自身）、不可达地址�
   assert.equal(bad.isError, true);
 });
 
-test('ws_delivery_status：无已发消息返回空数组', { timeout: 30000 }, async (t) => {
+test('ws_delivery_status：无已发消息返回空行集', { timeout: 30000 }, async (t) => {
   const home = makeTempDir(t);
   const client = await connectClient(t, INDEX_ENTRY, home, { port: await pickFreePort() });
   const called = await client.callTool({ name: 'ws_delivery_status', arguments: {} });
-  assert.deepEqual(JSON.parse(called.content[0].text), []);
+  assert.deepEqual(JSON.parse(called.content[0].text), { ok: true, rows: [], reportRows: 0 });
 });
 
 test('端口占用一：显式端口被另一驿站站点占 → 降级、takeover-taken 文案、LAN 工具明确报错', { timeout: 40000 }, async (t) => {
@@ -317,7 +317,7 @@ test('ws_list_collabs：新装返回空清单（协作工具面已接线）', { 
   const client = await connectClient(t, INDEX_ENTRY, home, { port: await pickFreePort() });
   const called = await client.callTool({ name: 'ws_list_collabs', arguments: {} });
   assert.equal(called.isError, undefined);
-  assert.deepEqual(JSON.parse(called.content[0].text), { collabs: [] });
+  assert.deepEqual(JSON.parse(called.content[0].text), { ok: true, collabs: [] });
 });
 
 test('ws_create_collab：参数非法 → isError（不建立任何协作）', { timeout: 30000 }, async (t) => {
@@ -326,7 +326,7 @@ test('ws_create_collab：参数非法 → isError（不建立任何协作）', {
   const bad = await client.callTool({ name: 'ws_create_collab', arguments: { name: '项目', topic: '主题', targets: [] } });
   assert.equal(bad.isError, true);
   const listed = await client.callTool({ name: 'ws_list_collabs', arguments: {} });
-  assert.deepEqual(JSON.parse(listed.content[0].text), { collabs: [] });
+  assert.deepEqual(JSON.parse(listed.content[0].text), { ok: true, collabs: [] });
 });
 
 test('ws_view_ledger / ws_send_message：未知协作 → isError（明确提示）', { timeout: 30000 }, async (t) => {
@@ -347,8 +347,10 @@ test('治理工具：未知协作的裁定 / 移交 / 抢接 → isError（明�
   assert.ok(decided.content[0].text.includes('没有该协作'));
   const handed = await client.callTool({ name: 'ws_handover', arguments: { collabId: 'collab-none', target: 'inst-b' } });
   assert.equal(handed.isError, true);
+  assert.ok(handed.content[0].text.includes('没有该协作'));
   const taken = await client.callTool({ name: 'ws_take_over', arguments: { collabId: 'collab-none' } });
   assert.equal(taken.isError, true);
+  assert.ok(taken.content[0].text.includes('没有该协作'));
   const badChoice = await client.callTool({ name: 'ws_decide', arguments: { collabId: 'collab-none' } });
   assert.equal(badChoice.isError, true, '两形态均缺 → 参数级错误');
   assert.ok(badChoice.content[0].text.includes('一种形态'));

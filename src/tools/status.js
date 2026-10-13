@@ -11,6 +11,7 @@ export function statusTool() {
     inputSchema: { type: 'object', properties: {} },
     handler: async (_args, context) => {
       const status = {
+        ok: true,
         name: 'waystation',
         version: context.version,
         instanceId: context.instanceId,

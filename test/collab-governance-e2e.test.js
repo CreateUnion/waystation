@@ -56,7 +56,7 @@ function makeStationDir(t) {
 }
 
 /* 治理节奏：短探测 / 短窗口（探针与窗口节律压到秒级以内；行为语义与默认定案一致）。
- * 显式端口写死：显式目录首跑不自动挑段内端口——测试要按预期端口寻址。 */
+ * 显式端口写死：测试要按可预期端口寻址——显式目录首跑会自动取段内最低空闲并写回，端口不确定。 */
 function writeStationConfig(home, port, extra = {}) {
   writeFileSync(join(home, 'config.json'), JSON.stringify({
     port,

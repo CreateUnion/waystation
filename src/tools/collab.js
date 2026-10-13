@@ -1,4 +1,5 @@
-import { ID_PATTERN, isIdentityName } from '../net/protocol.js';
+import { isIP } from 'node:net';
+import { ID_PATTERN, MAX_COLLAB_MEMBERS, isIdentityName, isPort } from '../net/protocol.js';
 
 /* 协作工具集（设计 §10 工具最小集的协作核心期落点）：薄层——只做参数形态校验
  * （非空字符串 / 布尔 / 数组 / 整数 / 身份名）与输出封装；业务判定（状态门控、冻结白名单、
@@ -8,14 +9,14 @@ import { ID_PATTERN, isIdentityName } from '../net/protocol.js';
 /* 会话消息可用的协作类类型（设计 §10）：治理类与建协类不经本工具。 */
 export const SEND_MESSAGE_TYPES = ['topic', 'task', 'progress', 'issue', 'stop', 'reply'];
 
-const MAX_TARGETS = 31;   // 目标上限 = 名单上限 32 减去发起者本人
+const MAX_TARGETS = MAX_COLLAB_MEMBERS - 1;   // 目标上限 = 名单上限减发起者本人（单一权威：protocol.MAX_COLLAB_MEMBERS）
 
 export function listCollabsTool() {
   return {
     name: 'ws_list_collabs',
     description: '列出本机参与的全部协作（角色、状态、待回应邀请与是否过期）——新建协作与同意门处置的入口',
     inputSchema: { type: 'object', properties: {} },
-    handler: async (_args, context) => okResult(context.collab.list()),
+    handler: async (_args, context) => okResult({ ok: true, ...context.collab.list() }),
   };
 }
 
@@ -53,7 +54,7 @@ export function createCollabTool() {
       }
       const targets = targetsArg(args);
       if (targets === null) {
-        return errorResult(`参数 targets 非法：需要 1–${MAX_TARGETS} 项 { instanceId, identityName, address, port }（端口为整数）`);
+        return errorResult(`参数 targets 非法：需要 1–${MAX_TARGETS} 项 { instanceId, identityName, address, port }（地址为 IP 字面量、端口为 1–65535 整数）`);
       }
       return resultOf(await context.collab.create({ name, topic, targets }));
     },
@@ -69,7 +70,7 @@ export function approveInviteTool() {
       properties: {
         collabId: { type: 'string', description: '协作标识（取自 ws_list_collabs 的待回应邀请条目）' },
         approve: { type: 'boolean', description: 'true = 同意加入；false = 拒绝' },
-        reason: { type: 'string', description: '拒绝原因（可选，≤200 字符）' },
+        reason: { type: 'string', description: '拒绝原因（可选，仅拒绝时使用，≤200 字符）' },
       },
       required: ['collabId', 'approve'],
     },
@@ -81,7 +82,10 @@ export function approveInviteTool() {
       if (typeof args.approve !== 'boolean') {
         return errorResult('参数 approve 非法：需要布尔值');
       }
-      return resultOf(await context.collab.approve({ collabId, approve: args.approve, reason: optionalTextArg(args, 'reason') }));
+      /* reason 按描述语义归一：approve=true 时在工具层丢弃（服务层该分支本就不消费）——宁可少传，
+       * 不让「同意 + 理由」这种无定义组合穿到线上。 */
+      const reason = args.approve === false ? optionalTextArg(args, 'reason') : undefined;
+      return resultOf(await context.collab.approve({ collabId, approve: args.approve, reason }));
     },
   };
 }
@@ -211,6 +215,8 @@ export function endCollabTool() {
   };
 }
 
+/* 工具返回口径（16 工具单一权威）：成功 = 顶层含 ok:true 的 JSON 对象（列表载荷用命名字段承载：
+ * hosts / rows / collabs）；失败 = errorResult 纯文案 + isError。新增工具一律照此。 */
 export function okResult(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
 }
@@ -269,7 +275,7 @@ function targetArg(entry) {
   return trimmedTargetFields(entry);
 }
 
-/* 三字段归一：instanceId / identityName / address 各自 trim 后按判据校验（配置面与协议同权威）。 */
+/* 四字段归一：instanceId / identityName / address 各自 trim 后按判据校验（与配置面、协议层同权威）；address 取 IP 字面量、port 取 protocol.isPort——与 ws_ping 同深度（服务侧兜底保留，纵深防御）。 */
 function trimmedTargetFields(entry) {
   const instanceId = typeof entry.instanceId === 'string' ? entry.instanceId.trim() : '';
   const identityName = typeof entry.identityName === 'string' ? entry.identityName.trim() : '';
@@ -277,7 +283,7 @@ function trimmedTargetFields(entry) {
   if (instanceId === '' || !ID_PATTERN.test(instanceId) || !isIdentityName(identityName)) {
     return null;
   }
-  if (address === '' || !Number.isInteger(entry.port)) {
+  if (address === '' || isIP(address) === 0 || !isPort(entry.port)) {
     return null;
   }
   return { instanceId, identityName, address, port: entry.port };

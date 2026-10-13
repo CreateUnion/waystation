@@ -137,7 +137,7 @@ test('验收预演：邀请→同意→对话→看台账（双真实实例全�
   assert.ok(chatFrame !== undefined && chatFrame.includes(`协作：${collabId}`), '对话消息自身的上下文头含协作标识');
   /* 档位真值（设计 §10 三档）：对方会话收到后投递回报回传，本侧档位由 queued 推进到 session */
   await waitFor(async () => {
-    const row = (await callTool(a, 'ws_delivery_status', { msgId: sent.payload.msgId })).payload[0];
+    const row = (await callTool(a, 'ws_delivery_status', { msgId: sent.payload.msgId })).payload.rows[0];
     return row !== undefined && row.tier === 'session' ? true : null;
   }, { timeoutMs: 20000 });
   assert.equal((await callTool(b, 'ws_send_message', { collabId, text: '收到，开始处理' })).isError, false);
@@ -183,13 +183,13 @@ test('验收预演：离线续投（乙关会话 → 排队 → 重开续投至�
   assert.equal(sent.isError, false, String(sent.payload));
   assert.equal(sent.payload.results[0].ok, true, '对方离线但端点已知：消息仍被受理入队');
   const queued = await callTool(a, 'ws_delivery_status', { msgId: sent.payload.msgId });
-  assert.equal(queued.payload[0].tier, 'queued', '对方离线：维持在排队档，不误报');
+  assert.equal(queued.payload.rows[0].tier, 'queued', '对方离线：维持在排队档，不误报');
   const inboxB2 = await startFakeSessionInbox(t);
   const b2 = await startStation(t, { home: homeB, port: portB, inbox: inboxB2 });
   await waitState(b2, collabId, 'active');
   await waitFor(() => (inboxB2.receivedText().includes('离线期间的事项') ? true : null), { timeoutMs: 60000 });
   await waitFor(async () => {
-    const row = (await callTool(a, 'ws_delivery_status', { msgId: sent.payload.msgId })).payload[0];
+    const row = (await callTool(a, 'ws_delivery_status', { msgId: sent.payload.msgId })).payload.rows[0];
     return row !== undefined && row.tier === 'session' ? true : null;
   }, { timeoutMs: 30000 });
 });

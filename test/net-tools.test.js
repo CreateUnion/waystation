@@ -7,6 +7,7 @@ import { statusTool } from '../src/tools/status.js';
 import { checkInboxTool } from '../src/tools/check-inbox.js';
 import { listCollabsTool, createCollabTool, approveInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, leaveCollabTool, endCollabTool, SEND_MESSAGE_TYPES } from '../src/tools/collab.js';
 import { decideTool, handoverTool, takeOverTool } from '../src/tools/governance.js';
+import { MAX_COLLAB_MEMBERS } from '../src/net/protocol.js';
 
 function contextWith(net) {
   return { version: '0.1.0', instanceId: 'inst-self', dataDir: '/data', logDir: '/data/logs', config: { identityName: '本机', port: 17321 }, net, collab: { stats: () => ({ collabs: 0, byState: {} }) }, startedAt: '2026-10-12T00:00:00.000Z' };
@@ -82,8 +83,9 @@ test('ws_list_hosts：清单输出含首选地址与全部端点', async () => {
     }),
   };
   const result = await callTool(hostsTool(), {}, net);
-  const hosts = JSON.parse(result.content[0].text);
-  assert.equal(result.isError, undefined);
+  const payload = JSON.parse(result.content[0].text);
+  assert.equal(payload.ok, true);
+  const hosts = payload.hosts;
   assert.equal(hosts[0].identityName, '主机乙');
   assert.equal(hosts[0].address, '127.0.0.2');
   assert.equal(hosts[0].port, 17321);
@@ -144,8 +146,9 @@ test('ws_delivery_status：透传查询参数（首尾空白去除后）并输�
   };
   const result = await callTool(deliveryStatusTool(), { msgId: ' msg-1 ', collabId: ' collab-1 ' }, net);
   assert.deepEqual(queries, [{ msgId: 'msg-1', collabId: 'collab-1' }]);
-  const rows = JSON.parse(result.content[0].text);
-  assert.equal(rows[0].tier, 'at-peer');
+  const payload = JSON.parse(result.content[0].text);
+  assert.equal(payload.ok, true);
+  assert.equal(payload.rows[0].tier, 'at-peer');
 });
 
 test('ws_delivery_status：过滤参数形态非法 → isError（不发查询）', async () => {
@@ -232,7 +235,7 @@ test('ws_list_hosts：输出端点（address / port / 地址:端口 字符串数
     }),
   };
   const result = await callTool(hostsTool(), {}, net);
-  const hosts = JSON.parse(result.content[0].text);
+  const hosts = JSON.parse(result.content[0].text).hosts;
   assert.equal(hosts[0].address, '127.0.0.2');
   assert.equal(hosts[0].port, 17321);
   assert.deepEqual(hosts[0].endpoints, ['127.0.0.2:17321', '127.0.0.3:17321']);
@@ -278,6 +281,8 @@ test('ws_create_collab：targets 形态逐拒（非数组 / 空 / 条目缺字�
     { name: '项目', topic: '主题', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.1' }] },
     { name: '项目', topic: '主题', targets: [{ instanceId: 'inst-b', identityName: '甲\n乙', address: '127.0.0.1', port: 17321 }] },
     { name: '项目', topic: '主题', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.1', port: 1.5 }] },
+    { name: '项目', topic: '主题', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: 'not-an-ip', port: 17321 }] },
+    { name: '项目', topic: '主题', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.1', port: 70000 }] },
   ];
   for (const args of cases) {
     const result = await callCollabTool(createCollabTool(), args, collab);
@@ -324,6 +329,8 @@ test('ws_approve_invite：同意与拒绝两态透传（reason 随拒绝）', as
     { collabId: 'collab-1', approve: true, reason: undefined },
     { collabId: 'collab-2', approve: false, reason: '人手不足' },
   ]);
+  await callCollabTool(approveInviteTool(), { collabId: 'collab-3', approve: true, reason: '随手填的' }, collab);
+  assert.deepEqual(collab.calls.approve[2], { collabId: 'collab-3', approve: true, reason: undefined }, 'approve=true 时 reason 在工具层丢弃（描述口径：仅拒绝时使用）');
 });
 
 test('ws_withdraw_invite：target 合法（字符串）与缺省（整条）两形态透传', async () => {
@@ -447,11 +454,20 @@ test('ws_decide：choice 合法透传、枚举外拒绝、服务拒绝 isError',
   const kept = await callCollabTool(decideTool(), { collabId: ' collab-1 ', choice: 'keep' }, collab);
   assert.equal(kept.isError, undefined);
   assert.deepEqual(collab.calls.decide, [{ collabId: 'collab-1', choice: 'keep' }]);
+  const merged = await callCollabTool(decideTool(), { collabId: 'collab-1', choice: 'merge' }, collab);
+  const terminated = await callCollabTool(decideTool(), { collabId: 'collab-1', choice: 'terminate' }, collab);
+  assert.equal(merged.isError, undefined);
+  assert.equal(terminated.isError, undefined);
+  assert.deepEqual(collab.calls.decide, [
+    { collabId: 'collab-1', choice: 'keep' },
+    { collabId: 'collab-1', choice: 'merge' },
+    { collabId: 'collab-1', choice: 'terminate' },
+  ]);
   const bad = await callCollabTool(decideTool(), { collabId: 'collab-1', choice: 'maybe' }, collab);
   assert.equal(bad.isError, true);
   const denied = fakeGovernanceService({ decide: { ok: false, message: '只有冻结中的协作需要裁定（当前未冻结）' } });
   assert.equal((await callCollabTool(decideTool(), { collabId: 'collab-1', choice: 'terminate' }, denied)).isError, true);
-  assert.equal(collab.calls.decide.length, 1);
+  assert.equal(collab.calls.decide.length, 3, 'merge / terminate 各透传一次、枚举外拒绝不触服务');
 });
 
 test('ws_decide：mergeOffer 合法透传、枚举外拒绝', async () => {
@@ -497,4 +513,67 @@ test('治理工具输出封装：ok 载荷 JSON 化输出（含仅 ok 的内建�
   const payload = JSON.parse(decided.content[0].text);
   assert.equal(payload.choice, 'keep');
   assert.equal(payload.message, '已解除冻结并广播');
+});
+
+test('ws_delivery_status：系统回报条目折叠为 reportRows、不进 rows（不静默）', async () => {
+  const net = {
+    deliveryStatus: () => ([
+      { msgId: 'msg-1', collabId: 'collab-1', type: 'notice', toInstanceId: 'inst-b', tier: 'at-peer', expired: false, attempts: 1, createdAt: '2026-10-13T00:00:00.000Z', nextAttemptAt: '2026-10-13T00:00:10.000Z', ackedAt: null, deliveredAt: null },
+      { msgId: 'msg-2', collabId: 'collab-1', type: 'delivery-status', toInstanceId: 'inst-b', tier: 'at-peer', expired: false, attempts: 1, createdAt: '2026-10-13T00:00:01.000Z', nextAttemptAt: '2026-10-13T00:00:11.000Z', ackedAt: null, deliveredAt: null },
+    ]),
+  };
+  const result = await callTool(deliveryStatusTool(), {}, net);
+  const payload = JSON.parse(result.content[0].text);
+  assert.ok(Array.isArray(payload.rows));
+  assert.deepEqual(payload.rows.map((row) => row.msgId), ['msg-1'], '回报条目折叠后其余行原样');
+  assert.equal(payload.reportRows, 1, '折叠条数以计数报出（不静默）');
+});
+
+test('ws_create_collab：目标上限随 MAX_COLLAB_MEMBERS 派生（上限内合法、越限拒绝）', async () => {
+  const collab = fakeService();
+  const targetOf = (index) => ({ instanceId: `inst-${index}`, identityName: `主机${index}`, address: '127.0.0.2', port: 17321 });
+  const targets = Array.from({ length: MAX_COLLAB_MEMBERS - 1 }, (_, index) => targetOf(index));
+  const accepted = await callCollabTool(createCollabTool(), { name: '项目', topic: '主题', targets }, collab);
+  assert.equal(accepted.isError, undefined);
+  const refused = await callCollabTool(createCollabTool(), { name: '项目', topic: '主题', targets: [...targets, targetOf(99)] }, collab);
+  assert.equal(refused.isError, true);
+  assert.equal(collab.calls.create.length, 1);
+});
+
+test('工具返回口径：16 工具成功载荷均为含 ok:true 的 JSON 对象（统一不变量）', async () => {
+  const net = {
+    listHosts: async () => ({ ok: true, hosts: [] }),
+    pingHost: async () => ({ ok: true, reachable: true, rttMs: 1 }),
+    deliveryStatus: () => [],
+    checkInbox: () => ({ collabId: 'collab-1', total: 0, returned: 0, messages: [] }),
+    status: () => ({ available: true, reason: null, message: '', port: 17321, counters: {} }),
+  };
+  const collab = fakeService();
+  const governance = fakeGovernanceService();
+  const single = { instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 };
+  const cases = [
+    { tool: statusTool(), args: {}, context: contextWith(net) },
+    { tool: hostsTool(), args: {}, context: contextWith(net) },
+    { tool: pingTool(), args: { address: '127.0.0.2', port: 17321 }, context: contextWith(net) },
+    { tool: deliveryStatusTool(), args: {}, context: contextWith(net) },
+    { tool: checkInboxTool(), args: { collabId: 'collab-1' }, context: contextWith(net) },
+    { tool: listCollabsTool(), args: {}, context: collabContextOf(collab) },
+    { tool: createCollabTool(), args: { name: '项目', topic: '主题', targets: [single] }, context: collabContextOf(collab) },
+    { tool: approveInviteTool(), args: { collabId: 'collab-1', approve: true }, context: collabContextOf(collab) },
+    { tool: withdrawInviteTool(), args: { collabId: 'collab-1' }, context: collabContextOf(collab) },
+    { tool: viewLedgerTool(), args: { collabId: 'collab-1' }, context: collabContextOf(collab) },
+    { tool: sendMessageTool(), args: { collabId: 'collab-1', text: '你好' }, context: collabContextOf(collab) },
+    { tool: leaveCollabTool(), args: { collabId: 'collab-1' }, context: collabContextOf(collab) },
+    { tool: endCollabTool(), args: { collabId: 'collab-1' }, context: collabContextOf(collab) },
+    { tool: decideTool(), args: { collabId: 'collab-1', choice: 'keep' }, context: collabContextOf(governance) },
+    { tool: handoverTool(), args: { collabId: 'collab-1', target: 'inst-b' }, context: collabContextOf(governance) },
+    { tool: takeOverTool(), args: { collabId: 'collab-1' }, context: collabContextOf(governance) },
+  ];
+  assert.equal(cases.length, 16, '覆盖全部 16 工具');
+  for (const { tool, args, context } of cases) {
+    const result = await tool.handler(args, context);
+    assert.equal(result.isError, undefined, tool.name);
+    const payload = JSON.parse(result.content[0].text);
+    assert.equal(payload.ok, true, tool.name);
+  }
 });

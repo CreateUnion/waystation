@@ -7,7 +7,7 @@ import { CHECK_INBOX_DEFAULT_LIMIT, CHECK_INBOX_MAX_LIMIT } from '../net/inbound
 export function checkInboxTool() {
   return {
     name: 'ws_check_inbox',
-    description: '读取某协作的收件流水（按保留期窗口）：返回最近的消息（含已投递与未投递；条数与上限以 limit 参数为准）',
+    description: `读取某协作的收件流水（按保留期窗口）：返回最近的消息（含已投递与未投递；默认 ${CHECK_INBOX_DEFAULT_LIMIT} 条、上限 ${CHECK_INBOX_MAX_LIMIT} 条，以 limit 参数为准）`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -25,7 +25,7 @@ export function checkInboxTool() {
         return { content: [{ type: 'text', text: `参数 limit 非法：需要 1–${CHECK_INBOX_MAX_LIMIT} 的整数（可选，不传用默认 ${CHECK_INBOX_DEFAULT_LIMIT}）` }], isError: true };
       }
       const result = context.net.checkInbox({ collabId, limit: args.limit ?? CHECK_INBOX_DEFAULT_LIMIT });
-      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ ok: true, ...result }, null, 2) }] };
     },
   };
 }
