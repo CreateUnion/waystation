@@ -285,7 +285,7 @@ install_claude_commands() {
       note "未找到 claude CLI——跳过安装（不影响安装的其他部分）"
     fi
     note "手工步骤（安装 Claude Code 后执行）："
-    note "  把 ${source_dir}/ 下两个文件拷到 ~/.claude/commands/"
+    note "  把 ${source_dir}/ 下的受管命令文件拷到 ~/.claude/commands/"
     return 0
   fi
   local args=(install --home "$HOME" --source "$source_dir")
@@ -298,7 +298,7 @@ install_claude_commands() {
   else
     note_lines "$output"
     warn "斜杠命令安装失败（退出码非 0，不中断安装——重跑本脚本即可重试）"
-    note "  或手工执行：把 ${source_dir}/ 下两个文件拷到 ~/.claude/commands/"
+    note "  或手工执行：把 ${source_dir}/ 下的受管命令文件拷到 ~/.claude/commands/"
   fi
 }
 

@@ -38,7 +38,7 @@ function runInstallScript(t, args, home = makeTempDir(t)) {
   return { home, result };
 }
 
-test('安装脚本 --dry-run：5/6 走到命令行模块（含三个受管文件名）、HOME 下零写入', (t) => {
+test('安装脚本 --dry-run：5/6 走到命令行模块（含五个受管文件名）、HOME 下零写入', (t) => {
   if (!bashAvailable) {
     t.skip('bash 不可用（Windows 需 git-bash；.ps1 臂由主控真机验证）');
     return;
@@ -47,8 +47,9 @@ test('安装脚本 --dry-run：5/6 走到命令行模块（含三个受管文件
   assert.equal(result.status, 0, `退出码非 0；stderr：${result.stderr}`);
   assert.ok(result.stdout.includes('斜杠命令'), '安装流程应含斜杠命令步骤');
   assert.ok(
-    result.stdout.includes('ws-collab') && result.stdout.includes('ws-list') && result.stdout.includes('ws-purge'),
-    `应打印模块安装计划（三个受管文件名）：${result.stdout}`,
+    result.stdout.includes('ws-collab') && result.stdout.includes('ws-discuss') && result.stdout.includes('ws-list')
+      && result.stdout.includes('ws-mute') && result.stdout.includes('ws-purge'),
+    `应打印模块安装计划（五个受管文件名）：${result.stdout}`,
   );
   assert.equal(existsSync(join(home, '.claude')), false, 'dry-run 不得创建 ~/.claude');
   assert.equal(existsSync(join(home, '.waystation')), false, 'dry-run 不得创建安装目录');

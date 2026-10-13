@@ -334,7 +334,7 @@ function Install-ClaudeCommands {
             Write-Note '未找到 claude CLI——跳过安装（不影响安装的其他部分）'
         }
         Write-Note '手工步骤（安装 Claude Code 后执行）：'
-        Write-Note "  把 $commandsSourceDir 下两个文件拷到 ~\.claude\commands\"
+        Write-Note "  把 $commandsSourceDir 下的受管命令文件拷到 ~\.claude\commands\"
         return
     }
     $modulePath = Join-Path $RepoRoot 'src\claude-commands.js'
@@ -348,7 +348,7 @@ function Install-ClaudeCommands {
     }
     if ($run.ExitCode -ne 0) {
         Write-Warn '斜杠命令安装失败（退出码非 0，不中断安装——重跑本脚本即可重试）'
-        Write-Note "  或手工执行：把 $commandsSourceDir 下两个文件拷到 ~\.claude\commands\"
+        Write-Note "  或手工执行：把 $commandsSourceDir 下的受管命令文件拷到 ~\.claude\commands\"
     }
 }
 

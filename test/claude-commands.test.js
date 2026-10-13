@@ -37,7 +37,7 @@ function runWithCapture(run) {
   }
 }
 
-/* 临时源目录：写入给定文件集（缺省 = 两个受管命令，对应仓库 scripts/claude-commands/ 的现状）。 */
+/* 临时源目录：写入给定文件集（缺省 = 两个受管命令样本——夹具自成一体，不随仓库源集合份数变动）。 */
 function makeSourceDir(t, files = { 'ws-collab.md': managedCommand('collab'), 'ws-list.md': managedCommand('list') }) {
   const sourceDir = join(makeTempDir(t), 'claude-commands');
   mkdirSync(sourceDir, { recursive: true });
@@ -56,8 +56,8 @@ function makeCommandsDir(home, files) {
   return commandsDir;
 }
 
-test('仓库命令源：三个文件存在且带受管标记（防源集合与标记漂移）', () => {
-  for (const name of ['ws-collab.md', 'ws-list.md', 'ws-purge.md']) {
+test('仓库命令源：五个文件存在且带受管标记（防源集合与标记漂移）', () => {
+  for (const name of ['ws-collab.md', 'ws-discuss.md', 'ws-list.md', 'ws-mute.md', 'ws-purge.md']) {
     const filePath = join(repoRoot, 'scripts', 'claude-commands', name);
     assert.equal(existsSync(filePath), true, `缺少命令源文件：${name}`);
     const text = readFileSync(filePath, 'utf8');
