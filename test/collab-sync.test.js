@@ -8,6 +8,7 @@ import { createCollabService } from '../src/collab/service.js';
 import { MEMBERS_FILE_NAME } from '../src/collab/members.js';
 import { POSTS_FILE_NAME } from '../src/collab/posts.js';
 import { comparePosition, rollbackPlanOf, summaryOf } from '../src/collab/sync.js';
+import { createDispatch } from '../src/net/dispatch.js';
 import { createInbound } from '../src/net/inbound.js';
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -201,7 +202,7 @@ async function makeForumPair(t, overrides = {}) {
   await madeB.service.approve({ collabId, approve: true });
   const joinMessage = sentOf(madeB.sent, 'join', collabId)[0];
   await wire.hop(madeA.service, joinMessage, selfB);
-  await awaitSync(madeB.service.sync({ collabId }));
+  await syncWhenIdle(madeB.service, collabId);
   return { wire, selfA, selfB, a: madeA, b: madeB, collabId, joinMessage };
 }
 
@@ -440,7 +441,7 @@ test('end 双通道：在线广播即归档；离线者回归经 bundle 元状�
   await wire.hop(b.service, endMessage, selfA);
   assert.equal(b.service.list().collabs[0].state, 'completed', '在线者收 end 广播即归档');
   /* 离线者 C 回归：对表拉取（归档后的 A 仍应答——只读回填通道不因归档关闭）。 */
-  const outcome = await awaitSync(madeC.service.sync({ collabId }));
+  const outcome = await syncWhenIdle(madeC.service, collabId);
   assert.equal(outcome.ok, true, JSON.stringify(outcome));
   assert.equal(madeC.service.list().collabs[0].state, 'completed', '经 bundle 元状态学到 end → 本地转归档');
   assert.equal((await madeC.service.view({ collabId })).posts.length, 2, '归档后回填仍可达');
@@ -484,11 +485,11 @@ test('无应答统一处理：不重试该源、换源重试；源耗尽则本�
   await receive(madeC.service, inviteFrame({ collabId, mode: 'forum', manager: peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port), members: [peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port), peer('inst-c', '主机丙', 17323)] }));
   await madeC.service.approve({ collabId, approve: true });
   await receive(madeA.service, joinFrameOf(collabId, peer('inst-c', '主机丙', 17323)));   // C 的 join 先达 A（应答条件：请求方在成员表内）
-  await awaitSync(madeC.service.sync({ collabId }));   // C 的对表（从 A 拉回事件集——C 的表含 A）
+  await syncWhenIdle(madeC.service, collabId);   // C 的对表（从 A 拉回事件集——C 的表含 A）
   await receive(madeA.service, joinFrameOf(collabId, peer(SELF_B.instanceId, SELF_B.identityName, SELF_B.port)));   // B 在表内但不在线（虚拟线未注册）
-  await waitFor(() => (madeA.service.stats().syncNoAnswer >= 1 ? true : null), { timeoutMs: 2000 });   // join 到达触发的后台一轮先收尾
+  await waitFor(() => (madeA.service.stats().syncBundlesIn >= 1 ? true : null), { timeoutMs: 2000 });   // join 到达触发的后台一轮先收尾（C 的应答已到）
   const before = madeA.service.stats().syncNoAnswer;
-  const outcome = await awaitSync(madeA.service.sync({ collabId }));
+  const outcome = await syncWhenIdle(madeA.service, collabId);
   assert.equal(outcome.ok, true, '换源后取得应答');
   assert.equal(outcome.sourceId, 'inst-c', 'B 无应答 → 换源到 C');
   assert.equal(madeA.service.stats().syncNoAnswer, before + 1, '无应答计数（不重试该源）');
@@ -511,11 +512,14 @@ test('请求类入站限流（同源 10s 内 2 次，产品默认值判别）与
   assert.equal(throttled.ok, false, '第三跳在窗口内被限流');
   assert.ok(throttled.reason.includes('频繁'), throttled.reason);
   assert.equal(a.service.stats().syncRequestsThrottled, 1);
+  /* 非成员拒绝计数按增量断言：新人同意后的首轮拉取可能先于 join 到达（应答方按成员面拒绝一次），
+   * 绝对值会被该一次性噪音扰动——本用例只钉「非成员请求被拒」这一点。 */
+  const rejectedBefore = a.service.stats().syncRequestsRejected;
   const stranger = collabFrame('history-request', collabId, peer('inst-z', '主机Z', 17399), {});
   const rejected = await receive(a.service, stranger);
   assert.equal(rejected.ok, false, '非成员请求拒绝');
   assert.ok(rejected.reason.includes('成员表'), rejected.reason);
-  assert.equal(a.service.stats().syncRequestsRejected, 1);
+  assert.equal(a.service.stats().syncRequestsRejected, rejectedBefore + 1);
 });
 
 /* —— 会话注入面（接收管线实链路） —— */
@@ -565,8 +569,35 @@ function makePipedService(t, overrides = {}) {
   return { ...made, inbound, session };
 }
 
+/* 假连接（接收管线与直连链路的共用形态）：sent 记本端发出的帧；onFrame/onClose/receive 供
+ * 直连链路装配的双向接线（拨号方客户端连接的回帧经 receive 进其帧路由）。 */
 function fakeConnection(remoteAddress = '127.0.0.1') {
-  return { remoteAddress, sent: [], send(frame) { this.sent.push(frame); } };
+  const listeners = { frame: null, close: null };
+  return {
+    remoteAddress,
+    sent: [],
+    closed: false,
+    send(frame) {
+      this.sent.push(frame);
+    },
+    onFrame(callback) {
+      listeners.frame = callback;
+    },
+    onClose(callback) {
+      listeners.close = callback;
+    },
+    close() {
+      if (!this.closed) {
+        this.closed = true;
+        if (listeners.close !== null) {
+          listeners.close();
+        }
+      }
+    },
+    receive(frame) {
+      return listeners.frame === null ? undefined : listeners.frame(frame);
+    },
+  };
 }
 
 test('注入栅栏（限帖通道）：(作者, postId) 去重命中抑制重复注入——判别副本用不同 msgId', async (t) => {
@@ -637,7 +668,7 @@ test('任何成员可邀请端到端：成员侧构造邀请 → 被邀同意 �
   await wire.hop(a.service, cJoin, selfC);
   assert.deepEqual(viewMembers(await b.service.view({ collabId })), ['inst-a', 'inst-b', 'inst-c'], 'B 的折叠表含 C');
   assert.deepEqual(viewMembers(await a.service.view({ collabId })), ['inst-a', 'inst-b', 'inst-c'], 'A 的折叠表含 C');
-  const outcome = await awaitSync(madeC.service.sync({ collabId }));
+  const outcome = await syncWhenIdle(madeC.service, collabId);
   assert.equal(outcome.ok, true, JSON.stringify(outcome));
   assert.equal((await madeC.service.view({ collabId })).posts.length, 3, '新人回填全部历史');
   assert.deepEqual(viewMembers(await madeC.service.view({ collabId })), ['inst-a', 'inst-b', 'inst-c']);
@@ -758,4 +789,150 @@ test('重复邀请换人：邀请者引用随最新邀请更新（拒绝后重�
   const bookkeeping = sentOf(made.sent, 'approve', 'collab-r1');
   assert.equal(bookkeeping.length, 1, 'approve 簿记发出');
   assert.equal(bookkeeping[0].to.instanceId, 'inst-c', '簿记发向最新邀请者（重入者的邀请者引用随最新邀请更新）');
+});
+
+/* —— 对表触发面：同意即回填（不等待周期节拍） —— */
+
+test('同意即回填：加入后立即驱动一轮对表、join 自播先于首轮拉取（不等待周期 tick）', async (t) => {
+  const wire = makeWire();
+  const madeA = makeService(t, { self: SELF_A, sendDirect: wire.sendDirectFor(SELF_A) });
+  wire.register(SELF_A, madeA.service);
+  /* B 的队列路径也在线上即时送达：join 自播与直投同回合成链。 */
+  const madeB = makeService(t, {
+    self: SELF_B,
+    send: (message) => wire.sendDirectFor(SELF_B)(message),
+    sendDirect: wire.sendDirectFor(SELF_B),
+    syncPeerPicker: () => [SELF_A.instanceId],
+  });
+  wire.register(SELF_B, madeB.service);
+  const collabId = madeA.service.create({ name: '讨论甲', topic: '议题', mode: 'forum', targets: [{ instanceId: SELF_B.instanceId, identityName: SELF_B.identityName, address: '127.0.0.2', port: SELF_B.port }] }).collabId;
+  await injectPosts(madeA.service, collabId, postsOf(2));
+  await receive(madeB.service, inviteFrame({ collabId, mode: 'forum', manager: peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port), members: [peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port), peer(SELF_B.instanceId, SELF_B.identityName, SELF_B.port)] }));
+  const joined = await madeB.service.approve({ collabId, approve: true });
+  assert.equal(joined.joined, true, joined.message);
+  /* 判别点（旧行为必红）：不调用任何 tick / 手工对表，首次回填由加入驱动自行发生。 */
+  await waitFor(async () => {
+    const view = await madeB.service.view({ collabId });
+    return view.posts.length === 2 ? true : null;
+  });
+  assert.equal(madeB.service.stats().syncPostsBackfilled, 2, '首次回填不等待周期节拍');
+  const joinIndex = wire.frames.findIndex((frame) => frame.type === 'join');
+  const requestIndex = wire.frames.findIndex((frame) => frame.type === 'history-request');
+  assert.ok(joinIndex >= 0 && requestIndex > joinIndex, `join 自播（#${joinIndex}）先于首轮拉取（#${requestIndex}）`);
+});
+
+/* —— 对表触发面：未加入者不参与周期对表 —— */
+
+test('未加入者不进入对表：受邀待回应与已拒绝期间零请求、对端零拒绝计数', async (t) => {
+  const wire = makeWire();
+  const madeA = makeService(t, { self: SELF_A, sendDirect: wire.sendDirectFor(SELF_A) });
+  wire.register(SELF_A, madeA.service);
+  const madeB = makeService(t, { self: SELF_B, sendDirect: wire.sendDirectFor(SELF_B), syncPeerPicker: () => [SELF_A.instanceId] });
+  wire.register(SELF_B, madeB.service);
+  const collabId = madeA.service.create({ name: '讨论甲', topic: '议题', mode: 'forum', targets: [{ instanceId: SELF_B.instanceId, identityName: SELF_B.identityName, address: '127.0.0.2', port: SELF_B.port }] }).collabId;
+  await receive(madeB.service, inviteFrame({ collabId, mode: 'forum', manager: peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port), members: [peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port), peer(SELF_B.instanceId, SELF_B.identityName, SELF_B.port)] }));
+  const requestCount = () => wireFramesOf(wire.frames, 'history-request', collabId).length;
+  /* 受邀待回应：单实例轮 + 全量扫（周期 tick 的同一入口）都不发请求。 */
+  await awaitSync(madeB.service.sync({ collabId }));
+  madeB.service.sync({});
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(requestCount(), 0, '待回应期间不发拉取请求');
+  assert.equal(madeB.service.stats().syncRequestsSent, 0);
+  assert.equal(madeA.service.stats().syncRequestsRejected, 0, '对端拒绝计数为零（异常信号不被常态请求淹没）');
+  /* 已拒绝（本地仍停留提议中）：同样零请求。 */
+  await madeB.service.approve({ collabId, approve: false });
+  await awaitSync(madeB.service.sync({ collabId }));
+  madeB.service.sync({});
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(requestCount(), 0, '已拒绝期间不发拉取请求');
+  assert.equal(madeA.service.stats().syncRequestsRejected, 0);
+  /* 重新受邀（decision 重置）后同意：加入恢复对表（跳过判据是「未加入」，不是「无受邀记录」）。 */
+  await receive(madeB.service, inviteFrame({ collabId, mode: 'forum', manager: peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port), members: [peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port), peer(SELF_B.instanceId, SELF_B.identityName, SELF_B.port)] }));
+  assert.equal((await madeB.service.approve({ collabId, approve: true })).joined, true);
+  await awaitSync(madeB.service.sync({ collabId }));
+  assert.ok(requestCount() >= 1, '加入后请求照发');
+});
+
+/* —— 出站队列终态：重复 join 重播的副本也回报投递 —— */
+
+const NET_CONFIG = { port: 7321, retryIntervalMs: 40, retrySlowIntervalMs: 80, retryFastCount: 2, queueMaxPerCollab: 100, messageTtlMs: 600000, dispatchTickMs: 20, dialTimeoutMs: 150 };
+
+/* 双节点直连（假传输/假连接）：拨号方 send 的帧进对端 inbound；接收方在连接上的回帧
+ * （ack / 投递回报）回到拨号方、经客户端帧路由进其 inbound——与生产组合根的接线同构。 */
+function makeNetPair() {
+  const nodes = new Map();
+  const addressOf = (self) => `127.0.0.${self.port - 17320}`;
+  const clientFor = (dialer, target) => {
+    const serverView = fakeConnection(addressOf(dialer));   // 接收方看到的来源地址 = 拨号方
+    const clientView = fakeConnection(addressOf(target));
+    clientView.send = (frame) => nodes.get(target.instanceId).inbound.onFrame(serverView, frame);
+    serverView.send = (frame) => clientView.receive(frame);
+    return clientView;
+  };
+  return {
+    register(self, inbound) {
+      nodes.set(self.instanceId, { inbound });
+    },
+    transportOf(self, target) {
+      return { setFrameHandler() {}, dial: () => Promise.resolve(clientFor(self, target)) };
+    },
+  };
+}
+
+/* 单节点装配（真 dispatch + 真 inbound + 协作服务）：与生产组合根同构的接线与启动。 */
+function makeNetNode(t, { self, dir, transport, serviceOverrides = {} }) {
+  const log = quietLog();
+  const dispatch = createDispatch({ dataDir: dir, config: NET_CONFIG, transport, self, log });
+  const service = createCollabService({
+    dataDir: dir,
+    config: { inviteTtlMs: DAY },
+    self,
+    send: (message) => dispatch.send(message),
+    sendDirect: (message) => dispatch.sendDirect(message),
+    notify: () => {},
+    knownHosts: { remember: () => {} },
+    log,
+    ledgerFetchTimeoutMs: 30,
+    inviteMinIntervalMs: 0,
+    syncPeerPicker: () => [],
+    ...serviceOverrides,
+  });
+  const inbound = createInbound({
+    dataDir: dir,
+    config: { messageTtlMs: 600000 },
+    self,
+    dispatch,
+    hooks: {
+      admit: (frame, meta) => service.hooks.admit(frame, meta),
+      consume: (frame, meta) => service.hooks.consume(frame, meta),
+      deliverToSession: () => true,
+    },
+    log,
+  });
+  dispatch.setClientFrameRouter((connection, frame) => inbound.onFrame(connection, frame));
+  dispatch.start();
+  t.after(() => dispatch.stop());
+  return { dispatch, service, inbound };
+}
+
+test('重复 join 重播的副本也回报投递：出站队列无永久停留条目（慢泄漏闭合）', async (t) => {
+  const selfA = { instanceId: 'inst-a', identityName: '主机甲', port: 17321 };
+  const selfB = { instanceId: 'inst-b', identityName: '主机乙', port: 17322 };
+  const net = makeNetPair();
+  const nodeA = makeNetNode(t, { self: selfA, dir: makeTempDir(t), transport: net.transportOf(selfA, selfB) });
+  const nodeB = makeNetNode(t, { self: selfB, dir: makeTempDir(t), transport: net.transportOf(selfB, selfA), serviceOverrides: { joinReplayIntervalsMs: [25, 50, 100, 200], pullReplyTimeoutMs: 200 } });
+  net.register(selfA, nodeA.inbound);
+  net.register(selfB, nodeB.inbound);
+  const collabId = nodeA.service.create({ name: '讨论甲', topic: '议题', mode: 'forum', targets: [{ instanceId: selfB.instanceId, identityName: selfB.identityName, address: '127.0.0.2', port: selfB.port }] }).collabId;
+  await waitFor(() => (nodeB.service.list().collabs.some((entry) => entry.collabId === collabId) ? true : null), { timeoutMs: 5000 });
+  assert.equal((await nodeB.service.approve({ collabId, approve: true })).joined, true);
+  /* 单轮重播：立即一次 + 四档递增间隔（重复副本被成员事件去重吸收）。 */
+  await waitFor(() => (nodeA.service.stats().forumJoinDuplicates >= 1 ? true : null), { timeoutMs: 5000 });
+  const joinRowsOf = () => nodeB.dispatch.deliveryStatus({ collabId }).filter((row) => row.type === 'join');
+  /* 判别点（旧行为必红）：被抑制的重复副本也回报投递——条目终态为 session，不再停在 at-peer。 */
+  await waitFor(() => {
+    const rows = joinRowsOf();
+    return rows.length >= 4 && rows.every((row) => row.tier === 'session') ? true : null;
+  }, { timeoutMs: 8000 });
+  assert.equal(joinRowsOf().every((row) => row.tier === 'session'), true, '无永久停留条目');
 });

@@ -47,6 +47,7 @@ function makeService(t, overrides = {}) {
     log: quietLog(),
     ledgerFetchTimeoutMs: overrides.ledgerFetchTimeoutMs ?? 60,
     inviteMinIntervalMs: overrides.inviteMinIntervalMs ?? 0,
+    pullReplyTimeoutMs: overrides.pullReplyTimeoutMs,
     syncPeerPicker: overrides.syncPeerPicker ?? (() => []),
   });
   return { service, sent, direct, remembered, dir, self, config };
@@ -1369,13 +1370,26 @@ async function deliverBroadcast(service, message, fromSelf) {
   });
 }
 
+/* 一轮对表并取本轮结论：同意即回填（加入后的驱动）可能有在途轮次——同一实例同时只跑一轮
+ * （在途期间起的轮次被拒 already-running），等其收尾后重试到本轮真正跑起来。 */
+async function syncWhenIdle(service, collabId) {
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const outcome = await service.sync({ collabId });
+    if (outcome.reason !== 'already-running') {
+      return outcome;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return { ok: false, reason: '在途轮次始终未收尾' };
+}
+
 test('讨论双节点并发发帖：真实 join 装配（自播 + 对表拉回）、互投收敛、重复副本无害、两端显示序一致', async (t) => {
   const wire = makeDirectWire();
   const selfA = { instanceId: 'inst-a', identityName: '主机甲', port: 17321 };
   const selfB = { instanceId: 'inst-b', identityName: '主机乙', port: 17322 };
   const madeA = makeService(t, { self: selfA, sendDirect: wire.sendDirect('inst-a') });
   wire.register(selfA, madeA.service);
-  const madeB = makeService(t, { self: selfB, sendDirect: wire.sendDirect('inst-b'), syncPeerPicker: () => ['inst-a'] });
+  const madeB = makeService(t, { self: selfB, sendDirect: wire.sendDirect('inst-b'), syncPeerPicker: () => ['inst-a'], pullReplyTimeoutMs: 60 });
   wire.register(selfB, madeB.service);
   const collabId = createForum(madeA.service, { targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17322 }] });
   await receive(madeB.service, inviteFrame({ collabId, mode: 'forum', manager: peer('inst-a', '主机甲'), members: [peer('inst-a', '主机甲'), peer('inst-b', '主机乙', 17322)] }));
@@ -1387,7 +1401,7 @@ test('讨论双节点并发发帖：真实 join 装配（自播 + 对表拉回�
   await deliverBroadcast(madeA.service, joinMessage, selfB);
   assert.equal(madeA.service.list().collabs[0].state, 'active', '发起人收悉首个加入：讨论转进行中');
   /* B 的成员表经对表拉回 A 的事件集（真实拉取/应答链走直达线），同时学到 A 的端点。 */
-  const synced = await madeB.service.sync({ collabId });
+  const synced = await syncWhenIdle(madeB.service, collabId);
   assert.equal(synced.ok, true, JSON.stringify(synced));
   assert.deepEqual((await madeB.service.view({ collabId })).members.map((entry) => entry.instanceId).sort(), ['inst-a', 'inst-b']);
   const postedA = await madeA.service.send({ collabId, text: '甲的第一帖' });

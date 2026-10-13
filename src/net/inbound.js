@@ -12,7 +12,8 @@ const COMPACT_LINE_FACTOR = 2;
 /** @typedef {{ admit?: (frame: object, meta: { remoteAddress: string }) => { ok: boolean, reason?: string } | null | undefined | Promise<{ ok: boolean, reason?: string } | null | undefined>, consume?: (frame: object, meta: { remoteAddress: string }) => unknown, deliverToSession?: (frame: object) => unknown }} InboundHooks */
 
 /* 接收管线（设计 §10）：帧的类型路由（四类）——
- * ① 协作域（含治理类）：准入 → 幂等去重 → 落盘 → ack → 钩子 → 投递成功后回报；
+ * ① 协作域（含治理类）：准入 → 幂等去重 → 落盘 → ack → 钩子 → 投递成功后回报
+ *    （去重抑制的副本按「已收到（重复）」回报——发送侧的持久条目由此能到终态）；
  * ② delivery-status（投递回报）：应用（更新本方发送队列档位，幂等）→ 回 ack → 结束；
  *    不落盘 inbox、不投会话、不产生针对回报的回报——ack 是链路确认、是递归的终端。
  *    回报必须以 ack 收敛，否则发送方该「协作 × 对端」单元的队头永占、后续消息永久阻塞；
@@ -183,7 +184,20 @@ async function handleCollabMessage(state, connection, frame) {
   if (await runDeliver(state, frame, consumed)) {
     state.counters.sessionDelivered++;
     sendDeliveryReport(state, frame, connection);
+    return;
   }
+  if (isAbsorbedDuplicate(frame, consumed)) {
+    /* 「已收到（重复）」的终态回报：不注入会话的重复副本（帖去重命中 / join 重播副本）仍是
+     * 已受理的帧——发送侧的持久条目收不到终态回报会永远停在「已到对方驿站」：投递豁免类
+     * （join）不参与过期回收，条目随重播轮次在出站队列里累积（慢泄漏）。 */
+    sendDeliveryReport(state, frame, connection);
+  }
+}
+
+/* 「已受理（重复）」判定：consume 声明不注入会话的抑制副本——只认帖与 join 两类通道的声明
+ * （拉取两件套的通道分流不在此回报：请求-应答经发送侧的换源 / 下轮节拍收敛，不给终态回报）。 */
+function isAbsorbedDuplicate(frame, consumed) {
+  return SESSION_GATED_TYPES.has(frame.type) && consumed?.sessionDeliver === false;
 }
 
 /* 会话注入的分流面（讨论模式的两条机制，互不越界）：

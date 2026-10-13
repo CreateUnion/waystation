@@ -6,7 +6,7 @@ import { decideAdmission, SYNC_REQUEST_MAX, SYNC_REQUEST_WINDOW_MS } from './gat
 import { handleEvent } from './events.js';
 import { localModeOf, localNameOf, localRosterOf, localStateOf, persistLedger } from './local.js';
 import { approveInvite, countLiveCollabs, createCollab, endCollab, inviteMembers, leaveCollab, sendMessage, viewLedger, withdrawInvite } from './outgoing.js';
-import { JOIN_REPLAY_INTERVALS_MS, SYNC_MAX_REQUESTS_PER_CYCLE, SYNC_MAX_SOURCES_PER_CYCLE, SYNC_REPLY_TIMEOUT_MS, SYNC_SOFT_BUNDLE_BYTES, SYNC_TAIL_POSTS, SYNC_TAIL_WINDOW_MS, runSyncCycle, runSyncSweep, startSyncEngine, stopSyncEngine } from './sync.js';
+import { JOIN_REPLAY_INTERVALS_MS, SYNC_MAX_REQUESTS_PER_CYCLE, SYNC_MAX_SOURCES_PER_CYCLE, SYNC_REPLY_TIMEOUT_MS, SYNC_SOFT_BUNDLE_BYTES, SYNC_TAIL_POSTS, SYNC_TAIL_WINDOW_MS, runSyncCycle, runSyncSweep, startSyncEngine, stopSyncEngine, triggerSync } from './sync.js';
 import { HANDSHAKE_REPLY_TIMEOUT_MS, TAKEOVER_PROBE_INTERVAL_MS, runHandshake, startLiveness, stopLiveness, takeOver } from './takeover.js';
 import { decide, decideMergeOffer } from './freeze.js';
 import { HANDOVER_CONFIRM_TIMEOUT_MS, handover } from './handover.js';
@@ -129,7 +129,7 @@ function apiOf(state) {
     list: () => listCollabs(state),
     create: (input) => createCollab(state, input),
     invite: (input) => inviteMembers(state, input),
-    approve: (input) => approveInvite(state, input),
+    approve: (input) => approveNow(state, input),
     withdraw: (input) => withdrawInvite(state, input),
     send: (input) => sendMessage(state, input),
     end: (input) => endCollab(state, input),
@@ -334,6 +334,22 @@ function statsOf(state) {
     byState[stateName] = (byState[stateName] ?? 0) + 1;
   }
   return { collabs: state.collabs.size, byState, ...state.counters };
+}
+
+/* 邀请回应的驱动面（讨论）：同意即加入后立即起一轮回填对表（复用周期对表的同一入口）——
+ * 新人不必等下一个周期节拍（默认 60s）才看到历史。让出到微任务边界再起：本机这一回合的外发
+ * 次序为 join 自播先、对表请求后（应答方准入按「请求方在成员表内」把关——请求先到会被拒）。 */
+function approveNow(state, input) {
+  const result = approveInvite(state, input);
+  if (result.ok === true && result.joined === true) {
+    const local = state.collabs.get(input?.collabId);
+    if (local !== undefined) {
+      queueMicrotask(() => {
+        triggerSync(state, local, { reason: 'join-decided' });
+      });
+    }
+  }
+  return result;
 }
 
 /* 对表驱动入口（显式触发面；周期 tick 走 startSyncEngine 的定时器）：省略 collabId = 全量扫一轮

@@ -1,6 +1,6 @@
 import { MAX_FRAME_BYTES } from '../net/protocol.js';
 import { isPostEntryShape, displayOrderOf } from './posts.js';
-import { foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, persistMember } from './local.js';
+import { foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, persistMember, selfJoinedOf } from './local.js';
 import { applyEndpoint, endpointFor, mutateLedger, notifyLocal, startJoinReplay, stopJoinReplay, stopJoinReplays } from './outgoing.js';
 import { foldMemberEvents } from './members.js';
 
@@ -76,10 +76,15 @@ export function triggerSync(state, local, options = {}) {
 }
 
 /* 一轮对表（单个讨论）：选取对端序 → 逐个拉取；一个源拉通即收（换源重试的有界形态）。
- * 同一实例同时只跑一轮（tick 与 join/leave 触发面互不叠加）。 */
+ * 同一实例同时只跑一轮（tick 与 join/leave 触发面互不叠加）；只对已加入（自播过 join）的讨论
+ * 运行——受邀待回应 / 已拒绝者不是成员，拉取请求必被应答方按成员面拒绝，只会空耗请求预算并
+ * 污染对方的拒绝计数（异常信号不被常态请求淹没）。 */
 export async function runSyncCycle(state, local, options = {}) {
   if (localModeOf(local) !== 'forum' || isLocalArchivedState(local)) {
     return { ok: false, reason: 'not-applicable' };
+  }
+  if (!selfJoinedOf(local, state.self.instanceId)) {
+    return { ok: false, reason: 'not-joined' };
   }
   if (state.syncActive.has(local.collabId)) {
     return { ok: false, reason: 'already-running' };
