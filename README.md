@@ -23,7 +23,7 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
 
 1. 新开一个 Claude Code 会话（会话启动时会拉起驿站进程）；`/mcp` 里 waystation 应显示已连接。
 2. 让 Claude 调用 `ws_status` 查看本站点状态、`ws_list_hosts` 扫局域网在线驿站（列出身份名与 地址:端口）；装了随安装分发的斜杠命令时，等价形态是 `/ws-list`。
-3. 发起协作：`ws_create_collab`（项目名 / 主题 / 目标取自扫描列表）——斜杠命令等价形态 `/ws-collab <对方> <项目名> <主题>`；对方在同意门 `ws_approve_invite` → 双向 `ws_send_message`、`ws_view_ledger` 看台账。
+3. 发起协作：`ws_create_collab`（项目名 / 主题 / 目标取自扫描列表）——斜杠命令等价形态 `/ws-collab <项目名> <主题…> [协作者…]`（不写协作者会弹出在线驿站多选）；对方在同意门 `ws_approve_invite` → 双向 `ws_send_message`、`ws_view_ledger` 看台账。
 4. 可选：配置状态栏「协作中」指示（见下节）——进入协作后状态栏显示当前协作。
 5. 可选：其他 MCP 客户端（如 opencode）见下节配置片段。
 
