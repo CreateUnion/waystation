@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
@@ -160,17 +160,71 @@ test('EPIPE 守卫：按监听器身份幂等（重复调用不叠加、被移�
   assert.equal(process.stdout.listenerCount('error'), installed, '监听被移除后按身份重装（数量复原）');
 });
 
+/* bin 子进程收尾：node:test 的收尾钩子按注册序执行，而临时目录的删除钩子由 makeTempDir 在其调用点
+ * 先行注册——「先等子进程退出、后删目录」要求收尾钩子抢在删除钩子之前注册（与 server.test.js 同一
+ * 模式），否则删除撞上存活进程的写盘抛错会跳过其后全部钩子（含杀进程）——泄漏的子进程拖住文件进程
+ * 永不退出，runner 无限等待该文件（整轮运行冻结）。 */
+const childrenByTest = new WeakMap();
+const binChildren = [];   // 文件级兜底：本文件启动过的全部 bin 子进程
+
+function cleanupRegistryOf(t) {
+  let children = childrenByTest.get(t);
+  if (children === undefined) {
+    children = [];
+    childrenByTest.set(t, children);
+    t.after(async () => {
+      for (const child of children) {
+        await stopChild(child);
+      }
+    });
+  }
+  return children;
+}
+
+/* 强杀并等 exit 落地；已退出的进程无操作——收尾路径不因二次处理把用例判红。 */
+async function stopChild(child) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+  const exited = new Promise((resolve) => child.once('exit', resolve));
+  child.kill('SIGKILL');
+  await exited;
+}
+
+/* 数据目录：收尾钩子先于 makeTempDir 的删除钩子注册（见上）。 */
+function makeStationDir(t) {
+  cleanupRegistryOf(t);
+  return makeTempDir(t);
+}
+
+/* 新起的子进程登记进用例清单与文件清单（用例收尾强杀；文件末兜底查漏）。 */
+function registerChild(t, child) {
+  cleanupRegistryOf(t).push(child);
+  binChildren.push(child);
+}
+
+/* 文件级兜底：任何收尾钩子被跳过（如钩子抛错）都会留下存活的子进程——此处强制杀灭并响亮失败，
+ * 绝不让泄漏把整轮运行拖进永不退出的等待（正常路径全部已杀，兜底无事可做）。 */
+after(() => {
+  const leakedPids = [];
+  for (const child of binChildren) {
+    if (child.exitCode === null && child.signalCode === null) {
+      leakedPids.push(child.pid);
+      child.kill('SIGKILL');
+    }
+  }
+  assert.equal(leakedPids.length, 0, `bin 子进程未被用例收尾（收尾钩子被跳过？）：${leakedPids.join(',')}——已兜底强制杀灭，检查用例清理`);
+});
+
 test('进程级：bin 分派 uninstall --dry-run（退出码 0）；未知参数 → 退出码 1', { timeout: 20000 }, async (t) => {
-  const home = makeTempDir(t);
+  const home = makeStationDir(t);
   const run = (args) => new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [BIN_ENTRY, ...args], {
       cwd: repoRoot,
       env: { ...process.env, WAYSTATION_HOME: home },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    t.after(() => {
-      child.kill('SIGKILL');
-    });
+    registerChild(t, child);
     let stdout = '';
     child.stdout.on('data', (chunk) => {
       stdout += chunk.toString();

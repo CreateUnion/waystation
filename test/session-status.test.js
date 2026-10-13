@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
@@ -169,8 +169,64 @@ test('写入失败：sessions 路径被同名文件占位 → 计数告警、不
   writer.close();
 });
 
+/* 站点子进程收尾：node:test 的收尾钩子按注册序执行，而临时目录的删除钩子由 makeTempDir 在其调用点
+ * 先行注册——「先杀站点进程、后删目录」要求收尾钩子抢在删除钩子之前注册（与 server.test.js 同一
+ * 模式），否则删除撞上存活站点的写盘抛错会跳过其后全部钩子（含杀进程）——泄漏的站点拖住文件进程
+ * 永不退出，runner 无限等待该文件（整轮运行冻结）。 */
+const childrenByTest = new WeakMap();
+const stationChildren = [];   // 文件级兜底：本文件启动过的全部站点进程
+
+function cleanupRegistryOf(t) {
+  let children = childrenByTest.get(t);
+  if (children === undefined) {
+    children = [];
+    childrenByTest.set(t, children);
+    t.after(async () => {
+      for (const child of children) {
+        await stopChild(child);
+      }
+    });
+  }
+  return children;
+}
+
+/* 强杀并等 exit 落地（会话状态文件随进程收尾清除）；已退出的进程无操作。 */
+async function stopChild(child) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+  const exited = new Promise((resolve) => child.once('exit', resolve));
+  child.kill('SIGKILL');
+  await exited;
+}
+
+/* 站点数据目录：收尾钩子先于 makeTempDir 的删除钩子注册（见上）。 */
+function makeStationDir(t) {
+  cleanupRegistryOf(t);
+  return makeTempDir(t);
+}
+
+/* 新起的站点进程登记进用例清单与文件清单（用例收尾强杀；文件末兜底查漏）。 */
+function registerChild(t, child) {
+  cleanupRegistryOf(t).push(child);
+  stationChildren.push(child);
+}
+
+/* 文件级兜底：任何收尾钩子被跳过（如钩子抛错）都会留下存活的站点进程——此处强制杀灭并响亮失败，
+ * 绝不让泄漏把整轮运行拖进永不退出的等待（正常路径全部已杀，兜底无事可做）。 */
+after(() => {
+  const leakedPids = [];
+  for (const child of stationChildren) {
+    if (child.exitCode === null && child.signalCode === null) {
+      leakedPids.push(child.pid);
+      child.kill('SIGKILL');
+    }
+  }
+  assert.equal(leakedPids.length, 0, `站点进程未被用例收尾（收尾钩子被跳过？）：${leakedPids.join(',')}——已兜底强制杀灭，检查用例清理`);
+});
+
 test('进程级：会话标识经环境注入 → 文件出现且字段正确；stdin 关闭 → 进程退出并清除文件', { timeout: 30000 }, async (t) => {
-  const home = makeTempDir(t);
+  const home = makeStationDir(t);
   const port = await pickFreePort();
   writeFileSync(join(home, 'config.json'), JSON.stringify({ port, scanWindowMs: 300, dialTimeoutMs: 1500 }));
   const sessionId = 'session-process-1';
@@ -179,9 +235,7 @@ test('进程级：会话标识经环境注入 → 文件出现且字段正确；
     env: { ...process.env, WAYSTATION_HOME: home, CLAUDE_CODE_SESSION_ID: sessionId },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
-  t.after(() => {
-    child.kill('SIGKILL');
-  });
+  registerChild(t, child);
   const file = sessionFilePath(home, sessionId);
   await waitFor(() => (existsSync(file) ? true : null), { timeoutMs: 15000 });
   const payload = JSON.parse(readFileSync(file, 'utf8'));
