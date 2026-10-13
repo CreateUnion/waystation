@@ -5,13 +5,16 @@ import { readFileSync } from 'node:fs';
 import { collabFilePath } from '../src/paths.js';
 import { makeTempDir, waitFor } from './helpers.js';
 import { createCollabService } from '../src/collab/service.js';
+import { createDispatch } from '../src/net/dispatch.js';
+import { createInbound } from '../src/net/inbound.js';
 
 /* 中继分发（默认）与直投（降级）的判别用例（设计 §5.2/§5.3/§9.1）：
  * ①三节点中继路径（投稿标记、from 保原作者、全员收敛一致）；②降级（中继不可达 → 当次即直投）；
  * ③恢复（后台检测通过 → 切回中继、计数断言）；④重复分发幂等；⑤端点未知跳过并计数；
  * ⑥与水位拉取正交（离线者照常追平）；⑦降级期直投副本不再转达（设计两可项的选定行为）；
- * ⑧发起人标识传递（邀请载荷 / bundle 元状态两路）；生命周期（发起人退出 → 直投兜底）。
- * 全部经注入缝（假发送 / 虚拟直投线（节点可达性可配）/ 可控探测面）+ 临时目录，不触真实网络。 */
+ * ⑧发起人标识传递（邀请载荷 / bundle 元状态两路）；生命周期（发起人退出 → 直投兜底）；
+ * 聚合捎回（成员会话回报译回原作者——真 dispatch + 真 inbound 三节点接缝）。
+ * 多数用例经注入缝（假发送 / 虚拟直投线（节点可达性可配）/ 可控探测面）+ 临时目录，不触真实网络。 */
 
 const DAY = 24 * 60 * 60 * 1000;
 const SELF_A = { instanceId: 'inst-a', identityName: '主机甲', port: 17321 };
@@ -513,4 +516,194 @@ test('生命周期：发起人退出（leave）= 永久放弃中继职责——�
   assert.equal(b.service.stats().relayDegradedPosts, 1);
   await waitFor(async () => ((await c.service.view({ collabId })).posts.length === 1 ? true : null));
   assert.equal((await c.service.view({ collabId })).posts[0].from.instanceId, SELF_B.instanceId);
+});
+
+/* —— 聚合捎回（设计 §5.2「成员级投递结果由中继聚合捎回」）：真 dispatch + 真 inbound 三节点 —— */
+
+const NET_CONFIG = { port: 7321, retryIntervalMs: 40, retrySlowIntervalMs: 80, retryFastCount: 2, queueMaxPerCollab: 100, messageTtlMs: 600000, dispatchTickMs: 20, dialTimeoutMs: 150 };
+
+/* 假连接（与生产 transport 接口同形）：send 记录帧，receive 分发给已注册的帧处理器。 */
+function fakeConnection(remoteAddress = '127.0.0.1') {
+  const listeners = { frame: null, close: null };
+  return {
+    remoteAddress,
+    sent: [],
+    send(frame) {
+      this.sent.push(frame);
+    },
+    onFrame(callback) {
+      listeners.frame = callback;
+    },
+    onClose(callback) {
+      listeners.close = callback;
+    },
+    close() {
+      if (listeners.close !== null) {
+        listeners.close();
+      }
+    },
+    receive(frame) {
+      return listeners.frame === null ? undefined : listeners.frame(frame);
+    },
+  };
+}
+
+/* 三节点直连网（假传输）：按拨号端口定位目标站点；dialed 记录每台机器拨出的帧——
+ * 聚合捎回「译回帧」的判别面（转达副本的回报沿原连接回执，不经拨号，故不在此表）。 */
+function makeNetPairs() {
+  const nodes = new Map();
+  const byPort = new Map();
+  const dialed = [];
+  const clientFor = (dialer, target) => {
+    const serverView = fakeConnection(addressOf(dialer));   // 接收方看到的来源地址 = 拨号方
+    const clientView = fakeConnection(addressOf(target));
+    clientView.send = (frame) => {
+      dialed.push({ from: dialer.instanceId, frame });
+      nodes.get(target.instanceId).inbound.onFrame(serverView, frame);
+    };
+    serverView.send = (frame) => clientView.receive(frame);
+    return clientView;
+  };
+  return {
+    dialed,
+    register(self, inbound) {
+      nodes.set(self.instanceId, { self, inbound });
+      byPort.set(self.port, self.instanceId);
+    },
+    transportOf(self) {
+      return {
+        setFrameHandler() {},
+        dial: ({ port }) => Promise.resolve(clientFor(self, nodes.get(byPort.get(port)).self)),
+      };
+    },
+  };
+}
+
+/* 单节点装配（真 dispatch + 真 inbound + 协作服务）：与生产组合根同构的接线（含聚合捎回注入面）。
+ * deliverToSession 可注入——中继侧「会话未回报」的变体由用例给出。 */
+function makeNetNode(t, { self, dir, transport, deliverToSession = () => true }) {
+  const log = quietLog();
+  const dispatch = createDispatch({
+    dataDir: dir,
+    config: NET_CONFIG,
+    transport,
+    self,
+    log,
+    onRelayedReport: (payload) => service.relayReport(payload),
+  });
+  const { service, inbound } = makeNetCollab({ dir, self, dispatch, log, deliverToSession });
+  dispatch.setClientFrameRouter((connection, frame) => inbound.onFrame(connection, frame));
+  dispatch.start();
+  t.after(() => dispatch.stop());
+  return { dispatch, service, inbound };
+}
+
+/* 协作服务 + 接收管线的装配（admit/consume 钩子与投递面；与生产组合根同一注入形状）。 */
+function makeNetCollab({ dir, self, dispatch, log, deliverToSession }) {
+  const service = createCollabService({
+    dataDir: dir,
+    config: { inviteTtlMs: DAY },
+    self,
+    send: (message) => dispatch.send(message),
+    sendDirect: (message) => dispatch.sendDirect(message),
+    probe: null,
+    notify: () => {},
+    knownHosts: { remember: () => {} },
+    log,
+    ledgerFetchTimeoutMs: 30,
+    inviteMinIntervalMs: 0,
+    syncPeerPicker: () => [],
+    joinReplayIntervalsMs: [2000],
+  });
+  const inbound = createInbound({
+    dataDir: dir,
+    config: { messageTtlMs: 600000 },
+    self,
+    dispatch,
+    hooks: {
+      admit: (frame, meta) => service.hooks.admit(frame, meta),
+      consume: (frame, meta) => service.hooks.consume(frame, meta),
+      deliverToSession,
+    },
+    log,
+  });
+  return { service, inbound };
+}
+
+/* 三节点装配：A=发起人/中继、B/C=成员，邀请与 join 全经真实队列送达（拨号按端口定位）。 */
+async function makeNetStudio(t, { relaySessionReports = true } = {}) {
+  const net = makeNetPairs();
+  const nodes = {
+    a: makeNetNode(t, { self: SELF_A, dir: makeTempDir(t), transport: net.transportOf(SELF_A), deliverToSession: () => relaySessionReports }),
+    b: makeNetNode(t, { self: SELF_B, dir: makeTempDir(t), transport: net.transportOf(SELF_B) }),
+    c: makeNetNode(t, { self: SELF_C, dir: makeTempDir(t), transport: net.transportOf(SELF_C) }),
+  };
+  net.register(SELF_A, nodes.a.inbound);
+  net.register(SELF_B, nodes.b.inbound);
+  net.register(SELF_C, nodes.c.inbound);
+  const collabId = nodes.a.service.create({ name: '讨论三', topic: '议题', mode: 'forum', targets: [targetOf(SELF_B), targetOf(SELF_C)] }).collabId;
+  await waitFor(() => (
+    nodes.b.service.list().collabs.some((entry) => entry.collabId === collabId)
+    && nodes.c.service.list().collabs.some((entry) => entry.collabId === collabId)
+      ? true : null
+  ), { timeoutMs: 8000 });
+  await nodes.b.service.approve({ collabId, approve: true });
+  await nodes.c.service.approve({ collabId, approve: true });
+  await waitFor(() => (nodes.a.service.stats().forumJoinsIn >= 2 ? true : null), { timeoutMs: 8000 });
+  return { net, nodes, collabId };
+}
+
+test('聚合捎回：中继把成员会话回报译回原作者（既有 delivery-status 帧；含幂等与无环判别）', async (t) => {
+  /* 中继侧会话不回报（适配器不可用态）：作者侧档位只能由成员会话的回报经聚合捎回升级——
+   * 该配置下「译回帧」不含歧义（既有投稿回报帧不存在）。 */
+  const { net, nodes, collabId } = await makeNetStudio(t, { relaySessionReports: false });
+  const own = await nodes.a.service.send({ collabId, text: '甲的帖' });
+  assert.equal(own.route, 'fanout', '中继自帖直接扇出（同时备下原生直投记录）');
+  const posted = await nodes.b.service.send({ collabId, text: '乙的帖' });
+  assert.equal(posted.route, 'relay');
+  const rowOf = (owner, target) => owner.dispatch.deliveryStatus({ collabId }).find((row) => row.type === 'post' && row.toInstanceId === target);
+  const submissionRow = rowOf(nodes.b, SELF_A.instanceId);
+  assert.ok(submissionRow !== undefined, '投稿直投记录在作者侧');
+  const reportsToAuthor = () => net.dialed.filter((entry) => (
+    entry.from === SELF_A.instanceId && entry.frame.type === 'delivery-status' && entry.frame.payload?.refMsgId === submissionRow.msgId
+  ));
+  /* 判别点（旧行为必红）：成员（丙）会话收到转达副本 → 中继把第三档回报译回原作者。 */
+  await waitFor(() => (reportsToAuthor().length >= 1 ? true : null), { timeoutMs: 8000 });
+  assert.equal(reportsToAuthor()[0].frame.payload.tier, 'session');
+  assert.equal(reportsToAuthor()[0].frame.from.instanceId, SELF_A.instanceId, '译回帧由中继发出');
+  /* 端到端 sanity：作者档位达第三档（此配置下只能经聚合捎回抵达）。 */
+  await waitFor(() => {
+    const row = nodes.b.dispatch.deliveryStatus({ collabId }).find((candidate) => candidate.msgId === submissionRow.msgId);
+    return row?.tier === 'session' ? true : null;
+  }, { timeoutMs: 8000 });
+  assert.equal(nodes.a.service.stats().relayReportSent >= 1, true, '聚合回报发送计数（可观测）');
+  assert.equal((await nodes.c.service.view({ collabId })).posts.length, 2, '成员侧实时副本已入列（中继自帖 + 转达副本；回报的前件）');
+
+  /* 幂等：同一转达副本的重复回报不再译回第二帧（状态首次跃迁才触发）。 */
+  const relayedRow = rowOf(nodes.a, SELF_C.instanceId);
+  assert.ok(relayedRow !== undefined, '中继的转达记录在案');
+  const before = reportsToAuthor().length;
+  nodes.a.dispatch.onDeliveryReport({ refMsgId: relayedRow.msgId, tier: 'session' });
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(reportsToAuthor().length, before, '重复回报无第二帧');
+
+  /* 回归：原生副本（无 originMsgId / 无 from）的第三档回报不触发译回。 */
+  const nativeRow = rowOf(nodes.a, SELF_B.instanceId);
+  assert.ok(nativeRow !== undefined, '中继自帖的直投记录（原生帧）');
+  nodes.a.dispatch.onDeliveryReport({ refMsgId: nativeRow.msgId, tier: 'session' });
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(reportsToAuthor().length, before, '原生回报不产生译回帧（既有路径不动）');
+
+  /* 无环：回报是递归终端——接收方不为「回报帧」再产生回报。 */
+  const reportFrame = reportsToAuthor()[0].frame;
+  assert.equal(net.dialed.some((entry) => entry.frame.type === 'delivery-status' && entry.frame.payload?.refMsgId === reportFrame.msgId), false, '不为回报再产生回报');
+});
+
+test('聚合捎回：原作者端点未知 → 跳过并计数（不臆造地址），主链不受影响', async (t) => {
+  const { collabId, a } = await makeStudio(t);
+  a.service.relayReport({ collabId, originMsgId: 'origin-unknown', author: { instanceId: 'inst-ghost', identityName: '幽灵' } });
+  assert.equal(a.service.stats().relayReportSkipped, 1);
+  assert.equal(a.service.stats().relayReportSent, 0);
+  a.service.relayReport({ collabId: 'collab-absent', originMsgId: 'origin-unknown', author: { instanceId: 'inst-ghost', identityName: '幽灵' } });
+  assert.equal(a.service.stats().relayReportSkipped, 1, '非本机在册协作不臆造（防御面：跳过不计）');
 });

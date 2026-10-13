@@ -117,7 +117,16 @@ if (configCreated || identityDefaulted || (site.ok && site.writeBackPort)) {
 const self = { instanceId, identityName: config.identityName, port: config.port };
 const knownHosts = createKnownHosts({ dataDir: activeDir, log });
 const transport = createTransport({ port: config.port, log });
-const dispatch = createDispatch({ dataDir: activeDir, config, transport, self, log });
+const dispatch = createDispatch({
+  dataDir: activeDir,
+  config,
+  transport,
+  self,
+  log,
+  /* 转达副本达第三档 → 聚合捎回译回原作者（讨论的中继分发）：回调只在运行期触发（与
+   * describeCollab 同一先例——声明顺序无碍）；寻址与失败留痕在协作侧，异常自隔离。 */
+  onRelayedReport: (payload) => collab.relayReport(payload),
+});
 const adapter = createClaudeCodeAdapter({
   env: process.env,
   log,

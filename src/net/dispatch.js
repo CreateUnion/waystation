@@ -49,8 +49,10 @@ export function createDispatch(options) {
   };
 }
 
-/* 运行态容器：依赖注入与直投参数一次性定格（直投参数缺省 = 模块顶部常量；测试经选项收敛）。 */
-function buildState({ dataDir, config, transport, self, log,
+/* 运行态容器：依赖注入与直投参数一次性定格（直投参数缺省 = 模块顶部常量；测试经选项收敛）。
+ * onRelayedReport（可选注入面）：转达副本首次达第三档时的聚合捎回通知（讨论的中继分发）——
+ * 与协作层的接线口径同 setClientFrameRouter 先例；缺省不接（本层行为照旧）。 */
+function buildState({ dataDir, config, transport, self, log, onRelayedReport = null,
   directMaxAttempts = DIRECT_MAX_ATTEMPTS, directRetryIntervalMs = DIRECT_RETRY_INTERVAL_MS,
   directRecordTtlMs = DIRECT_RECORD_TTL_MS, directRecordMax = DIRECT_RECORD_MAX }) {
   return {
@@ -59,6 +61,7 @@ function buildState({ dataDir, config, transport, self, log,
     transport,
     self,
     log,
+    onRelayedReport,
     directMaxAttempts,
     directRetryIntervalMs,
     directRecordTtlMs,
@@ -452,6 +455,27 @@ function markDirectSession(state, record, now) {
   return true;
 }
 
+/* 中继转达副本的回报译回（讨论中继分发的聚合捎回，设计 §5.2「成员级投递结果由中继捎回」）：
+ * 被转达副本（载荷带 originMsgId）首次达第三档时，把「该成员会话已收到」通知注入面译回原作者
+ * （原投稿帧）。只在状态首次跃迁时触发（重复回报不再产生第二帧）；原生副本（无 originMsgId /
+ * 无 from）不触发——既有回报语义与 queue 路径（治理转发）均不受影响；注入面异常隔离为日志，
+ * 绝不穿出投递回报主链（投递回报的 ack 与状态推进照旧）。 */
+function notifyRelayedReport(state, record) {
+  const originMsgId = record.payload?.originMsgId;
+  const author = record.from;
+  if (typeof originMsgId !== 'string' || originMsgId === '' || typeof author?.instanceId !== 'string') {
+    return;
+  }
+  if (typeof state.onRelayedReport !== 'function') {
+    return;
+  }
+  try {
+    state.onRelayedReport({ collabId: record.collabId, originMsgId, author: { instanceId: author.instanceId, identityName: author.identityName } });
+  } catch (error) {
+    state.log.error('聚合回报注入面异常（已隔离）', { collabId: record.collabId, reason: error?.message });
+  }
+}
+
 function markDirectUndelivered(state, record) {
   if (record.state === 'at-peer' || record.state === 'session') {
     return;   // 等待窗与收尾之间的迟到确认：已投达不得被标成未达
@@ -502,7 +526,9 @@ function onAck(state, msgId) {
 function onDeliveryReport(state, { refMsgId, tier }) {
   const direct = state.directRecords.get(refMsgId);
   if (direct !== undefined && tier === 'session') {
-    markDirectSession(state, direct, Date.now());
+    if (markDirectSession(state, direct, Date.now())) {
+      notifyRelayedReport(state, direct);
+    }
     return;
   }
   const located = locate(state, refMsgId);

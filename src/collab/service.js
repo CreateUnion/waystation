@@ -5,7 +5,7 @@ import { createMembersStore } from './members.js';
 import { decideAdmission, SYNC_REQUEST_MAX, SYNC_REQUEST_WINDOW_MS } from './gate.js';
 import { handleEvent } from './events.js';
 import { localModeOf, localNameOf, localRosterOf, localStateOf, persistLedger } from './local.js';
-import { approveInvite, countLiveCollabs, createCollab, endCollab, inviteMembers, leaveCollab, sendMessage, viewLedger, withdrawInvite } from './outgoing.js';
+import { applyRelayedReport, approveInvite, countLiveCollabs, createCollab, endCollab, inviteMembers, leaveCollab, sendMessage, viewLedger, withdrawInvite } from './outgoing.js';
 import { JOIN_REPLAY_INTERVALS_MS, SYNC_MAX_REQUESTS_PER_CYCLE, SYNC_MAX_SOURCES_PER_CYCLE, SYNC_REPLY_TIMEOUT_MS, SYNC_SOFT_BUNDLE_BYTES, SYNC_TAIL_POSTS, SYNC_TAIL_WINDOW_MS, runSyncCycle, runSyncSweep, startSyncEngine, stopSyncEngine, triggerSync } from './sync.js';
 import { HANDSHAKE_REPLY_TIMEOUT_MS, TAKEOVER_PROBE_INTERVAL_MS, runHandshake, startLiveness, stopLiveness, takeOver } from './takeover.js';
 import { decide, decideMergeOffer } from './freeze.js';
@@ -131,6 +131,7 @@ function apiOf(state) {
     create: (input) => createCollab(state, input),
     invite: (input) => inviteMembers(state, input),
     approve: (input) => approveNow(state, input),
+    relayReport: (input) => applyRelayedReport(state, input),   // 网层回报注入面（转达副本达第三档 → 译回原作者）
     withdraw: (input) => withdrawInvite(state, input),
     send: (input) => sendMessage(state, input),
     end: (input) => endCollab(state, input),
@@ -476,6 +477,9 @@ function emptyFlowCounters() {
     relaySubmissionsIn: 0,    // 收到的投稿数（中继侧，首发入列时计）
     relayRedistributed: 0,    // 转达处理的帖数（每（作者, postId）至多一次）
     relayFanoutSkipped: 0,    // 转达时端点未知跳过的目标数
+    relayReportSent: 0,       // 聚合捎回：译回原作者的第三档回报帧数
+    relayReportSkipped: 0,    // 聚合捎回：原作者端点未知跳过数
+    relayReportFailed: 0,     // 聚合捎回：入队失败 / 异常数
   };
 }
 

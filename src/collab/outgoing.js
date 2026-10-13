@@ -593,6 +593,35 @@ export async function checkRelayRecovery(state, local) {
   return true;
 }
 
+/* 聚合捎回（设计 §5.2「成员级投递结果由中继聚合捎回」）：中继把「某成员会话已收到某转达副本」
+ * 的既有第三档回报译回原作者——以既有 delivery-status 帧（refMsgId = 原投稿帧 msgId、
+ * tier = session）经既有可靠发送面（入队重试）发给原作者；作者侧按既有回报机制幂等吸收
+ * （重复回报无副作用、不产生第二帧）。触发点在网层回报路径的首次跃迁（net/dispatch 的注入面），
+ * 本函数只做寻址与发送，尽力而为：端点未知跳过并计数（不臆造地址——沿用既有教训口径）、
+ * 入队失败只计数告警（sendTo 已留痕），异常一律隔离——绝不影响回报主链。 */
+export function applyRelayedReport(state, { collabId, originMsgId, author }) {
+  try {
+    const local = state.collabs.get(collabId);
+    if (local === undefined || localModeOf(local) !== 'forum') {
+      return;   // 非本机在册协作 / 非讨论实例：不臆造（防御面；帖转达副本只出现在讨论）
+    }
+    const endpoint = endpointFor(state, local, author.instanceId);
+    if (endpoint === undefined) {
+      state.counters.relayReportSkipped++;
+      return;
+    }
+    const sent = sendTo(state, collabId, author.instanceId, endpoint, 'delivery-status', { refMsgId: originMsgId, tier: 'session' });
+    if (sent.ok === true) {
+      state.counters.relayReportSent++;
+    } else {
+      state.counters.relayReportFailed++;
+    }
+  } catch (error) {
+    state.counters.relayReportFailed++;
+    state.log.warn('聚合回报发送异常（已隔离）', { collabId, reason: error?.message });
+  }
+}
+
 /* 帖分配与本地落列（设计 §5.2）：postId 一次生成、序号严格递增、ts 强制单调——
  * 回拨时取 max(上一条 ts + 1ms, now)；三者以本机已落列表的该作者基线为准，落列即定。 */
 function allocateOwnPost(state, local, kind, text) {
