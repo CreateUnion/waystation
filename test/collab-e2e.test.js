@@ -291,7 +291,7 @@ async function waitPostConvergence(clientA, clientB, collabId, count) {
   }, { timeoutMs: 30000 });
 }
 
-test('验收预演：讨论模式双节点——成员自播 join、直投发帖、周期对表收敛（会话注入与本地视图）', { timeout: 120000 }, async (t) => {
+test('验收预演：讨论模式双节点——成员自播 join、中继发帖（发起人=中继）、周期对表收敛（会话注入与本地视图）', { timeout: 120000 }, async (t) => {
   const made = await startTemporaryStudio(t, { name: '讨论甲', topic: '议题', mode: 'forum' });
   const { inboxA, inboxB, a, b, collabId, statusA, statusB } = made;
   await waitFor(() => (inboxB.receivedText().includes('讨论甲') ? true : null), { timeoutMs: 20000 });
@@ -307,14 +307,15 @@ test('验收预演：讨论模式双节点——成员自播 join、直投发帖
   assert.equal(postedA.payload.seq, 1);
   assert.equal(postedA.payload.results[0].ok, true, '对端在册且端点已知：直投受理');
   await waitFor(() => (inboxB.receivedText().includes('甲的第一帖') ? true : null), { timeoutMs: 20000 });
-  /* B 的对表（周期 tick）把 A 的 join 事件拉回——B 的折叠表含 A 后发帖才对 A 有扇出面。 */
+  /* B 的对表（周期 tick）把 A 的 join 事件拉回——两侧成员表收敛（成员数 2）。 */
   await waitFor(async () => {
     const view = (await callTool(b, 'ws_view_ledger', { collabId })).payload;
     return view.members.length === 2 ? true : null;
   }, { timeoutMs: 30000 });
   const postedB = await callTool(b, 'ws_send_message', { collabId, text: '乙的回应' });
   assert.equal(postedB.isError, false, String(postedB.payload));
-  assert.equal(postedB.payload.results[0].ok, true, 'B 的成员表经对表拉回后对 A 直投');
+  assert.equal(postedB.payload.route, 'relay', '成员发帖默认经中继（发起人）');
+  assert.equal(postedB.payload.results[0].ok, true, 'B 的投稿达中继 A');
   await waitFor(() => (inboxA.receivedText().includes('乙的回应') ? true : null), { timeoutMs: 20000 });
   await waitPostConvergence(a, b, collabId, 2);
   const viewB = (await callTool(b, 'ws_view_ledger', { collabId })).payload;

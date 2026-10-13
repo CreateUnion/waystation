@@ -1408,8 +1408,8 @@ test('讨论双节点并发发帖：真实 join 装配（自播 + 对表拉回�
   const postedB = await madeB.service.send({ collabId, text: '乙的第一帖' });
   assert.equal(postedA.ok, true);
   assert.equal(postedB.ok, true);
-  assert.equal(postedA.results[0].ok, true, 'A 的扇出经折叠成员表达 B');
-  assert.equal(postedB.results[0].ok, true, 'B 的扇出经折叠成员表达 A');
+  assert.equal(postedA.results[0].ok, true, 'A（发起人=中继）直接扇出经折叠成员表达 B');
+  assert.equal(postedB.results[0].ok, true, 'B（成员）经中继路径投稿达 A');
   /* 重复路径副本（不同 msgId 的同帖）：去重命中不重复入列；首份由真实直投到位。 */
   const delivered = wire.frames.filter((frame) => frame.type === 'post');
   assert.equal(delivered.length, 2, '两帖各直投一份');
@@ -1444,7 +1444,7 @@ test('讨论视图：显示序按 ts 排序（同刻按 postId 兜底）、折�
   assert.equal((await made.service.send({ collabId: 'collab-f4', text: '未加入者的帖' })).ok, false, '未加入不可发帖');
 });
 
-test('讨论发帖：端点未知的成员如实标注待对表、不影响其余成员投出（成员侧扇出）', async (t) => {
+test('讨论发帖（邀请未携发起人标识的旧形态）：中继未知 → 降级直投——端点未知成员如实标注待对表、不影响其余成员投出', async (t) => {
   const made = makeService(t);
   await receive(made.service, inviteFrame({ collabId: 'collab-f3', mode: 'forum', members: [peer('inst-a', '主机甲'), peer('inst-self', '本机', 17321), peer('inst-c', '主机丙')] }));
   assert.equal((await made.service.approve({ collabId: 'collab-f3', approve: true })).ok, true, '成员侧同意即加入');
@@ -1453,6 +1453,7 @@ test('讨论发帖：端点未知的成员如实标注待对表、不影响其�
   await receiveJoin(made.service, 'collab-f3', peer('inst-c', '主机丙'), { remoteAddress: '' });
   const posted = await made.service.send({ collabId: 'collab-f3', text: '乙的帖' });
   assert.equal(posted.ok, true);
+  assert.equal(posted.route, 'degraded', '中继未知（邀请未携发起人标识）→ 直投，待对表补学后自动回中继');
   const results = Object.fromEntries(posted.results.map((entry) => [entry.instanceId, entry]));
   assert.equal(results['inst-a'].ok, true);
   assert.equal(results['inst-c'].ok, false);
