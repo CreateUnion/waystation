@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { createSessionStatusWriter } from '../src/session-status.js';
+import { createSessionStatusWriter, isIndicatedCollab } from '../src/session-status.js';
 import { sessionFilePath } from '../src/paths.js';
 import { makeTempDir, pickFreePort, repoRoot, waitFor } from './helpers.js';
 
@@ -55,6 +55,23 @@ test('start：立即写入会话状态文件（字段完整、落在主数据目
   assert.equal(payload.updatedAt, '2026-10-13T00:00:00.000Z');
   assert.deepEqual(payload.collabs, sampleSnapshot().collabs);
   assert.equal(writer.stats().writes, 1);
+  writer.close();
+});
+
+test('归档条目不进指示面：归档与非归档混合清单 → 文件 collabs 仅保留非归档', (t) => {
+  /* 与组合根收集接线同形：谓词过滤后进快照，断言落在指示面（文件 collabs）。
+   * 该行为此前无任何断言（过滤内联于组合根，无独立观测面），本用例即其锁点——谓词判反即红。 */
+  const entries = [
+    { collabId: 'collab-active', name: '联调项目', state: 'active', role: 'manager', memberCount: 3, archived: false },
+    { collabId: 'collab-completed', name: '已结束项目', state: 'completed', role: 'manager', memberCount: 3, archived: true },
+    { collabId: 'collab-left', name: '已退出项目', state: 'left', role: 'member', memberCount: 2, archived: true },
+  ];
+  const { dir, writer } = makeWriter(t, {
+    collect: () => sampleSnapshot({ collabs: entries.filter(isIndicatedCollab) }),
+  });
+  writer.refresh();
+  const payload = JSON.parse(readFileSync(sessionFilePath(dir, 'session-abc-1'), 'utf8'));
+  assert.deepEqual(payload.collabs, [entries[0]]);
   writer.close();
 });
 

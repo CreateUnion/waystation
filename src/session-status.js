@@ -16,6 +16,14 @@ export const SESSION_STATUS_STALE_MS = 20000;
 const STATUS_VERSION = 1;
 const SESSION_ID_ENV = 'CLAUDE_CODE_SESSION_ID';
 
+/* 归档协作不进指示面：状态栏指示的是「本会话正在参与的协作」，条目自带的 archived 布尔
+ * （完成 / 终止 / 退出后为真）即判据——不在此重复推导状态语义。
+ * 单独导出的缘由：过滤原内联在组合根（src/index.js）收集闭包、无独立观测面——谓词提出来
+ * 才能把这条行为契约锁进断言（test/session-status.test.js）。 */
+export function isIndicatedCollab(entry) {
+  return entry.archived !== true;
+}
+
 /**
  * @param {{ mainDataDir: string, sessionId: string | undefined, collect: () => object, log: any,
  *   heartbeatMs?: number, now?: () => Date }} options
