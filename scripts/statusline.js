@@ -69,12 +69,27 @@ function itemPartsOf(entry) {
   return parts;
 }
 
-/* 条目渲染（「讨论中：名称（人数）」与协作条目同形——人数是两侧的关键读数）。 */
+/* 消息数读法：非负整数才呈现；缺字段（旧状态文件）/ 形态不符一律省略该项（读取侧宽容——
+ * 与「缺 mode 按 managed 解释」同族）。单位词随模式自带口径：讨论记「帖」（本机全量副本帖数，
+ * 含回填）、协作记「条」（本机累计收到的内容消息数）。 */
+function countLabelOf(entry) {
+  const count = entry?.msgCount;
+  if (!Number.isInteger(count) || count < 0) {
+    return null;
+  }
+  return modeOf(entry) === FORUM_MODE ? `${count} 帖` : `${count} 条`;
+}
+
+/* 条目渲染（「讨论中：名称（人数）」与协作条目同形——人数是两侧的关键读数，消息数位次在人数后）。 */
 function renderItem(entry) {
   const parts = itemPartsOf(entry);
   const name = typeof entry?.name === 'string' && entry.name !== '' ? entry.name : '未命名';
-  const size = Number.isInteger(entry?.memberCount) ? `${entry.memberCount} 人` : '人数未知';
-  return parts.length === 0 ? `${name}（${size}）` : `${name}（${parts.join('，')}，${size}）`;
+  parts.push(Number.isInteger(entry?.memberCount) ? `${entry.memberCount} 人` : '人数未知');
+  const countLabel = countLabelOf(entry);
+  if (countLabel !== null) {
+    parts.push(countLabel);
+  }
+  return `${name}（${parts.join('，')}）`;
 }
 
 /* 一行指示：按模式分段落（协作中 / 讨论中并列）——同模式的条目内以 ｜ 连接；两者皆无则不显示。 */

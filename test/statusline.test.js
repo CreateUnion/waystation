@@ -157,6 +157,48 @@ test('混合条目：协作与讨论并列（各自前缀分组）、缺 mode �
   assert.equal(run.stdout, '协作中：项目甲（驿丞，3 人） ｜ 项目丙（协作者，2 人） ｜ 讨论中：讨论乙（4 人）');
 });
 
+test('消息数：讨论条目「（人数，N 帖）」、协作条目「（角色，人数，N 条）」——计数位次在人数之后', async (t) => {
+  const home = makeStationDir(t);
+  writeSessionFile(home, 'session-abc-1', sessionFileOf({
+    collabs: [
+      { collabId: 'collab-f1', name: '联调讨论', state: 'active', role: 'manager', mode: 'forum', memberCount: 5, msgCount: 7 },
+      { collabId: 'collab-1', name: '项目甲', state: 'frozen', role: 'member', memberCount: 2, msgCount: 12 },
+      { collabId: 'collab-2', name: '新协作', state: 'active', role: 'member', memberCount: 2, msgCount: 0 },
+    ],
+  }));
+  const run = await runStatusline(t, { input: JSON.stringify({ session_id: 'session-abc-1' }), home });
+  assert.equal(run.code, 0);
+  assert.equal(run.stdout, '协作中：项目甲（协作者，冻结，2 人，12 条） ｜ 新协作（协作者，2 人，0 条） ｜ 讨论中：联调讨论（5 人，7 帖）');
+});
+
+test('消息数不可得：字段缺失（旧状态文件）或形态不符一律省略该项，其余渲染不变', async (t) => {
+  const home = makeStationDir(t);
+  writeSessionFile(home, 'session-abc-1', sessionFileOf({
+    collabs: [
+      { collabId: 'collab-1', name: '旧协作', state: 'active', role: 'manager', memberCount: 3 },
+      { collabId: 'collab-2', name: '负计数', state: 'active', role: 'manager', memberCount: 3, msgCount: -1 },
+      { collabId: 'collab-3', name: '文本计数', state: 'active', role: 'manager', memberCount: 3, msgCount: '7' },
+      { collabId: 'collab-f1', name: '旧讨论', state: 'active', role: 'member', mode: 'forum', memberCount: 2 },
+    ],
+  }));
+  const run = await runStatusline(t, { input: JSON.stringify({ session_id: 'session-abc-1' }), home });
+  assert.equal(run.code, 0);
+  assert.equal(run.stdout, '协作中：旧协作（驿丞，3 人） ｜ 负计数（驿丞，3 人） ｜ 文本计数（驿丞，3 人） ｜ 讨论中：旧讨论（2 人）');
+});
+
+test('人数未知：既有行为不动；计数可得时仍位次在后', async (t) => {
+  const home = makeStationDir(t);
+  writeSessionFile(home, 'session-abc-1', sessionFileOf({
+    collabs: [
+      { collabId: 'collab-1', name: '人数缺', state: 'active', role: 'member' },
+      { collabId: 'collab-f1', name: '人数缺带计数', state: 'active', role: 'member', mode: 'forum', msgCount: 7 },
+    ],
+  }));
+  const run = await runStatusline(t, { input: JSON.stringify({ session_id: 'session-abc-1' }), home });
+  assert.equal(run.code, 0);
+  assert.equal(run.stdout, '协作中：人数缺（协作者，人数未知） ｜ 讨论中：人数缺带计数（人数未知，7 帖）');
+});
+
 test('无该会话文件：空输出、退出码 0、不写 stderr', async (t) => {
   const home = makeStationDir(t);
   const run = await runStatusline(t, { input: JSON.stringify({ session_id: 'session-none' }), home });
