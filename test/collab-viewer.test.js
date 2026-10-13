@@ -30,13 +30,29 @@ function cleanupRegistryOf(t) {
   return children;
 }
 
+/* 短超时兜底：q 请退后这么久仍未退（卡在未预期状态）才强杀——强杀不落 V8 覆盖数据，
+ * 只留给异常路径。 */
+const STOP_GRACE_MS = 2000;
+
+/* 收尾：先送 q 请其优雅退出（等 exit）——正常退出路径才让子进程把覆盖数据落盘，覆盖率采集
+ * 才是完整读数（此前一律强杀，覆盖数字被系统性低估）；q 请退带短超时兜底 SIGKILL。 */
 async function stopChild(child) {
   if (child.exitCode !== null || child.signalCode !== null) {
     return;
   }
   const exited = new Promise((resolve) => child.once('exit', resolve));
-  child.kill('SIGKILL');
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return;   // 检查与监听注册之间已退出：on exit 已错过，按已退出处理
+  }
+  try {
+    child.stdin?.on('error', () => {});
+    child.stdin?.write('q');
+  } catch {
+    // stdin 不可写（无管道 / 已关闭）：跳过请退，转等退出 + 兜底强杀
+  }
+  const killer = setTimeout(() => child.kill('SIGKILL'), STOP_GRACE_MS);
   await exited;
+  clearTimeout(killer);
 }
 
 function makeStationDir(t) {
