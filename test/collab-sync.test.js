@@ -1,12 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { appendFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { collabFilePath } from '../src/paths.js';
 import { makeTempDir, waitFor } from './helpers.js';
 import { createCollabService } from '../src/collab/service.js';
 import { SYNC_REQUEST_MAX, SYNC_REQUEST_WINDOW_MS } from '../src/collab/gate.js';
 import { MEMBERS_FILE_NAME } from '../src/collab/members.js';
+import { MUTE_FILE_NAME } from '../src/collab/mute.js';
 import { POSTS_FILE_NAME } from '../src/collab/posts.js';
 import { comparePosition, rollbackPlanOf, summaryOf } from '../src/collab/sync.js';
 import { createDispatch } from '../src/net/dispatch.js';
@@ -441,6 +442,16 @@ test('发起人退出（leave 自播）：成员表出表、讨论存续（成�
 
 /* —— end 双通道与终态吸收 —— */
 
+/* 归档后的重入探测（receiveRepeatInvite 复用路径）：已加入者的重邀为幂等并集吸收——记录面不动、
+ * 不复活静音（静音文件不复活、帖注入判定不静音）。 */
+async function assertReentryKeepsNoMute(made, collabId, self, expectedState) {
+  const roster = [peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port), peer(SELF_B.instanceId, SELF_B.identityName, SELF_B.port), peer(self.instanceId, self.identityName, self.port)];
+  await receive(made.service, inviteFrame({ collabId, mode: 'forum', manager: peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port), members: roster }));
+  assert.equal(made.service.list().collabs[0].state, expectedState, '已加入者重邀幂等：记录面不动');
+  assert.equal(existsSync(collabFilePath(made.dir, collabId, MUTE_FILE_NAME)), false, '重入不复活静音文件');
+  assert.equal(made.service.hooks.sessionGate(collabFrame('post', collabId, peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port), {})).suppress, false, '重入后帖注入判定：不静音');
+}
+
 test('end 双通道：在线广播即归档；离线者回归经 bundle 元状态学 end → 本地转归档；终态吸收不回退', async (t) => {
   const { wire, selfA, selfB, a, b, collabId } = await makeForumPair(t);
   await injectPosts(a.service, collabId, postsOf(2));
@@ -451,6 +462,9 @@ test('end 双通道：在线广播即归档；离线者回归经 bundle 元状�
   await receive(madeC.service, inviteFrame({ collabId, mode: 'forum', manager: peer(selfA.instanceId, selfA.identityName, selfA.port), members: [peer(selfA.instanceId, selfA.identityName, selfA.port), peer(selfB.instanceId, selfB.identityName, selfB.port), peer(selfC.instanceId, selfC.identityName, selfC.port)], endpoints: { [selfA.instanceId]: { address: '127.0.0.1', port: selfA.port } } }));
   await madeC.service.approve({ collabId, approve: true });
   await receive(a.service, joinFrameOf(collabId, peer(selfC.instanceId, selfC.identityName, selfC.port)));
+  /* C 在离线期间处于静音：归档无论走 end 帧还是 bundle 学终态都必须清掉（防重入带幽灵静音）。 */
+  assert.equal((await madeC.service.setMute({ collabId, muted: true })).ok, true);
+  assert.equal(existsSync(collabFilePath(madeC.dir, collabId, MUTE_FILE_NAME)), true, '静音状态已落盘');
   /* 发起人结束：广播 end（豁免 TTL/上限）；在线者 B 经广播通道。 */
   const ended = await a.service.end({ collabId });
   assert.equal(ended.ok, true);
@@ -463,6 +477,7 @@ test('end 双通道：在线广播即归档；离线者回归经 bundle 元状�
   const outcome = await syncWhenIdle(madeC.service, collabId);
   assert.equal(outcome.ok, true, JSON.stringify(outcome));
   assert.equal(madeC.service.list().collabs[0].state, 'completed', '经 bundle 元状态学到 end → 本地转归档');
+  assert.equal(existsSync(collabFilePath(madeC.dir, collabId, MUTE_FILE_NAME)), false, '经 bundle 学终态转归档即清静音（与 end 帧入口同口径）');
   assert.equal((await madeC.service.view({ collabId })).posts.length, 2, '归档后回填仍可达');
   assert.equal(madeC.service.stats().syncTerminalsIn, 1);
   /* 终态吸收：陈旧副本（meta=active）不把 completed 回退。 */
@@ -481,6 +496,8 @@ test('end 双通道：在线广播即归档；离线者回归经 bundle 元状�
   const latePost = forumPostFrame(collabId, AUTHOR_U, { postId: 'post-late', seq: 9, text: '结束后的帖' }, new Date(BASE_MS + 9000).toISOString());
   assert.equal((await receive(a.service, latePost)).ok, false, '归档后新帖照拒');
   assert.equal(a.service.stats().lateDropped >= 1, true);
+  /* 重入（receiveRepeatInvite 复用路径）：复用既有记录与 store 不携带幽灵静音。 */
+  await assertReentryKeepsNoMute(madeC, collabId, selfC, 'completed');
 });
 
 /* —— 无应答与限流 —— */

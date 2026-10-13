@@ -500,6 +500,9 @@ function mergeForumState(state, local, metaState) {
     if (local.member.archivedAt === undefined) {
       local.member.archivedAt = new Date().toISOString();
     }
+    /* 与 end 帧入口（handleEnd）同口径：本地转归档即清静音——不清则重入
+     * （receiveRepeatInvite 复用既有记录）时带着幽灵静音，用户从未对重入后的协作设过静音。 */
+    local.mute.clear();
     stopJoinReplay(state, local);
     state.counters.syncTerminalsIn++;
     state.log.info('经对表学到讨论终态——本地转归档', { collabId: local.collabId, state: metaState });

@@ -1,13 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { collabFilePath } from '../src/paths.js';
 import { makeTempDir, waitFor } from './helpers.js';
 import { createCollabService } from '../src/collab/service.js';
 import { createInbound } from '../src/net/inbound.js';
-import { MUTE_FILE_NAME } from '../src/collab/mute.js';
-import { INJECTED_FILE_NAME } from '../src/collab/injected.js';
+import { createMuteStore, isMuteShape, MUTE_FILE_NAME } from '../src/collab/mute.js';
+import { createInjectedStore, isInjectedRecordShape, INJECTED_FILE_NAME } from '../src/collab/injected.js';
 
 /* 静音开关与注入标记（讨论模式 §5.7）的用例面：store 与栅栏判定（服务直调）、取消摘要与
  * 跨重启持久、清理挂点（退出 / 归档）、真管线（接收管线 → 服务钩子 → 假会话注入）的抑制与
@@ -384,4 +385,111 @@ test('静音期结束帧照常注入；成员侧归档（handleEnd）同时清�
   assert.equal(made.inbound.stats().sessionGated, 0, '结束帧不落入抑制集（只做减法）');
   assert.equal(existsSync(mutePath(made.dir, collabId)), false, '归档清理静音状态');
   assert.equal(suppressedOf(makeService(t, { dir: made.dir }).service, { type: 'post', collabId }), false, '归档后重建服务：不静音');
+});
+
+/* —— store 级补测（与 members / counter 同族口径：形态单测、坏载、读写失败面） —— */
+
+test('静音 store 形态与坏载：逐字段拒、形态不符 / 读取失败归默认并留痕、不静音载入清基线', (t) => {
+  assert.equal(isMuteShape({ v: 1, muted: true, baseline: 0 }), true);
+  assert.equal(isMuteShape({ v: 1, muted: false, baseline: null }), true);
+  assert.equal(isMuteShape(null), false);
+  assert.equal(isMuteShape('状态'), false);
+  assert.equal(isMuteShape([1]), false);
+  assert.equal(isMuteShape({ v: 2, muted: true, baseline: 0 }), false);
+  assert.equal(isMuteShape({ v: 1, muted: 'yes', baseline: 0 }), false);
+  assert.equal(isMuteShape({ v: 1, muted: true, baseline: -1 }), false);
+  assert.equal(isMuteShape({ v: 1, muted: true, baseline: 1.5 }), false);
+  const dir = makeTempDir(t);
+  mkdirSync(dirname(mutePath(dir, 'collab-shape')), { recursive: true });
+  writeFileSync(mutePath(dir, 'collab-shape'), JSON.stringify({ v: 2, muted: true, baseline: 3 }));
+  const { logs, log } = makeLog();
+  const bad = createMuteStore({ dataDir: dir, collabId: 'collab-shape', log });
+  assert.equal(bad.isMuted(), false, '形态不符按默认不静音');
+  assert.equal(bad.stats().corruptLoads, 1);
+  assert.ok(logs.some((entry) => entry.message.includes('静音状态文件不可用') && entry.fields.reason === '形态不符'), '形态不符必须留痕');
+  writeFileSync(mutePath(dir, 'collab-shape'), JSON.stringify({ v: 1, muted: false, baseline: 9 }));
+  const off = createMuteStore({ dataDir: dir, collabId: 'collab-shape', log: makeLog().log });
+  assert.deepEqual([off.isMuted(), off.stats().baseline], [false, null], '不静音载入即清基线');
+  const dir2 = makeTempDir(t);
+  mkdirSync(mutePath(dir2, 'collab-dir'), { recursive: true });
+  const { logs: logs2, log: log2 } = makeLog();
+  const dirStore = createMuteStore({ dataDir: dir2, collabId: 'collab-dir', log: log2 });
+  assert.equal(dirStore.isMuted(), false);
+  assert.equal(dirStore.stats().corruptLoads, 1, '读取非 ENOENT 并入损坏面');
+  assert.ok(logs2.some((entry) => entry.message.includes('静音状态文件不可用')), '读取失败必须留痕');
+});
+
+test('静音 store 失败面与基线语义：写 / 删失败内存态继续、基线补记与取消清空', (t) => {
+  const dir = makeTempDir(t);
+  mkdirSync(mutePath(dir, 'collab-rm'), { recursive: true });
+  const { logs, log } = makeLog();
+  const rmStore = createMuteStore({ dataDir: dir, collabId: 'collab-rm', log });
+  rmStore.clear();
+  assert.equal(rmStore.stats().persistFailures, 1, '删除失败只计数（内存态已复位）');
+  assert.ok(logs.some((entry) => entry.message.includes('静音状态清理失败')));
+  const dir2 = makeTempDir(t);
+  writeFileSync(join(dir2, 'collabs'), '占位：协作目录无法创建');
+  const { logs: logs2, log: log2 } = makeLog();
+  const failStore = createMuteStore({ dataDir: dir2, collabId: 'collab-fail', log: log2 });
+  const before = failStore.setMuted(true, 0);
+  assert.deepEqual([before.wasMuted, failStore.isMuted()], [false, true], '写盘失败内存态继续');
+  assert.deepEqual([failStore.stats().persists, failStore.stats().persistFailures], [0, 1]);
+  assert.ok(logs2.some((entry) => entry.message.includes('静音状态写入失败')));
+  const store = createMuteStore({ dataDir: makeTempDir(t), collabId: 'collab-baseline', log: makeLog().log });
+  store.setMuted(true);
+  assert.equal(store.stats().baseline, null, '计数缺失：基线降级');
+  store.setMuted(true, 7);
+  assert.equal(store.stats().baseline, 7, '基线缺失时再设静音补记当前值');
+  store.setMuted(false, 9);
+  assert.deepEqual([store.isMuted(), store.stats().baseline], [false, null], '取消清基线');
+  store.clear();
+  assert.equal(store.stats().clears, 1, '清理成功计数（文件本已不在也算成功）');
+});
+
+test('注入标记 store 形态与坏载：逐字段拒、坏行跳过、半写尾行截断、残缺留痕', (t) => {
+  assert.equal(isInjectedRecordShape({ authorId: 'inst-a', postId: 'post-1' }), true);
+  assert.equal(isInjectedRecordShape(null), false);
+  assert.equal(isInjectedRecordShape([{ authorId: 'inst-a', postId: 'post-1' }]), false);
+  assert.equal(isInjectedRecordShape({ postId: 'post-1' }), false);
+  assert.equal(isInjectedRecordShape({ authorId: 'inst-a', postId: 'bad id!' }), false);
+  const dir = makeTempDir(t);
+  const seeded = createInjectedStore({ dataDir: dir, collabId: 'collab-load', log: makeLog().log });
+  assert.equal(seeded.mark('inst-a', 'post-1'), true, '记真即落盘');
+  appendFileSync(injectedPath(dir, 'collab-load'), '{"坏行"\n');
+  appendFileSync(injectedPath(dir, 'collab-load'), `${JSON.stringify({ authorId: 'inst-a' })}\n`);
+  const { logs, log } = makeLog();
+  const loaded = createInjectedStore({ dataDir: dir, collabId: 'collab-load', log });
+  assert.equal(loaded.size(), 1, '不可解析行与形态不符行不入集');
+  assert.equal(loaded.stats().corruptRecords, 1, '形态不符行计数');
+  assert.ok(logs.some((entry) => entry.message.includes('注入标记有残缺记录') && entry.fields.tailDropped === false), '中间坏行留痕');
+  appendFileSync(injectedPath(dir, 'collab-load'), '{"authorId":"inst-b",');
+  const { logs: logs2, log: log2 } = makeLog();
+  const reloaded = createInjectedStore({ dataDir: dir, collabId: 'collab-load', log: log2 });
+  assert.equal(reloaded.size(), 1, '半写尾行截断丢弃');
+  assert.ok(logs2.some((entry) => entry.message.includes('注入标记有残缺记录') && entry.fields.tailDropped === true), '半写尾行留痕');
+});
+
+test('注入标记 store 失败面与幂等：读 / 写失败内存态继续、mark 拒绝与重复记真', (t) => {
+  const dir = makeTempDir(t);
+  mkdirSync(injectedPath(dir, 'collab-err'), { recursive: true });
+  const { logs, log } = makeLog();
+  const errStore = createInjectedStore({ dataDir: dir, collabId: 'collab-err', log });
+  assert.equal(errStore.size(), 0, '读取失败按空集继续');
+  assert.equal(errStore.stats().persistFailures, 1);
+  assert.ok(logs.some((entry) => entry.message.includes('注入标记读取失败')));
+  assert.equal(errStore.mark('bad id!', 'post-2'), false);
+  assert.equal(errStore.stats().corruptRecords, 1);
+  assert.ok(logs.some((entry) => entry.message.includes('注入标记形态不符')), '形态不符拒绝入集并留痕');
+  const empty = createInjectedStore({ dataDir: makeTempDir(t), collabId: 'collab-empty', log: makeLog().log });
+  assert.equal(empty.size(), 0, '无文件即空集');
+  const dir2 = makeTempDir(t);
+  writeFileSync(join(dir2, 'collabs'), '占位：协作目录无法创建');
+  const { logs: logs2, log: log2 } = makeLog();
+  const failStore = createInjectedStore({ dataDir: dir2, collabId: 'collab-fail', log: log2 });
+  assert.equal(failStore.mark('inst-d', 'post-4'), true);
+  assert.equal(failStore.has('inst-d', 'post-4'), true, '写盘失败内存态继续');
+  assert.equal(failStore.stats().persistFailures, 1);
+  assert.ok(logs2.some((entry) => entry.message.includes('注入标记写入失败')));
+  assert.equal(failStore.mark('inst-d', 'post-4'), false, '同帖重复记真幂等');
+  assert.equal(failStore.size(), 1);
 });
