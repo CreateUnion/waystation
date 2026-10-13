@@ -317,6 +317,12 @@ function validateInvitePayload(payload) {
   if (!members.ok) {
     return members;
   }
+  /* originator（可选加法字段，讨论邀请携带；设计 §5.1/§5.3）：发起人实例标识（= 中继归属，
+   * 与「邀请者引用」不同字段——邀请者≠发起人，中继归属不得由邀请者推断）。缺省不拒
+   * （旧版对端形态——接收侧按「中继未知」处理，投递降级直投）；存在则须为完整身份对。 */
+  if (payload.originator !== undefined && !isPeerShape(payload.originator)) {
+    return refuse('invite.originator 非法（需 instanceId + identityName 的发起人标识）');
+  }
   /* endpoints（可选加法字段，讨论邀请携带）：现成员端点表，被邀者据此取得入群所需的寻址信息。
    * 缺省不拒（managed 与旧版邀请不带）；存在则逐项过端点形态。 */
   return optionalInviteEndpointsRejection(payload.endpoints);
@@ -422,7 +428,9 @@ function validateProgressPayload(payload) {
  * 各字段形态与长度边界成立，不判协作模式；模式语义（讨论帖 vs managed 实例、kind 词表归属、
  * 帧类型与帖形态的一致性）归协作层。postId 由作者生成、接收端原样采用（不得本地重编）；
  * seq = 作者内单调序号（随帖携带、作者内比较的权威序列）；text 沿既有消息文本上限
- * （不复用 topic/stop 的呈现文本限制、不触发 task 的 taskId 分支）。 */
+ * （不复用 topic/stop 的呈现文本限制、不触发 task 的 taskId 分支）。
+ * relay 为可选加法字段（讨论的中继分发，设计 §5.2）：成员把投稿发往中继时携带 true，
+ * 中继据此识别「投稿转发」并扇出；缺省＝普通副本（接收端幂等吸收、不转达）。 */
 function validatePostPayload(payload) {
   if (!isPlainObject(payload) || !isPlainObject(payload.post)) {
     return refuse('post 缺少 payload.post（帖形态）');
@@ -439,6 +447,14 @@ function validatePostPayload(payload) {
   }
   if (!isMessageText(post.text)) {
     return refuse(`post.text 非法（非空、≤${MAX_MESSAGE_TEXT_CHARS} 字符）`);
+  }
+  return relayFlagRejection(payload);
+}
+
+/* relay 标记（可选加法字段）：布尔底线在本层，语义（投稿识别与转达）归协作层。 */
+function relayFlagRejection(payload) {
+  if (payload.relay !== undefined && typeof payload.relay !== 'boolean') {
+    return refuse('post.relay 非法（布尔；缺省＝普通副本）');
   }
   return { ok: true };
 }

@@ -260,14 +260,15 @@ function isKnownType(value) {
  * 与队列路径共用：参数 / 终帧预检（与对端入站校验同一权威——不合法直接拒绝，不做无谓重试）、
  * 连接模型（首投复用、重试重拨）、ack 与投递回报的归属机制。
  * 不共用：落盘（无 outbox 写入）、节律（固定短重试、失败即止）。
- * createdAt 缺省取当前时刻；调用方可给帖的落盘 ts——帧 ts 随帖携带（接收端显示序与作者内序依据）。 */
-function sendDirect(state, { collabId, to, type, payload, createdAt }) {
+ * createdAt 缺省取当前时刻；调用方可给帖的落盘 ts——帧 ts 随帖携带（接收端显示序与作者内序依据）。
+ * from（可选）＝转达帧的原发身份（中继扇出保原作者；与队列路径同一语义）——缺省以本机身份盖章。 */
+function sendDirect(state, { collabId, to, type, payload, createdAt, from }) {
   const rejection = directRejection(state, collabId, to, type);
   if (rejection !== null) {
     state.counters.directRejected++;
     return { ok: false, reason: rejection };
   }
-  const record = directRecordOf(collabId, to, { type, payload, createdAt });
+  const record = directRecordOf(collabId, to, { type, payload, createdAt, from });
   const payloadRejection = frameRejectionOf(frameOf(state, collabId, record));
   if (payloadRejection !== null) {
     state.counters.directRejected++;
@@ -300,13 +301,14 @@ function directRejection(state, collabId, to, type) {
   return null;
 }
 
-function directRecordOf(collabId, to, { type, payload, createdAt }) {
+function directRecordOf(collabId, to, { type, payload, createdAt, from }) {
   return {
     msgId: newMsgId(),
     collabId,
     to: { instanceId: to.instanceId, address: to.address, port: to.port },
     type,
     payload,
+    from,
     state: 'inflight',
     attempts: 0,
     createdAt: typeof createdAt === 'string' ? createdAt : new Date().toISOString(),
