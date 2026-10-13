@@ -1,8 +1,8 @@
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -52,8 +52,39 @@ function cleanupRegistryOf(t) {
 
 function makeStationDir(t) {
   cleanupRegistryOf(t);
-  return makeTempDir(t);
+  const dir = makeTempDir(t);
+  stationDirs.push(dir);
+  return dir;
 }
+
+/* 文件级兜底：任何收尾钩子被跳过（如钩子抛错）都会留下未关闭的站点——强制关闭并响亮失败，绝不让
+ * 泄漏把整轮运行拖进永不退出的等待；顺带清理可能因删除钩子被跳过而残留的临时目录（正常路径两处
+ * 都无事可做）。 */
+const stationTransports = [];
+const stationDirs = [];
+
+after(async () => {
+  const leakedPids = [];
+  for (const transport of stationTransports) {
+    if (transport.pid !== null) {
+      leakedPids.push(transport.pid);
+      try {
+        await transport.close();
+      } catch (error) {
+        /* 兜底自身不得中断：close 抛错也要继续走到目录清理与响亮断言 */
+        console.error(`[测试收尾] 兜底关闭站点失败：pid=${transport.pid}（${error.message}）`);
+      }
+    }
+  }
+  for (const dir of stationDirs) {
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch (error) {
+      console.error(`[测试收尾] 兜底清理临时目录失败：${dir}（${error.code}）`);
+    }
+  }
+  assert.equal(leakedPids.length, 0, `站点进程未被用例收尾（收尾钩子被跳过？）：${leakedPids.join(',')}——已兜底强制关闭，检查用例清理`);
+});
 
 /* 治理节奏：短探测 / 短窗口（探针与窗口节律压到秒级以内；行为语义与默认定案一致）。
  * 显式端口写死：测试要按可预期端口寻址——显式目录首跑会自动取段内最低空闲并写回，端口不确定。 */
@@ -80,6 +111,7 @@ async function startStation(t, { home, inbox }) {
     cwd: repoRoot,
     env: { ...process.env, WAYSTATION_HOME: home, CLAUDE_CODE_MESSAGING_SOCKET: inbox.path, CLAUDE_CODE_MESSAGING_TOKEN: inbox.token },
   });
+  stationTransports.push(transport);   // 文件级兜底纳管：收尾钩子被跳过时由文件末尾统一关闭
   const client = new Client({ name: 'waystation-m5-e2e', version: '0.0.0' });
   cleanupRegistryOf(t).push(client);
   await client.connect(transport);

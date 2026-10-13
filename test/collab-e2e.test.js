@@ -1,8 +1,8 @@
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -55,11 +55,42 @@ async function closeStation(client) {
   }
 }
 
-/* 站点数据目录：收尾钩子必须抢在 makeTempDir 的删除钩子前注册（见上）。 */
+/* 站点数据目录：收尾钩子必须抢在 makeTempDir 的删除钩子前注册（见上）；目录登记进文件级兜底。 */
 function makeStationDir(t) {
   cleanupRegistryOf(t);
-  return makeTempDir(t);
+  const dir = makeTempDir(t);
+  stationDirs.push(dir);
+  return dir;
 }
+
+/* 文件级兜底：任何收尾钩子被跳过（如钩子抛错）都会留下未关闭的站点——强制关闭并响亮失败，绝不让
+ * 泄漏把整轮运行拖进永不退出的等待；顺带清理可能因删除钩子被跳过而残留的临时目录（正常路径两处
+ * 都无事可做）。 */
+const stationTransports = [];
+const stationDirs = [];
+
+after(async () => {
+  const leakedPids = [];
+  for (const transport of stationTransports) {
+    if (transport.pid !== null) {
+      leakedPids.push(transport.pid);
+      try {
+        await transport.close();
+      } catch (error) {
+        /* 兜底自身不得中断：close 抛错也要继续走到目录清理与响亮断言 */
+        console.error(`[测试收尾] 兜底关闭站点失败：pid=${transport.pid}（${error.message}）`);
+      }
+    }
+  }
+  for (const dir of stationDirs) {
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch (error) {
+      console.error(`[测试收尾] 兜底清理临时目录失败：${dir}（${error.code}）`);
+    }
+  }
+  assert.equal(leakedPids.length, 0, `站点进程未被用例收尾（收尾钩子被跳过？）：${leakedPids.join(',')}——已兜底强制关闭，检查用例清理`);
+});
 
 /* 真实组合根 + 假会话收件箱 + SDK 客户端：与生产装配同参（唯一差异 = 消息套接字指向假收件箱）。
  * 端口与数据目录经预写配置 + WAYSTATION_HOME 注入（显式目录模式，与 server.test.js 同法）。 */
@@ -71,6 +102,7 @@ async function startStation(t, { home, port, inbox }) {
     cwd: repoRoot,
     env: { ...process.env, WAYSTATION_HOME: home, CLAUDE_CODE_MESSAGING_SOCKET: inbox.path, CLAUDE_CODE_MESSAGING_TOKEN: inbox.token },
   });
+  stationTransports.push(transport);   // 文件级兜底纳管：收尾钩子被跳过时由文件末尾统一关闭
   const client = new Client({ name: 'waystation-m4-e2e', version: '0.0.0' });
   cleanupRegistryOf(t).push(client);   // 清单先于 connect：启动中途失败的站点也纳管
   await client.connect(transport);
