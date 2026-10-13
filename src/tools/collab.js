@@ -155,7 +155,7 @@ export function withdrawInviteTool() {
 export function viewLedgerTool() {
   return {
     name: 'ws_view_ledger',
-    description: '查看协作台账：管理者本机直读；成员在线时向管理者拉取（source=live），管理者离线回退本地快照并标注可能非最新',
+    description: '查看协作台账：管理者本机直读；成员在线时向管理者拉取（source=live），管理者离线回退本地快照并标注可能非最新；讨论模式=本地合并视图（帖子列表＋成员表＋端点，标注「本地视图，未与全员核对」）',
     inputSchema: {
       type: 'object',
       properties: {
