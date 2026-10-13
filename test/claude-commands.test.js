@@ -56,8 +56,8 @@ function makeCommandsDir(home, files) {
   return commandsDir;
 }
 
-test('仓库命令源：两个文件存在且带受管标记（防源集合与标记漂移）', () => {
-  for (const name of ['ws-collab.md', 'ws-list.md']) {
+test('仓库命令源：三个文件存在且带受管标记（防源集合与标记漂移）', () => {
+  for (const name of ['ws-collab.md', 'ws-list.md', 'ws-purge.md']) {
     const filePath = join(repoRoot, 'scripts', 'claude-commands', name);
     assert.equal(existsSync(filePath), true, `缺少命令源文件：${name}`);
     const text = readFileSync(filePath, 'utf8');

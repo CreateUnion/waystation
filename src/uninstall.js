@@ -3,6 +3,7 @@ import { existsSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { MANAGED_MARKER, applyRemoveCommands, planRemoveCommands } from './claude-commands.js';
+import { looksLikeStationDataDir, purgePathRefusal } from './purge.js';
 import { resolveDataDir } from './paths.js';
 
 /* `waystation uninstall` 子命令（设计「安装与配置」节的卸载命令形态）：注销 MCP 注册 →
@@ -170,8 +171,10 @@ function handleDataDir(parsed, dataDir, home) {
     return 0;
   }
   /* 守卫（三重，含 dry-run 预检——预览与真实执行同一判据）：数据目录位置由 HOME / WAYSTATION_HOME
-   * 派生、不接受子命令参数覆盖；再叠加路径与「内容形态」检查——WAYSTATION_HOME 指向任意目录时，
-   * 防「一次输入换一次灭顶删除」；脚本侧守卫要求路径以 .waystation 结尾，为更严的对照面。 */
+   * 派生、不接受子命令参数覆盖；路径层与「内容形态」判据与 purge-data 共用（src/purge.js 的
+   * purgePathRefusal / looksLikeStationDataDir）——WAYSTATION_HOME 指向任意目录时，
+   * 防「一次输入换一次灭顶删除」；脚本侧守卫要求路径以 .waystation 结尾，为更严的对照面。
+   * 注意：本命令是整目录删除（卸载场景不适用保留清单），删除面与 purge-data 不同。 */
   const resolved = resolve(dataDir);
   const pathRefusal = purgePathRefusal(resolved, home);
   if (pathRefusal !== null) {
@@ -182,8 +185,7 @@ function handleDataDir(parsed, dataDir, home) {
     write(`    不存在，跳过：${resolved}`);
     return 0;
   }
-  /* 内容形态判据：config.json / collabs / sessions 任一存在即认作驿站数据目录。 */
-  if (!['config.json', 'collabs', 'sessions'].some((name) => existsSync(join(resolved, name)))) {
+  if (!looksLikeStationDataDir(resolved)) {
     write(`    拒绝删除：目录内容不像驿站数据目录（无 config.json / collabs / sessions）：${resolved}`);
     return 1;
   }
@@ -199,17 +201,6 @@ function handleDataDir(parsed, dataDir, home) {
     write(`    删除失败：${error?.message}——请手动删除：${resolved}`);
     return 1;
   }
-}
-
-/* 路径层守卫：文件系统根与用户家目录本身一律拒绝（内容形态判据在 handleDataDir 内联处说明）。 */
-function purgePathRefusal(resolved, home) {
-  if (resolve(resolved, '..') === resolved) {
-    return `疑似文件系统根：${resolved}`;
-  }
-  if (resolved === resolve(home)) {
-    return `用户家目录本身：${resolved}`;
-  }
-  return null;
 }
 
 function write(text) {

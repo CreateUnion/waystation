@@ -1,0 +1,20 @@
+---
+description: 清空本机驿站全部数据（保留身份与安装）
+---
+<!-- waystation-managed-command -->
+用户要清理本机驿站的**全部数据**。这是不可恢复的操作，严格按下面流程走。
+
+范围口径（动手前先讲清楚）：
+- 将删除：本机数据目录下的一切协作数据（协作台账/成员记录/快照/收件流水/已知主机/日志/会话状态文件……）
+- 将保留：**身份**（config.json 整份——含 identityName 与自定义参数；主站点与各槽位各自的）＋ 机器实例标识（instance-id 文件）＋ 安装面（app/、bin/）
+- 只清**本机**：每台机器各存一份数据，其他机器不受影响
+- 安装与 MCP 注册保留（要卸载重装用 `waystation uninstall`）
+
+步骤：
+
+1. 找到驿站入口：优先 PATH 上的 `waystation` 命令；没有就用 `node "<数据目录>/app/bin/waystation.js"`（Windows 默认 `%USERPROFILE%\.waystation\app\bin\waystation.js`，Linux 默认 `~/.waystation/app/bin/waystation.js`）。
+2. 跑预览（裸 `purge-data`，不改动任何东西），把「将删除 / 保留」清单如实列给用户。
+3. 用 AskUserQuestion 二次确认（选项：**永久删除（不可恢复）** / 取消）；用户选取消即终止。
+4. 确认后跑 `purge-data --yes`，把结果如实转述（删了什么、保留了什么）。
+5. 收尾提醒：正在使用驿站的会话需**重开会话**（驿站进程内存里的活跃协作可能把部分数据写回）。
+6. 任何报错（守卫拒绝等）原文转述，不要绕过或重试别的删除手段。

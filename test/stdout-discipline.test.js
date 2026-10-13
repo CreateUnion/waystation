@@ -14,8 +14,10 @@ const STDOUT_PATTERN = /console\.(?!(?:error|warn|trace|assert)\b)[A-Za-z_$][\w$
 /* 扫描豁免（显式、可审）：src/uninstall.js 是 CLI 子命令模块——stdout 是它的用户输出通道、
  * 不是 MCP 协议通道；该模块仅由 bin 在 uninstall 分支动态导入，不参与服务路径（index.js 不引用它）。
  * src/claude-commands.js 是斜杠命令随安装分发的 CLI 模块，同理——stdout 是它的用户/脚本输出通道
- * （安装脚本经进程调用逐行转发），它只 import node 内置模块、不参与服务路径。 */
-const STDOUT_EXEMPT_FILES = ['src/uninstall.js', 'src/claude-commands.js'];
+ * （安装脚本经进程调用逐行转发），它只 import node 内置模块、不参与服务路径。
+ * src/purge.js 是 purge-data 子命令的 CLI 模块，同型——stdout 是它的用户输出通道，
+ * 仅由 bin 在 purge-data 分支动态导入，不参与服务路径。 */
+const STDOUT_EXEMPT_FILES = ['src/uninstall.js', 'src/claude-commands.js', 'src/purge.js'];
 
 // 目录缺失时返回空列表：起步阶段 src/ 可能尚不存在属预期；终态由下方「扫描非空」断言兜底
 function listSourceFiles(relativeDir) {
