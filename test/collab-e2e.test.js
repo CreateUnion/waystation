@@ -345,3 +345,80 @@ test('验收预演：讨论模式双节点——成员自播 join、中继发帖
   assert.ok(!inboxA.receivedText().includes('\\"after\\"'), '拉取请求帧不进会话');
   assert.ok(!inboxA.receivedText().includes('\\"overlap\\"'), '拉取应答帧不进会话');
 });
+
+/* 主动加入预演场景：A 起讨论（幽灵目标占位，成员数 1）并先静音；申请人 C 只知讨论名，
+ * 经预写 known-hosts.json 注入 A 端点（回环下真实走单播兜底路径）。 */
+async function startKnockScene(t) {
+  const homeA = makeStationDir(t);
+  const homeC = makeStationDir(t);
+  const portA = await pickFreePort();
+  const portC = await pickFreePort();
+  const ghostPort = await pickFreePort();
+  const inboxA = await startFakeSessionInbox(t);
+  const inboxC = await startFakeSessionInbox(t);
+  const a = await startStation(t, { home: homeA, port: portA, inbox: inboxA });
+  const statusA = (await callTool(a, 'ws_status')).payload;
+  const topic = '议题'.repeat(100);   // 协议上限 200 字符：应答体积整形（逐字 ≤512 字节含信封）必先截它
+  const collabId = await createCollab(a, { instanceId: 'inst-ghost', identityName: '幽灵机', address: '127.0.0.1', port: ghostPort }, { name: '敲门讨论', topic, mode: 'forum' });
+  assert.equal((await callTool(a, 'ws_set_mute', { collabId, muted: true })).isError, false, 'A 先静音：放行提示的静音不抑判别面');
+  writeFileSync(join(homeC, 'known-hosts.json'), JSON.stringify({ version: 2, hosts: [{ address: '127.0.0.1', port: portA, instanceId: '', identityName: '', lastSeenAt: new Date().toISOString() }] }));
+  const c = await startStation(t, { home: homeC, port: portC, inbox: inboxC });
+  const statusC = (await callTool(c, 'ws_status')).payload;
+  return { a, c, inboxA, inboxC, statusA, statusC, collabId, topic, portA, portC };
+}
+
+/* 敲门应答行逐项核验：命中本讨论、成员数与发起人标识如实、来源端点回指应答方；
+ * 截断语义 = 非空、短于原文、按码位前缀（UTF-8 安全）——完整值靠加入后的正式通道补齐。 */
+function assertKnockReplyRow(replies, { collabId, statusA, portA, fullTopic }) {
+  const row = replies.find((reply) => reply.collabId === collabId);
+  assert.ok(row !== undefined, `应答清单应含 A 的讨论：${JSON.stringify(replies)}`);
+  assert.equal(row.name, '敲门讨论');
+  assert.equal(row.memberCount, 1, '成员数如实（发起人一人；受邀未加入者不占名额）');
+  assert.deepEqual(row.originator, { instanceId: statusA.instanceId, identityName: statusA.identityName }, '发起人标识 = A（中继归属，加入后寻址中继的依据）');
+  assert.equal(row.responder.instanceId, statusA.instanceId);
+  assert.equal(row.responder.port, portA);
+  assert.equal(row.topicTruncated, true, '200 字符主题在 512 字节预算内必被截断');
+  assert.ok(row.topic.length > 0 && row.topic.length < fullTopic.length, '截断非空且短于原文');
+  assert.ok(fullTopic.startsWith(row.topic), '截断按码位前缀、UTF-8 安全');
+}
+
+test('验收预演：主动加入——敲门应答（主题截断）、静音不抑放行提示、放行邀请→同意加入→对表补齐；无应答统一提示', { timeout: 180000 }, async (t) => {
+  const { a, c, inboxA, inboxC, statusA, statusC, collabId, topic, portA, portC } = await startKnockScene(t);
+
+  const knocked = await callTool(c, 'ws_request_join', { name: '敲门讨论' });
+  assert.equal(knocked.isError, false, String(knocked.payload));
+  assert.equal(knocked.payload.ok, true);
+  assert.equal(knocked.payload.note, undefined, '有应答不带「无应答」提示');
+  assertKnockReplyRow(knocked.payload.replies, { collabId, statusA, portA, fullTopic: topic });
+
+  /* A 本机（静音中）收到一行放行提示：申请人身份 + 实例标识 + 来源端点 + ws_invite 指引；
+   * 提示只进命中方会话。 */
+  await waitFor(() => (inboxA.receivedText().includes('收到加入申请') ? true : null), { timeoutMs: 20000 });
+  const hint = inboxA.receivedText();
+  assert.ok(hint.includes(statusC.identityName), '提示含申请人身份名');
+  assert.ok(hint.includes(statusC.instanceId), '提示含申请人实例标识');
+  assert.ok(hint.includes(`:${portC}`), '提示含申请人来源端点端口（放行时作 ws_invite 目标）');
+  assert.ok(hint.includes('ws_invite'), '提示给出放行动作');
+  assert.ok(!inboxC.receivedText().includes('收到加入申请'), '提示只进命中方会话（申请人侧无此注入）');
+
+  /* 放行 = A 本机人执行 ws_invite（用提示里的身份与端点）→ C 同意门确认加入。 */
+  const released = await callTool(a, 'ws_invite', { collabId, targets: [{ instanceId: statusC.instanceId, identityName: statusC.identityName, address: '127.0.0.1', port: portC }] });
+  assert.equal(released.isError, false, String(released.payload));
+  await waitFor(async () => ((await listCollabs(c)).some((entry) => entry.collabId === collabId) ? true : null), { timeoutMs: 20000 });
+  assert.equal((await callTool(c, 'ws_approve_invite', { collabId, approve: true })).isError, false);
+  await waitState(c, collabId, 'active');
+  await waitMemberCount(a, c, collabId, 2);
+
+  /* 对表补齐：加入后经正式通道（邀请载荷 / 对表）拿到完整主题与全员名单——截断值不承载权威数据。 */
+  const viewC = await callTool(c, 'ws_view_ledger', { collabId });
+  assert.equal(viewC.payload.mode, 'forum');
+  assert.equal(viewC.payload.topic, topic, '完整主题随加入路径补齐（敲门应答的截断值不回灌）');
+  assert.deepEqual(viewC.payload.members.map((member) => member.instanceId).sort(), [statusA.instanceId, statusC.instanceId].sort());
+
+  /* 无应答 = 统一提示（不作错误、不自动重试）。 */
+  const lonely = await callTool(c, 'ws_request_join', { name: '无人认领的讨论' });
+  assert.equal(lonely.isError, false, '无应答不是工具错误');
+  assert.deepEqual(lonely.payload.replies, []);
+  assert.ok(lonely.payload.note.includes('未收到任何应答'), lonely.payload.note);
+  assert.ok(lonely.payload.note.includes('不做自动重试'));
+});

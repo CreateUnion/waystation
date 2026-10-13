@@ -97,6 +97,37 @@ function targetsErrorMessage() {
   return `参数 targets 非法：需要 1–${MAX_TARGETS} 项 { instanceId, identityName, address, port }（地址为 IP 字面量、端口为 1–65535 整数）`;
 }
 
+/* 无应答的统一处理（设计 §5.6）：不作错误、不自动重试——提示稍后重试或改走对方 ws_invite 邀请。 */
+const JOIN_NO_ANSWER_NOTE = '未收到任何应答（可能无人收到敲门、在场成员离线，或该讨论名无人认领）——稍后重试，或直接联系讨论成员由对方执行 ws_invite 邀请你；本工具不做自动重试。';
+
+/* 主动加入（设计 §5.6/§7）：敲门会把讨论名播给全网（局域网可见——如实披露⑥）；应答为在场成员的
+ * 自动行为（主题 / 名称可能截断，加入后经正式通道对表补齐）；申请本身可伪造，由放行（对方本机人）
+ * 与同意门兜底（披露⑦）。加入 = 任一成员本机放行（ws_invite 邀请你）→ 你在同意门确认。 */
+export function requestJoinTool() {
+  return {
+    name: 'ws_request_join',
+    description: '主动加入讨论：向局域网敲门（广播 + 已知主机单播、少量重发）询问「谁在 <讨论名> 讨论」，返回应答清单（collabId / 名称 / 主题 / 成员数 / 发起人实例标识 / 应答者与地址:端口）。加入流程 = 任一在场成员本机放行（对方执行 ws_invite 邀请你）→ 你在同意门 ws_approve_invite 确认。注意：敲门会把讨论名播给全网（局域网可见）；伪造申请由放行与同意门兜底。无应答时稍后重试或直接联系成员。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: '讨论名（必填；同身份名呈现判据，≤64 字符）' },
+      },
+      required: ['name'],
+    },
+    handler: async (args, context) => {
+      const name = trimmedString(args, 'name');
+      if (name === '') {
+        return errorResult('参数 name 非法：需要非空白字符串（讨论名）');
+      }
+      const result = await context.net.requestJoin({ name });
+      if (result.ok === true && result.replies.length === 0) {
+        return okResult({ ...result, note: JOIN_NO_ANSWER_NOTE });
+      }
+      return resultOf(result);
+    },
+  };
+}
+
 export function approveInviteTool() {
   return {
     name: 'ws_approve_invite',
@@ -276,7 +307,7 @@ export function endCollabTool() {
   };
 }
 
-/* 工具返回口径（18 工具单一权威）：成功 = 顶层含 ok:true 的 JSON 对象（列表载荷用命名字段承载：
+/* 工具返回口径（19 工具单一权威）：成功 = 顶层含 ok:true 的 JSON 对象（列表载荷用命名字段承载：
  * hosts / rows / collabs）；失败 = errorResult 纯文案 + isError。新增工具一律照此。 */
 export function okResult(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };

@@ -14,7 +14,7 @@ import { hostsTool } from './tools/hosts.js';
 import { pingTool } from './tools/ping.js';
 import { deliveryStatusTool } from './tools/delivery-status.js';
 import { checkInboxTool } from './tools/check-inbox.js';
-import { listCollabsTool, createCollabTool, inviteTool, approveInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, setMuteTool, leaveCollabTool, endCollabTool } from './tools/collab.js';
+import { listCollabsTool, createCollabTool, inviteTool, requestJoinTool, approveInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, setMuteTool, leaveCollabTool, endCollabTool } from './tools/collab.js';
 import { decideTool, handoverTool, takeOverTool } from './tools/governance.js';
 import { createMcpServer } from './server.js';
 import { createKnownHosts } from './net/known-hosts.js';
@@ -157,6 +157,9 @@ const discovery = createDiscovery({
   getCollabCount: () => collab.count(),
   knownHosts,
   log,
+  /* 主动加入的敲门命中面（设计 §5.6）：命中匹配、应答载荷与本机放行提示在协作域
+   * （发现层不 import 协作层——经注入回调解除，异常由发现层隔离）。 */
+  onJoinKnock: (knock) => collab.joinKnock(knock),
 });
 /* 协作门控、静音栅栏（sessionGate）与注入标记通知（sessionDelivered）与投递适配器均经钩子注入
  * （分层纪律：核心模块不 import 协作层 / 适配层）；autoDeliver 关闭 = 不注入投递钩子，
@@ -226,6 +229,7 @@ registry.register(setMuteTool());
 registry.register(leaveCollabTool());
 registry.register(endCollabTool());
 registry.register(inviteTool());
+registry.register(requestJoinTool());
 registry.register(decideTool());
 registry.register(handoverTool());
 registry.register(takeOverTool());

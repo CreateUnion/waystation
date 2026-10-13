@@ -7,7 +7,7 @@ import { pingTool } from '../src/tools/ping.js';
 import { deliveryStatusTool } from '../src/tools/delivery-status.js';
 import { statusTool } from '../src/tools/status.js';
 import { checkInboxTool } from '../src/tools/check-inbox.js';
-import { listCollabsTool, createCollabTool, inviteTool, approveInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, setMuteTool, leaveCollabTool, endCollabTool, SEND_MESSAGE_TYPES } from '../src/tools/collab.js';
+import { listCollabsTool, createCollabTool, inviteTool, requestJoinTool, approveInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, setMuteTool, leaveCollabTool, endCollabTool, SEND_MESSAGE_TYPES } from '../src/tools/collab.js';
 import { decideTool, handoverTool, takeOverTool } from '../src/tools/governance.js';
 import { MAX_COLLAB_MEMBERS } from '../src/net/protocol.js';
 import { CONFIG_FILE_NAME, loadConfig } from '../src/config.js';
@@ -382,6 +382,49 @@ test('ws_invite：合法 → 透传 trim 后的参数、输出 invited 详情；
   assert.ok(refused.content[0].text.includes('另立任务'));
 });
 
+test('ws_request_join：name 缺失 / 空白 / 非字符串 → isError，不发敲门', async () => {
+  const requests = [];
+  const net = { requestJoin: async (input) => { requests.push(input); return { ok: true, replies: [] }; } };
+  const cases = [{}, { name: '   ' }, { name: 42 }, { name: null }];
+  for (const args of cases) {
+    const result = await callTool(requestJoinTool(), args, net);
+    assert.equal(result.isError, true, JSON.stringify(args));
+  }
+  assert.equal(requests.length, 0, '非法名在工具层拦下（不触发现层——广播不承载畸形载荷）');
+});
+
+test('ws_request_join：合法 → 透传 trim 名并输出应答清单（含不可截字段与截断标注）', async () => {
+  const requests = [];
+  const replies = [{ collabId: 'collab-1', name: '讨论甲', topic: '议题', memberCount: 2, originator: { instanceId: 'inst-a', identityName: '主机甲' }, topicTruncated: false, nameTruncated: false, responder: { instanceId: 'inst-a', identityName: '主机甲', address: '127.0.0.2', port: 17321 }, replies: 1 }];
+  const net = { requestJoin: async (input) => { requests.push(input); return { ok: true, replies }; } };
+  const result = await callTool(requestJoinTool(), { name: ' 讨论甲 ' }, net);
+  assert.equal(result.isError, undefined);
+  assert.deepEqual(requests, [{ name: '讨论甲' }]);
+  const payload = JSON.parse(result.content[0].text);
+  assert.equal(payload.ok, true);
+  assert.deepEqual(payload.replies, replies);
+  assert.equal(payload.note, undefined, '有应答不带「无应答」提示');
+});
+
+test('ws_request_join：无应答 → 正常输出 + 统一提示（不作错误、不自动重试）', async () => {
+  const net = { requestJoin: async () => ({ ok: true, replies: [] }) };
+  const result = await callTool(requestJoinTool(), { name: '讨论甲' }, net);
+  assert.equal(result.isError, undefined, '无应答不是工具错误');
+  const payload = JSON.parse(result.content[0].text);
+  assert.equal(payload.ok, true);
+  assert.deepEqual(payload.replies, []);
+  assert.ok(payload.note.includes('未收到任何应答'), payload.note);
+  assert.ok(payload.note.includes('ws_invite'), '统一提示给出人工兜底路径（改走对方邀请）');
+  assert.ok(payload.note.includes('不做自动重试'), '提示明示不做自动重试（不重试风暴）');
+});
+
+test('ws_request_join：服务拒绝（降级等）→ isError + 原文案', async () => {
+  const net = { requestJoin: async () => ({ ok: false, message: '局域网监听失败——端口被占用' }) };
+  const result = await callTool(requestJoinTool(), { name: '讨论甲' }, net);
+  assert.equal(result.isError, true);
+  assert.ok(result.content[0].text.includes('端口被占用'));
+});
+
 test('ws_approve_invite：collabId 缺失 / approve 非布尔 → isError，不调服务', async () => {
   const collab = fakeService();
   for (const args of [{}, { collabId: 'collab-1' }, { collabId: 'collab-1', approve: 'yes' }, { collabId: '  ', approve: true }]) {
@@ -644,14 +687,20 @@ test('ws_create_collab：目标上限随 MAX_COLLAB_MEMBERS 派生（上限内�
   assert.equal(collab.calls.create.length, 1);
 });
 
-test('工具返回口径：18 工具成功载荷均为含 ok:true 的 JSON 对象（统一不变量）', async () => {
-  const net = {
+/* 口径测试的桩网络：覆盖发现/网络面工具的最低合法返回（含主动加入的应答清单）。 */
+function fakeNet() {
+  return {
     listHosts: async () => ({ ok: true, hosts: [] }),
     pingHost: async () => ({ ok: true, reachable: true, rttMs: 1 }),
     deliveryStatus: () => [],
     checkInbox: () => ({ collabId: 'collab-1', total: 0, returned: 0, messages: [] }),
     status: () => ({ available: true, reason: null, message: '', port: 17321, counters: {} }),
+    requestJoin: async () => ({ ok: true, replies: [] }),
   };
+}
+
+test('工具返回口径：19 工具成功载荷均为含 ok:true 的 JSON 对象（统一不变量）', async () => {
+  const net = fakeNet();
   const collab = fakeService();
   const governance = fakeGovernanceService();
   const single = { instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 };
@@ -671,11 +720,12 @@ test('工具返回口径：18 工具成功载荷均为含 ok:true 的 JSON 对�
     { tool: leaveCollabTool(), args: { collabId: 'collab-1' }, context: collabContextOf(collab) },
     { tool: endCollabTool(), args: { collabId: 'collab-1' }, context: collabContextOf(collab) },
     { tool: inviteTool(), args: { collabId: 'collab-1', targets: [single] }, context: collabContextOf(collab) },
+    { tool: requestJoinTool(), args: { name: '讨论甲' }, context: contextWith(net) },
     { tool: decideTool(), args: { collabId: 'collab-1', choice: 'keep' }, context: collabContextOf(governance) },
     { tool: handoverTool(), args: { collabId: 'collab-1', target: 'inst-b' }, context: collabContextOf(governance) },
     { tool: takeOverTool(), args: { collabId: 'collab-1' }, context: collabContextOf(governance) },
   ];
-  assert.equal(cases.length, 18, '覆盖全部 18 工具');
+  assert.equal(cases.length, 19, '覆盖全部 19 工具');
   for (const { tool, args, context } of cases) {
     const result = await tool.handler(args, context);
     assert.equal(result.isError, undefined, tool.name);
