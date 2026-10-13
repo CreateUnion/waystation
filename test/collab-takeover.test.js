@@ -985,3 +985,19 @@ test('资格校验不拦高版本合流腿：被替换驿丞携带更高台账�
   assert.equal(mergeOffers[0].payload.version, 5);
   assert.equal(managerRefOf(harness, collabId), 'inst-b');
 });
+
+test('探测可观测性：驿丞端点未知时探测跳过并计数（probeSkippedNoEndpoint）', async (t) => {
+  /* M7-F1 可观测性小项：旧载荷形态的 manager-changed（无端点字段）——成员采纳后端点仍未知，
+   * 探测跳过必须留痕（运维面可见「互盲」状态，不再静默）。 */
+  const harness = makeHarness(t);
+  const collabId = await memberActive(harness);
+  await receive(harness.service, collabFrame('notice', collabId, peer('inst-a', '主机甲'), {
+    event: 'manager-changed',
+    version: 3,
+    manager: { instanceId: 'inst-b', identityName: '主机乙' },
+  }));
+  assert.equal(managerRefOf(harness, collabId), 'inst-b', '采纳新驿丞（旧载荷形态、无端点字段）');
+  harness.service.start();
+  await waitFor(() => (harness.service.stats().probeSkippedNoEndpoint >= 1 ? true : null), { timeoutMs: 3000 });
+  harness.service.close();
+});

@@ -77,6 +77,7 @@ function maybeProbeManager(state, local) {
   }
   const endpoint = local.endpoints.get(local.member.manager.instanceId);
   if (endpoint === undefined) {
+    state.counters.probeSkippedNoEndpoint++;   // 运维面可见：驿丞端点未知时探测不可达（不静默跳过）
     return;
   }
   probeState.inFlight = true;

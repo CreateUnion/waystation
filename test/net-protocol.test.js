@@ -427,6 +427,9 @@ test('治理域 handover：offer / accept / reject 三型与逐字段拒', () =>
   assert.equal(validateMessage(frameWith({ type: 'handover', payload: { kind: 'offer', version: 3, digest: digestOf, ledger: {} } })).ok, true);
   assert.equal(validateMessage(frameWith({ type: 'handover', payload: { kind: 'accept', version: 3, digest: digestOf } })).ok, true);
   assert.equal(validateMessage(frameWith({ type: 'handover', payload: { kind: 'reject', reason: '忙' } })).ok, true);
+  /* 端点互盲修复的加法字段：offer 可选端点全表（旧帧无此字段行为不变；自家新帧不被自家拒收）。 */
+  const withEndpoints = { kind: 'offer', version: 3, digest: digestOf, ledger: {}, endpoints: { 'inst-b': { address: '127.0.0.2', port: 7321 } } };
+  assert.equal(validateMessage(frameWith({ type: 'handover', payload: withEndpoints })).ok, true, 'offer.endpoints 放行');
   for (const payload of [
     { kind: 'offer', version: 0, digest: digestOf, ledger: {} },
     { kind: 'offer', version: 3, digest: 'zz', ledger: {} },
@@ -435,6 +438,10 @@ test('治理域 handover：offer / accept / reject 三型与逐字段拒', () =>
     { kind: 'reject', reason: 42 },
     { kind: 'later' },
     'x',
+    { kind: 'offer', version: 3, digest: digestOf, ledger: {}, endpoints: 'x' },
+    { kind: 'offer', version: 3, digest: digestOf, ledger: {}, endpoints: { 'bad id!': { address: '127.0.0.2', port: 7321 } } },
+    { kind: 'offer', version: 3, digest: digestOf, ledger: {}, endpoints: { 'inst-b': { address: 7, port: 7321 } } },
+    { kind: 'offer', version: 3, digest: digestOf, ledger: {}, endpoints: { 'inst-b': { address: '127.0.0.2', port: 0 } } },
   ]) {
     assert.equal(validateMessage(frameWith({ type: 'handover', payload })).ok, false, JSON.stringify(payload).slice(0, 60));
   }
@@ -493,11 +500,17 @@ test('治理域全类型覆盖：五个治理类型给非法 payload 必拒（�
   }
 });
 
-test('notice manager-changed：manager 与 version 必填', () => {
+test('notice manager-changed：manager 与 version 必填；endpoint 可选且形状受检', () => {
   const manager = { instanceId: 'inst-b', identityName: '主机乙' };
   assert.equal(validateMessage(frameWith({ type: 'notice', payload: { event: 'manager-changed', version: 3, manager } })).ok, true);
   assert.equal(validateMessage(frameWith({ type: 'notice', payload: { event: 'manager-changed', version: 3 } })).ok, false);
   assert.equal(validateMessage(frameWith({ type: 'notice', payload: { event: 'manager-changed', version: 0, manager } })).ok, false);
+  /* 端点互盲修复的加法字段：新驿丞端点随通告下发（旧帧无此字段行为不变；自家新帧不被自家拒收）。 */
+  const withEndpoint = { event: 'manager-changed', version: 3, manager, endpoint: { address: '127.0.0.2', port: 7321 } };
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: withEndpoint })).ok, true, 'endpoint 放行');
+  for (const endpoint of [{ address: '127.0.0.2', port: 0 }, { address: 7, port: 7321 }, 'x', { port: 7321 }, { address: '', port: 7321 }]) {
+    assert.equal(validateMessage(frameWith({ type: 'notice', payload: { ...withEndpoint, endpoint } })).ok, false, JSON.stringify(endpoint));
+  }
 });
 
 test('notice handshake：role / version / takeover / reply 逐字段拒', () => {

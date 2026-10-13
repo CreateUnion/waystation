@@ -648,12 +648,30 @@ export function retargetStaleQueue(state, local, fromInstanceId, toInstanceId) {
   }
 }
 
-/* 端点学习后的补投（events.applyEndpoint 的挂点）：暂存的旧驿丞队列等到新驿丞端点即可重定向。 */
+/* 端点学习后的补投（applyEndpoint 的挂点）：暂存的旧驿丞队列等到新驿丞端点即可重定向。 */
 export function resumeStaleRetarget(state, local) {
   if (local.staleManagerId === null || local.staleManagerId === undefined) {
     return;
   }
   retargetStaleQueue(state, local, local.staleManagerId, currentManagerIdOf(local));
+}
+
+/* 端点学习（协作端点表入口——直连帧学习与治理载荷学习共用）：记录「实例标识 → 地址:端口」，
+ * 仅在变化时写 member.json；学到现任驿丞端点时补做陈旧队列重定向（互盲解除后改投立即发生）。
+ * 返回是否发生更新（调用方据此决定补发生效通告等后续动作）。 */
+export function applyEndpoint(state, local, peer, address, port) {
+  const held = local.endpoints.get(peer.instanceId);
+  const changed = held === undefined || held.address !== address || held.port !== port;
+  if (changed) {
+    local.endpoints.set(peer.instanceId, { address, port });
+    local.member.endpoints = Object.fromEntries(local.endpoints);
+    persistMember(state, local);
+    if (peer.instanceId === currentManagerIdOf(local)) {
+      resumeStaleRetarget(state, local);
+    }
+  }
+  rememberKnownHost(state, { address, port, instanceId: peer.instanceId, identityName: peer.identityName });
+  return changed;
 }
 
 /* 向现任驿丞拉取当前视图（快照请求；端点未知静默跳过——对方主动联系时端点自然学习）。 */

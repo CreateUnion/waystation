@@ -405,13 +405,33 @@ function validateVersionedNotice(payload) {
   return { ok: true };
 }
 
-/* 驿丞已变更（移交完成后旧席位广播）：新驿丞身份与交接版本均必填。 */
+/* 驿丞已变更（移交完成后旧席位广播）：新驿丞身份与交接版本均必填；endpoint（新驿丞端点）
+ * 为可选加法字段——随通告下发以解除「只与旧驿丞通信过的成员」与新驿丞的端点互盲。 */
 function validateManagerChangedNotice(payload) {
   if (!Number.isInteger(payload.version) || payload.version < 1) {
     return refuse('manager-changed.version 非法（≥1 的整数）');
   }
   if (!isPeerShape(payload.manager)) {
     return refuse('manager-changed.manager 非法（需 instanceId + identityName）');
+  }
+  return optionalEndpointRejection(payload.endpoint, 'manager-changed.endpoint');
+}
+
+/* 可选端点字段（治理载荷的加法扩展；旧帧无此字段行为不变）：结构底线在此（原样拒收超限
+ * 或形态不符），地址的 IP 字面量语义由协作层在采用前复核（协议层不引 node:net）。 */
+function optionalEndpointRejection(endpoint, label) {
+  if (endpoint === undefined) {
+    return { ok: true };
+  }
+  return endpointEntryRejection(endpoint, label);
+}
+
+function endpointEntryRejection(endpoint, label) {
+  if (!isPlainObject(endpoint) || typeof endpoint.address !== 'string' || endpoint.address === '' || endpoint.address.length > 64) {
+    return refuse(`${label} 非法（需 address 字符串，≤64 字符）`);
+  }
+  if (!isPort(endpoint.port)) {
+    return refuse(`${label}.port 非法（1–65535 的整数）`);
   }
   return { ok: true };
 }
@@ -563,12 +583,29 @@ function validateHandoverPayload(payload) {
   return refuse('handover.kind 非法（offer / accept / reject）');
 }
 
+/* offer：版本 + 摘要 + 台账整份；endpoints（可选加法字段）= 旧驿丞视角的端点全表
+ * （instanceId → {address, port}）——受让方逐项学习后立即可直投老成员（端点互盲修复）。 */
 function validateHandoverOffer(payload) {
   if (!isVersionedDigestPayload(payload)) {
     return refuse('handover.version / digest 非法（版本 ≥1 整数、摘要 64 位小写十六进制）');
   }
   if (!isPlainObject(payload.ledger)) {
     return refuse('handover.ledger 非法（须为台账对象）');
+  }
+  if (payload.endpoints === undefined) {
+    return { ok: true };
+  }
+  if (!isPlainObject(payload.endpoints)) {
+    return refuse('handover.endpoints 非法（须为对象：实例标识 → {address, port}）');
+  }
+  for (const [instanceId, endpoint] of Object.entries(payload.endpoints)) {
+    if (!isId(instanceId)) {
+      return refuse('handover.endpoints 键非法（需 1–64 位字母数字与连字符的实例标识）');
+    }
+    const rejection = endpointEntryRejection(endpoint, 'handover.endpoints 项');
+    if (!rejection.ok) {
+      return rejection;
+    }
   }
   return { ok: true };
 }

@@ -1,9 +1,9 @@
 import { isPort } from '../net/protocol.js';
 import { MAX_BOARD_ENTRIES, isSnapshotShape } from './model.js';
 import { ledgerDigest } from './store.js';
-import { currentManagerIdOf, isLocalArchivedState, persistMember, persistSnapshot, rememberKnownHost } from './local.js';
+import { isLocalArchivedState, persistMember, persistSnapshot, rememberKnownHost } from './local.js';
 import { matchConflictCollabs } from './gate.js';
-import { applyFreezeLocally, broadcastFreeze, governanceTargets, memberIdsOf, mutateLedger, relayGovernance, resumeStaleRetarget, sendTo } from './outgoing.js';
+import { applyEndpoint, applyFreezeLocally, broadcastFreeze, governanceTargets, memberIdsOf, mutateLedger, relayGovernance, sendTo } from './outgoing.js';
 import { handleHandshake, handleTakeover, handleTakeoverInit, resendEffectiveTakeover, resumeLocal } from './takeover.js';
 import { handleDecision, handleMergeOutcome, handleMergeRequest, handleUnfreeze } from './freeze.js';
 import { handleHandover, handleManagerChanged } from './handover.js';
@@ -65,34 +65,28 @@ function learnEndpoints(state, frame, meta) {
   if (address === '' || !isPort(frame.from?.port)) {
     return;
   }
-  /* 转达副本的 from 是原发者、链路地址是转达者的——据此学习会把原发者端点记成转达者地址
-   * （错误寻址）：转达帧不作端点学习，仍作「任一成功接触」的可达性证据。 */
-  if (!isRelayedCopy(frame)) {
-    applyEndpoint(state, local, frame.from, address, frame.from.port);
-  }
+  learnDirectFrameEndpoints(state, local, frame, address);
   if (local.suspended !== null && local.suspended.reason === 'handshake-unresolved') {
     resumeLocal(state, local, 'handshake-contacted');
   }
   local.handshakeUnresolved = false;
 }
 
+/* 直连帧端点学习（转达副本的 from 是原发者、链路地址是转达者的——据此学习会把原发者端点记成
+ * 转达者地址（错误寻址）：转达帧不作端点学习，仍作「任一成功接触」的可达性证据）；端点更新时
+ * 补发生效通告（「未入队即无重试」的盲区收窄）。 */
+function learnDirectFrameEndpoints(state, local, frame, address) {
+  if (isRelayedCopy(frame)) {
+    return;
+  }
+  if (applyEndpoint(state, local, frame.from, address, frame.from.port)) {
+    resendEffectiveTakeover(state, local, frame.from.instanceId);
+  }
+}
+
 /* 转达副本判别：转达出口在载荷里带 originMsgId（原生帧没有）。 */
 function isRelayedCopy(frame) {
   return typeof frame.payload?.originMsgId === 'string' && frame.payload.originMsgId !== '';
-}
-
-export function applyEndpoint(state, local, peer, address, port) {
-  const held = local.endpoints.get(peer.instanceId);
-  if (held === undefined || held.address !== address || held.port !== port) {
-    local.endpoints.set(peer.instanceId, { address, port });
-    local.member.endpoints = Object.fromEntries(local.endpoints);
-    persistMember(state, local);
-    if (peer.instanceId === currentManagerIdOf(local)) {
-      resumeStaleRetarget(state, local);
-    }
-    resendEffectiveTakeover(state, local, peer.instanceId);
-  }
-  rememberKnownHost(state, { address, port, instanceId: peer.instanceId, identityName: peer.identityName });
 }
 
 /* 邀请到达（admit 已做名单 / 频率 / 上限判定）：创建本地参与记录（proposed），冲突检测命中则

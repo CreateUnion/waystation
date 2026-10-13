@@ -668,3 +668,57 @@ test('挂起期入站回应：拒绝且不虚增计数、不发名单通告（�
   const ledger = (await harness.service.view({ collabId })).ledger;
   assert.equal(ledger.members.find((member) => member.instanceId === 'inst-c').state, 'invited', '成员状态未被写入');
 });
+
+/* —— 交接端点互盲修复（M7-F1）—— */
+
+/* 三节点交接前置：A 为驿丞，B / C 均只与 A 直连过（各自的端点表只有 A）。 */
+async function handoverTriadReady(a, b, c, collabId) {
+  const peerA = peer('inst-a', '主机甲');
+  for (const node of [b, c]) {
+    const address = node === b ? '127.0.0.2' : '127.0.0.3';
+    await memberActiveAt(node, collabId, peerA, 4);
+    const approve = node.sent.find((message) => message.type === 'approve');
+    await receive(a.service, collabFrame('approve', collabId, peer(node.self.instanceId, node.self.identityName), approve.payload), address);
+  }
+}
+
+test('交接端点互盲修复：manager-changed 携带新驿丞端点、offer 携带端点全表（成员即时可达）', async (t) => {
+  /* 判别性用例（M7-F1 真机缺陷）：成员只与旧驿丞直连过（端点表只有旧驿丞）——交接后若新
+   * 驿丞端点不随通告下发即互盲死结（探测跳过、握手 / 消息发不出）；载荷携带端点 + 接收侧
+   * 学习后，成员立即学到新驿丞端点（互盲解除、出站可达）。 */
+  const a = makeHarness(t, { probeResults: [{ reachable: true, rttMs: 1 }] });
+  const b = makeHarness(t, { self: { instanceId: 'inst-b', identityName: '主机乙', port: 17321 } });
+  const c = makeHarness(t, { self: { instanceId: 'inst-c', identityName: '主机丙', port: 17321 } });
+  const peerA = peer('inst-a', '主机甲');
+  const collabId = a.service.create({
+    name: '交接项目',
+    topic: '联调',
+    targets: [
+      { instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 },
+      { instanceId: 'inst-c', identityName: '主机丙', address: '127.0.0.3', port: 17321 },
+    ],
+  }).collabId;
+  await handoverTriadReady(a, b, c, collabId);
+
+  const pending = a.service.handover({ collabId, target: 'inst-b' });
+  const offer = await waitFor(() => a.sent.find((message) => message.type === 'handover' && message.payload.kind === 'offer'), { timeoutMs: 2000 });
+  assert.deepEqual(offer.payload.endpoints['inst-c'], { address: '127.0.0.3', port: 17321 }, '辅修：offer 携带端点全表（旧驿丞视角）');
+  await receive(b.service, collabFrame('handover', collabId, peerA, offer.payload));
+  const memberB = JSON.parse(readFileSync(join(b.dir, 'collabs', collabId, 'member.json'), 'utf8'));
+  assert.deepEqual(memberB.endpoints['inst-c'], { address: '127.0.0.3', port: 17321 }, '辅修：受让方逐项学习（可直投老成员）');
+  const accept = await waitFor(() => b.sent.find((message) => message.type === 'handover' && message.payload.kind === 'accept'), { timeoutMs: 2000 });
+  await receive(a.service, collabFrame('handover', collabId, peer('inst-b', '主机乙'), accept.payload), '127.0.0.2');
+  assert.equal((await pending).ok, true);
+
+  const changed = a.sent.find((message) => message.type === 'notice' && message.payload.event === 'manager-changed');
+  assert.ok(changed, '旧驿丞广播驿丞变更');
+  assert.deepEqual(changed.payload.endpoint, { address: '127.0.0.2', port: 17321 }, '主修：载荷携带新驿丞端点');
+  await receive(c.service, collabFrame('notice', collabId, peerA, changed.payload));
+  const memberC = JSON.parse(readFileSync(join(c.dir, 'collabs', collabId, 'member.json'), 'utf8'));
+  assert.equal(memberC.manager.instanceId, 'inst-b');
+  assert.deepEqual(memberC.endpoints['inst-b'], { address: '127.0.0.2', port: 17321 }, '成员学到新驿丞端点（互盲解除）');
+  const sent = await c.service.send({ collabId, text: '交接后第一条', type: 'reply' });
+  assert.equal(sent.ok, true, '消息直达新驿丞（不再「端点未知」）');
+  assert.equal(sent.to[0], 'inst-b');
+  c.service.close();
+});
