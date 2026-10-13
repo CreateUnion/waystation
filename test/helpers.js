@@ -11,7 +11,19 @@ export const repoRoot = fileURLToPath(new URL('..', import.meta.url));
 export function makeTempDir(t) {
   const dir = mkdtempSync(join(tmpdir(), 'waystation-test-'));
   t.after(() => {
-    rmSync(dir, { recursive: true, force: true });
+    try {
+      /* Windows 下删除撞上存活站点进程/杀软对文件的瞬时占用属环境性竞态（EBUSY/EPERM/ENOTEMPTY），
+       * Node 原生重试窗口（maxRetries × retryDelay）内自愈；collab-e2e.test.js 头注记录了同类现象。 */
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch (error) {
+      if (!['EBUSY', 'EPERM', 'ENOTEMPTY'].includes(error.code)) {
+        throw error;   // 非环境性错误照常响亮暴露
+      }
+      /* 重试耗尽的删除失败只留痕、不抛出：node:test 的收尾钩子按注册序执行，任一钩子抛出会跳过其后全部钩子
+       * ——被跳过的站点关闭钩子会泄漏站点子进程，让测试进程永不退出（runner 无限等待，整轮运行冻结）。
+       * 残留的临时目录无害（%TEMP% 可回收），不得以它换取整套测试的冻结。 */
+      console.error(`[测试收尾] 临时目录删除失败（环境性文件占用，已重试）：${dir}（${error.code}）`);
+    }
   });
   return dir;
 }
