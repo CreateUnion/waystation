@@ -111,6 +111,7 @@ function runtimeMaps() {
     syncRotations: new Map(),  // collabId → 对端轮换游标
     joinReplays: new Map(),    // collabId → { timer, attempts }（join 未收敛重播）
     syncRequestWindow: new Map(),   // 来源地址 → 窗口内请求时刻（请求类入站限流）
+    relayDown: new Set(),      // 中继降级态的 collabId 集（探测不可达置位；恢复检测清除）
   };
 }
 
@@ -467,6 +468,14 @@ function emptyFlowCounters() {
     postsDuplicated: 0,
     postRejected: 0,
     postFanoutSkipped: 0,
+    relayPostsSent: 0,        // 成员经中继提交的帖数（中继路径态）
+    relayDegradedPosts: 0,    // 降级直投的帖数（降级态）
+    relayDegrades: 0,         // 进入降级态次数（探测不可达 / 中继端点未知置位）
+    relayRecoveries: 0,       // 恢复中继路径次数（后台恢复检测）
+    relayEndpointUnknown: 0,  // 中继端点未知的降级次数（发起人标识已学但端点缺）
+    relaySubmissionsIn: 0,    // 收到的投稿数（中继侧，首发入列时计）
+    relayRedistributed: 0,    // 转达的帖数（每（作者, postId）至多一次）
+    relayFanoutSkipped: 0,    // 转达时端点未知跳过的目标数
   };
 }
 

@@ -71,6 +71,28 @@ export function selfJoinedOf(local, selfId) {
   return local.members.includes(selfId);
 }
 
+/* 讨论的中继（= 发起人）身份读法（设计 §5.2/§9.1）：发起人本机即中继；成员取本地记录里
+ * 随邀请载荷 / bundle 元状态学得的 originator（与「邀请者引用」member.manager 是不同字段
+ * ——邀请者≠发起人，中继归属不得由邀请者推断）。未知返回 null——投递按降级直投处理。 */
+export function relayPeerOf(local, self) {
+  if (localModeOf(local) === 'forum' && local.role === 'manager') {
+    return { instanceId: self.instanceId, identityName: self.identityName };
+  }
+  const originator = local.member?.originator;
+  if (originator !== undefined && typeof originator.instanceId === 'string') {
+    return { instanceId: originator.instanceId, identityName: originator.identityName };
+  }
+  return null;
+}
+
+/* 发起人是否已放弃中继职责（设计 §5.2/§9.1：发起人退出＝永久放弃 → 直投兜底）。
+ * 判据 = 本机成员事件集里该发起人最近一条事件为 leave；事件未到 / 从未见过该实例 → false
+ * （不臆断，按可达处理——新加入者在成员事件收敛前也须照常经中继）。 */
+export function relayDepartedOf(local, relayId) {
+  const latest = local.members.latestEventOf(relayId);
+  return latest !== null && latest.kind === 'leave';
+}
+
 /* 主题读法（两侧视角统一）：管理席位取台账、成员取本地记录（邀请载荷/对表元状态写入）。 */
 export function localTopicOf(local) {
   const raw = local.role === 'manager' ? local.ledger.topic : local.member.topic;

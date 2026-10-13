@@ -1,7 +1,7 @@
 import { MAX_FRAME_BYTES } from '../net/protocol.js';
 import { isPostEntryShape, displayOrderOf } from './posts.js';
 import { foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, persistMember, selfJoinedOf } from './local.js';
-import { applyEndpoint, endpointFor, mutateLedger, notifyLocal, startJoinReplay, stopJoinReplay, stopJoinReplays } from './outgoing.js';
+import { applyEndpoint, checkRelayRecovery, endpointFor, mutateLedger, notifyLocal, startJoinReplay, stopJoinReplay, stopJoinReplays } from './outgoing.js';
 import { foldMemberEvents } from './members.js';
 
 /* 讨论模式的拉取机制（真对账）与成员收敛（设计 §5.3/§5.4/§5.5）：
@@ -75,10 +75,10 @@ export function triggerSync(state, local, options = {}) {
   });
 }
 
-/* 一轮对表（单个讨论）：选取对端序 → 逐个拉取；一个源拉通即收（换源重试的有界形态）。
- * 同一实例同时只跑一轮（tick 与 join/leave 触发面互不叠加）；只对已加入（自播过 join）的讨论
- * 运行——受邀待回应 / 已拒绝者不是成员，拉取请求必被应答方按成员面拒绝，只会空耗请求预算并
- * 污染对方的拒绝计数（异常信号不被常态请求淹没）。 */
+/* 一轮对表（单个讨论）：中继恢复检测（降级态下顺带探测）→ 选取对端序 → 逐个拉取；
+ * 一个源拉通即收（换源重试的有界形态）。同一实例同时只跑一轮（tick 与 join/leave 触发面
+ * 互不叠加）；只对已加入（自播过 join）的讨论运行——受邀待回应 / 已拒绝者不是成员，拉取请求
+ * 必被应答方按成员面拒绝，只会空耗请求预算并污染对方的拒绝计数（异常信号不被常态请求淹没）。 */
 export async function runSyncCycle(state, local, options = {}) {
   if (localModeOf(local) !== 'forum' || isLocalArchivedState(local)) {
     return { ok: false, reason: 'not-applicable' };
@@ -88,6 +88,11 @@ export async function runSyncCycle(state, local, options = {}) {
   }
   if (state.syncActive.has(local.collabId)) {
     return { ok: false, reason: 'already-running' };
+  }
+  if (state.relayDown.has(local.collabId)) {
+    /* 恢复检测只在降级态下挂上——非降级时不入此分支，本轮对表的既有次序（同步前奏直进拉取）不变。
+     * 检测不改变本轮拉取结论（异常已在其内隔离）。 */
+    await checkRelayRecovery(state, local);
   }
   const candidates = syncCandidatesOf(state, local, options);
   if (candidates.length === 0) {
@@ -422,7 +427,19 @@ function mergeForumFacts(state, local, meta) {
     local.member.topic = meta.topic;
     changed = true;
   }
+  if (learnForumOriginator(local, meta)) {
+    changed = true;
+  }
+  if (mergeForumStamps(local, meta)) {
+    changed = true;
+  }
+  return changed;
+}
+
+/* 成立/结束时刻的单调合并（取更早者——终态时刻取最早的既有口径）。 */
+function mergeForumStamps(local, meta) {
   const learned = { ...(local.member.forumMeta ?? {}) };
+  let changed = false;
   for (const field of ['createdAt', 'establishedAt', 'endedAt']) {
     if (typeof meta[field] === 'string' && (learned[field] === undefined || meta[field] < learned[field])) {
       learned[field] = meta[field];
@@ -433,6 +450,20 @@ function mergeForumFacts(state, local, meta) {
     local.member.forumMeta = learned;
   }
   return changed;
+}
+
+/* 发起人实例标识（中继归属）只补不覆：发起人恒不随讨论变——已学得者不被后续来源改写；
+ * 迟到成员与敲门入群者经 bundle 元状态补学中继归属（设计 §5.3 携带面）。 */
+function learnForumOriginator(local, meta) {
+  const originator = meta.originator;
+  if (local.member.originator !== undefined || !isPlainObject(originator)) {
+    return false;
+  }
+  if (typeof originator.instanceId !== 'string' || typeof originator.identityName !== 'string') {
+    return false;
+  }
+  local.member.originator = { instanceId: originator.instanceId, identityName: originator.identityName };
+  return true;
 }
 
 /* 状态单调推进 + 终态吸收：completed/terminated 为吸收态（任何来源不得回退到先前状态）。 */
@@ -634,8 +665,9 @@ function positionOf(wirePost) {
   return { ts: wirePost.ts, postId: wirePost.postId };
 }
 
-/* 讨论元状态（bundle 携带面）：状态/项目名/主题/成立事实与时刻/结束时刻。
- * 成员侧状态为 'left' 时不携带 state（本地终态不是讨论状态——不误导对端）。 */
+/* 讨论元状态（bundle 携带面）：状态/项目名/主题/发起人实例标识（中继归属）/成立事实与时刻/
+ * 结束时刻。成员侧状态为 'left' 时不携带 state（本地终态不是讨论状态——不误导对端）；
+ * 发起人标识本机未知时不携带（不臆造；对端保持「中继未知」的原状）。 */
 function forumMetaOf(state, local) {
   if (local.role === 'manager') {
     return managerMetaOf(state, local);
@@ -647,6 +679,9 @@ function forumMetaOf(state, local) {
   if (typeof local.member.topic === 'string') {
     meta.topic = local.member.topic;
   }
+  if (isPlainObject(local.member.originator)) {
+    meta.originator = { instanceId: local.member.originator.instanceId, identityName: local.member.originator.identityName };
+  }
   const learned = local.member.forumMeta ?? {};
   for (const field of ['createdAt', 'establishedAt', 'endedAt']) {
     if (learned[field] !== undefined) {
@@ -657,7 +692,13 @@ function forumMetaOf(state, local) {
 }
 
 function managerMetaOf(state, local) {
-  const meta = { state: local.ledger.status, name: local.ledger.name, topic: local.ledger.topic, createdAt: local.ledger.createdAt };
+  const meta = {
+    state: local.ledger.status,
+    name: local.ledger.name,
+    topic: local.ledger.topic,
+    createdAt: local.ledger.createdAt,
+    originator: { instanceId: state.self.instanceId, identityName: state.self.identityName },
+  };
   const derived = local.ledger.establishedAt ?? earliestOtherJoinTs(state, local);
   if (derived !== null) {
     meta.establishedAt = derived;

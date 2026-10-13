@@ -4,7 +4,7 @@ import { MAX_FORUM_MEMBERS, MAX_LOCAL_COLLABS, canTransition, isArchived, newCol
 import { createPostsStore, displayOrderOf, newPostId } from './posts.js';
 import { createMembersStore } from './members.js';
 import { ledgerDigest, removeLedgerFile } from './store.js';
-import { currentManagerIdOf, emitOwnMemberEvent, foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, localTopicOf, memberStateFor, persistLedger, persistMember, persistSnapshot, rememberKnownHost, selfJoinedOf } from './local.js';
+import { currentManagerIdOf, emitOwnMemberEvent, foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, localTopicOf, memberStateFor, persistLedger, persistMember, persistSnapshot, relayDepartedOf, relayPeerOf, rememberKnownHost, selfJoinedOf } from './local.js';
 import { matchConflictCollabs } from './gate.js';
 
 /* 对外操作与协作态变更实现（服务公共 API 的落点）：请求来自本机会话（工具面）——
@@ -44,18 +44,32 @@ export function createCollab(state, { name, topic, targets, mode }) {
   local.member.endpoints = Object.fromEntries(local.endpoints);
   state.collabs.set(ledger.collabId, local);
   if (collabMode === 'forum') {
+    /* 发起人实例标识 = 中继归属（设计 §5.1/§5.3）：本机即中继，随记录持久化
+     * （随即发出的邀请载荷与 bundle 元状态携带它；成员据此定位中继）。 */
+    local.member.originator = { instanceId: state.self.instanceId, identityName: state.self.identityName };
     emitOwnMemberEvent(state, local, 'join');   // 发起人自创建即在成员表内（"第一个"，设计 §5.1）
   }
   persistMember(state, local);
   persistLedger(state, local);
+  const invited = inviteInitialTargets(state, ledger, targets, collabMode, local);
+  state.counters.collabsCreated++;
+  return { ok: true, collabId: ledger.collabId, invited };
+}
+
+/* 创建邀请的发送面：逐目标发 invite（单条入队失败只如实标注，不回滚已建协作）；
+ * 讨论邀请同携发起人实例标识（= 中继归属；创建者即发起人——与增邀 ws_invite 同款）。 */
+function inviteInitialTargets(state, ledger, targets, collabMode, local) {
   const invited = [];
   for (const target of targets) {
-    const result = sendTo(state, ledger.collabId, target.instanceId, { address: target.address, port: target.port }, 'invite', invitePayloadOf(ledger, [], forumEndpointsOf(collabMode, local)));
+    const payload = invitePayloadOf(ledger, [], forumEndpointsOf(collabMode, local));
+    if (collabMode === 'forum') {
+      payload.originator = { instanceId: state.self.instanceId, identityName: state.self.identityName };
+    }
+    const result = sendTo(state, ledger.collabId, target.instanceId, { address: target.address, port: target.port }, 'invite', payload);
     invited.push({ instanceId: target.instanceId, ok: result.ok === true, msgId: result.msgId, reason: result.reason });
     state.counters.invitesSent++;
   }
-  state.counters.collabsCreated++;
-  return { ok: true, collabId: ledger.collabId, invited };
+  return invited;
 }
 
 /* 讨论邀请随带的端点表（设计 §5.1：现成员表与端点表——被邀者据此取得寻址信息）；managed 不带。 */
@@ -127,8 +141,10 @@ export function inviteMembers(state, { collabId, targets }) {
   return { ok: true, collabId, invited };
 }
 
-/* 讨论邀请载荷（发送侧公共构造）：名/主题/模式 + **折叠成员表 ∪ 本次目标**（被邀者据此校验
- * 名单含自己与来源）+ 现端点表。名单 2–32 由协议层照旧校验（折叠表 ≥2：本机 + 至少一个目标）。 */
+/* 讨论邀请载荷（发送侧公共构造）：名/主题/模式 + **发起人实例标识（中继归属）** +
+ * **折叠成员表 ∪ 本次目标**（被邀者据此校验名单含自己与来源）+ 现端点表。
+ * 发起人标识随最新邀请定格（中继归属不得由邀请者推断——邀请者≠发起人）；本机未知时省略
+ * （不臆造——被邀者按「中继未知」降级直投，待对表补学）。名单 2–32 由协议层照旧校验。 */
 function forumInvitePayloadOf(state, local, topic, targets) {
   const members = foldedMembersOf(local).map((member) => ({ instanceId: member.instanceId, identityName: member.identityName }));
   const seen = new Set(members.map((member) => member.instanceId));
@@ -138,13 +154,18 @@ function forumInvitePayloadOf(state, local, topic, targets) {
       members.push({ instanceId: target.instanceId, identityName: target.identityName });
     }
   }
-  return {
+  const payload = {
     name: localNameOf(local),
     topic,
     mode: 'forum',
     members,
     endpoints: Object.fromEntries(local.endpoints),
   };
+  const relay = relayPeerOf(local, state.self);
+  if (relay !== null) {
+    payload.originator = { instanceId: relay.instanceId, identityName: relay.identityName };
+  }
+  return payload;
 }
 
 export function approveInvite(state, { collabId, approve, reason }) {
@@ -262,7 +283,7 @@ export function withdrawInvite(state, { collabId, target }) {
   return withdrawOne(state, local, targetId);
 }
 
-export function sendMessage(state, { collabId, text, type, to }) {
+export async function sendMessage(state, { collabId, text, type, to }) {
   const local = state.collabs.get(collabId);
   if (local === undefined) {
     return { ok: false, message: '本机没有该协作（先 ws_list_collabs）' };
@@ -271,7 +292,7 @@ export function sendMessage(state, { collabId, text, type, to }) {
     return { ok: false, message: '协作对外写已暂停（在途抢接或未能对表）——收敛后恢复' };
   }
   if (localModeOf(local) === 'forum') {
-    return sendForumPost(state, local, { text, type, to });
+    return await sendForumPost(state, local, { text, type, to });
   }
   return sendManagedMessage(state, local, { text, type, to });
 }
@@ -348,9 +369,10 @@ function sendToTarget(state, local, type, payload, targetId) {
 
 /* 讨论模式发帖（设计 §5.2）：to 一律拒绝（讨论不设定向）；kind 按徽标词表、text 沿消息文本
  * 上限（不走 topic/stop 的呈现限制、不触发 task 的 taskId 分支）；先本地落列（postId / 序号 /
- * ts 分配即定）再扇出直投——帖的事务点在本机列表，直投失败不回滚。
- * 帖不进会话注入以外的任何元状态面：topic 帖亦按普通帖处理（主题创建时定死）。 */
-function sendForumPost(state, local, { text, type, to }) {
+ * ts 分配即定）再按路由投递——帖的事务点在本机列表，投递失败不回滚（收敛由拉取兜底）。
+ * 帖不进会话注入以外的任何元状态面：topic 帖亦按普通帖处理（主题创建时定死）。
+ * 路由 = 中继分发（默认）/ 直接扇出（中继本机）/ 降级直投（中继不可达或未知，见 routeForumPost）。 */
+async function sendForumPost(state, local, { text, type, to }) {
   const routedTo = typeof to === 'string' ? to.trim() : to ?? '';
   if (routedTo !== '') {
     return { ok: false, message: '讨论不设定向消息（to 参数一律拒绝）——发言即广播，移除 to 后重试' };
@@ -371,17 +393,204 @@ function sendForumPost(state, local, { text, type, to }) {
     return { ok: false, message: textRejection };
   }
   const post = allocateOwnPost(state, local, kind, text);
-  const results = fanOutPost(state, local, post);
+  const routed = await routeForumPost(state, local, post);
   state.counters.postsSent++;
   return {
     ok: true,
     postId: post.postId,
     seq: post.seq,
     ts: post.ts,
-    to: results.map((entry) => entry.instanceId),
-    results,
-    note: '已直投（在线尽力 + 短重试，不落持久队列）——未达者由对方周期对表拉取收敛；投递结果可用 ws_delivery_status 查询',
+    route: routed.route,
+    to: routed.results.map((entry) => entry.instanceId),
+    results: routed.results,
+    note: routed.note,
   };
+}
+
+/* —— 讨论的中继分发（设计 §5.2/§9.1：中继 = 发起人，无选举无迁移） —— */
+
+/* 帖载荷构造（直接扇出 / 投稿 / 转达三处共用）：只取帖形态四字段，不夹带来源帧其它字段。 */
+function postPayloadOf(post) {
+  return { post: { postId: post.postId, seq: post.seq, kind: post.kind, text: post.text } };
+}
+
+/* 本机是否即该讨论的中继（发起人）——中继转达的前提判据（成员侧不转达）。 */
+export function selfIsRelay(state, local) {
+  return relayPeerOf(local, state.self)?.instanceId === state.self.instanceId;
+}
+
+/* 发帖路由（设计 §5.2 降级/恢复闭环）：成员发帖 → 发中继；中继自帖 → 直接扇出；
+ * 中继不可达（拨号失败/探测不可达）→ 当场降级＝本次即走直投，并置降级态等待后台恢复检测。
+ * 降级态由周期对表 tick 的恢复检测清除（checkRelayRecovery）；两态各有计数可观测。
+ * 探测面缺失（未注入）时以投稿受理结果为判据：受理被拒则本次直投（不置降级态——
+ * 「受理被拒」不等于不可达，可能是形态/端点类拒绝）。
+ * 档位口径（设计 §5.2「面向最终成员」）：作者→中继段走既有直投回执（「已到对方驿站」=
+ * 投稿达中继；「已投进对方会话」= 中继侧会话收到），成员级送达结果留在中继侧投递记录里——
+ * 作者侧不把「达中继」当成「达成员」，未达者如实呈现「待对表收敛」；到会话 ≠ 已读。 */
+async function routeForumPost(state, local, post) {
+  const relay = relayPeerOf(local, state.self);
+  if (relay === null) {
+    return degradedRoute(state, local, post, '中继未知（发起人标识尚未学到）——先直投，待邀请/对表补学后自动回中继');
+  }
+  if (relay.instanceId === state.self.instanceId) {
+    return {
+      route: 'fanout',
+      results: fanOutPost(state, local, post),
+      note: '已直接扇出（本机即中继）——在线尽力 + 短重试，不落持久队列；未达者由对方周期对表拉取收敛',
+    };
+  }
+  const fallback = relayFallbackReason(state, local, relay);
+  if (fallback !== null) {
+    return degradedRoute(state, local, post, fallback);
+  }
+  const endpoint = endpointFor(state, local, relay.instanceId);
+  const verdict = await relayVerdict(state, endpoint);
+  if (verdict.ok !== true) {
+    state.relayDown.add(local.collabId);
+    state.counters.relayDegrades++;
+    return degradedRoute(state, local, post, `${verdict.reason}——已当场降级直投`);
+  }
+  const submitted = submitToRelay(state, local, relay, endpoint, post);
+  if (submitted.ok === true) {
+    state.counters.relayPostsSent++;
+    return {
+      route: 'relay',
+      results: [submitted],
+      note: `已发中继（发起人 ${relay.identityName}）——成员级投递结果由中继聚合捎回（尽力而为）；离线成员待对表收敛；「已投进对方会话」≠ 已读`,
+    };
+  }
+  return degradedRoute(state, local, post, `投稿未受理（${submitted.reason}）`);
+}
+
+/* 不走中继的常态判据（返回原因文案；null = 走中继路径）：发起人已退出（永久放弃中继职责，
+ * 非错误——直投 + 对表收敛兜底照常送达）或降级态（上次探测不可达；避免每帖重复探测，
+ * 等周期对表 tick 的恢复检测切回）。 */
+function relayFallbackReason(state, local, relay) {
+  if (relayDepartedOf(local, relay.instanceId)) {
+    return '发起人已退出讨论（永久放弃中继职责）——直投兜底';
+  }
+  if (state.relayDown.has(local.collabId)) {
+    return '中继降级中（上次探测不可达）——直投，待恢复检测切回';
+  }
+  return null;
+}
+
+/* 中继可达性判定：端点未知即不可达（跳过不静默——不得静默死等，未达者由对方对表追平）；
+ * 有探测面则探测，无探测面时放行至投稿受理（唯一可用信号）。 */
+async function relayVerdict(state, endpoint) {
+  if (endpoint === undefined) {
+    state.counters.relayEndpointUnknown++;
+    return { ok: false, reason: '中继端点未知' };
+  }
+  if (typeof state.probe !== 'function') {
+    return { ok: true };
+  }
+  const result = await probeRelay(state, endpoint);
+  if (result.reachable === true) {
+    return { ok: true, rttMs: result.rttMs };
+  }
+  return { ok: false, reason: `中继探测不可达（${result.reason ?? '未知原因'}）` };
+}
+
+/* 中继探测出口（注入的 probe；统一包一层——异常一律归「不可达」，与失联判定的探测口径一致）。 */
+async function probeRelay(state, endpoint) {
+  try {
+    return await state.probe(endpoint.address, endpoint.port);
+  } catch (error) {
+    return { reachable: false, reason: `探测异常：${error?.message ?? '未知原因'}` };
+  }
+}
+
+/* 投稿提交（成员 → 中继）：payload.relay 标记即「投稿转发」的识别形态（中继据此扇出转达；
+ * 接收端既有（作者, postId）去重与显示不受影响——帖形态四字段原样）。 */
+function submitToRelay(state, local, relay, endpoint, post) {
+  if (typeof state.sendDirect !== 'function') {
+    state.counters.postFanoutSkipped++;
+    return { instanceId: relay.instanceId, ok: false, reason: '直投面不可用（发送注入缺失）——待对表收敛' };
+  }
+  const sent = state.sendDirect({
+    collabId: local.collabId,
+    to: { instanceId: relay.instanceId, address: endpoint.address, port: endpoint.port },
+    type: 'post',
+    payload: { ...postPayloadOf(post), relay: true },
+    createdAt: post.ts,   // 帧 ts 随帖携带（接收端显示序与作者内序的依据）
+  });
+  return { instanceId: relay.instanceId, ok: sent.ok === true, msgId: sent.msgId, reason: sent.reason };
+}
+
+/* 降级直投一帖（设计 §5.2「当场降级=对全成员直投」，复用 T2 直投通道）：帖已落本机列表，
+ * 直投对端点已知成员逐份发出；未达者由对表收敛。两态可观测：降级帖计数 + 结果逐目标标注。 */
+function degradedRoute(state, local, post, reason) {
+  state.counters.relayDegradedPosts++;
+  return {
+    route: 'degraded',
+    results: fanOutPost(state, local, post),
+    note: `中继未用（${reason}）——已直投全体成员（在线尽力 + 短重试）；未达者由对方周期对表拉取收敛`,
+  };
+}
+
+/* 投稿转达（中继侧，设计 §5.2）：中继收到投稿 → 对折叠成员表逐成员直投一份（除本机与原作者
+ * ——作者已持该帖），转达帧 from 保原作者、随带 originMsgId（转达副本的既有判别面：接收端据此
+ * 不做端点学习、投递回报沿原路回执）、ts 取原帖帧 ts（接收端以帧 ts 落条目——显示序跨副本
+ * 一致的前提）。端点未知者跳过并计入 relayFanoutSkipped（跳过不静默、不阻塞其余目标——对方经
+ * 周期对表追平）。**降级期经直投已到中继的副本不再转达**（设计留白两可项的实现选定）：
+ * 投稿标记（payload.relay）是唯一转达触发——直投副本与转达目标重叠，再转达只增重复流量，
+ * 漏者由对表兜底。 */
+export function relayRedistribute(state, local, frame) {
+  if (typeof state.sendDirect !== 'function') {
+    state.counters.postFanoutSkipped++;
+    return 0;
+  }
+  const origin = { instanceId: frame.from.instanceId, identityName: frame.from.identityName, port: frame.from.port };
+  let relayed = 0;
+  for (const entry of forumRecipientsOf(state, local)) {
+    if (entry.instanceId === frame.from.instanceId) {
+      continue;   // 原作者已持该帖
+    }
+    const endpoint = endpointFor(state, local, entry.instanceId);
+    if (endpoint === undefined) {
+      state.counters.relayFanoutSkipped++;
+      continue;
+    }
+    const sent = state.sendDirect({
+      collabId: local.collabId,
+      to: { instanceId: entry.instanceId, address: endpoint.address, port: endpoint.port },
+      type: 'post',
+      payload: { ...postPayloadOf(frame.payload.post), originMsgId: frame.msgId },
+      createdAt: frame.ts,
+      from: origin,
+    });
+    if (sent.ok === true) {
+      relayed++;
+    }
+  }
+  state.counters.relayRedistributed++;
+  return relayed;
+}
+
+/* 后台恢复检测（设计 §5.2：恢复检测通过后自动回中继路径）：由周期对表 tick 顺带执行
+ * （每轮对表先探一次）——降级态下探测中继，可达即清除降级态并计数，下一帖回中继路径。
+ * 探测面缺失或中继端点未知 → 保持降级（无从判定；服务重启后按中继路径重试）。 */
+export async function checkRelayRecovery(state, local) {
+  if (!state.relayDown.has(local.collabId)) {
+    return false;
+  }
+  const relay = relayPeerOf(local, state.self);
+  if (relay === null || typeof state.probe !== 'function') {
+    return false;
+  }
+  const endpoint = endpointFor(state, local, relay.instanceId);
+  if (endpoint === undefined) {
+    return false;
+  }
+  const result = await probeRelay(state, endpoint);
+  if (result.reachable !== true) {
+    return false;
+  }
+  state.relayDown.delete(local.collabId);
+  state.counters.relayRecoveries++;
+  state.log.info('中继恢复可达——投递切回中继路径', { collabId: local.collabId, relay: relay.instanceId });
+  return true;
 }
 
 /* 帖分配与本地落列（设计 §5.2）：postId 一次生成、序号严格递增、ts 强制单调——

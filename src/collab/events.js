@@ -5,7 +5,7 @@ import { createMembersStore } from './members.js';
 import { ledgerDigest } from './store.js';
 import { isLocalArchivedState, localModeOf, persistMember, persistSnapshot, rememberKnownHost, selfJoinedOf } from './local.js';
 import { matchConflictCollabs, noteForumGovernanceIgnored } from './gate.js';
-import { applyEndpoint, applyFreezeLocally, broadcastFreeze, governanceTargets, memberIdsOf, mutateLedger, relayGovernance, sendTo, stopJoinReplay } from './outgoing.js';
+import { applyEndpoint, applyFreezeLocally, broadcastFreeze, governanceTargets, memberIdsOf, mutateLedger, relayGovernance, relayRedistribute, selfIsRelay, sendTo, stopJoinReplay } from './outgoing.js';
 import { applyIncomingJoin, applyIncomingLeave, handleHistoryBundle, handleHistoryRequest } from './sync.js';
 import { handleHandshake, handleTakeover, handleTakeoverInit, resendEffectiveTakeover, resumeLocal } from './takeover.js';
 import { handleDecision, handleMergeOutcome, handleMergeRequest, handleUnfreeze } from './freeze.js';
@@ -160,13 +160,19 @@ function receiveRepeatInvite(state, existing, frame, meta) {
   /* 邀请者引用随最新邀请定格（换人二次邀请的重入者）：join 广播、对表候选与 approve/decline
    * 簿记都以它为准——旧引用指向已退出/长期离线的邀请者时，重入者会再次被孤立。 */
   existing.member.manager = { instanceId: frame.from.instanceId, identityName: frame.from.identityName };
+  /* 发起人标识（中继归属）随最新邀请补学；载荷未携带时保留既有知识（发起人不随邀请者变）。 */
+  const originator = payloadOriginatorOf(frame);
+  if (originator !== undefined) {
+    existing.member.originator = originator;
+  }
   delete existing.member.archivedAt;
   persistMember(state, existing);
 }
 
 /* 邀请定格的本地记录（roster 供冲突交集判据在成员侧取数；有效期自本地收到时刻起算）。
  * 模式随邀请载荷定格（缺字段按 managed 解释——旧版对端不携带该字段）；主题随记录定格
- * （成员侧发起邀请的取数面）。 */
+ * （成员侧发起邀请的取数面）；发起人实例标识（中继归属）随载荷定格——缺字段 = 旧版形态，
+ * 按「中继未知」处理（发帖降级直投，待 bundle 元状态补学）。 */
 function inviteRecordOf(state, frame) {
   const now = new Date().toISOString();
   return {
@@ -177,12 +183,22 @@ function inviteRecordOf(state, frame) {
     topic: frame.payload.topic,
     mode: frame.payload.mode ?? DEFAULT_COLLAB_MODE,
     manager: { instanceId: frame.from.instanceId, identityName: frame.from.identityName },
+    originator: payloadOriginatorOf(frame),
     roster: inviteRosterOf(frame),
     endpoints: {},
     invitedAt: now,
     expiresAt: new Date(Date.parse(now) + state.config.inviteTtlMs).toISOString(),
     decision: null,
   };
+}
+
+/* 邀请载荷的发起人标识（协议层已过身份对形态；缺省 undefined = 未学到）。 */
+function payloadOriginatorOf(frame) {
+  const originator = frame.payload.originator;
+  if (originator === undefined) {
+    return undefined;
+  }
+  return { instanceId: originator.instanceId, identityName: originator.identityName };
 }
 
 function inviteRosterOf(frame) {
@@ -459,6 +475,9 @@ function handleProgress(state, frame) {
  * 重复路径副本不再入列（计数留痕、无害）；帖只追加、不改任何元状态（topic 帖亦按普通帖处理，
  * 主题创建时定死）。ts 取帧 ts（作者侧落盘强制单调、随帖携带）；entryId 取载荷 postId 原样
  * （该帖在全部副本中的稳定标识）。
+ * 投稿转达（中继侧）：payload.relay 标记 = 成员发往中继的投稿（设计 §5.2 投稿识别形态）——
+ * 中继本机（发起人）对首发入列的投稿扇出转达（重复副本由列表去重吸收、不重复扇出；
+ * 非中继节点与未标记的直投副本只入列、不转达——见 relayRedistribute 的两可项选定）。
  * 注入栅栏（限帖通道、不泛化）：去重命中的副本以 sessionDeliver:false 声明不重复注入会话
  * （`(作者, postId)` 去重结果参与投递判定）——不同 msgId 的重复路径副本由此不再二次通知；
  * managed 的「受理帧仍注入」行为不受影响（本声明只由帖通道发出，接收管线只在该类型采信）。 */
@@ -481,6 +500,10 @@ function handlePost(state, frame) {
     return { sessionDeliver: false };
   }
   state.counters.postsIn++;
+  if (frame.payload.relay === true && selfIsRelay(state, local) && frame.from.instanceId !== state.self.instanceId) {
+    state.counters.relaySubmissionsIn++;
+    relayRedistribute(state, local, frame);
+  }
   return undefined;
 }
 
