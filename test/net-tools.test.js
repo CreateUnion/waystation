@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { hostsTool } from '../src/tools/hosts.js';
 import { pingTool } from '../src/tools/ping.js';
 import { deliveryStatusTool } from '../src/tools/delivery-status.js';
@@ -8,6 +10,8 @@ import { checkInboxTool } from '../src/tools/check-inbox.js';
 import { listCollabsTool, createCollabTool, approveInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, leaveCollabTool, endCollabTool, SEND_MESSAGE_TYPES } from '../src/tools/collab.js';
 import { decideTool, handoverTool, takeOverTool } from '../src/tools/governance.js';
 import { MAX_COLLAB_MEMBERS } from '../src/net/protocol.js';
+import { CONFIG_FILE_NAME, loadConfig } from '../src/config.js';
+import { makeTempDir } from './helpers.js';
 
 function contextWith(net) {
   return { version: '0.1.0', instanceId: 'inst-self', dataDir: '/data', logDir: '/data/logs', config: { identityName: '本机', port: 17321 }, net, collab: { stats: () => ({ collabs: 0, byState: {} }) }, startedAt: '2026-10-12T00:00:00.000Z' };
@@ -248,6 +252,28 @@ test('ws_status：输出含 site 站点块', async () => {
   const result = await statusTool().handler({}, context);
   const status = JSON.parse(result.content[0].text);
   assert.deepEqual(status.site, { mode: 'slot', slot: 2, port: 17322, takeover: false });
+});
+
+test('ws_status：身份未设置（首跑）载荷带 identityHint；预写合法身份名则不带', async (t) => {
+  const net = { status: () => ({ available: true, reason: null, message: '', port: 17321, counters: { discovery: {}, transport: {}, dispatch: {}, inbound: {} } }) };
+  const fresh = makeTempDir(t);
+  const loaded = loadConfig(fresh);
+  assert.equal(loaded.identityDefaulted, true, '前置：全新数据目录按未设置读入');
+  const freshContext = { ...contextWith(net), dataDir: fresh, config: loaded.config, identityDefaulted: loaded.identityDefaulted };
+  const freshStatus = JSON.parse((await statusTool().handler({}, freshContext)).content[0].text);
+  assert.equal(typeof freshStatus.identityHint, 'string');
+  assert.ok(freshStatus.identityHint.includes(loaded.config.identityName), '提示需含当前机器名值');
+  assert.ok(freshStatus.identityHint.includes(join(fresh, CONFIG_FILE_NAME)), '提示需含配置文件路径');
+  assert.ok(freshStatus.identityHint.includes('不设置就继续用它') && freshStatus.identityHint.includes('此提醒只出现这一次'));
+  assert.ok(freshStatus.identityHint.includes('identityName') && freshStatus.identityHint.includes('下次会话生效'));
+
+  const configured = makeTempDir(t);
+  writeFileSync(join(configured, CONFIG_FILE_NAME), JSON.stringify({ identityName: '工位机' }));
+  const named = loadConfig(configured);
+  assert.equal(named.identityDefaulted, false, '前置：合法身份名不触发');
+  const namedContext = { ...contextWith(net), dataDir: configured, config: named.config, identityDefaulted: named.identityDefaulted };
+  const namedStatus = JSON.parse((await statusTool().handler({}, namedContext)).content[0].text);
+  assert.equal(Object.hasOwn(namedStatus, 'identityHint'), false, '字段有值：一切照旧、无提示');
 });
 
 test('ws_list_collabs：透传服务清单（含角色/状态/邀请过期标注字段）', async () => {

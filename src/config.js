@@ -102,6 +102,8 @@ export function buildDefaults(hostName, options = {}) {
 
 /**
  * 读配置。created=true 表示文件不存在或已损坏重建——调用方应把生效值落盘（首跑生成 config.json）。
+ * identityDefaulted=true 表示根对象里的 identityName「未设置」（缺失 / null / 空串 / 纯空白）——
+ * 按未设置处理：保留默认机器名、不告警；调用方应把生效值落盘并在本会话给一次提示（见 status 工具）。
  * 损坏处理遵循设计 §13 的「不静默覆盖」：原文件改名留副本后再按默认值重建。
  * 未知字段原样保留到生效配置里，saveConfig 写回时不丢（前后版本并存的安全带）。
  * options.defaults：站点感知默认值对象（多站点槽位目录传 buildDefaults(hostname(), { slot })）；
@@ -113,6 +115,7 @@ export function loadConfig(dataDir, options = {}) {
   const defaults = options.defaults ?? buildDefaults(hostname());
   const { raw, created } = readRawConfig(file, warn);
   const config = { ...defaults };
+  const identityDefaulted = isIdentityUnset(raw.identityName);
   // 用户可手改的文件是外部输入：自有键判定一律 Object.hasOwn——防 toString/constructor/__proto__
   // 等原型成员名穿透（`key in defaults` 会命中 Object.prototype 上的内置成员）；
   // unknown 用 null 原型对象：防 `unknown['__proto__'] = ...` 经原型 setter 改写而非落成数据键
@@ -122,6 +125,9 @@ export function loadConfig(dataDir, options = {}) {
       unknown[key] = value;
       continue;
     }
+    if (key === 'identityName' && identityDefaulted) {
+      continue;   // 未设置不告警：保留默认机器名，由调用方落盘触发一次提示
+    }
     const checked = validateField(key, value);
     if (checked.ok) {
       config[key] = checked.value;
@@ -129,7 +135,14 @@ export function loadConfig(dataDir, options = {}) {
       warn(`配置项 ${key} 无效（${checked.reason}），改用默认值 ${JSON.stringify(defaults[key])}`);
     }
   }
-  return { config: { ...config, ...unknown }, created };
+  return { config: { ...config, ...unknown }, created, identityDefaulted };
+}
+
+/* 身份名「未设置」的口径：字段缺失 / null / 空串 / 纯空白——用户清空字段即回到未设置，
+ * 下次启动重新触发一轮「落盘默认值 + 本会话提示一次」，语义自洽。类型错（数字 / 布尔 / 对象）
+ * 不属此列：那是有值但不合法，仍走告警回落路径。 */
+function isIdentityUnset(value) {
+  return value === undefined || value === null || (typeof value === 'string' && value.trim() === '');
 }
 
 /** 原子整体替换写回（设计 §15 写入路径二：临时文件 + 重命名）；失败向上抛，由调用方兜底 */

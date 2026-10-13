@@ -413,6 +413,7 @@ show_session_checklist() {
   note "4) 同机多终端时端口自动落在槽位段 ${ANCHOR_PORT}–${SEGMENT_END}（首终端用 ${ANCHOR_PORT}）；跨机互扫端口段覆盖"
   note "5) 两台机器互扫可见后，再按设计验收场景走「建立协作」流程"
   note "6)（可选）状态栏「协作中」指示：把 ${APP_DIR}/scripts/statusline.js 配为 statusLine 命令（见 README 状态栏节）；进入协作后应显示「协作中：⋯」"
+  note "7) 身份名默认为机器名：首个会话会提示一次；可用数据目录 config.json 的 identityName 自定义（下次会话生效）"
 }
 
 show_client_snippets() {

@@ -23,6 +23,7 @@ test('README：数据目录与多站点说明（WAYSTATION_HOME 与槽位目录�
   const text = readFileSync(join(repoRoot, 'README.md'), 'utf8');
   assert.ok(text.includes('WAYSTATION_HOME'), 'README 开发节须说明显式数据目录');
   assert.ok(text.includes('sites/'), 'README 开发节须说明一机多站点目录布局');
+  assert.ok(text.includes('identityName'), 'README 须说明身份名默认为机器名、可用 identityName 自定义');
 });
 
 test('README：披露锚句与安装/状态栏/卸载/迁移文档面齐备（防腐化）', () => {

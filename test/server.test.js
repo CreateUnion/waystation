@@ -7,6 +7,7 @@ import dgram from 'node:dgram';
 import { join, resolve } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { loadConfig } from '../src/config.js';
 import { makeTempDir, pickFreePort, repoRoot, waitFor } from './helpers.js';
 
 const INDEX_ENTRY = join(repoRoot, 'src', 'index.js');
@@ -163,6 +164,11 @@ test('stdio 骨架：进程可起、ws_status 可调、网络层就绪、数据�
   assert.equal(existsSync(join(home, 'collabs')), true);
   const saved = JSON.parse(readFileSync(join(home, 'config.json'), 'utf8'));
   assert.equal(saved.port, port);
+  // 预写配置没写身份名 = 未设置：本会话载荷带一次性提示，生效的默认机器名已补写落盘；
+  // 回读即「有值」——下一会话不再触发提示（一次性语义的落盘侧证据）
+  assert.ok(status.identityHint.includes(status.identityName), `身份提示需含生效值：${status.identityHint}`);
+  assert.equal(saved.identityName, status.identityName);
+  assert.equal(loadConfig(home).identityDefaulted, false);
 });
 
 test('机器实例标识：跨进程重启不变（持久化生效）', { timeout: 30000 }, async (t) => {

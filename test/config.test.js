@@ -217,10 +217,60 @@ test('identityName 白名单：配置值含控制字符 / 零宽字符 → 回�
   const dir = makeTempDir(t);
   writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({ identityName: '甲\u0007乙' }));
   const warnings = [];
-  const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+  const { config, identityDefaulted } = loadConfig(dir, { warn: (message) => warnings.push(message) });
   assert.equal(config.identityName, hostname());
   assert.equal(warnings.length, 1);
   assert.ok(warnings[0].includes('identityName'));
+  assert.equal(identityDefaulted, false, '非法非空值不是「未设置」：照旧告警回落、不带提示标志');
+});
+
+test('identityName 未设置（缺文件 / null / 空串 / 纯空白）：无告警、identityDefaulted=true、生效值=默认机器名', (t) => {
+  const cases = [
+    { raw: null, created: true, label: '缺文件' },
+    { raw: { identityName: null }, created: false, label: 'null' },
+    { raw: { identityName: '' }, created: false, label: '空串' },
+    { raw: { identityName: '   ' }, created: false, label: '纯空白' },
+  ];
+  for (const item of cases) {
+    const dir = makeTempDir(t);
+    if (item.raw !== null) {
+      writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify(item.raw));
+    }
+    const warnings = [];
+    const { config, created, identityDefaulted } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+    assert.equal(created, item.created, item.label);
+    assert.equal(identityDefaulted, true, item.label);
+    assert.deepEqual(warnings, [], `${item.label}：未设置不应告警`);
+    assert.equal(config.identityName, hostname(), item.label);
+  }
+});
+
+test('identityName 有值（合法 / 非法非空）：identityDefaulted=false，不触发一次性提示', (t) => {
+  const valid = makeTempDir(t);
+  writeFileSync(join(valid, CONFIG_FILE_NAME), JSON.stringify({ identityName: '工位机' }));
+  const okLoad = loadConfig(valid);
+  assert.equal(okLoad.identityDefaulted, false);
+  assert.equal(okLoad.config.identityName, '工位机');
+  for (const raw of [{ identityName: 'x'.repeat(65) }, { identityName: '甲\u0007乙' }, { identityName: 123 }, { identityName: [] }]) {
+    const dir = makeTempDir(t);
+    writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify(raw));
+    const warnings = [];
+    const { config, identityDefaulted } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+    assert.equal(identityDefaulted, false, JSON.stringify(raw));
+    assert.equal(warnings.length, 1, JSON.stringify(raw));
+    assert.ok(warnings[0].includes('identityName'), JSON.stringify(raw));
+    assert.equal(config.identityName, hostname(), JSON.stringify(raw));
+  }
+});
+
+test('identityName 未设置 + 槽位默认（defaults 注入）：identityDefaulted=true、生效值=槽位默认名', (t) => {
+  const dir = makeTempDir(t);
+  writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({ identityName: '' }));
+  const { config, identityDefaulted } = loadConfig(dir, { defaults: buildDefaults('主机甲', { slot: 2 }) });
+  assert.equal(identityDefaulted, true);
+  assert.equal(config.identityName, '主机甲-2');
+  const fresh = makeTempDir(t);
+  assert.equal(loadConfig(fresh, { defaults: buildDefaults('主机甲', { slot: 3 }) }).identityDefaulted, true, '字段缺失同样按未设置处理');
 });
 
 test('probeTimeoutMs：范围非法回落默认并告警', (t) => {

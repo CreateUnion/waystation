@@ -66,7 +66,7 @@ const dataCheck = checkWritableDir(activeDir);
 if (!dataCheck.ok) {
   fatal(`启动自检失败，拒绝服务：${dataCheck.message}`);
 }
-const { config, created: configCreated } = loadConfig(activeDir, {
+const { config, created: configCreated, identityDefaulted } = loadConfig(activeDir, {
   defaults: buildDefaults(hostname(), { slot: site.ok && site.mode === 'slot' ? site.slot : null }),
 });
 if (site.ok && site.writeBackPort) {
@@ -96,8 +96,10 @@ try {
   log.error('实例标识读写失败', { dataDir: activeDir, reason: error.message });
   fatal(`实例标识无法持久化：${error.message}——启动失败`);
 }
-/* 首跑/写回落盘必须先于组件构造与 net.start()——「先落盘、后生效」是既定验收项。 */
-if (configCreated || (site.ok && site.writeBackPort)) {
+/* 首跑/写回/身份补写落盘必须先于组件构造与 net.start()——「先落盘、后生效」是既定验收项。
+ * 身份补写（identityDefaulted）= 把生效的默认机器名写进字段：此后各会话读到的字段已有值，
+ * 提示不再触发（本次会话的提示标志只活在内存里，不随配置落盘）。 */
+if (configCreated || identityDefaulted || (site.ok && site.writeBackPort)) {
   try {
     saveConfig(activeDir, firstRunConfig(config, site));
   } catch (error) {
@@ -217,6 +219,8 @@ const context = {
   dataDir: activeDir,
   logDir,
   config,
+  // 身份未设置的会话级标志（内存态）：status 工具据此在载荷里带一次身份提示
+  identityDefaulted,
   site: site.ok ? { mode: site.mode, slot: site.slot, port: site.port, takeover: site.takeover } : null,
   net,
   collab,
