@@ -137,13 +137,15 @@ function readNewBytes(state) {
     return 'missing';
   }
   if (size < state.offset) {
-    state.wasMissing = false;
     resetReader(state, 'truncated');
   } else if (state.wasMissing && state.offset > 0) {
-    /* 位移为零 = 尚未消费过任何内容：文件缺席再出现无连续性可言，重置是空操作，也不提示。 */
-    state.wasMissing = false;
+    /* 缺席后重现：位移已指不到原内容，自卷首重读。位移为零 = 尚未消费过任何内容，重置是
+     * 空操作——不提示，也不按「重现」处理。 */
     resetReader(state, 'restarted');
   }
+  /* 文件在位即清缺席标记：它只对「已消费后消失再重现」的判定有意义，残留到首读成功之后
+   * 会让下一拍误判重现、整卷重读（晚落盘的数据被重印、多出「已恢复」提示）。 */
+  state.wasMissing = false;
   if (size === state.offset) {
     return 'idle';
   }

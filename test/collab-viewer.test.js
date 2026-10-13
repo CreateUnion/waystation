@@ -449,6 +449,19 @@ test('数据未就绪：横幅如实标注并持续等待，数据出现后补�
   await viewer.waitForText('帖子正文 1');
 });
 
+test('数据晚就位：首读内容恰好一次——缺席标记不误触发次拍重置（帖 / 成员 / 台账三面）', async (t) => {
+  const home = makeStationDir(t);
+  const viewer = startViewer(t, { home });
+  await viewer.waitForText(`【数据未就绪】${COLLAB_ID}`);
+  seedCollab(home, { posts: 1, seat: 'manager' });
+  await viewer.waitForText('帖子正文 1');
+  await sleep(1200);   // 跨过首读后的两拍轮询：误重置若存在即发生在此窗口
+  assert.equal(viewer.countOf('帖子正文 1'), 1, '晚就位首读帖不重印');
+  assert.equal(viewer.countOf('主机甲 加入'), 1, '成员系统行恰好一次');
+  assert.equal(viewer.countOf('已恢复'), 0, '无「已恢复」误提示（成员 / 台账面同受修）');
+  assert.equal(viewer.child.exitCode, null, '持续等待、不退出');
+});
+
 test('零写盘：运行前后数据目录逐文件字节 diff 为空（半写尾行也不得被修复）', async (t) => {
   const home = makeStationDir(t);
   seedCollab(home, { posts: 2, seat: 'manager' });
