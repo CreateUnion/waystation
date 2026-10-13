@@ -939,3 +939,93 @@ function writeLegacyMemberRecord(dir, collabId) {
     ts: '2026-10-13T00:00:00.000Z',
   })}\n`);
 }
+
+/* —— 三节点并发发帖去重 与 跨机收敛连续链（邀请 → join → 发帖 → 离线 → 回填 → end） —— */
+
+/* 三端本地视图同拍读取与收敛判定（帖数与文本序同时一致才为真）：两用例共用。 */
+async function viewsConverged(a, b, c, collabId, count) {
+  const made = [await a.service.view({ collabId }), await b.service.view({ collabId }), await c.service.view({ collabId })];
+  if (made.some((view) => view.posts.length !== count)) {
+    return null;
+  }
+  const textsOf = (view) => JSON.stringify(view.posts.map((entry) => entry.text));
+  return made.every((view) => textsOf(view) === textsOf(made[0])) ? true : null;
+}
+
+test('三节点并发发帖去重：三端同时发帖互不阻塞、重复副本各端吸收、显示序全员一致', async (t) => {
+  const { wire, collabId, a, b, c } = await makeStudio(t);
+  /* 并发工况：发起人与两名成员同一时刻各自发帖（成员投稿到中继、中继当场扇出自己那份）。 */
+  const [byB, byC, byA] = await Promise.all([
+    b.service.send({ collabId, text: '乙的并发帖' }),
+    c.service.send({ collabId, text: '丙的并发帖' }),
+    a.service.send({ collabId, text: '甲的并发帖' }),
+  ]);
+  assert.equal(byB.route, 'relay', byB.message);
+  assert.equal(byC.route, 'relay', byC.message);
+  assert.equal(byA.route, 'fanout', byA.message);
+  await waitFor(() => viewsConverged(a, b, c, collabId, 3));
+  /* 去重：每端各收一份「重试 / 多路」副本（不同 msgId、同（作者, postId））——本地吸收不重复入列，
+   * 中继不重复转达；副本来源地址按真实链路给（避免端点点位学习把断言带偏）。 */
+  const submissionToA = wire.postsTo(SELF_A.instanceId).find((frame) => frame.from.instanceId === SELF_B.instanceId);
+  const relayedToC = wire.postsTo(SELF_C.instanceId).find((frame) => frame.from.instanceId === SELF_B.instanceId);
+  const fanoutToB = wire.postsTo(SELF_B.instanceId).find((frame) => frame.from.instanceId === SELF_A.instanceId);
+  assert.ok(submissionToA !== undefined && relayedToC !== undefined && fanoutToB !== undefined, '三路副本各有可重投的样本帧');
+  assert.equal((await receive(a.service, { ...submissionToA, msgId: `copy-a-${randomUUID()}` }, addressOf(SELF_B))).ok, true);
+  assert.equal((await receive(c.service, { ...relayedToC, msgId: `copy-c-${randomUUID()}` }, addressOf(SELF_A))).ok, true);
+  assert.equal((await receive(b.service, { ...fanoutToB, msgId: `copy-b-${randomUUID()}` }, addressOf(SELF_A))).ok, true);
+  assert.equal(a.service.stats().postsDuplicated >= 1, true, '中继侧重复投稿不重复入列');
+  assert.equal(c.service.stats().postsDuplicated >= 1, true, '成员侧重复转达副本不重复入列');
+  assert.equal(b.service.stats().postsDuplicated >= 1, true, '成员侧重复扇出副本不重复入列');
+  assert.equal(a.service.stats().relaySubmissionsIn, 2, '重复副本不计投稿（乙丙各一）');
+  assert.equal(a.service.stats().relayRedistributed, 2, '转达每（作者, postId）至多一次');
+  await waitFor(() => viewsConverged(a, b, c, collabId, 3), { timeoutMs: 2000 });
+  const made = [await a.service.view({ collabId }), await b.service.view({ collabId }), await c.service.view({ collabId })];
+  assert.equal(new Set(made[0].posts.map((entry) => entry.entryId)).size, 3, '三帖条目无重复');
+  assert.deepEqual(made[1].posts.map((entry) => entry.entryId), made[0].posts.map((entry) => entry.entryId), '显示序跨端一致（副本吸收不改变序）');
+});
+
+test('跨机收敛连续链：邀请 → join → 发帖 → 离线 → 回填 → end（一条场景全链）', async (t) => {
+  const { wire, up, collabId, a, b, c } = await makeStudio(t);
+  const allIds = [SELF_A.instanceId, SELF_B.instanceId, SELF_C.instanceId].sort();
+  /* ① 邀请 → join：三方折叠成员表收敛齐（装配经真实邀请载荷与 join 自播，非手写名单）。 */
+  for (const made of [a, b, c]) {
+    const view = await made.service.view({ collabId });
+    assert.deepEqual(view.members.map((entry) => entry.instanceId).sort(), allIds, '邀请 → join：三方成员表齐');
+  }
+  /* ② 发帖：成员投稿（经中继）与发起人扇出——三端收敛到同一帖集合。 */
+  const byB = await b.service.send({ collabId, text: '乙的第一帖' });
+  assert.equal(byB.ok, true, byB.message);
+  assert.equal(byB.results[0].ok, true, '投稿达中继');
+  const byA = await a.service.send({ collabId, text: '甲的第一帖' });
+  assert.equal(byA.ok, true, byA.message);
+  await waitFor(() => viewsConverged(a, b, c, collabId, 2));
+  /* ③ 离线：丙掉线（实时通道不可达）——离线期乙再发一帖，丙停在 2 帖。 */
+  up.delete(SELF_C.instanceId);
+  const whileOffline = await b.service.send({ collabId, text: '离线期的帖' });
+  assert.equal(whileOffline.ok, true, whileOffline.message);
+  await waitFor(async () => ((await a.service.view({ collabId })).posts.length === 3 ? true : null));
+  assert.equal((await b.service.view({ collabId })).posts.length, 3, '在线者照常收到');
+  assert.equal((await c.service.view({ collabId })).posts.length, 2, '离线者未收到实时副本');
+  assert.equal(c.service.stats().postsIn, 2, '实时通道到站数停在离线前');
+  /* ④ 回填：丙回归——对表拉取把离线期错过的帖补上（实时通道零增量）。 */
+  const backfilledBefore = c.service.stats().syncPostsBackfilled;
+  up.add(SELF_C.instanceId);
+  const outcome = await syncWhenIdle(c.service, collabId);
+  assert.equal(outcome.ok, true, JSON.stringify(outcome));
+  assert.equal(c.service.stats().syncPostsBackfilled, backfilledBefore + 1, '回填计数 = 离线期错过的帖数');
+  assert.equal(c.service.stats().postsIn, 2, '回填与实时接收分开计数');
+  await waitFor(() => viewsConverged(a, b, c, collabId, 3), { timeoutMs: 2000 });
+  /* ⑤ end：发起人结束——逐成员广播把三方一并归档；归档后本地副本仍可读。 */
+  const ended = await a.service.end({ collabId });
+  assert.equal(ended.ok, true, ended.message);
+  assert.equal(a.service.list().collabs[0].state, 'completed');
+  const endMessages = sentOf(a.sent, 'end', collabId);
+  const endForB = endMessages.find((message) => message.to.instanceId === SELF_B.instanceId);
+  const endForC = endMessages.find((message) => message.to.instanceId === SELF_C.instanceId);
+  assert.ok(endForB !== undefined && endForC !== undefined, 'end 通告逐成员寻址（乙、丙各一条）');
+  await wire.hop(endForB, SELF_A, b.service);
+  await wire.hop(endForC, SELF_A, c.service);
+  assert.equal(b.service.list().collabs[0].state, 'completed', '在线者收 end 广播即归档');
+  assert.equal(c.service.list().collabs[0].state, 'completed', '刚回归者同口径归档');
+  assert.equal((await c.service.view({ collabId })).posts.length, 3, '归档后回填副本仍可读');
+});
