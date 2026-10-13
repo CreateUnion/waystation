@@ -475,6 +475,7 @@ function emptyFlowCounters() {
     relayRecoveries: 0,       // 恢复中继路径次数（后台恢复检测）
     relayEndpointUnknown: 0,  // 中继端点未知的降级次数（发起人标识已学但端点缺）
     relaySubmissionsIn: 0,    // 收到的投稿数（中继侧，首发入列时计）
+    relaySubmissionsRejected: 0,   // 转达面拒绝的非成员投稿数（只拒转达，帖照常受理）
     relayRedistributed: 0,    // 转达处理的帖数（每（作者, postId）至多一次）
     relayFanoutSkipped: 0,    // 转达时端点未知跳过的目标数
     relayReportSent: 0,       // 聚合捎回：译回原作者的第三档回报帧数

@@ -89,20 +89,22 @@ export async function runSyncCycle(state, local, options = {}) {
   if (state.syncActive.has(local.collabId)) {
     return { ok: false, reason: 'already-running' };
   }
-  if (state.relayDown.has(local.collabId)) {
-    /* 恢复检测只在降级态下挂上——非降级时不入此分支，本轮对表的既有次序（同步前奏直进拉取）不变。
-     * 检测不改变本轮拉取结论（异常已在其内隔离）。 */
-    await checkRelayRecovery(state, local);
-  }
-  const candidates = syncCandidatesOf(state, local, options);
-  if (candidates.length === 0) {
-    state.counters.syncNoPeer++;
-    nudgeJoinReplay(state, local);   // 拉取无从发起 = 未确认：重播面照走（递增间隔有界）
-    return { ok: false, reason: 'no-peer' };
-  }
-  const sources = pickSources(state, local, candidates, options);
+  /* 在途置位先于恢复检测的 await：检测（探测）有等待窗，置位若排在它后面，窗口内并发触发的
+   * 第二轮会绕过 already-running 判定、与在途轮次叠加（try/finally 覆盖含检测在内的全部返回分支）。 */
   state.syncActive.add(local.collabId);
   try {
+    if (state.relayDown.has(local.collabId)) {
+      /* 恢复检测只在降级态下挂上——非降级时不入此分支，本轮对表的既有次序（同步前奏直进拉取）不变。
+       * 检测不改变本轮拉取结论（异常已在其内隔离）。 */
+      await checkRelayRecovery(state, local);
+    }
+    const candidates = syncCandidatesOf(state, local, options);
+    if (candidates.length === 0) {
+      state.counters.syncNoPeer++;
+      nudgeJoinReplay(state, local);   // 拉取无从发起 = 未确认：重播面照走（递增间隔有界）
+      return { ok: false, reason: 'no-peer' };
+    }
+    const sources = pickSources(state, local, candidates, options);
     state.counters.syncCycles++;
     for (const sourceId of sources) {
       const outcome = await pullFrom(state, local, sourceId, options);

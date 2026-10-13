@@ -176,7 +176,7 @@ export function viewLedgerTool() {
 export function sendMessageTool() {
   return {
     name: 'ws_send_message',
-    description: '发送协作域消息（星型路由：成员发给管理者；管理者省略 to 即发全体成员）——离线时消息排队、对方重开后送达；讨论模式为发帖广播（人人可见、to 参数一律拒绝、离线者由对方周期对表收敛）',
+    description: '发送协作域消息（星型路由：成员发给管理者；管理者省略 to 即发全体成员）——离线时消息排队、对方重开后送达；讨论模式为发帖（人人可见、to 参数一律拒绝）：默认经中继（发起人）投递（成员投稿至中继、由其转达全员），中继不可达时自动降级直投——返回的 route 字段如实标注本机走的路（relay/degraded/fanout）、results 为投稿或直投的受理态，成员级结果经中继聚合捎回、未达者由对方周期对表收敛',
     inputSchema: {
       type: 'object',
       properties: {

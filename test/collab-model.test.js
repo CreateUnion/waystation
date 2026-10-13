@@ -209,3 +209,18 @@ test('成员记录冻结标记：frozenAt / frozenFrom 同判据（缺省兼容 
   assert.equal(isMemberRecordShape(sampleMember({ frozenAt: 'x' })), false);
   assert.equal(isMemberRecordShape(sampleMember({ frozenFrom: 'terminated' })), false);
 });
+
+test('成员记录发起人标识（originator）：缺省兼容、身份对形态通过、坏形态拒', () => {
+  assert.equal(isMemberRecordShape(sampleMember()), true, '缺省（旧记录/未学到）通过');
+  assert.equal(isMemberRecordShape(sampleMember({ originator: { instanceId: 'inst-a', identityName: '主机甲' } })), true);
+  const cases = [
+    sampleMember({ originator: 'inst-a' }),
+    sampleMember({ originator: { instanceId: 'bad id!', identityName: '主机甲' } }),
+    sampleMember({ originator: { instanceId: 'inst-a', identityName: '' } }),
+    sampleMember({ originator: { instanceId: 'inst-a' } }),
+    sampleMember({ originator: {} }),
+  ];
+  for (const candidate of cases) {
+    assert.equal(isMemberRecordShape(candidate), false, JSON.stringify(candidate.originator));
+  }
+});

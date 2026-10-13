@@ -246,9 +246,13 @@ function isMemberTimestampsShape(record) {
 }
 
 /* 讨论专用可选字段（旧记录缺省）：topic = 邀请/元状态学得的主题（成员侧发起邀请的取数面）；
- * forumMeta = 学得的讨论元状态时刻（成立/结束/创建）；syncCursor = 专用同步游标（只由拉取推进）。 */
+ * forumMeta = 学得的讨论元状态时刻（成立/结束/创建）；syncCursor = 专用同步游标（只由拉取推进）；
+ * originator = 发起人实例标识（= 中继归属；随邀请载荷 / bundle 元状态学得，身份对形态）。 */
 function isForumMemberMarksShape(record) {
   if (record.topic !== undefined && !isPresentationText(record.topic, MAX_TOPIC_CHARS)) {
+    return false;
+  }
+  if (record.originator !== undefined && !isPeerShape(record.originator)) {
     return false;
   }
   if (!isForumMetaShape(record.forumMeta)) {

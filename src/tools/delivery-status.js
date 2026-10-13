@@ -11,7 +11,7 @@ const REPORT_ROW_TYPE = 'delivery-status';
 export function deliveryStatusTool() {
   return {
     name: 'ws_delivery_status',
-    description: '查询已发消息的投递状态（已排队 / 已到对方驿站 / 已投进对方会话——「已投进会话」不等于已被阅读）；讨论模式的帖不落持久队列：档位为 直投中 / 已到对方驿站 / 已投进对方会话 / 未达（待对表收敛，note 字段说明），「已排队」档不适用；系统内部回报条目不逐行列出（其条数见 reportRows）',
+    description: '查询已发消息的投递状态（已排队 / 已到对方驿站 / 已投进对方会话——「已投进会话」不等于已被阅读）；讨论模式的帖不落持久队列，两路投递（经中继投稿、降级直投）共用同一档位面：投递中 / 已到对方驿站 / 已投进对方会话 / 未达（待对表收敛，note 字段说明）——中继路径下「已到对方驿站」= 投稿达中继（成员级结果由中继聚合捎回），「已排队」档不适用；系统内部回报条目不逐行列出（其条数见 reportRows）',
     inputSchema: {
       type: 'object',
       properties: {

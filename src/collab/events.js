@@ -500,11 +500,23 @@ function handlePost(state, frame) {
     return { sessionDeliver: false };
   }
   state.counters.postsIn++;
-  if (frame.payload.relay === true && selfIsRelay(state, local) && frame.from.instanceId !== state.self.instanceId) {
-    state.counters.relaySubmissionsIn++;
-    relayRedistribute(state, local, frame);
-  }
+  handleRelaySubmission(state, local, frame);
   return undefined;
+}
+
+/* 投稿转达触发（中继侧）：标记命中 + 本机即中继 + 投稿人 ∈ 折叠成员表（单一取数面）才转达。
+ * 非成员不转达并计数——防任意知 collabId 者借中继把一帧放大为全员直投与会话注入（帖子本身的
+ * 受理 / 落盘 / 去重照旧：全信任模型的内容面不变，只堵 1→N 的放大路径）。 */
+function handleRelaySubmission(state, local, frame) {
+  if (frame.payload.relay !== true || frame.from.instanceId === state.self.instanceId || !selfIsRelay(state, local)) {
+    return;
+  }
+  if (!local.members.includes(frame.from.instanceId)) {
+    state.counters.relaySubmissionsRejected++;
+    return;
+  }
+  state.counters.relaySubmissionsIn++;
+  relayRedistribute(state, local, frame);
 }
 
 /* 冻结接收（设计 §6）：匹配 → 记下对端名单（合并并集的输入）→ 本地冻结（幂等）→ 转达

@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { collabFilePath } from '../src/paths.js';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { collabDir, collabFilePath } from '../src/paths.js';
 import { makeTempDir, waitFor } from './helpers.js';
 import { createCollabService } from '../src/collab/service.js';
 import { createDispatch } from '../src/net/dispatch.js';
@@ -517,6 +517,82 @@ test('生命周期：发起人退出（leave）= 永久放弃中继职责——�
   await waitFor(async () => ((await c.service.view({ collabId })).posts.length === 1 ? true : null));
   assert.equal((await c.service.view({ collabId })).posts[0].from.instanceId, SELF_B.instanceId);
 });
+
+test('转达面成员校验：非成员投稿（带 relay 标记）照常入列但不转达——不放大到全员直投', async (t) => {
+  const { wire, collabId, a } = await makeStudio(t);
+  const frame = forumPostFrame(collabId, { instanceId: 'inst-z', identityName: '主机Z', port: 17399 }, { postId: 'post-outsider', seq: 1, text: '陌生人的投稿' });
+  frame.payload.relay = true;
+  const admitted = await receive(a.service, frame, '127.0.0.9');
+  assert.equal(admitted.ok, true, '帖本身照常受理（内容面语义不变）');
+  const view = await a.service.view({ collabId });
+  assert.equal(view.posts.some((entry) => entry.entryId === 'post-outsider'), true, '入列落盘去重照旧');
+  assert.equal(a.service.stats().relaySubmissionsRejected, 1, '非成员投稿不转达并计数');
+  assert.equal(a.service.stats().relaySubmissionsIn, 0);
+  assert.equal(a.service.stats().relayRedistributed, 0);
+  assert.equal(wire.postsTo(SELF_C.instanceId).length, 0, '成员端点零投递（1→N 放大被堵）');
+});
+
+test('恢复检测窗口内并发第二轮对表：already-running（在途置位先于检测 await）', async (t) => {
+  let probeReachable = false;
+  const slowProbe = () => new Promise((resolve) => setTimeout(() => resolve(
+    probeReachable ? { reachable: true, rttMs: 1 } : { reachable: false, reason: '测试：探测不可达' },
+  ), 40));
+  const studio = await makeStudio(t, { probes: { [SELF_B.instanceId]: slowProbe } });
+  studio.up.delete(SELF_A.instanceId);
+  const degraded = await studio.b.service.send({ collabId: studio.collabId, text: '降级帖' });
+  assert.equal(degraded.route, 'degraded', '探测不可达 → 降级（同时置降级态）');
+  probeReachable = true;
+  const first = studio.b.service.sync({ collabId: studio.collabId });   // 不等待：首轮进入恢复检测（40ms 桩）
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const second = await studio.b.service.sync({ collabId: studio.collabId });
+  assert.equal(second.reason, 'already-running', '检测窗口内并发第二轮被拒（在途轮次唯一）');
+  const outcome = await awaitSync(first);
+  assert.notEqual(outcome.reason, 'already-running', '首轮正常收尾（未被并发判据误伤）');
+  assert.equal(studio.b.service.stats().relayRecoveries, 1, '首轮完成恢复检测');
+  const third = await awaitSync(studio.b.service.sync({ collabId: studio.collabId }));
+  assert.notEqual(third.reason, 'already-running', '置位已释放（下一轮不再 already-running）');
+});
+
+test('发起人标识入 member.json 形态校验：坏形态按既有加载语义跳过并计数，合法记录照常加载', (t) => {
+  const dir = makeTempDir(t);
+  const memberFile = collabFilePath(dir, 'collab-origin', 'member.json');
+  const member = {
+    collabId: 'collab-origin',
+    role: 'member',
+    state: 'active',
+    name: '讨论甲',
+    mode: 'forum',
+    manager: { instanceId: 'inst-a', identityName: '主机甲' },
+    roster: [{ instanceId: 'inst-a', identityName: '主机甲' }, { instanceId: 'inst-b', identityName: '主机乙' }],
+    endpoints: {},
+    decision: 'approved',
+    originator: { instanceId: 'bad id!', identityName: '主机甲' },
+  };
+  mkdirSync(collabDir(dir, 'collab-origin'), { recursive: true });
+  writeFileSync(memberFile, JSON.stringify(member));
+  const rejected = makeLoadService(dir);
+  assert.deepEqual(rejected.list(), { collabs: [] }, '坏 originator 记录按坏数据跳过');
+  assert.equal(rejected.stats().loadFailures, 1);
+  member.originator = { instanceId: 'inst-a', identityName: '主机甲' };
+  writeFileSync(memberFile, JSON.stringify(member));
+  const loaded = makeLoadService(dir);
+  assert.equal(loaded.list().collabs.length, 1, '合法记录照常加载');
+  assert.equal(loaded.list().collabs[0].collabId, 'collab-origin');
+});
+
+/* 加载面最小装配（只关心注册表恢复与计数）。 */
+function makeLoadService(dir) {
+  return createCollabService({
+    dataDir: dir,
+    config: { inviteTtlMs: DAY },
+    self: SELF_A,
+    send: () => ({ ok: true, msgId: 'q-load' }),
+    sendDirect: null,
+    probe: null,
+    knownHosts: { remember: () => {} },
+    log: quietLog(),
+  });
+}
 
 /* —— 聚合捎回（设计 §5.2「成员级投递结果由中继聚合捎回」）：真 dispatch + 真 inbound 三节点 —— */
 
