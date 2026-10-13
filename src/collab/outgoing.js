@@ -1,8 +1,8 @@
 import { isIP } from 'node:net';
-import { ID_PATTERN, MAX_COLLAB_MEMBERS, MAX_MESSAGE_TEXT_CHARS, MAX_REASON_CHARS, MAX_TOPIC_CHARS, PROTOCOL_VERSION, isIdentityName, isPort, isPresentationText, newMsgId } from '../net/protocol.js';
-import { MAX_LOCAL_COLLABS, canTransition, isArchived, newCollabId } from './model.js';
+import { COLLAB_MODES, DEFAULT_COLLAB_MODE, ID_PATTERN, MAX_COLLAB_MEMBERS, MAX_MESSAGE_TEXT_CHARS, MAX_REASON_CHARS, MAX_TOPIC_CHARS, PROTOCOL_VERSION, isCollabMode, isIdentityName, isPort, isPresentationText, newMsgId } from '../net/protocol.js';
+import { MAX_FORUM_MEMBERS, MAX_LOCAL_COLLABS, canTransition, isArchived, newCollabId } from './model.js';
 import { ledgerDigest, removeLedgerFile } from './store.js';
-import { currentManagerIdOf, isLocalArchivedState, localNameOf, localRosterOf, localStateOf, memberStateFor, persistLedger, persistMember, persistSnapshot, rememberKnownHost } from './local.js';
+import { currentManagerIdOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, memberStateFor, persistLedger, persistMember, persistSnapshot, rememberKnownHost } from './local.js';
 import { matchConflictCollabs } from './gate.js';
 
 /* 对外操作与协作态变更实现（服务公共 API 的落点）：请求来自本机会话（工具面）——
@@ -16,12 +16,13 @@ const MESSAGING_MEMBER_STATES = ['invited', 'approved', 'member'];
  * 每条治理通告的每跳只在首次收到时转达一次，重复副本不再向外扩散（本地应用仍幂等执行）。 */
 const RELAYED_ORIGINS_MAX = 256;
 
-export function createCollab(state, { name, topic, targets }) {
-  const rejected = createRejection(state, name, topic, targets);
+export function createCollab(state, { name, topic, targets, mode }) {
+  const collabMode = mode ?? DEFAULT_COLLAB_MODE;
+  const rejected = createRejection(state, name, topic, targets, collabMode);
   if (rejected !== null) {
     return { ok: false, message: rejected };
   }
-  const ledger = freshLedgerOf(state, name, topic, targets);
+  const ledger = freshLedgerOf(state, name, topic, targets, collabMode);
   const local = {
     collabId: ledger.collabId,
     role: 'manager',
@@ -50,14 +51,17 @@ export function createCollab(state, { name, topic, targets }) {
   return { ok: true, collabId: ledger.collabId, invited };
 }
 
-/* 新建台账（v1 proposed；名单 = 本机〔manager〕+ 各目标〔invited〕）。 */
-function freshLedgerOf(state, name, topic, targets) {
+/* 新建台账（v1 proposed；名单 = 本机〔manager〕+ 各目标〔invited〕；模式创建时定死）。
+ * 讨论模式的角色名沿用既有结构（发起人 = 本机管理席位）——平权语义与角色重命名归各模式链路
+ * 落地阶段，本表只保证 mode 字段随实例走。 */
+function freshLedgerOf(state, name, topic, targets, mode) {
   const now = new Date().toISOString();
   return {
     version: 1,
     collabId: newCollabId(),
     name,
     topic,
+    mode,
     status: 'proposed',
     manager: { instanceId: state.self.instanceId, identityName: state.self.identityName },
     members: [
@@ -68,6 +72,40 @@ function freshLedgerOf(state, name, topic, targets) {
     createdAt: now,
     updatedAt: now,
   };
+}
+
+/* 邀请成员加入既有的讨论（邀请入口的发送侧）：任何成员可发起是目标语义——本段落先把发起人
+ * （本机为管理席位者）侧做通：邀请帧复用既有构造、对既有 collabId 发出、重复邀请幂等（本地
+ * 成员表不由邀请动作改写——成员关系由加入事件推进）。成员侧邀请未就位：帧需随带讨论主题等
+ * 元数据，成员侧当前无处可取（待加入回填落地）；在此之前明确拒绝并指引，不代发残缺帧。 */
+export function inviteMembers(state, { collabId, targets }) {
+  const local = state.collabs.get(collabId);
+  if (local === undefined) {
+    return { ok: false, message: '本机没有该讨论（collabId 不存在）——先看 ws_list_collabs' };
+  }
+  if (localModeOf(local) !== 'forum') {
+    return { ok: false, message: `协作模式（${DEFAULT_COLLAB_MODE}）的增员补齐另立任务中——ws_invite 当前仅用于讨论模式` };
+  }
+  if (isLocalArchivedState(local)) {
+    return { ok: false, message: '讨论已结束（或已终止 / 已退出）——不再受理邀请动作' };
+  }
+  if (local.role !== 'manager') {
+    return { ok: false, message: '成员侧邀请随加入流程补齐——当前请由发起人邀请成员' };
+  }
+  const targetsRejection = targetsRejectionOf(targets, state.self.instanceId);
+  if (targetsRejection !== null) {
+    return { ok: false, message: targetsRejection };
+  }
+  if (localRosterOf(local).length >= MAX_FORUM_MEMBERS) {
+    return { ok: false, message: `该讨论成员表已达上限（${MAX_FORUM_MEMBERS}）——不再发起新邀请` };
+  }
+  const invited = [];
+  for (const target of targets) {
+    const result = sendTo(state, collabId, target.instanceId, { address: target.address, port: target.port }, 'invite', invitePayloadOf(local.ledger, targets));
+    invited.push({ instanceId: target.instanceId, ok: result.ok === true, msgId: result.msgId, reason: result.reason });
+    state.counters.invitesSent++;
+  }
+  return { ok: true, collabId, invited };
 }
 
 export function approveInvite(state, { collabId, approve, reason }) {
@@ -509,7 +547,7 @@ export function applyFreezeLocally(state, local, reason) {
   }
   const now = new Date().toISOString();
   if (local.role === 'manager') {
-    if (!canTransition(local.ledger.status, 'frozen')) {
+    if (!canTransition(local.ledger.status, 'frozen', localModeOf(local))) {
       return false;
     }
     const from = local.ledger.status;
@@ -792,6 +830,7 @@ export function managerRecordOf(ledger) {
     role: 'manager',
     state: ledger.status,
     name: ledger.name,
+    mode: ledger.mode ?? DEFAULT_COLLAB_MODE,
     manager: { instanceId: ledger.manager.instanceId, identityName: ledger.manager.identityName },
     roster: ledger.members.map((member) => ({ instanceId: member.instanceId, identityName: member.identityName })),
     endpoints: {},
@@ -799,7 +838,7 @@ export function managerRecordOf(ledger) {
   };
 }
 
-/* 成员记录（降级 / 让位的构造面）：以台账定格名单为 roster（不随台账逐次更新）。 */
+/* 成员记录（降级 / 让位的构造面）：以台账定格名单为 roster（不随台账逐次更新）；模式随本地视角定格。 */
 function memberRecordOf(local, managerPeer) {
   const status = localStateOf(local);
   const record = {
@@ -807,6 +846,7 @@ function memberRecordOf(local, managerPeer) {
     role: 'member',
     state: memberStateFor(status),
     name: localNameOf(local),
+    mode: localModeOf(local),
     manager: { instanceId: managerPeer.instanceId, identityName: managerPeer.identityName },
     roster: localRosterOf(local).map((entry) => ({ instanceId: entry.instanceId, identityName: entry.identityName })),
     endpoints: Object.fromEntries(local.endpoints),
@@ -818,11 +858,23 @@ function memberRecordOf(local, managerPeer) {
   return record;
 }
 
-export function invitePayloadOf(ledger) {
+/* 邀请帧的载荷构造（创建邀请与既有协作的增邀共用）：随带模式（被邀者据此按模式建记录；
+ * 缺省 managed = 旧行为）。extraMembers = 尚未进本地名单的本次被邀目标——被邀方须能在名单中
+ * 看到自己与邀请者（接收侧名单校验），按实例标识去重（协议层拒绝重复名单）。 */
+export function invitePayloadOf(ledger, extraMembers = []) {
+  const seen = new Set(ledger.members.map((member) => member.instanceId));
+  const members = ledger.members.map((member) => ({ instanceId: member.instanceId, identityName: member.identityName }));
+  for (const extra of extraMembers) {
+    if (!seen.has(extra.instanceId)) {
+      seen.add(extra.instanceId);
+      members.push({ instanceId: extra.instanceId, identityName: extra.identityName });
+    }
+  }
   return {
     name: ledger.name,
     topic: ledger.topic,
-    members: ledger.members.map((member) => ({ instanceId: member.instanceId, identityName: member.identityName })),
+    mode: ledger.mode ?? DEFAULT_COLLAB_MODE,
+    members,
   };
 }
 
@@ -869,14 +921,41 @@ function withdrawAll(state, local) {
   return { ok: true, scope: 'all', withdrawn: recipients.map((member) => member.instanceId) };
 }
 
-/* 创建前置检查：名与主题的呈现判据、目标形态、本机协作上限、本机同名交集冲突（防重复发起——
- * 同名且参与者有交集的协作在本机再次创建必然构成设计 §6 的冲突面，直接拒绝给出明确指引）。 */
-function createRejection(state, name, topic, targets) {
+/* 创建前置检查：模式合法后走形态面；本机同名交集冲突（防重复发起——同名且参与者有交集的协作
+ * 在本机再次创建必然构成设计 §6 的冲突面，直接拒绝给出明确指引）只施于 managed：讨论创建跳过
+ * 冲突检测（讨论不参与同名冲突匹配，任何方向）。 */
+function createRejection(state, name, topic, targets, mode) {
+  if (!isCollabMode(mode)) {
+    return `模式非法：可选值 ${COLLAB_MODES.join(' / ')}（缺省 ${DEFAULT_COLLAB_MODE}）`;
+  }
+  const shapeRejection = createShapeRejection(state, name, topic, targets, mode);
+  if (shapeRejection !== null) {
+    return shapeRejection;
+  }
+  if (mode === 'forum') {
+    return null;
+  }
+  const conflict = matchConflictCollabs(state, name, [state.self.instanceId, ...targets.map((target) => target.instanceId)]);
+  if (conflict.length > 0) {
+    return `本机已有同名且参与者有交集的协作（${conflict[0].collabId}）——请换名或先处理既有协作`;
+  }
+  return null;
+}
+
+/* 创建形态面（模式无关的判据 + 讨论参与者上限）：名 / 主题呈现判据、目标形态与去重、本机协作
+ * 总数上限。协议层名单硬顶（32）照旧校验——此处的 16 是讨论模式的策略校验点（含发起人）。 */
+function createShapeRejection(state, name, topic, targets, mode) {
   if (typeof name !== 'string' || !isIdentityName(name)) {
     return '项目名非法：需为非空、≤64 字符、不含控制 / 不可见格式 / 行段分隔字符（同身份名呈现判据）';
   }
   if (typeof topic !== 'string' || !isPresentationText(topic, MAX_TOPIC_CHARS)) {
     return `主题非法：需为非空、≤${MAX_TOPIC_CHARS} 字符的呈现文本`;
+  }
+  if (mode === 'forum') {
+    const forumRejection = forumTargetsRejection(targets);
+    if (forumRejection !== null) {
+      return forumRejection;
+    }
   }
   const targetsRejection = targetsRejectionOf(targets, state.self.instanceId);
   if (targetsRejection !== null) {
@@ -885,9 +964,13 @@ function createRejection(state, name, topic, targets) {
   if (countLiveCollabs(state) >= MAX_LOCAL_COLLABS) {
     return `本机参与协作数已达上限（${MAX_LOCAL_COLLABS}）——先结束或退出旧协作`;
   }
-  const conflict = matchConflictCollabs(state, name, [state.self.instanceId, ...targets.map((target) => target.instanceId)]);
-  if (conflict.length > 0) {
-    return `本机已有同名且参与者有交集的协作（${conflict[0].collabId}）——请换名或先处理既有协作`;
+  return null;
+}
+
+/* 讨论参与者上限（16 含发起人，设计 §9 邀请侧软约束的创建侧表达）。 */
+function forumTargetsRejection(targets) {
+  if (Array.isArray(targets) && targets.length > MAX_FORUM_MEMBERS - 1) {
+    return `讨论参与者上限 ${MAX_FORUM_MEMBERS}（含发起人）——targets 至多 ${MAX_FORUM_MEMBERS - 1} 项`;
   }
   return null;
 }

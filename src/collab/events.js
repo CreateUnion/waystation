@@ -1,8 +1,8 @@
-import { isPort } from '../net/protocol.js';
+import { DEFAULT_COLLAB_MODE, isPort } from '../net/protocol.js';
 import { MAX_BOARD_ENTRIES, isSnapshotShape } from './model.js';
 import { ledgerDigest } from './store.js';
-import { isLocalArchivedState, persistMember, persistSnapshot, rememberKnownHost } from './local.js';
-import { matchConflictCollabs } from './gate.js';
+import { isLocalArchivedState, localModeOf, persistMember, persistSnapshot, rememberKnownHost } from './local.js';
+import { matchConflictCollabs, noteForumGovernanceIgnored } from './gate.js';
 import { applyEndpoint, applyFreezeLocally, broadcastFreeze, governanceTargets, memberIdsOf, mutateLedger, relayGovernance, sendTo } from './outgoing.js';
 import { handleHandshake, handleTakeover, handleTakeoverInit, resendEffectiveTakeover, resumeLocal } from './takeover.js';
 import { handleDecision, handleMergeOutcome, handleMergeRequest, handleUnfreeze } from './freeze.js';
@@ -90,7 +90,8 @@ function isRelayedCopy(frame) {
 }
 
 /* 邀请到达（admit 已做名单 / 频率 / 上限判定）：创建本地参与记录（proposed），冲突检测命中则
- * 直接冻结本记录并广播（第一检测点，设计 §6）；两种结局都投递会话（同意门入口）。 */
+ * 直接冻结本记录并广播（第一检测点，设计 §6）；两种结局都投递会话（同意门入口）。
+ * 讨论邀请跳过冲突检测（设计 §6 实现面②）：讨论不参与同名冲突匹配，到达即建记录。 */
 function handleInvite(state, frame, meta) {
   if (state.collabs.has(frame.collabId)) {
     state.counters.invitesRejected++;
@@ -109,16 +110,19 @@ function handleInvite(state, frame, meta) {
   };
   learnInviteSource(state, local, frame, meta);
   state.counters.invitesReceived++;
-  const conflict = matchConflictCollabs(state, member.name, member.roster.map((entry) => entry.instanceId));
-  if (conflict.length > 0) {
-    freezeOnInviteConflict(state, frame, local, conflict);
-    return;
+  if (member.mode !== 'forum') {
+    const conflict = matchConflictCollabs(state, member.name, member.roster.map((entry) => entry.instanceId));
+    if (conflict.length > 0) {
+      freezeOnInviteConflict(state, frame, local, conflict);
+      return;
+    }
   }
   state.collabs.set(frame.collabId, local);
   persistMember(state, local);
 }
 
-/* 邀请定格的本地记录（roster 供冲突交集判据在成员侧取数；有效期自本地收到时刻起算）。 */
+/* 邀请定格的本地记录（roster 供冲突交集判据在成员侧取数；有效期自本地收到时刻起算）。
+ * 模式随邀请载荷定格（缺字段按 managed 解释——旧版对端不携带该字段）。 */
 function inviteRecordOf(state, frame) {
   const now = new Date().toISOString();
   return {
@@ -126,6 +130,7 @@ function inviteRecordOf(state, frame) {
     role: 'member',
     state: 'proposed',
     name: frame.payload.name,
+    mode: frame.payload.mode ?? DEFAULT_COLLAB_MODE,
     manager: { instanceId: frame.from.instanceId, identityName: frame.from.identityName },
     roster: frame.payload.members.map((entry) => ({ instanceId: entry.instanceId, identityName: entry.identityName })),
     endpoints: {},
@@ -244,8 +249,13 @@ function countResponse(state, wanted) {
 }
 
 /* 建立判定点（定案 7）：全部应邀者有终局决策且同意 ≥1 → 建立前冲突复检（第二检测点）→
- * 冻结（检出）或转 active；部分未决等待；全部拒绝保持提议中（管理者可整条撤回）。 */
+ * 冻结（检出）或转 active；部分未决等待；全部拒绝保持提议中（管理者可整条撤回）。
+ * 讨论模式不走本路径：建立 = 加入事件（个别加入制、不设 established 帧——设计 §5.1），
+ * 由加入链路推进；此处拦截以免讨论被 managed 的「收齐全票」判定提前转正。 */
 function maybeEstablish(state, local) {
+  if (localModeOf(local) === 'forum') {
+    return;
+  }
   const invited = local.ledger.members.filter((entry) => entry.role !== 'manager');
   if (invited.some((entry) => entry.state === 'invited')) {
     return;
@@ -381,10 +391,15 @@ function handleProgress(state, frame) {
 }
 
 /* 冻结接收（设计 §6）：匹配 → 记下对端名单（合并并集的输入）→ 本地冻结（幂等）→ 转达
- * （每节点对同一原帧至多一次）。 */
+ * （每节点对同一原帧至多一次）。命中讨论实例（准入已受理 + ack）：忽略并计数——冻结规程
+ * 不施于讨论、转达面也不进入（讨论无治理面）。 */
 function handleFreeze(state, frame) {
   const payload = frame.payload;
   const matched = matchConflictCollabs(state, payload.name, payload.members.map((entry) => entry.instanceId));
+  if (matched.length === 0) {
+    noteForumGovernanceIgnored(state, frame);
+    return;
+  }
   let applied = 0;
   for (const local of matched) {
     /* 帧描述的是「检出方的那条」——记录到本地其它匹配条上即对端数据（合并并集与保留方判定的输入）。 */

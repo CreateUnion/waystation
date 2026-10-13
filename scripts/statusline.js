@@ -13,6 +13,8 @@ import { ID_PATTERN } from '../src/net/protocol.js';
 
 const ROLE_LABELS = { manager: '驿丞', member: '协作者' };
 const STATE_LABELS = { proposed: '待同意', frozen: '冻结' };
+const MODE_LABELS = { managed: '协作中', forum: '讨论中' };
+const FORUM_MODE = 'forum';
 const MAX_INPUT_BYTES = 262144;   // 状态栏 JSON 体量上限：超限按解析失败处理，不做无界读
 
 async function readInput() {
@@ -49,24 +51,46 @@ function isFresh(status) {
   return Number.isFinite(updatedAtMs) && Date.now() - updatedAtMs <= SESSION_STATUS_STALE_MS;
 }
 
-function renderItem(entry) {
-  const role = ROLE_LABELS[entry?.role] ?? '协作者';
-  const parts = [role];
+/* 模式读法：缺 mode 与词表外取值一律按 managed 解释（读取侧宽容——旧文件无该字段）。 */
+function modeOf(entry) {
+  return entry?.mode === FORUM_MODE ? FORUM_MODE : 'managed';
+}
+
+/* 条目前缀：协作条目带角色（驿丞 / 协作者）；讨论条目平权、不带角色。非进行中状态带标注。 */
+function itemPartsOf(entry) {
+  const parts = [];
+  if (modeOf(entry) !== FORUM_MODE) {
+    parts.push(ROLE_LABELS[entry?.role] ?? '协作者');
+  }
   const stateLabel = STATE_LABELS[entry?.state];
   if (stateLabel !== undefined) {
     parts.push(stateLabel);
   }
-  const name = typeof entry?.name === 'string' && entry.name !== '' ? entry.name : '未命名';
-  const size = Number.isInteger(entry?.memberCount) ? `${entry.memberCount} 人` : '人数未知';
-  return `${name}（${parts.join('，')}，${size}）`;
+  return parts;
 }
 
+/* 条目渲染（「讨论中：名称（人数）」与协作条目同形——人数是两侧的关键读数）。 */
+function renderItem(entry) {
+  const parts = itemPartsOf(entry);
+  const name = typeof entry?.name === 'string' && entry.name !== '' ? entry.name : '未命名';
+  const size = Number.isInteger(entry?.memberCount) ? `${entry.memberCount} 人` : '人数未知';
+  return parts.length === 0 ? `${name}（${size}）` : `${name}（${parts.join('，')}，${size}）`;
+}
+
+/* 一行指示：按模式分段落（协作中 / 讨论中并列）——同模式的条目内以 ｜ 连接；两者皆无则不显示。 */
 function lineFromStatusFile(sessionId) {
   const status = readStatusFile(resolveDataDir(process.env), sessionId);
   if (status === null || !isFresh(status) || !Array.isArray(status.collabs) || status.collabs.length === 0) {
     return '';
   }
-  return `协作中：${status.collabs.map((entry) => renderItem(entry)).join(' ｜ ')}`;
+  const segments = [];
+  for (const mode of ['managed', FORUM_MODE]) {
+    const items = status.collabs.filter((entry) => modeOf(entry) === mode);
+    if (items.length > 0) {
+      segments.push(`${MODE_LABELS[mode]}：${items.map((entry) => renderItem(entry)).join(' ｜ ')}`);
+    }
+  }
+  return segments.join(' ｜ ');
 }
 
 function statusLineFor(inputText) {

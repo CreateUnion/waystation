@@ -14,7 +14,7 @@ import { hostsTool } from './tools/hosts.js';
 import { pingTool } from './tools/ping.js';
 import { deliveryStatusTool } from './tools/delivery-status.js';
 import { checkInboxTool } from './tools/check-inbox.js';
-import { listCollabsTool, createCollabTool, approveInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, leaveCollabTool, endCollabTool } from './tools/collab.js';
+import { listCollabsTool, createCollabTool, inviteTool, approveInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, leaveCollabTool, endCollabTool } from './tools/collab.js';
 import { decideTool, handoverTool, takeOverTool } from './tools/governance.js';
 import { createMcpServer } from './server.js';
 import { createKnownHosts } from './net/known-hosts.js';
@@ -184,7 +184,7 @@ const sessionStatus = createSessionStatusWriter({
     port: config.port,
     collabs: collab.list().collabs
       .filter(isIndicatedCollab)
-      .map((entry) => ({ collabId: entry.collabId, name: entry.name, state: entry.state, role: entry.role, memberCount: entry.memberCount })),
+      .map((entry) => ({ collabId: entry.collabId, name: entry.name, state: entry.state, role: entry.role, mode: entry.mode, memberCount: entry.memberCount })),
   }),
   log,
 });
@@ -210,6 +210,7 @@ registry.register(viewLedgerTool());
 registry.register(sendMessageTool());
 registry.register(leaveCollabTool());
 registry.register(endCollabTool());
+registry.register(inviteTool());
 registry.register(decideTool());
 registry.register(handoverTool());
 registry.register(takeOverTool());

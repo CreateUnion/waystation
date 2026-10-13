@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { DIGEST_PATTERN, ID_PATTERN, MAX_COLLAB_MEMBERS, MAX_MESSAGE_TEXT_CHARS, MAX_TOPIC_CHARS, isIdentityName, isPort, isPresentationText } from '../net/protocol.js';
+import { DEFAULT_COLLAB_MODE, DIGEST_PATTERN, ID_PATTERN, MAX_COLLAB_MEMBERS, MAX_MESSAGE_TEXT_CHARS, MAX_TOPIC_CHARS, isCollabMode, isIdentityName, isPort, isPresentationText } from '../net/protocol.js';
 
 /* 协作实例模型（设计 §6/§11）：状态集、迁移表与本地记录形态校验。
  * 本地协作文件（member.json / 台账行 / 快照）是外部输入——手改与旧数据都可能出现；
@@ -19,6 +19,9 @@ export const MAX_PENDING_INVITES = 16;
 export const MAX_LOCAL_COLLABS = 64;
 export const MAX_BOARD_ENTRIES = 200;
 export const INVITE_THROTTLE_TABLE_MAX = 64;
+/* 讨论参与者上限（设计 §9，邀请侧软约束）：成员表 ≥16 拒绝发起新邀请、创建 targets ≤15
+ *（含发起人共 16）；join / 合并不设限（保收敛）、协议层名单硬顶 MAX_COLLAB_MEMBERS 照旧。 */
+export const MAX_FORUM_MEMBERS = 16;
 
 const MEMBER_STATES = ['invited', 'approved', 'declined', 'withdrawn', 'member', 'left'];
 const ROLES = ['manager', 'member'];
@@ -29,6 +32,15 @@ const TRANSITIONS = /** @type {Record<string, string[]>} */ ({
   proposed: ['active', 'frozen', 'terminated'],
   active: ['frozen', 'completed'],
   frozen: ['proposed', 'active', 'completed', 'terminated'],
+  completed: [],
+  terminated: [],
+});
+
+/* 讨论模式的迁移表（四态去冻结，设计 §3/§4）：冻结态不可达、冻结规程不适用。
+ * 与 managed 表的差异只有冻结面——其余边同形，收敛/终态语义两模式一致。 */
+const FORUM_TRANSITIONS = /** @type {Record<string, string[]>} */ ({
+  proposed: ['active', 'terminated'],
+  active: ['completed'],
   completed: [],
   terminated: [],
 });
@@ -45,9 +57,21 @@ export function isArchived(state) {
   return typeof state === 'string' && ARCHIVED_STATES.includes(state);
 }
 
-export function canTransition(from, to) {
-  const allowed = TRANSITIONS[from];
+/* 状态迁移判定（模式相关）：mode 缺省 managed——既有调用点（治理冻结 / 解冻）零变化；
+ * 讨论实例的冻结边一律拒绝（冻结态不可达，不依赖调用方自觉避开）。 */
+export function canTransition(from, to, mode = DEFAULT_COLLAB_MODE) {
+  const table = mode === 'forum' ? FORUM_TRANSITIONS : TRANSITIONS;
+  const allowed = table[from];
   return Array.isArray(allowed) && allowed.includes(to);
+}
+
+/* 载入兼容（对照 port 缺省先例）：缺 mode 的旧记录按 managed 解释——读取侧宽容、写入侧写全。
+ * 就地补写缺省值（调用方随后按完整形态消费与落盘）。 */
+export function withDefaultMode(record) {
+  if (record.mode === undefined) {
+    record.mode = DEFAULT_COLLAB_MODE;
+  }
+  return record;
 }
 
 /* 台账对象形态（单一权威形态的校验面）：字段逐一校验；校验通过的对象可参与 digest 计算。 */
@@ -75,6 +99,9 @@ function isLedgerTailShape(ledger) {
   if (!Array.isArray(ledger.board) || !ledger.board.every(isBoardEntryShape)) {
     return false;
   }
+  if (!isModeShape(ledger)) {
+    return false;
+  }
   if (!isTimestamp(ledger.createdAt) || !isTimestamp(ledger.updatedAt)) {
     return false;
   }
@@ -91,6 +118,12 @@ function isFrozenMarksShape(record) {
     return false;
   }
   return record.frozenFrom === undefined || FROZEN_FROM_STATES.includes(record.frozenFrom);
+}
+
+/* 模式字段（可选，旧数据缺省）：缺省按 managed 解释（读取侧宽容）；出现即须为词表内取值
+ * ——脏值拒绝，不做清洗（与本文件「形态不符一律拒绝」同一思路）。 */
+function isModeShape(record) {
+  return record.mode === undefined || isCollabMode(record.mode);
 }
 
 /* 本地参与记录（member.json）：role 与 state 是本地视角；decision 缺省 null（旧字段缺失兼容）。
@@ -185,6 +218,9 @@ function isBoardEntryShape(entry) {
 }
 
 function isMemberMarksShape(record) {
+  if (!isModeShape(record)) {
+    return false;
+  }
   if (record.invitedAt !== undefined && !isTimestamp(record.invitedAt)) {
     return false;
   }

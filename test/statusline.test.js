@@ -128,6 +128,35 @@ test('多协作：以 ｜ 连接、非进行中状态带标注（冻结 / 待同
   assert.equal(run.stdout, '协作中：项目甲（协作者，冻结，2 人） ｜ 项目乙（协作者，待同意，2 人）');
 });
 
+test('讨论条目：渲染为「讨论中：名称（人数）」——不带角色、保留状态标注', async (t) => {
+  const home = makeStationDir(t);
+  writeSessionFile(home, 'session-abc-1', sessionFileOf({
+    collabs: [{ collabId: 'collab-f1', name: '联调讨论', state: 'active', role: 'manager', mode: 'forum', memberCount: 5 }],
+  }));
+  writeSessionFile(home, 'session-abc-2', sessionFileOf({
+    sessionId: 'session-abc-2',
+    collabs: [{ collabId: 'collab-f2', name: '待入讨论', state: 'proposed', role: 'member', mode: 'forum', memberCount: 2 }],
+  }));
+  const active = await runStatusline(t, { input: JSON.stringify({ session_id: 'session-abc-1' }), home });
+  assert.equal(active.code, 0);
+  assert.equal(active.stdout, '讨论中：联调讨论（5 人）');
+  const waiting = await runStatusline(t, { input: JSON.stringify({ session_id: 'session-abc-2' }), home });
+  assert.equal(waiting.stdout, '讨论中：待入讨论（待同意，2 人）');
+});
+
+test('混合条目：协作与讨论并列（各自前缀分组）、缺 mode 按 managed 解释', async (t) => {
+  const home = makeStationDir(t);
+  writeSessionFile(home, 'session-abc-1', sessionFileOf({
+    collabs: [
+      { collabId: 'collab-1', name: '项目甲', state: 'active', role: 'manager', mode: 'managed', memberCount: 3 },
+      { collabId: 'collab-f1', name: '讨论乙', state: 'active', role: 'manager', mode: 'forum', memberCount: 4 },
+      { collabId: 'collab-2', name: '项目丙', state: 'active', role: 'member', memberCount: 2 },
+    ],
+  }));
+  const run = await runStatusline(t, { input: JSON.stringify({ session_id: 'session-abc-1' }), home });
+  assert.equal(run.stdout, '协作中：项目甲（驿丞，3 人） ｜ 项目丙（协作者，2 人） ｜ 讨论中：讨论乙（4 人）');
+});
+
 test('无该会话文件：空输出、退出码 0、不写 stderr', async (t) => {
   const home = makeStationDir(t);
   const run = await runStatusline(t, { input: JSON.stringify({ session_id: 'session-none' }), home });

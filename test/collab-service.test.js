@@ -1,11 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { COLLABS_DIR_NAME, collabDir, collabFilePath } from '../src/paths.js';
 import { makeTempDir } from './helpers.js';
 import { createCollabService } from '../src/collab/service.js';
-import { LEDGER_FILE_NAME, ledgerDigest, loadLedger } from '../src/collab/store.js';
+import { LEDGER_FILE_NAME, MEMBER_FILE_NAME, appendLedger, ledgerDigest, loadLedger } from '../src/collab/store.js';
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -44,7 +44,7 @@ function peer(instanceId, identityName, port = 17321) {
   return { instanceId, identityName, port };
 }
 
-function inviteFrame({ collabId = null, manager = peer('inst-a', '主机甲'), members, name = '联调项目', topic = '发布联调', msgId = null } = {}) {
+function inviteFrame({ collabId = null, manager = peer('inst-a', '主机甲'), members, name = '联调项目', topic = '发布联调', mode, msgId = null } = {}) {
   seq++;
   const roster = members ?? [manager, peer('inst-self', '本机', 17321)];
   return {
@@ -54,8 +54,17 @@ function inviteFrame({ collabId = null, manager = peer('inst-a', '主机甲'), m
     from: { instanceId: manager.instanceId, identityName: manager.identityName, port: manager.port },
     collabId: collabId ?? `collab-${seq}`,
     ts: new Date().toISOString(),
-    payload: { name, topic, members: roster.map((entry) => ({ instanceId: entry.instanceId, identityName: entry.identityName })) },
+    payload: invitePayloadOf(name, topic, roster, mode),
   };
+}
+
+/* 邀请载荷成形：mode 给定才携带（缺字段 = 旧版对端形态——接收侧按 managed 解释）。 */
+function invitePayloadOf(name, topic, roster, mode) {
+  const payload = { name, topic, members: roster.map((entry) => ({ instanceId: entry.instanceId, identityName: entry.identityName })) };
+  if (mode !== undefined) {
+    payload.mode = mode;
+  }
+  return payload;
 }
 
 function collabFrame(type, collabId, from, payload) {
@@ -871,4 +880,247 @@ test('观测计数：未知协作拒绝 / 快照回执 / 未匹配冻结（运�
   const freezeRefused = await receive(member.service, collabFrame('freeze', 'collab-none', peer('inst-a', '主机甲'), { name: '不存在的项目', members: [{ instanceId: 'inst-a' }, { instanceId: 'inst-self' }] }));
   assert.equal(freezeRefused.ok, false);
   assert.equal(member.service.stats().freezeUnmatched, freezeBefore + 1, '与己无关的冻结通告拒绝并计数');
+});
+
+/* —— 讨论模式（模式字段、状态机裁剪、冲突隔离、邀请入口）—— */
+
+function targetOf(index) {
+  return { instanceId: `inst-${index}`, identityName: `主机${index}`, address: '127.0.0.2', port: 17321 };
+}
+
+function createForum(service, { name = '讨论甲', targets = [targetOf('b')] } = {}) {
+  const created = service.create({ name, topic: '议题', targets, mode: 'forum' });
+  assert.equal(created.ok, true, created.message);
+  return created.collabId;
+}
+
+/* 「已加入」态夹具（服务 / 协议级口径）：真实加入通路归后续任务——此处以追加合法台账行的方式
+ * 装配「进行中」，走正常加载路径（成员记录不动，管理席位状态以台账为权威）。 */
+function advanceForumToActive(made, collabId) {
+  const loaded = loadLedger(made.dir, collabId);
+  appendLedger(made.dir, { ...loaded.ledger, status: 'active', version: loaded.ledger.version + 1 });
+}
+
+test('讨论创建：mode 入台账 / 成员记录 / 列表；写入侧写全（managed 创建同样显式写 mode）', (t) => {
+  const { service, dir } = makeService(t);
+  const collabId = createForum(service);
+  const entry = service.list().collabs[0];
+  assert.equal(entry.collabId, collabId);
+  assert.equal(entry.mode, 'forum');
+  const onDisk = JSON.parse(readFileSync(collabFilePath(dir, collabId, MEMBER_FILE_NAME), 'utf8'));
+  assert.equal(onDisk.mode, 'forum');
+  assert.equal(loadLedger(dir, collabId).ledger.mode, 'forum');
+
+  const managed = service.create({ name: '协作乙', topic: '主题', targets: [targetOf('c')] });
+  assert.equal(managed.ok, true);
+  const managedEntry = service.list().collabs.find((candidate) => candidate.collabId === managed.collabId);
+  assert.equal(managedEntry.mode, 'managed', '缺 mode 按 managed 解释（写入侧同样写全）');
+  assert.equal(loadLedger(dir, managed.collabId).ledger.mode, 'managed');
+});
+
+test('讨论创建：targets 上限 15（含发起人共 16）；协议层名单硬顶 32 校验照旧', (t) => {
+  const { service, sent } = makeService(t);
+  const fifteen = Array.from({ length: 15 }, (_, index) => targetOf(`t${index}`));
+  const created = service.create({ name: '讨论甲', topic: '议题', targets: fifteen, mode: 'forum' });
+  assert.equal(created.ok, true, '15 项在限内');
+  assert.equal(sentOf(sent, 'invite', created.collabId).length, 15);
+  const overflow = service.create({ name: '讨论乙', topic: '议题', targets: [...fifteen, targetOf('t15')], mode: 'forum' });
+  assert.equal(overflow.ok, false, '第 16 项（=17 人）拒绝');
+  assert.ok(overflow.message.includes('16'), overflow.message);
+  const badMode = service.create({ name: '讨论丙', topic: '议题', targets: [targetOf('c')], mode: 'discussion' });
+  assert.equal(badMode.ok, false);
+  assert.ok(badMode.message.includes('模式非法'));
+  const managed = service.create({ name: '协作丁', topic: '主题', targets: [...fifteen, targetOf('t15')] });
+  assert.equal(managed.ok, true, 'managed 上限（31）不受讨论 16 限制');
+});
+
+test('讨论状态机：提议中→进行中→已完成 / 提议中→已终止；非法边拒绝', async (t) => {
+  const made = makeService(t);
+  const collabId = createForum(made.service);
+  assert.equal(made.service.list().collabs[0].state, 'proposed', '创建即「提议中」');
+  const earlyEnd = await made.service.end({ collabId });
+  assert.equal(earlyEnd.ok, false, '提议中不可直接结束（取消走整条撤回）');
+  advanceForumToActive(made, collabId);
+  const service = reloadService(made);
+  assert.equal(service.list().collabs[0].state, 'active', '夹具装配「进行中」后经正常加载路径恢复');
+  assert.equal(service.list().collabs[0].mode, 'forum', '模式随台账恢复');
+  const activeWithdraw = await service.withdraw({ collabId });
+  assert.equal(activeWithdraw.ok, false, '进行中不可整条撤回（结束走 end）');
+  const ended = await service.end({ collabId });
+  assert.equal(ended.ok, true);
+  const entry = service.list().collabs[0];
+  assert.equal(entry.state, 'completed');
+  assert.equal(entry.archived, true);
+  assert.equal((await service.end({ collabId })).ok, false, '终态不可再结束');
+
+  const second = makeService(t);
+  const secondId = createForum(second.service, { name: '讨论乙' });
+  const all = await second.service.withdraw({ collabId: secondId });
+  assert.equal(all.ok, true);
+  assert.equal(second.service.list().collabs[0].state, 'terminated');
+});
+
+test('讨论收冻结族帧：受理 + ack + 忽略计数、状态不变、不转达（freeze / decision 同判据）', async (t) => {
+  const { service, sent } = makeService(t);
+  createForum(service);
+  sent.length = 0;
+  const members = [peer('inst-c', '主机丙'), peer('inst-self', '本机', 17321)];
+  const freeze = collabFrame('freeze', 'collab-remote', peer('inst-c', '主机丙'), { name: '讨论甲', members, reason: '同名冲突' });
+  const admitted = await receive(service, freeze);
+  assert.equal(admitted.ok, true, '讨论命中的冻结帧：受理 + ack（防治理重试钉死）');
+  assert.equal(service.list().collabs[0].state, 'proposed', '讨论不被冻结（冻结态不可达）');
+  assert.equal(service.stats().forumGovernanceIgnored, 1);
+  assert.equal(service.stats().freezeApplied, 0);
+  assert.equal(sentOf(sent, 'freeze').length, 0, '讨论不转达冻结帧');
+  const decision = collabFrame('decision', 'collab-remote', peer('inst-c', '主机丙'), { choice: 'terminate', name: '讨论甲', members, executed: true });
+  const decisionAdmitted = await receive(service, decision);
+  assert.equal(decisionAdmitted.ok, true);
+  assert.equal(service.stats().forumGovernanceIgnored, 2);
+  assert.equal(service.list().collabs[0].state, 'proposed', '终结裁定不施于讨论');
+  assert.equal(service.stats().freezeTerminatedLocal, 0);
+  const unrelated = collabFrame('freeze', 'collab-none', peer('inst-z', '主机Z'), { name: '不相干项目', members: [{ instanceId: 'inst-z' }, { instanceId: 'inst-w' }] });
+  assert.equal((await receive(service, unrelated)).ok, false, '与讨论也无关的冻结帧照旧拒绝（不滥 ack）');
+});
+
+test('冲突隔离①：managed 检出（邀请到达 / 建立前复检）不命中同名讨论', async (t) => {
+  const { service } = makeService(t);
+  createForum(service);
+  const incoming = inviteFrame({ collabId: 'collab-m', name: '讨论甲', manager: peer('inst-d', '主机丁'), members: [peer('inst-d', '主机丁'), peer('inst-self', '本机', 17321)] });
+  const admitted = await receive(service, incoming);
+  assert.equal(admitted.ok, true);
+  const forumEntry = service.list().collabs.find((entry) => entry.mode === 'forum');
+  assert.equal(forumEntry.state, 'proposed', '同名 managed 邀请到达：讨论不被连带冻结');
+  const managedEntry = service.list().collabs.find((entry) => entry.collabId === 'collab-m');
+  assert.equal(managedEntry.state, 'proposed', '新到 managed 邀请不因同名讨论被检出冻结');
+  assert.equal(service.stats().freezeDetected, 0);
+});
+
+test('冲突隔离②：讨论创建与讨论邀请跳过冲突检测（同名 managed 在场）', async (t) => {
+  const { service } = makeService(t);
+  const managed = service.create({ name: '讨论甲', topic: '主题', targets: [targetOf('b')] });
+  assert.equal(managed.ok, true);
+  const forumId = service.create({ name: '讨论甲', topic: '议题', targets: [targetOf('c')], mode: 'forum' });
+  assert.equal(forumId.ok, true, '同名 managed 在场：讨论创建不拒绝、不触发冻结');
+  assert.equal(service.stats().freezeDetected, 0);
+
+  const member = makeService(t);
+  await receive(member.service, inviteFrame({ collabId: 'collab-m9', name: '讨论甲' }));
+  const forumAdmitted = await receive(member.service, inviteFrame({ collabId: 'collab-f9', name: '讨论甲', mode: 'forum' }));
+  assert.equal(forumAdmitted.ok, true);
+  const states = Object.fromEntries(member.service.list().collabs.map((entry) => [entry.collabId, entry.state]));
+  assert.equal(states['collab-f9'], 'proposed', '讨论邀请到达不触发冲突冻结');
+  assert.equal(states['collab-m9'], 'proposed', '既有同名 managed 记录不被讨论邀请连带冻结');
+  assert.equal(member.service.stats().freezeDetected, 0);
+
+  const reverse = makeService(t);
+  const forum = reverse.service.create({ name: '讨论甲', topic: '议题', targets: [targetOf('b')], mode: 'forum' });
+  assert.equal(forum.ok, true);
+  const managedAfter = reverse.service.create({ name: '讨论甲', topic: '主题', targets: [targetOf('c')] });
+  assert.equal(managedAfter.ok, true, '讨论不参与匹配：不阻挠同名 managed 创建（任何方向）');
+});
+
+test('冲突隔离③：建立前复检不命中同名讨论（managed 正常建立、讨论不被连带冻结）', async (t) => {
+  const made = makeService(t);
+  const forumId = createForum(made.service);
+  const managed = made.service.create({ name: '讨论甲', topic: '主题', targets: [targetOf('b'), targetOf('c')] });
+  assert.equal(managed.ok, true);
+  await receive(made.service, collabFrame('approve', managed.collabId, peer('inst-b', '主机乙'), {}));
+  await receive(made.service, collabFrame('approve', managed.collabId, peer('inst-c', '主机丙'), {}));
+  const states = Object.fromEntries(made.service.list().collabs.map((entry) => [entry.collabId, entry.state]));
+  assert.equal(states[managed.collabId], 'active', '同名讨论在场不阻挠 managed 建立');
+  assert.equal(states[forumId], 'proposed', '讨论不被建立前复检连带冻结');
+  assert.equal(made.service.stats().freezeDetected, 0);
+});
+
+test('载入兼容：缺 mode 的旧成员记录 / 旧台账 / 旧邀请一律按 managed 解释', async (t) => {
+  const made = makeService(t);
+  const managed = made.service.create({ name: '协作甲', topic: '主题', targets: [targetOf('b')] });
+  /* 旧数据回放：把落盘记录与台账行里的 mode 剥掉（模拟旧版写出），重载后语义应为 managed。 */
+  const memberPath = collabFilePath(made.dir, managed.collabId, MEMBER_FILE_NAME);
+  const member = JSON.parse(readFileSync(memberPath, 'utf8'));
+  delete member.mode;
+  writeFileSync(memberPath, JSON.stringify(member));
+  const ledgerPath = collabFilePath(made.dir, managed.collabId, LEDGER_FILE_NAME);
+  const legacyLedger = loadLedger(made.dir, managed.collabId).ledger;
+  delete legacyLedger.mode;
+  writeFileSync(ledgerPath, `${JSON.stringify(legacyLedger)}\n`);
+  const reloaded = reloadService(made);
+  assert.equal(reloaded.list().collabs[0].mode, 'managed', '缺 mode 的旧记录按 managed 解释');
+  assert.equal(reloaded.count(), 1, '载入兼容不丢记录');
+
+  const memberSide = makeService(t);
+  await receive(memberSide.service, inviteFrame({ collabId: 'collab-old' }));
+  assert.equal(memberSide.service.list().collabs[0].mode, 'managed', '旧版邀请（无 mode 字段）→ managed');
+  await receive(memberSide.service, inviteFrame({ collabId: 'collab-new', mode: 'forum' }));
+  assert.equal(memberSide.service.list().collabs.find((entry) => entry.collabId === 'collab-new').mode, 'forum');
+});
+
+test('ws_invite：向既有讨论发邀请帧（模式随载荷、目标并入名单去重、重复邀请幂等、不改本地成员表）', async (t) => {
+  const { service, sent } = makeService(t);
+  const collabId = createForum(service);
+  sent.length = 0;
+  const target = targetOf('c');
+  const result = await service.invite({ collabId, targets: [target] });
+  assert.equal(result.ok, true);
+  const invites = sentOf(sent, 'invite', collabId);
+  assert.equal(invites.length, 1);
+  assert.equal(invites[0].to.instanceId, 'inst-c');
+  assert.equal(invites[0].payload.mode, 'forum');
+  assert.equal(invites[0].payload.name, '讨论甲');
+  assert.equal(invites[0].payload.topic, '议题');
+  assert.deepEqual(invites[0].payload.members, [
+    { instanceId: 'inst-self', identityName: '本机' },
+    { instanceId: 'inst-b', identityName: '主机b' },
+    { instanceId: 'inst-c', identityName: '主机c' },
+  ]);
+  const again = await service.invite({ collabId, targets: [target] });
+  assert.equal(again.ok, true, '重复邀请幂等（重发帧、不报错）');
+  const second = sentOf(sent, 'invite', collabId)[1];
+  assert.equal(new Set(second.payload.members.map((entry) => entry.instanceId)).size, 3, '并集去重（协议层拒绝重复名单）');
+  const entry = service.list().collabs[0];
+  assert.equal(entry.memberCount, 2, '邀请动作不改本地成员表（成员关系由加入事件推进）');
+  assert.equal(entry.mode, 'forum', '模式创建时定死、不可变');
+});
+
+test('ws_invite：16 软约束（邀请侧）——成员表 16 人（夹具装配）拒绝新邀请并提示', async (t) => {
+  /* 夹具口径：本任务无加入通路，「折叠成员表」以创建名单装配——发起人 + 15 名受邀者 = 16。
+   * 邀请侧上限独立于创建名单变化（并发补位可暂到 17 属设计已披露的软约束边界）。 */
+  const { service } = makeService(t);
+  const fifteen = Array.from({ length: 15 }, (_, index) => targetOf(`t${index}`));
+  const collabId = createForum(service, { targets: fifteen });
+  assert.equal(service.list().collabs[0].memberCount, 16, '夹具：成员表 16 人');
+  const invited = await service.invite({ collabId, targets: [targetOf('x')] });
+  assert.equal(invited.ok, false);
+  assert.ok(invited.message.includes('上限'), invited.message);
+
+  const roomy = makeService(t);
+  const roomyId = createForum(roomy.service, { targets: fifteen.slice(0, 14) });
+  assert.equal(roomy.service.list().collabs[0].memberCount, 15);
+  assert.equal((await roomy.service.invite({ collabId: roomyId, targets: [targetOf('x')] })).ok, true, '15 人成员表仍可邀请');
+});
+
+test('ws_invite：managed / 未知 / 归档 / 成员侧 / 目标形态一律明确拒绝并指引', async (t) => {
+  const { service } = makeService(t);
+  const managed = service.create({ name: '协作甲', topic: '主题', targets: [targetOf('b')] });
+  const onManaged = await service.invite({ collabId: managed.collabId, targets: [targetOf('c')] });
+  assert.equal(onManaged.ok, false);
+  assert.ok(onManaged.message.includes('managed'), onManaged.message);
+  const unknown = await service.invite({ collabId: 'collab-none', targets: [targetOf('c')] });
+  assert.equal(unknown.ok, false);
+  assert.ok(unknown.message.includes('没有该讨论'));
+
+  const collabId = createForum(service);
+  const badTargets = await service.invite({ collabId, targets: [] });
+  assert.equal(badTargets.ok, false);
+  assert.ok(badTargets.message.includes('目标'));
+  await service.withdraw({ collabId });
+  const archived = await service.invite({ collabId, targets: [targetOf('c')] });
+  assert.equal(archived.ok, false);
+  assert.ok(archived.message.includes('不再受理'), archived.message);
+
+  const memberSide = makeService(t);
+  await receive(memberSide.service, inviteFrame({ collabId: 'collab-f8', mode: 'forum' }));
+  const onMember = await memberSide.service.invite({ collabId: 'collab-f8', targets: [targetOf('c')] });
+  assert.equal(onMember.ok, false);
+  assert.ok(onMember.message.includes('发起人'), onMember.message);
 });

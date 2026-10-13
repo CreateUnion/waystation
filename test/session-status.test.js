@@ -225,6 +225,60 @@ after(() => {
   assert.equal(leakedPids.length, 0, `站点进程未被用例收尾（收尾钩子被跳过？）：${leakedPids.join(',')}——已兜底强制杀灭，检查用例清理`);
 });
 
+/* 成员记录磁盘夹具（会话状态文件的模式标签来自真实载入路径）：mode 缺省不写 = 旧版记录形态。 */
+function writeMemberFixture(home, { collabId, name, mode }) {
+  const now = new Date().toISOString();
+  const record = {
+    collabId,
+    role: 'member',
+    state: 'proposed',
+    name,
+    manager: { instanceId: 'inst-a', identityName: '主机甲' },
+    roster: [{ instanceId: 'inst-a', identityName: '主机甲' }, { instanceId: 'inst-self', identityName: '本机' }],
+    endpoints: {},
+    invitedAt: now,
+    expiresAt: new Date(Date.parse(now) + 86400000).toISOString(),
+    decision: null,
+  };
+  if (mode !== undefined) {
+    record.mode = mode;
+  }
+  mkdirSync(join(home, 'collabs', collabId), { recursive: true });
+  writeFileSync(join(home, 'collabs', collabId, 'member.json'), JSON.stringify(record));
+}
+
+test('进程级：讨论参与随模式标签进入会话状态文件（缺 mode 的旧记录按 managed 解释）', { timeout: 30000 }, async (t) => {
+  const home = makeStationDir(t);
+  const port = await pickFreePort();
+  writeFileSync(join(home, 'config.json'), JSON.stringify({ port, scanWindowMs: 300, dialTimeoutMs: 1500 }));
+  writeMemberFixture(home, { collabId: 'collab-forum-fx', name: '联调讨论', mode: 'forum' });
+  writeMemberFixture(home, { collabId: 'collab-legacy-fx', name: '联调项目' });
+  const sessionId = 'session-forum-fx';
+  const child = spawn(process.execPath, [join(repoRoot, 'src', 'index.js')], {
+    cwd: repoRoot,
+    env: { ...process.env, WAYSTATION_HOME: home, CLAUDE_CODE_SESSION_ID: sessionId },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  registerChild(t, child);
+  const file = sessionFilePath(home, sessionId);
+  await waitFor(() => (existsSync(file) ? true : null), { timeoutMs: 15000 });
+  const payload = JSON.parse(readFileSync(file, 'utf8'));
+  const byId = Object.fromEntries(payload.collabs.map((entry) => [entry.collabId, entry]));
+  assert.equal(byId['collab-forum-fx'].mode, 'forum', '讨论条目带模式标签');
+  assert.equal(byId['collab-forum-fx'].state, 'proposed');
+  assert.equal(byId['collab-forum-fx'].memberCount, 2);
+  assert.equal(byId['collab-legacy-fx'].mode, 'managed', '缺 mode 的旧记录按 managed 解释');
+  child.stdin.end();
+  const exit = await new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), 15000);
+    child.once('exit', (code) => {
+      clearTimeout(timer);
+      resolve(code);
+    });
+  });
+  assert.equal(exit, 0);
+});
+
 test('进程级：会话标识经环境注入 → 文件出现且字段正确；stdin 关闭 → 进程退出并清除文件', { timeout: 30000 }, async (t) => {
   const home = makeStationDir(t);
   const port = await pickFreePort();

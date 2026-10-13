@@ -261,6 +261,19 @@ test('协作域 invite：合法通过（中文名、主题、成员 2 项）', (
   assert.equal(validateMessage(collabFrame('invite', { name: '联调项目', topic: '发布联调', members })).ok, true);
 });
 
+test('协作域 invite：mode 可选（缺省 = managed 旧行为）、词表内通过、词表外拒', () => {
+  const members = [{ instanceId: 'inst-a', identityName: '甲' }, { instanceId: 'inst-b', identityName: '乙' }];
+  const base = { name: '项目', topic: '主题', members };
+  assert.equal(validateMessage(collabFrame('invite', base)).ok, true, '缺 mode（旧版对端）通过');
+  assert.equal(validateMessage(collabFrame('invite', { ...base, mode: 'managed' })).ok, true);
+  assert.equal(validateMessage(collabFrame('invite', { ...base, mode: 'forum' })).ok, true);
+  for (const mode of ['discussion', '', 42, null]) {
+    const checked = validateMessage(collabFrame('invite', { ...base, mode }));
+    assert.equal(checked.ok, false, String(mode));
+    assert.ok(checked.reason.includes('invite.mode'), checked.reason);
+  }
+});
+
 test('协作域 invite：name 非法逐拒（控制字符 / 超 64 字符 / 空串 / 缺字段）', () => {
   const members = [{ instanceId: 'inst-a', identityName: '甲' }, { instanceId: 'inst-b', identityName: '乙' }];
   for (const name of ['甲\n乙', 'x'.repeat(65), '', undefined]) {

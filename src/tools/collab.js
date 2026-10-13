@@ -1,5 +1,5 @@
 import { isIP } from 'node:net';
-import { ID_PATTERN, MAX_COLLAB_MEMBERS, isIdentityName, isPort } from '../net/protocol.js';
+import { COLLAB_MODES, DEFAULT_COLLAB_MODE, ID_PATTERN, MAX_COLLAB_MEMBERS, isCollabMode, isIdentityName, isPort } from '../net/protocol.js';
 
 /* 协作工具集（设计 §10 工具最小集的协作核心期落点）：薄层——只做参数形态校验
  * （非空字符串 / 布尔 / 数组 / 整数 / 身份名）与输出封装；业务判定（状态门控、冻结白名单、
@@ -10,6 +10,18 @@ import { ID_PATTERN, MAX_COLLAB_MEMBERS, isIdentityName, isPort } from '../net/p
 export const SEND_MESSAGE_TYPES = ['topic', 'task', 'progress', 'issue', 'stop', 'reply'];
 
 const MAX_TARGETS = MAX_COLLAB_MEMBERS - 1;   // 目标上限 = 名单上限减发起者本人（单一权威：protocol.MAX_COLLAB_MEMBERS）
+
+/* 被邀请目标的条目 schema（创建邀请与增邀两工具共用同一形状；上线前的形态把关）。 */
+const TARGET_ITEM_SCHEMA = {
+  type: 'object',
+  properties: {
+    instanceId: { type: 'string', description: '目标驿站实例标识（取自 ws_list_hosts）' },
+    identityName: { type: 'string', description: '目标身份名（取自 ws_list_hosts；进邀请名单与同意门）' },
+    address: { type: 'string', description: '目标地址（IP 字面量）' },
+    port: { type: 'integer', description: '目标端口（取自 ws_list_hosts 的端点）' },
+  },
+  required: ['instanceId', 'identityName', 'address', 'port'],
+};
 
 export function listCollabsTool() {
   return {
@@ -23,26 +35,14 @@ export function listCollabsTool() {
 export function createCollabTool() {
   return {
     name: 'ws_create_collab',
-    description: '发起协作：向选中目标并行发出邀请（对方在同意门点头后自动建立）；目标取自 ws_list_hosts 的实例标识与端点',
+    description: '发起协作或讨论（模式创建时定死、不可变）：向选中目标并行发出邀请（对方在同意门点头后加入）；目标取自 ws_list_hosts 的实例标识与端点',
     inputSchema: {
       type: 'object',
       properties: {
         name: { type: 'string', description: '项目名（必填；同身份名呈现判据，≤64 字符）' },
         topic: { type: 'string', description: '主题描述（必填；≤200 字符）' },
-        targets: {
-          type: 'array',
-          description: `被邀请目标（1–${MAX_TARGETS} 项）`,
-          items: {
-            type: 'object',
-            properties: {
-              instanceId: { type: 'string', description: '目标驿站实例标识（取自 ws_list_hosts）' },
-              identityName: { type: 'string', description: '目标身份名（取自 ws_list_hosts；进邀请名单与同意门）' },
-              address: { type: 'string', description: '目标地址（IP 字面量）' },
-              port: { type: 'integer', description: '目标端口（取自 ws_list_hosts 的端点）' },
-            },
-            required: ['instanceId', 'identityName', 'address', 'port'],
-          },
-        },
+        mode: { type: 'string', description: `模式（可选，缺省 ${DEFAULT_COLLAB_MODE}）：${COLLAB_MODES.join(' / ')}——forum（讨论）参与者至多 16（含发起人）` },
+        targets: { type: 'array', description: `被邀请目标（1–${MAX_TARGETS} 项；讨论模式至多 15 项）`, items: TARGET_ITEM_SCHEMA },
       },
       required: ['name', 'topic', 'targets'],
     },
@@ -52,13 +52,48 @@ export function createCollabTool() {
       if (name === '' || topic === '') {
         return errorResult('参数 name / topic 非法：需要非空白字符串（项目名与主题描述）');
       }
+      const mode = args.mode === undefined ? DEFAULT_COLLAB_MODE : args.mode;
+      if (!isCollabMode(mode)) {
+        return errorResult(`参数 mode 非法：可选值为 ${COLLAB_MODES.join(' / ')}（缺省 ${DEFAULT_COLLAB_MODE}）`);
+      }
       const targets = targetsArg(args);
       if (targets === null) {
-        return errorResult(`参数 targets 非法：需要 1–${MAX_TARGETS} 项 { instanceId, identityName, address, port }（地址为 IP 字面量、端口为 1–65535 整数）`);
+        return errorResult(targetsErrorMessage());
       }
-      return resultOf(await context.collab.create({ name, topic, targets }));
+      return resultOf(await context.collab.create({ name, topic, targets, mode }));
     },
   };
+}
+
+export function inviteTool() {
+  return {
+    name: 'ws_invite',
+    description: '邀请成员加入既有讨论（对既有讨论发出，重复邀请幂等）——协作（managed）的增员补齐另立任务中，本工具当前仅用于讨论',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        collabId: { type: 'string', description: '讨论标识（取自 ws_list_collabs 的 mode=forum 条目）' },
+        targets: { type: 'array', description: `被邀请目标（1–${MAX_TARGETS} 项）`, items: TARGET_ITEM_SCHEMA },
+      },
+      required: ['collabId', 'targets'],
+    },
+    handler: async (args, context) => {
+      const collabId = collabIdArg(args);
+      if (collabId === null) {
+        return errorResult('参数 collabId 非法：需要非空白字符串');
+      }
+      const targets = targetsArg(args);
+      if (targets === null) {
+        return errorResult(targetsErrorMessage());
+      }
+      return resultOf(await context.collab.invite({ collabId, targets }));
+    },
+  };
+}
+
+/* targets 非法时的统一文案（两工具共用——形状与上限同一权威）。 */
+function targetsErrorMessage() {
+  return `参数 targets 非法：需要 1–${MAX_TARGETS} 项 { instanceId, identityName, address, port }（地址为 IP 字面量、端口为 1–65535 整数）`;
 }
 
 export function approveInviteTool() {
@@ -215,7 +250,7 @@ export function endCollabTool() {
   };
 }
 
-/* 工具返回口径（16 工具单一权威）：成功 = 顶层含 ok:true 的 JSON 对象（列表载荷用命名字段承载：
+/* 工具返回口径（17 工具单一权威）：成功 = 顶层含 ok:true 的 JSON 对象（列表载荷用命名字段承载：
  * hosts / rows / collabs）；失败 = errorResult 纯文案 + isError。新增工具一律照此。 */
 export function okResult(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };

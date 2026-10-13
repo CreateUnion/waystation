@@ -1,3 +1,4 @@
+import { DEFAULT_COLLAB_MODE } from '../net/protocol.js';
 import { appendLedger, ensureCollabDir, saveMember, saveSnapshot } from './store.js';
 import { isArchived } from './model.js';
 
@@ -7,6 +8,13 @@ import { isArchived } from './model.js';
 
 export function localStateOf(local) {
   return local.role === 'manager' ? local.ledger.status : local.member.state;
+}
+
+/* 模式读法（两侧视角统一）：管理席位取台账、成员取本地记录；缺省 managed（旧数据兼容，
+ * 创建时定死不可变——本函数是全部模式判定的单一入口）。 */
+export function localModeOf(local) {
+  const raw = local.role === 'manager' ? local.ledger.mode : local.member.mode;
+  return raw ?? DEFAULT_COLLAB_MODE;
 }
 
 export function isLocalArchivedState(local) {

@@ -1,5 +1,5 @@
 import { CONFLICT_STATES, INVITE_THROTTLE_TABLE_MAX, MAX_PENDING_INVITES } from './model.js';
-import { isLocalArchivedState, localNameOf, localRosterOf, localStateOf } from './local.js';
+import { isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf } from './local.js';
 
 /* 入站门控（admit 决策）：invite 与「冲突裁定族」（freeze / unfreeze / decision）不按 collabId
  * 已知性判定（首个接触点 / 跨协作匹配——裁定帧的 collabId 是执行方那条，须按名匹配）；
@@ -42,12 +42,35 @@ export function decideAdmission(state, frame, meta) {
 }
 
 /* 同名 + 成员交集的匹配面（设计 §6 判据的机器化）：冻结通告、冲突检测、转达目标共用。
- * memberIds 传「完整参与者集合」（含发起者）——判据是两条协作的参与者集合有交集。 */
+ * memberIds 传「完整参与者集合」（含发起者）——判据是两条协作的参与者集合有交集。
+ * 模式隔离（设计 §6）：冲突匹配只取 managed 实例——讨论不参与同名冲突匹配（任何方向：
+ * 不冻结别人、也不被人冻结；跨模式同名视为不同实例）。 */
 export function matchConflictCollabs(state, name, memberIds) {
+  return collabsMatchingName(state, name, memberIds, 'managed');
+}
+
+/* 讨论侧同名匹配：冻结流程帧的「忽略 + 受理」判定用——同判据、只取讨论实例。 */
+export function matchForumCollabs(state, name, memberIds) {
+  return collabsMatchingName(state, name, memberIds, 'forum');
+}
+
+/* 冻结族帧命中讨论实例的忽略计数（消费侧，与准入侧的受理 + ack 配对）：命中返回 true。
+ * 冻结规程不施于讨论、讨论无治理面——忽略即正确处理（设计 §6；只可能来自同名 managed 邻域
+ * 的广播，跨模式同名视为不同实例）。 */
+export function noteForumGovernanceIgnored(state, frame) {
+  const memberIds = frame.payload.members.map((member) => member.instanceId);
+  if (matchForumCollabs(state, frame.payload.name, memberIds).length === 0) {
+    return false;
+  }
+  state.counters.forumGovernanceIgnored++;
+  return true;
+}
+
+function collabsMatchingName(state, name, memberIds, mode) {
   const ids = new Set(memberIds);
   const matched = [];
   for (const local of state.collabs.values()) {
-    if (!CONFLICT_STATES.includes(localStateOf(local))) {
+    if (localModeOf(local) !== mode || !CONFLICT_STATES.includes(localStateOf(local))) {
       continue;
     }
     const roster = localRosterOf(local);
@@ -88,14 +111,19 @@ function admitInvite(state, frame, meta) {
 }
 
 /* 冲突裁定族（freeze / unfreeze / decision）的准入：同名 + 成员交集匹配本地在册协作
- * （裁定帧的 collabId 是执行方那条——按名匹配，与冻结检出的判据同一权威）。 */
+ * （裁定帧的 collabId 是执行方那条——按名匹配，与冻结检出的判据同一权威）。
+ * 讨论实例命中（设计 §6）：受理 + ack，忽略与计数在消费侧（冻结流程帧只可能来自同名 managed
+ * 邻域的广播，跨模式同名视为不同实例）；受理而非拒绝是为了不让邻域的治理重试被无 ack 钉死。 */
 function admitConflictFrame(state, frame) {
-  const matched = matchConflictCollabs(state, frame.payload.name, frame.payload.members.map((member) => member.instanceId));
-  if (matched.length === 0) {
-    state.counters.freezeUnmatched++;
-    return { ok: false, reason: '冻结 / 裁定通告与本机协作无匹配（与己无关，忽略）' };
+  const memberIds = frame.payload.members.map((member) => member.instanceId);
+  if (matchConflictCollabs(state, frame.payload.name, memberIds).length > 0) {
+    return { ok: true };
   }
-  return { ok: true };
+  if (matchForumCollabs(state, frame.payload.name, memberIds).length > 0) {
+    return { ok: true };
+  }
+  state.counters.freezeUnmatched++;
+  return { ok: false, reason: '冻结 / 裁定通告与本机协作无匹配（与己无关，忽略）' };
 }
 
 /* 待回应邀请数：成员侧 proposed 且未回应的本地记录（管理席位自己发起的提议中协作不算挂起）。 */

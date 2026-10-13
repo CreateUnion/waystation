@@ -1,7 +1,7 @@
 import { MAX_BOARD_ENTRIES, canTransition, isLedgerShape } from './model.js';
 import { inferredFrozenFrom, isLocalArchivedState, localNameOf, localRosterOf, localStateOf, persistMember } from './local.js';
 import { ledgerDigest } from './store.js';
-import { matchConflictCollabs } from './gate.js';
+import { matchConflictCollabs, noteForumGovernanceIgnored } from './gate.js';
 import { endpointFor, governanceTargets, invitePayloadOf, mutateLedger, notifyLocal, relayGovernance, sendTo, sendToRoster } from './outgoing.js';
 
 /* 冻结裁定流（设计 §6 的补全）：合并 / 保持两条 / 终止的执行、unfreeze 处理、48 小时单方处置提示、
@@ -251,6 +251,9 @@ export async function handleDecision(state, frame) {
   const memberIds = payload.members.map((entry) => entry.instanceId);
   const matched = matchConflictCollabs(state, payload.name, memberIds);
   if (matched.length === 0) {
+    if (noteForumGovernanceIgnored(state, frame)) {
+      return;
+    }
     state.counters.freezeUnmatched++;
     return;
   }
@@ -353,6 +356,9 @@ export async function handleUnfreeze(state, frame) {
   const payload = frame.payload;
   const matched = matchConflictCollabs(state, payload.name, payload.members.map((entry) => entry.instanceId));
   if (matched.length === 0) {
+    if (noteForumGovernanceIgnored(state, frame)) {
+      return;
+    }
     state.counters.freezeUnmatched++;
     return;
   }

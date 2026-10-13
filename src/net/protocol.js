@@ -19,6 +19,16 @@ export const MAX_COLLAB_COUNT = 1000000;
  * 形态上排除路径穿越（与 paths.collabDir 的守卫同一权威）。 */
 export const ID_PATTERN = /^[0-9a-zA-Z-]{1,64}$/;
 
+/* 协作模式（设计 §3）：managed = 协作（缺省、兼容旧行为）、forum = 讨论（无主平权）。
+ * 模式在创建时定死、不可变；缺字段按 managed 解释（读取侧宽容——对照 port 缺省先例）。
+ * 版本一致性：旧版对端会忽略 mode 字段、也不认识讨论新增帧类型——讨论模式要求参与者同版本。 */
+export const COLLAB_MODES = ['managed', 'forum'];
+export const DEFAULT_COLLAB_MODE = 'managed';
+
+export function isCollabMode(value) {
+  return typeof value === 'string' && COLLAB_MODES.includes(value);
+}
+
 /* 消息类型最小集（设计 §10）+ 投递可靠性所必需的确认帧 ack。
  * 类型集是两端契约：未知类型一律拒绝（版本不匹配或伪造）。 */
 export const MESSAGE_TYPES = [
@@ -274,6 +284,9 @@ const COLLAB_PAYLOAD_RULES = {
 function validateInvitePayload(payload) {
   if (!isPlainObject(payload)) {
     return refuse('invite 缺少 payload');
+  }
+  if (payload.mode !== undefined && !isCollabMode(payload.mode)) {
+    return refuse(`invite.mode 非法（可选值：${COLLAB_MODES.join(' / ')}；缺省 ${DEFAULT_COLLAB_MODE}）`);
   }
   if (!isIdentityName(payload.name)) {
     return refuse('invite.name 非法（项目名，同身份名呈现判据）');

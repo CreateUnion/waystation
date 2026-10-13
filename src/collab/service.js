@@ -1,9 +1,9 @@
 import { listLocalCollabIds, loadLedger, loadMember, loadSnapshot, quarantineLedger } from './store.js';
-import { isArchived } from './model.js';
+import { isArchived, withDefaultMode } from './model.js';
 import { decideAdmission } from './gate.js';
 import { handleEvent } from './events.js';
-import { localNameOf, localRosterOf, localStateOf, persistLedger } from './local.js';
-import { approveInvite, countLiveCollabs, createCollab, endCollab, leaveCollab, sendMessage, viewLedger, withdrawInvite } from './outgoing.js';
+import { localModeOf, localNameOf, localRosterOf, localStateOf, persistLedger } from './local.js';
+import { approveInvite, countLiveCollabs, createCollab, endCollab, inviteMembers, leaveCollab, sendMessage, viewLedger, withdrawInvite } from './outgoing.js';
 import { HANDSHAKE_REPLY_TIMEOUT_MS, TAKEOVER_PROBE_INTERVAL_MS, runHandshake, startLiveness, stopLiveness, takeOver } from './takeover.js';
 import { decide, decideMergeOffer } from './freeze.js';
 import { HANDOVER_CONFIRM_TIMEOUT_MS, handover } from './handover.js';
@@ -94,6 +94,7 @@ function apiOf(state) {
     handover: (input) => handover(state, input),
     list: () => listCollabs(state),
     create: (input) => createCollab(state, input),
+    invite: (input) => inviteMembers(state, input),
     approve: (input) => approveInvite(state, input),
     withdraw: (input) => withdrawInvite(state, input),
     send: (input) => sendMessage(state, input),
@@ -152,11 +153,14 @@ function loadRegistry(state) {
   }
 }
 
+/* 载入兼容：缺 mode 的旧记录按 managed 解释（读取侧宽容、写入侧写全——对照 port 缺省先例；
+ * 就地补缺省值，后续落盘即写全）。快照内嵌台账不做补写（其 digest 与内容自洽，改动会破坏一致性）。 */
 function loadOne(state, collabId) {
   const member = loadMember(state.dataDir, collabId);
   if (member === null) {
     throw new Error('缺少可用的成员记录（member.json）');
   }
+  withDefaultMode(member);
   const local = {
     collabId,
     role: member.role,
@@ -178,7 +182,7 @@ function loadOne(state, collabId) {
 function recoverLedger(state, collabId, local) {
   const loaded = loadLedger(state.dataDir, collabId);
   if (loaded.ledger !== null) {
-    return loaded.ledger;
+    return withDefaultMode(loaded.ledger);
   }
   if (loaded.corrupt) {
     state.counters.ledgerCorrupt++;
@@ -194,7 +198,9 @@ function recoverLedger(state, collabId, local) {
 
 function ledgerFromSource(local, collabId) {
   if (local.snapshot !== null) {
-    return { source: 'snapshot', ledger: local.snapshot.ledger };
+    /* 浅拷贝：补 mode 缺省不得回写快照内嵌台账（其 digest 与内容自洽，就地改动会破坏一致性）。 */
+    const fromSnapshot = local.snapshot.ledger;
+    return { source: 'snapshot', ledger: { ...fromSnapshot, mode: fromSnapshot.mode ?? local.member.mode } };
   }
   const now = new Date().toISOString();
   return {
@@ -204,6 +210,7 @@ function ledgerFromSource(local, collabId) {
       collabId,
       name: local.member.name,
       topic: '（台账损坏重建——主题待确认）',
+      mode: local.member.mode,
       status: 'proposed',
       manager: { instanceId: local.member.manager.instanceId, identityName: local.member.manager.identityName },
       members: [{ instanceId: local.member.manager.instanceId, identityName: local.member.manager.identityName, role: 'manager', state: 'member', joinedAt: now }],
@@ -234,6 +241,7 @@ function listEntryOf(state, local, now) {
     collabId: local.collabId,
     name: localNameOf(local),
     role: local.role,
+    mode: localModeOf(local),
     state: stateName,
     version: local.role === 'manager' ? local.ledger.version : (local.snapshot === null ? null : local.snapshot.version),
     memberCount: localRosterOf(local).length,
@@ -348,6 +356,7 @@ function emptyGuardCounters() {
     freezeApplied: 0,
     freezeRelayed: 0,
     freezeUnmatched: 0,
+    forumGovernanceIgnored: 0,
     lateDropped: 0,
     rejectedFrozen: 0,
     unknownCollab: 0,

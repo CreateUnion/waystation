@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   ARCHIVED_STATES,
   COLLAB_STATES,
+  MAX_FORUM_MEMBERS,
   canTransition,
   isArchived,
   isCollabState,
@@ -10,6 +11,7 @@ import {
   isMemberRecordShape,
   isSnapshotShape,
   newCollabId,
+  withDefaultMode,
 } from '../src/collab/model.js';
 
 function sampleLedger(overrides = {}) {
@@ -72,6 +74,44 @@ test('状态集：isCollabState / isArchived 边界；常量集齐五态与归�
   assert.equal(isCollabState('left'), false);
   assert.equal(isArchived('left'), true);
   assert.equal(isArchived('active'), false);
+});
+
+test('讨论模式迁移表：四态去冻结——冻结边入 / 出全部拒绝，其余边与 managed 同形', () => {
+  assert.equal(canTransition('proposed', 'active', 'forum'), true);
+  assert.equal(canTransition('proposed', 'terminated', 'forum'), true);
+  assert.equal(canTransition('active', 'completed', 'forum'), true);
+  assert.equal(canTransition('proposed', 'frozen', 'forum'), false, '冻结态对讨论不可达');
+  assert.equal(canTransition('active', 'frozen', 'forum'), false);
+  assert.equal(canTransition('frozen', 'active', 'forum'), false, '冻结前状态簿记不适用（无冻结面）');
+  assert.equal(canTransition('proposed', 'completed', 'forum'), false, '跨态直达拒绝');
+  assert.equal(canTransition('active', 'terminated', 'forum'), false, '进行中的讨论不整条撤回（结束走 end）');
+  assert.equal(canTransition('completed', 'active', 'forum'), false);
+  assert.equal(canTransition('terminated', 'active', 'forum'), false);
+});
+
+test('迁移表默认模式：mode 缺省 = managed——既有调用点语义零变化', () => {
+  assert.equal(canTransition('proposed', 'frozen'), true);
+  assert.equal(canTransition('active', 'frozen'), true);
+  assert.equal(canTransition('proposed', 'frozen', 'managed'), true);
+  assert.equal(canTransition('active', 'completed'), true);
+  assert.equal(canTransition('proposed', 'completed'), false);
+});
+
+test('模式形态：缺省通过（旧数据兼容）、词表内通过、词表外拒（台账与成员记录同判据）', () => {
+  assert.equal(isLedgerShape(sampleLedger()), true, '缺 mode（旧数据）通过');
+  assert.equal(isLedgerShape(sampleLedger({ mode: 'managed' })), true);
+  assert.equal(isLedgerShape(sampleLedger({ mode: 'forum' })), true);
+  assert.equal(isLedgerShape(sampleLedger({ mode: 'discussion' })), false);
+  assert.equal(isLedgerShape(sampleLedger({ mode: 42 })), false);
+  assert.equal(isMemberRecordShape(sampleMember()), true, '缺 mode（旧数据）通过');
+  assert.equal(isMemberRecordShape(sampleMember({ mode: 'forum' })), true);
+  assert.equal(isMemberRecordShape(sampleMember({ mode: 'paused' })), false);
+});
+
+test('withDefaultMode：缺 mode 就地补 managed（读取侧宽容）；已有取值不动', () => {
+  assert.equal(withDefaultMode({}).mode, 'managed');
+  assert.equal(withDefaultMode({ mode: 'forum' }).mode, 'forum');
+  assert.equal(MAX_FORUM_MEMBERS, 16, '讨论参与者上限（含发起人）');
 });
 
 test('newCollabId：ID 形态且不重复', () => {
