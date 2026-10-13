@@ -824,9 +824,9 @@ export function leaveCollab(state, { collabId }) {
   return { ok: true, delivered: endpoint !== undefined };
 }
 
-/* 讨论退出（设计 §5.4/§6）：leave 事件照走（自播广播、豁免 TTL/上限）；**发起人同普通成员**
- * ——退出即放弃结束权（本批无中继，即放弃结束权；本机归档后 end 调用被拒属状态面，
- * 工具面守卫随后续任务收口）。退出后讨论存续；本机归档，不再对表与重播。 */
+/* 讨论退出（设计 §5.4/§6/§9.1）：leave 事件照走（自播广播、豁免 TTL/上限）；**发起人同普通成员**
+ * ——退出即放弃结束权与中继职责（中继无迁移：退出后讨论进入无中继直投、无人可 end 的自然消亡
+ * 形态；结束权守卫在 endCollab，本机归档后调用被拒属状态面）。退出后讨论存续；本机归档，不再对表与重播。 */
 function leaveForum(state, local) {
   if (isLocalArchivedState(local)) {
     return { ok: false, message: '讨论已结束（或已退出）' };
