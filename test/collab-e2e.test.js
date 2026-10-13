@@ -6,6 +6,7 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { applyInstallCommands, commandsDirFor, planInstallCommands } from '../src/claude-commands.js';
 import { makeTempDir, pickFreePort, repoRoot, waitFor, waitForRebindable } from './helpers.js';
 
 const INDEX_ENTRY = join(repoRoot, 'src', 'index.js');
@@ -158,6 +159,43 @@ async function startTemporaryStudio(t, { name, topic, mode }) {
     return listed.some((entry) => entry.collabId === collabId) ? true : null;
   }, { timeoutMs: 20000 });
   return { homeA, homeB, portA, portB, inboxA, inboxB, a, b, collabId, statusA, statusB };
+}
+
+/* 命令文件驱动链的装置：把仓库真实命令源装进临时 HOME（与用户 ~/.claude 完全隔离，安装机制
+ * 见 claude-commands.test.js），读回安装态文件——它即命令被执行时实际读到的指令。 */
+function installManagedCommand(t, fileName) {
+  const home = makeTempDir(t);
+  const applied = applyInstallCommands(planInstallCommands({ home, sourceDir: join(repoRoot, 'scripts', 'claude-commands') }));
+  assert.deepEqual(applied.failures, [], `命令安装不得有失败项：${applied.failures.join('；')}`);
+  const path = join(commandsDirFor(home), fileName);
+  assert.equal(existsSync(path), true, `命令文件应经安装落地：${fileName}`);
+  return readFileSync(path, 'utf8');
+}
+
+/* 命令文件里引用的工具名必须全部真实存在于工具面（命令-工具面契约：工具改名 / 删除即红）。 */
+async function assertReferencedToolsExist(client, commandText) {
+  const toolFace = await client.listTools();
+  const names = new Set(toolFace.tools.map((tool) => tool.name));
+  const referenced = [...new Set(commandText.match(/ws_[a-z_]+/g) ?? [])];
+  assert.ok(referenced.length > 0, '命令文件应引用工具名（取样面自检）');
+  const missing = referenced.filter((name) => !names.has(name));
+  assert.deepEqual(missing, [], `命令文件引用的工具必须真实存在：${missing.join('、')}`);
+  return referenced;
+}
+
+/* 扫描直到按实例标识发现目标（有界重扫）：本站启动自介的探测会先计入对端应答限流（同源 250ms），
+ * 紧接其后的首次扫描探测可能被吞掉（UDP 发现的有损语义内）；每次扫描窗口 300ms 即天然拉开
+ * 两次探测的间隔，至多三次后的末次结果供断言报错举证。 */
+async function scanUntilHost(client, instanceId) {
+  let found = null;
+  let scanned = null;
+  for (let attempt = 0; attempt < 3 && found === null; attempt++) {
+    scanned = await callTool(client, 'ws_list_hosts');
+    assert.equal(scanned.isError, false, String(scanned.payload));
+    found = scanned.payload.hosts.find((host) => host.instanceId === instanceId) ?? null;
+  }
+  assert.ok(found !== null, `扫描应经已知主机兜底发现目标：${JSON.stringify(scanned.payload.hosts)}`);
+  return found;
 }
 
 test('验收预演：邀请→同意→对话→看台账（双真实实例全流程）', { timeout: 120000 }, async (t) => {
@@ -421,4 +459,88 @@ test('验收预演：主动加入——敲门应答（主题截断）、静音�
   assert.deepEqual(lonely.payload.replies, []);
   assert.ok(lonely.payload.note.includes('未收到任何应答'), lonely.payload.note);
   assert.ok(lonely.payload.note.includes('不做自动重试'));
+});
+
+test('验收预演：/ws-discuss 驱动链——命令文件经安装落地、引用工具面齐全、按命令流程驱动讨论建立与发言', { timeout: 180000 }, async (t) => {
+  /* 命令面：安装态文件即会话读到指令；发起动作与模式参数是其承诺面。 */
+  const commandText = installManagedCommand(t, 'ws-discuss.md');
+  assert.ok(commandText.includes('ws_create_collab'), '发起动作经 ws_create_collab');
+  assert.ok(commandText.includes("'forum'"), '讨论必须显式带 mode=forum（命令文件的承诺面）');
+
+  /* 会话面：乙先起（身份与端点已知），甲预写 known-hosts 指向乙——命令第 2 步扫描的已知主机
+   * 单播兜底路径（与主动加入场景同法，回环下不依赖广播段扫）。 */
+  const homeA = makeStationDir(t);
+  const homeB = makeStationDir(t);
+  const portA = await pickFreePort();
+  const portB = await pickFreePort();
+  const inboxA = await startFakeSessionInbox(t);
+  const inboxB = await startFakeSessionInbox(t);
+  const b = await startStation(t, { home: homeB, port: portB, inbox: inboxB });
+  const statusB = (await callTool(b, 'ws_status')).payload;
+  writeFileSync(join(homeA, 'known-hosts.json'), JSON.stringify({ version: 2, hosts: [{ address: '127.0.0.1', port: portB, instanceId: statusB.instanceId, identityName: statusB.identityName, lastSeenAt: new Date().toISOString() }] }));
+  const a = await startStation(t, { home: homeA, port: portA, inbox: inboxA });
+
+  const referenced = await assertReferencedToolsExist(a, commandText);
+  assert.ok(referenced.includes('ws_invite') && referenced.includes('ws_end_collab'), '回执承诺的邀请与结束动作在引用面内');
+
+  /* 第 2 步：扫描在线驿站——被邀方端点取自扫描结果（命令的 take-a-targets 面）；重扫语义见 scanUntilHost。 */
+  const found = await scanUntilHost(a, statusB.instanceId);
+  /* 第 3 步身份提示面与第 5 步发起：按扫描端点原样透传。 */
+  assert.equal((await callTool(a, 'ws_status')).isError, false);
+  const created = await callTool(a, 'ws_create_collab', {
+    name: '驱动讨论',
+    topic: '命令驱动主题',
+    mode: 'forum',
+    targets: [{ instanceId: found.instanceId, identityName: found.identityName, address: found.address, port: found.port }],
+  });
+  assert.equal(created.isError, false, String(created.payload));
+  const collabId = created.payload.collabId;
+
+  /* 第 6 步同意门：邀请进乙会话，乙点头后加入——回执承诺的后续动作逐条驱动。 */
+  await waitFor(() => (inboxB.receivedText().includes('驱动讨论') ? true : null), { timeoutMs: 20000 });
+  assert.equal((await callTool(b, 'ws_approve_invite', { collabId, approve: true })).isError, false);
+  await waitState(b, collabId, 'active');
+  await waitMemberCount(a, b, collabId, 2);
+  const posted = await callTool(a, 'ws_send_message', { collabId, text: '命令链第一帖' });
+  assert.equal(posted.isError, false, String(posted.payload));
+  await waitFor(() => (inboxB.receivedText().includes('命令链第一帖') ? true : null), { timeoutMs: 20000 });
+  const view = await callTool(a, 'ws_view_ledger', { collabId });
+  assert.equal(view.payload.posts.length, 1, '补看路径可读（回执承诺的 ws_view_ledger）');
+  assert.equal((await callTool(a, 'ws_end_collab', { collabId })).isError, false);
+  await waitState(b, collabId, 'completed');
+});
+
+test('验收预演：/ws-mute 驱动链——命令文件经安装落地、引用工具面齐全、静音→内容静默照常落本地→取消恢复', { timeout: 180000 }, async (t) => {
+  const made = await startTemporaryStudio(t, { name: '静音讨论', topic: '静音议题', mode: 'forum' });
+  const { inboxA, a, b, collabId } = made;
+  assert.equal((await callTool(b, 'ws_approve_invite', { collabId, approve: true })).isError, false);
+  await waitState(b, collabId, 'active');
+  await waitMemberCount(a, b, collabId, 2);
+
+  /* 命令面：安装态文件与引用工具面比对（列表与开关动作必须是真实工具）。 */
+  const commandText = installManagedCommand(t, 'ws-mute.md');
+  const referenced = await assertReferencedToolsExist(a, commandText);
+  assert.ok(referenced.includes('ws_set_mute') && referenced.includes('ws_list_collabs'), '命令承诺的列表与开关动作在引用面内');
+
+  /* 第 2 步：列表定位目标（命令的选择面）；第 4 步：进入静音。 */
+  const entry = (await listCollabs(a)).find((row) => row.collabId === collabId);
+  assert.ok(entry !== undefined && entry.mode === 'forum', '列表条目可定位目标讨论');
+  assert.equal((await callTool(a, 'ws_set_mute', { collabId, muted: true })).isError, false);
+
+  /* 静音期：对端发帖——内容静默（不注入本会话）但照常落本地（视图可见，无丢内容面）。 */
+  assert.equal((await callTool(b, 'ws_send_message', { collabId, text: '静音期的帖' })).isError, false);
+  await waitFor(async () => {
+    const view = await callTool(a, 'ws_view_ledger', { collabId });
+    return view.payload.posts.some((post) => post.text === '静音期的帖') ? true : null;
+  }, { timeoutMs: 30000 });
+  await new Promise((resolve) => setTimeout(resolve, 300));   // 注入窗口余量：等该帧的处理周期彻底过去再验「不出现」
+  assert.ok(!inboxA.receivedText().includes('静音期的帖'), '静音期内容不进会话注入');
+
+  /* 第 5 步：取消静音——一行摘要（N = 静音期新增 1 条）＋恢复实时注入（新帖即时进会话；
+   * 静音期错过内容不补注入，由摘要指引补看）。 */
+  assert.equal((await callTool(a, 'ws_set_mute', { collabId, muted: false })).isError, false);
+  await waitFor(() => (inboxA.receivedText().includes('静音期间本讨论新增 1 条') ? true : null), { timeoutMs: 20000 });
+  assert.equal((await callTool(b, 'ws_send_message', { collabId, text: '静音后的帖' })).isError, false);
+  await waitFor(() => (inboxA.receivedText().includes('静音后的帖') ? true : null), { timeoutMs: 20000 });
+  assert.ok(!inboxA.receivedText().includes('静音期的帖'), '取消静音不补注静音期内容（一行摘要代替）');
 });
