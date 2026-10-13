@@ -7,14 +7,16 @@ import { SLOT_COUNT } from './site.js';
 
 /* `waystation purge-data` 子命令：清空数据目录下的一切协作数据，只保留身份与安装面。
  * 保留清单（默认布局与自定义 WAYSTATION_HOME 同一套算法）：config.json、instance-id、app/、
- * bin/，以及 sites/<槽位>/ 下的同名身份二件套；删除面取保留清单的补集——未来新增的文件 /
- * 目录名自动归入删除面，故计划必须一次算清、预览与执行共用（预览即列全）。
+ * bin/，以及 sites/<槽位>/ 下的同名身份二件套；顶层保留判定一律按名字、与条目类型无关
+ * （符号链接 / junction 也原样保留），win32 下名字比对大小写不敏感——盘上以非规范大小写命名的
+ * 条目应用照常可用，漏判等于删活身份。删除面取保留清单的补集——未来新增的文件 / 目录名
+ * 自动归入删除面，故计划必须一次算清、预览与执行共用（预览即列全）。
  * 数据目录位置只由 resolveDataDir(env) 解析（不接受参数覆盖）；路径层与内容形态两道守卫
  * 与 uninstall 共用（本模块导出，uninstall.js 改用之）——uninstall --purge-data 是整目录
  * 删除（卸载场景不适用保留清单），两者只共享守卫、不共享删除面。
  * 输出走 stdout：它是 CLI 的用户输出通道、不参与 MCP 服务路径（stdout 纪律扫描对该文件显式
  * 豁免，见 test/stdout-discipline.test.js 的豁免清单）；bin 只在 purge-data 分支动态导入本模块。
- * 家目录经注入缝：单测不触真实家目录。 */
+ * 家目录与平台经注入缝：单测不触真实家目录、可注入 platform 在任意宿主上验证两种名字比对语义。 */
 
 const USAGE_LINES = [
   '用法：',
@@ -24,10 +26,23 @@ const USAGE_LINES = [
   '（数据目录按 WAYSTATION_HOME 环境变量解析，默认 ~/.waystation；不接受参数覆盖。）',
 ];
 
-/* 保留清单的两个名字组：身份二件套按名字判定（同名目录也保留——宁留勿删：删除是危险方向，
- * 条目只在确定不属保留清单时才进删除面）；安装面按名字 + 目录形态判定。 */
+/* 保留清单的两个名字组：身份二件套与安装面都按名字判定，与条目类型无关（同名目录 / 链接也保留
+ * ——宁留勿删：删除是危险方向，条目只在确定不属保留清单时才进删除面）。 */
 const IDENTITY_FILE_NAMES = [CONFIG_FILE_NAME, INSTANCE_ID_FILE];
 const INSTALL_DIR_NAMES = ['app', 'bin'];
+
+/* 保留判定的名字比对：win32 文件系统大小写不敏感——盘上以非规范大小写命名的条目（如 Config.json、
+ * App）应用照常可用，保留判定必须同样认到，否则会删掉仍生效的身份 / 安装面；其余平台按字节精确比对。 */
+function matchesRetainedName(name, expected, platform) {
+  if (platform === 'win32') {
+    return name.toLowerCase() === expected.toLowerCase();
+  }
+  return name === expected;
+}
+
+function isRetainedName(name, names, platform) {
+  return names.some((expected) => matchesRetainedName(name, expected, platform));
+}
 
 /* 内容形态判据的标记名（单一权威：判定与提示文案共用）。 */
 const DATA_DIR_MARKER_NAMES = [CONFIG_FILE_NAME, COLLABS_DIR_NAME, SESSIONS_DIR_NAME];
@@ -67,11 +82,30 @@ export function looksLikeStationDataDir(resolved) {
 }
 
 /**
- * @param {{ argv?: string[], env?: Record<string, string | undefined>, home?: string }} [options]
+ * @param {{ argv?: string[], env?: Record<string, string | undefined>, home?: string,
+ *   platform?: NodeJS.Platform }} [options]
  */
-export function runPurgeCli({ argv = [], env = process.env, home = homedir() } = {}) {
+export function runPurgeCli({ argv = [], env = process.env, home = homedir(), platform = process.platform } = {}) {
   guardBrokenPipe();
   const options = parsePurgeArgs(argv);
+  const argExit = preflightArgs(options);
+  if (argExit !== null) {
+    return argExit;
+  }
+  const checked = checkDataDir(resolveDataDir(env), home);
+  if (!checked.ok) {
+    write(checked.message);
+    return checked.code;
+  }
+  const plan = planPurgeOrRefuse(checked.dataDir, platform);
+  if (plan === null) {
+    return 1;
+  }
+  return previewOrApply(options, plan);
+}
+
+/* 参数前置：--help / 未知参数先于一切文件系统动作处理；返回退出码，null = 参数无误、继续。 */
+function preflightArgs(options) {
   if (options.help) {
     write(USAGE_LINES.join('\n'));
     return 0;
@@ -81,12 +115,11 @@ export function runPurgeCli({ argv = [], env = process.env, home = homedir() } =
     write(USAGE_LINES.join('\n'));
     return 1;
   }
-  const checked = checkDataDir(resolveDataDir(env), home);
-  if (!checked.ok) {
-    write(checked.message);
-    return checked.code;
-  }
-  const plan = planPurge(checked.dataDir);
+  return null;
+}
+
+/* 预览或执行由 --yes 决定：预览只列计划、零写动作；执行逐条尽力删除、失败按条记账后折算退出码。 */
+function previewOrApply(options, plan) {
   if (!options.execute) {
     reportPreview(plan);
     return 0;
@@ -114,18 +147,32 @@ function checkDataDir(dataDir, home) {
   return { ok: true, code: 0, message: '', dataDir: resolved };
 }
 
-/* 清理计划：一次算清、预览与执行共用（预览因此必然列全删除面）；条目按名字排序，输出稳定可读。 */
-function planPurge(dataDir) {
+/* 计划阶段全程只读：读不到就无法按补集算法核清删除面（如 sites/ 读不出就无法逐个保住槽位
+ * 身份）——宁可整体拒绝，不做部分动作。失败打印明确错误并返回 null（调用方按拒绝处理）。 */
+function planPurgeOrRefuse(dataDir, platform) {
+  try {
+    return planPurge(dataDir, platform);
+  } catch (error) {
+    write(`拒绝清理：目录读取失败（未做任何改动）：${error?.message ?? String(error)}`);
+    return null;
+  }
+}
+
+/* 清理计划：一次算清、预览与执行共用（预览因此必然列全删除面）；条目按名字排序，输出稳定可读。
+ * 顶层保留判定按名字、与条目类型无关（名字匹配即保留）；sites/ 是唯一要下钻的保留目录，且只有
+ * 真目录（非符号链接 / junction）才下钻——链接指向的目标在数据目录树之外，删除面不穿出链接。 */
+function planPurge(dataDir, platform) {
   const retained = [];
   const removable = [];
   for (const entry of sortByName(readdirSync(dataDir, { withFileTypes: true }))) {
     const absolutePath = join(dataDir, entry.name);
-    if (IDENTITY_FILE_NAMES.includes(entry.name)) {
-      retained.push(entry.name);
-    } else if (INSTALL_DIR_NAMES.includes(entry.name) && entry.isDirectory()) {
-      retained.push(`${entry.name}/`);
-    } else if (entry.name === SITES_DIR_NAME && entry.isDirectory()) {
-      planSitesDir(absolutePath, retained, removable);
+    if (isRetainedName(entry.name, IDENTITY_FILE_NAMES, platform) || isRetainedName(entry.name, INSTALL_DIR_NAMES, platform)) {
+      retained.push(entry.isDirectory() ? `${entry.name}/` : entry.name);
+    } else if (matchesRetainedName(entry.name, SITES_DIR_NAME, platform)) {
+      retained.push(entry.isDirectory() ? `${entry.name}/` : entry.name);
+      if (entry.isDirectory()) {
+        planSitesDir(absolutePath, entry.name, retained, removable, platform);
+      }
     } else {
       removable.push(describeEntry(absolutePath, entry.name));
     }
@@ -134,20 +181,21 @@ function planPurge(dataDir) {
 }
 
 /* sites/ 下的槽位目录判定与 siteDataDir 的生成口径对齐（String(整数槽位)、2..SLOT_COUNT）：
- * 形态不符的目录不当作槽位、整目录归入删除面（不猜、不越界删）；合法槽位目录只留身份二件套、
- * 其余子项逐个列入删除面（槽位目录本身保留）。 */
-function planSitesDir(sitesPath, retained, removable) {
+ * 形态不符的条目不当作槽位、整条归入删除面（不猜、不越界删）；合法槽位目录只留身份二件套、
+ * 其余子项逐个列入删除面——槽位目录本身保留，故自身也进保留清单（预览两个面都要列全）。 */
+function planSitesDir(sitesPath, sitesName, retained, removable, platform) {
   for (const entry of sortByName(readdirSync(sitesPath, { withFileTypes: true }))) {
     const slotPath = join(sitesPath, entry.name);
     if (!entry.isDirectory() || slotNumberFor(entry.name) === null) {
-      removable.push(describeEntry(slotPath, `${SITES_DIR_NAME}/${entry.name}`));
+      removable.push(describeEntry(slotPath, `${sitesName}/${entry.name}`));
       continue;
     }
+    retained.push(`${sitesName}/${entry.name}/`);
     for (const child of sortByName(readdirSync(slotPath, { withFileTypes: true }))) {
       const childPath = join(slotPath, child.name);
-      const display = `${SITES_DIR_NAME}/${entry.name}/${child.name}`;
-      if (IDENTITY_FILE_NAMES.includes(child.name)) {
-        retained.push(display);
+      const display = `${sitesName}/${entry.name}/${child.name}`;
+      if (isRetainedName(child.name, IDENTITY_FILE_NAMES, platform)) {
+        retained.push(child.isDirectory() ? `${display}/` : display);
       } else {
         removable.push(describeEntry(childPath, display));
       }

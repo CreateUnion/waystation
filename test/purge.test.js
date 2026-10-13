@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join, parse, resolve } from 'node:path';
 import { parsePurgeArgs, purgePathRefusal, runPurgeCli } from '../src/purge.js';
 import { makeTempDir, repoRoot } from './helpers.js';
@@ -96,7 +96,7 @@ test('预览（裸 purge-data）：列出将删除与保留清单与计数、零
   assert.equal(code, 0, output);
   assert.ok(output.includes('数据清理（预览'), output);
   const lines = output.split('\n');
-  for (const kept of ['  config.json', '  instance-id', '  app/', '  bin/', '  sites/2/config.json', '  sites/2/instance-id']) {
+  for (const kept of ['  config.json', '  instance-id', '  app/', '  bin/', '  sites/', '  sites/2/', '  sites/2/config.json', '  sites/2/instance-id', '  sites/3/']) {
     assert.ok(lines.includes(kept), `保留清单应含精确行 ${JSON.stringify(kept)}：\n${output}`);
   }
   for (const gone of [
@@ -123,12 +123,147 @@ test('--yes：保留清单逐项存活、其余全消失、槽位目录只保两
   assert.equal(existsSync(dataDir), true, '数据目录本身保留');
   assert.deepEqual(readdirSync(join(dataDir, 'sites', '2')).sort(), ['config.json', 'instance-id'], '槽位目录只留身份二件套');
   assert.deepEqual(readdirSync(join(dataDir, 'sites', '3')), [], '无身份文件的合法槽位目录：内容清空、目录保留');
+  assert.ok(output.includes('  sites/3/'), `执行报告的保留清单也应列出存活的空槽位目录：\n${output}`);
   for (const gone of ['collabs', 'sessions', 'logs', 'known-hosts.json', 'instance-id.lock', 'outbox']) {
     assert.equal(existsSync(join(dataDir, gone)), false, `应删除：${gone}`);
   }
   for (const name of ['abc', '02', '9', 'readme.txt']) {
     assert.equal(existsSync(join(dataDir, 'sites', name)), false, `非槽位条目整条删除：sites/${name}`);
   }
+});
+
+/* 顶层保留判定按名字、与条目类型无关；win32 下名字比对大小写不敏感——盘上以 Config.json / App /
+ * Sites 这类非规范大小写命名时应用照常可用（win32 文件系统大小写不敏感），漏判即删活身份。
+ * 经注入 platform 在任意宿主上双向验证两种语义，不依赖运行平台。 */
+test('保留判定：注入 win32 时大小写变体仍是保留面（含槽位内二件套），槽位内其余数据照删', (t) => {
+  const dataDir = makeTempDir(t);
+  writeFileSync(join(dataDir, 'Config.json'), '{}\n');
+  writeFileSync(join(dataDir, 'Instance-id'), 'id-main\n');
+  mkdirSync(join(dataDir, 'App', 'src'), { recursive: true });
+  writeFileSync(join(dataDir, 'App', 'src', 'index.js'), '// 安装面\n');
+  mkdirSync(join(dataDir, 'Bin'), { recursive: true });
+  mkdirSync(join(dataDir, 'collabs', 'collab-x'), { recursive: true });
+  writeFileSync(join(dataDir, 'collabs', 'collab-x', 'ledger.jsonl'), '{}\n');
+  mkdirSync(join(dataDir, 'Sites', '2', 'logs'), { recursive: true });
+  writeFileSync(join(dataDir, 'Sites', '2', 'Config.json'), '{}\n');
+  writeFileSync(join(dataDir, 'Sites', '2', 'Instance-id'), 'id-slot2\n');
+  writeFileSync(join(dataDir, 'Sites', '2', 'logs', 'old.log'), 'x\n');
+
+  const env = { WAYSTATION_HOME: dataDir };
+  const home = makeTempDir(t);
+  const preview = runWithCapture(() => runPurgeCli({ argv: [], env, home, platform: 'win32' }));
+  assert.equal(preview.code, 0, preview.output);
+  const lines = preview.output.split('\n');
+  for (const kept of ['  Config.json', '  Instance-id', '  App/', '  Bin/', '  Sites/', '  Sites/2/', '  Sites/2/Config.json', '  Sites/2/Instance-id']) {
+    assert.ok(lines.includes(kept), `win32 判定应保留精确行 ${JSON.stringify(kept)}：\n${preview.output}`);
+  }
+  assert.ok(preview.output.includes('collabs（1 个子项'), `协作数据仍入删除面：\n${preview.output}`);
+  assert.ok(preview.output.includes('Sites/2/logs（1 个子项'), `槽位内非身份内容仍入删除面：\n${preview.output}`);
+
+  const applied = runWithCapture(() => runPurgeCli({ argv: ['--yes'], env, home, platform: 'win32' }));
+  assert.equal(applied.code, 0, applied.output);
+  for (const kept of ['Config.json', 'Instance-id', join('App', 'src', 'index.js'), join('Sites', '2', 'Config.json'), join('Sites', '2', 'Instance-id')]) {
+    assert.equal(existsSync(join(dataDir, kept)), true, `win32 判定应保留：${kept}`);
+  }
+  assert.equal(existsSync(join(dataDir, 'collabs')), false, '协作数据应删除');
+  assert.equal(existsSync(join(dataDir, 'Sites', '2', 'logs')), false, '槽位内非身份内容应删除');
+  assert.deepEqual(readdirSync(join(dataDir, 'Sites', '2')).sort(), ['Config.json', 'Instance-id']);
+});
+
+test('保留判定：注入非 win32（linux）时大小写变体不保留——精确比对、整条入删除面', (t) => {
+  const dataDir = makeTempDir(t);
+  writeFileSync(join(dataDir, 'Config.json'), '{}\n');
+  writeFileSync(join(dataDir, 'Instance-id'), 'id-main\n');
+  mkdirSync(join(dataDir, 'App', 'src'), { recursive: true });
+  mkdirSync(join(dataDir, 'Sites', '2'), { recursive: true });
+  mkdirSync(join(dataDir, 'collabs'), { recursive: true });
+
+  const preview = runWithCapture(() => runPurgeCli({ argv: [], env: { WAYSTATION_HOME: dataDir }, home: makeTempDir(t), platform: 'linux' }));
+  assert.equal(preview.code, 0, preview.output);
+  const lines = preview.output.split('\n');
+  assert.ok(lines.includes('  （无——数据目录里没有身份 / 安装面文件）'), `精确比对下不应有任何保留项：\n${preview.output}`);
+  for (const gone of ['Config.json（', 'Instance-id（', 'App（1 个子项', 'Sites（1 个子项']) {
+    assert.ok(preview.output.includes(gone), `删除面应含 ${gone}：\n${preview.output}`);
+  }
+});
+
+/* 顶层 app / sites 为链接形态：按名字保留、链接原样不动、不下钻——链接目标在数据目录树之外，
+ * 删除面不穿出链接。win32 用 junction（免特权），其余平台用目录符号链接；建不出链接则跳过。 */
+test('顶层 app / sites 为链接：按名字保留、原样不动、目标不被下钻清理', (t) => {
+  const dataDir = makeTempDir(t);
+  const targetRoot = makeTempDir(t);
+  const appTarget = join(targetRoot, 'app-target');
+  const sitesTarget = join(targetRoot, 'sites-target');
+  mkdirSync(join(appTarget, 'src'), { recursive: true });
+  writeFileSync(join(appTarget, 'src', 'index.js'), '// 安装面副本\n');
+  mkdirSync(join(sitesTarget, '2', 'logs'), { recursive: true });
+  writeFileSync(join(sitesTarget, '2', 'config.json'), '{}\n');
+  writeFileSync(join(sitesTarget, '2', 'logs', 'old.log'), 'x\n');
+  writeFileSync(join(dataDir, 'config.json'), '{}\n');
+  mkdirSync(join(dataDir, 'collabs'), { recursive: true });
+  writeFileSync(join(dataDir, 'collabs', 'x.jsonl'), '{}\n');
+  try {
+    const linkType = process.platform === 'win32' ? 'junction' : 'dir';
+    symlinkSync(appTarget, join(dataDir, 'app'), linkType);
+    symlinkSync(sitesTarget, join(dataDir, 'sites'), linkType);
+  } catch (error) {
+    t.skip(`宿主无法创建目录链接（${error?.message}）；链接形态的保留语义在可建链接的平台验证`);
+    return;
+  }
+
+  const env = { WAYSTATION_HOME: dataDir };
+  const preview = runWithCapture(() => runPurgeCli({ argv: [], env, home: makeTempDir(t) }));
+  assert.equal(preview.code, 0, preview.output);
+  const lines = preview.output.split('\n');
+  assert.ok(lines.includes('  app'), `链接形态 app 应入保留清单：\n${preview.output}`);
+  assert.ok(lines.includes('  sites'), `链接形态 sites 应入保留清单：\n${preview.output}`);
+
+  const applied = runWithCapture(() => runPurgeCli({ argv: ['--yes'], env, home: makeTempDir(t) }));
+  assert.equal(applied.code, 0, applied.output);
+  assert.equal(lstatSync(join(dataDir, 'app')).isSymbolicLink(), true, '链接本身原样保留');
+  assert.equal(lstatSync(join(dataDir, 'sites')).isSymbolicLink(), true, '链接本身原样保留');
+  assert.equal(existsSync(join(appTarget, 'src', 'index.js')), true);
+  assert.equal(existsSync(join(sitesTarget, '2', 'config.json')), true);
+  assert.equal(existsSync(join(sitesTarget, '2', 'logs', 'old.log')), true, '链接目标不被下钻清理');
+  assert.equal(existsSync(join(dataDir, 'collabs')), false, '其余条目照常按补集删除');
+});
+
+/* 目录不可读：计划阶段读取失败 → 拒绝执行（退出码 1、零改动、不裸栈崩溃）。注入方案：POSIX
+ * 权限位——目录给「仅执行」权限时按名 stat 可用（形态判据过）、枚举必败，正好只打中计划阶段的
+ * readdirSync。Windows 的目录权限没有「列目录」与「按名访问」之分（同一 ACL 位），构造不出
+ * 「判据可过、枚举失败」的目录，故 win32 跳过、由 Linux 覆盖；root 下权限位不生效（容器场景）同样跳过。 */
+test('计划阶段目录不可读：拒绝执行、退出码 1、零改动（POSIX 权限位注入；win32 / root 跳过）', (t) => {
+  if (process.platform === 'win32' || process.getuid?.() === 0) {
+    t.skip('需 POSIX 权限位且非 root：Windows 无「列目录 / 按名访问」权限之分，root 下 chmod 不生效');
+    return;
+  }
+  const dataDir = makeTempDir(t);
+  writeFileSync(join(dataDir, 'config.json'), '{}\n');
+  chmodSync(dataDir, 0o111);
+  try {
+    const run = runWithCapture(() => runPurgeCli({ argv: ['--yes'], env: { WAYSTATION_HOME: dataDir }, home: makeTempDir(t) }));
+    assert.equal(run.code, 1, run.output);
+    assert.ok(run.output.includes('拒绝清理：目录读取失败') && run.output.includes('未做任何改动'), run.output);
+  } finally {
+    chmodSync(dataDir, 0o755);
+  }
+  assert.equal(existsSync(join(dataDir, 'config.json')), true, '拒绝执行：零改动');
+
+  const sitesDir = makeTempDir(t);
+  writeFileSync(join(sitesDir, 'config.json'), '{}\n');
+  mkdirSync(join(sitesDir, 'collabs'), { recursive: true });
+  mkdirSync(join(sitesDir, 'sites', '2'), { recursive: true });
+  writeFileSync(join(sitesDir, 'sites', '2', 'config.json'), '{}\n');
+  chmodSync(join(sitesDir, 'sites'), 0o000);
+  try {
+    const run = runWithCapture(() => runPurgeCli({ argv: ['--yes'], env: { WAYSTATION_HOME: sitesDir }, home: makeTempDir(t) }));
+    assert.equal(run.code, 1, run.output);
+    assert.ok(run.output.includes('拒绝清理：目录读取失败'), run.output);
+  } finally {
+    chmodSync(join(sitesDir, 'sites'), 0o755);
+  }
+  assert.equal(existsSync(join(sitesDir, 'collabs')), true, 'sites/ 读不出即整体拒绝：协作数据未动');
+  assert.equal(existsSync(join(sitesDir, 'sites', '2', 'config.json')), true);
 });
 
 test('守卫：家目录本身 / 非驿站形态 → 拒绝（退出码 1、零删除）；不存在 → 跳过（退出码 0）', (t) => {
