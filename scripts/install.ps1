@@ -16,8 +16,9 @@
       - -DryRun：只做只读检测并打印将执行的动作，不改动任何文件或系统设置。
       - 防火墙只打印指引、绝不自动修改。
       - 卸载：-Uninstall（注销 MCP、删安装目录与可执行）；数据目录默认保留，
-        加 -PurgeData 才连数据目录一起删。设计中的 `waystation uninstall` 子命令
-        形态由后续工具面提供，本脚本的卸载开关是当前唯一入口。
+        加 -PurgeData 才连数据目录一起删。「waystation uninstall」命令（驿站本体提供：
+        注销注册 + 清理 + 数据可选保留）在默认布局下与之等价可选——已装驿站二选一即可；
+        自定义 WAYSTATION_HOME 时以该命令为准（本脚本不读该变量）。
 
 .PARAMETER DryRun
     预览模式：只做只读检测并打印将执行的动作，不改动任何文件或系统设置。
@@ -34,7 +35,9 @@
     powershell -File scripts\install.ps1 -DryRun
 .EXAMPLE
     powershell -File scripts\install.ps1 -Uninstall
-    （若本机脚本执行策略拦截，按你的安全策略处理后再运行；脚本可全文审读）
+    （若本机脚本执行策略拦截，按你的安全策略处理后再运行；脚本可全文审读。
+      另有 waystation uninstall 命令（由驿站本体提供）：默认布局下与脚本开关等价，
+      自定义 WAYSTATION_HOME 时以该命令为准——本脚本不读该变量）
 #>
 [CmdletBinding()]
 param(
@@ -44,6 +47,12 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# PowerShell 5.1 在 stdout 被重定向/管道时按系统 OEM 码页（中文环境 CP936）编码输出，用 UTF-8
+# 工具查看会乱码；仅在重定向形态下显式置 UTF-8，让留档/CI 日志可读（交互式控制台零影响）。
+if ([Console]::IsOutputRedirected) {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+}
 
 $DataDir = Join-Path $HOME '.waystation'
 $AppDir = Join-Path $DataDir 'app'
@@ -213,18 +222,22 @@ function Test-PathOnPath([string]$Dir) {
 function Install-Files {
     Write-Step '2/5' "安装运行文件到 $AppDir"
     if ($DryRun) {
-        Write-Note '将清理并重新拷贝：bin\ src\ package.json package-lock.json'
+        Write-Note '将清理并重新拷贝：bin\ src\ scripts\statusline.js package.json package-lock.json'
         Write-Note '将在安装目录执行：npm ci --omit=dev --no-audit --no-fund'
         return
     }
     New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
-    foreach ($sub in @('bin', 'src')) {
+    foreach ($sub in @('bin', 'src', 'scripts')) {
         $target = Join-Path $AppDir $sub
         if (Test-Path $target) {
             Remove-Item -Recurse -Force $target
         }
-        Copy-Item -Recurse -Force -Path (Join-Path $RepoRoot $sub) -Destination $target
     }
+    foreach ($sub in @('bin', 'src')) {
+        Copy-Item -Recurse -Force -Path (Join-Path $RepoRoot $sub) -Destination (Join-Path $AppDir $sub)
+    }
+    New-Item -ItemType Directory -Force -Path (Join-Path $AppDir 'scripts') | Out-Null
+    Copy-Item -Force -Path (Join-Path $RepoRoot 'scripts\statusline.js') -Destination (Join-Path $AppDir 'scripts')
     Copy-Item -Force -Path (Join-Path $RepoRoot 'package.json') -Destination $AppDir
     Copy-Item -Force -Path (Join-Path $RepoRoot 'package-lock.json') -Destination $AppDir
     if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
@@ -328,6 +341,13 @@ function Invoke-SelfCheck {
         Write-Warn "可执行缺失：$ShimPath"
         $problems++
     }
+    $statusline = Join-Path $AppDir 'scripts\statusline.js'
+    if (Test-Path $statusline) {
+        Write-Note "状态栏脚本就位：$statusline"
+    } else {
+        Write-Warn "状态栏脚本缺失：$statusline"
+        $problems++
+    }
     switch ($script:McpState) {
         'registered' { Write-Note 'MCP 注册：已写入（claude mcp add 退出码 0）' }
         'skipped' { Write-Note 'MCP 注册：跳过（未装 claude CLI；手工步骤见上）' }
@@ -376,9 +396,40 @@ function Show-SessionChecklist {
     Write-Step '指引' '会话期首检清单（脚本期无法代验，需在 Claude Code 会话里做）'
     Write-Note '1) 新开一个会话（会话启动时会拉起驿站进程）'
     Write-Note '2) 查看 MCP 连接：会话里执行 /mcp，waystation 应显示已连接'
-    Write-Note '3) 让 Claude 调用驿站工具：ws_status 应返回本站点状态；ws_list_hosts 应能扫到局域网在线站点'
+    Write-Note '3) 让 Claude 调用驿站工具：ws_status 应返回本站点状态；ws_list_hosts 应能扫到局域网在线站点；ws_list_collabs 应返回空清单（新装）——工具面共 16 项'
     Write-Note "4) 同机多终端时端口自动落在槽位段 $($script:AnchorPort)-$($script:SegmentEnd)（首终端用 $($script:AnchorPort)）；跨机互扫端口段覆盖"
     Write-Note '5) 两台机器互扫可见后，再按设计验收场景走「建立协作」流程'
+    Write-Note "6)（可选）状态栏「协作中」指示：把 $AppDir\scripts\statusline.js 配为 statusLine 命令（见 README 状态栏节）；进入协作后应显示「协作中：⋯」"
+}
+
+function Show-ClientSnippets {
+    Write-Step '指引' '其他 MCP 客户端（stdio 形态，以 opencode 为例）'
+    Write-Note '在 opencode 配置文件（opencode.json）的 mcp 段加入：'
+    # 片段逐行拼装（路径折成正斜杠——直接手拼 "C:\\Users\\…" 在 JSON 里是非法转义（\\U 等），
+    # 且 \\b 一类会把路径静默损坏）并回读 ConvertFrom-Json 自校验，未过则退单行形态
+    $commandPath = ($AppDir -replace '\\', '/') + '/bin/waystation.js'
+    $snippet = @(
+        '  {',
+        '    "mcp": {',
+        '      "waystation": {',
+        '        "type": "local",',
+        ('        "command": ["node", "' + $commandPath + '"],'),
+        '        "enabled": true',
+        '      }',
+        '    }',
+        '  }'
+    ) -join "`n"
+    try {
+        $null = $snippet | ConvertFrom-Json
+    } catch {
+        $snippet = '{"mcp":{"waystation":{"type":"local","command":["node","' + $commandPath + '"],"enabled":true}}}'
+        Write-Warn 'MCP 客户端片段 JSON 自校验未过，已改用单行形态输出；请按文档手工填写。'
+    }
+    foreach ($line in ($snippet -split "`n")) {
+        Write-Note "  $line"
+    }
+    Write-Note '字段：type=local 为本地进程型；command 为命令数组（示例 = node + 安装目录入口的绝对路径）；不同客户端字段名不同，按其文档对应填写。'
+    Write-Note '（示例依据 opencode 官方文档 mcp-servers 页，2026-10-13 核对；客户端版本演进可能变化。）'
 }
 
 function Invoke-Uninstall {
@@ -424,6 +475,7 @@ function Invoke-Uninstall {
 
     Write-Step '4/4' '数据目录'
     if ($PurgeData) {
+        # 数据目录位置由 HOME 派生、不接受参数覆盖——这才是防护的真正来源；本守卫只作纵深防御
         if ((Split-Path -Leaf $DataDir) -ne '.waystation') {
             Fail "数据目录路径异常，拒绝删除：$DataDir"
         }
@@ -473,16 +525,18 @@ Install-Files
 Install-Shim
 Register-Mcp
 if ($DryRun) {
-    Write-Note '（dry-run：自检从略——真实运行时将核对入口、运行依赖、可执行与 MCP 注册四项）'
+    Write-Note '（dry-run：自检从略——真实运行时将核对入口、运行依赖、可执行、状态栏脚本与 MCP 注册五项）'
 } else {
     Invoke-SelfCheck
 }
 
 Show-FirewallGuidance
 Show-SessionChecklist
+Show-ClientSnippets
 
 if ($DryRun) {
     Write-Say "`n（dry-run 结束：以上为将执行的动作清单与指引；未改动任何文件或系统设置）"
 } else {
     Write-Say "`n安装完成。下一步：按上方指引放行防火墙（如需要），然后到 Claude Code 会话里做首检。"
+    Write-Say '提示：刚安装或升级过 Node 时，请重启 Claude Code 与终端让 PATH 生效，再进会话首检。'
 }

@@ -13,8 +13,9 @@
 #   - --dry-run：只做只读检测并打印将执行的动作，不改动任何文件或系统设置。
 #   - 防火墙只打印指引、绝不自动修改。
 #   - 卸载：--uninstall（注销 MCP、删安装目录与可执行）；数据目录默认保留，
-#     加 --purge-data 才连数据目录一起删。设计中的 `waystation uninstall` 子命令
-#     形态由后续工具面提供，本脚本的卸载开关是当前唯一入口。
+#     加 --purge-data 才连数据目录一起删。「waystation uninstall」命令（驿站本体提供：
+#     注销注册 + 清理 + 数据可选保留）在默认布局下与之等价可选——已装驿站二选一即可；
+#     自定义 WAYSTATION_HOME 时以该命令为准（本脚本不读该变量）。
 #   - macOS 暂不在支持范围（随公开发布补齐）。
 #
 # 用法：
@@ -44,6 +45,7 @@ TCP_STATE="unknown"
 UDP_STATE="unknown"
 MCP_TARGET=""
 MCP_STATE="pending"
+FIREWALL_STATE="unknown"
 
 say() { printf '%s\n' "$*"; }
 step() { printf '\n[%s] %s\n' "$1" "$2"; }
@@ -63,6 +65,8 @@ waystation 安装脚本（Linux）
   bash scripts/install.sh --help                     显示本帮助
 
 脚本不会自动安装 Node，也不修改防火墙；缺失/需要放行时只打印指引。
+（另有 `waystation uninstall [--purge-data]` 命令，由驿站本体提供：默认布局下与脚本开关等价；
+自定义 WAYSTATION_HOME 时以该命令为准——本脚本不读该变量。）
 EOF
 }
 
@@ -100,7 +104,7 @@ read_engines_node() {
 
 check_node() {
   command -v node >/dev/null 2>&1 || fail "未找到 node。请先安装 Node.js（https://nodejs.org 或发行版包管理器），安装后重跑本脚本。本脚本不会自动安装 Node。"
-  NODE_VERSION="$(node -v)"
+  NODE_VERSION="$(node -v)" || fail "node -v 执行失败——Node 安装可能损坏，请修复后重跑。"
   REQUIRED_ENGINES="$(read_engines_node "${REPO_ROOT}/package.json" || true)"
   [ -n "$REQUIRED_ENGINES" ] || fail "无法从 package.json 读取 engines.node，不能核对 Node 下限"
   REQUIRED_MAJOR="$(printf '%s' "$REQUIRED_ENGINES" | grep -oE '[0-9]+' | head -n 1 || true)"
@@ -183,14 +187,16 @@ check_port() {
 install_files() {
   step "2/5" "安装运行文件到 ${APP_DIR}"
   if [ "$DRY_RUN" = 1 ]; then
-    note "将清理并重新拷贝：bin/ src/ package.json package-lock.json"
+    note "将清理并重新拷贝：bin/ src/ scripts/statusline.js package.json package-lock.json"
     note "将在安装目录执行：npm ci --omit=dev --no-audit --no-fund"
     return 0
   fi
   mkdir -p "$APP_DIR"
-  rm -rf "${APP_DIR:?}/bin" "${APP_DIR:?}/src"
+  rm -rf "${APP_DIR:?}/bin" "${APP_DIR:?}/src" "${APP_DIR:?}/scripts"
   cp -R "${REPO_ROOT}/bin" "${APP_DIR}/bin"
   cp -R "${REPO_ROOT}/src" "${APP_DIR}/src"
+  mkdir -p "${APP_DIR}/scripts"
+  cp "${REPO_ROOT}/scripts/statusline.js" "${APP_DIR}/scripts/statusline.js"
   cp "${REPO_ROOT}/package.json" "${APP_DIR}/package.json"
   cp "${REPO_ROOT}/package-lock.json" "${APP_DIR}/package-lock.json"
   chmod +x "${APP_DIR}/bin/waystation.js"
@@ -281,6 +287,12 @@ self_check() {
     warn "可执行缺失：${SHIM_PATH}"
     problems=$((problems + 1))
   fi
+  if [ -f "${APP_DIR}/scripts/statusline.js" ]; then
+    note "状态栏脚本就位：${APP_DIR}/scripts/statusline.js"
+  else
+    warn "状态栏脚本缺失：${APP_DIR}/scripts/statusline.js"
+    problems=$((problems + 1))
+  fi
   case "$MCP_STATE" in
     registered) note "MCP 注册：已写入（claude mcp add 退出码 0）" ;;
     skipped) note "MCP 注册：跳过（未装 claude CLI；手工步骤见上）" ;;
@@ -295,13 +307,45 @@ self_check() {
 
 # ---- 指引 ------------------------------------------------------------------
 
+detect_firewall_state() {
+  # 免 root 的只读检测：ufw 的启用态看配置文件（ufw status 需要 root，非 root 必失败）；
+  # firewalld 看服务运行态；都判读不了按 unknown——只影响提示文案，绝不修改任何规则。
+  FIREWALL_STATE="unknown"
+  if [ -r /etc/ufw/ufw.conf ]; then
+    enabled_line="$(grep -E '^ENABLED=' /etc/ufw/ufw.conf 2>/dev/null || true)"
+    case "$enabled_line" in
+      *yes*) FIREWALL_STATE="ufw-active" ;;
+      *no*) FIREWALL_STATE="ufw-inactive" ;;
+      *) FIREWALL_STATE="ufw-unknown" ;;
+    esac
+    return 0
+  fi
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+    FIREWALL_STATE="firewalld-active"
+    return 0
+  fi
+  if command -v ufw >/dev/null 2>&1 || command -v firewall-cmd >/dev/null 2>&1; then
+    FIREWALL_STATE="firewall-present-unknown"
+  fi
+}
+
 show_firewall_guidance() {
   step "指引" "防火墙放行指引（只提示，不自动修改）"
+  detect_firewall_state
+  case "$FIREWALL_STATE" in
+    ufw-active) note "检测到 ufw 已启用（/etc/ufw/ufw.conf：ENABLED=yes）——需要以下放行：" ;;
+    ufw-inactive) note "检测到 ufw 已安装但未启用（ENABLED=no）——当前无需放行；若日后启用，参考如下：" ;;
+    firewalld-active) note "检测到 firewalld 正在运行——请做等效放行：" ;;
+    *) note "未检测到可判读的防火墙状态（ufw / firewalld 均不可判读）——请自行确认；放行参考如下：" ;;
+  esac
   note "驿站需要入站 TCP 与 UDP 同号端口（发现走 UDP、消息走 TCP），默认端口段 ${ANCHOR_PORT}–${SEGMENT_END}（${SLOT_COUNT} 个槽位）；显式改过端口的站点按实际端口放行。"
   note "使用 ufw（Ubuntu/Debian 等）："
   note "  sudo ufw allow ${ANCHOR_PORT}:${SEGMENT_END}/tcp"
   note "  sudo ufw allow ${ANCHOR_PORT}:${SEGMENT_END}/udp"
-  note "使用 firewalld 或 nftables 时，请对上述端口的入站 TCP 与 UDP 做等效放行。"
+  note "使用 firewalld（示例）："
+  note "  sudo firewall-cmd --permanent --add-port=${ANCHOR_PORT}-${SEGMENT_END}/tcp"
+  note "  sudo firewall-cmd --permanent --add-port=${ANCHOR_PORT}-${SEGMENT_END}/udp && sudo firewall-cmd --reload"
+  note "nftables 等直配置场景请做等效放行。"
   note "出站方向默认放行即可，无需额外规则。"
 }
 
@@ -309,9 +353,26 @@ show_session_checklist() {
   step "指引" "会话期首检清单（脚本期无法代验，需在 Claude Code 会话里做）"
   note "1) 新开一个会话（会话启动时会拉起驿站进程）"
   note "2) 查看 MCP 连接：会话里执行 /mcp，waystation 应显示已连接"
-  note "3) 让 Claude 调用驿站工具：ws_status 应返回本站点状态；ws_list_hosts 应能扫到局域网在线站点"
+  note "3) 让 Claude 调用驿站工具：ws_status 应返回本站点状态；ws_list_hosts 应能扫到局域网在线站点；ws_list_collabs 应返回空清单（新装）——工具面共 16 项"
   note "4) 同机多终端时端口自动落在槽位段 ${ANCHOR_PORT}–${SEGMENT_END}（首终端用 ${ANCHOR_PORT}）；跨机互扫端口段覆盖"
   note "5) 两台机器互扫可见后，再按设计验收场景走「建立协作」流程"
+  note "6)（可选）状态栏「协作中」指示：把 ${APP_DIR}/scripts/statusline.js 配为 statusLine 命令（见 README 状态栏节）；进入协作后应显示「协作中：⋯」"
+}
+
+show_client_snippets() {
+  step "指引" "其他 MCP 客户端（stdio 形态，以 opencode 为例）"
+  note "在 opencode 配置文件（opencode.json）的 mcp 段加入："
+  note "  {"
+  note "    \"mcp\": {"
+  note "      \"waystation\": {"
+  note "        \"type\": \"local\","
+  note "        \"command\": [\"node\", \"${APP_DIR}/bin/waystation.js\"],"
+  note "        \"enabled\": true"
+  note "      }"
+  note "    }"
+  note "  }"
+  note "字段：type=local 为本地进程型；command 为命令数组（示例 = node + 安装目录入口的绝对路径）；不同客户端字段名不同，按其文档对应填写。"
+  note "（示例依据 opencode 官方文档 mcp-servers 页，2026-10-13 核对；客户端版本演进可能变化。）"
 }
 
 # ---- 卸载 ------------------------------------------------------------------
@@ -358,6 +419,7 @@ do_uninstall() {
 
   step "4/4" "数据目录"
   if [ "$PURGE_DATA" = 1 ]; then
+    # 数据目录位置由 HOME 派生、不接受参数覆盖——这才是防护的真正来源；本守卫只作纵深防御
     case "$DATA_DIR" in
       */.waystation) ;;
       *) fail "数据目录路径异常，拒绝删除：${DATA_DIR}" ;;
@@ -406,16 +468,18 @@ install_files
 place_executable
 register_mcp
 if [ "$DRY_RUN" = 1 ]; then
-  note "（dry-run：自检从略——真实运行时将核对入口、运行依赖、可执行与 MCP 注册四项）"
+  note "（dry-run：自检从略——真实运行时将核对入口、运行依赖、可执行、状态栏脚本与 MCP 注册五项）"
 else
   self_check
 fi
 
 show_firewall_guidance
 show_session_checklist
+show_client_snippets
 
 if [ "$DRY_RUN" = 1 ]; then
   say $'\n（dry-run 结束：以上为将执行的动作清单与指引；未改动任何文件或系统设置）'
 else
   say $'\n安装完成。下一步：按上方指引放行防火墙（如需要），然后到 Claude Code 会话里做首检。'
+  say '提示：刚安装或升级过 Node 时，请重启 Claude Code 与终端让 PATH 生效，再进会话首检。'
 fi
