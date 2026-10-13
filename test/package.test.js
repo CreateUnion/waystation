@@ -44,3 +44,9 @@ test('bin/waystation.js：存在且带 node shebang', () => {
   const firstLine = readFileSync(binPath, 'utf8').split('\n')[0];
   assert.equal(firstLine, '#!/usr/bin/env node');
 });
+
+test('package.json：运行时依赖唯一且为 semver 区间形态（发行复核）', () => {
+  const pkg = readJson('package.json');
+  assert.deepEqual(Object.keys(pkg.dependencies), ['@modelcontextprotocol/sdk']);
+  assert.match(pkg.dependencies['@modelcontextprotocol/sdk'], /^\^\d+\.\d+\.\d+$/);
+});

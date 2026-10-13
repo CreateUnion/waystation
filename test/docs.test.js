@@ -24,3 +24,11 @@ test('README：数据目录与多站点说明（WAYSTATION_HOME 与槽位目录�
   assert.ok(text.includes('WAYSTATION_HOME'), 'README 开发节须说明显式数据目录');
   assert.ok(text.includes('sites/'), 'README 开发节须说明一机多站点目录布局');
 });
+
+test('README：披露锚句与安装/状态栏/卸载/迁移文档面齐备（防腐化）', () => {
+  const text = readFileSync(join(repoRoot, 'README.md'), 'utf8');
+  assert.ok(text.includes('建议仅在可信网络使用'), '安全披露锚句保持（发布义务）');
+  assert.ok(text.includes('statusline.js'), '状态栏配置段指向读取脚本');
+  assert.ok(text.includes('waystation uninstall'), '卸载命令面写入文档');
+  assert.ok(text.includes('自介') && text.includes('升级与迁移'), '改端口旧站点的迁移注意在文档');
+});
