@@ -9,7 +9,7 @@ import { POST_KINDS } from '../net/protocol.js';
 import { decideAdmission, SYNC_REQUEST_MAX, SYNC_REQUEST_WINDOW_MS } from './gate.js';
 import { handleEvent } from './events.js';
 import { localModeOf, localNameOf, localRosterOf, localStateOf, persistLedger } from './local.js';
-import { applyRelayedReport, approveInvite, countLiveCollabs, createCollab, endCollab, inviteMembers, leaveCollab, notifyLocal, sendMessage, viewLedger, withdrawInvite } from './outgoing.js';
+import { applyRelayedReport, approveInvite, countLiveCollabs, createCollab, endCollab, handleJoinKnock, inviteMembers, leaveCollab, notifyLocal, sendMessage, viewLedger, withdrawInvite } from './outgoing.js';
 import { JOIN_REPLAY_INTERVALS_MS, SYNC_MAX_REQUESTS_PER_CYCLE, SYNC_MAX_SOURCES_PER_CYCLE, SYNC_REPLY_TIMEOUT_MS, SYNC_SOFT_BUNDLE_BYTES, SYNC_TAIL_POSTS, SYNC_TAIL_WINDOW_MS, runSyncCycle, runSyncSweep, startSyncEngine, stopSyncEngine, triggerSync } from './sync.js';
 import { HANDSHAKE_REPLY_TIMEOUT_MS, TAKEOVER_PROBE_INTERVAL_MS, runHandshake, startLiveness, stopLiveness, takeOver } from './takeover.js';
 import { decide, decideMergeOffer } from './freeze.js';
@@ -140,6 +140,7 @@ function apiOf(state) {
     indicators: () => indicators(state),
     create: (input) => createCollab(state, input),
     invite: (input) => inviteMembers(state, input),
+    joinKnock: (knock) => handleJoinKnock(state, knock),   // 发现层注入面（UDP 敲门命中 → 成员侧应答与本机放行提示）
     approve: (input) => approveNow(state, input),
     relayReport: (input) => applyRelayedReport(state, input),   // 网层回报注入面（转达副本达第三档 → 译回原作者）
     withdraw: (input) => withdrawInvite(state, input),
@@ -589,6 +590,14 @@ function emptyFlowCounters() {
     postsDuplicated: 0,
     postRejected: 0,
     postFanoutSkipped: 0,
+    ...emptyRelayCounters(),
+    ...emptyJoinKnockCounters(),
+  };
+}
+
+/* 中继路径与转达面计数（中继 / 降级 / 转达 / 聚合捎回）。 */
+function emptyRelayCounters() {
+  return {
     relayPostsSent: 0,        // 成员经中继提交的帖数（中继路径态）
     relayDegradedPosts: 0,    // 降级直投的帖数（降级态）
     relayDegrades: 0,         // 进入降级态次数（探测不可达 / 中继端点未知置位）
@@ -601,6 +610,14 @@ function emptyFlowCounters() {
     relayReportSent: 0,       // 聚合捎回：译回原作者的第三档回报帧数
     relayReportSkipped: 0,    // 聚合捎回：原作者端点未知跳过数
     relayReportFailed: 0,     // 聚合捎回：入队失败 / 异常数
+  };
+}
+
+/* 敲门命中的两个计数（成员侧，设计 §5.6），独立成块以维持各计数块的行数上限。 */
+function emptyJoinKnockCounters() {
+  return {
+    joinKnockMatches: 0,      // 敲门命中本机讨论实例数
+    joinKnockAckSkipped: 0,   // 命中但本地元数据不全、未发应答数（提示照发）
   };
 }
 

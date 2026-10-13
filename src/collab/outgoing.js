@@ -174,6 +174,67 @@ function forumInvitePayloadOf(state, local, topic, targets) {
   return payload;
 }
 
+/* —— 主动加入（设计 §5.6）：成员侧敲门命中处理 —— */
+
+/* 发现层经注入回调调用（本层不 import 发现层）：逐本机讨论实例按讨论名匹配；命中即向本机会话
+ * 注入一行放行指引（放行实质 = 本机人确认后执行 ws_invite），并在本地元数据可答时生成 join-ack
+ * 应答载荷交发现层回发。提示属「状态与待办」类（放行是待办动作）——经 notifyLocal 直投，
+ * 属放行链的触发面，不因静音被抑制。
+ * 本地元数据不全（主题 / 发起人标识未知）的实例仍提示、但**不代发残缺应答**（沿邀请侧
+ * 「不代发残缺帧」先例）：提示照发（放行路径不依赖应答内容），应答跳过并计数留痕——
+ * 由申请人稍后重敲或待对表补齐后再答。 */
+export function handleJoinKnock(state, knock) {
+  const replies = [];
+  for (const local of state.collabs.values()) {
+    if (!matchesJoinKnock(state, local, knock.name)) {
+      continue;
+    }
+    state.counters.joinKnockMatches++;
+    notifyLocal(state, local, joinKnockNoticeText(knock, localNameOf(local)));
+    const reply = joinKnockReplyOf(state, local);
+    if (reply === null) {
+      state.counters.joinKnockAckSkipped++;
+      state.log.warn('敲门命中讨论但本地元数据不全，不回应答（提示照发）', { collabId: local.collabId });
+      continue;
+    }
+    replies.push(reply);
+  }
+  return replies;
+}
+
+/* 命中判据：本机**已加入**的讨论实例（forum、本机已加入、未归档 / 未退出）且讨论名相等。
+ * 已结束 / 已退出 / 已终止的实例不再纳新（应答指向的加入路径必然失败）；受邀未同意者尚非成员、
+ * 无权放行；managed 实例与讨论名同形也不命中（主动加入是讨论模式的能力）。 */
+function matchesJoinKnock(state, local, name) {
+  return localModeOf(local) === 'forum'
+    && !isLocalArchivedState(local)
+    && selfJoinedOf(local, state.self.instanceId)
+    && localNameOf(local) === name;
+}
+
+/* 应答载荷（不可截字段在此定格：collabId / 成员数 / 发起人标识；主题与名称的截断归发现层的
+ * 体积整形）。主题或发起人标识未知 → null（不代发残缺应答）。 */
+function joinKnockReplyOf(state, local) {
+  const topic = localTopicOf(local);
+  const originator = relayPeerOf(local, state.self);
+  if (topic === null || originator === null) {
+    return null;
+  }
+  return {
+    collabId: local.collabId,
+    name: localNameOf(local),
+    topic,
+    memberCount: foldedMembersOf(local).length,
+    originator: { instanceId: originator.instanceId, identityName: originator.identityName },
+  };
+}
+
+/* 放行指引文案：申请人身份（含实例标识）与来源端点（放行时作 ws_invite 的 targets 项）、讨论名。
+ * 同意门仍在申请人一侧——本机放行只是发出正式邀请。 */
+function joinKnockNoticeText(knock, name) {
+  return `收到加入申请：「${knock.identityName}」（实例 ${knock.instanceId}，端点 ${knock.address}:${knock.port}）想加入讨论「${name}」——放行 = 本机用 ws_invite 邀请它（targets 用该身份与端点），随后由对方的同意门定夺`;
+}
+
 export function approveInvite(state, { collabId, approve, reason }) {
   const local = state.collabs.get(collabId);
   if (local === undefined) {

@@ -15,9 +15,10 @@ function quietLog() {
   return { info: () => {}, warn: () => {}, error: () => {} };
 }
 
-/* 服务单测脚手架：真临时目录 + 假发送（捕获出队消息）+ 假直投（捕获直投消息）+ 假清单；
- * hooks 直调模拟接收管线（admit 通过才 consume——与真实管线同序；落盘/ack 属接收管线自身用例，
- * 不在此重复）。overrides.self 供双节点夹具区分身份；sendDirect: null = 直投面不可用（降级面）。
+/* 服务单测脚手架：真临时目录 + 假发送（捕获出队消息）+ 假直投（捕获直投消息）+ 假清单 + 本机提示捕获
+ * （notify 注入面——放行提示等 local-alert 的落点）；hooks 直调模拟接收管线（admit 通过才 consume——
+ * 与真实管线同序；落盘/ack 属接收管线自身用例，不在此重复）。overrides.self 供双节点夹具区分身份；
+ * sendDirect: null = 直投面不可用（降级面）。
  * 对表对端选取默认静默（syncPeerPicker 返回空序）——由专门的对表用例注入真实对端，
  * 其余用例不被环境性直投噪音干扰。 */
 function makeService(t, overrides = {}) {
@@ -25,6 +26,7 @@ function makeService(t, overrides = {}) {
   const sent = [];
   const direct = [];
   const remembered = [];
+  const notices = [];
   const self = overrides.self ?? { instanceId: 'inst-self', identityName: '本机', port: 17321 };
   const config = { inviteTtlMs: DAY, ...(overrides.config ?? {}) };
   const knownHosts = { remember: (entry) => remembered.push(entry) };
@@ -44,13 +46,14 @@ function makeService(t, overrides = {}) {
     },
     sendDirect,
     knownHosts,
+    notify: (frame) => notices.push(frame),
     log: quietLog(),
     ledgerFetchTimeoutMs: overrides.ledgerFetchTimeoutMs ?? 60,
     inviteMinIntervalMs: overrides.inviteMinIntervalMs ?? 0,
     pullReplyTimeoutMs: overrides.pullReplyTimeoutMs,
     syncPeerPicker: overrides.syncPeerPicker ?? (() => []),
   });
-  return { service, sent, direct, remembered, dir, self, config };
+  return { service, sent, direct, remembered, notices, dir, self, config };
 }
 
 let seq = 0;
@@ -1347,6 +1350,114 @@ test('讨论成员侧邀请链：任何成员可邀请——同意加入后由�
   assert.equal(typeof joinFrames[0].payload.eventId, 'string');
   const approveFrames = sentOf(memberSide.sent, 'approve', 'collab-f8');
   assert.equal(approveFrames.length, 1, 'approve 回执仍发回邀请者（簿记，不构成生效条件）');
+});
+
+/* —— 主动加入（设计 §5.6）：成员侧敲门命中处理（collab.joinKnock = 发现层注入面）—— */
+
+function joinKnockOf(name, { instanceId = 'inst-x', identityName = '主机X', address = '127.0.0.2', port = 17321 } = {}) {
+  return { instanceId, identityName, address, port, knockId: 'knock-1', name };
+}
+
+test('主动加入：敲门命中本机讨论 → 应答载荷（collabId / 主题 / 成员数 / 发起人）+ 本机一行放行提示', (t) => {
+  const { service, notices } = makeService(t);
+  const collabId = createForum(service, { name: '讨论甲' });
+  const replies = service.joinKnock(joinKnockOf('讨论甲'));
+  assert.deepEqual(replies, [{
+    collabId,
+    name: '讨论甲',
+    topic: '议题',
+    memberCount: 1,
+    originator: { instanceId: 'inst-self', identityName: '本机' },
+  }], '发起人本机即中继：应答的发起人标识 = 本机');
+  assert.equal(service.stats().joinKnockMatches, 1);
+  assert.equal(service.stats().joinKnockAckSkipped, 0);
+  assert.equal(notices.length, 1, '命中一次提示一行');
+  const notice = notices[0];
+  assert.equal(notice.type, 'notice');
+  assert.equal(notice.collabId, collabId, '提示挂在命中的讨论上（渲染时取讨论名做头行）');
+  assert.equal(notice.payload.event, 'local-alert');
+  assert.ok(notice.payload.text.includes('主机X'), '提示含申请人身份名');
+  assert.ok(notice.payload.text.includes('inst-x'), '提示含申请人实例标识');
+  assert.ok(notice.payload.text.includes('127.0.0.2:17321'), '提示含来源端点（放行时作 ws_invite 目标）');
+  assert.ok(notice.payload.text.includes('讨论甲'), '提示含讨论名');
+  assert.ok(notice.payload.text.includes('ws_invite'), '提示给出放行动作（本机人执行）');
+});
+
+test('主动加入：静音不抑制放行提示（提示属待办类、不经内容栅栏；应答为成员自动行为）', async (t) => {
+  const { service, notices } = makeService(t);
+  const collabId = createForum(service, { name: '讨论甲' });
+  const muted = await service.setMute({ collabId, muted: true });
+  assert.equal(muted.ok, true);
+  assert.deepEqual(service.hooks.sessionGate({ type: 'post', collabId }), { suppress: true }, '静音确已生效：实时帖被内容栅栏抑制');
+  const replies = service.joinKnock(joinKnockOf('讨论甲'));
+  assert.equal(replies.length, 1, '静音不影响应答（放行链不因本机静音而断）');
+  assert.equal(notices.length, 1, '放行提示照常注入（静音不抑）');
+});
+
+test('主动加入：非命中矩阵（异名 / 协作实例同名 / 已归档 / 受邀未加入）→ 零应答零提示', async (t) => {
+  const made = makeService(t);
+  const forumId = createForum(made.service, { name: '讨论甲' });
+  const managed = made.service.create({ name: '同名协作', topic: '主题', targets: [targetOf('b')] });
+  assert.equal(managed.ok, true);
+  assert.deepEqual(made.service.joinKnock(joinKnockOf('另一个讨论')), [], '异名不命中');
+  assert.deepEqual(made.service.joinKnock(joinKnockOf('同名协作')), [], 'managed 实例同名也不命中（主动加入是讨论模式的能力）');
+  assert.equal((await made.service.withdraw({ collabId: forumId })).ok, true);
+  assert.deepEqual(made.service.joinKnock(joinKnockOf('讨论甲')), [], '已终止（归档）的讨论不再应答纳新');
+  assert.equal(made.notices.length, 0);
+
+  const invitedOnly = makeService(t);
+  await receive(invitedOnly.service, inviteFrame({ collabId: 'collab-f-knock', mode: 'forum', name: '讨论甲' }));
+  assert.deepEqual(invitedOnly.service.joinKnock(joinKnockOf('讨论甲')), [], '受邀未同意者尚非成员、无权放行');
+  assert.equal(invitedOnly.notices.length, 0);
+});
+
+test('主动加入：成员侧命中（已加入、发起人已知）→ 应答取本地元数据；发起人未知 → 提示照发、不代发残缺应答', async (t) => {
+  const memberSide = makeService(t);
+  const frame = inviteFrame({ collabId: 'collab-f-knock', mode: 'forum', name: '讨论甲' });
+  frame.payload.originator = { instanceId: 'inst-a', identityName: '主机甲' };
+  await receive(memberSide.service, frame);
+  await memberSide.service.approve({ collabId: 'collab-f-knock', approve: true });
+  const replies = memberSide.service.joinKnock(joinKnockOf('讨论甲'));
+  assert.deepEqual(replies, [{
+    collabId: 'collab-f-knock',
+    name: '讨论甲',
+    topic: '发布联调',
+    memberCount: 1,
+    originator: { instanceId: 'inst-a', identityName: '主机甲' },
+  }], '成员侧应答取本地记录（主题随邀请载荷学得；成员数 = 折叠成员表）');
+  assert.equal(memberSide.notices.length, 1);
+
+  const noOriginator = makeService(t);
+  await receive(noOriginator.service, inviteFrame({ collabId: 'collab-f-knock', mode: 'forum', name: '讨论甲' }));
+  await noOriginator.service.approve({ collabId: 'collab-f-knock', approve: true });
+  assert.deepEqual(noOriginator.service.joinKnock(joinKnockOf('讨论甲')), [], '发起人标识未知：不代发残缺应答');
+  assert.equal(noOriginator.service.stats().joinKnockAckSkipped, 1, '跳过一份计数留痕');
+  assert.equal(noOriginator.notices.length, 1, '提示照发（放行路径不依赖应答内容）');
+});
+
+test('主动加入：同名多讨论 → 各实例各自应答、逐一提示（跨模式同名 = 不同实例）', (t) => {
+  const { service, notices } = makeService(t);
+  const first = createForum(service, { name: '讨论甲' });
+  const second = createForum(service, { name: '讨论甲' });
+  const replies = service.joinKnock(joinKnockOf('讨论甲'));
+  assert.equal(replies.length, 2);
+  assert.deepEqual(replies.map((reply) => reply.collabId).sort(), [first, second].sort());
+  assert.equal(service.stats().joinKnockMatches, 2);
+  assert.equal(notices.length, 2, '同一敲门在两实例各提示一行（放行按 collabId 执行）');
+});
+
+test('主动加入：16 人讨论如实应答成员数（上限判定在放行/邀请步，不拒应答——16 检查点）', async (t) => {
+  const { service } = makeService(t);
+  const collabId = createForum(service, { name: '讨论甲' });
+  for (let index = 0; index < 15; index++) {
+    await receiveJoin(service, collabId, peer(`inst-j${index}`, `主机j${index}`));
+  }
+  const replies = service.joinKnock(joinKnockOf('讨论甲'));
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].memberCount, 16, '成员数如实（折叠成员表：发起人 + 15 名加入者）');
+  const refused = await service.invite({ collabId, targets: [targetOf('extra')] });
+  assert.equal(refused.ok, false, '16 检查点：上限判定在放行/邀请步（T3 既有面）——成员表满拒绝新邀请');
+  assert.ok(refused.message.includes('上限'));
 });
 
 /* —— 讨论模式（帖通道：发帖直投、接收幂等与本地列表、显示序、本地视图）—— */
