@@ -307,6 +307,19 @@ test('坏行：跳过不崩、后续行照常', async (t) => {
   await viewer.waitForText('帖子正文 2');
 });
 
+test('帖正文：控制 / 格式类字符剥除（C1 与双向重排），ZWJ emoji 组合保留', async (t) => {
+  const home = makeStationDir(t);
+  seedCollab(home, { posts: 0 });
+  const viewer = startViewer(t, { home });
+  await viewer.waitForText('【架构讨论】');
+  appendJson(collabPath(home, 'posts.jsonl'), postOf(2, { text: 'A\u202eB\u009bC' }));
+  await viewer.waitForText('ABC');   // 剥除后剩语义词——重排符 / C1 控制符不得夹带呈现
+  appendJson(collabPath(home, 'posts.jsonl'), postOf(3, { text: '组合 👨\u200d👩\u200d👧' }));
+  await viewer.waitForText('👨\u200d👩\u200d👧');   // ZWJ 成串的表情序列整体保留
+  assert.equal(viewer.out().includes('\u202e'), false, '双向重排符（RLO）不得进输出');
+  assert.equal(viewer.out().includes('\u009b'), false, 'C1 控制符（CSI）不得进输出');
+});
+
 test('成员事件：系统行（身份名/方向/现人数）、不产生帖行、横幅只印一次', async (t) => {
   const home = makeStationDir(t);
   seedCollab(home, { posts: 1 });
@@ -321,6 +334,20 @@ test('成员事件：系统行（身份名/方向/现人数）、不产生帖行
   assert.equal(viewer.countOf('【架构讨论】'), 1, '横幅只印一次');
 });
 
+test('成员流坏行：回放与增量均印跳过提示（与帖流同一提示）', async (t) => {
+  const home = makeStationDir(t);
+  seedCollab(home, { posts: 1 });
+  appendFileSync(collabPath(home, 'members.jsonl'), '{oops not json\n');
+  const viewer = startViewer(t, { home });
+  await viewer.waitForText('帖子正文 1');
+  await viewer.waitForText('跳过一条无法解析的记录行');
+  assert.equal(viewer.countOf('跳过一条无法解析的记录行'), 1, '回放期坏行留痕一次');
+  assert.equal(viewer.countOf('主机甲 加入'), 0, '回放期成员行不印（既有语义）');
+  appendFileSync(collabPath(home, 'members.jsonl'), '{"eventId":"not-an-event"}\n');
+  await waitFor(() => (viewer.countOf('跳过一条无法解析的记录行') === 2 ? true : null), WAIT);
+  assert.equal(viewer.countOf('跳过一条无法解析的记录行'), 2, '增量期坏行再留痕一次');
+});
+
 test('元状态：名称/状态变化各印一行系统行（管理席读台账）', async (t) => {
   const home = makeStationDir(t);
   seedCollab(home, { posts: 1, seat: 'manager' });
@@ -331,6 +358,29 @@ test('元状态：名称/状态变化各印一行系统行（管理席读台账�
   await viewer.waitForText('名称：架构讨论二');
   appendJson(collabPath(home, 'ledger.jsonl'), ledgerOf({ version: 3, name: '架构讨论二', status: 'completed' }));
   await viewer.waitForText('状态：已结束');
+});
+
+test('台账流坏行：回放与增量均印跳过提示（原恒静默面）', async (t) => {
+  const home = makeStationDir(t);
+  seedCollab(home, { posts: 1, seat: 'manager' });
+  appendFileSync(collabPath(home, 'ledger.jsonl'), '{oops not json\n');
+  const viewer = startViewer(t, { home });
+  await viewer.waitForText('帖子正文 1');
+  await viewer.waitForText('跳过一条无法解析的记录行');
+  assert.equal(viewer.countOf('跳过一条无法解析的记录行'), 1, '回放期坏行留痕一次');
+  appendFileSync(collabPath(home, 'ledger.jsonl'), '{"version":"nope"}\n');
+  await waitFor(() => (viewer.countOf('跳过一条无法解析的记录行') === 2 ? true : null), WAIT);
+  assert.equal(viewer.countOf('跳过一条无法解析的记录行'), 2, '增量期坏行再留痕一次');
+});
+
+test('管理席位已退出：名取台账（对齐 localNameOf）、态取 left（对齐 localStateOf）', async (t) => {
+  const home = makeStationDir(t);
+  seedCollab(home, { posts: 1, seat: 'manager' });
+  writeFileSync(collabPath(home, 'member.json'), JSON.stringify(memberRecordOf({ role: 'manager', state: 'left', name: '记录名甲' })));
+  writeFileSync(collabPath(home, 'ledger.jsonl'), `${JSON.stringify(ledgerOf({ name: '台账名乙' }))}\n`);
+  const viewer = startViewer(t, { home });
+  await viewer.waitForText('帖子正文 1');
+  assert.equal(viewer.lines()[0], '【台账名乙】已退出 ｜ 1 人');
 });
 
 test('中途消失：标注暂缺并等待，恢复后自卷首重读', async (t) => {

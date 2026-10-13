@@ -90,14 +90,20 @@ function formatTime(ts) {
 }
 
 /* 帖正文按单行呈现：换行类字符（LF / CR / U+2028 / U+2029）替换为 ⏎（一帖一行是两栏形态的约束）；
- * 其余控制字符剔除——远程内容不可信，终端转义 / 响铃一律不得进观战窗输出。 */
+ * 控制类（C0 / DEL / C1，含可作终端 CSI 的 U+009B）与格式类（Cf——双向文本重排、零宽类，
+ * Trojan Source 一类）字符剔除：远程内容不可信，终端控制与显示重排一律不得进观战窗输出。
+ * U+200D（零宽连接符）同属 Cf 但有意保留：ZWJ emoji 组合序列靠它成串，剥掉会把一个合法表情
+ * 拆散——渲染失真的代价高于该字符本身的可滥用面。 */
+const CONTROL_OR_FORMAT = /^[\p{Cc}\p{Cf}]$/u;
+const ZERO_WIDTH_JOINER = '\u200d';
+
 function singleLineText(text) {
   let presented = '';
   for (const char of text) {
     const code = char.codePointAt(0);
     if (code === 0x0a || code === 0x0d || code === 0x2028 || code === 0x2029) {
       presented += '⏎';
-    } else if (code >= 0x20 && code !== 0x7f) {
+    } else if (char === ZERO_WIDTH_JOINER || !CONTROL_OR_FORMAT.test(char)) {
       presented += char;
     }
   }
@@ -191,15 +197,18 @@ function emitLines(state, bytes) {
 
 /* —— 呈现 —— */
 
-/* 元状态取数（口径对齐 local.js 的 localNameOf / localStateOf）：管理席位取台账名与台账状态
- * （成员态已退出则退出优先）；成员席位取参与记录的名与态；两者都不可读 = 未就绪。
- * 管理席位在台账缺失时退回参与记录（降级但不静默——状态按成员记录如实呈现）。 */
+/* 元状态取数（口径对齐 local.js 的 localNameOf / localStateOf）：管理席位名一律取台账
+ * （localNameOf——名以台账为权威，「已退出」只改状态不改名源）；状态在成员记录为 left 时
+ * 取 left（localStateOf 的退出优先），否则取台账状态；成员席位取参与记录的名与态；
+ * 两者都不可读 = 未就绪。管理席位在台账缺失时退回参与记录（降级但不静默——状态按成员记录
+ * 如实呈现）。「管理席位 + 已退出」此前名取参与记录、与 localNameOf 是两个来源（现形态下
+ * 不可达的取数差异），对齐防后续把它当成有意口径。 */
 function metaViewOf(ledger, member) {
   if (member === null) {
     return ledger === null ? null : { name: ledger.name, state: ledger.status };
   }
-  if (member.role === 'manager' && ledger !== null && member.state !== 'left') {
-    return { name: ledger.name, state: ledger.status };
+  if (member.role === 'manager' && ledger !== null) {
+    return { name: ledger.name, state: member.state === 'left' ? member.state : ledger.status };
   }
   return { name: member.name, state: member.state };
 }
@@ -249,16 +258,17 @@ function absorbMemberEvent(view, event) {
   return 'added';
 }
 
-/* 成员事件行：基线重放（启动 / 回卷重读）只重建折叠态、不印行；增量事件印一行系统行
- * （身份名 + 方向 + 现人数）——成员事件绝不产生帖行。 */
+/* 成员事件行：基线重放（启动 / 回卷重读）只重建折叠态、不印成员行；增量事件印一行系统行
+ * （身份名 + 方向 + 现人数）——成员事件绝不产生帖行。坏行留痕不设重放静默：跳过记录在
+ * 回放期与增量期一律留痕（与帖流同一提示）。 */
 function onMemberLine(view, line) {
   const event = parseJsonOrNull(line);
   const outcome = absorbMemberEvent(view, event);
-  if (view.replay.has('members')) {
-    return;
-  }
   if (outcome === 'rejected') {
     systemLine(BAD_LINE_NOTICE);
+    return;
+  }
+  if (view.replay.has('members')) {
     return;
   }
   if (outcome === 'added') {
@@ -266,12 +276,16 @@ function onMemberLine(view, line) {
   }
 }
 
-/* 台账行：留最后一条通过形态校验的完整行（与 loadLedger 同判据）；坏行 / 半写残行静默跳过。 */
+/* 台账行：留最后一条通过形态校验的完整行（与 loadLedger 同判据）；坏行跳过并留痕
+ * （与帖 / 成员流同一提示，回放与增量一致——三面口径统一）。半写尾行到不了这里：
+ * 尾读器缓冲至换行才算行。 */
 function onLedgerLine(view, line) {
   const ledger = parseJsonOrNull(line);
-  if (isLedgerShape(ledger)) {
-    view.ledger = ledger;
+  if (!isLedgerShape(ledger)) {
+    systemLine(BAD_LINE_NOTICE);
+    return;
   }
+  view.ledger = ledger;
 }
 
 /* 读取器重置（截断 / 消失后重现）：数据面状态同步重置（成员表重折叠、台账重取），
