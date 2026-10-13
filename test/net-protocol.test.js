@@ -19,6 +19,8 @@ import {
   isPresentationText,
   newMsgId,
   parseFrame,
+  validateJoinAck,
+  validateJoinKnock,
   validateMessage,
   validateProbe,
   validateProbeAck,
@@ -669,4 +671,109 @@ test('notice event 为原型成员名（__proto__ / constructor / toString）：
     assert.equal(checked.ok, false, event);
     assert.ok(checked.reason.includes('notice.event'), `${event}: ${checked.reason}`);
   }
+});
+
+/* —— 主动加入（设计 §5.6）：敲门与应答数据报（发现类，不入 MESSAGE_TYPES） —— */
+
+const KNOCK = { v: PROTOCOL_VERSION, type: 'join-knock', instanceId: 'inst-a', identityName: '主机甲', knockId: 'knock-1', name: '联调讨论' };
+
+/* 应答骨架（截断标注缺省不携带；截断用例按需覆盖）。 */
+function ackDatagram(overrides = {}) {
+  return {
+    v: PROTOCOL_VERSION,
+    type: 'join-ack',
+    instanceId: 'inst-b',
+    identityName: '主机乙',
+    knockId: 'knock-1',
+    collabId: 'collab-1',
+    name: '联调讨论',
+    topic: '发布联调',
+    memberCount: 3,
+    originator: { instanceId: 'inst-org', identityName: '发起人' },
+    port: 7321,
+    ...overrides,
+  };
+}
+
+test('join-knock：合法通过；knockId 与 name 逐项拒', () => {
+  assert.equal(validateJoinKnock(KNOCK).ok, true);
+  for (const knockId of ['../x', 'a b', '', 'x'.repeat(65), 42, undefined]) {
+    assert.equal(validateJoinKnock({ ...KNOCK, knockId }).ok, false, String(knockId));
+  }
+  for (const name of ['甲\n乙', 'x'.repeat(65), '', '   ', undefined, 42]) {
+    const checked = validateJoinKnock({ ...KNOCK, name });
+    assert.equal(checked.ok, false, String(name));
+    assert.ok(checked.reason.includes('name'), checked.reason);
+  }
+});
+
+test('join-ack：合法通过；port 可选（宽容缺省）、存在则须合法', () => {
+  assert.equal(validateJoinAck(ackDatagram()).ok, true);
+  assert.equal(validateJoinAck(ackDatagram({ port: undefined })).ok, true, '缺 port 回退数据报来源端口（同 probe-ack 宽容缺省）');
+  for (const port of [0, 65536, '7321', 1.5]) {
+    assert.equal(validateJoinAck(ackDatagram({ port })).ok, false, String(port));
+  }
+});
+
+test('join-ack：必携字段逐项拒（knockId / collabId / memberCount / originator）', () => {
+  for (const knockId of ['../x', undefined]) {
+    assert.equal(validateJoinAck(ackDatagram({ knockId })).ok, false, String(knockId));
+  }
+  for (const collabId of ['a/b', undefined]) {
+    assert.equal(validateJoinAck(ackDatagram({ collabId })).ok, false, String(collabId));
+  }
+  assert.equal(validateJoinAck(ackDatagram({ memberCount: 0 })).ok, false, '成员数 ≥1');
+  assert.equal(validateJoinAck(ackDatagram({ memberCount: 1.5 })).ok, false);
+  assert.equal(validateJoinAck(ackDatagram({ memberCount: MAX_COLLAB_COUNT + 1 })).ok, false);
+  assert.equal(validateJoinAck(ackDatagram({ memberCount: undefined })).ok, false);
+  assert.equal(validateJoinAck(ackDatagram({ originator: undefined })).ok, false, '发起人标识为必携字段');
+  assert.equal(validateJoinAck(ackDatagram({ originator: { instanceId: 'inst-org' } })).ok, false);
+  assert.equal(validateJoinAck(ackDatagram({ originator: { instanceId: 'bad id!', identityName: '发起人' } })).ok, false);
+});
+
+test('join-ack：主题与名称可截断——空值仅限带截断标注；标注须为布尔', () => {
+  assert.equal(validateJoinAck(ackDatagram({ topic: '', topicTruncated: true })).ok, true, '截到空主题必须带标注（诚实留痕）');
+  assert.equal(validateJoinAck(ackDatagram({ topic: '' })).ok, false, '空主题无标注 = 以空值伪装完整值');
+  assert.equal(validateJoinAck(ackDatagram({ name: '', nameTruncated: true })).ok, true);
+  assert.equal(validateJoinAck(ackDatagram({ name: '' })).ok, false);
+  assert.equal(validateJoinAck(ackDatagram({ topicTruncated: true })).ok, true, '未截断而携带标注只是冗余（不拒）');
+  for (const flag of ['yes', 1, null]) {
+    assert.equal(validateJoinAck(ackDatagram({ topicTruncated: flag })).ok, false, String(flag));
+    assert.equal(validateJoinAck(ackDatagram({ nameTruncated: flag })).ok, false, String(flag));
+  }
+});
+
+test('join-ack：主题与名称沿用呈现面判据（超长 / 控制字符 / 非字符串拒）', () => {
+  assert.equal(validateJoinAck(ackDatagram({ topic: 'x'.repeat(MAX_TOPIC_CHARS) })).ok, true);
+  assert.equal(validateJoinAck(ackDatagram({ topic: 'x'.repeat(MAX_TOPIC_CHARS + 1) })).ok, false);
+  assert.equal(validateJoinAck(ackDatagram({ name: 'x'.repeat(65) })).ok, false);
+  assert.equal(validateJoinAck(ackDatagram({ name: '甲\n乙' })).ok, false);
+  assert.equal(validateJoinAck(ackDatagram({ topic: '主​题' })).ok, false);
+  assert.equal(validateJoinAck(ackDatagram({ topic: 42 })).ok, false);
+  assert.equal(validateJoinAck(ackDatagram({ name: 42 })).ok, false);
+});
+
+test('敲门与应答不入协作域类型表：validateMessage 按未知类型拒绝', () => {
+  assert.equal(MESSAGE_TYPES.includes('join-knock'), false);
+  assert.equal(MESSAGE_TYPES.includes('join-ack'), false);
+  assert.equal(validateMessage(frameWith({ type: 'join-knock' })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'join-ack' })).ok, false);
+  assert.ok(validateMessage(frameWith({ type: 'join-knock' })).reason.includes('未知'));
+});
+
+test('发现类校验器互不认账：probe / probe-ack / join-knock / join-ack 交叉拒绝', () => {
+  const probe = { v: PROTOCOL_VERSION, type: 'probe', instanceId: 'inst-a', identityName: '主机甲' };
+  const probeAck = { ...probe, type: 'probe-ack', collabCount: 0 };
+  assert.equal(validateProbe(KNOCK).ok, false);
+  assert.equal(validateProbe(ackDatagram()).ok, false);
+  assert.equal(validateProbeAck(KNOCK).ok, false);
+  assert.equal(validateProbeAck(ackDatagram()).ok, false);
+  assert.equal(validateJoinKnock(probe).ok, false);
+  assert.equal(validateJoinKnock(probeAck).ok, false);
+  assert.equal(validateJoinAck(probe).ok, false);
+  assert.equal(validateJoinAck(probeAck).ok, false, 'probe-ack 不得被当作 join-ack 吸收');
+  assert.equal(validateJoinKnock({ ...KNOCK, v: 2 }).ok, false);
+  assert.equal(validateJoinKnock({ ...KNOCK, instanceId: '../x' }).ok, false);
+  assert.equal(validateJoinAck(null).ok, false);
+  assert.equal(validateJoinKnock('text').ok, false);
 });

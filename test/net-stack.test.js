@@ -293,6 +293,68 @@ test('pingHost：地址非法 → 明确错误；可用时透传探测结果', {
   assert.equal(probed.reachable, false);
 });
 
+test('requestJoin：降级（站点不可用）→ 明确错误文案（不触达发现层）', { timeout: 15000 }, async (t) => {
+  const discovery = createFakeDiscovery();
+  const { stack } = makeStack(t, { discovery, degraded: { reason: 'segment-exhausted', message: '端口段全满——本地功能可用' } });
+  await stack.start();
+  const result = await stack.requestJoin({ name: '讨论甲' });
+  assert.equal(result.ok, false);
+  assert.equal(result.message, '端口段全满——本地功能可用');
+  assert.deepEqual(discovery.calls, [], '降级态不触达组件（预降级直通）');
+});
+
+test('requestJoin：讨论名形态非法 → 明确错误（不发畸形载荷）；缺省参数同样拒绝', { timeout: 15000 }, async (t) => {
+  const calls = [];
+  const discovery = createFakeDiscovery({
+    requestJoin: async ({ name }) => {
+      calls.push(name);
+      return [];
+    },
+  });
+  const { stack } = makeStack(t, { discovery });
+  await stack.start();
+  t.after(() => stack.close());
+  const cases = [{}, { name: '   ' }, { name: 42 }, { name: 'x'.repeat(65) }, { name: '甲​乙' }];
+  for (const args of cases) {
+    const result = await stack.requestJoin(args);
+    assert.equal(result.ok, false, JSON.stringify(args));
+    assert.ok(result.message.includes('讨论名非法'), result.message);
+  }
+  assert.equal(calls.length, 0, '非法名在启程前把关（广播不承载畸形载荷、不做无谓的收答等待）');
+});
+
+test('requestJoin：合法 → 透传 trim 名、回传应答清单', { timeout: 15000 }, async (t) => {
+  const calls = [];
+  const row = { collabId: 'collab-1', name: '讨论甲', topic: '议题', memberCount: 2, originator: { instanceId: 'inst-a', identityName: '主机甲' }, topicTruncated: false, nameTruncated: false, responder: { instanceId: 'inst-a', identityName: '主机甲', address: '127.0.0.2', port: 17321 }, replies: 1 };
+  const discovery = createFakeDiscovery({
+    requestJoin: async ({ name }) => {
+      calls.push(name);
+      return [row];
+    },
+  });
+  const { stack } = makeStack(t, { discovery });
+  await stack.start();
+  t.after(() => stack.close());
+  const result = await stack.requestJoin({ name: ' 讨论甲 ' });
+  assert.deepEqual(calls, ['讨论甲'], '名字 trim 后下传');
+  assert.deepEqual(result, { ok: true, replies: [row] });
+});
+
+test('requestJoin：发现层 rejection → 收敛为错误形态（不直穿）', { timeout: 15000 }, async (t) => {
+  const discovery = createFakeDiscovery({
+    requestJoin: async () => {
+      throw new Error('套接字未运行');
+    },
+  });
+  const { stack } = makeStack(t, { discovery });
+  await stack.start();
+  t.after(() => stack.close());
+  const result = await stack.requestJoin({ name: '讨论甲' });
+  assert.equal(result.ok, false);
+  assert.ok(result.message.includes('主动加入敲门失败'));
+  assert.ok(result.message.includes('套接字未运行'));
+});
+
 test('listHosts：透传扫描窗口与结果', { timeout: 15000 }, async (t) => {
   const discovery = createFakeDiscovery();
   const { stack } = makeStack(t, { discovery });

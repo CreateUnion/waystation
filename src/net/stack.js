@@ -1,6 +1,6 @@
 import { isIP } from 'node:net';
 import { OCCUPIER_PROBE_TIMEOUT_MS } from '../site.js';
-import { PROTOCOL_VERSION, isPort, newMsgId } from './protocol.js';
+import { PROTOCOL_VERSION, isIdentityName, isPort, newMsgId } from './protocol.js';
 
 /* 组件已被 close 后重试 start 的固定结论：一次性生命周期下重试不可能成功，恢复途径是重建组件（组合根职责） */
 const COMPONENTS_CLOSED = {
@@ -46,6 +46,7 @@ export function createNetStack({ discovery, transport, dispatch, inbound, port, 
     close: () => close(state),
     listHosts: () => listHosts(state),
     pingHost: (options) => pingHost(state, options),
+    requestJoin: (options) => requestJoin(state, options ?? {}),
     send: (message) => state.dispatch.send(message),
     deliveryStatus: (query) => state.dispatch.deliveryStatus(query ?? {}),
     checkInbox: (query) => state.inbound.checkInbox(query),
@@ -170,6 +171,24 @@ async function pingHost(state, { address, port }) {
     return { ok: true, ...(await state.dispatch.ping({ address, port })) };
   } catch (error) {
     return { ok: false, message: `主机探测失败：${error.message}` };
+  }
+}
+
+/* 主动加入敲门（设计 §5.6；工具 ws_request_join 的落点）：讨论名形态在启程前把关——发现类广播会把
+ * 名字播给全网，不发畸形载荷、也不做无谓的收答等待；无应答 = 空清单（统一「无应答」提示由工具层
+ * 承载；不作错误、不自动重试）。 */
+async function requestJoin(state, { name }) {
+  if (!state.available) {
+    return { ok: false, message: state.message };
+  }
+  const wanted = typeof name === 'string' ? name.trim() : '';
+  if (!isIdentityName(wanted)) {
+    return { ok: false, message: '讨论名非法：需要 ≤64 字符、不含换行 / 不可见字符的呈现文本（同身份名判据）' };
+  }
+  try {
+    return { ok: true, replies: await state.discovery.requestJoin({ name: wanted }) };
+  } catch (error) {
+    return { ok: false, message: `主动加入敲门失败：${error.message}` };
   }
 }
 

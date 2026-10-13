@@ -2,7 +2,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import dgram from 'node:dgram';
 import { networkInterfaces } from 'node:os';
-import { DISCOVERY_REPLY_MIN_INTERVAL_MS, broadcastTargets, createDiscovery } from '../src/net/discovery.js';
+import {
+  DISCOVERY_REPLY_MIN_INTERVAL_MS,
+  JOIN_KNOCK_RETRY_COUNT,
+  JOIN_KNOCK_RETRY_INTERVAL_MS,
+  JOIN_KNOCK_WINDOW_MS,
+  broadcastTargets,
+  createDiscovery,
+  fitJoinAckDatagram,
+} from '../src/net/discovery.js';
 import { createKnownHosts } from '../src/net/known-hosts.js';
 import { MAX_COLLAB_COUNT } from '../src/net/protocol.js';
 import { makeTempDir, pickFreePort, waitFor } from './helpers.js';
@@ -14,7 +22,7 @@ function quietLog() {
   return { info: () => {}, warn: () => {}, error: () => {} };
 }
 
-async function startNode(t, { self, bindAddress, collabCount = 0, port, segmentBase }) {
+async function startNode(t, { self, bindAddress, collabCount = 0, port, segmentBase, onJoinKnock = null, knockOptions = {} }) {
   const dataDir = makeTempDir(t);
   const knownHosts = createKnownHosts({ dataDir, log: quietLog() });
   const node = createDiscovery({
@@ -26,6 +34,8 @@ async function startNode(t, { self, bindAddress, collabCount = 0, port, segmentB
     knownHosts,
     log: quietLog(),
     segmentBase,
+    onJoinKnock,
+    ...knockOptions,
   });
   await node.start();
   t.after(() => node.close());
@@ -431,4 +441,278 @@ test('伪造洪泛边界（M8 计量）：写次数随「来源数」而非「�
   assert.equal(b.knownHosts.stats().remembered, 1, '单源 20 连发只写一次清单（整文件原子写不被放大）');
   assert.ok(b.node.stats().rateLimited >= 19);
   assert.equal(b.knownHosts.stats().entries, 1);
+});
+
+/* —— 主动加入（设计 §5.6）：敲门 / 应答的收发、限流、合并与体积预算 —— */
+
+/* 压缩后的敲门时程（生产值见 discovery.js 顶部常量）：窗口覆盖重发时程、应答限流跨重发——
+ * 与生产三者的相对关系一致，用例才具备判别力。 */
+const KNOCK_TIMINGS = { joinKnockRetryCount: 2, joinKnockRetryIntervalMs: 60, joinKnockWindowMs: 300, joinKnockReplyMinIntervalMs: 600 };
+
+/* 成员侧命中回调的固定应答载荷（形态 = 协作层 handleJoinKnock 的返回项）。 */
+const JOIN_REPLY = {
+  collabId: 'collab-1',
+  name: '联调讨论',
+  topic: '发布联调',
+  memberCount: 3,
+  originator: { instanceId: 'inst-org', identityName: '发起人' },
+};
+
+/* 伪敲门对端：收到敲门后按序数决定是否应答（replyOnOrdinal=false 恒不应答）；应答回指收到敲门的 knockId。 */
+function startKnockPeer(t, { port, address, replyOnOrdinal = 1, overrides = {} }) {
+  const socket = dgram.createSocket({ type: 'udp4', reuseAddr: false });
+  t.after(() => socket.close());
+  const peer = { knocksReceived: 0 };
+  socket.on('message', (buffer, rinfo) => {
+    const knock = JSON.parse(buffer.toString('utf8'));
+    if (knock.type !== 'join-knock') {
+      return;
+    }
+    peer.knocksReceived++;
+    if (peer.knocksReceived !== replyOnOrdinal) {
+      return;
+    }
+    const ack = Buffer.from(JSON.stringify({
+      v: 1,
+      type: 'join-ack',
+      instanceId: SELF_B.instanceId,
+      identityName: '主机乙',
+      knockId: knock.knockId,
+      collabId: 'collab-1',
+      name: '联调讨论',
+      topic: '发布联调',
+      memberCount: 3,
+      originator: { instanceId: 'inst-org', identityName: '发起人' },
+      port,
+      ...overrides,
+    }));
+    socket.send(ack, rinfo.port, rinfo.address);
+  });
+  return new Promise((resolve, reject) => {
+    socket.once('error', reject);
+    socket.bind({ port, address, exclusive: true }, () => resolve(peer));
+  });
+}
+
+/* 裸对端：绑定回环、收集收到的全部数据报（供「不应答 / 应答形态」类断言）。 */
+async function startRawPeer(t) {
+  const raw = dgram.createSocket('udp4');
+  t.after(() => raw.close());
+  const received = [];
+  raw.on('message', (buffer) => received.push(JSON.parse(buffer.toString('utf8'))));
+  await new Promise((resolve, reject) => {
+    raw.once('error', reject);
+    raw.bind({ port: 0, address: '127.0.0.1' }, resolve);
+  });
+  return { raw, received };
+}
+
+test('敲门与应答（单播兜底实测）：成员命中自动应答、应答按讨论合并为一行、重发被限流不放大', { timeout: 15000 }, async (t) => {
+  const portA = await pickFreePort();
+  const portB = await pickFreePort();
+  const knocksSeen = [];
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port: portA, knockOptions: KNOCK_TIMINGS });
+  const b = await startNode(t, { self: SELF_B, bindAddress: '127.0.0.2', port: portB, onJoinKnock: (knock) => { knocksSeen.push(knock); return [JOIN_REPLY]; }, knockOptions: KNOCK_TIMINGS });
+  a.knownHosts.remember({ address: '127.0.0.2', port: portB });
+  const replies = await a.node.requestJoin({ name: '联调讨论' });
+  assert.equal(knocksSeen.length, 1, '首个敲门即被处理；后续重发应落在应答限流窗内不再触发命中处理');
+  assert.equal(knocksSeen[0].instanceId, SELF_A.instanceId);
+  assert.equal(knocksSeen[0].identityName, '主机甲');
+  assert.equal(knocksSeen[0].name, '联调讨论');
+  assert.equal(knocksSeen[0].address, '127.0.0.1', '命中回调携申请人来源端点（放行时作 ws_invite 目标）');
+  assert.equal(knocksSeen[0].port, portA);
+  assert.match(knocksSeen[0].knockId, /^[0-9a-f-]{32,40}$/);
+  assert.deepEqual(replies, [{
+    collabId: 'collab-1',
+    name: '联调讨论',
+    topic: '发布联调',
+    memberCount: 3,
+    originator: { instanceId: 'inst-org', identityName: '发起人' },
+    topicTruncated: false,
+    nameTruncated: false,
+    responder: { instanceId: SELF_B.instanceId, identityName: '主机乙', address: '127.0.0.2', port: portB },
+    replies: 1,
+  }]);
+  assert.ok(a.node.stats().joinKnocksSent >= 3, `敲门应少量重发（1+${JOIN_KNOCK_RETRY_COUNT} 发），实际 ${a.node.stats().joinKnocksSent}`);
+  assert.equal(a.node.stats().joinRepliesIn, 1);
+  assert.equal(b.node.stats().joinRepliesAnswered, 1, '重发落在限流窗内：一次申请只放大为一份应答');
+  assert.ok(b.node.stats().joinKnocksThrottled >= 1, '被限流的重发应计数留痕');
+  assert.equal(b.node.stats().probesAnswered, 0, '敲门不触探测面');
+});
+
+test('敲门重发覆盖首包丢失：伪对端只答第二发，应答按 knockId 回指本次敲门被采信', { timeout: 15000 }, async (t) => {
+  const portA = await pickFreePort();
+  const portB = await pickFreePort();
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port: portA, knockOptions: KNOCK_TIMINGS });
+  const peer = await startKnockPeer(t, { port: portB, address: '127.0.0.2', replyOnOrdinal: 2 });
+  a.knownHosts.remember({ address: '127.0.0.2', port: portB });
+  const replies = await a.node.requestJoin({ name: '联调讨论' });
+  assert.ok(peer.knocksReceived >= 2, `首包丢失应由重发覆盖，实际收到 ${peer.knocksReceived} 发`);
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].collabId, 'collab-1');
+  assert.equal(a.node.stats().joinRepliesIn, 1, 'knockId 相符的应答被采信');
+});
+
+test('敲门应答限流（同源最小间隔）：窗口内再次敲门不放大为二次应答', { timeout: 15000 }, async (t) => {
+  const portA = await pickFreePort();
+  const portB = await pickFreePort();
+  const timings = { joinKnockRetryCount: 0, joinKnockRetryIntervalMs: 10, joinKnockWindowMs: 200, joinKnockReplyMinIntervalMs: 1500 };
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port: portA, knockOptions: timings });
+  const b = await startNode(t, { self: SELF_B, bindAddress: '127.0.0.2', port: portB, onJoinKnock: () => [JOIN_REPLY], knockOptions: timings });
+  a.knownHosts.remember({ address: '127.0.0.2', port: portB });
+  const first = await a.node.requestJoin({ name: '联调讨论' });
+  const second = await a.node.requestJoin({ name: '联调讨论' });
+  assert.equal(first.length, 1);
+  assert.deepEqual(second, [], '限流窗内的再敲不应答（申请人不做重试风暴，成员也不被放大）');
+  assert.equal(b.node.stats().joinRepliesAnswered, 1);
+  assert.ok(b.node.stats().joinKnocksThrottled >= 1);
+});
+
+test('无讨论面（onJoinKnock 缺省）：敲门不应答；探测面行为零变化（probe-ack 不含敲门字段）', { timeout: 15000 }, async (t) => {
+  const portB = await pickFreePort();
+  await startNode(t, { self: SELF_B, bindAddress: '127.0.0.2', port: portB });
+  const { raw, received } = await startRawPeer(t);
+  const knock = Buffer.from(JSON.stringify({ v: 1, type: 'join-knock', instanceId: SELF_A.instanceId, identityName: '主机甲', knockId: 'knock-1', name: '联调讨论' }));
+  raw.send(knock, portB, '127.0.0.2');
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  raw.send(Buffer.from(JSON.stringify({ v: 1, type: 'probe', instanceId: SELF_A.instanceId, identityName: '主机甲' })), portB, '127.0.0.2');
+  await waitFor(() => received.length >= 1);
+  assert.equal(received[0].type, 'probe-ack', '敲门不触发探测应答、探测仍走原路（兼容面零变化）');
+  assert.equal('knockId' in received[0], false);
+  assert.equal(received[0].collabCount, 0);
+});
+
+test('非法敲门：超体积 / 坏字段 / 版本不符——拒绝、计数、不应答', { timeout: 15000 }, async (t) => {
+  const portB = await pickFreePort();
+  const b = await startNode(t, { self: SELF_B, bindAddress: '127.0.0.2', port: portB, onJoinKnock: () => [JOIN_REPLY] });
+  const { raw, received } = await startRawPeer(t);
+  const knockWith = (overrides) => Buffer.from(JSON.stringify({ v: 1, type: 'join-knock', instanceId: SELF_A.instanceId, identityName: '主机甲', knockId: 'knock-1', name: '联调讨论', ...overrides }));
+  raw.send(Buffer.alloc(600, 0x61), portB, '127.0.0.2');
+  raw.send(knockWith({ knockId: '../x' }), portB, '127.0.0.2');
+  raw.send(knockWith({ name: '甲\n乙' }), portB, '127.0.0.2');
+  raw.send(knockWith({ v: 2 }), portB, '127.0.0.2');
+  await waitFor(() => b.node.stats().rejected.invalid >= 3);
+  await waitFor(() => b.node.stats().rejected.oversize >= 1);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.deepEqual(received, [], '非法敲门不得触发应答（命中回调也不应被调用）');
+  assert.equal(b.node.stats().joinRepliesAnswered, 0);
+});
+
+test('非法加入应答：拒绝并计数、不并入在途收集', { timeout: 15000 }, async (t) => {
+  const portA = await pickFreePort();
+  const portB = await pickFreePort();
+  const timings = { joinKnockRetryCount: 0, joinKnockRetryIntervalMs: 10, joinKnockWindowMs: 250, joinKnockReplyMinIntervalMs: 600 };
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port: portA, knockOptions: timings });
+  await startKnockPeer(t, { port: portB, address: '127.0.0.2', overrides: { memberCount: 0 } });
+  a.knownHosts.remember({ address: '127.0.0.2', port: portB });
+  const replies = await a.node.requestJoin({ name: '联调讨论' });
+  assert.deepEqual(replies, []);
+  assert.ok(a.node.stats().rejected.invalid >= 1, '非法应答拒绝并计数');
+  assert.equal(a.node.stats().joinRepliesIn, 0, '校验失败不得进入应答计数（与探测应答同口径：先校验后计数）');
+});
+
+test('自答排除：敲自己的门不触发命中处理；自己实例标识的应答不采信', { timeout: 15000 }, async (t) => {
+  const portA = await pickFreePort();
+  let hitCount = 0;
+  const timings = { joinKnockRetryCount: 0, joinKnockRetryIntervalMs: 10, joinKnockWindowMs: 250, joinKnockReplyMinIntervalMs: 600 };
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port: portA, onJoinKnock: () => { hitCount++; return [JOIN_REPLY]; }, knockOptions: timings });
+  a.knownHosts.remember({ address: '127.0.0.1', port: portA });
+  const first = await a.node.requestJoin({ name: '联调讨论' });
+  assert.deepEqual(first, []);
+  assert.equal(hitCount, 0, '自答排除先于命中处理');
+  assert.ok(a.node.stats().selfObserved >= 1);
+  assert.equal(a.node.stats().joinRepliesAnswered, 0);
+  const { raw } = await startRawPeer(t);
+  const pending = a.node.requestJoin({ name: '联调讨论' });
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  raw.send(Buffer.from(JSON.stringify({
+    v: 1, type: 'join-ack', instanceId: SELF_A.instanceId, identityName: '主机甲', knockId: 'knock-x',
+    collabId: 'collab-1', name: '联调讨论', topic: '发布联调', memberCount: 3,
+    originator: { instanceId: 'inst-org', identityName: '发起人' },
+  })), portA, '127.0.0.1');
+  const second = await pending;
+  assert.deepEqual(second, []);
+  assert.equal(a.node.stats().joinRepliesIn, 1, '应答计数先于自答排除（同探测应答口径）');
+  assert.ok(a.node.stats().selfObserved >= 1);
+});
+
+test('应答合并：同讨论多成员合一行计数、同名不同讨论各占一行（按名与标识排序）', { timeout: 15000 }, async (t) => {
+  const portA = await pickFreePort();
+  const portB = await pickFreePort();
+  const portC = await pickFreePort();
+  const portD = await pickFreePort();
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port: portA, knockOptions: KNOCK_TIMINGS });
+  await startKnockPeer(t, { port: portB, address: '127.0.0.2' });
+  await startKnockPeer(t, { port: portC, address: '127.0.0.3' });
+  await startKnockPeer(t, { port: portD, address: '127.0.0.4', overrides: { collabId: 'collab-2' } });
+  a.knownHosts.remember({ address: '127.0.0.2', port: portB });
+  a.knownHosts.remember({ address: '127.0.0.3', port: portC });
+  a.knownHosts.remember({ address: '127.0.0.4', port: portD });
+  const replies = await a.node.requestJoin({ name: '联调讨论' });
+  assert.deepEqual(replies.map((row) => [row.collabId, row.replies]), [['collab-1', 2], ['collab-2', 1]], '同讨论合并计数；不同讨论各占一行；按（名，标识）稳定排序');
+  assert.equal(replies[0].responder.address, '127.0.0.2', '首份应答的来源即该行的应答者端点');
+});
+
+test('fitJoinAckDatagram：先截主题、仍超再截名称；UTF-8 安全、标注截断、固定字段不可截；截到无可截则拒发', () => {
+  const small = {
+    v: 1, type: 'join-ack', instanceId: 'inst-b', identityName: '主机乙', knockId: 'knock-1', port: 7321,
+    collabId: 'collab-1', name: '联调讨论', topic: '发布联调', memberCount: 3,
+    originator: { instanceId: 'inst-org', identityName: '发起人' },
+  };
+  assert.deepEqual(fitJoinAckDatagram(small), small, '预算内原样返回');
+  const longTopic = '题'.repeat(200);
+  const fittedTopic = fitJoinAckDatagram({ ...small, topic: longTopic });
+  assert.ok(Buffer.byteLength(JSON.stringify(fittedTopic)) <= 512);
+  assert.equal(fittedTopic.topicTruncated, true);
+  assert.equal(fittedTopic.nameTruncated === true, false, '主题尚可容纳时不得动名称');
+  assert.equal(fittedTopic.name, '联调讨论');
+  assert.equal(fittedTopic.collabId, 'collab-1');
+  assert.equal(fittedTopic.memberCount, 3);
+  assert.deepEqual(fittedTopic.originator, { instanceId: 'inst-org', identityName: '发起人' });
+  assert.ok(fittedTopic.topic.length > 0 && fittedTopic.topic.length < 200);
+  assert.ok(longTopic.startsWith(fittedTopic.topic), '截断 = 前缀（不重排原文）');
+  assert.equal(Buffer.from(fittedTopic.topic, 'utf8').toString('utf8'), fittedTopic.topic, 'UTF-8 安全：不得切出半个字符');
+  const longIds = { instanceId: 'e'.repeat(36), identityName: 'e'.repeat(36), knockId: 'k'.repeat(36), collabId: 'c'.repeat(36), originator: { instanceId: 'o'.repeat(36), identityName: 'o'.repeat(36) } };
+  const longName = '名'.repeat(64);
+  const fittedName = fitJoinAckDatagram({ ...small, ...longIds, name: longName, topic: '题'.repeat(200) });
+  assert.ok(Buffer.byteLength(JSON.stringify(fittedName)) <= 512);
+  assert.equal(fittedName.topic, '', '主题截空后仍超：主题归空（带标注）再截名称');
+  assert.equal(fittedName.topicTruncated, true);
+  assert.equal(fittedName.nameTruncated, true);
+  assert.ok(fittedName.name.length > 0 && fittedName.name.length < 64);
+  assert.ok(longName.startsWith(fittedName.name));
+  assert.equal(fittedName.collabId, 'c'.repeat(36), '不可截字段保持完整（加入后对表补齐由接收侧承担）');
+  const hopeless = fitJoinAckDatagram({ ...small, ...longIds, identityName: '甲'.repeat(64), originator: { instanceId: 'o'.repeat(36), identityName: '乙'.repeat(64) }, name: longName, topic: '题'.repeat(200) });
+  assert.equal(hopeless, null, '身份与标识撑爆信封：宁可不答（绝不发超限数据报、绝不截不可截字段）');
+});
+
+test('敲门应答的体积预算在线上生效：超长主题截断后仍可达（整形而非被拒），截到无可截则不发并计数', { timeout: 15000 }, async (t) => {
+  const portA = await pickFreePort();
+  const portB = await pickFreePort();
+  const portC = await pickFreePort();
+  const longTopic = '题'.repeat(200);
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port: portA, knockOptions: KNOCK_TIMINGS });
+  await startNode(t, { self: SELF_B, bindAddress: '127.0.0.2', port: portB, onJoinKnock: () => [{ ...JOIN_REPLY, topic: longTopic }], knockOptions: KNOCK_TIMINGS });
+  const bigSelf = { instanceId: 'cccccccc-0000-4000-8000-000000000003', identityName: '丙'.repeat(64) };
+  const c = await startNode(t, { self: bigSelf, bindAddress: '127.0.0.3', port: portC, onJoinKnock: () => [{ ...JOIN_REPLY, topic: longTopic, name: '名'.repeat(64) }], knockOptions: KNOCK_TIMINGS });
+  a.knownHosts.remember({ address: '127.0.0.2', port: portB });
+  a.knownHosts.remember({ address: '127.0.0.3', port: portC });
+  const replies = await a.node.requestJoin({ name: '联调讨论' });
+  assert.equal(replies.length, 1, '可截断的应答整形后送达；不可截的应答不占结果面');
+  assert.equal(replies[0].responder.port, portB);
+  assert.equal(replies[0].topicTruncated, true);
+  assert.equal(replies[0].topic.length < 200, true);
+  assert.ok(longTopic.startsWith(replies[0].topic));
+  assert.equal(c.node.stats().joinRepliesSkipped, 1, '截到无可截：放弃发送并计数留痕（绝不发超限数据报）');
+  assert.equal(c.node.stats().joinRepliesAnswered, 0);
+});
+
+test('敲门参数与常量：非法讨论名抛 TypeError；生产窗口覆盖重发时程且应答限流跨重发', { timeout: 15000 }, async (t) => {
+  const port = await pickFreePort();
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port });
+  await assert.rejects(a.node.requestJoin({ name: '甲\n乙' }), TypeError);
+  await assert.rejects(a.node.requestJoin({ name: '' }), TypeError);
+  await assert.rejects(a.node.requestJoin({}), TypeError);
+  assert.equal(JOIN_KNOCK_RETRY_COUNT, 2, '少量重发：1+2 发');
+  assert.ok(JOIN_KNOCK_WINDOW_MS >= JOIN_KNOCK_RETRY_INTERVAL_MS * (JOIN_KNOCK_RETRY_COUNT + 1), '收答窗口覆盖重发时程（末次重发仍有收条时间）');
 });

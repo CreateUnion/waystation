@@ -121,6 +121,16 @@ export function validateProbeAck(datagram) {
   return validateDiscovery(datagram, 'probe-ack');
 }
 
+/* 主动加入的敲门与应答（设计 §5.6）：同样走发现类数据报校验族——不进 MESSAGE_TYPES
+ * （它们不是协作域帧，与入站帧白名单无交互）。 */
+export function validateJoinKnock(datagram) {
+  return validateDiscovery(datagram, 'join-knock');
+}
+
+export function validateJoinAck(datagram) {
+  return validateDiscovery(datagram, 'join-ack');
+}
+
 /** 帧解码：JSON 解析 + 信封校验；成功时回带 frame 供调用方使用。 */
 export function parseFrame(text) {
   if (typeof text !== 'string') {
@@ -200,15 +210,97 @@ function validateDiscovery(datagram, expectedType) {
     return refuse('发现报文 identityName 非法');
   }
   if (expectedType === 'probe-ack') {
-    if (!isCollabCount(datagram.collabCount)) {
-      return refuse('扫描应答 collabCount 非法');
-    }
-    /* port：宽容缺省（已定案）——缺 port 回退数据报来源端口；字段存在则校验 1–65535 且以字段为准。 */
-    if (datagram.port !== undefined && !isPort(datagram.port)) {
-      return refuse('扫描应答 port 非法（1–65535 的整数）');
-    }
+    return probeAckFieldsRejection(datagram);
+  }
+  if (expectedType === 'join-knock') {
+    return joinKnockFieldsRejection(datagram);
+  }
+  if (expectedType === 'join-ack') {
+    return joinAckFieldsRejection(datagram);
   }
   return { ok: true };
+}
+
+/* 扫描应答专属字段：collabCount 必填合法（0 起——无协作的站点照样应答）。
+ * port：宽容缺省（已定案）——缺 port 回退数据报来源端口；字段存在则校验 1–65535 且以字段为准。 */
+function probeAckFieldsRejection(datagram) {
+  if (!isCollabCount(datagram.collabCount)) {
+    return refuse('扫描应答 collabCount 非法');
+  }
+  if (datagram.port !== undefined && !isPort(datagram.port)) {
+    return refuse('扫描应答 port 非法（1–65535 的整数）');
+  }
+  return { ok: true };
+}
+
+/* 敲门：讨论名（同身份名呈现判据；敲门会把名字播给全网，形态不得放宽）+ 报送标识
+ * （应答据此回指本次敲门——旧应答不进新申请的结果面）。端口不入报文：来源端口即站点端口。 */
+function joinKnockFieldsRejection(datagram) {
+  if (!isId(datagram.knockId)) {
+    return refuse('敲门报文 knockId 非法');
+  }
+  if (!isIdentityName(datagram.name)) {
+    return refuse(`敲门报文 name 非法（讨论名：≤${MAX_IDENTITY_NAME_CHARS} 字符、不含不可见字符的呈现文本）`);
+  }
+  return { ok: true };
+}
+
+/* 应答：讨论面字段齐全（collabId / 名称 / 主题 / 成员数 / 发起人标识）+ port 宽容缺省。
+ * 主题与名称可截断（体积预算，设计 §5.6），截断必须带标注——空值仅在被标注截断时容许，
+ * 不得以空串伪装完整值；collabId / 成员数 / 发起人标识不可截（接收侧校验同口径）。 */
+function joinAckFieldsRejection(datagram) {
+  if (!isId(datagram.knockId)) {
+    return refuse('加入应答 knockId 非法');
+  }
+  if (!isId(datagram.collabId)) {
+    return refuse('加入应答 collabId 非法');
+  }
+  const textIssue = joinAckTextFieldsRejection(datagram);
+  if (textIssue !== null) {
+    return textIssue;
+  }
+  return joinAckMemberFieldsRejection(datagram);
+}
+
+/* 可截断文本字段（名称 / 主题）逐项拒收，全部通过返回 null。 */
+function joinAckTextFieldsRejection(datagram) {
+  const nameIssue = joinAckTextRejection(datagram.name, MAX_IDENTITY_NAME_CHARS, datagram.nameTruncated, '名称');
+  if (nameIssue !== null) {
+    return nameIssue;
+  }
+  const topicIssue = joinAckTextRejection(datagram.topic, MAX_TOPIC_CHARS, datagram.topicTruncated, '主题');
+  if (topicIssue !== null) {
+    return topicIssue;
+  }
+  return null;
+}
+
+/* 成员面字段（成员数 / 发起人标识）与 port 宽容缺省（缺 port 回退来源端口，同上扫描应答口径）。 */
+function joinAckMemberFieldsRejection(datagram) {
+  if (!Number.isInteger(datagram.memberCount) || datagram.memberCount < 1 || datagram.memberCount > MAX_COLLAB_COUNT) {
+    return refuse(`加入应答 memberCount 非法（1–${MAX_COLLAB_COUNT} 的整数）`);
+  }
+  if (!isPeerShape(datagram.originator)) {
+    return refuse('加入应答 originator 非法（需 instanceId + identityName 的发起人标识）');
+  }
+  if (datagram.port !== undefined && !isPort(datagram.port)) {
+    return refuse('加入应答 port 非法（1–65535 的整数）');
+  }
+  return { ok: true };
+}
+
+/* 可截断文本字段（名称 / 主题）：形态合法即通过（返回 null）；空值仅限带截断标注；标注存在则须为布尔。 */
+function joinAckTextRejection(value, maxChars, truncatedFlag, label) {
+  if (truncatedFlag !== undefined && typeof truncatedFlag !== 'boolean') {
+    return refuse(`加入应答 ${label}截断标注非法（布尔）`);
+  }
+  if (typeof value !== 'string') {
+    return refuse(`加入应答 ${label}非法（≤${maxChars} 字符的呈现文本）`);
+  }
+  if (value === '') {
+    return truncatedFlag === true ? null : refuse(`加入应答 ${label}不能为空（空值仅限截断标注）`);
+  }
+  return isPresentationText(value, maxChars) ? null : refuse(`加入应答 ${label}非法（≤${maxChars} 字符的呈现文本）`);
 }
 
 function isPlainObject(value) {
