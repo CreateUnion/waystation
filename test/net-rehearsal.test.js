@@ -1,8 +1,8 @@
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, rmSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -62,30 +62,97 @@ async function stopNode(node) {
   await exited;
 }
 
-/* 复用目录的用例（离线补投 / 重启收敛）建目录也走这里：收尾钩子必须抢在 makeTempDir 的删除钩子前注册。 */
+/* 复用目录的用例（离线补投 / 重启收敛）建目录也走这里：收尾钩子必须抢在 makeTempDir 的删除钩子前注册；
+ * 目录一并登记进文件级兜底（删除钩子被跳过时由文件末清理残留）。 */
 function makeNodeDir(t) {
   cleanupRegistryOf(t);
-  return makeTempDir(t);
+  const dir = makeTempDir(t);
+  rehearsalDirs.push(dir);
+  return dir;
 }
+
+/* 文件级兜底：任何收尾钩子被跳过（如钩子抛错）都会留下存活的预演节点——强制杀灭并响亮失败，绝不让
+ * 泄漏把整轮运行拖进永不退出的等待；顺带清理可能因删除钩子被跳过而残留的临时目录（正常路径两处
+ * 都无事可做）。 */
+const rehearsalNodes = [];
+const rehearsalDirs = [];
+
+after(async () => {
+  const leakedPids = [];
+  for (const node of rehearsalNodes) {
+    const child = node.child;
+    if (child !== null && child.exitCode === null && child.signalCode === null) {
+      leakedPids.push(child.pid);
+      child.kill('SIGKILL');
+    }
+  }
+  for (const dir of rehearsalDirs) {
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch (error) {
+      console.error(`[测试收尾] 兜底清理临时目录失败：${dir}（${error.code}）`);
+    }
+  }
+  assert.equal(leakedPids.length, 0, `预演节点未被用例收尾（收尾钩子被跳过？）：${leakedPids.join(',')}——已兜底强制杀灭，检查用例清理`);
+});
 
 /* 本机双进程预演（跨机的本机近似）：两个真实进程、真实套接字、回环双地址同端口。
  * 单播兜底的目标地址正是这样喂进「已知主机清单」的——与生产路径同一机制（PoC 实测：
  * 广播单向盲区正是靠清单里的地址反向补偿）。 */
-async function startNode(t, { identityName, bindAddress, port, knownPeers = [], dataDir: reusedDir, adapter = false, env = {}, collab = true, config = {} }) {
+async function spawnNode(t, { identityName, bindAddress, port, knownPeers = [], dataDir: reusedDir, adapter = false, env = {}, collab = true, config = {} }) {
   const node = { child: null, pending: [], ready: null, stderr: '' };
   cleanupRegistryOf(t).push(node);   // 先登记收尾（见 nodesByTest 注释），再让 makeTempDir 注册删除
-  const dataDir = reusedDir ?? makeTempDir(t);   // 复用数据目录 = 同一实例标识（跨重启场景）
+  const dataDir = reusedDir ?? makeNodeDir(t);   // 复用数据目录 = 同一实例标识（跨重启场景）
   writeNodeConfig(dataDir, { identityName, port, ...config });
   node.child = spawn(process.execPath, [FIXTURE, JSON.stringify({ dataDir, bindAddress, knownPeers, adapter, collab })], {
     cwd: repoRoot,
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, ...env },
   });
+  rehearsalNodes.push(node);
   wireNodeOutput(node);
   attachCommand(node);
   await waitFor(() => node.ready !== null, { timeoutMs: 10000 });
+  return node;
+}
+
+/* 单节点启动：即刻断言绑定成功。组守卫的重放轮一律走 spawnNode，绑定断言由守卫在收束轮统一执行。 */
+async function startNode(t, options) {
+  const node = await spawnNode(t, options);
   assert.equal(node.ready.bind.ok, true, JSON.stringify(node.ready.bind));
   return node;
+}
+
+const GROUP_SETUP_ATTEMPTS = 3;
+
+/* 端口环境碰撞判定：取端口（探测后即刻释放）到子进程实际绑定的窗口里，端口可能被并行运行的其它
+ * 测试文件/外部程序抢占——绑定竞态分类把无应答的占用者报为 port-taken、把另一预演节点（应答合法
+ * pong）报为 occupied-by-station，两者都属环境碰撞；bind-failed 等其余 reason 与实现缺陷同形，不重试
+ * （照常交断言判红）。 */
+function isPortCollision(node) {
+  return node.ready.bind.ok === false
+    && (node.ready.bind.reason === 'port-taken' || node.ready.bind.reason === 'occupied-by-station');
+}
+
+/* 组级端口守卫：取段与整组节点启动收进同一重放单元（口径同 site.test.js 的 withSegmentBase 与
+ * server.test.js 的端口 setup 守卫）——组内任一节点绑定撞上环境碰撞即收摊换新段重放整组；重试用尽
+ * 把最后一轮结果原样交回，由绑定断言判红（确定性缺陷不被掩盖，守卫只吸收环境碰撞）。
+ * startNodes(port) 返回该组全部节点：组内先启后停的探针也要在内，重放时一并收摊。 */
+async function startNodesGuarded(t, size, startNodes) {
+  for (let round = 0; ; round++) {
+    const port = size > 1 ? await pickFreeSegment(size) : await pickFreePort();
+    const nodes = await startNodes(port);
+    const collided = nodes.some(isPortCollision);
+    if (!collided || round === GROUP_SETUP_ATTEMPTS - 1) {
+      for (const node of nodes) {
+        assert.equal(node.ready.bind.ok, true, JSON.stringify(node.ready.bind));
+      }
+      return { port, nodes };
+    }
+    for (const node of nodes) {
+      await stopNode(node);
+    }
+  }
 }
 
 /* 预演节点的配置：随机高位端口 + 加速参数（扫描窗口 / 重传节律 / 调度周期），压缩整轮预演的等待时间；
@@ -148,20 +215,53 @@ function attachCommand(node) {
  * 使互扫断言不依赖启动时序；产品行为不变（限流窗口自愈，人类尺度无感）。 */
 const PAIR_SETTLE_MS = DISCOVERY_REPLY_MIN_INTERVAL_MS + 100;   // 窗口 + 余量
 
-function startPair(t, port, { collab = true } = {}) {
-  const ready = Promise.all([
-    startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: [{ address: '127.0.0.2', port }], collab }),
-    startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, knownPeers: [{ address: '127.0.0.1', port }], collab }),
+/* 同端口双节点（回环双地址各占一端；重放轮用 spawnNode，绑定断言由组守卫在收束轮执行）。 */
+function spawnPairNodes(t, port, { collab = true } = {}) {
+  return Promise.all([
+    spawnNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: [{ address: '127.0.0.2', port }], collab }),
+    spawnNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, knownPeers: [{ address: '127.0.0.1', port }], collab }),
   ]);
-  return ready.then(async ([a, b]) => {
-    await new Promise((resolve) => setTimeout(resolve, PAIR_SETTLE_MS));
-    return { a, b };
+}
+
+/* 同地址相邻端口双节点（a 占段基、b 占段基+1，b 的已知主机指向 a）。 */
+function spawnAdjacentPairNodes(t, port, { collab = true } = {}) {
+  return Promise.all([
+    spawnNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, collab }),
+    spawnNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }], collab }),
+  ]);
+}
+
+/* 双节点就绪并等限流窗口过期后交回（等待放在守卫收束后——重放轮不重复等待）。 */
+async function startPairGuarded(t, { collab = true } = {}) {
+  const { port, nodes } = await startNodesGuarded(t, 1, (startPort) => spawnPairNodes(t, startPort, { collab }));
+  const [a, b] = nodes;
+  await new Promise((resolve) => setTimeout(resolve, PAIR_SETTLE_MS));
+  return { port, a, b };
+}
+
+/* 「先起探针乙取实例标识并退出 → 再起甲」的启动序（离线补投 / 重启收敛共用；探针与甲同属一个重放
+ * 单元——任一节点绑定被环境抢走即换段重放整组，重启时复用数据目录 = 实例标识不变）。 */
+async function startProbeThenNodeOne(t, { probeDir, nodeADir }) {
+  return startNodesGuarded(t, 1, async (startPort) => {
+    const probe = await spawnNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port: startPort, dataDir: probeDir, collab: false });
+    await probe.command({ cmd: 'exit' });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const a = await spawnNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port: startPort, knownPeers: [{ address: '127.0.0.2', port: startPort }], dataDir: nodeADir, collab: false });
+    return [probe, a];
   });
 }
 
+/* 相邻三连端口三节点（a 占段基，乙丙的已知主机指向 a）。 */
+function spawnTriadNodes(t, port, config = {}) {
+  return Promise.all([
+    spawnNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, config }),
+    spawnNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }], config }),
+    spawnNode(t, { identityName: '主机丙', bindAddress: '127.0.0.1', port: port + 2, knownPeers: [{ address: '127.0.0.1', port }], config }),
+  ]);
+}
+
 test('互扫可见（身份正确）+ ping 双向与不可达', { timeout: 40000 }, async (t) => {
-  const port = await pickFreePort();
-  const { a, b } = await startPair(t, port);
+  const { port, a, b } = await startPairGuarded(t);
   const listedByA = await a.command({ cmd: 'list_hosts' });
   const peerSeenByA = listedByA.hosts.find((host) => host.instanceId === b.ready.instanceId);
   assert.ok(peerSeenByA, `甲应扫到乙，实际清单：${JSON.stringify(listedByA.hosts)}`);
@@ -182,8 +282,7 @@ test('互扫可见（身份正确）+ ping 双向与不可达', { timeout: 40000
 });
 
 test('消息可靠往返：A 发 B 收，会话投递成功后 A 侧见第三档', { timeout: 40000 }, async (t) => {
-  const port = await pickFreePort();
-  const { a, b } = await startPair(t, port, { collab: false });
+  const { port, a, b } = await startPairGuarded(t, { collab: false });
   const sent = await a.command({
     cmd: 'send',
     collabId: 'rehearsal-1',
@@ -215,8 +314,7 @@ test('消息可靠往返：A 发 B 收，会话投递成功后 A 侧见第三档
 });
 
 test('第二档语义：对端会话写入失败 → 维持「已到对方驿站」', { timeout: 40000 }, async (t) => {
-  const port = await pickFreePort();
-  const { a, b } = await startPair(t, port, { collab: false });
+  const { port, a, b } = await startPairGuarded(t, { collab: false });
   await b.command({ cmd: 'set_writer', ok: false });
   const sent = await a.command({
     cmd: 'send',
@@ -240,14 +338,10 @@ test('第二档语义：对端会话写入失败 → 维持「已到对方驿站
 });
 
 test('离线排队 + 补投 + 保序：对端未启动时排队，启动后按发送序送达', { timeout: 60000 }, async (t) => {
-  const port = await pickFreePort();
   const bDir = makeNodeDir(t);
   // 先起一次乙取实例标识与地址归属，再让它退出——重启时复用数据目录（实例标识不变）
-  const probe = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, dataDir: bDir, collab: false });
+  const { port, nodes: [probe, a] } = await startProbeThenNodeOne(t, { probeDir: bDir });
   const peerId = probe.ready.instanceId;
-  await probe.command({ cmd: 'exit' });
-  await new Promise((resolve) => setTimeout(resolve, 200));
-  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: [{ address: '127.0.0.2', port }], collab: false });
   const sentIds = [];
   const messages = ['第一封', '第二封', '第三封'];
   for (const text of messages) {
@@ -274,16 +368,12 @@ test('离线排队 + 补投 + 保序：对端未启动时排队，启动后按�
 });
 
 test('重启收敛（故障注入）：强杀不丢队列，以原数据目录重建后补投至终态', { timeout: 60000 }, async (t) => {
-  const port = await pickFreePort();
   const aDir = makeNodeDir(t);
   const bDir = makeNodeDir(t);
   // 先起一次乙取实例标识，再让它退出——重启时复用数据目录（实例标识不变），仍是「同一个乙」
-  const probe = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.2', port, dataDir: bDir, collab: false });
+  const { port, nodes: [probe, a1] } = await startProbeThenNodeOne(t, { probeDir: bDir, nodeADir: aDir });
   const peerId = probe.ready.instanceId;
-  await probe.command({ cmd: 'exit' });
-  await new Promise((resolve) => setTimeout(resolve, 200));
   // 乙不在线时甲发消息：离线入队（落盘承诺）——随后甲进程被强杀，队列只靠磁盘幸存
-  const a1 = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, knownPeers: [{ address: '127.0.0.2', port }], dataDir: aDir, collab: false });
   const sent = await a1.command({
     cmd: 'send',
     collabId: 'restart-1',
@@ -313,8 +403,9 @@ test('重启收敛（故障注入）：强杀不丢队列，以原数据目录�
 });
 
 test('exit 干净退出（真实进程生命周期收尾）', { timeout: 40000 }, async (t) => {
-  const port = await pickFreePort();
-  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port });
+  const { nodes: [a] } = await startNodesGuarded(t, 1, async (startPort) => [
+    await spawnNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port: startPort }),
+  ]);
   const exitCode = new Promise((resolve) => a.child.on('exit', resolve));
   const closed = await a.command({ cmd: 'exit' });
   assert.equal(closed.ok, true);
@@ -322,9 +413,8 @@ test('exit 干净退出（真实进程生命周期收尾）', { timeout: 40000 }
 });
 
 test('多站点同机预演：同地址两节点（端口 P 与 P+1）按站点端口独立投递', { timeout: 40000 }, async (t) => {
-  const port = await pickFreeSegment(2);   // 两站点占相邻端口：整段取（pickFreePort 只保证单端口空闲，邻位不保证）
-  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, collab: false });
-  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }], collab: false });
+  // 两站点占相邻端口：整段取（pickFreePort 只保证单端口空闲，邻位不保证）
+  const { port, nodes: [a, b] } = await startNodesGuarded(t, 2, (startPort) => spawnAdjacentPairNodes(t, startPort, { collab: false }));
   const sent = await a.command({
     cmd: 'send',
     collabId: 'rehearsal-multi',
@@ -345,18 +435,19 @@ test('多站点同机预演：同地址两节点（端口 P 与 P+1）按站点�
 });
 
 test('适配器端到端：乙经注入口投进假收件箱（内容含上下文头），甲侧推进第三档', { timeout: 40000 }, async (t) => {
-  const port = await pickFreePort();
   const inbox = await startFakeSessionInbox(t);
-  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, collab: false });
-  const b = await startNode(t, {
-    identityName: '主机乙',
-    bindAddress: '127.0.0.2',
-    port,
-    knownPeers: [{ address: '127.0.0.1', port }],
-    adapter: true,
-    env: { CLAUDE_CODE_MESSAGING_SOCKET: inbox.path, CLAUDE_CODE_MESSAGING_TOKEN: 'tok-1' },
-    collab: false,
-  });
+  const { port, nodes: [a, b] } = await startNodesGuarded(t, 1, async (startPort) => [
+    await spawnNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port: startPort, collab: false }),
+    await spawnNode(t, {
+      identityName: '主机乙',
+      bindAddress: '127.0.0.2',
+      port: startPort,
+      knownPeers: [{ address: '127.0.0.1', port: startPort }],
+      adapter: true,
+      env: { CLAUDE_CODE_MESSAGING_SOCKET: inbox.path, CLAUDE_CODE_MESSAGING_TOKEN: 'tok-1' },
+      collab: false,
+    }),
+  ]);
   const sent = await a.command({
     cmd: 'send',
     collabId: 'rehearsal-adapter',
@@ -375,18 +466,19 @@ test('适配器端到端：乙经注入口投进假收件箱（内容含上下�
 });
 
 test('适配器拒收：注入口关闭 → 甲维持第二档（不误报第三档）', { timeout: 40000 }, async (t) => {
-  const port = await pickFreePort();
   const inbox = await startFakeSessionInbox(t, { reject: true });
-  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, collab: false });
-  const b = await startNode(t, {
-    identityName: '主机乙',
-    bindAddress: '127.0.0.2',
-    port,
-    knownPeers: [{ address: '127.0.0.1', port }],
-    adapter: true,
-    env: { CLAUDE_CODE_MESSAGING_SOCKET: inbox.path, CLAUDE_CODE_MESSAGING_TOKEN: 'tok-1' },
-    collab: false,
-  });
+  const { port, nodes: [a, b] } = await startNodesGuarded(t, 1, async (startPort) => [
+    await spawnNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port: startPort, collab: false }),
+    await spawnNode(t, {
+      identityName: '主机乙',
+      bindAddress: '127.0.0.2',
+      port: startPort,
+      knownPeers: [{ address: '127.0.0.1', port: startPort }],
+      adapter: true,
+      env: { CLAUDE_CODE_MESSAGING_SOCKET: inbox.path, CLAUDE_CODE_MESSAGING_TOKEN: 'tok-1' },
+      collab: false,
+    }),
+  ]);
   const sent = await a.command({
     cmd: 'send',
     collabId: 'rehearsal-reject',
@@ -405,9 +497,8 @@ test('适配器拒收：注入口关闭 → 甲维持第二档（不误报第三
 });
 
 test('协作预演：建协全流程（邀请→同意→建立→对话→看台账）', { timeout: 60000 }, async (t) => {
-  const port = await pickFreeSegment(2);   // 两站点占相邻端口：整段取（pickFreePort 只保证单端口空闲，邻位不保证）
-  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port });
-  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }] });
+  // 两站点占相邻端口：整段取（pickFreePort 只保证单端口空闲，邻位不保证）
+  const { port, nodes: [a, b] } = await startNodesGuarded(t, 2, (startPort) => spawnAdjacentPairNodes(t, startPort));
   const created = await a.command({
     cmd: 'create_collab',
     name: '联调项目',
@@ -441,10 +532,8 @@ test('协作预演：建协全流程（邀请→同意→建立→对话→看�
 });
 
 test('协作预演：同名并发冲突（三节点双冻结 + 广播）', { timeout: 90000 }, async (t) => {
-  const port = await pickFreeSegment(3);   // 三站点占三连端口：整段取
-  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port });
-  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }] });
-  const c = await startNode(t, { identityName: '主机丙', bindAddress: '127.0.0.1', port: port + 2, knownPeers: [{ address: '127.0.0.1', port }] });
+  // 三站点占三连端口：整段取
+  const { port, nodes: [a, b, c] } = await startNodesGuarded(t, 3, (startPort) => spawnTriadNodes(t, startPort));
   const first = await a.command({ cmd: 'create_collab', name: '重名项目', topic: '甲发起的联调', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
   assert.equal(first.ok, true);
   await waitFor(async () => {
@@ -475,9 +564,7 @@ test('协作预演：同名并发冲突（三节点双冻结 + 广播）', { tim
 });
 
 test('协作预演：撤回（single 定格 withdrawn → all 整条终止）', { timeout: 60000 }, async (t) => {
-  const port = await pickFreeSegment(2);
-  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port });
-  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }] });
+  const { port, nodes: [a, b] } = await startNodesGuarded(t, 2, (startPort) => spawnAdjacentPairNodes(t, startPort));
   const created = await a.command({ cmd: 'create_collab', name: '撤回项目', topic: '主题', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
   await waitFor(async () => {
     const listed = await b.command({ cmd: 'list_collabs' });
@@ -498,12 +585,13 @@ test('协作预演：撤回（single 定格 withdrawn → all 整条终止）', 
 });
 
 test('协作预演：离线续投（乙离线期间排队、重开后续投并推进第三档）', { timeout: 90000 }, async (t) => {
-  const port = await pickFreeSegment(2);
   const nodeConfig = { retryIntervalMs: 200, retryFastCount: 100 };
   const dirA = makeNodeDir(t);
   const dirB = makeNodeDir(t);
-  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, dataDir: dirA, config: nodeConfig });
-  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }], dataDir: dirB, config: nodeConfig });
+  const { port, nodes: [a, b] } = await startNodesGuarded(t, 2, async (startPort) => [
+    await spawnNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port: startPort, dataDir: dirA, config: nodeConfig }),
+    await spawnNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: startPort + 1, knownPeers: [{ address: '127.0.0.1', port: startPort }], dataDir: dirB, config: nodeConfig }),
+  ]);
   const created = await a.command({ cmd: 'create_collab', name: '续投项目', topic: '主题', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
   await waitFor(async () => {
     const listed = await b.command({ cmd: 'list_collabs' });
@@ -531,9 +619,7 @@ test('协作预演：离线续投（乙离线期间排队、重开后续投并�
 });
 
 test('协作预演：结束后迟到消息丢弃并计数 + 服务层门控拒绝', { timeout: 60000 }, async (t) => {
-  const port = await pickFreeSegment(2);
-  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port });
-  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }] });
+  const { port, nodes: [a, b] } = await startNodesGuarded(t, 2, (startPort) => spawnAdjacentPairNodes(t, startPort));
   const created = await a.command({ cmd: 'create_collab', name: '收尾项目', topic: '主题', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
   await waitFor(async () => {
     const listed = await b.command({ cmd: 'list_collabs' });
@@ -572,9 +658,7 @@ test('协作预演：结束后迟到消息丢弃并计数 + 服务层门控拒�
 });
 
 test('协作预演：管理者离线 → view_ledger 回退快照并标注可能非最新', { timeout: 90000 }, async (t) => {
-  const port = await pickFreeSegment(2);
-  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port });
-  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }] });
+  const { port, nodes: [a, b] } = await startNodesGuarded(t, 2, (startPort) => spawnAdjacentPairNodes(t, startPort));
   const created = await a.command({ cmd: 'create_collab', name: '回退项目', topic: '主题', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
   await waitFor(async () => {
     const listed = await b.command({ cmd: 'list_collabs' });
@@ -638,11 +722,8 @@ async function approveInto(node, collabId) {
   assert.equal((await node.command({ cmd: 'approve_invite', collabId, approve: true })).ok, true);
 }
 
-/* 三节点编排（并发抢接用）：先建乙丙协作接上彼此端点，再建甲管理的三人主协作。 */
-async function buildGovernedTriad(t, port, config) {
-  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, config });
-  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }], config });
-  const c = await startNode(t, { identityName: '主机丙', bindAddress: '127.0.0.1', port: port + 2, knownPeers: [{ address: '127.0.0.1', port }], config });
+/* 三节点编排（并发抢接用）：节点已由组守卫启动，这里先建乙丙协作接上彼此端点，再建甲管理的三人主协作。 */
+async function buildGovernedTriad(t, { a, b, c, port }) {
   const y = await c.command({ cmd: 'create_collab', name: '接线项目', topic: '主题', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
   await approveInto(b, y.collabId);
   await waitCollabState(c, y.collabId, 'active');
@@ -657,13 +738,19 @@ async function buildGovernedTriad(t, port, config) {
   await waitCollabState(a, x.collabId, 'active');
   await waitCollabState(b, x.collabId, 'active');
   await waitCollabState(c, x.collabId, 'active');
-  return { a, b, c, collabId: x.collabId };
+  return x.collabId;
 }
 
-/* 双成员达成（甲管理、乙同意、建立并推过快照）；options.dataDirA 供重启复用目录的场景。 */
-async function establishPairWith(t, port, name, config, options = {}) {
-  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, dataDir: options.dataDirA, config });
-  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }], config });
+/* 相邻端口双成员节点启动（建立协作的前半段）：a 占段基、b 占段基+1；options.dataDirA 供重启复用目录的场景。 */
+function spawnEstablishPairNodes(t, port, config, options = {}) {
+  return Promise.all([
+    spawnNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, dataDir: options.dataDirA, config }),
+    spawnNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }], config }),
+  ]);
+}
+
+/* 双成员达成（甲管理、乙同意、建立并推过快照）。 */
+async function establishPairWith(t, { a, b, port, name }) {
   const created = await a.command({ cmd: 'create_collab', name, topic: '主题', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
   assert.equal(created.ok, true);
   await waitFor(async () => {
@@ -673,13 +760,13 @@ async function establishPairWith(t, port, name, config, options = {}) {
   assert.equal((await b.command({ cmd: 'approve_invite', collabId: created.collabId, approve: true })).ok, true);
   await waitCollabState(a, created.collabId, 'active');
   await waitCollabState(b, created.collabId, 'active');
-  return { a, b, collabId: created.collabId };
+  return created.collabId;
 }
 
 test('治理预演：显式交接全链（先确认后删除；受让方承担席位）', { timeout: 120000 }, async (t) => {
-  const port = await pickFreeSegment(2);
   const dirA = makeNodeDir(t);
-  const { a, b, collabId } = await establishPairWith(t, port, '交接项目', GOVERNANCE_CONFIG, { dataDirA: dirA });
+  const { port, nodes: [a, b] } = await startNodesGuarded(t, 2, (startPort) => spawnEstablishPairNodes(t, startPort, GOVERNANCE_CONFIG, { dataDirA: dirA }));
+  const collabId = await establishPairWith(t, { a, b, port, name: '交接项目' });
   const handed = await a.command({ cmd: 'handover', collabId, target: b.ready.instanceId });
   assert.equal(handed.ok, true, JSON.stringify(handed));
   assert.ok(handed.message.includes('移交完成'));
@@ -695,9 +782,9 @@ test('治理预演：显式交接全链（先确认后删除；受让方承担�
 });
 
 test('治理预演：失联抢接全链 + 原驿丞重启握手降级', { timeout: 180000 }, async (t) => {
-  const port = await pickFreeSegment(2);
   const dirA = makeNodeDir(t);
-  const { a, b, collabId } = await establishPairWith(t, port, '抢接项目', GOVERNANCE_CONFIG, { dataDirA: dirA });
+  const { port, nodes: [a, b] } = await startNodesGuarded(t, 2, (startPort) => spawnEstablishPairNodes(t, startPort, GOVERNANCE_CONFIG, { dataDirA: dirA }));
+  const collabId = await establishPairWith(t, { a, b, port, name: '抢接项目' });
   await a.command({ cmd: 'exit' });
   await waitForRebindable(port);
   await waitManagerOffline(b, collabId);
@@ -725,9 +812,9 @@ test('治理预演：失联抢接全链 + 原驿丞重启握手降级', { timeou
 });
 
 test('治理预演：假失联中止（窗口内原驿丞复活 → 抢接中止）', { timeout: 120000 }, async (t) => {
-  const port = await pickFreeSegment(2);
   const config = { ...GOVERNANCE_CONFIG, takeoverWindowMs: 4000 };
-  const { a, b, collabId } = await establishPairWith(t, port, '假失联项目', config);
+  const { port, nodes: [a, b] } = await startNodesGuarded(t, 2, (startPort) => spawnEstablishPairNodes(t, startPort, config));
+  const collabId = await establishPairWith(t, { a, b, port, name: '假失联项目' });
   await a.command({ cmd: 'exit' });
   await waitForRebindable(port);
   await waitManagerOffline(b, collabId);
@@ -746,9 +833,9 @@ test('治理预演：假失联中止（窗口内原驿丞复活 → 抢接中止
 });
 
 test('治理预演：并发抢接（互见让位、确定性单一胜者、败方收敛）', { timeout: 180000 }, async (t) => {
-  const port = await pickFreeSegment(3);
   const config = { ...GOVERNANCE_CONFIG, takeoverWindowMs: 1500 };
-  const { a, b, c, collabId } = await buildGovernedTriad(t, port, config);
+  const { port, nodes: [a, b, c] } = await startNodesGuarded(t, 3, (startPort) => spawnTriadNodes(t, startPort, config));
+  const collabId = await buildGovernedTriad(t, { a, b, c, port });
   await a.command({ cmd: 'exit' });
   await waitForRebindable(port);
   await waitManagerOffline(b, collabId);
@@ -777,10 +864,10 @@ test('治理预演：并发抢接（互见让位、确定性单一胜者、败�
 });
 
 test('治理预演：离线错过通告 → 恢复后送达即让位（治理豁免过期）', { timeout: 180000 }, async (t) => {
-  const port = await pickFreeSegment(2);
   const dirA = makeNodeDir(t);
   const config = { ...GOVERNANCE_CONFIG, messageTtlMs: 1000 };
-  const { a, b, collabId } = await establishPairWith(t, port, '让位项目', config, { dataDirA: dirA });
+  const { port, nodes: [a, b] } = await startNodesGuarded(t, 2, (startPort) => spawnEstablishPairNodes(t, startPort, config, { dataDirA: dirA }));
+  const collabId = await establishPairWith(t, { a, b, port, name: '让位项目' });
   await a.command({ cmd: 'exit' });
   await waitForRebindable(port);
   await waitManagerOffline(b, collabId);
@@ -804,11 +891,8 @@ test('治理预演：离线错过通告 → 恢复后送达即让位（治理豁
 });
 
 test('治理预演：同名冲突双冻结 → 人裁定合并 → 三方收敛', { timeout: 180000 }, async (t) => {
-  const port = await pickFreeSegment(3);
   const config = GOVERNANCE_CONFIG;
-  const a = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, config });
-  const b = await startNode(t, { identityName: '主机乙', bindAddress: '127.0.0.1', port: port + 1, knownPeers: [{ address: '127.0.0.1', port }], config });
-  const c = await startNode(t, { identityName: '主机丙', bindAddress: '127.0.0.1', port: port + 2, knownPeers: [{ address: '127.0.0.1', port }], config });
+  const { port, nodes: [a, b, c] } = await startNodesGuarded(t, 3, (startPort) => spawnTriadNodes(t, startPort, config));
   const x = await a.command({ cmd: 'create_collab', name: '合并项目', topic: '主题', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
   await waitFor(async () => {
     const listed = await b.command({ cmd: 'list_collabs' });
