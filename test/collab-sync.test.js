@@ -5,6 +5,7 @@ import { appendFileSync, readFileSync } from 'node:fs';
 import { collabFilePath } from '../src/paths.js';
 import { makeTempDir, waitFor } from './helpers.js';
 import { createCollabService } from '../src/collab/service.js';
+import { SYNC_REQUEST_MAX, SYNC_REQUEST_WINDOW_MS } from '../src/collab/gate.js';
 import { MEMBERS_FILE_NAME } from '../src/collab/members.js';
 import { POSTS_FILE_NAME } from '../src/collab/posts.js';
 import { comparePosition, rollbackPlanOf, summaryOf } from '../src/collab/sync.js';
@@ -346,6 +347,24 @@ test('分段续拉：软阈之下分段（more / nextAfter）、续拉直至追�
   assert.deepEqual(continueAfters, nextAfters, '续拉起点 = 上一段末帖落点（按序一一对应）');
 });
 
+test('反向对账：应答方按请求摘要检出本机缺帖 → 定向回拉（两件套的双向半边）', async (t) => {
+  const { wire, a, b, collabId } = await makeForumPair(t);
+  /* B 侧多出一帖（A 从未收到该直投——模拟漏投）：A 应答 B 的请求时按摘要比对检出。 */
+  await receive(b.service, forumPostFrame(collabId, AUTHOR_U, { postId: 'post-x', seq: 1, text: 'B 独有的帖' }, new Date(BASE_MS + 1000).toISOString()));
+  assert.equal((await b.service.view({ collabId })).posts.length, 1, 'B 侧独有该帖');
+  const aRequestsBefore = wireFramesOf(wire.frames, 'history-request', collabId).filter((frame) => frame.from.instanceId === SELF_A.instanceId).length;
+  await awaitSync(b.service.sync({ collabId }));   // B 请求 → A 应答并检出自身缺帖 → 定向回拉
+  await waitFor(async () => {
+    const view = await a.service.view({ collabId });
+    return view.posts.length === 1 ? true : null;
+  });
+  assert.equal(a.service.stats().syncMismatches, 1, '应答方检出本机缺帖（反向对账触发）');
+  assert.equal(a.service.stats().syncPostsBackfilled, 1, '经定向回拉补齐');
+  const aRequests = wireFramesOf(wire.frames, 'history-request', collabId).filter((frame) => frame.from.instanceId === SELF_A.instanceId);
+  assert.equal(aRequests.length, aRequestsBefore + 1, 'A 新增一次向 B 的定向回拉');
+  assert.equal(aRequests[aRequests.length - 1].payload.after, null, '定位不到更早落点 → 整粒度重拉（从头发起）');
+});
+
 /* —— 成员收敛 —— */
 
 test('join 未收敛重播（对表自愈）：递增间隔有界；拉回的表含自己即停', async (t) => {
@@ -503,8 +522,8 @@ test('无应答统一处理：不重试该源、换源重试；源耗尽则本�
 });
 
 test('请求类入站限流（同源 10s 内 2 次，产品默认值判别）与非成员拒绝计数', async (t) => {
-  /* 产品默认数值显式注入（模块常量：窗口 10s、上限 2 次）。 */
-  const { a, collabId } = await makeForumPair(t, { a: { syncRequestMax: 2, syncRequestWindowMs: 10000 } });
+  /* 产品默认数值从模块常量导入显式注入（常量漂移随之进入本用例，不再硬编码）。 */
+  const { a, collabId } = await makeForumPair(t, { a: { syncRequestMax: SYNC_REQUEST_MAX, syncRequestWindowMs: SYNC_REQUEST_WINDOW_MS } });
   const request = () => collabFrame('history-request', collabId, peer(SELF_B.instanceId, SELF_B.identityName, SELF_B.port), {});
   assert.equal((await receive(a.service, request())).ok, true);
   assert.equal((await receive(a.service, request())).ok, true);
