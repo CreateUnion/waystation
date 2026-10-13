@@ -2,6 +2,8 @@ import { listLocalCollabIds, loadLedger, loadMember, loadSnapshot, quarantineLed
 import { isArchived, withDefaultMode } from './model.js';
 import { createPostsStore } from './posts.js';
 import { createMembersStore } from './members.js';
+import { createCounterStore, notifyIndicatorChange } from './counter.js';
+import { POST_KINDS } from '../net/protocol.js';
 import { decideAdmission, SYNC_REQUEST_MAX, SYNC_REQUEST_WINDOW_MS } from './gate.js';
 import { handleEvent } from './events.js';
 import { localModeOf, localNameOf, localRosterOf, localStateOf, persistLedger } from './local.js';
@@ -26,6 +28,7 @@ const INVITE_MIN_INTERVAL_MS = 1000;
  *   reassign?: ((payload: object) => { ok: boolean, moved?: number, reason?: string }) | null,
  *   notify?: ((frame: object) => unknown) | null,
  *   sendDirect?: ((message: object) => { ok: boolean, msgId?: string, tier?: string, reason?: string }) | null,
+ *   onIndicatorChange?: (() => void) | null,
  *   ledgerFetchTimeoutMs?: number, inviteMinIntervalMs?: number, takeoverProbeIntervalMs?: number,
  *   handshakeReplyTimeoutMs?: number, handoverConfirmTimeoutMs?: number,
  *   pullReplyTimeoutMs?: number, syncMaxRequestsPerCycle?: number, syncMaxSourcesPerCycle?: number,
@@ -44,6 +47,7 @@ function buildState(options) {
     ...coreStateOf(options),
     ...syncStateOf(options),
     ...runtimeMaps(),
+    onIndicatorChange: options.onIndicatorChange ?? null,
     probeTimer: null,
     syncTimer: null,
     started: false,
@@ -128,6 +132,7 @@ function apiOf(state) {
     decideMerge: (input) => decideMergeOffer(state, input),
     handover: (input) => handover(state, input),
     list: () => listCollabs(state),
+    indicators: () => indicators(state),
     create: (input) => createCollab(state, input),
     invite: (input) => inviteMembers(state, input),
     approve: (input) => approveNow(state, input),
@@ -160,12 +165,30 @@ function gateFrame(state, frame, meta) {
 async function consumeFrame(state, frame, meta) {
   try {
     state.counters.eventsHandled++;
+    noteContentMessage(state, frame);
     return await handleEvent(state, frame, meta);
   } catch (error) {
     state.counters.eventFailures++;
     state.log.error('协作事件处理异常（已隔离）', { type: frame?.type, collabId: frame?.collabId, reason: error?.message });
     return undefined;
   }
+}
+
+/* 内容类入站消息计数（状态栏「N 条」的口径：累计收到的六类内容消息）：消费钩子每帧至多一次、
+ * 去重命中的重复副本到不了这里——在消费面记账即天然「去重后各计一次」。判据用协议层 POST_KINDS
+ * 六类（设计 §5.7 内容类词表，与帖子类型徽标、ws_send_message 类型面同一权威）：治理 / 控制类
+ * （notice / freeze / decision 等）不入计数；讨论实例的计数面是帖子列表，而帖帧类型（post）
+ * 不在六类内、天然不落此账。计数先于事件处理：消息已被受理（落盘 + ack）即是「收到」，
+ * 事件处理内部失败不撤销到站事实。 */
+function noteContentMessage(state, frame) {
+  const local = state.collabs.get(frame.collabId);
+  if (local === undefined || localModeOf(local) === 'forum') {
+    return;
+  }
+  if (!POST_KINDS.includes(frame.type)) {
+    return;
+  }
+  local.counter.increment();
 }
 
 /* 服务启动（组合根在 net.start 成功后调用；降级不调用）：探测定时器 + 启动握手（managed 收敛机制）
@@ -209,8 +232,9 @@ function loadOne(state, collabId) {
     member,
     endpoints: new Map(Object.entries(member.endpoints)),
     snapshot: loadSnapshot(state.dataDir, collabId),
-    posts: createPostsStore({ dataDir: state.dataDir, collabId, log: state.log }),
-    members: createMembersStore({ dataDir: state.dataDir, collabId, log: state.log }),
+    posts: createPostsStore({ dataDir: state.dataDir, collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
+    members: createMembersStore({ dataDir: state.dataDir, collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
+    counter: createCounterStore({ dataDir: state.dataDir, collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
     suspended: null,
     staleManagerId: null,
   };
@@ -275,6 +299,20 @@ function listCollabs(state) {
     collabs.push(listEntryOf(state, local, now));
   }
   return { collabs };
+}
+
+/* 观察面读数（状态栏消息数）：讨论 = 本机全量副本帖数（含回填帖）、协作 = 累计收到的内容消息数。
+ * 独立于 ws_list_collabs 的清单面（工具载荷零变化）——会话状态文件的收集闭包按 collabId 分别
+ * 取清单与读数再合并。 */
+function indicators(state) {
+  const readings = [];
+  for (const local of state.collabs.values()) {
+    readings.push({
+      collabId: local.collabId,
+      msgCount: localModeOf(local) === 'forum' ? local.posts.size() : local.counter.count(),
+    });
+  }
+  return readings;
 }
 
 /* 成员数读数：讨论 = 折叠成员表（成员事件并集折叠——被拒/被撤回者不占名额、退出者即时出表，
@@ -512,6 +550,7 @@ function emptyGuardCounters() {
     eventsHandled: 0,
     eventFailures: 0,
     gateFailures: 0,
+    indicatorChangeFailures: 0,
     loadFailures: 0,
     persistFailures: 0,
   };

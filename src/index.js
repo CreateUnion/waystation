@@ -25,7 +25,7 @@ import { createInbound } from './net/inbound.js';
 import { createNetStack } from './net/stack.js';
 import { createClaudeCodeAdapter } from './adapters/claude-code.js';
 import { createCollabService } from './collab/service.js';
-import { createSessionStatusWriter, isIndicatedCollab } from './session-status.js';
+import { createSessionStatusWriter, indicatedEntriesOf, isIndicatedCollab } from './session-status.js';
 
 // 版本单一来源：包元数据（不另设常量，避免与 package.json 漂移）
 const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
@@ -146,6 +146,9 @@ const collab = createCollabService({
   notify: (frame) => adapter.deliverFrame(frame),
   knownHosts,
   log,
+  /* 观察面变化（内容消息计数 / 帖入列 / 成员事件）→ 会话状态文件即时刷新（计数变化不等心跳）；
+   * 声明顺序无碍（同 describeCollab 先例）：回调只在运行期触发，sessionStatus 彼时已就绪。 */
+  onIndicatorChange: () => sessionStatus.refresh(),
 });
 const discovery = createDiscovery({
   port: config.port,
@@ -192,9 +195,7 @@ const sessionStatus = createSessionStatusWriter({
     identityName: self.identityName,
     site: site.ok ? { mode: site.mode, slot: site.slot, port: site.port, takeover: site.takeover } : null,
     port: config.port,
-    collabs: collab.list().collabs
-      .filter(isIndicatedCollab)
-      .map((entry) => ({ collabId: entry.collabId, name: entry.name, state: entry.state, role: entry.role, mode: entry.mode, memberCount: entry.memberCount })),
+    collabs: indicatedEntriesOf(collab.list().collabs.filter(isIndicatedCollab), collab.indicators()),
   }),
   log,
 });

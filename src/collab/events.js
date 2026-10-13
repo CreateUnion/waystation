@@ -2,6 +2,7 @@ import { DEFAULT_COLLAB_MODE, isPort } from '../net/protocol.js';
 import { MAX_BOARD_ENTRIES, isSnapshotShape } from './model.js';
 import { createPostsStore } from './posts.js';
 import { createMembersStore } from './members.js';
+import { createCounterStore, notifyIndicatorChange } from './counter.js';
 import { ledgerDigest } from './store.js';
 import { isLocalArchivedState, localModeOf, persistMember, persistSnapshot, rememberKnownHost, selfJoinedOf } from './local.js';
 import { matchConflictCollabs, noteForumGovernanceIgnored } from './gate.js';
@@ -117,8 +118,9 @@ function handleInvite(state, frame, meta) {
     member,
     endpoints: new Map(),
     snapshot: null,
-    posts: createPostsStore({ dataDir: state.dataDir, collabId: frame.collabId, log: state.log }),
-    members: createMembersStore({ dataDir: state.dataDir, collabId: frame.collabId, log: state.log }),
+    posts: createPostsStore({ dataDir: state.dataDir, collabId: frame.collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
+    members: createMembersStore({ dataDir: state.dataDir, collabId: frame.collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
+    counter: createCounterStore({ dataDir: state.dataDir, collabId: frame.collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
     suspended: null,
     staleManagerId: null,
   };

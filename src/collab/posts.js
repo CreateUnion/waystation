@@ -69,14 +69,19 @@ function comparePosts(left, right) {
 
 /* 本地帖子列表（每协作一份）：加载即投影为内存 Map；追加 = 去重 → 内存入列 → 落盘。
  * 落盘失败只计数告警、内存态继续（与成员记录写盘同一语义：写盘失败不得中断协作主链），
- * 但去重以内存态为准——重复副本绝不二次入列与二次落盘。 */
-export function createPostsStore({ dataDir, collabId, log }) {
+ * 但去重以内存态为准——重复副本绝不二次入列与二次落盘。
+ * onChange = 观察面变化回调（状态栏帖数即时刷新的挂点）：只在真的入列（新条目）后触发。 */
+/**
+ * @param {{ dataDir: string, collabId: string, log: any, onChange?: (() => void) | null }} options
+ */
+export function createPostsStore({ dataDir, collabId, log, onChange = null }) {
   const state = {
     collabId,
     log,
     file: collabFilePath(dataDir, collabId, POSTS_FILE_NAME),
     dataDir,
     entries: new Map(),
+    onChange,
     counters: { appended: 0, corruptRecords: 0, persistFailures: 0 },
   };
   load(state);
@@ -137,6 +142,9 @@ function append(state, entry) {
   }
   state.entries.set(key, entry);
   persist(state, entry);
+  if (state.onChange !== null) {
+    state.onChange();
+  }
   return true;
 }
 

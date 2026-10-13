@@ -287,6 +287,23 @@ test('重复 msgId：重发 ack、不重复落盘、不重发回报', async (t) 
   assert.equal(inbound.stats().acksSent, 2, '重复路径发出的 ack 与正常路径同口径计数');
 });
 
+test('重复 msgId：consume 钩子只回调一次（受理后的去重语义）', async (t) => {
+  /* 计数面（状态栏消息数）依赖这条管线性质：consume 每帧至多一次，去重命中不再回调——
+   * 在 consume 里记账即天然「去重后各计一次」。 */
+  const consumed = [];
+  const { inbound } = makeInbound(t, {
+    hooks: { admit: () => ({ ok: true }), consume: (frame) => { consumed.push(frame.msgId); }, deliverToSession: () => true },
+  });
+  const connection = createFakeConnection();
+  const frame = messageFrame();
+  inbound.onFrame(connection, frame);
+  await waitFor(() => consumed.length === 1);
+  inbound.onFrame(connection, frame);
+  await waitFor(() => inbound.stats().duplicates === 1);
+  assert.equal(consumed.length, 1, '重复副本不再触发 consume');
+  assert.deepEqual(consumed, [frame.msgId]);
+});
+
 test('去重窗口：保留期内的记录参与去重；超窗视为新消息', async (t) => {
   const dir = makeTempDir(t);
   mkdirSync(join(dir, COLLABS_DIR_NAME, 'collab-1'), { recursive: true });

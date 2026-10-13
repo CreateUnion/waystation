@@ -41,14 +41,19 @@ export function newMemberEventId() {
 }
 
 /* 成员事件存储（每协作一份）：加载即投影为内存 Map（键 = 事件 id）；apply 去重后入列并落盘。
- * 落盘失败只计数告警、内存态继续（与帖子列表同一语义）；去重以内存态为准。 */
-export function createMembersStore({ dataDir, collabId, log }) {
+ * 落盘失败只计数告警、内存态继续（与帖子列表同一语义）；去重以内存态为准。
+ * onChange = 观察面变化回调（人数即时刷新的挂点）：只在真的并入（新事件）后触发。 */
+/**
+ * @param {{ dataDir: string, collabId: string, log: any, onChange?: (() => void) | null }} options
+ */
+export function createMembersStore({ dataDir, collabId, log, onChange = null }) {
   const state = {
     collabId,
     log,
     file: collabFilePath(dataDir, collabId, MEMBERS_FILE_NAME),
     dataDir,
     events: new Map(),
+    onChange,
     counters: { appended: 0, duplicates: 0, corruptRecords: 0, persistFailures: 0 },
   };
   load(state);
@@ -106,6 +111,9 @@ function apply(state, event) {
   }
   state.events.set(event.eventId, event);
   persist(state, event);
+  if (state.onChange !== null) {
+    state.onChange();
+  }
   return 'added';
 }
 

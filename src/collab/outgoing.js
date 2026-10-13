@@ -3,6 +3,7 @@ import { COLLAB_MODES, DEFAULT_COLLAB_MODE, ID_PATTERN, MAX_COLLAB_MEMBERS, MAX_
 import { MAX_FORUM_MEMBERS, MAX_LOCAL_COLLABS, canTransition, isArchived, newCollabId } from './model.js';
 import { createPostsStore, displayOrderOf, newPostId } from './posts.js';
 import { createMembersStore } from './members.js';
+import { createCounterStore, notifyIndicatorChange } from './counter.js';
 import { ledgerDigest, removeLedgerFile } from './store.js';
 import { currentManagerIdOf, emitOwnMemberEvent, foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, localTopicOf, memberStateFor, persistLedger, persistMember, persistSnapshot, relayDepartedOf, relayPeerOf, rememberKnownHost, selfJoinedOf } from './local.js';
 import { matchConflictCollabs } from './gate.js';
@@ -32,8 +33,9 @@ export function createCollab(state, { name, topic, targets, mode }) {
     member: managerRecordOf(ledger),
     endpoints: new Map(),
     snapshot: null,
-    posts: createPostsStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log }),
-    members: createMembersStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log }),
+    posts: createPostsStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
+    members: createMembersStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
+    counter: createCounterStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
     suspended: null,
     staleManagerId: null,
   };
