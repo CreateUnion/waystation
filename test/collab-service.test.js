@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { COLLABS_DIR_NAME, collabDir, collabFilePath } from '../src/paths.js';
@@ -16,7 +17,9 @@ function quietLog() {
 
 /* 服务单测脚手架：真临时目录 + 假发送（捕获出队消息）+ 假直投（捕获直投消息）+ 假清单；
  * hooks 直调模拟接收管线（admit 通过才 consume——与真实管线同序；落盘/ack 属接收管线自身用例，
- * 不在此重复）。overrides.self 供双节点夹具区分身份；sendDirect: null = 直投面不可用（降级面）。 */
+ * 不在此重复）。overrides.self 供双节点夹具区分身份；sendDirect: null = 直投面不可用（降级面）。
+ * 对表对端选取默认静默（syncPeerPicker 返回空序）——由专门的对表用例注入真实对端，
+ * 其余用例不被环境性直投噪音干扰。 */
 function makeService(t, overrides = {}) {
   const dir = makeTempDir(t);
   const sent = [];
@@ -44,6 +47,7 @@ function makeService(t, overrides = {}) {
     log: quietLog(),
     ledgerFetchTimeoutMs: overrides.ledgerFetchTimeoutMs ?? 60,
     inviteMinIntervalMs: overrides.inviteMinIntervalMs ?? 0,
+    syncPeerPicker: overrides.syncPeerPicker ?? (() => []),
   });
   return { service, sent, direct, remembered, dir, self, config };
 }
@@ -88,6 +92,13 @@ async function receive(service, frame, remoteAddress = '127.0.0.1') {
     await service.hooks.consume(frame, { remoteAddress });
   }
   return admitted;
+}
+
+/* 讨论「加入」事件注入缝：经与真实接收同序的 admit + consume 落进成员事件日志（成员表装配）。
+ * remoteAddress 传 '' 模拟「端点未知」的对端（事件入表但不学端点）。 */
+async function receiveJoin(service, collabId, from, { remoteAddress = '127.0.0.1', ts = null } = {}) {
+  const frame = collabFrame('join', collabId, from, { eventId: randomUUID(), ts: ts ?? new Date().toISOString() });
+  return { frame, admitted: await receive(service, frame, remoteAddress) };
 }
 
 function sentOf(sent, type, collabId = null) {
@@ -1069,9 +1080,10 @@ test('载入兼容：缺 mode 的旧成员记录 / 旧台账 / 旧邀请一律�
   assert.equal(memberSide.service.list().collabs.find((entry) => entry.collabId === 'collab-new').mode, 'forum');
 });
 
-test('ws_invite：向既有讨论发邀请帧（模式随载荷、目标并入名单去重、重复邀请幂等、不改本地成员表）', async (t) => {
+test('ws_invite：向既有讨论发邀请帧（模式随载荷、折叠成员表并入目标去重、重复邀请幂等、不改本地成员表）', async (t) => {
   const { service, sent } = makeService(t);
   const collabId = createForum(service);
+  await receiveJoin(service, collabId, peer('inst-b', '主机b'));
   sent.length = 0;
   const target = targetOf('c');
   const result = await service.invite({ collabId, targets: [target] });
@@ -1083,10 +1095,11 @@ test('ws_invite：向既有讨论发邀请帧（模式随载荷、目标并入�
   assert.equal(invites[0].payload.name, '讨论甲');
   assert.equal(invites[0].payload.topic, '议题');
   assert.deepEqual(invites[0].payload.members, [
-    { instanceId: 'inst-self', identityName: '本机' },
     { instanceId: 'inst-b', identityName: '主机b' },
+    { instanceId: 'inst-self', identityName: '本机' },
     { instanceId: 'inst-c', identityName: '主机c' },
-  ]);
+  ], '名单 = 折叠成员表 ∪ 本次目标（折叠按实例标识排序：已加入者 + 发起人 + 被邀者）');
+  assert.equal(invites[0].payload.endpoints['inst-b'].port, 17321, '讨论邀请随带端点表（被邀者据此取得寻址信息）');
   const again = await service.invite({ collabId, targets: [target] });
   assert.equal(again.ok, true, '重复邀请幂等（重发帧、不报错）');
   const second = sentOf(sent, 'invite', collabId)[1];
@@ -1096,24 +1109,33 @@ test('ws_invite：向既有讨论发邀请帧（模式随载荷、目标并入�
   assert.equal(entry.mode, 'forum', '模式创建时定死、不可变');
 });
 
-test('ws_invite：16 软约束（邀请侧）——成员表 16 人（夹具装配）拒绝新邀请并提示', async (t) => {
-  /* 夹具口径：本任务无加入通路，「折叠成员表」以创建名单装配——发起人 + 15 名受邀者 = 16。
-   * 邀请侧上限独立于创建名单变化（并发补位可暂到 17 属设计已披露的软约束边界）。 */
+test('ws_invite：16 软约束（邀请侧，数据源=折叠成员表）——16 人拒新邀请；被拒者不占名额', async (t) => {
+  /* 数据源勘正（T1 Info4 / T2 审查 Info-6）：名额 = 按事件折叠的成员表（join 者才占位），
+   * 创建名单/受邀未加入者/被拒者都不占（旧名单口径下被拒者永久占名额——本用例旧口径必红）。 */
   const { service } = makeService(t);
   const fifteen = Array.from({ length: 15 }, (_, index) => targetOf(`t${index}`));
   const collabId = createForum(service, { targets: fifteen });
-  assert.equal(service.list().collabs[0].memberCount, 16, '夹具：成员表 16 人');
+  for (const target of fifteen) {
+    await receiveJoin(service, collabId, peer(target.instanceId, target.identityName));
+  }
+  assert.equal(service.list().collabs[0].memberCount, 16, '折叠成员表 16 人（发起人 + 15 名已加入者）');
   const invited = await service.invite({ collabId, targets: [targetOf('x')] });
   assert.equal(invited.ok, false);
   assert.ok(invited.message.includes('上限'), invited.message);
 
   const roomy = makeService(t);
-  const roomyId = createForum(roomy.service, { targets: fifteen.slice(0, 14) });
+  const roomyId = createForum(roomy.service, { targets: fifteen });
+  for (const target of fifteen.slice(0, 14)) {
+    await receiveJoin(roomy.service, roomyId, peer(target.instanceId, target.identityName));
+  }
   assert.equal(roomy.service.list().collabs[0].memberCount, 15);
   assert.equal((await roomy.service.invite({ collabId: roomyId, targets: [targetOf('x')] })).ok, true, '15 人成员表仍可邀请');
+  await receive(roomy.service, collabFrame('decline', roomyId, peer(fifteen[14].instanceId, fifteen[14].identityName), {}));
+  assert.equal(roomy.service.list().collabs[0].memberCount, 15, '被拒者不占名额（旧名单口径此处为 16）');
+  assert.equal((await roomy.service.invite({ collabId: roomyId, targets: [targetOf('y')] })).ok, true, '被拒者不占名额后仍可邀请');
 });
 
-test('ws_invite：managed / 未知 / 归档 / 成员侧 / 目标形态一律明确拒绝并指引', async (t) => {
+test('ws_invite：managed / 未知 / 归档 / 未加入 / 目标形态一律明确拒绝并指引', async (t) => {
   const { service } = makeService(t);
   const managed = service.create({ name: '协作甲', topic: '主题', targets: [targetOf('b')] });
   const onManaged = await service.invite({ collabId: managed.collabId, targets: [targetOf('c')] });
@@ -1135,8 +1157,30 @@ test('ws_invite：managed / 未知 / 归档 / 成员侧 / 目标形态一律明�
   const memberSide = makeService(t);
   await receive(memberSide.service, inviteFrame({ collabId: 'collab-f8', mode: 'forum' }));
   const onMember = await memberSide.service.invite({ collabId: 'collab-f8', targets: [targetOf('c')] });
-  assert.equal(onMember.ok, false);
-  assert.ok(onMember.message.includes('发起人'), onMember.message);
+  assert.equal(onMember.ok, false, '受邀未加入者不可邀请（加入为成员后才能邀请）');
+  assert.ok(onMember.message.includes('尚未加入'), onMember.message);
+});
+
+test('讨论成员侧邀请链：任何成员可邀请——同意加入后由本地记录构造邀请帧（T1 交接闭合）', async (t) => {
+  const memberSide = makeService(t);
+  await receive(memberSide.service, inviteFrame({ collabId: 'collab-f8', mode: 'forum' }));
+  const approved = await memberSide.service.approve({ collabId: 'collab-f8', approve: true });
+  assert.equal(approved.ok, true, approved.message);
+  assert.equal(approved.joined, true, '讨论同意即加入（join 生效不依赖邀请者）');
+  assert.equal(memberSide.service.list().collabs[0].state, 'active', '本地转进行中');
+  const onMember = await memberSide.service.invite({ collabId: 'collab-f8', targets: [targetOf('c')] });
+  assert.equal(onMember.ok, true, onMember.message);
+  const invite = sentOf(memberSide.sent, 'invite', 'collab-f8')[0];
+  assert.equal(invite.payload.mode, 'forum');
+  assert.equal(invite.payload.name, '联调项目', '名取本地记录');
+  assert.equal(invite.payload.topic, '发布联调', '主题取本地记录（邀请载荷定格——T1 缺口闭合）');
+  assert.deepEqual(invite.payload.members.map((entry) => entry.instanceId).sort(), ['inst-c', 'inst-self'], '名单 = 折叠成员表（本机已加入）∪ 目标');
+  assert.equal(memberSide.service.stats().forumJoinsOut, 1, '同意后自播 join');
+  const joinFrames = sentOf(memberSide.sent, 'join', 'collab-f8');
+  assert.ok(joinFrames.length >= 1, 'join 自播发出');
+  assert.equal(typeof joinFrames[0].payload.eventId, 'string');
+  const approveFrames = sentOf(memberSide.sent, 'approve', 'collab-f8');
+  assert.equal(approveFrames.length, 1, 'approve 回执仍发回邀请者（簿记，不构成生效条件）');
 });
 
 /* —— 讨论模式（帖通道：发帖直投、接收幂等与本地列表、显示序、本地视图）—— */
@@ -1152,6 +1196,8 @@ function forumPostFrame(collabId, from, { postId, postSeq, kind = 'reply', text 
 test('讨论发帖：本地先落列表（postId/序号/ts 分配即定）、除本机逐成员直投、载荷帖形态、topic 帖零元状态变化', async (t) => {
   const made = makeService(t);
   const collabId = createForum(made.service, { targets: [targetOf('b'), targetOf('c')] });
+  await receiveJoin(made.service, collabId, peer('inst-b', '主机b'));
+  await receiveJoin(made.service, collabId, peer('inst-c', '主机c'));
   const before = loadLedger(made.dir, collabId).ledger;
   const posted = await made.service.send({ collabId, text: '第一条议题贴', type: 'topic' });
   assert.equal(posted.ok, true, posted.message);
@@ -1264,33 +1310,87 @@ test('讨论收帖：入本地列表、重复副本不重复入列；kind 越表
   assert.equal(managed.service.stats().postRejected, 1);
 });
 
-test('讨论双节点并发发帖：互投收敛、重复副本无害、两端显示序一致（成员表注入缝装配）', async (t) => {
-  const wire = [];   // 直投 fake 只记账不投出——flush 时手工互投（构造并发的同一时刻）
+/* 直投虚拟线（服务级双节点夹具）：sendDirect → 组上线帧（与 dispatch.sendDirect 的帧同构）→
+ * 异步投进对端接收管线（admit + consume）。入队（send）不建模——广播一跳由用例手工投递。 */
+function makeDirectWire() {
+  const nodes = new Map();
+  const frames = [];
+  let serial = 0;
+  return {
+    register(self, service) {
+      nodes.set(self.instanceId, { self, service });
+    },
+    frames,
+    sendDirect(instanceId) {
+      return (message) => {
+        const sender = nodes.get(instanceId);
+        serial++;
+        const frame = {
+          v: 1,
+          type: message.type,
+          msgId: `wire-${serial}`,
+          from: { instanceId: sender.self.instanceId, identityName: sender.self.identityName, port: sender.self.port },
+          collabId: message.collabId,
+          ts: typeof message.createdAt === 'string' ? message.createdAt : new Date().toISOString(),
+          payload: message.payload,
+        };
+        frames.push(frame);
+        const target = nodes.get(message.to.instanceId);
+        if (target !== undefined) {
+          Promise.resolve().then(() => receive(target.service, frame)).catch(() => {});
+        }
+        return { ok: true, msgId: frame.msgId };
+      };
+    },
+  };
+}
+
+/* 广播帧（入队路径）的手工投递：一步到对端，无应答语义。 */
+async function deliverBroadcast(service, message, fromSelf) {
+  return receive(service, {
+    v: 1,
+    type: message.type,
+    msgId: randomUUID(),
+    from: { instanceId: fromSelf.instanceId, identityName: fromSelf.identityName, port: fromSelf.port },
+    collabId: message.collabId,
+    ts: new Date().toISOString(),
+    payload: message.payload,
+  });
+}
+
+test('讨论双节点并发发帖：真实 join 装配（自播 + 对表拉回）、互投收敛、重复副本无害、两端显示序一致', async (t) => {
+  const wire = makeDirectWire();
   const selfA = { instanceId: 'inst-a', identityName: '主机甲', port: 17321 };
   const selfB = { instanceId: 'inst-b', identityName: '主机乙', port: 17322 };
-  const madeA = makeService(t, { self: selfA, sendDirect: (message) => { wire.push({ self: selfA, message }); return { ok: true, msgId: `wa-${wire.length}` }; } });
-  const madeB = makeService(t, { self: selfB, sendDirect: (message) => { wire.push({ self: selfB, message }); return { ok: true, msgId: `wb-${wire.length}` }; } });
+  const madeA = makeService(t, { self: selfA, sendDirect: wire.sendDirect('inst-a') });
+  wire.register(selfA, madeA.service);
+  const madeB = makeService(t, { self: selfB, sendDirect: wire.sendDirect('inst-b'), syncPeerPicker: () => ['inst-a'] });
+  wire.register(selfB, madeB.service);
   const collabId = createForum(madeA.service, { targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17322 }] });
   await receive(madeB.service, inviteFrame({ collabId, mode: 'forum', manager: peer('inst-a', '主机甲'), members: [peer('inst-a', '主机甲'), peer('inst-b', '主机乙', 17322)] }));
+  /* B 同意即加入（自播 join）；join 是广播（入队路径）——手工投给 A（一跳、无应答）。 */
+  const approved = await madeB.service.approve({ collabId, approve: true });
+  assert.equal(approved.ok, true, approved.message);
+  const joinMessage = sentOf(madeB.sent, 'join', collabId)[0];
+  assert.ok(joinMessage !== undefined, '同意后自播 join 帧');
+  await deliverBroadcast(madeA.service, joinMessage, selfB);
+  assert.equal(madeA.service.list().collabs[0].state, 'active', '发起人收悉首个加入：讨论转进行中');
+  /* B 的成员表经对表拉回 A 的事件集（真实拉取/应答链走直达线），同时学到 A 的端点。 */
+  const synced = await madeB.service.sync({ collabId });
+  assert.equal(synced.ok, true, JSON.stringify(synced));
+  assert.deepEqual((await madeB.service.view({ collabId })).members.map((entry) => entry.instanceId).sort(), ['inst-a', 'inst-b']);
   const postedA = await madeA.service.send({ collabId, text: '甲的第一帖' });
   const postedB = await madeB.service.send({ collabId, text: '乙的第一帖' });
   assert.equal(postedA.ok, true);
   assert.equal(postedB.ok, true);
-  assert.equal(wire.length, 2, '各投一份给对方');
-  for (const leg of [...wire]) {
-    const target = leg.self.instanceId === 'inst-a' ? madeB.service : madeA.service;
-    for (let copyIndex = 0; copyIndex < 2; copyIndex++) {
-      const frame = {
-        v: 1,
-        type: 'post',
-        msgId: `${leg.message.payload.post.postId}-c${copyIndex}`,
-        from: { ...leg.self },
-        collabId: leg.message.collabId,
-        ts: leg.message.createdAt,
-        payload: leg.message.payload,
-      };
-      assert.equal((await receive(target, frame)).ok, true);
-    }
+  assert.equal(postedA.results[0].ok, true, 'A 的扇出经折叠成员表达 B');
+  assert.equal(postedB.results[0].ok, true, 'B 的扇出经折叠成员表达 A');
+  /* 重复路径副本（不同 msgId 的同帖）：去重命中不重复入列；首份由真实直投到位。 */
+  const delivered = wire.frames.filter((frame) => frame.type === 'post');
+  assert.equal(delivered.length, 2, '两帖各直投一份');
+  for (const frame of delivered) {
+    const target = frame.from.instanceId === 'inst-a' ? madeB.service : madeA.service;
+    assert.equal((await receive(target, { ...frame, msgId: `${frame.msgId}-copy` })).ok, true);
   }
   const viewA = await madeA.service.view({ collabId });
   const viewB = await madeB.service.view({ collabId });
@@ -1302,9 +1402,10 @@ test('讨论双节点并发发帖：互投收敛、重复副本无害、两端�
   assert.equal(madeA.service.stats().postsIn, 1);
 });
 
-test('讨论视图：显示序按 ts 排序（同刻按 postId 兜底）、成员表与端点齐备、标注本地视图', async (t) => {
+test('讨论视图：显示序按 ts 排序（同刻按 postId 兜底）、折叠成员表与端点齐备、标注本地视图', async (t) => {
   const made = makeService(t);
   await receive(made.service, inviteFrame({ collabId: 'collab-f4', mode: 'forum' }));
+  await receiveJoin(made.service, 'collab-f4', peer('inst-a', '主机甲'));
   const lateTs = new Date(Date.now() + 2000).toISOString();
   const earlyTs = new Date().toISOString();
   await receive(made.service, forumPostFrame('collab-f4', peer('inst-a', '主机甲'), { postId: 'post-late', postSeq: 2, text: '晚的' }, lateTs));
@@ -1312,13 +1413,19 @@ test('讨论视图：显示序按 ts 排序（同刻按 postId 兜底）、成�
   const view = await made.service.view({ collabId: 'collab-f4' });
   assert.deepEqual(view.posts.map((entry) => entry.entryId), ['post-early', 'post-late'], '显示序按 ts 排序（与到达序无关）');
   assert.ok(view.note.includes('本地视图，未与全员核对'));
-  assert.deepEqual(view.members.map((member) => member.instanceId).sort(), ['inst-a', 'inst-self']);
+  assert.equal(view.topic, '发布联调', '主题取本地记录（成员侧经邀请/对表学习）');
+  assert.deepEqual(view.members.map((member) => member.instanceId), ['inst-a'], '成员表 = 折叠成员表（本机未加入不在表内）');
   assert.equal(view.endpoints['inst-a'].address, '127.0.0.1');
+  assert.equal((await made.service.send({ collabId: 'collab-f4', text: '未加入者的帖' })).ok, false, '未加入不可发帖');
 });
 
 test('讨论发帖：端点未知的成员如实标注待对表、不影响其余成员投出（成员侧扇出）', async (t) => {
   const made = makeService(t);
   await receive(made.service, inviteFrame({ collabId: 'collab-f3', mode: 'forum', members: [peer('inst-a', '主机甲'), peer('inst-self', '本机', 17321), peer('inst-c', '主机丙')] }));
+  assert.equal((await made.service.approve({ collabId: 'collab-f3', approve: true })).ok, true, '成员侧同意即加入');
+  /* 成员表经 join 事件并入：甲（端点可学）与丙（来源地址缺失——端点未知）。 */
+  await receiveJoin(made.service, 'collab-f3', peer('inst-a', '主机甲'));
+  await receiveJoin(made.service, 'collab-f3', peer('inst-c', '主机丙'), { remoteAddress: '' });
   const posted = await made.service.send({ collabId: 'collab-f3', text: '乙的帖' });
   assert.equal(posted.ok, true);
   const results = Object.fromEntries(posted.results.map((entry) => [entry.instanceId, entry]));
@@ -1332,6 +1439,7 @@ test('讨论发帖：端点未知的成员如实标注待对表、不影响其�
 test('讨论发帖：直投面不可用（注入缺失）——帖仍落本机列表、计数留痕、结果逐目标如实标注', async (t) => {
   const made = makeService(t, { sendDirect: null });
   const collabId = createForum(made.service);
+  await receiveJoin(made.service, collabId, peer('inst-b', '主机b'));
   const posted = await made.service.send({ collabId, text: '降级帖' });
   assert.equal(posted.ok, true, '帖的事务点在本机列表（直投尽力）');
   assert.equal(posted.results[0].ok, false);

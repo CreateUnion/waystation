@@ -1,5 +1,5 @@
 import { isArchived } from './model.js';
-import { currentManagerIdOf, isLocalArchivedState, localNameOf, localRosterOf, localStateOf, localVersionOf } from './local.js';
+import { currentManagerIdOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, localVersionOf } from './local.js';
 import { checkFrozenDeadlines } from './freeze.js';
 import {
   adoptNewManager, downgradeToMember, endpointFor, governanceTargets, notifyLocal, promoteToManager, relayGovernance, requestCurrentView, sendMergeOffer, sendTo, sendToRoster,
@@ -62,9 +62,10 @@ export function runProbeTick(state) {
   }
 }
 
-/* 成员侧对现任驿丞的周期探测：只在存活协作、端点已知、无在途探测时发起。 */
+/* 成员侧对现任驿丞的周期探测：只在存活协作、端点已知、无在途探测时发起。
+ * 讨论实例不参与（无驿丞 / 无失联判定 / 无抢接——设计 §4；讨论的收敛由对表引擎承担）。 */
 function maybeProbeManager(state, local) {
-  if (typeof state.probe !== 'function' || local.role === 'manager') {
+  if (typeof state.probe !== 'function' || local.role === 'manager' || localModeOf(local) === 'forum') {
     return;
   }
   const stateName = localStateOf(local);
@@ -163,12 +164,14 @@ function checkSuspensionDeadlines(state, now) {
 
 /* —— 握手（启动 / 网络恢复 / 治理通告后的对表）—— */
 
+/* 讨论实例不参与 managed 握手：讨论的「对表（讨论版握手）」= 拉取引擎的周期 tick
+ * （设计 §5.4）——治理握手通告对讨论无意义，且未获回应会把发起人误置为收敛等待（阻断发帖）。 */
 export function runHandshake(state, options = {}) {
   const scope = options.collabId === undefined
     ? [...state.collabs.values()]
     : [state.collabs.get(options.collabId)].filter((local) => local !== undefined);
   for (const local of scope) {
-    if (isLocalArchivedState(local)) {
+    if (isLocalArchivedState(local) || localModeOf(local) === 'forum') {
       continue;
     }
     handshakeOne(state, local);

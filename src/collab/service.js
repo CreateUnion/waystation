@@ -1,10 +1,12 @@
 import { listLocalCollabIds, loadLedger, loadMember, loadSnapshot, quarantineLedger } from './store.js';
 import { isArchived, withDefaultMode } from './model.js';
 import { createPostsStore } from './posts.js';
-import { decideAdmission } from './gate.js';
+import { createMembersStore } from './members.js';
+import { decideAdmission, SYNC_REQUEST_MAX, SYNC_REQUEST_WINDOW_MS } from './gate.js';
 import { handleEvent } from './events.js';
 import { localModeOf, localNameOf, localRosterOf, localStateOf, persistLedger } from './local.js';
 import { approveInvite, countLiveCollabs, createCollab, endCollab, inviteMembers, leaveCollab, sendMessage, viewLedger, withdrawInvite } from './outgoing.js';
+import { JOIN_REPLAY_INTERVALS_MS, SYNC_MAX_REQUESTS_PER_CYCLE, SYNC_MAX_SOURCES_PER_CYCLE, SYNC_REPLY_TIMEOUT_MS, SYNC_SOFT_BUNDLE_BYTES, SYNC_TAIL_POSTS, SYNC_TAIL_WINDOW_MS, runSyncCycle, runSyncSweep, startSyncEngine, stopSyncEngine } from './sync.js';
 import { HANDSHAKE_REPLY_TIMEOUT_MS, TAKEOVER_PROBE_INTERVAL_MS, runHandshake, startLiveness, stopLiveness, takeOver } from './takeover.js';
 import { decide, decideMergeOffer } from './freeze.js';
 import { HANDOVER_CONFIRM_TIMEOUT_MS, handover } from './handover.js';
@@ -25,7 +27,11 @@ const INVITE_MIN_INTERVAL_MS = 1000;
  *   notify?: ((frame: object) => unknown) | null,
  *   sendDirect?: ((message: object) => { ok: boolean, msgId?: string, tier?: string, reason?: string }) | null,
  *   ledgerFetchTimeoutMs?: number, inviteMinIntervalMs?: number, takeoverProbeIntervalMs?: number,
- *   handshakeReplyTimeoutMs?: number, handoverConfirmTimeoutMs?: number }} options
+ *   handshakeReplyTimeoutMs?: number, handoverConfirmTimeoutMs?: number,
+ *   pullReplyTimeoutMs?: number, syncMaxRequestsPerCycle?: number, syncMaxSourcesPerCycle?: number,
+ *   syncSoftBundleBytes?: number, syncTailPosts?: number, syncTailWindowMs?: number,
+ *   syncPeerPicker?: ((context: { collabId: string, candidates: string[] }) => string[] | null) | null,
+ *   syncRequestWindowMs?: number, syncRequestMax?: number, joinReplayIntervalsMs?: number[] }} options
  */
 export function createCollabService(options) {
   const state = buildState(options);
@@ -34,39 +40,59 @@ export function createCollabService(options) {
 }
 
 function buildState(options) {
-  const {
-    dataDir, config, self, send, knownHosts, log,
-    probe = null, reassign = null, notify = null, sendDirect = null,
-    ledgerFetchTimeoutMs = LEDGER_FETCH_TIMEOUT_MS,
-    inviteMinIntervalMs = INVITE_MIN_INTERVAL_MS,
-    takeoverProbeIntervalMs = TAKEOVER_PROBE_INTERVAL_MS,
-    handshakeReplyTimeoutMs = HANDSHAKE_REPLY_TIMEOUT_MS,
-    handoverConfirmTimeoutMs = HANDOVER_CONFIRM_TIMEOUT_MS,
-  } = options;
   return {
-    dataDir,
-    config,
-    self,
-    send,
-    sendDirect,
-    knownHosts,
-    log,
-    probe,
-    reassign,
-    notify,
-    ledgerFetchTimeoutMs,
-    inviteMinIntervalMs,
-    takeoverProbeIntervalMs,
-    handshakeReplyTimeoutMs,
-    handoverConfirmTimeoutMs,
+    ...coreStateOf(options),
+    ...syncStateOf(options),
     ...runtimeMaps(),
     probeTimer: null,
+    syncTimer: null,
     started: false,
     counters: emptyCounters(),
   };
 }
 
-/* 运行期容器（注册表 / 限频 / 转达集 / 等待面 / 抢接与握手状态）。 */
+/* 既有面状态（缺省值见各模块顶部常量：ledger/invite/takeover/handover 超时）。 */
+function coreStateOf(options) {
+  return {
+    dataDir: options.dataDir,
+    config: options.config,
+    self: options.self,
+    send: options.send,
+    sendDirect: options.sendDirect ?? null,
+    knownHosts: options.knownHosts,
+    log: options.log,
+    probe: options.probe ?? null,
+    reassign: options.reassign ?? null,
+    notify: options.notify ?? null,
+    ledgerFetchTimeoutMs: options.ledgerFetchTimeoutMs ?? LEDGER_FETCH_TIMEOUT_MS,
+    inviteMinIntervalMs: options.inviteMinIntervalMs ?? INVITE_MIN_INTERVAL_MS,
+    takeoverProbeIntervalMs: options.takeoverProbeIntervalMs ?? TAKEOVER_PROBE_INTERVAL_MS,
+    handshakeReplyTimeoutMs: options.handshakeReplyTimeoutMs ?? HANDSHAKE_REPLY_TIMEOUT_MS,
+    handoverConfirmTimeoutMs: options.handoverConfirmTimeoutMs ?? HANDOVER_CONFIRM_TIMEOUT_MS,
+  };
+}
+
+/* 讨论对表与 join 重播面的构造选项（数值默认见 sync.js / gate.js 常量；测试经选项收敛）。 */
+function syncStateOf(options) {
+  return {
+    pullReplyTimeoutMs: pickOption(options, 'pullReplyTimeoutMs', SYNC_REPLY_TIMEOUT_MS),
+    syncMaxRequestsPerCycle: pickOption(options, 'syncMaxRequestsPerCycle', SYNC_MAX_REQUESTS_PER_CYCLE),
+    syncMaxSourcesPerCycle: pickOption(options, 'syncMaxSourcesPerCycle', SYNC_MAX_SOURCES_PER_CYCLE),
+    syncSoftBundleBytes: pickOption(options, 'syncSoftBundleBytes', SYNC_SOFT_BUNDLE_BYTES),
+    syncTailPosts: pickOption(options, 'syncTailPosts', SYNC_TAIL_POSTS),
+    syncTailWindowMs: pickOption(options, 'syncTailWindowMs', SYNC_TAIL_WINDOW_MS),
+    syncPeerPicker: pickOption(options, 'syncPeerPicker', null),
+    syncRequestWindowMs: pickOption(options, 'syncRequestWindowMs', SYNC_REQUEST_WINDOW_MS),
+    syncRequestMax: pickOption(options, 'syncRequestMax', SYNC_REQUEST_MAX),
+    joinReplayIntervalsMs: pickOption(options, 'joinReplayIntervalsMs', JOIN_REPLAY_INTERVALS_MS),
+  };
+}
+
+function pickOption(options, key, fallback) {
+  return options[key] ?? fallback;
+}
+
+/* 运行期容器（注册表 / 限频 / 转达集 / 等待面 / 抢接与握手 / 对表与 join 重播状态）。 */
 function runtimeMaps() {
   return {
     collabs: new Map(),
@@ -80,6 +106,11 @@ function runtimeMaps() {
     effectiveTakeovers: new Map(),
     handshakeWatch: new Map(),
     pendingHandovers: new Map(),
+    syncWaiters: new Map(),    // 键 = collabId + 对端实例标识 → 拉取应答等待面
+    syncActive: new Set(),     // 在途对表的 collabId（tick 与触发面互不叠加）
+    syncRotations: new Map(),  // collabId → 对端轮换游标
+    joinReplays: new Map(),    // collabId → { timer, attempts }（join 未收敛重播）
+    syncRequestWindow: new Map(),   // 来源地址 → 窗口内请求时刻（请求类入站限流）
   };
 }
 
@@ -106,6 +137,7 @@ function apiOf(state) {
     view: (input) => viewLedger(state, input),
     describe: (collabId) => describeCollab(state, collabId),
     count: () => countLiveCollabs(state),
+    sync: (input) => syncNow(state, input),
     stats: () => statsOf(state),
     close: () => closeService(state),
   };
@@ -121,25 +153,29 @@ function gateFrame(state, frame, meta) {
   }
 }
 
-/* 事件包装：异常隔离为计数与告警——协作事件绝不因内部错误穿出接收管线（健壮性硬性要求）。 */
+/* 事件包装：异常隔离为计数与告警——协作事件绝不因内部错误穿出接收管线（健壮性硬性要求）。
+ * 返回值透传（讨论的帖去重栅栏经它声明「不重复注入会话」；异常归 undefined = 保持照旧注入）。 */
 async function consumeFrame(state, frame, meta) {
   try {
     state.counters.eventsHandled++;
-    await handleEvent(state, frame, meta);
+    return await handleEvent(state, frame, meta);
   } catch (error) {
     state.counters.eventFailures++;
     state.log.error('协作事件处理异常（已隔离）', { type: frame?.type, collabId: frame?.collabId, reason: error?.message });
+    return undefined;
   }
 }
 
-/* 服务启动（组合根在 net.start 成功后调用；降级不调用）：探测定时器 + 启动握手（常驻收敛机制）。
- * 幂等；不调用 start 的服务无定时器——行为与协作核心期一致（既有单测路径零变化）。 */
+/* 服务启动（组合根在 net.start 成功后调用；降级不调用）：探测定时器 + 启动握手（managed 收敛机制）
+ * + 讨论对表引擎（周期 tick，anti-entropy）。幂等；不调用 start 的服务无定时器——
+ * 既有单测路径零变化（对表可由 syncNow 直接驱动）。 */
 function startService(state) {
   if (state.started) {
     return;
   }
   state.started = true;
   startLiveness(state);
+  startSyncEngine(state);
   runHandshake(state);
 }
 
@@ -172,6 +208,7 @@ function loadOne(state, collabId) {
     endpoints: new Map(Object.entries(member.endpoints)),
     snapshot: loadSnapshot(state.dataDir, collabId),
     posts: createPostsStore({ dataDir: state.dataDir, collabId, log: state.log }),
+    members: createMembersStore({ dataDir: state.dataDir, collabId, log: state.log }),
     suspended: null,
     staleManagerId: null,
   };
@@ -238,6 +275,15 @@ function listCollabs(state) {
   return { collabs };
 }
 
+/* 成员数读数：讨论 = 折叠成员表（成员事件并集折叠——被拒/被撤回者不占名额、退出者即时出表，
+ * 与邀请名额判据同一权威）；managed = 台账/定格名单（既有口径不变）。 */
+function memberCountOf(local) {
+  if (localModeOf(local) === 'forum') {
+    return local.members.fold().length;
+  }
+  return localRosterOf(local).length;
+}
+
 function listEntryOf(state, local, now) {
   const stateName = localStateOf(local);
   const probeState = state.probes.get(local.collabId);
@@ -248,7 +294,7 @@ function listEntryOf(state, local, now) {
     mode: localModeOf(local),
     state: stateName,
     version: local.role === 'manager' ? local.ledger.version : (local.snapshot === null ? null : local.snapshot.version),
-    memberCount: localRosterOf(local).length,
+    memberCount: memberCountOf(local),
     archived: isArchived(stateName),
     managerOffline: local.role === 'manager' ? false : (probeState?.offline === true),
     frozenUnresolved: local.freezeDeadlineNotified === true,
@@ -290,9 +336,26 @@ function statsOf(state) {
   return { collabs: state.collabs.size, byState, ...state.counters };
 }
 
-/* 收尾：定时器、等待面与在途流程统一解挂（闸门、快照拉取、握手观察、抢接窗口、移交回执）。 */
+/* 对表驱动入口（显式触发面；周期 tick 走 startSyncEngine 的定时器）：省略 collabId = 全量扫一轮
+ * （fire-and-forget）；给定 collabId = 单实例一轮（返回本轮结果——确定性测试的判据面）。 */
+async function syncNow(state, input = {}) {
+  const { collabId, ...options } = input ?? {};
+  if (collabId === undefined) {
+    runSyncSweep(state, { reason: 'manual', ...options });
+    return { ok: true, scope: 'all' };
+  }
+  const local = state.collabs.get(collabId);
+  if (local === undefined) {
+    return { ok: false, message: '本机没有该讨论（collabId 不存在）——先看 ws_list_collabs' };
+  }
+  return runSyncCycle(state, local, { reason: 'manual', ...options });
+}
+
+/* 收尾：定时器、等待面与在途流程统一解挂（闸门、快照拉取、握手观察、抢接窗口、移交回执、
+ * 对表等待面与 join 重播）。 */
 function closeService(state) {
   stopLiveness(state);
+  stopSyncEngine(state);
   for (const held of state.pendingViews.values()) {
     for (const waiter of held) {
       clearTimeout(waiter.timer);
@@ -325,6 +388,39 @@ function emptyCounters() {
     ...emptyFlowCounters(),
     ...emptyGuardCounters(),
     ...emptyGovernanceCounters(),
+    ...emptySyncCounters(),
+  };
+}
+
+/* 讨论的对表与成员收敛计数（拉取 / 真对账 / 成员事件 / 重播）。 */
+function emptySyncCounters() {
+  return {
+    syncCycles: 0,
+    syncFailures: 0,
+    syncRequestsSent: 0,
+    syncRequestsRejected: 0,
+    syncRequestsThrottled: 0,
+    syncBundlesSent: 0,
+    syncBundlesIn: 0,
+    syncSegments: 0,
+    syncMismatches: 0,
+    syncRollbacks: 0,
+    syncPostsBackfilled: 0,
+    syncPostsRejected: 0,
+    syncEventsIn: 0,
+    syncTerminalsIn: 0,
+    syncNoPeer: 0,
+    syncNoAnswer: 0,
+    syncSendSkipped: 0,
+    syncBundleSkipped: 0,
+    forumJoinsIn: 0,
+    forumJoinDuplicates: 0,
+    forumJoinsOut: 0,
+    forumLeavesIn: 0,
+    forumLeavesOut: 0,
+    forumEstablished: 0,
+    forumBroadcastSkipped: 0,
+    joinReplays: 0,
   };
 }
 

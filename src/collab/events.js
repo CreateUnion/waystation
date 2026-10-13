@@ -1,10 +1,12 @@
 import { DEFAULT_COLLAB_MODE, isPort } from '../net/protocol.js';
 import { MAX_BOARD_ENTRIES, isSnapshotShape } from './model.js';
 import { createPostsStore } from './posts.js';
+import { createMembersStore } from './members.js';
 import { ledgerDigest } from './store.js';
-import { isLocalArchivedState, localModeOf, persistMember, persistSnapshot, rememberKnownHost } from './local.js';
+import { isLocalArchivedState, localModeOf, persistMember, persistSnapshot, rememberKnownHost, selfJoinedOf } from './local.js';
 import { matchConflictCollabs, noteForumGovernanceIgnored } from './gate.js';
-import { applyEndpoint, applyFreezeLocally, broadcastFreeze, governanceTargets, memberIdsOf, mutateLedger, relayGovernance, sendTo } from './outgoing.js';
+import { applyEndpoint, applyFreezeLocally, broadcastFreeze, governanceTargets, memberIdsOf, mutateLedger, relayGovernance, sendTo, stopJoinReplay } from './outgoing.js';
+import { applyIncomingJoin, applyIncomingLeave, handleHistoryBundle, handleHistoryRequest } from './sync.js';
 import { handleHandshake, handleTakeover, handleTakeoverInit, resendEffectiveTakeover, resumeLocal } from './takeover.js';
 import { handleDecision, handleMergeOutcome, handleMergeRequest, handleUnfreeze } from './freeze.js';
 import { handleHandover, handleManagerChanged } from './handover.js';
@@ -25,6 +27,9 @@ const EVENT_HANDLERS = {
   freeze: handleFreeze,
   snapshot: handleSnapshot,
   post: handlePost,
+  join: applyIncomingJoin,
+  'history-request': handleHistoryRequest,
+  'history-bundle': handleHistoryBundle,
   end: handleEnd,
   leave: handleLeave,
   'takeover-init': handleTakeoverInit,
@@ -43,12 +48,14 @@ const NOTICE_HANDLERS = {
   'merge-outcome': handleMergeOutcome,
 };
 
+/* 事件分发：返回值透传（帖去重栅栏的「不重复注入会话」声明经此到达接收管线）。 */
 export async function handleEvent(state, frame, meta) {
   learnEndpoints(state, frame, meta);
   const handler = EVENT_HANDLERS[frame.type];
   if (handler !== undefined) {
-    await handler(state, frame, meta);
+    return await handler(state, frame, meta);
   }
+  return undefined;
 }
 
 /* 端点学习（设计 §5「清单随协作参与关系更新」的接入面）：已受理帧的来源地址与端口记入
@@ -93,10 +100,13 @@ function isRelayedCopy(frame) {
 
 /* 邀请到达（admit 已做名单 / 频率 / 上限判定）：创建本地参与记录（proposed），冲突检测命中则
  * 直接冻结本记录并广播（第一检测点，设计 §6）；两种结局都投递会话（同意门入口）。
- * 讨论邀请跳过冲突检测（设计 §6 实现面②）：讨论不参与同名冲突匹配，到达即建记录。 */
+ * 讨论邀请跳过冲突检测（设计 §6 实现面②）：讨论不参与同名冲突匹配，到达即建记录。
+ * 同一 collabId 的再次邀请不再丢弃（讨论侧"并发/重复邀请互认"与"退出后重入"两处修复，
+ * 设计 §5.1/§5.4）；managed 的既有重复邀请语义（拒绝）不变。 */
 function handleInvite(state, frame, meta) {
-  if (state.collabs.has(frame.collabId)) {
-    state.counters.invitesRejected++;
+  const existing = state.collabs.get(frame.collabId);
+  if (existing !== undefined) {
+    receiveRepeatInvite(state, existing, frame, meta);
     return;
   }
   const member = inviteRecordOf(state, frame);
@@ -108,10 +118,12 @@ function handleInvite(state, frame, meta) {
     endpoints: new Map(),
     snapshot: null,
     posts: createPostsStore({ dataDir: state.dataDir, collabId: frame.collabId, log: state.log }),
+    members: createMembersStore({ dataDir: state.dataDir, collabId: frame.collabId, log: state.log }),
     suspended: null,
     staleManagerId: null,
   };
   learnInviteSource(state, local, frame, meta);
+  learnInviteEndpoints(state, local, frame);
   state.counters.invitesReceived++;
   if (member.mode !== 'forum') {
     const conflict = matchConflictCollabs(state, member.name, member.roster.map((entry) => entry.instanceId));
@@ -124,8 +136,34 @@ function handleInvite(state, frame, meta) {
   persistMember(state, local);
 }
 
+/* 同 collabId 再次邀请（讨论）：就地互认——已加入者只学端点（重复 join 由事件日志幂等吸收）；
+ * 未加入者（含已拒绝、已过期、已退出重入）重新定格提议面（新有效期、最新名单与主题），
+ * 事件日志与帖子原样保留（重入回填按同步游标续拉）。 */
+function receiveRepeatInvite(state, existing, frame, meta) {
+  if (localModeOf(existing) !== 'forum' || (frame.payload.mode ?? DEFAULT_COLLAB_MODE) !== 'forum') {
+    state.counters.invitesRejected++;
+    return;
+  }
+  learnInviteSource(state, existing, frame, meta);
+  learnInviteEndpoints(state, existing, frame);
+  state.counters.invitesReceived++;
+  if (selfJoinedOf(existing, state.self.instanceId)) {
+    return;   // 已加入：邀请幂等（并集吸收），不动本地成员面
+  }
+  const now = new Date().toISOString();
+  existing.member.state = 'proposed';
+  existing.member.decision = null;
+  existing.member.invitedAt = now;
+  existing.member.expiresAt = new Date(Date.parse(now) + state.config.inviteTtlMs).toISOString();
+  existing.member.roster = inviteRosterOf(frame);
+  existing.member.topic = frame.payload.topic;
+  delete existing.member.archivedAt;
+  persistMember(state, existing);
+}
+
 /* 邀请定格的本地记录（roster 供冲突交集判据在成员侧取数；有效期自本地收到时刻起算）。
- * 模式随邀请载荷定格（缺字段按 managed 解释——旧版对端不携带该字段）。 */
+ * 模式随邀请载荷定格（缺字段按 managed 解释——旧版对端不携带该字段）；主题随记录定格
+ * （成员侧发起邀请的取数面）。 */
 function inviteRecordOf(state, frame) {
   const now = new Date().toISOString();
   return {
@@ -133,14 +171,19 @@ function inviteRecordOf(state, frame) {
     role: 'member',
     state: 'proposed',
     name: frame.payload.name,
+    topic: frame.payload.topic,
     mode: frame.payload.mode ?? DEFAULT_COLLAB_MODE,
     manager: { instanceId: frame.from.instanceId, identityName: frame.from.identityName },
-    roster: frame.payload.members.map((entry) => ({ instanceId: entry.instanceId, identityName: entry.identityName })),
+    roster: inviteRosterOf(frame),
     endpoints: {},
     invitedAt: now,
     expiresAt: new Date(Date.parse(now) + state.config.inviteTtlMs).toISOString(),
     decision: null,
   };
+}
+
+function inviteRosterOf(frame) {
+  return frame.payload.members.map((entry) => ({ instanceId: entry.instanceId, identityName: entry.identityName }));
 }
 
 /* 邀请来源端点学习（记录创建时的一次性学习——注册表尚无本条，走 learnEndpoints 之外的特例路径）。 */
@@ -152,6 +195,22 @@ function learnInviteSource(state, local, frame, meta) {
   local.endpoints.set(frame.from.instanceId, { address, port: frame.from.port });
   local.member.endpoints = Object.fromEntries(local.endpoints);
   rememberKnownHost(state, { address, port: frame.from.port, instanceId: frame.from.instanceId, identityName: frame.from.identityName });
+}
+
+/* 邀请载荷随带的端点表学习（讨论邀请；设计 §5.1）：被邀者据此取得入群寻址信息——
+ * 加入后的 join 自播与回填对表由此不盲。身份名尽力取（邀请名单里找），缺名不拒（寻址不受影响）。 */
+function learnInviteEndpoints(state, local, frame) {
+  const endpoints = frame.payload?.endpoints;
+  if (endpoints === undefined) {
+    return;
+  }
+  for (const [instanceId, endpoint] of Object.entries(endpoints)) {
+    if (instanceId === state.self.instanceId) {
+      continue;
+    }
+    const identityName = local.member.roster.find((entry) => entry.instanceId === instanceId)?.identityName ?? '';
+    applyEndpoint(state, local, { instanceId, identityName }, endpoint.address, endpoint.port);
+  }
 }
 
 /* 冲突检出（第一检测点）：冻结新到那条并连带冻结本机全部匹配协作（检出方本地一并冻上，
@@ -396,7 +455,10 @@ function handleProgress(state, frame) {
 /* 帖到达（讨论实例；准入已判模式与词表）：按（作者实例标识, postId）幂等入本地列表——
  * 重复路径副本不再入列（计数留痕、无害）；帖只追加、不改任何元状态（topic 帖亦按普通帖处理，
  * 主题创建时定死）。ts 取帧 ts（作者侧落盘强制单调、随帖携带）；entryId 取载荷 postId 原样
- * （该帖在全部副本中的稳定标识）。 */
+ * （该帖在全部副本中的稳定标识）。
+ * 注入栅栏（限帖通道、不泛化）：去重命中的副本以 sessionDeliver:false 声明不重复注入会话
+ * （`(作者, postId)` 去重结果参与投递判定）——不同 msgId 的重复路径副本由此不再二次通知；
+ * managed 的「受理帧仍注入」行为不受影响（本声明只由帖通道发出，接收管线只在该类型采信）。 */
 function handlePost(state, frame) {
   const local = state.collabs.get(frame.collabId);
   if (local === undefined || localModeOf(local) !== 'forum') {
@@ -413,9 +475,10 @@ function handlePost(state, frame) {
   });
   if (!added) {
     state.counters.postsDuplicated++;
-    return;
+    return { sessionDeliver: false };
   }
   state.counters.postsIn++;
+  return undefined;
 }
 
 /* 冻结接收（设计 §6）：匹配 → 记下对端名单（合并并集的输入）→ 本地冻结（幂等）→ 转达
@@ -564,7 +627,9 @@ function answerSnapshotRequest(state, frame) {
   state.counters.snapshotSent++;
 }
 
-/* 结束到达（成员侧）：归档；重复通告幂等；管理席位收到结束通告忽略（结束只能由本机发起）。 */
+/* 结束到达（成员侧）：归档；重复通告幂等；管理席位收到结束通告忽略（结束只能由本机发起）。
+ * 讨论实例的发起人同样收不到合法的 end（仅发起人可 end——本批状态面经归档守卫，守卫面归后续）；
+ * 成员侧归档即停 join 重播与对表（end 双通道之一：在线广播；离线者经 bundle 元状态学到）。 */
 function handleEnd(state, frame) {
   const local = state.collabs.get(frame.collabId);
   if (local === undefined || isLocalArchivedState(local)) {
@@ -578,13 +643,22 @@ function handleEnd(state, frame) {
   local.member.state = 'completed';
   local.member.archivedAt = new Date().toISOString();
   persistMember(state, local);
+  stopJoinReplay(state, local);
   state.counters.endedIn++;
 }
 
-/* 退出到达（管理席位）：成员状态入账 + 名单变更通告（既有参与者不重复点头，设计 §6）。 */
+/* 退出到达：讨论 = 成员事件并入（折叠出表）+ 触发对表（设计 §5.4——leave 是广播事件，
+ * 由接收方按事件集并集吸收）；managed = 管理席位记成员状态 + 名单变更通告（设计 §6）。 */
 function handleLeave(state, frame) {
   const local = state.collabs.get(frame.collabId);
-  if (local === undefined || local.role !== 'manager') {
+  if (local === undefined) {
+    return;
+  }
+  if (localModeOf(local) === 'forum') {
+    applyIncomingLeave(state, local, frame);
+    return;
+  }
+  if (local.role !== 'manager') {
     return;
   }
   const member = local.ledger.members.find((entry) => entry.instanceId === frame.from.instanceId);

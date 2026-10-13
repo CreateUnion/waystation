@@ -8,8 +8,16 @@ import { isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localSta
  * 白名单是「冻结期允许的操作」与「归档后幂等 / 只读类」的机器化（设计 §6/§10）。 */
 
 const FROZEN_ALLOWED = new Set(['freeze', 'unfreeze', 'decision', 'takeover-init', 'takeover', 'notice', 'snapshot', 'end', 'leave']);
-const ARCHIVED_ALLOWED = new Set(['snapshot', 'notice', 'end', 'leave']);
+const ARCHIVED_ALLOWED = new Set(['snapshot', 'notice', 'end', 'leave', 'history-request', 'history-bundle']);
 const CONFLICT_FRAME_TYPES = new Set(['freeze', 'unfreeze', 'decision']);
+const FORUM_CHANNEL_TYPES = new Set(['join', 'history-request', 'history-bundle']);
+
+/* 请求类入站限流（设计 §5.3「请求类入站限流需新增」，计划 §4：同源 10s 内 2 次）：
+ * 协作域现无通用入站限流器——沿同源记账思路新增（来源可见面为地址；拨入连接端口是临时端口，
+ * 不作记账键——与邀请限频同一口径）。数值可经服务选项注入（测试收敛用）。 */
+export const SYNC_REQUEST_WINDOW_MS = 10000;
+export const SYNC_REQUEST_MAX = 2;
+const SYNC_THROTTLE_TABLE_MAX = 64;
 
 export function decideAdmission(state, frame, meta) {
   if (frame.type === 'invite') {
@@ -23,6 +31,21 @@ export function decideAdmission(state, frame, meta) {
     state.counters.unknownCollab++;
     return { ok: false, reason: '本机无此协作（未知 collabId）' };
   }
+  if (FORUM_CHANNEL_TYPES.has(frame.type)) {
+    return admitForumChannel(state, local, frame, meta);
+  }
+  const stateGate = admitByLocalState(state, local, frame);
+  if (stateGate !== null) {
+    return stateGate;
+  }
+  if (frame.type === 'post') {
+    return admitForumPost(state, local, frame);
+  }
+  return { ok: true };
+}
+
+/* 冻结 / 归档白名单门（状态相关分支的收口）：null = 本层无异议，交后续类型语义判定。 */
+function admitByLocalState(state, local, frame) {
   const stateName = localStateOf(local);
   if (stateName === 'frozen') {
     if (FROZEN_ALLOWED.has(frame.type)) {
@@ -31,18 +54,88 @@ export function decideAdmission(state, frame, meta) {
     state.counters.rejectedFrozen++;
     return { ok: false, reason: '协作已冻结：仅允许读台账 / 裁定 / 退出 / 终止' };
   }
-  if (isLocalArchivedState(local)) {
-    if (ARCHIVED_ALLOWED.has(frame.type)) {
+  if (!isLocalArchivedState(local)) {
+    return null;
+  }
+  if (ARCHIVED_ALLOWED.has(frame.type)) {
+    return { ok: true };
+  }
+  state.counters.lateDropped++;
+  state.log.warn(`协作已结束（或已退出），迟到消息丢弃：${frame.type}`, { collabId: frame.collabId, msgId: frame.msgId, from: frame.from?.instanceId });
+  return { ok: false, reason: '协作已结束（或已退出）：消息丢弃并计数留痕' };
+}
+
+/* 讨论的 join 与拉取两件套（设计 §5.1/§5.3）：论坛专属类型——managed 实例收到即类型语义不符
+ * 拒绝并计数；两件套在**归档后仍放行**（只读回填通道不因归档关闭，白名单与分支同点表达），
+ * 且两者都要求请求方在本地折叠成员表内（非成员拒绝并计数）；join 在归档后不改变任何状态
+ * （迟到副本丢弃并计数）。history-request 另过同源限流（被拒 = 无应答，由请求方换源/下轮）。 */
+function admitForumChannel(state, local, frame, meta) {
+  if (localModeOf(local) !== 'forum') {
+    state.counters.eventMismatch++;
+    return { ok: false, reason: `${frame.type} 通道属于讨论模式——本机该实例为协作（managed），类型语义不符` };
+  }
+  if (frame.type === 'join') {
+    if (isLocalArchivedState(local)) {
+      state.counters.lateDropped++;
+      state.log.warn('讨论已结束（或已退出），join 迟到副本丢弃', { collabId: frame.collabId, from: frame.from?.instanceId });
+      return { ok: false, reason: '讨论已结束（或已终止 / 已退出）：join 丢弃并计数留痕' };
+    }
+    return { ok: true };
+  }
+  if (frame.type === 'history-bundle') {
+    /* 应答准入：折叠成员表，或本机记录的发起人引用——新人首次回填窗口里，应答方（邀请者）
+     * 的 join 事件尚未随对表拉回，但它是合法成员（发起人自创建即在表内）。 */
+    if (isMemberOrInviter(local, frame.from.instanceId)) {
       return { ok: true };
     }
-    state.counters.lateDropped++;
-    state.log.warn(`协作已结束（或已退出），迟到消息丢弃：${frame.type}`, { collabId: frame.collabId, msgId: frame.msgId, from: frame.from?.instanceId });
-    return { ok: false, reason: '协作已结束（或已退出）：消息丢弃并计数留痕' };
+    state.counters.syncRequestsRejected++;
+    return { ok: false, reason: '拉取应答方既不在本机折叠成员表内、也不是本机记录的邀请者（拒绝并计数）' };
   }
-  if (frame.type === 'post') {
-    return admitForumPost(state, local, frame);
+  if (!local.members.includes(frame.from.instanceId)) {
+    state.counters.syncRequestsRejected++;
+    state.log.warn('拉取请求方不在本机折叠成员表内（拒绝）', { collabId: frame.collabId, from: frame.from?.instanceId });
+    return { ok: false, reason: '拉取请求方不在本机折叠成员表内（拒绝并计数）' };
+  }
+  if (!withinRequestRate(state, meta)) {
+    state.counters.syncRequestsThrottled++;
+    return { ok: false, reason: '拉取请求过于频繁（同源限频）' };
   }
   return { ok: true };
+}
+
+function isMemberOrInviter(local, instanceId) {
+  if (local.members.includes(instanceId)) {
+    return true;
+  }
+  return local.role === 'member' && local.member?.manager?.instanceId === instanceId;
+}
+
+/* 同源请求频次判定：窗口内已达上限 → 拒绝（请求方按「无应答」换源或下轮对表）；
+ * 表满按插入序淘汰（防伪造洪泛的写放大）。来源未知（测试假连接）不参与记账。 */
+function withinRequestRate(state, meta) {
+  const source = typeof meta?.remoteAddress === 'string' && meta.remoteAddress !== '' ? meta.remoteAddress : '';
+  if (source === '') {
+    return true;
+  }
+  const now = Date.now();
+  const recent = (state.syncRequestWindow.get(source) ?? []).filter((at) => now - at < state.syncRequestWindowMs);
+  if (recent.length >= state.syncRequestMax) {
+    rememberRequestRate(state, source, recent);
+    return false;
+  }
+  recent.push(now);
+  rememberRequestRate(state, source, recent);
+  return true;
+}
+
+/* 记账（删除后重插保持新鲜度；表满淘汰最旧来源）。 */
+function rememberRequestRate(state, source, recent) {
+  state.syncRequestWindow.delete(source);
+  state.syncRequestWindow.set(source, recent);
+  while (state.syncRequestWindow.size > SYNC_THROTTLE_TABLE_MAX) {
+    const oldest = state.syncRequestWindow.keys().next().value;
+    state.syncRequestWindow.delete(oldest);
+  }
 }
 
 /* 帖通道的模式语义校验（设计 §5.2/§5.5 分层：协议层只校并集形态，本层判模式与词表）：

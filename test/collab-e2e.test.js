@@ -95,7 +95,7 @@ after(async () => {
 /* 真实组合根 + 假会话收件箱 + SDK 客户端：与生产装配同参（唯一差异 = 消息套接字指向假收件箱）。
  * 端口与数据目录经预写配置 + WAYSTATION_HOME 注入（显式目录模式，与 server.test.js 同法）。 */
 async function startStation(t, { home, port, inbox }) {
-  writeFileSync(join(home, 'config.json'), JSON.stringify({ port, scanWindowMs: 300, dialTimeoutMs: 1500, dispatchTickMs: 100, retryIntervalMs: 200, retryFastCount: 100, messageTtlMs: 3600000 }));
+  writeFileSync(join(home, 'config.json'), JSON.stringify({ port, scanWindowMs: 300, dialTimeoutMs: 1500, dispatchTickMs: 100, retryIntervalMs: 200, retryFastCount: 100, messageTtlMs: 3600000, forumSyncIntervalMs: 4000 }));
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [INDEX_ENTRY],
@@ -262,40 +262,73 @@ test('验收预演：管理者离线 → 读快照回退并标注可能非最新
   assert.equal(viewed.payload.ledger.status, 'active');
 });
 
-test('验收预演：讨论模式双节点直投发帖（成员表经邀请装配）——会话注入、两端收敛、本地视图', { timeout: 120000 }, async (t) => {
+/* 折叠成员表收敛等待（讨论页）：两侧 memberCount 同时达到目标值。 */
+async function waitMemberCount(clientA, clientB, collabId, count) {
+  await waitFor(async () => {
+    const listA = (await listCollabs(clientA)).find((entry) => entry.collabId === collabId);
+    const listB = (await listCollabs(clientB)).find((entry) => entry.collabId === collabId);
+    return listA?.memberCount === count && listB?.memberCount === count ? true : null;
+  }, { timeoutMs: 30000 });
+}
+
+/* 投递档位等待（帖子）：该消息达到 session 档。 */
+async function waitSessionTier(client, msgId) {
+  await waitFor(async () => {
+    const row = (await callTool(client, 'ws_delivery_status', { msgId })).payload.rows[0];
+    return row !== undefined && row.tier === 'session' ? true : null;
+  }, { timeoutMs: 20000 });
+}
+
+/* 帖集合收敛等待（讨论页）：两侧本地视图的帖数达标且显示序一致。 */
+async function waitPostConvergence(clientA, clientB, collabId, count) {
+  await waitFor(async () => {
+    const viewA = (await callTool(clientA, 'ws_view_ledger', { collabId })).payload;
+    const viewB = (await callTool(clientB, 'ws_view_ledger', { collabId })).payload;
+    if (viewA.posts.length !== count || viewB.posts.length !== count) {
+      return null;
+    }
+    return JSON.stringify(viewA.posts.map((entry) => entry.text)) === JSON.stringify(viewB.posts.map((entry) => entry.text)) ? true : null;
+  }, { timeoutMs: 30000 });
+}
+
+test('验收预演：讨论模式双节点——成员自播 join、直投发帖、周期对表收敛（会话注入与本地视图）', { timeout: 120000 }, async (t) => {
   const made = await startTemporaryStudio(t, { name: '讨论甲', topic: '议题', mode: 'forum' });
   const { inboxA, inboxB, a, b, collabId, statusA, statusB } = made;
   await waitFor(() => (inboxB.receivedText().includes('讨论甲') ? true : null), { timeoutMs: 20000 });
-  const admitted = (await listCollabs(b)).find((entry) => entry.collabId === collabId);
-  assert.equal(admitted.mode, 'forum', '成员表经邀请装配（帖通路不依赖加入/建立通路）');
+  assert.equal((await listCollabs(b)).find((entry) => entry.collabId === collabId).mode, 'forum');
+  assert.equal((await listCollabs(a)).find((entry) => entry.collabId === collabId).memberCount, 1, '发起人自创建即在成员表内（"第一个"；被邀未加入者不占名额）');
+  /* 被邀者同意 = 加入生效（自播 join，不依赖邀请者）——两侧折叠成员表收敛到 2 人。 */
+  assert.equal((await callTool(b, 'ws_approve_invite', { collabId, approve: true })).isError, false);
+  await waitState(b, collabId, 'active');
+  await waitMemberCount(a, b, collabId, 2);
   const postedA = await callTool(a, 'ws_send_message', { collabId, text: '甲的第一帖', type: 'issue' });
   assert.equal(postedA.isError, false, String(postedA.payload));
   assert.ok(postedA.payload.postId);
   assert.equal(postedA.payload.seq, 1);
   assert.equal(postedA.payload.results[0].ok, true, '对端在册且端点已知：直投受理');
   await waitFor(() => (inboxB.receivedText().includes('甲的第一帖') ? true : null), { timeoutMs: 20000 });
+  /* B 的对表（周期 tick）把 A 的 join 事件拉回——B 的折叠表含 A 后发帖才对 A 有扇出面。 */
+  await waitFor(async () => {
+    const view = (await callTool(b, 'ws_view_ledger', { collabId })).payload;
+    return view.members.length === 2 ? true : null;
+  }, { timeoutMs: 30000 });
   const postedB = await callTool(b, 'ws_send_message', { collabId, text: '乙的回应' });
   assert.equal(postedB.isError, false, String(postedB.payload));
+  assert.equal(postedB.payload.results[0].ok, true, 'B 的成员表经对表拉回后对 A 直投');
   await waitFor(() => (inboxA.receivedText().includes('乙的回应') ? true : null), { timeoutMs: 20000 });
-  await waitFor(async () => {
-    const viewA = (await callTool(a, 'ws_view_ledger', { collabId })).payload;
-    const viewB = (await callTool(b, 'ws_view_ledger', { collabId })).payload;
-    if (viewA.posts.length !== 2 || viewB.posts.length !== 2) {
-      return null;
-    }
-    return JSON.stringify(viewA.posts.map((entry) => entry.text)) === JSON.stringify(viewB.posts.map((entry) => entry.text)) ? true : null;
-  }, { timeoutMs: 20000 });
+  await waitPostConvergence(a, b, collabId, 2);
   const viewB = (await callTool(b, 'ws_view_ledger', { collabId })).payload;
   assert.equal(viewB.mode, 'forum');
   assert.equal(viewB.source, 'local');
   assert.ok(viewB.note.includes('本地视图，未与全员核对'));
+  assert.equal(viewB.topic, '议题');
   assert.deepEqual(viewB.members.map((member) => member.instanceId).sort(), [statusA.instanceId, statusB.instanceId].sort());
   assert.deepEqual(viewB.posts.map((entry) => entry.from.instanceId).sort(), [statusA.instanceId, statusB.instanceId].sort());
-  await waitFor(async () => {
-    const row = (await callTool(a, 'ws_delivery_status', { msgId: postedA.payload.results[0].msgId })).payload.rows[0];
-    return row !== undefined && row.tier === 'session' ? true : null;
-  }, { timeoutMs: 20000 });
+  await waitSessionTier(a, postedA.payload.results[0].msgId);
   const rejectTo = await callTool(a, 'ws_send_message', { collabId, text: '定向', to: statusB.instanceId });
   assert.equal(rejectTo.isError, true, '讨论不设定向：to 参数一律拒绝');
   assert.ok(rejectTo.payload.includes('定向'), rejectTo.payload);
+  /* 拉取通道帧不进会话注入（周期对表已在跑——history-request 帧不落会话文本）。 */
+  assert.ok(!inboxA.receivedText().includes('类型：history-request'), '拉取请求帧不进会话');
+  assert.ok(!inboxA.receivedText().includes('类型：history-bundle'), '拉取应答帧不进会话');
 });

@@ -2,8 +2,9 @@ import { isIP } from 'node:net';
 import { COLLAB_MODES, DEFAULT_COLLAB_MODE, ID_PATTERN, MAX_COLLAB_MEMBERS, MAX_MESSAGE_TEXT_CHARS, MAX_REASON_CHARS, MAX_TOPIC_CHARS, POST_KINDS, PROTOCOL_VERSION, isCollabMode, isIdentityName, isPort, isPresentationText, newMsgId } from '../net/protocol.js';
 import { MAX_FORUM_MEMBERS, MAX_LOCAL_COLLABS, canTransition, isArchived, newCollabId } from './model.js';
 import { createPostsStore, displayOrderOf, newPostId } from './posts.js';
+import { createMembersStore } from './members.js';
 import { ledgerDigest, removeLedgerFile } from './store.js';
-import { currentManagerIdOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, memberStateFor, persistLedger, persistMember, persistSnapshot, rememberKnownHost } from './local.js';
+import { currentManagerIdOf, emitOwnMemberEvent, foldedMembersOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, localTopicOf, memberStateFor, persistLedger, persistMember, persistSnapshot, rememberKnownHost, selfJoinedOf } from './local.js';
 import { matchConflictCollabs } from './gate.js';
 
 /* 对外操作与协作态变更实现（服务公共 API 的落点）：请求来自本机会话（工具面）——
@@ -32,6 +33,7 @@ export function createCollab(state, { name, topic, targets, mode }) {
     endpoints: new Map(),
     snapshot: null,
     posts: createPostsStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log }),
+    members: createMembersStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log }),
     suspended: null,
     staleManagerId: null,
   };
@@ -41,16 +43,24 @@ export function createCollab(state, { name, topic, targets, mode }) {
   }
   local.member.endpoints = Object.fromEntries(local.endpoints);
   state.collabs.set(ledger.collabId, local);
+  if (collabMode === 'forum') {
+    emitOwnMemberEvent(state, local, 'join');   // 发起人自创建即在成员表内（"第一个"，设计 §5.1）
+  }
   persistMember(state, local);
   persistLedger(state, local);
   const invited = [];
   for (const target of targets) {
-    const result = sendTo(state, ledger.collabId, target.instanceId, { address: target.address, port: target.port }, 'invite', invitePayloadOf(ledger));
+    const result = sendTo(state, ledger.collabId, target.instanceId, { address: target.address, port: target.port }, 'invite', invitePayloadOf(ledger, [], forumEndpointsOf(collabMode, local)));
     invited.push({ instanceId: target.instanceId, ok: result.ok === true, msgId: result.msgId, reason: result.reason });
     state.counters.invitesSent++;
   }
   state.counters.collabsCreated++;
   return { ok: true, collabId: ledger.collabId, invited };
+}
+
+/* 讨论邀请随带的端点表（设计 §5.1：现成员表与端点表——被邀者据此取得寻址信息）；managed 不带。 */
+function forumEndpointsOf(mode, local) {
+  return mode === 'forum' ? Object.fromEntries(local.endpoints) : null;
 }
 
 /* 新建台账（v1 proposed；名单 = 本机〔manager〕+ 各目标〔invited〕；模式创建时定死）。
@@ -76,10 +86,10 @@ function freshLedgerOf(state, name, topic, targets, mode) {
   };
 }
 
-/* 邀请成员加入既有的讨论（邀请入口的发送侧）：任何成员可发起是目标语义——本段落先把发起人
- * （本机为管理席位者）侧做通：邀请帧复用既有构造、对既有 collabId 发出、重复邀请幂等（本地
- * 成员表不由邀请动作改写——成员关系由加入事件推进）。成员侧邀请未就位：帧需随带讨论主题等
- * 元数据，成员侧当前无处可取（待加入回填落地）；在此之前明确拒绝并指引，不代发残缺帧。 */
+/* 邀请成员加入既有的讨论（邀请入口的发送侧）：**任何成员可发起**（平权，设计 §5.1）——
+ * 邀请帧复用既有构造、对既有 collabId 发出、重复邀请幂等（本地成员表不由邀请动作改写——
+ * 成员关系由加入事件推进）。名单与名额以**折叠成员表**为准（被拒/被撤回者不占名额）；
+ * 成员侧的主题等元数据取本地记录（邀请载荷/对表元状态写入的落点——成员侧无主题可取的缺口由此闭合）。 */
 export function inviteMembers(state, { collabId, targets }) {
   const local = state.collabs.get(collabId);
   if (local === undefined) {
@@ -91,23 +101,50 @@ export function inviteMembers(state, { collabId, targets }) {
   if (isLocalArchivedState(local)) {
     return { ok: false, message: '讨论已结束（或已终止 / 已退出）——不再受理邀请动作' };
   }
-  if (local.role !== 'manager') {
-    return { ok: false, message: '成员侧邀请随加入流程补齐——当前请由发起人邀请成员' };
+  if (!selfJoinedOf(local, state.self.instanceId)) {
+    return { ok: false, message: '本机尚未加入该讨论（等待邀请或先回应邀请）——加入为成员后才能邀请他人' };
   }
   const targetsRejection = targetsRejectionOf(targets, state.self.instanceId);
   if (targetsRejection !== null) {
     return { ok: false, message: targetsRejection };
   }
-  if (localRosterOf(local).length >= MAX_FORUM_MEMBERS) {
+  /* 上限检查点在放行/邀请步之前（设计 §5.6）；名额数据源 = 折叠成员表（含 invited 的旧名单口径
+   * 会让被拒者永久占用名额）。 */
+  if (foldedMembersOf(local).length >= MAX_FORUM_MEMBERS) {
     return { ok: false, message: `该讨论成员表已达上限（${MAX_FORUM_MEMBERS}）——不再发起新邀请` };
+  }
+  const topic = localTopicOf(local);
+  if (topic === null) {
+    return { ok: false, message: '本地记录缺讨论主题（等待对表拉回讨论元状态后重试）——不代发残缺帧' };
   }
   const invited = [];
   for (const target of targets) {
-    const result = sendTo(state, collabId, target.instanceId, { address: target.address, port: target.port }, 'invite', invitePayloadOf(local.ledger, targets));
+    const payload = forumInvitePayloadOf(state, local, topic, targets);
+    const result = sendTo(state, collabId, target.instanceId, { address: target.address, port: target.port }, 'invite', payload);
     invited.push({ instanceId: target.instanceId, ok: result.ok === true, msgId: result.msgId, reason: result.reason });
     state.counters.invitesSent++;
   }
   return { ok: true, collabId, invited };
+}
+
+/* 讨论邀请载荷（发送侧公共构造）：名/主题/模式 + **折叠成员表 ∪ 本次目标**（被邀者据此校验
+ * 名单含自己与来源）+ 现端点表。名单 2–32 由协议层照旧校验（折叠表 ≥2：本机 + 至少一个目标）。 */
+function forumInvitePayloadOf(state, local, topic, targets) {
+  const members = foldedMembersOf(local).map((member) => ({ instanceId: member.instanceId, identityName: member.identityName }));
+  const seen = new Set(members.map((member) => member.instanceId));
+  for (const target of targets) {
+    if (!seen.has(target.instanceId)) {
+      seen.add(target.instanceId);
+      members.push({ instanceId: target.instanceId, identityName: target.identityName });
+    }
+  }
+  return {
+    name: localNameOf(local),
+    topic,
+    mode: 'forum',
+    members,
+    endpoints: Object.fromEntries(local.endpoints),
+  };
 }
 
 export function approveInvite(state, { collabId, approve, reason }) {
@@ -126,15 +163,66 @@ export function approveInvite(state, { collabId, approve, reason }) {
   if (decided !== null) {
     return { ok: false, message: `已回应过（${decided}）——不能改口` };
   }
+  if (localModeOf(local) === 'forum') {
+    return decideForumInvite(state, local, wanted, reason);
+  }
   return sendDecision(state, local, approve, wanted, reason);
+}
+
+/* 讨论的邀请回应（设计 §5.1/§5.4）：同意 = 加入**立即生效**——本地转进行中、自播 join
+ * （携身份；端点经既有学习面散布）、未收敛前递增间隔重播；生效不依赖邀请者在场。
+ * approve/decline 帧仍发回邀请者作簿记（best-effort——端点未知不构成失败）。
+ * joined 标记供服务层在加入后驱动一轮回填对表（显式契约，不越模块边界）。 */
+function decideForumInvite(state, local, wanted, reason) {
+  const validated = validateDeclineReason(reason);
+  if (validated.ok !== true) {
+    return { ok: false, message: validated.message };
+  }
+  local.member.decision = wanted;
+  if (wanted === 'approved') {
+    local.member.state = 'active';
+    local.joinConfirmed = false;   // 新加入：未确认（重播/对表自愈的判据位）
+  }
+  persistMember(state, local);
+  if (wanted === 'approved') {
+    const event = emitOwnMemberEvent(state, local, 'join');
+    if (event !== null) {
+      state.counters.forumJoinsOut++;
+      startJoinReplay(state, local, event);
+    }
+  }
+  const bookkeeping = sendInviteBookkeeping(state, local, wanted, validated.reason);
+  state.counters.decisionsSent++;
+  return { ok: true, decision: wanted, joined: wanted === 'approved', bookkeeping };
+}
+
+/* 拒绝原因的服务层预校验（与 sendDecision 同一判据；空串归一为未给出）。 */
+function validateDeclineReason(reason) {
+  const trimmed = typeof reason === 'string' ? reason.trim() : '';
+  if (trimmed !== '' && !isPresentationText(trimmed, MAX_REASON_CHARS)) {
+    return { ok: false, message: `拒绝原因非法：需为 ≤${MAX_REASON_CHARS} 字符、不含换行 / 不可见字符的呈现文本` };
+  }
+  return { ok: true, reason: trimmed === '' ? undefined : trimmed };
+}
+
+/* 邀请回执的簿记面（approve / decline 发回邀请者；加入生效不依赖它）。 */
+function sendInviteBookkeeping(state, local, wanted, reason) {
+  const managerId = local.member.manager?.instanceId;
+  const endpoint = typeof managerId === 'string' ? local.endpoints.get(managerId) : undefined;
+  if (endpoint === undefined) {
+    return { delivered: false, reason: '邀请者端点未知（簿记帧未发出——加入 / 拒绝已本地生效）' };
+  }
+  const payload = wanted === 'approved' || reason === undefined ? {} : { reason };
+  const sent = sendTo(state, local.collabId, managerId, endpoint, wanted === 'approved' ? 'approve' : 'decline', payload);
+  return { delivered: sent.ok === true, msgId: sent.msgId, reason: sent.reason };
 }
 
 /* 决策发帧：先定格 decision（本地状态即真相），再入队；管理者端点未知给出明确指引。
  * 拒绝原因按协议呈现判据先行校验（超限 / 换行在入队侧会被拒——不得先定格、后静默失败）。 */
 function sendDecision(state, local, approve, wanted, reason) {
-  const trimmedReason = typeof reason === 'string' ? reason.trim() : '';
-  if (!approve && trimmedReason !== '' && !isPresentationText(trimmedReason, MAX_REASON_CHARS)) {
-    return { ok: false, message: `拒绝原因非法：需为 ≤${MAX_REASON_CHARS} 字符、不含换行 / 不可见字符的呈现文本` };
+  const validated = validateDeclineReason(approve ? undefined : reason);
+  if (validated.ok !== true) {
+    return { ok: false, message: validated.message };
   }
   const endpoint = local.endpoints.get(local.member.manager.instanceId);
   if (endpoint === undefined) {
@@ -142,7 +230,7 @@ function sendDecision(state, local, approve, wanted, reason) {
   }
   local.member.decision = wanted;
   persistMember(state, local);
-  const payload = approve || trimmedReason === '' ? {} : { reason: trimmedReason };
+  const payload = approve || validated.reason === undefined ? {} : { reason: validated.reason };
   const sent = sendTo(state, local.collabId, local.member.manager.instanceId, endpoint, approve ? 'approve' : 'decline', payload);
   state.counters.decisionsSent++;
   return { ok: true, decision: wanted, msgId: sent.msgId };
@@ -274,6 +362,10 @@ function sendForumPost(state, local, { text, type, to }) {
   if (isArchived(localStateOf(local))) {
     return { ok: false, message: '讨论已结束（或已终止）——不再接受新帖' };
   }
+  /* 发帖是成员行为：本机未加入（仅受邀）不发帖——发出去也无人收（扇出按折叠成员表）。 */
+  if (!selfJoinedOf(local, state.self.instanceId)) {
+    return { ok: false, message: '本机尚未加入该讨论（等待邀请或先回应邀请）——加入后才能发言' };
+  }
   const textRejection = textRejectionOf('reply', text);
   if (textRejection !== null) {
     return { ok: false, message: textRejection };
@@ -310,8 +402,8 @@ function allocateOwnPost(state, local, kind, text) {
   return post;
 }
 
-/* 直投扇出：对本地成员表逐成员直发一份（除本机；终态成员不投）——不走持久队列、
- * 无逐帖排队；端点未知者如实记「待对表收敛」，由对方周期拉取兜底。 */
+/* 直投扇出：对折叠成员表逐成员直发一份（除本机）——不走持久队列、无逐帖排队；
+ * 端点未知者如实记「待对表收敛」，由对方周期拉取兜底。 */
 function fanOutPost(state, local, post) {
   const results = [];
   for (const entry of forumRecipientsOf(state, local)) {
@@ -320,13 +412,10 @@ function fanOutPost(state, local, post) {
   return results;
 }
 
+/* 帖的收件人 = 折叠成员表（除本机）：被拒 / 被撤回 / 已退出者不收帖——成员语义的单一取数面
+ * （名单口径含 invited 的临时形态就此勘正——被拒/被撤回/已退出者不收帖）。 */
 function forumRecipientsOf(state, local) {
-  return localRosterOf(local).filter((entry) => {
-    if (entry.instanceId === state.self.instanceId) {
-      return false;
-    }
-    return entry.state === undefined || MESSAGING_MEMBER_STATES.includes(entry.state);
-  });
+  return foldedMembersOf(local).filter((entry) => entry.instanceId !== state.self.instanceId);
 }
 
 function deliverPostTo(state, local, instanceId, post) {
@@ -353,6 +442,10 @@ export function endCollab(state, { collabId }) {
   if (local === undefined || local.role !== 'manager') {
     return { ok: false, message: '只有管理席位可以结束协作' };
   }
+  /* 讨论的发起人退出即放弃结束权（设计 §6）：本机已退出该讨论 → end 不再受理（状态面）。 */
+  if (local.member.state === 'left') {
+    return { ok: false, message: '本机已退出该讨论——发起人退出即放弃结束权（讨论存续，结束不再受理）' };
+  }
   /* 挂起期明确拒绝（与 sendMessage 同一口径）：收敛等待中的结束会半执行——台账写被暂停守卫
    * 拦下，成员记录与通告却照发，产出「成员已归档、驿丞仍活跃」的僵尸协作。 */
   if (local.suspended !== null) {
@@ -372,20 +465,34 @@ export function endCollab(state, { collabId }) {
   local.member.state = 'completed';
   local.member.archivedAt = new Date().toISOString();
   persistMember(state, local);
+  stopJoinReplay(state, local);
+  broadcastCollabEnd(state, local, collabId);   // 双通道之一：在线广播（豁免 TTL/上限）
+  state.counters.ended++;
+  return { ok: true };
+}
+
+/* 结束广播（设计 §5.5 控制事件类；end 豁免 TTL/上限）：讨论经折叠成员表出口（端点未知者
+ * 跳过计数），managed 沿既有名册出口（仅端点已知者，快照与通告兜底可见性）。 */
+function broadcastCollabEnd(state, local, collabId) {
+  if (localModeOf(local) === 'forum') {
+    broadcastToForumMembers(state, local, 'end', {});
+    return;
+  }
   for (const instanceId of memberIdsOf(state, local)) {
     const endpoint = local.endpoints.get(instanceId);
     if (endpoint !== undefined) {
       sendTo(state, collabId, instanceId, endpoint, 'end', {});
     }
   }
-  state.counters.ended++;
-  return { ok: true };
 }
 
 export function leaveCollab(state, { collabId }) {
   const local = state.collabs.get(collabId);
   if (local === undefined) {
     return { ok: false, message: '本机没有该协作' };
+  }
+  if (localModeOf(local) === 'forum') {
+    return leaveForum(state, local);
   }
   if (local.role === 'manager') {
     return { ok: false, message: '管理席位不可退出——请先结束协作（显式交接属治理事项）' };
@@ -403,6 +510,26 @@ export function leaveCollab(state, { collabId }) {
   persistMember(state, local);
   state.counters.left++;
   return { ok: true, delivered: endpoint !== undefined };
+}
+
+/* 讨论退出（设计 §5.4/§6）：leave 事件照走（自播广播、豁免 TTL/上限）；**发起人同普通成员**
+ * ——退出即放弃结束权（本批无中继，即放弃结束权；本机归档后 end 调用被拒属状态面，
+ * 工具面守卫随后续任务收口）。退出后讨论存续；本机归档，不再对表与重播。 */
+function leaveForum(state, local) {
+  if (isLocalArchivedState(local)) {
+    return { ok: false, message: '讨论已结束（或已退出）' };
+  }
+  stopJoinReplay(state, local);
+  const event = emitOwnMemberEvent(state, local, 'leave');
+  if (event !== null) {
+    state.counters.forumLeavesOut++;
+  }
+  const delivered = event === null ? 0 : broadcastMemberEvent(state, local, 'leave', event);
+  local.member.state = 'left';
+  local.member.archivedAt = new Date().toISOString();
+  persistMember(state, local);
+  state.counters.left++;
+  return { ok: true, delivered, eventId: event?.eventId ?? null };
 }
 
 export async function viewLedger(state, { collabId }) {
@@ -433,8 +560,8 @@ export async function viewLedger(state, { collabId }) {
   return { ok: false, message: archived ? '协作已归档且本机无可用快照' : '管理者离线且本机无快照——没有可读台账' };
 }
 
-/* 讨论的本地合并视图（设计 §7 工具面）：本地帖子列表（显示序）+ 成员表 + 端点——标注
- * 「本地视图，未与全员核对」（收敛由各节点周期对表推进，本机副本可能暂时落后）；
+/* 讨论的本地合并视图（设计 §7 工具面）：本地帖子列表（显示序）+ 折叠成员表 + 端点 + 主题——
+ * 标注「本地视图，未与全员核对」（收敛由各节点周期对表推进，本机副本可能暂时落后）；
  * 不向任何成员拉取（拉取机制属对表链路）。 */
 function forumViewOf(local) {
   return {
@@ -444,8 +571,9 @@ function forumViewOf(local) {
     archived: isLocalArchivedState(local),
     note: '本地视图，未与全员核对——收敛由各节点周期对表推进，本机副本可能暂时落后',
     name: localNameOf(local),
+    topic: localTopicOf(local),
     state: localStateOf(local),
-    members: localRosterOf(local).map((entry) => ({ instanceId: entry.instanceId, identityName: entry.identityName })),
+    members: foldedMembersOf(local),
     endpoints: Object.fromEntries(local.endpoints),
     posts: displayOrderOf(local.posts.entries()),
   };
@@ -488,7 +616,8 @@ function dropSnapshotWaiter(state, collabId, waiter) {
 /* 台账变更的统一入口（单写者纪律）：打补丁 → version 自增 → updatedAt → 落盘 → 推快照。
  * 补丁函数直接改写台账字段（调用方可借闭包引用名单条目）；推快照失败不影响本地状态。
  * 暂停守卫：本机进入收敛等待（在途抢接 / 未对表）时拒绝一切非治理写——治理动作（冻结 / 解冻 /
- * 裁定执行 / 席位恢复）经 options.governance 放行：收敛本身依赖这些写入，暂停不得阻断收敛。 */
+ * 裁定执行 / 席位恢复）经 options.governance 放行：收敛本身依赖这些写入，暂停不得阻断收敛。
+ * 讨论实例不推快照（设计 §5.5 讨论内 snapshot 弃用；成员状态经 bundle 元状态与事件集收敛）。 */
 export function mutateLedger(state, local, apply, options = {}) {
   if (local.suspended !== null && options.governance !== true) {
     state.counters.mutationSuspended++;
@@ -500,7 +629,9 @@ export function mutateLedger(state, local, apply, options = {}) {
   local.ledger.updatedAt = new Date().toISOString();
   persistLedger(state, local);
   state.counters.ledgerMutations++;
-  pushSnapshot(state, local);
+  if (localModeOf(local) !== 'forum') {
+    pushSnapshot(state, local);
+  }
   return local.ledger;
 }
 
@@ -586,6 +717,105 @@ export function sendToRoster(state, local, type, payload, options = {}) {
     }
   }
   return sent;
+}
+
+/* —— 讨论的成员事件广播与 join 未收敛重播 —— */
+
+/* 成员事件广播（join / leave；设计 §5.4）：发给折叠成员表（除本机）中端点已知者——
+ * 未收敛时另经发起人引用补达（成员刚加入、对端事件尚未拉回）与应用层广播豁免（豁免 TTL/上限）。 */
+export function broadcastMemberEvent(state, local, type, event) {
+  return broadcastToForumMembers(state, local, type, { eventId: event.eventId, ts: event.ts });
+}
+
+/* 讨论控制事件广播出口（join / leave / end 共用）：折叠成员表 ∪ 本机记录的发起人引用。 */
+export function broadcastToForumMembers(state, local, type, payload) {
+  let sent = 0;
+  for (const instanceId of forumBroadcastTargets(state, local)) {
+    const endpoint = endpointFor(state, local, instanceId);
+    if (endpoint === undefined) {
+      state.counters.forumBroadcastSkipped++;
+      continue;
+    }
+    const result = sendTo(state, local.collabId, instanceId, endpoint, type, payload);
+    if (result.ok === true) {
+      sent++;
+    }
+  }
+  return sent;
+}
+
+function forumBroadcastTargets(state, local) {
+  const ids = new Set();
+  for (const member of foldedMembersOf(local)) {
+    ids.add(member.instanceId);
+  }
+  if (local.role === 'member' && typeof local.member?.manager?.instanceId === 'string') {
+    ids.add(local.member.manager.instanceId);
+  }
+  ids.delete(state.self.instanceId);
+  return [...ids];
+}
+
+/* join 未收敛重播（设计 §5.4 防幽灵成员）：同一事件原样重发（事件 id 幂等并集吸收）、
+ * 递增间隔有界（每轮至多 intervals.length 次）；确认（对表拉回的成员表含自己）或退出即停，
+ * 每轮对表若仍未收敛则由收敛判定重新起一轮。 */
+export function startJoinReplay(state, local, event) {
+  if (state.joinReplays.has(local.collabId)) {
+    return false;   // 一轮在跑：不叠加（防风暴）
+  }
+  state.joinReplays.set(local.collabId, { timer: null, attempts: 0 });
+  state.counters.joinReplays++;
+  broadcastMemberEvent(state, local, 'join', event);
+  scheduleJoinReplayStep(state, local, event, 0);
+  return true;
+}
+
+function scheduleJoinReplayStep(state, local, event, step) {
+  const intervals = state.joinReplayIntervalsMs;
+  if (step >= intervals.length) {
+    state.joinReplays.delete(local.collabId);
+    return;
+  }
+  const timer = setTimeout(() => {
+    const held = state.joinReplays.get(local.collabId);
+    if (held === undefined || held.timer !== timer) {
+      return;
+    }
+    held.timer = null;
+    held.attempts = step + 1;
+    state.counters.joinReplays++;
+    broadcastMemberEvent(state, local, 'join', event);
+    scheduleJoinReplayStep(state, local, event, step + 1);
+  }, intervals[step]);
+  if (typeof timer.unref === 'function') {
+    timer.unref();
+  }
+  const held = state.joinReplays.get(local.collabId);
+  if (held !== undefined) {
+    held.timer = timer;
+  }
+}
+
+/* 重播停止（已收敛 / 退出 / 结束 / 服务关闭）：清除挂起定时器。 */
+export function stopJoinReplay(state, local) {
+  const held = state.joinReplays.get(local.collabId);
+  if (held === undefined) {
+    return false;
+  }
+  if (held.timer !== null) {
+    clearTimeout(held.timer);
+  }
+  state.joinReplays.delete(local.collabId);
+  return true;
+}
+
+export function stopJoinReplays(state) {
+  for (const held of state.joinReplays.values()) {
+    if (held.timer !== null) {
+      clearTimeout(held.timer);
+    }
+  }
+  state.joinReplays.clear();
 }
 
 /* 治理转达目标集：名册中全部端点可寻址的参与者（除本机与来源由 relayGovernance 过滤）；
@@ -944,13 +1174,15 @@ function payloadOf(type, text) {
   return { text };
 }
 
-/* 管理席位记录（含移交受让与接管恢复的构造面）：roster = 台账定格名单，endpoints 由调用方补。 */
+/* 管理席位记录（含移交受让与接管恢复的构造面）：roster = 台账定格名单，endpoints 由调用方补。
+ * topic 随记录定格（讨论成员侧发起邀请的取数面；managed 记录同样携带——形态无差别）。 */
 export function managerRecordOf(ledger) {
   return {
     collabId: ledger.collabId,
     role: 'manager',
     state: ledger.status,
     name: ledger.name,
+    topic: ledger.topic,
     mode: ledger.mode ?? DEFAULT_COLLAB_MODE,
     manager: { instanceId: ledger.manager.instanceId, identityName: ledger.manager.identityName },
     roster: ledger.members.map((member) => ({ instanceId: member.instanceId, identityName: member.identityName })),
@@ -967,6 +1199,7 @@ function memberRecordOf(local, managerPeer) {
     role: 'member',
     state: memberStateFor(status),
     name: localNameOf(local),
+    topic: localTopicOf(local) ?? undefined,
     mode: localModeOf(local),
     manager: { instanceId: managerPeer.instanceId, identityName: managerPeer.identityName },
     roster: localRosterOf(local).map((entry) => ({ instanceId: entry.instanceId, identityName: entry.identityName })),
@@ -981,8 +1214,14 @@ function memberRecordOf(local, managerPeer) {
 
 /* 邀请帧的载荷构造（创建邀请与既有协作的增邀共用）：随带模式（被邀者据此按模式建记录；
  * 缺省 managed = 旧行为）。extraMembers = 尚未进本地名单的本次被邀目标——被邀方须能在名单中
- * 看到自己与邀请者（接收侧名单校验），按实例标识去重（协议层拒绝重复名单）。 */
-export function invitePayloadOf(ledger, extraMembers = []) {
+ * 看到自己与邀请者（接收侧名单校验），按实例标识去重（协议层拒绝重复名单）。
+ * endpoints（可选，讨论携带）：现成员端点表 → 被邀者据此取得入群寻址信息。 */
+/**
+ * @param {any} ledger
+ * @param {any[]} [extraMembers]
+ * @param {Record<string, { address: string, port: number }> | null} [endpoints]
+ */
+export function invitePayloadOf(ledger, extraMembers = [], endpoints = null) {
   const seen = new Set(ledger.members.map((member) => member.instanceId));
   const members = ledger.members.map((member) => ({ instanceId: member.instanceId, identityName: member.identityName }));
   for (const extra of extraMembers) {
@@ -991,12 +1230,16 @@ export function invitePayloadOf(ledger, extraMembers = []) {
       members.push({ instanceId: extra.instanceId, identityName: extra.identityName });
     }
   }
-  return {
+  const payload = {
     name: ledger.name,
     topic: ledger.topic,
     mode: ledger.mode ?? DEFAULT_COLLAB_MODE,
     members,
   };
+  if (endpoints !== null) {
+    payload.endpoints = endpoints;
+  }
+  return payload;
 }
 
 function withdrawOne(state, local, targetId) {

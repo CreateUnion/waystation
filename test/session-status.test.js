@@ -266,7 +266,8 @@ test('进程级：讨论参与随模式标签进入会话状态文件（缺 mode
   const byId = Object.fromEntries(payload.collabs.map((entry) => [entry.collabId, entry]));
   assert.equal(byId['collab-forum-fx'].mode, 'forum', '讨论条目带模式标签');
   assert.equal(byId['collab-forum-fx'].state, 'proposed');
-  assert.equal(byId['collab-forum-fx'].memberCount, 2);
+  /* 讨论的成员数 = 折叠成员表（成员事件并集折叠）——夹具只有名单、没有成员事件 → 0 人。 */
+  assert.equal(byId['collab-forum-fx'].memberCount, 0);
   assert.equal(byId['collab-legacy-fx'].mode, 'managed', '缺 mode 的旧记录按 managed 解释');
   child.stdin.end();
   const exit = await new Promise((resolve) => {
