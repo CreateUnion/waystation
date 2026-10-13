@@ -494,6 +494,9 @@ test('⑧端点就绪检查：发起人标识已学、端点未知 → 降级直
   assert.ok(noEndpoint.note.includes('中继端点未知'), noEndpoint.note);
   assert.equal(madeE.service.stats().relayEndpointUnknown, 1);
   assert.equal(madeE.service.stats().relayDegradedPosts, 1);
+  /* 恢复检测不误判：端点仍未知 → 无从探测，保持降级（不得凭空中继路径）。 */
+  await syncWhenIdle(madeE.service, lonelyId);
+  assert.equal(madeE.service.stats().relayRecoveries, 0, '端点未知无从探测——保持降级');
 });
 
 test('生命周期：发起人退出（leave）= 永久放弃中继职责——成员转常态直投兜底（非探测失败）', async (t) => {
