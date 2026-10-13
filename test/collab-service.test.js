@@ -1133,6 +1133,17 @@ test('ws_invite：16 软约束（邀请侧，数据源=折叠成员表）——1
   await receive(roomy.service, collabFrame('decline', roomyId, peer(fifteen[14].instanceId, fifteen[14].identityName), {}));
   assert.equal(roomy.service.list().collabs[0].memberCount, 15, '被拒者不占名额（旧名单口径此处为 16）');
   assert.equal((await roomy.service.invite({ collabId: roomyId, targets: [targetOf('y')] })).ok, true, '被拒者不占名额后仍可邀请');
+
+  /* 合并不设限：16 人表上第 17 个 join 事件照并入（上限是邀请侧软约束、不是合并侧闸门——并发补位可暂到 17）。 */
+  const capped = makeService(t);
+  const cappedId = createForum(capped.service, { targets: fifteen });
+  for (const target of fifteen) {
+    await receiveJoin(capped.service, cappedId, peer(target.instanceId, target.identityName));
+  }
+  assert.equal(capped.service.list().collabs[0].memberCount, 16);
+  const extra = await receiveJoin(capped.service, cappedId, peer('inst-x', '主机X'));
+  assert.equal(extra.admitted.ok, true, '第 17 个 join 照受理（软约束不设合并闸门）');
+  assert.equal(capped.service.list().collabs[0].memberCount, 17, '并发补位暂 17 允许（设计 §9 已披露边界）');
 });
 
 test('ws_invite：managed / 未知 / 归档 / 未加入 / 目标形态一律明确拒绝并指引', async (t) => {
