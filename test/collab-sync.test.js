@@ -32,10 +32,10 @@ function makeService(t, overrides = {}) {
     dataDir: dir,
     config,
     self,
-    send: (message) => {
+    send: overrides.send ?? ((message) => {
       sent.push(message);
       return { ok: true, msgId: `q-${sent.length}` };
-    },
+    }),
     sendDirect: overrides.sendDirect ?? ((message) => {
       direct.push(message);
       return { ok: true, msgId: `d-${direct.length}` };
@@ -675,4 +675,87 @@ test('成员事件时刻的跨重启单调基线：落盘基线恢复，回拨�
   const leaveEvent = events.find((event) => event.kind === 'leave');
   assert.ok(leaveEvent !== undefined, 'leave 事件落盘');
   assert.equal(Date.parse(leaveEvent.ts), Date.parse(postFuture) + 1, '取 max(帖子基线 + 1ms, 事件基线 + 1ms, now)');
+});
+
+/* —— 邀请随带的端点表：群体可达面（邀请者离线不孤立新人） —— */
+
+const SELF_C = { instanceId: 'inst-c', identityName: '主机丙', port: 17323 };
+
+function inviteTo(sent, collabId, instanceId) {
+  return sentOf(sent, 'invite', collabId).find((message) => message.to.instanceId === instanceId);
+}
+
+/* 起一轮对表并取本轮结论：同意即回填（加入后的驱动）可能已有一轮在途——同一实例同时只跑一轮，
+ * 在途期间起的轮次会被拒（already-running）；等待其收尾后重试到本轮真正跑起来。 */
+async function syncWhenIdle(service, collabId) {
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const outcome = await awaitSync(service.sync({ collabId }));
+    if (outcome.reason !== 'already-running') {
+      return outcome;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return { ok: false, reason: '在途轮次始终未收尾' };
+}
+
+/* 「邀请者离线」场景装配：A = 发起人（发帧不进虚拟线——直投无目标、入队帧不送达）；C = 先应答
+ * 加入的成员；B = 新人（其广播与直投都在线上即时送达）。返回时 B 已收妥 A 的邀请、C 已持两帖、
+ * A 不再可达；B 尚未同意（判别在同意之后）。 */
+async function makeOfflineInviterScene(t) {
+  const wire = makeWire();
+  const madeA = makeService(t, { self: SELF_A });
+  const madeC = makeService(t, { self: SELF_C, sendDirect: wire.sendDirectFor(SELF_C) });
+  wire.register(SELF_C, madeC.service);
+  const madeB = makeService(t, {
+    self: SELF_B,
+    send: (message) => wire.sendDirectFor(SELF_B)(message),
+    sendDirect: wire.sendDirectFor(SELF_B),
+    syncPeerPicker: () => [SELF_C.instanceId],
+  });
+  wire.register(SELF_B, madeB.service);
+  const collabId = madeA.service.create({ name: '讨论甲', topic: '议题', mode: 'forum', targets: [{ instanceId: SELF_C.instanceId, identityName: SELF_C.identityName, address: '127.0.0.3', port: SELF_C.port }] }).collabId;
+  await wire.hop(madeC.service, inviteTo(madeA.sent, collabId, SELF_C.instanceId), SELF_A);
+  assert.equal((await madeC.service.approve({ collabId, approve: true })).ok, true);
+  await wire.hop(madeA.service, sentOf(madeC.sent, 'join', collabId)[0], SELF_C);   // A 学到 C 的端点
+  await madeC.service.send({ collabId, text: '丙的第一帖' });
+  await madeC.service.send({ collabId, text: '丙的第二帖' });
+  const invited = await madeA.service.invite({ collabId, targets: [{ instanceId: SELF_B.instanceId, identityName: SELF_B.identityName, address: '127.0.0.2', port: SELF_B.port }] });
+  assert.equal(invited.ok, true, invited.message);
+  const inviteToB = inviteTo(madeA.sent, collabId, SELF_B.instanceId);
+  assert.deepEqual(Object.keys(inviteToB.payload.endpoints), [SELF_C.instanceId], '邀请随带现端点表（设计 §5.1 寻址信息）');
+  await wire.hop(madeB.service, inviteToB, SELF_A);
+  return { madeB, madeC, collabId };
+}
+
+test('邀请者离线：新人 join 直达第三成员、经其回填（邀请端点表为群体可达面）', async (t) => {
+  const { madeB, madeC, collabId } = await makeOfflineInviterScene(t);
+  const joined = await madeB.service.approve({ collabId, approve: true });
+  assert.equal(joined.joined, true, joined.message);
+  /* 判别点（旧行为必红）：B 的 join 自播直达 C（旧行为只联系邀请者 A——C 永远不知道 B）。 */
+  await waitFor(async () => {
+    const members = viewMembers(await madeC.service.view({ collabId }));
+    return members.includes(SELF_B.instanceId) ? true : null;
+  });
+  /* B 向在场成员 C 发起对表（A 离线无应答）：C 应答并供历史——B 完成回填。 */
+  const outcome = await syncWhenIdle(madeB.service, collabId);
+  assert.equal(outcome.ok, true, JSON.stringify(outcome));
+  assert.equal(outcome.sourceId, SELF_C.instanceId, '经第三成员回填（不依赖邀请者）');
+  const view = await madeB.service.view({ collabId });
+  assert.deepEqual(view.posts.map((entry) => entry.text), ['丙的第一帖', '丙的第二帖'], '新人回填全部历史');
+  /* 成员表 = 事件集并集：B 学到 C 的 join 事件；发起人 A 的 join 事件随 A 的应答/对表收敛——
+   * A 离线期间不在任何在场者的表内，属收敛的正常中间态（A 回归即并集补齐）。 */
+  assert.deepEqual(viewMembers(view), [SELF_B.instanceId, SELF_C.instanceId], '经对表学到第三成员');
+});
+
+test('重复邀请换人：邀请者引用随最新邀请更新（拒绝后重邀，approve 回执发向新邀请者）', async (t) => {
+  const made = makeService(t);
+  const selfPeer = peer('inst-self', '本机', 17321);
+  await receive(made.service, inviteFrame({ collabId: 'collab-r1', mode: 'forum', manager: peer('inst-a', '主机甲', 17321), members: [peer('inst-a', '主机甲', 17321), selfPeer] }));
+  assert.equal((await made.service.approve({ collabId: 'collab-r1', approve: false, reason: '本轮不参加' })).ok, true);
+  await receive(made.service, inviteFrame({ collabId: 'collab-r1', mode: 'forum', manager: peer('inst-c', '主机丙', 17323), members: [peer('inst-a', '主机甲', 17321), peer('inst-c', '主机丙', 17323), selfPeer] }));
+  const rejoined = await made.service.approve({ collabId: 'collab-r1', approve: true });
+  assert.equal(rejoined.joined, true, rejoined.message);
+  const bookkeeping = sentOf(made.sent, 'approve', 'collab-r1');
+  assert.equal(bookkeeping.length, 1, 'approve 簿记发出');
+  assert.equal(bookkeeping[0].to.instanceId, 'inst-c', '簿记发向最新邀请者（重入者的邀请者引用随最新邀请更新）');
 });

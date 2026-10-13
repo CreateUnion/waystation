@@ -1,6 +1,6 @@
 import { POST_KINDS } from '../net/protocol.js';
 import { CONFLICT_STATES, INVITE_THROTTLE_TABLE_MAX, MAX_PENDING_INVITES } from './model.js';
-import { isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf } from './local.js';
+import { forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf } from './local.js';
 
 /* 入站门控（admit 决策）：invite 与「冲突裁定族」（freeze / unfreeze / decision）不按 collabId
  * 已知性判定（首个接触点 / 跨协作匹配——裁定帧的 collabId 是执行方那条，须按名匹配）；
@@ -83,13 +83,15 @@ function admitForumChannel(state, local, frame, meta) {
     return { ok: true };
   }
   if (frame.type === 'history-bundle') {
-    /* 应答准入：折叠成员表，或本机记录的发起人引用——新人首次回填窗口里，应答方（邀请者）
-     * 的 join 事件尚未随对表拉回，但它是合法成员（发起人自创建即在表内）。 */
-    if (isMemberOrInviter(local, frame.from.instanceId)) {
+    /* 应答准入：本机的群体可达面内（折叠成员表 ∪ 邀请者引用 ∪ 端点表已知者——与对表候选、
+     * 控制事件广播同一取数面）。新人首次回填窗口里，应答方可能既不在本机折叠成员表内
+     * （对端事件尚未随对表拉回）、也不是邀请者：邀请随带的端点表（设计 §5.1 寻址信息）即
+     * 「应答方是合法成员」的依据。请求侧准入不放宽（请求方须在折叠成员表内，见下）。 */
+    if (forumReachIdsOf(local, state.self.instanceId).includes(frame.from.instanceId)) {
       return { ok: true };
     }
     state.counters.syncRequestsRejected++;
-    return { ok: false, reason: '拉取应答方既不在本机折叠成员表内、也不是本机记录的邀请者（拒绝并计数）' };
+    return { ok: false, reason: '拉取应答方不在本机的可达成员面内（折叠成员表 / 邀请者引用 / 端点表——拒绝并计数）' };
   }
   if (!local.members.includes(frame.from.instanceId)) {
     state.counters.syncRequestsRejected++;
@@ -101,13 +103,6 @@ function admitForumChannel(state, local, frame, meta) {
     return { ok: false, reason: '拉取请求过于频繁（同源限频）' };
   }
   return { ok: true };
-}
-
-function isMemberOrInviter(local, instanceId) {
-  if (local.members.includes(instanceId)) {
-    return true;
-  }
-  return local.role === 'member' && local.member?.manager?.instanceId === instanceId;
 }
 
 /* 同源请求频次判定：窗口内已达上限 → 拒绝（请求方按「无应答」换源或下轮对表）；

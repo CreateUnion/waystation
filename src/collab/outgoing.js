@@ -4,7 +4,7 @@ import { MAX_FORUM_MEMBERS, MAX_LOCAL_COLLABS, canTransition, isArchived, newCol
 import { createPostsStore, displayOrderOf, newPostId } from './posts.js';
 import { createMembersStore } from './members.js';
 import { ledgerDigest, removeLedgerFile } from './store.js';
-import { currentManagerIdOf, emitOwnMemberEvent, foldedMembersOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, localTopicOf, memberStateFor, persistLedger, persistMember, persistSnapshot, rememberKnownHost, selfJoinedOf } from './local.js';
+import { currentManagerIdOf, emitOwnMemberEvent, foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, localTopicOf, memberStateFor, persistLedger, persistMember, persistSnapshot, rememberKnownHost, selfJoinedOf } from './local.js';
 import { matchConflictCollabs } from './gate.js';
 
 /* 对外操作与协作态变更实现（服务公共 API 的落点）：请求来自本机会话（工具面）——
@@ -721,16 +721,18 @@ export function sendToRoster(state, local, type, payload, options = {}) {
 
 /* —— 讨论的成员事件广播与 join 未收敛重播 —— */
 
-/* 成员事件广播（join / leave；设计 §5.4）：发给折叠成员表（除本机）中端点已知者——
- * 未收敛时另经发起人引用补达（成员刚加入、对端事件尚未拉回）与应用层广播豁免（豁免 TTL/上限）。 */
+/* 成员事件广播（join / leave；设计 §5.4）：发给群体可达面（折叠成员表 ∪ 邀请者引用 ∪
+ * 端点表已知者）中端点已知者与应用层广播豁免（豁免 TTL/上限）。 */
 export function broadcastMemberEvent(state, local, type, event) {
   return broadcastToForumMembers(state, local, type, { eventId: event.eventId, ts: event.ts });
 }
 
-/* 讨论控制事件广播出口（join / leave / end 共用）：折叠成员表 ∪ 本机记录的发起人引用。 */
+/* 讨论控制事件广播出口（join / leave / end 共用）：群体可达面（折叠成员表 ∪ 邀请者引用 ∪
+ * 端点表已知者，见 local.forumReachIdsOf）——新成员刚加入时折叠表只有自己，只发邀请者会让
+ * 邀请者离线即隔离新人（设计 §5.1「被邀者据此取得入群所需的成员与寻址信息」的落点）。 */
 export function broadcastToForumMembers(state, local, type, payload) {
   let sent = 0;
-  for (const instanceId of forumBroadcastTargets(state, local)) {
+  for (const instanceId of forumReachIdsOf(local, state.self.instanceId)) {
     const endpoint = endpointFor(state, local, instanceId);
     if (endpoint === undefined) {
       state.counters.forumBroadcastSkipped++;
@@ -742,18 +744,6 @@ export function broadcastToForumMembers(state, local, type, payload) {
     }
   }
   return sent;
-}
-
-function forumBroadcastTargets(state, local) {
-  const ids = new Set();
-  for (const member of foldedMembersOf(local)) {
-    ids.add(member.instanceId);
-  }
-  if (local.role === 'member' && typeof local.member?.manager?.instanceId === 'string') {
-    ids.add(local.member.manager.instanceId);
-  }
-  ids.delete(state.self.instanceId);
-  return [...ids];
 }
 
 /* join 未收敛重播（设计 §5.4 防幽灵成员）：同一事件原样重发（事件 id 幂等并集吸收）、

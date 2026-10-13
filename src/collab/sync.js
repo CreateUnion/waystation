@@ -1,6 +1,6 @@
 import { MAX_FRAME_BYTES } from '../net/protocol.js';
 import { isPostEntryShape, displayOrderOf } from './posts.js';
-import { foldedMembersOf, isLocalArchivedState, localModeOf, localNameOf, persistMember } from './local.js';
+import { foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, persistMember } from './local.js';
 import { applyEndpoint, endpointFor, mutateLedger, notifyLocal, startJoinReplay, stopJoinReplay, stopJoinReplays } from './outgoing.js';
 import { foldMemberEvents } from './members.js';
 
@@ -119,24 +119,17 @@ function nudgeJoinReplay(state, local) {
   }
 }
 
-/* 候选对端：折叠成员表（除本机）∪ 成员侧记录的发起人引用（刚加入、对端事件尚未拉回时的补面）；
- * 只保留端点已知者（可达性近似——端点未知者由对方主动联系或后续对表补学）。 */
+/* 候选对端：群体可达面（折叠成员表 ∪ 邀请者引用 ∪ 端点表已知者，见 local.forumReachIdsOf）——
+ * 设计 §5.3「向任一在场成员发 history-request」的落点：新成员在折叠表未收敛、对端事件未拉回时
+ * 仍能按邀请随带的端点表发起对表；只保留端点已知者（可达性近似——端点未知者由对方主动联系或
+ * 后续对表补学）。options.sources 为定向回拉（应答后的补面），不扩面。 */
 function syncCandidatesOf(state, local, options) {
-  const ids = new Set();
   if (Array.isArray(options.sources)) {
-    for (const id of options.sources) {
-      ids.add(id);
-    }
-  } else {
-    for (const member of foldedMembersOf(local)) {
-      ids.add(member.instanceId);
-    }
-    if (local.role === 'member' && typeof local.member?.manager?.instanceId === 'string') {
-      ids.add(local.member.manager.instanceId);
-    }
+    const ids = new Set(options.sources);
+    ids.delete(state.self.instanceId);
+    return [...ids].filter((id) => endpointFor(state, local, id) !== undefined);
   }
-  ids.delete(state.self.instanceId);
-  return [...ids].filter((id) => endpointFor(state, local, id) !== undefined);
+  return forumReachIdsOf(local, state.self.instanceId).filter((id) => endpointFor(state, local, id) !== undefined);
 }
 
 /* 对端序：默认按候选稳定序轮换（避免固定单一对端造成「洞持有者互不碰面」的漏检）；

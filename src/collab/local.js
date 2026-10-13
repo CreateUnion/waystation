@@ -45,6 +45,27 @@ export function foldedMembersOf(local) {
   return local.members.fold();
 }
 
+/* 讨论的群体可达面（控制事件广播 / 对表候选 / 拉取应答准入的共用成员集）：
+ * 折叠成员表 ∪ 邀请者引用 ∪ 端点表已知者（除本机）。
+ * 端点表是邀请随带的寻址信息的落点（设计 §5.1「被邀者据此取得入群所需的成员与寻址信息」）——
+ * 新成员刚加入时折叠表只有自己，可达面若只到邀请者，邀请者离线即把成员钉成孤点：join 达不到
+ * 其余成员、回填无从发起、对全员不可见；端点表已知者即从邀请面可寻址的成员/受邀者，
+ * 端点未知者由对方主动联系或后续对表补学（跳过不阻塞其余目标）。 */
+export function forumReachIdsOf(local, selfId) {
+  const ids = new Set();
+  for (const member of local.members.fold()) {
+    ids.add(member.instanceId);
+  }
+  if (local.role === 'member' && typeof local.member?.manager?.instanceId === 'string') {
+    ids.add(local.member.manager.instanceId);
+  }
+  for (const instanceId of local.endpoints.keys()) {
+    ids.add(instanceId);
+  }
+  ids.delete(selfId);
+  return [...ids];
+}
+
 /* 本机是否已在折叠成员表内（讨论的「已加入」判据：发帖与发 join 重播的前置）。 */
 export function selfJoinedOf(local, selfId) {
   return local.members.includes(selfId);

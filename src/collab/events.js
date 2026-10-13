@@ -157,6 +157,9 @@ function receiveRepeatInvite(state, existing, frame, meta) {
   existing.member.expiresAt = new Date(Date.parse(now) + state.config.inviteTtlMs).toISOString();
   existing.member.roster = inviteRosterOf(frame);
   existing.member.topic = frame.payload.topic;
+  /* 邀请者引用随最新邀请定格（换人二次邀请的重入者）：join 广播、对表候选与 approve/decline
+   * 簿记都以它为准——旧引用指向已退出/长期离线的邀请者时，重入者会再次被孤立。 */
+  existing.member.manager = { instanceId: frame.from.instanceId, identityName: frame.from.identityName };
   delete existing.member.archivedAt;
   persistMember(state, existing);
 }
