@@ -1,5 +1,6 @@
 import { listLocalCollabIds, loadLedger, loadMember, loadSnapshot, quarantineLedger } from './store.js';
 import { isArchived, withDefaultMode } from './model.js';
+import { createPostsStore } from './posts.js';
 import { decideAdmission } from './gate.js';
 import { handleEvent } from './events.js';
 import { localModeOf, localNameOf, localRosterOf, localStateOf, persistLedger } from './local.js';
@@ -22,6 +23,7 @@ const INVITE_MIN_INTERVAL_MS = 1000;
  *   probe?: ((address: string, port: number) => Promise<{ reachable: boolean, rttMs?: number, reason?: string }>) | null,
  *   reassign?: ((payload: object) => { ok: boolean, moved?: number, reason?: string }) | null,
  *   notify?: ((frame: object) => unknown) | null,
+ *   sendDirect?: ((message: object) => { ok: boolean, msgId?: string, tier?: string, reason?: string }) | null,
  *   ledgerFetchTimeoutMs?: number, inviteMinIntervalMs?: number, takeoverProbeIntervalMs?: number,
  *   handshakeReplyTimeoutMs?: number, handoverConfirmTimeoutMs?: number }} options
  */
@@ -34,7 +36,7 @@ export function createCollabService(options) {
 function buildState(options) {
   const {
     dataDir, config, self, send, knownHosts, log,
-    probe = null, reassign = null, notify = null,
+    probe = null, reassign = null, notify = null, sendDirect = null,
     ledgerFetchTimeoutMs = LEDGER_FETCH_TIMEOUT_MS,
     inviteMinIntervalMs = INVITE_MIN_INTERVAL_MS,
     takeoverProbeIntervalMs = TAKEOVER_PROBE_INTERVAL_MS,
@@ -46,6 +48,7 @@ function buildState(options) {
     config,
     self,
     send,
+    sendDirect,
     knownHosts,
     log,
     probe,
@@ -168,6 +171,7 @@ function loadOne(state, collabId) {
     member,
     endpoints: new Map(Object.entries(member.endpoints)),
     snapshot: loadSnapshot(state.dataDir, collabId),
+    posts: createPostsStore({ dataDir: state.dataDir, collabId, log: state.log }),
     suspended: null,
     staleManagerId: null,
   };
@@ -346,6 +350,11 @@ function emptyFlowCounters() {
     progressIn: 0,
     noticesIn: 0,
     eventMismatch: 0,
+    postsSent: 0,
+    postsIn: 0,
+    postsDuplicated: 0,
+    postRejected: 0,
+    postFanoutSkipped: 0,
   };
 }
 

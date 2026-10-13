@@ -1,5 +1,6 @@
 import { DEFAULT_COLLAB_MODE, isPort } from '../net/protocol.js';
 import { MAX_BOARD_ENTRIES, isSnapshotShape } from './model.js';
+import { createPostsStore } from './posts.js';
 import { ledgerDigest } from './store.js';
 import { isLocalArchivedState, localModeOf, persistMember, persistSnapshot, rememberKnownHost } from './local.js';
 import { matchConflictCollabs, noteForumGovernanceIgnored } from './gate.js';
@@ -23,6 +24,7 @@ const EVENT_HANDLERS = {
   progress: handleProgress,
   freeze: handleFreeze,
   snapshot: handleSnapshot,
+  post: handlePost,
   end: handleEnd,
   leave: handleLeave,
   'takeover-init': handleTakeoverInit,
@@ -105,6 +107,7 @@ function handleInvite(state, frame, meta) {
     member,
     endpoints: new Map(),
     snapshot: null,
+    posts: createPostsStore({ dataDir: state.dataDir, collabId: frame.collabId, log: state.log }),
     suspended: null,
     staleManagerId: null,
   };
@@ -388,6 +391,31 @@ function handleProgress(state, frame) {
     }
   });
   state.counters.progressIn++;
+}
+
+/* 帖到达（讨论实例；准入已判模式与词表）：按（作者实例标识, postId）幂等入本地列表——
+ * 重复路径副本不再入列（计数留痕、无害）；帖只追加、不改任何元状态（topic 帖亦按普通帖处理，
+ * 主题创建时定死）。ts 取帧 ts（作者侧落盘强制单调、随帖携带）；entryId 取载荷 postId 原样
+ * （该帖在全部副本中的稳定标识）。 */
+function handlePost(state, frame) {
+  const local = state.collabs.get(frame.collabId);
+  if (local === undefined || localModeOf(local) !== 'forum') {
+    return;   // 准入已保证（此处为直调 consume 的防御面：不把帖写进 managed 实例的列表）
+  }
+  const post = frame.payload.post;
+  const added = local.posts.append({
+    entryId: post.postId,
+    seq: post.seq,
+    ts: frame.ts,
+    from: { instanceId: frame.from.instanceId, identityName: frame.from.identityName },
+    kind: post.kind,
+    text: post.text,
+  });
+  if (!added) {
+    state.counters.postsDuplicated++;
+    return;
+  }
+  state.counters.postsIn++;
 }
 
 /* 冻结接收（设计 §6）：匹配 → 记下对端名单（合并并集的输入）→ 本地冻结（幂等）→ 转达

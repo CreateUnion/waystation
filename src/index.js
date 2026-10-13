@@ -111,9 +111,9 @@ if (configCreated || identityDefaulted || (site.ok && site.writeBackPort)) {
 /* 网络层与协作层组合根：构造组件、注入装配层（接线与生命周期归 stack——循环依赖在那里解除）。
  * 适配器先于协作服务构造：协作服务的 notify（本机提示注入面）需要它；其 describeCollab 闭包
  * 延迟引用协作服务（TDZ 安全——描述器只在投递渲染时调用，启动期不触达）。
- * 协作服务在 dispatch 之后构造（发送经其可靠队列；探测经其即时通道；队列改投经其新出口）、
- * 在 inbound 之前构造（admit/consume 注入）；发现层经闭包取协作计数（扫描列表显示真实忙闲；
- * 闭包在 start 时才调用，声明顺序无碍）。 */
+ * 协作服务在 dispatch 之后构造（发送经其可靠队列、帖直投经其直投通道；探测经其即时通道；
+ * 队列改投经其新出口）、在 inbound 之前构造（admit/consume 注入）；发现层经闭包取协作计数
+ * （扫描列表显示真实忙闲；闭包在 start 时才调用，声明顺序无碍）。 */
 const self = { instanceId, identityName: config.identityName, port: config.port };
 const knownHosts = createKnownHosts({ dataDir: activeDir, log });
 const transport = createTransport({ port: config.port, log });
@@ -131,6 +131,7 @@ const collab = createCollabService({
   config,
   self,
   send: (message) => dispatch.send(message),
+  sendDirect: (message) => dispatch.sendDirect(message),
   probe: (address, port) => dispatch.ping({ address, port }),
   reassign: (payload) => dispatch.reassignPeer(payload),
   notify: (frame) => adapter.deliverFrame(frame),

@@ -30,15 +30,22 @@ export function isCollabMode(value) {
 }
 
 /* 消息类型最小集（设计 §10）+ 投递可靠性所必需的确认帧 ack。
- * 类型集是两端契约：未知类型一律拒绝（版本不匹配或伪造）。 */
+ * 类型集是两端契约：未知类型一律拒绝（版本不匹配或伪造）。
+ * post = 讨论模式的帖通道（设计 §5.2：帧 type = 通道类别、kind = 语义徽标）——
+ * 本表是 managed 与讨论两模式的并集（帖载荷只校并集形态，模式语义归协作层）。 */
 export const MESSAGE_TYPES = [
   'invite', 'approve', 'decline', 'withdraw',
   'topic', 'task', 'progress', 'issue', 'stop', 'reply',
   'freeze', 'unfreeze', 'decision', 'handover', 'takeover-init', 'takeover', 'notice', 'leave', 'end',
   'ping', 'pong', 'delivery-status',
   'snapshot',
+  'post',
   'ack',
 ];
+
+/* 帖的语义徽标词表（设计 §5.2：协作类六类＝帖子类型、仅作标签——topic 帖按普通帖处理、
+ * 不改任何元状态）。与 ws_send_message 的类型面同一词表（工具层直接引用本常量，单一权威）。 */
+export const POST_KINDS = ['topic', 'task', 'progress', 'issue', 'stop', 'reply'];
 
 /* 治理类通告（设计 §10 路由例外清单 + §9 takeover 豁免明示）：重试直至送达、豁免队列上限与过期。 */
 export const GOVERNANCE_TYPES = ['freeze', 'unfreeze', 'decision', 'takeover-init', 'takeover'];
@@ -277,6 +284,7 @@ const COLLAB_PAYLOAD_RULES = {
   'takeover-init': validateTakeoverInitPayload,
   takeover: validateTakeoverPayload,
   snapshot: validateSnapshotPayload,
+  post: validatePostPayload,
   end: validateOptionalObjectPayload,
   leave: validateOptionalObjectPayload,
 };
@@ -384,6 +392,31 @@ function validateProgressPayload(payload) {
     return refuse('progress.taskId 非法（1–64 位字母数字与连字符）');
   }
   return validateBodyPayload(payload);
+}
+
+/* 帖载荷（设计 §5.2 帖形态；校验分层见 §5.5）：本层只校「并集形态」——post 字段齐全、
+ * 各字段形态与长度边界成立，不判协作模式；模式语义（讨论帖 vs managed 实例、kind 词表归属、
+ * 帧类型与帖形态的一致性）归协作层。postId 由作者生成、接收端原样采用（不得本地重编）；
+ * seq = 作者内单调序号（随帖携带、作者内比较的权威序列）；text 沿既有消息文本上限
+ * （不复用 topic/stop 的呈现文本限制、不触发 task 的 taskId 分支）。 */
+function validatePostPayload(payload) {
+  if (!isPlainObject(payload) || !isPlainObject(payload.post)) {
+    return refuse('post 缺少 payload.post（帖形态）');
+  }
+  const post = payload.post;
+  if (!isId(post.postId)) {
+    return refuse('post.postId 非法（1–64 位字母数字与连字符）');
+  }
+  if (!Number.isInteger(post.seq) || post.seq < 1) {
+    return refuse('post.seq 非法（≥1 的整数）');
+  }
+  if (typeof post.kind !== 'string' || post.kind === '') {
+    return refuse('post.kind 非法（非空字符串；词表归属由协作层判定）');
+  }
+  if (!isMessageText(post.text)) {
+    return refuse(`post.text 非法（非空、≤${MAX_MESSAGE_TEXT_CHARS} 字符）`);
+  }
+  return { ok: true };
 }
 
 /* notice 事件集（建协 / 协作 + 治理与韧性扩展）：事件枚举 + 各事件字段形态。

@@ -119,8 +119,12 @@ async function listCollabs(client) {
   return (await callTool(client, 'ws_list_collabs')).payload.collabs;
 }
 
-async function createCollab(client, target, { name, topic }) {
-  const called = await callTool(client, 'ws_create_collab', { name, topic, targets: [target] });
+async function createCollab(client, target, { name, topic, mode }) {
+  const args = { name, topic, targets: [target] };
+  if (mode !== undefined) {
+    args.mode = mode;
+  }
+  const called = await callTool(client, 'ws_create_collab', args);
   assert.equal(called.isError, false, String(called.payload));
   return called.payload.collabId;
 }
@@ -132,7 +136,7 @@ async function waitState(client, collabId, state) {
   }, { timeoutMs: 20000 });
 }
 
-async function startTemporaryStudio(t, { name, topic }) {
+async function startTemporaryStudio(t, { name, topic, mode }) {
   const homeA = makeStationDir(t);
   const homeB = makeStationDir(t);
   const portA = await pickFreePort();
@@ -141,13 +145,14 @@ async function startTemporaryStudio(t, { name, topic }) {
   const inboxB = await startFakeSessionInbox(t);
   const a = await startStation(t, { home: homeA, port: portA, inbox: inboxA });
   const b = await startStation(t, { home: homeB, port: portB, inbox: inboxB });
+  const statusA = (await callTool(a, 'ws_status')).payload;
   const statusB = (await callTool(b, 'ws_status')).payload;
-  const collabId = await createCollab(a, { instanceId: statusB.instanceId, identityName: statusB.identityName, address: '127.0.0.1', port: portB }, { name, topic });
+  const collabId = await createCollab(a, { instanceId: statusB.instanceId, identityName: statusB.identityName, address: '127.0.0.1', port: portB }, { name, topic, mode });
   await waitFor(async () => {
     const listed = await listCollabs(b);
     return listed.some((entry) => entry.collabId === collabId) ? true : null;
   }, { timeoutMs: 20000 });
-  return { homeA, homeB, portA, portB, inboxA, inboxB, a, b, collabId };
+  return { homeA, homeB, portA, portB, inboxA, inboxB, a, b, collabId, statusA, statusB };
 }
 
 test('验收预演：邀请→同意→对话→看台账（双真实实例全流程）', { timeout: 120000 }, async (t) => {
@@ -255,4 +260,42 @@ test('验收预演：管理者离线 → 读快照回退并标注可能非最新
   assert.equal(viewed.payload.source, 'snapshot');
   assert.ok(viewed.payload.note.includes('可能非最新'));
   assert.equal(viewed.payload.ledger.status, 'active');
+});
+
+test('验收预演：讨论模式双节点直投发帖（成员表经邀请装配）——会话注入、两端收敛、本地视图', { timeout: 120000 }, async (t) => {
+  const made = await startTemporaryStudio(t, { name: '讨论甲', topic: '议题', mode: 'forum' });
+  const { inboxA, inboxB, a, b, collabId, statusA, statusB } = made;
+  await waitFor(() => (inboxB.receivedText().includes('讨论甲') ? true : null), { timeoutMs: 20000 });
+  const admitted = (await listCollabs(b)).find((entry) => entry.collabId === collabId);
+  assert.equal(admitted.mode, 'forum', '成员表经邀请装配（帖通路不依赖加入/建立通路）');
+  const postedA = await callTool(a, 'ws_send_message', { collabId, text: '甲的第一帖', type: 'issue' });
+  assert.equal(postedA.isError, false, String(postedA.payload));
+  assert.ok(postedA.payload.postId);
+  assert.equal(postedA.payload.seq, 1);
+  assert.equal(postedA.payload.results[0].ok, true, '对端在册且端点已知：直投受理');
+  await waitFor(() => (inboxB.receivedText().includes('甲的第一帖') ? true : null), { timeoutMs: 20000 });
+  const postedB = await callTool(b, 'ws_send_message', { collabId, text: '乙的回应' });
+  assert.equal(postedB.isError, false, String(postedB.payload));
+  await waitFor(() => (inboxA.receivedText().includes('乙的回应') ? true : null), { timeoutMs: 20000 });
+  await waitFor(async () => {
+    const viewA = (await callTool(a, 'ws_view_ledger', { collabId })).payload;
+    const viewB = (await callTool(b, 'ws_view_ledger', { collabId })).payload;
+    if (viewA.posts.length !== 2 || viewB.posts.length !== 2) {
+      return null;
+    }
+    return JSON.stringify(viewA.posts.map((entry) => entry.text)) === JSON.stringify(viewB.posts.map((entry) => entry.text)) ? true : null;
+  }, { timeoutMs: 20000 });
+  const viewB = (await callTool(b, 'ws_view_ledger', { collabId })).payload;
+  assert.equal(viewB.mode, 'forum');
+  assert.equal(viewB.source, 'local');
+  assert.ok(viewB.note.includes('本地视图，未与全员核对'));
+  assert.deepEqual(viewB.members.map((member) => member.instanceId).sort(), [statusA.instanceId, statusB.instanceId].sort());
+  assert.deepEqual(viewB.posts.map((entry) => entry.from.instanceId).sort(), [statusA.instanceId, statusB.instanceId].sort());
+  await waitFor(async () => {
+    const row = (await callTool(a, 'ws_delivery_status', { msgId: postedA.payload.results[0].msgId })).payload.rows[0];
+    return row !== undefined && row.tier === 'session' ? true : null;
+  }, { timeoutMs: 20000 });
+  const rejectTo = await callTool(a, 'ws_send_message', { collabId, text: '定向', to: statusB.instanceId });
+  assert.equal(rejectTo.isError, true, '讨论不设定向：to 参数一律拒绝');
+  assert.ok(rejectTo.payload.includes('定向'), rejectTo.payload);
 });

@@ -1,6 +1,7 @@
 import { isIP } from 'node:net';
-import { COLLAB_MODES, DEFAULT_COLLAB_MODE, ID_PATTERN, MAX_COLLAB_MEMBERS, MAX_MESSAGE_TEXT_CHARS, MAX_REASON_CHARS, MAX_TOPIC_CHARS, PROTOCOL_VERSION, isCollabMode, isIdentityName, isPort, isPresentationText, newMsgId } from '../net/protocol.js';
+import { COLLAB_MODES, DEFAULT_COLLAB_MODE, ID_PATTERN, MAX_COLLAB_MEMBERS, MAX_MESSAGE_TEXT_CHARS, MAX_REASON_CHARS, MAX_TOPIC_CHARS, POST_KINDS, PROTOCOL_VERSION, isCollabMode, isIdentityName, isPort, isPresentationText, newMsgId } from '../net/protocol.js';
 import { MAX_FORUM_MEMBERS, MAX_LOCAL_COLLABS, canTransition, isArchived, newCollabId } from './model.js';
+import { createPostsStore, displayOrderOf, newPostId } from './posts.js';
 import { ledgerDigest, removeLedgerFile } from './store.js';
 import { currentManagerIdOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, memberStateFor, persistLedger, persistMember, persistSnapshot, rememberKnownHost } from './local.js';
 import { matchConflictCollabs } from './gate.js';
@@ -30,6 +31,7 @@ export function createCollab(state, { name, topic, targets, mode }) {
     member: managerRecordOf(ledger),
     endpoints: new Map(),
     snapshot: null,
+    posts: createPostsStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log }),
     suspended: null,
     staleManagerId: null,
   };
@@ -180,6 +182,14 @@ export function sendMessage(state, { collabId, text, type, to }) {
   if (local.suspended !== null) {
     return { ok: false, message: '协作对外写已暂停（在途抢接或未能对表）——收敛后恢复' };
   }
+  if (localModeOf(local) === 'forum') {
+    return sendForumPost(state, local, { text, type, to });
+  }
+  return sendManagedMessage(state, local, { text, type, to });
+}
+
+/* 协作模式的发送路径（星型路由与状态门控；讨论模式的发帖路径见 sendForumPost）。 */
+function sendManagedMessage(state, local, { text, type, to }) {
   const messageType = type ?? 'reply';
   const stateName = localStateOf(local);
   if (stateName === 'frozen') {
@@ -248,6 +258,96 @@ function sendToTarget(state, local, type, payload, targetId) {
   return { instanceId: targetId, ok: sent.ok === true, msgId: sent.msgId, reason: sent.reason };
 }
 
+/* 讨论模式发帖（设计 §5.2）：to 一律拒绝（讨论不设定向）；kind 按徽标词表、text 沿消息文本
+ * 上限（不走 topic/stop 的呈现限制、不触发 task 的 taskId 分支）；先本地落列（postId / 序号 /
+ * ts 分配即定）再扇出直投——帖的事务点在本机列表，直投失败不回滚。
+ * 帖不进会话注入以外的任何元状态面：topic 帖亦按普通帖处理（主题创建时定死）。 */
+function sendForumPost(state, local, { text, type, to }) {
+  const routedTo = typeof to === 'string' ? to.trim() : to ?? '';
+  if (routedTo !== '') {
+    return { ok: false, message: '讨论不设定向消息（to 参数一律拒绝）——发言即广播，移除 to 后重试' };
+  }
+  const kind = type ?? 'reply';
+  if (typeof kind !== 'string' || !POST_KINDS.includes(kind)) {
+    return { ok: false, message: `消息类型非法：可选值为 ${POST_KINDS.join(' / ')}（缺省 reply）` };
+  }
+  if (isArchived(localStateOf(local))) {
+    return { ok: false, message: '讨论已结束（或已终止）——不再接受新帖' };
+  }
+  const textRejection = textRejectionOf('reply', text);
+  if (textRejection !== null) {
+    return { ok: false, message: textRejection };
+  }
+  const post = allocateOwnPost(state, local, kind, text);
+  const results = fanOutPost(state, local, post);
+  state.counters.postsSent++;
+  return {
+    ok: true,
+    postId: post.postId,
+    seq: post.seq,
+    ts: post.ts,
+    to: results.map((entry) => entry.instanceId),
+    results,
+    note: '已直投（在线尽力 + 短重试，不落持久队列）——未达者由对方周期对表拉取收敛；投递结果可用 ws_delivery_status 查询',
+  };
+}
+
+/* 帖分配与本地落列（设计 §5.2）：postId 一次生成、序号严格递增、ts 强制单调——
+ * 回拨时取 max(上一条 ts + 1ms, now)；三者以本机已落列表的该作者基线为准，落列即定。 */
+function allocateOwnPost(state, local, kind, text) {
+  const baseline = local.posts.ownBaseline(state.self.instanceId);
+  const nowMs = Date.now();
+  const monotonicMs = baseline.ts === null ? nowMs : Math.max(Date.parse(baseline.ts) + 1, nowMs);
+  const post = { postId: newPostId(), seq: (baseline.seq ?? 0) + 1, ts: new Date(monotonicMs).toISOString(), kind, text };
+  local.posts.append({
+    entryId: post.postId,
+    seq: post.seq,
+    ts: post.ts,
+    from: { instanceId: state.self.instanceId, identityName: state.self.identityName },
+    kind,
+    text,
+  });
+  return post;
+}
+
+/* 直投扇出：对本地成员表逐成员直发一份（除本机；终态成员不投）——不走持久队列、
+ * 无逐帖排队；端点未知者如实记「待对表收敛」，由对方周期拉取兜底。 */
+function fanOutPost(state, local, post) {
+  const results = [];
+  for (const entry of forumRecipientsOf(state, local)) {
+    results.push(deliverPostTo(state, local, entry.instanceId, post));
+  }
+  return results;
+}
+
+function forumRecipientsOf(state, local) {
+  return localRosterOf(local).filter((entry) => {
+    if (entry.instanceId === state.self.instanceId) {
+      return false;
+    }
+    return entry.state === undefined || MESSAGING_MEMBER_STATES.includes(entry.state);
+  });
+}
+
+function deliverPostTo(state, local, instanceId, post) {
+  if (typeof state.sendDirect !== 'function') {
+    state.counters.postFanoutSkipped++;
+    return { instanceId, ok: false, reason: '直投面不可用（发送注入缺失）——待对表收敛' };
+  }
+  const endpoint = endpointFor(state, local, instanceId);
+  if (endpoint === undefined) {
+    return { instanceId, ok: false, reason: '端点未知——待对表收敛' };
+  }
+  const sent = state.sendDirect({
+    collabId: local.collabId,
+    to: { instanceId, address: endpoint.address, port: endpoint.port },
+    type: 'post',
+    payload: { post: { postId: post.postId, seq: post.seq, kind: post.kind, text: post.text } },
+    createdAt: post.ts,   // 帧 ts 随帖携带（作者侧强制单调的落盘 ts，接收端显示序与作者内序的依据）
+  });
+  return { instanceId, ok: sent.ok === true, msgId: sent.msgId, reason: sent.reason };
+}
+
 export function endCollab(state, { collabId }) {
   const local = state.collabs.get(collabId);
   if (local === undefined || local.role !== 'manager') {
@@ -310,6 +410,9 @@ export async function viewLedger(state, { collabId }) {
   if (local === undefined) {
     return { ok: false, message: '本机没有该协作（先 ws_list_collabs）' };
   }
+  if (localModeOf(local) === 'forum') {
+    return forumViewOf(local);
+  }
   if (local.role === 'manager') {
     return { ok: true, source: 'local', version: local.ledger.version, archived: isArchived(local.ledger.status), ledger: local.ledger };
   }
@@ -328,6 +431,24 @@ export async function viewLedger(state, { collabId }) {
     return { ok: true, source: 'snapshot', version: stored.version, note: `快照，版本 ${stored.version}，可能非最新`, archived, ledger: stored.ledger };
   }
   return { ok: false, message: archived ? '协作已归档且本机无可用快照' : '管理者离线且本机无快照——没有可读台账' };
+}
+
+/* 讨论的本地合并视图（设计 §7 工具面）：本地帖子列表（显示序）+ 成员表 + 端点——标注
+ * 「本地视图，未与全员核对」（收敛由各节点周期对表推进，本机副本可能暂时落后）；
+ * 不向任何成员拉取（拉取机制属对表链路）。 */
+function forumViewOf(local) {
+  return {
+    ok: true,
+    mode: 'forum',
+    source: 'local',
+    archived: isLocalArchivedState(local),
+    note: '本地视图，未与全员核对——收敛由各节点周期对表推进，本机副本可能暂时落后',
+    name: localNameOf(local),
+    state: localStateOf(local),
+    members: localRosterOf(local).map((entry) => ({ instanceId: entry.instanceId, identityName: entry.identityName })),
+    endpoints: Object.fromEntries(local.endpoints),
+    posts: displayOrderOf(local.posts.entries()),
+  };
 }
 
 /* 在线拉取的等待面：回应经接收管线到达（快照接收路径统一 resolve）；超时按快照回退。

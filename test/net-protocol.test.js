@@ -8,8 +8,10 @@ import {
   MAX_COLLAB_MEMBERS,
   MAX_DATAGRAM_BYTES,
   MAX_FRAME_BYTES,
+  MAX_MESSAGE_TEXT_CHARS,
   MAX_TOPIC_CHARS,
   MESSAGE_TYPES,
+  POST_KINDS,
   PROTOCOL_VERSION,
   TRANSPORT_TYPES,
   isIdentityName,
@@ -164,12 +166,13 @@ test('发现报文类型不匹配（探测/应答互收）：拒绝', () => {
 
 test('常量：版本、类型集、治理集、传输集与体积上限', () => {
   assert.equal(PROTOCOL_VERSION, 1);
-  assert.equal(MESSAGE_TYPES.length, 24);
-  for (const type of ['invite', 'approve', 'decline', 'withdraw', 'topic', 'task', 'progress', 'issue', 'stop', 'reply', 'freeze', 'unfreeze', 'decision', 'handover', 'takeover-init', 'takeover', 'notice', 'leave', 'end', 'ping', 'pong', 'delivery-status', 'snapshot', 'ack']) {
+  assert.equal(MESSAGE_TYPES.length, 25);
+  for (const type of ['invite', 'approve', 'decline', 'withdraw', 'topic', 'task', 'progress', 'issue', 'stop', 'reply', 'freeze', 'unfreeze', 'decision', 'handover', 'takeover-init', 'takeover', 'notice', 'leave', 'end', 'ping', 'pong', 'delivery-status', 'snapshot', 'post', 'ack']) {
     assert.ok(MESSAGE_TYPES.includes(type), type);
   }
   assert.deepEqual(GOVERNANCE_TYPES, ['freeze', 'unfreeze', 'decision', 'takeover-init', 'takeover']);
   assert.deepEqual(TRANSPORT_TYPES, ['ping', 'pong', 'ack']);
+  assert.deepEqual(POST_KINDS, ['topic', 'task', 'progress', 'issue', 'stop', 'reply']);
   assert.equal(MAX_FRAME_BYTES, 1048576);
   assert.equal(MAX_DATAGRAM_BYTES, 512);
   assert.equal(ID_PATTERN.test('../x'), false);
@@ -343,6 +346,23 @@ test('协作域 progress / issue / reply：正文判据（缺失拒 / 4001 拒 /
   assert.equal(MAX_TOPIC_CHARS, 200);
 });
 
+test('协作域 post：帖形态判据（并集形态在协议层、kind 词表归属协作层）', () => {
+  const post = { postId: 'post-1', seq: 1, kind: 'reply', text: '你好' };
+  assert.equal(validateMessage(collabFrame('post', { post })).ok, true);
+  assert.equal(validateMessage(collabFrame('post', { post: { ...post, kind: 'topic', text: 'x'.repeat(MAX_MESSAGE_TEXT_CHARS) } })).ok, true, 'text 沿消息文本上限（不与 topic 的 200 呈现限制挂钩）');
+  assert.equal(validateMessage(collabFrame('post', { post: { ...post, text: '第一行\n第二行' } })).ok, true, '正文面允许换行（与既有消息正文同判据）');
+  assert.equal(validateMessage(collabFrame('post', {})).ok, false, '缺 payload.post');
+  assert.equal(validateMessage(collabFrame('post', { post: { ...post, postId: 'bad id!' } })).ok, false);
+  assert.equal(validateMessage(collabFrame('post', { post: { ...post, seq: 0 } })).ok, false);
+  assert.equal(validateMessage(collabFrame('post', { post: { ...post, seq: 1.5 } })).ok, false);
+  assert.equal(validateMessage(collabFrame('post', { post: { ...post, seq: '1' } })).ok, false);
+  assert.equal(validateMessage(collabFrame('post', { post: { ...post, kind: 7 } })).ok, false);
+  assert.equal(validateMessage(collabFrame('post', { post: { ...post, text: '' } })).ok, false);
+  assert.equal(validateMessage(collabFrame('post', { post: { ...post, text: 'x'.repeat(4001) } })).ok, false);
+  assert.equal(validateMessage(collabFrame('post', { post: { ...post, seq: undefined } })).ok, false, '序号必填（随帖携带）');
+  assert.equal(validateMessage(collabFrame('post', { post: { ...post, kind: '飘' } })).ok, true, '词表越界的 kind 由协作层判定（协议层只判并集形态）');
+});
+
 test('协作域 notice：event 枚举（established / roster / snapshot-stored）、version 可选且 ≥1', () => {
   assert.equal(validateMessage(collabFrame('notice', { event: 'established', version: 3 })).ok, true);
   assert.equal(validateMessage(collabFrame('notice', { event: 'roster' })).ok, true);
@@ -365,7 +385,7 @@ test('协作域 freeze / snapshot：freeze 名单形态；snapshot request 通�
 });
 
 test('协作域全类型覆盖：对每个协作域类型给非法 payload 必拒（防漏挂表）', () => {
-  const collabTypes = ['invite', 'approve', 'decline', 'withdraw', 'topic', 'task', 'progress', 'issue', 'stop', 'reply', 'notice', 'freeze', 'snapshot', 'end', 'leave'];
+  const collabTypes = ['invite', 'approve', 'decline', 'withdraw', 'topic', 'task', 'progress', 'issue', 'stop', 'reply', 'notice', 'freeze', 'snapshot', 'post', 'end', 'leave'];
   const invalidPayload = {
     invite: { name: '项目' },
     approve: 'x',
@@ -380,6 +400,7 @@ test('协作域全类型覆盖：对每个协作域类型给非法 payload 必�
     notice: {},
     freeze: {},
     snapshot: {},
+    post: { post: { postId: 'post-1' } },
     end: 'x',
     leave: 'x',
   };

@@ -1,13 +1,14 @@
 import { isIP } from 'node:net';
-import { COLLAB_MODES, DEFAULT_COLLAB_MODE, ID_PATTERN, MAX_COLLAB_MEMBERS, isCollabMode, isIdentityName, isPort } from '../net/protocol.js';
+import { COLLAB_MODES, DEFAULT_COLLAB_MODE, ID_PATTERN, MAX_COLLAB_MEMBERS, POST_KINDS, isCollabMode, isIdentityName, isPort } from '../net/protocol.js';
 
 /* 协作工具集（设计 §10 工具最小集的协作核心期落点）：薄层——只做参数形态校验
  * （非空字符串 / 布尔 / 数组 / 整数 / 身份名）与输出封装；业务判定（状态门控、冻结白名单、
  * 路由、上限）一律在协作服务，服务的 { ok: false, message } 映射为 isError。
  * 本组工具同域共置一个文件：共享同一份参数助手，避免多份重复的 trim / 形态校验。 */
 
-/* 会话消息可用的协作类类型（设计 §10）：治理类与建协类不经本工具。 */
-export const SEND_MESSAGE_TYPES = ['topic', 'task', 'progress', 'issue', 'stop', 'reply'];
+/* 会话消息可用的协作类类型（设计 §10）：治理类与建协类不经本工具。
+ * 同一词表即讨论模式帖的语义徽标（protocol.POST_KINDS，单一权威——两处判定同一份取值）。 */
+export const SEND_MESSAGE_TYPES = POST_KINDS;
 
 const MAX_TARGETS = MAX_COLLAB_MEMBERS - 1;   // 目标上限 = 名单上限减发起者本人（单一权威：protocol.MAX_COLLAB_MEMBERS）
 
@@ -175,7 +176,7 @@ export function viewLedgerTool() {
 export function sendMessageTool() {
   return {
     name: 'ws_send_message',
-    description: '发送协作域消息（星型路由：成员发给管理者；管理者省略 to 即发全体成员）——离线时消息排队、对方重开后送达',
+    description: '发送协作域消息（星型路由：成员发给管理者；管理者省略 to 即发全体成员）——离线时消息排队、对方重开后送达；讨论模式为发帖广播（人人可见、to 参数一律拒绝、离线者由对方周期对表收敛）',
     inputSchema: {
       type: 'object',
       properties: {

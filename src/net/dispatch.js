@@ -5,39 +5,37 @@ import { COLLABS_DIR_NAME } from '../paths.js';
 import { ID_PATTERN, MAX_FRAME_BYTES, MESSAGE_TYPES, PROTOCOL_VERSION, TRANSPORT_TYPES, isPort, newMsgId, validateMessage } from './protocol.js';
 import { createOutbox } from './outbox.js';
 
+/* 直投（讨论模式帖通道，设计 §5.2「在线直投 + 短重试」）：逐帖直发、不落持久逐帖队列——
+ * 尝试次数与重试间隔取「短」量级（首投 + 2 次重试、每次等待窗 1s），失败即止、不逐帖承诺送达；
+ * 离线者的收敛由对方周期对表拉取兜底（拉取机制属对表链路）。单次尝试的等待窗 = 重试间隔
+ * （到点未 ack 按失败重试）；重试必重拨（与队列的半开连接检测同口径）。
+ * 投递记录（供 ws_delivery_status 的帖行集）在内存短期保留：保留窗 10 分钟、上限 512 条
+ * （按插入序淘汰）——它是短时事实面，与持久队列（7 天保留、可重启续投）明确分开。
+ * 四个数值均经构造选项可注入（测试收敛用），生产用本默认值。 */
+const DIRECT_MAX_ATTEMPTS = 3;
+const DIRECT_RETRY_INTERVAL_MS = 1000;
+const DIRECT_RECORD_TTL_MS = 10 * 60 * 1000;
+const DIRECT_RECORD_MAX = 512;
+
 /* 发送调度（设计 §10）：按「协作 × 对端」单元串行投递（FIFO 保序），ack 推进，超时重传。
  * 节律：首投立即；未 ack 的重试恒定 retryIntervalMs，连续 retryFastCount 次后转 retrySlowIntervalMs，
  * 直至送达 / 过期——节律参数与容量、过期的权威在 outbox，本层只驱动「何时再试一次」。
  * 半开连接检测：重试必重拨（旧连接关闭）——应用层 ack 与超时是唯一判据（设计 §5/§10）。
  * 拨号连接上的回程帧（ack / pong / 投递回报）统一经 setClientFrameRouter 注入的路由器转交接收管线
  * （生产路径由装配层注入 inbound.onFrame）；未接线时帧计数丢弃。
- * deliveryStatus 查询按需惰性载入协作目录（幂等）：未 start 的降级态也能看到落盘的历史队列——
- * 查询只加载，不启 tick、不调度。
+ * deliveryStatus 查询按需惰性载入协作目录（幂等）：未 start 的降级态也能看到落盘的历史队列与
+ * 直投短时记录——查询只加载，不启 tick、不调度。
  * stop() 是发送截止点：停止后醒来的在途投递一律不发帧，在途拨号完成即关（连同探测在内一并收口）；
- * stop() 返回的 promise 在在途拨号全部落地后 resolve——resolve 即无无主连接。
+ * 直投等待面在 stop 时统一解挂（未达 + 不再重试）；stop() 返回的 promise 在在途拨号全部落地后
+ * resolve——resolve 即无无主连接。
  * 一切异常（拨号失败、写失败、调度循环内任何错误）都被捕获记录，绝不退出进程（健壮性硬性要求）。 */
-export function createDispatch({ dataDir, config, transport, self, log }) {
-  const state = {
-    dataDir,
-    config,
-    transport,
-    self,
-    log,
-    outboxes: new Map(),
-    entryIndex: new Map(),     // msgId → collabId（ack / 回报的归属查找）
-    inFlight: new Set(),       // 单元键（一次只投一条）
-    pendingDials: new Set(),   // 在途拨号 promise（stop 收口等它们落地，不留无主连接）
-    connections: new Map(),    // 单元键 → { connection, collabId, peer }
-    pendingPings: new Map(),   // ping msgId → { resolve, startedAt, timer }
-    counters: emptyCounters(),
-    clientFrameRouter: null,
-    timer: null,
-    stopped: false,            // 发送截止点：stop 置位、start 复位
-  };
+export function createDispatch(options) {
+  const state = buildState(options);
   return {
     start: () => start(state),
     stop: () => stop(state),
     send: (message) => send(state, message),
+    sendDirect: (message) => sendDirect(state, message),
     onAck: (msgId) => onAck(state, msgId),
     onDeliveryReport: (payload) => onDeliveryReport(state, payload),
     resolvePong: (frame) => resolvePong(state, frame),
@@ -48,6 +46,37 @@ export function createDispatch({ dataDir, config, transport, self, log }) {
       state.clientFrameRouter = router;
     },
     stats: () => statsOf(state),
+  };
+}
+
+/* 运行态容器：依赖注入与直投参数一次性定格（直投参数缺省 = 模块顶部常量；测试经选项收敛）。 */
+function buildState({ dataDir, config, transport, self, log,
+  directMaxAttempts = DIRECT_MAX_ATTEMPTS, directRetryIntervalMs = DIRECT_RETRY_INTERVAL_MS,
+  directRecordTtlMs = DIRECT_RECORD_TTL_MS, directRecordMax = DIRECT_RECORD_MAX }) {
+  return {
+    dataDir,
+    config,
+    transport,
+    self,
+    log,
+    directMaxAttempts,
+    directRetryIntervalMs,
+    directRecordTtlMs,
+    directRecordMax,
+    outboxes: new Map(),
+    entryIndex: new Map(),     // msgId → collabId（ack / 回报的归属查找）
+    inFlight: new Set(),       // 单元键（一次只投一条）
+    pendingDials: new Set(),   // 在途拨号 promise（stop 收口等它们落地，不留无主连接）
+    unitDials: new Map(),      // 单元键 → 在途拨号 promise（并发同单元投递共享同一次拨号）
+    connections: new Map(),    // 单元键 → { connection, collabId, peer }
+    pendingPings: new Map(),   // ping msgId → { resolve, startedAt, timer }
+    directRecords: new Map(),  // 直投 msgId → 投递记录（短时保留；查询行集来源）
+    directWaiters: new Map(),  // 直投 msgId → { resolve, timer }（单次尝试的 ack 等待面）
+    directActive: new Map(),   // 单元键 → 在途直投数（空闲连接判定据此不关闭在用连接）
+    counters: emptyCounters(),
+    clientFrameRouter: null,
+    timer: null,
+    stopped: false,            // 发送截止点：stop 置位、start 复位
   };
 }
 
@@ -63,6 +92,11 @@ function emptyCounters() {
     deliveryFailures: 0,
     expiredTotal: 0,
     clientFramesDropped: 0,
+    directRejected: 0,
+    directAttempts: 0,
+    directAcked: 0,
+    directSession: 0,
+    directUndelivered: 0,
   };
 }
 
@@ -82,7 +116,8 @@ function start(state) {
 
 /* 停止 = 发送截止点：置位后醒来的在途投递一律不发帧（完成即关连接），在途拨号由本层收口——
  * transport.close() 兜不住这个窗口：它只遍历「已连上」的连接集，close() 之前尚未连上的拨号 socket 收不到，
- * 连上后会成为没人跟踪的活连接。返回的 promise 在全部在途拨号落地后 resolve。 */
+ * 连上后会成为没人跟踪的活连接。返回的 promise 在全部在途拨号落地后 resolve。
+ * 直投等待面在此时统一解挂（未达语义）——直投任务醒来即止，不留跨停止的挂起定时器。 */
 async function stop(state) {
   state.stopped = true;
   if (state.timer !== null) {
@@ -98,7 +133,17 @@ async function stop(state) {
     pending.resolve(null);
   }
   state.pendingPings.clear();
+  settleDirectWaiters(state);
   await Promise.allSettled([...state.pendingDials]);
+}
+
+/* 直投等待面统一解挂（stop 路径）：以 'stopped' 终止单次尝试等待——任务层据此收尾为「未达」。 */
+function settleDirectWaiters(state) {
+  for (const waiter of state.directWaiters.values()) {
+    clearTimeout(waiter.timer);
+    waiter.resolve('stopped');
+  }
+  state.directWaiters.clear();
 }
 
 /* message.from（可选）：转达帧的原发身份——治理转达保留发起者身份（身份语义定义在 from 上），
@@ -211,7 +256,235 @@ function isKnownType(value) {
   return typeof value === 'string' && MESSAGE_TYPES.includes(value);
 }
 
+/* 直投受理（讨论模式帖通道）：当场返回受理结果，投递在独立任务中进行（不占调用方、不落队列）。
+ * 与队列路径共用：参数 / 终帧预检（与对端入站校验同一权威——不合法直接拒绝，不做无谓重试）、
+ * 连接模型（首投复用、重试重拨）、ack 与投递回报的归属机制。
+ * 不共用：落盘（无 outbox 写入）、节律（固定短重试、失败即止）。
+ * createdAt 缺省取当前时刻；调用方可给帖的落盘 ts——帧 ts 随帖携带（接收端显示序与作者内序依据）。 */
+function sendDirect(state, { collabId, to, type, payload, createdAt }) {
+  const rejection = directRejection(state, collabId, to, type);
+  if (rejection !== null) {
+    state.counters.directRejected++;
+    return { ok: false, reason: rejection };
+  }
+  const record = directRecordOf(collabId, to, { type, payload, createdAt });
+  const payloadRejection = frameRejectionOf(frameOf(state, collabId, record));
+  if (payloadRejection !== null) {
+    state.counters.directRejected++;
+    return { ok: false, reason: payloadRejection };
+  }
+  rememberDirectRecord(state, record);
+  const key = `${collabId}:${to.instanceId}`;
+  runDirectDelivery(state, key, record).catch((error) => {
+    state.log.error('直投任务异常（已隔离）', { msgId: record.msgId, reason: error.message });
+  });
+  return { ok: true, msgId: record.msgId };
+}
+
+/* 直投参数拒绝（与 send 同一形态判据 + 直投专属两条）：传输类帧不走直投（即时通道语义）；
+ * 本机端口必须就位（帧的 from.port 是对方回报寻址依据）。返回拒绝原因或 null。 */
+function directRejection(state, collabId, to, type) {
+  const shapeReason = sendRejection(collabId, to, type);
+  if (shapeReason !== null) {
+    return shapeReason;
+  }
+  if (TRANSPORT_TYPES.includes(type)) {
+    return '传输类帧（ping / pong / ack）不走直投：请求应答与链路确认是即时通道';
+  }
+  if (to.instanceId === state.self.instanceId) {
+    return '目标为本机实例，拒绝对自己投递';
+  }
+  if (!isPort(state.self.port)) {
+    return 'from.port 非法（1–65535 的整数）：本机站点端口未就位（构造侧必填）';
+  }
+  return null;
+}
+
+function directRecordOf(collabId, to, { type, payload, createdAt }) {
+  return {
+    msgId: newMsgId(),
+    collabId,
+    to: { instanceId: to.instanceId, address: to.address, port: to.port },
+    type,
+    payload,
+    state: 'inflight',
+    attempts: 0,
+    createdAt: typeof createdAt === 'string' ? createdAt : new Date().toISOString(),
+    ackedAt: undefined,
+    deliveredAt: undefined,
+    failedAt: undefined,
+    reason: undefined,
+  };
+}
+
+/* 直投任务：短重试循环——每次尝试（拨号/复用 → 发帧 → 等 ack）；未确认则等一个间隔后重试，
+ * 尝试上限用尽或调度器停止即收尾为「未达」（不逐帖承诺送达；离线者由对方周期对表拉取收敛）。
+ * directActive 计该单元在途直投数：空闲连接判定据此不关闭正在等待 ack 的连接。 */
+async function runDirectDelivery(state, key, record) {
+  state.directActive.set(key, (state.directActive.get(key) ?? 0) + 1);
+  try {
+    for (let attempt = 1; attempt <= state.directMaxAttempts; attempt++) {
+      const outcome = await attemptDirectDelivery(state, key, record);
+      if (outcome === 'settled') {
+        return;
+      }
+      if (outcome === 'stopped' || attempt === state.directMaxAttempts) {
+        markDirectUndelivered(state, record);
+        return;
+      }
+      await sleep(state.directRetryIntervalMs);
+    }
+  } finally {
+    dropDirectActivity(state, key);
+  }
+}
+
+/* 单次尝试：连接（首投复用 / 重试重拨）→ 发帧 → 等 ack（等待窗 = 重试间隔）。
+ * 返回 'settled'（ack / 会话回报已到）、'retry'（未确认——失败也要等间隔，不得每轮重拨）、
+ * 'stopped'（调度器停止：中止且不再重试）。尝试计数含拨号失败（与队列口径一致）。 */
+async function attemptDirectDelivery(state, key, record) {
+  if (record.state === 'at-peer' || record.state === 'session') {
+    return 'settled';   // 重试间隙到达的确认（等待面已收）：不再重发
+  }
+  if (state.stopped) {
+    record.reason = '调度器已停止——直投中止';
+    return 'stopped';
+  }
+  try {
+    const connection = await obtainConnection(state, key, record.collabId, record);
+    if (connection === null || state.stopped) {
+      record.reason = '调度器已停止——直投中止';
+      return 'stopped';
+    }
+    connection.send(frameOf(state, record.collabId, record));
+    state.counters.directAttempts++;
+    record.attempts++;
+  } catch (error) {
+    record.attempts++;
+    record.reason = `拨号失败：${error.message}`;
+    state.counters.deliveryFailures++;
+    state.log.warn('直投失败，按短节律重试', { msgId: record.msgId, peer: record.to.instanceId, reason: error.message });
+    return 'retry';
+  }
+  const outcome = await waitForDirectSettle(state, record.msgId);
+  if (outcome === 'settled') {
+    return 'settled';
+  }
+  if (outcome === 'stopped') {
+    record.reason = '调度器已停止——直投中止';
+    return 'stopped';
+  }
+  record.reason = `等待对方驿站确认超时（${state.directRetryIntervalMs}ms 内无 ack）`;
+  return 'retry';
+}
+
+/* 单次尝试的 ack 等待面：到点按超时返回；ack / 会话回报 / 停止由结算路径唤醒。 */
+function waitForDirectSettle(state, msgId) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      state.directWaiters.delete(msgId);
+      resolve('timeout');
+    }, state.directRetryIntervalMs);
+    state.directWaiters.set(msgId, { resolve, timer });
+  });
+}
+
+function settleDirectWaiter(state, msgId, outcome) {
+  const waiter = state.directWaiters.get(msgId);
+  if (waiter === undefined) {
+    return;
+  }
+  state.directWaiters.delete(msgId);
+  clearTimeout(waiter.timer);
+  waiter.resolve(outcome);
+}
+
+/* 投递记录登记（短时保留）：登记即按保留窗剪枝 + 容量淘汰最旧（幂等、无定时器）。 */
+function rememberDirectRecord(state, record) {
+  pruneDirectRecords(state, Date.now());
+  state.directRecords.set(record.msgId, record);
+  while (state.directRecords.size > state.directRecordMax) {
+    const oldest = state.directRecords.keys().next().value;
+    state.directRecords.delete(oldest);
+  }
+}
+
+/* 保留窗剪枝：记录自创建起超窗即移除（查询与登记两路径共同维护——无定时器，稳态零开销）。 */
+function pruneDirectRecords(state, now) {
+  for (const [msgId, record] of state.directRecords) {
+    if (now - Date.parse(record.createdAt) > state.directRecordTtlMs) {
+      state.directRecords.delete(msgId);
+    }
+  }
+}
+
+/* 记录推进（状态单调向前：inflight → at-peer → session；未达档不吞迟到 ack——真实送达不得回退）：
+ * ack 与会话回报都可能晚于等待面到达（重试间隙 / 任务收尾后），推进一律幂等。 */
+function markDirectAcked(state, record, now) {
+  if (record.state === 'at-peer' || record.state === 'session') {
+    return false;
+  }
+  record.state = 'at-peer';
+  record.ackedAt = new Date(now).toISOString();
+  record.reason = undefined;
+  state.counters.directAcked++;
+  settleDirectWaiter(state, record.msgId, 'settled');
+  return true;
+}
+
+function markDirectSession(state, record, now) {
+  if (record.state === 'session') {
+    return false;
+  }
+  if (record.state !== 'at-peer') {
+    /* 会话回报蕴含对方驿站已确认（接收侧先 ack 后投会话）：ack 未被本机观测到时按同一时刻记。 */
+    record.state = 'at-peer';
+    record.ackedAt = new Date(now).toISOString();
+    state.counters.directAcked++;
+  }
+  record.state = 'session';
+  record.deliveredAt = new Date(now).toISOString();
+  record.reason = undefined;
+  state.counters.directSession++;
+  settleDirectWaiter(state, record.msgId, 'settled');
+  return true;
+}
+
+function markDirectUndelivered(state, record) {
+  if (record.state === 'at-peer' || record.state === 'session') {
+    return;   // 等待窗与收尾之间的迟到确认：已投达不得被标成未达
+  }
+  record.state = 'undelivered';
+  record.failedAt = new Date().toISOString();
+  state.counters.directUndelivered++;
+}
+
+function dropDirectActivity(state, key) {
+  const held = state.directActive.get(key);
+  if (held === undefined || held <= 1) {
+    state.directActive.delete(key);
+    return;
+  }
+  state.directActive.set(key, held - 1);
+}
+
+/* 重试等待（不阻止进程退出：会话结束即退出是产品语义——等待窗不得拖住事件循环；
+ * 停止后任务在下一轮唤醒点看到截止位即收尾）。 */
+function sleep(ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    if (typeof timer.unref === 'function') {
+      timer.unref();
+    }
+  });
+}
+
 function onAck(state, msgId) {
+  const direct = state.directRecords.get(msgId);
+  if (direct !== undefined) {
+    markDirectAcked(state, direct, Date.now());
+    return;
+  }
   const located = locate(state, msgId);
   if (located === null) {
     state.counters.acksUnknown++;
@@ -225,6 +498,11 @@ function onAck(state, msgId) {
 }
 
 function onDeliveryReport(state, { refMsgId, tier }) {
+  const direct = state.directRecords.get(refMsgId);
+  if (direct !== undefined && tier === 'session') {
+    markDirectSession(state, direct, Date.now());
+    return;
+  }
   const located = locate(state, refMsgId);
   if (located === null || tier !== 'session') {
     state.counters.reportsUnknown++;
@@ -289,7 +567,14 @@ async function ping(state, { address, port }) {
 }
 
 function deliveryStatus(state, query = {}) {
-  ensureLoadedCollabs(state);   // 查询路径惰性载入（幂等）：未 start 也能看到落盘的历史队列；只加载，不启 tick、不调度
+  ensureLoadedCollabs(state);   // 查询路径惰性载入（幂等）：未 start 也能看到落盘的历史队列与直投短时记录；只加载，不启 tick、不调度
+  pruneDirectRecords(state, Date.now());
+  const rows = [...outboxRowsOf(state, query), ...directRowsOf(state, query)];
+  return rows.sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt));
+}
+
+/* 队列行集（含在线直投的短时记录之外的全部历史条目）；过滤口径：字符串非空才过滤。 */
+function outboxRowsOf(state, query) {
   const { msgId, collabId } = query;
   const rows = [];
   for (const [id, outbox] of state.outboxes) {
@@ -303,7 +588,44 @@ function deliveryStatus(state, query = {}) {
       rows.push(statusRow(id, entry));
     }
   }
-  return rows.sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt));
+  return rows;
+}
+
+/* 直投短时记录行集（讨论模式的帖投递事实面；与队列行集同形输出）。 */
+function directRowsOf(state, query) {
+  const { msgId, collabId } = query;
+  const rows = [];
+  for (const record of state.directRecords.values()) {
+    if (typeof collabId === 'string' && collabId !== '' && record.collabId !== collabId) {
+      continue;
+    }
+    if (typeof msgId === 'string' && msgId !== '' && record.msgId !== msgId) {
+      continue;
+    }
+    rows.push(directStatusRow(record));
+  }
+  return rows;
+}
+
+/* 直投投递记录 → 查询行（设计 §5.2 讨论语义）：档位取记录状态——inflight（直投中，过渡态）/
+ * at-peer（已到对方驿站，直投 ack）/ session（已投进对方会话，回报）/ undelivered（未送达，
+ * 待对表收敛；「已排队」档不适用、不出现）。未达行带 note 与失败原因，如实呈现收敛路径。 */
+function directStatusRow(record) {
+  return {
+    msgId: record.msgId,
+    collabId: record.collabId,
+    type: record.type,
+    toInstanceId: record.to.instanceId,
+    tier: record.state,
+    expired: false,
+    attempts: record.attempts,
+    createdAt: record.createdAt,
+    nextAttemptAt: null,
+    ackedAt: record.ackedAt ?? null,
+    deliveredAt: record.deliveredAt ?? null,
+    note: record.state === 'undelivered' ? '未达——待对表收敛（对方周期拉取后自动追平）' : null,
+    reason: record.reason ?? null,
+  };
 }
 
 /* 队列改投（协作层在降级 / 移交时消费）：把该协作发往旧对端的未确认条目改投新对端。
@@ -339,6 +661,8 @@ function statsOf(state) {
     inFlight: state.inFlight.size,
     connections: state.connections.size,
     pendingPings: state.pendingPings.size,
+    directRecords: state.directRecords.size,
+    directActive: state.directActive.size,
   };
 }
 
@@ -416,6 +740,28 @@ async function obtainConnection(state, key, collabId, entry) {
     held.connection.close();  // 重试 = 半开嫌疑：重拨后再发
     state.connections.delete(key);
   }
+  return dialForUnit(state, key, collabId, entry);
+}
+
+/* 拨号去重（同单元共享在途拨号）：并发的同单元投递（帖直投与队列调度可同时触达同一对端）
+ * 不得各自拨号——后到者共享先到者的拨号结果，避免双连接与连接登记的相互覆盖
+ * （被覆盖的连接会脱离空闲回收视野，只能等对端关闭）。 */
+function dialForUnit(state, key, collabId, entry) {
+  let pending = state.unitDials.get(key);
+  if (pending === undefined) {
+    pending = performDial(state, key, collabId, entry);
+    state.unitDials.set(key, pending);
+    const clear = () => {
+      if (state.unitDials.get(key) === pending) {
+        state.unitDials.delete(key);
+      }
+    };
+    pending.then(clear, clear);   // 成败都清（失败不产生未处理 rejection：两个出口都接住）
+  }
+  return pending;
+}
+
+async function performDial(state, key, collabId, entry) {
   const connection = await dialPeer(state, { address: entry.to.address, port: entry.to.port, timeoutMs: state.config.dialTimeoutMs });
   if (connection === null) {
     return null;   // 停止收口后才完成的拨号：连接已被收口关闭，不得登记、不得发帧
@@ -476,6 +822,9 @@ function adopt(state, connection) {
 }
 
 function closeConnectionIfIdle(state, collabId, peer) {
+  if (state.directActive.has(`${collabId}:${peer}`)) {
+    return;   // 该连接上仍有在途直投（ack 等待面挂在其上）：不得关闭
+  }
   const outbox = state.outboxes.get(collabId);
   if (outbox !== undefined && outbox.headFor(peer) === undefined) {
     const key = `${collabId}:${peer}`;
@@ -489,6 +838,9 @@ function closeConnectionIfIdle(state, collabId, peer) {
 
 function closeIdleConnections(state) {
   for (const [key, held] of [...state.connections]) {
+    if (state.directActive.has(key)) {
+      continue;   // 在途直投连接不是空闲连接（关闭会丢掉正在等待的 ack）
+    }
     const outbox = state.outboxes.get(held.collabId);
     if (outbox === undefined || outbox.headFor(held.peer) === undefined) {
       held.connection.close();

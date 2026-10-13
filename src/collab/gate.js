@@ -1,3 +1,4 @@
+import { POST_KINDS } from '../net/protocol.js';
 import { CONFLICT_STATES, INVITE_THROTTLE_TABLE_MAX, MAX_PENDING_INVITES } from './model.js';
 import { isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf } from './local.js';
 
@@ -37,6 +38,26 @@ export function decideAdmission(state, frame, meta) {
     state.counters.lateDropped++;
     state.log.warn(`协作已结束（或已退出），迟到消息丢弃：${frame.type}`, { collabId: frame.collabId, msgId: frame.msgId, from: frame.from?.instanceId });
     return { ok: false, reason: '协作已结束（或已退出）：消息丢弃并计数留痕' };
+  }
+  if (frame.type === 'post') {
+    return admitForumPost(state, local, frame);
+  }
+  return { ok: true };
+}
+
+/* 帖通道的模式语义校验（设计 §5.2/§5.5 分层：协议层只校并集形态，本层判模式与词表）：
+ * 帖只属于讨论实例——managed 实例收到 post 帧、或 post.kind 越出徽标词表，均为校验失败
+ * （拒绝并计数；不匹配即不 ack，由发送侧按短重试与对表收敛）。帧形态（payload.post 齐全）
+ * 已由协议层保证；此处只判「帖通道 ⇔ 讨论实例」与 kind 词表。 */
+function admitForumPost(state, local, frame) {
+  if (localModeOf(local) !== 'forum') {
+    state.counters.postRejected++;
+    return { ok: false, reason: 'post 通道属于讨论模式——本机该实例为协作（managed），类型语义不符' };
+  }
+  const kind = frame.payload?.post?.kind;
+  if (typeof kind !== 'string' || !POST_KINDS.includes(kind)) {
+    state.counters.postRejected++;
+    return { ok: false, reason: `post.kind 不在标签词表（${POST_KINDS.join(' / ')}）` };
   }
   return { ok: true };
 }

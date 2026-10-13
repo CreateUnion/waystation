@@ -1,10 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { COLLABS_DIR_NAME, collabDir, collabFilePath } from '../src/paths.js';
 import { makeTempDir } from './helpers.js';
 import { createCollabService } from '../src/collab/service.js';
+import { POSTS_FILE_NAME } from '../src/collab/posts.js';
 import { LEDGER_FILE_NAME, MEMBER_FILE_NAME, appendLedger, ledgerDigest, loadLedger } from '../src/collab/store.js';
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -13,15 +14,23 @@ function quietLog() {
   return { info: () => {}, warn: () => {}, error: () => {} };
 }
 
-/* 服务单测脚手架：真临时目录 + 假发送（捕获出队消息）+ 假清单；hooks 直调模拟接收管线
- * （admit 通过才 consume——与真实管线同序；落盘/ack 属接收管线自身用例，不在此重复）。 */
+/* 服务单测脚手架：真临时目录 + 假发送（捕获出队消息）+ 假直投（捕获直投消息）+ 假清单；
+ * hooks 直调模拟接收管线（admit 通过才 consume——与真实管线同序；落盘/ack 属接收管线自身用例，
+ * 不在此重复）。overrides.self 供双节点夹具区分身份；sendDirect: null = 直投面不可用（降级面）。 */
 function makeService(t, overrides = {}) {
   const dir = makeTempDir(t);
   const sent = [];
+  const direct = [];
   const remembered = [];
-  const self = { instanceId: 'inst-self', identityName: '本机', port: 17321 };
+  const self = overrides.self ?? { instanceId: 'inst-self', identityName: '本机', port: 17321 };
   const config = { inviteTtlMs: DAY, ...(overrides.config ?? {}) };
   const knownHosts = { remember: (entry) => remembered.push(entry) };
+  const sendDirect = overrides.sendDirect === undefined
+    ? (message) => {
+        direct.push(message);
+        return { ok: true, msgId: `d-${direct.length}` };
+      }
+    : overrides.sendDirect;
   const service = createCollabService({
     dataDir: dir,
     config,
@@ -30,12 +39,13 @@ function makeService(t, overrides = {}) {
       sent.push(message);
       return { ok: true, msgId: `q-${sent.length}` };
     },
+    sendDirect,
     knownHosts,
     log: quietLog(),
     ledgerFetchTimeoutMs: overrides.ledgerFetchTimeoutMs ?? 60,
     inviteMinIntervalMs: overrides.inviteMinIntervalMs ?? 0,
   });
-  return { service, sent, remembered, dir, self, config };
+  return { service, sent, direct, remembered, dir, self, config };
 }
 
 let seq = 0;
@@ -125,7 +135,7 @@ function writeRivalMember(dir, name = '联调项目') {
   }));
 }
 
-/* 以既有工作目录重建服务（重载恢复与竞态构造共用；发送仍汇入原 sent 数组便于断言）。 */
+/* 以既有工作目录重建服务（重载恢复与竞态构造共用；发送与直投仍汇入原数组便于断言）。 */
 function reloadService(made) {
   return createCollabService({
     dataDir: made.dir,
@@ -134,6 +144,10 @@ function reloadService(made) {
     send: (message) => {
       made.sent.push(message);
       return { ok: true, msgId: `q-${made.sent.length}` };
+    },
+    sendDirect: (message) => {
+      made.direct.push(message);
+      return { ok: true, msgId: `d-${made.direct.length}` };
     },
     knownHosts: { remember: () => {} },
     log: quietLog(),
@@ -1123,4 +1137,221 @@ test('ws_invite：managed / 未知 / 归档 / 成员侧 / 目标形态一律明�
   const onMember = await memberSide.service.invite({ collabId: 'collab-f8', targets: [targetOf('c')] });
   assert.equal(onMember.ok, false);
   assert.ok(onMember.message.includes('发起人'), onMember.message);
+});
+
+/* —— 讨论模式（帖通道：发帖直投、接收幂等与本地列表、显示序、本地视图）—— */
+
+function forumPostFrame(collabId, from, { postId, postSeq, kind = 'reply', text }, ts = null) {
+  const frame = collabFrame('post', collabId, from, { post: { postId, seq: postSeq, kind, text } });
+  if (ts !== null) {
+    frame.ts = ts;
+  }
+  return frame;
+}
+
+test('讨论发帖：本地先落列表（postId/序号/ts 分配即定）、除本机逐成员直投、载荷帖形态、topic 帖零元状态变化', async (t) => {
+  const made = makeService(t);
+  const collabId = createForum(made.service, { targets: [targetOf('b'), targetOf('c')] });
+  const before = loadLedger(made.dir, collabId).ledger;
+  const posted = await made.service.send({ collabId, text: '第一条议题贴', type: 'topic' });
+  assert.equal(posted.ok, true, posted.message);
+  assert.match(posted.postId, /^[0-9a-f-]{36}$/);
+  assert.equal(posted.seq, 1);
+  assert.ok(!Number.isNaN(Date.parse(posted.ts)));
+  assert.deepEqual(posted.to.sort(), ['inst-b', 'inst-c']);
+  assert.equal(made.direct.length, 2, '除本机外逐成员一投');
+  for (const message of made.direct) {
+    assert.equal(message.type, 'post');
+    assert.equal(message.payload.post.postId, posted.postId);
+    assert.equal(message.payload.post.seq, 1);
+    assert.equal(message.payload.post.kind, 'topic');
+    assert.equal(message.payload.post.text, '第一条议题贴');
+    assert.equal(message.createdAt, posted.ts, '帧 ts 随帖携带（作者侧强制单调的落盘 ts）');
+  }
+  const view = await made.service.view({ collabId });
+  assert.equal(view.ok, true);
+  assert.equal(view.mode, 'forum');
+  assert.equal(view.source, 'local');
+  assert.ok(view.note.includes('本地视图'));
+  assert.equal(view.posts.length, 1);
+  const entry = view.posts[0];
+  assert.equal(entry.entryId, posted.postId, '本地条目 id 取载荷 postId（原样采用、不本地重编）');
+  assert.equal(entry.seq, 1);
+  assert.equal(entry.ts, posted.ts);
+  assert.deepEqual(entry.from, { instanceId: 'inst-self', identityName: '本机' });
+  assert.equal(entry.kind, 'topic');
+  assert.equal(entry.text, '第一条议题贴');
+  assert.deepEqual(view.members.map((member) => member.instanceId).sort(), ['inst-b', 'inst-c', 'inst-self']);
+  assert.equal(view.endpoints['inst-b'].port, 17321);
+  assert.deepEqual(loadLedger(made.dir, collabId).ledger, before, 'topic 帖零元状态变化（只追加，不改任何元状态）');
+  assert.equal(made.service.stats().postsSent, 1);
+});
+
+test('讨论发帖：作者序号严格递增、ts 强制单调（回拨取上一条 +1ms）', async (t) => {
+  const made = makeService(t);
+  const collabId = createForum(made.service);
+  const first = await made.service.send({ collabId, text: '一' });
+  const second = await made.service.send({ collabId, text: '二' });
+  assert.equal(first.seq, 1);
+  assert.equal(second.seq, 2);
+  assert.ok(Date.parse(second.ts) > Date.parse(first.ts), '连续发帖 ts 严格递增');
+  /* 回拨注入：落盘基线带未来 ts（时钟回拨后的等价形态），重载后新帖必须严格大于基线。 */
+  const futureMs = Date.now() + DAY;
+  const futureTs = new Date(futureMs).toISOString();
+  appendFileSync(collabFilePath(made.dir, collabId, POSTS_FILE_NAME), `${JSON.stringify({ entryId: 'post-fixture', seq: 5, ts: futureTs, from: { instanceId: 'inst-self', identityName: '本机' }, kind: 'reply', text: '未来基线的帖（夹具）' })}\n`);
+  const reloaded = reloadService(made);
+  const third = await reloaded.send({ collabId, text: '三' });
+  assert.equal(third.seq, 6, '序号以已落列表的作者基线续增');
+  assert.equal(Date.parse(third.ts), futureMs + 1, '回拨场景取 max(上一条 +1ms, now)');
+});
+
+test('讨论发帖：to 一律拒绝并提示；kind 越表 / text 越限拒绝；拒绝路径零本地变更', async (t) => {
+  const made = makeService(t);
+  const collabId = createForum(made.service);
+  const routed = await made.service.send({ collabId, text: '定向', to: 'inst-b' });
+  assert.equal(routed.ok, false);
+  assert.ok(routed.message.includes('定向'), routed.message);
+  const badKind = await made.service.send({ collabId, text: 'x', type: 'freeze' });
+  assert.equal(badKind.ok, false);
+  assert.ok(badKind.message.includes('类型'), badKind.message);
+  assert.equal((await made.service.send({ collabId, text: 'x'.repeat(4001) })).ok, false);
+  assert.equal((await made.service.send({ collabId, text: '   ' })).ok, false);
+  assert.equal(made.direct.length, 0);
+  assert.equal((await made.service.view({ collabId })).posts.length, 0, '拒绝路径不落帖');
+  assert.equal(made.service.stats().postsSent, 0);
+});
+
+test('讨论发帖：归档后拒绝新帖（本地入口与入站两侧）', async (t) => {
+  const made = makeService(t);
+  const collabId = createForum(made.service);
+  await made.service.withdraw({ collabId });   // 整条撤回 → 已终止
+  const rejected = await made.service.send({ collabId, text: '结束后的帖' });
+  assert.equal(rejected.ok, false);
+  assert.ok(rejected.message.includes('不再接受'), rejected.message);
+  const late = await receive(made.service, forumPostFrame(collabId, peer('inst-a', '主机甲'), { postId: 'post-late', postSeq: 1, text: 'x' }));
+  assert.equal(late.ok, false);
+  assert.equal(made.service.stats().lateDropped, 1);
+});
+
+test('讨论收帖：入本地列表、重复副本不重复入列；kind 越表在准入门拒绝计数；post 帧到 managed 实例拒绝计数', async (t) => {
+  const made = makeService(t);
+  await receive(made.service, inviteFrame({ collabId: 'collab-f1', mode: 'forum' }));
+  const frame = forumPostFrame('collab-f1', peer('inst-a', '主机甲'), { postId: 'post-x', postSeq: 3, kind: 'issue', text: '甲的问题' });
+  const admitted = await receive(made.service, frame);
+  assert.equal(admitted.ok, true);
+  const view = await made.service.view({ collabId: 'collab-f1' });
+  assert.equal(view.posts.length, 1);
+  assert.deepEqual(view.posts[0].from, { instanceId: 'inst-a', identityName: '主机甲' });
+  assert.equal(view.posts[0].seq, 3);
+  assert.equal(view.posts[0].ts, frame.ts);
+  assert.equal(made.service.stats().postsIn, 1);
+  const copy = await receive(made.service, { ...frame, msgId: `${frame.msgId}-copy` });
+  assert.equal(copy.ok, true, '重复路径副本照常受理（msgId 不同——帖级去重由列表承担）');
+  assert.equal((await made.service.view({ collabId: 'collab-f1' })).posts.length, 1);
+  assert.equal(made.service.stats().postsDuplicated, 1);
+  const badKind = forumPostFrame('collab-f1', peer('inst-a', '主机甲'), { postId: 'post-y', postSeq: 4, kind: '笔记', text: 'x' });
+  const refused = await receive(made.service, badKind);
+  assert.equal(refused.ok, false);
+  assert.ok(refused.reason.includes('词表'), refused.reason);
+  assert.equal(made.service.stats().postRejected, 1);
+
+  const managed = makeService(t);
+  const managedId = managed.service.create({ name: '协作甲', topic: '主题', targets: [targetOf('b')] }).collabId;
+  const toManaged = forumPostFrame(managedId, peer('inst-a', '主机甲'), { postId: 'post-z', postSeq: 1, text: 'x' });
+  const refusedManaged = await receive(managed.service, toManaged);
+  assert.equal(refusedManaged.ok, false);
+  assert.ok(refusedManaged.reason.includes('讨论'), refusedManaged.reason);
+  assert.equal(managed.service.stats().postRejected, 1);
+});
+
+test('讨论双节点并发发帖：互投收敛、重复副本无害、两端显示序一致（成员表注入缝装配）', async (t) => {
+  const wire = [];   // 直投 fake 只记账不投出——flush 时手工互投（构造并发的同一时刻）
+  const selfA = { instanceId: 'inst-a', identityName: '主机甲', port: 17321 };
+  const selfB = { instanceId: 'inst-b', identityName: '主机乙', port: 17322 };
+  const madeA = makeService(t, { self: selfA, sendDirect: (message) => { wire.push({ self: selfA, message }); return { ok: true, msgId: `wa-${wire.length}` }; } });
+  const madeB = makeService(t, { self: selfB, sendDirect: (message) => { wire.push({ self: selfB, message }); return { ok: true, msgId: `wb-${wire.length}` }; } });
+  const collabId = createForum(madeA.service, { targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17322 }] });
+  await receive(madeB.service, inviteFrame({ collabId, mode: 'forum', manager: peer('inst-a', '主机甲'), members: [peer('inst-a', '主机甲'), peer('inst-b', '主机乙', 17322)] }));
+  const postedA = await madeA.service.send({ collabId, text: '甲的第一帖' });
+  const postedB = await madeB.service.send({ collabId, text: '乙的第一帖' });
+  assert.equal(postedA.ok, true);
+  assert.equal(postedB.ok, true);
+  assert.equal(wire.length, 2, '各投一份给对方');
+  for (const leg of [...wire]) {
+    const target = leg.self.instanceId === 'inst-a' ? madeB.service : madeA.service;
+    for (let copyIndex = 0; copyIndex < 2; copyIndex++) {
+      const frame = {
+        v: 1,
+        type: 'post',
+        msgId: `${leg.message.payload.post.postId}-c${copyIndex}`,
+        from: { ...leg.self },
+        collabId: leg.message.collabId,
+        ts: leg.message.createdAt,
+        payload: leg.message.payload,
+      };
+      assert.equal((await receive(target, frame)).ok, true);
+    }
+  }
+  const viewA = await madeA.service.view({ collabId });
+  const viewB = await madeB.service.view({ collabId });
+  assert.deepEqual(viewA.posts, viewB.posts, '两端对同一帖集合收敛出同一显示序');
+  assert.equal(viewA.posts.length, 2);
+  assert.deepEqual(viewA.posts.map((entry) => entry.from.instanceId).sort(), ['inst-a', 'inst-b']);
+  assert.equal(madeA.service.stats().postsDuplicated, 1, '重复路径副本不重复入列');
+  assert.equal(madeB.service.stats().postsDuplicated, 1);
+  assert.equal(madeA.service.stats().postsIn, 1);
+});
+
+test('讨论视图：显示序按 ts 排序（同刻按 postId 兜底）、成员表与端点齐备、标注本地视图', async (t) => {
+  const made = makeService(t);
+  await receive(made.service, inviteFrame({ collabId: 'collab-f4', mode: 'forum' }));
+  const lateTs = new Date(Date.now() + 2000).toISOString();
+  const earlyTs = new Date().toISOString();
+  await receive(made.service, forumPostFrame('collab-f4', peer('inst-a', '主机甲'), { postId: 'post-late', postSeq: 2, text: '晚的' }, lateTs));
+  await receive(made.service, forumPostFrame('collab-f4', peer('inst-a', '主机甲'), { postId: 'post-early', postSeq: 1, text: '早的' }, earlyTs));
+  const view = await made.service.view({ collabId: 'collab-f4' });
+  assert.deepEqual(view.posts.map((entry) => entry.entryId), ['post-early', 'post-late'], '显示序按 ts 排序（与到达序无关）');
+  assert.ok(view.note.includes('本地视图，未与全员核对'));
+  assert.deepEqual(view.members.map((member) => member.instanceId).sort(), ['inst-a', 'inst-self']);
+  assert.equal(view.endpoints['inst-a'].address, '127.0.0.1');
+});
+
+test('讨论发帖：端点未知的成员如实标注待对表、不影响其余成员投出（成员侧扇出）', async (t) => {
+  const made = makeService(t);
+  await receive(made.service, inviteFrame({ collabId: 'collab-f3', mode: 'forum', members: [peer('inst-a', '主机甲'), peer('inst-self', '本机', 17321), peer('inst-c', '主机丙')] }));
+  const posted = await made.service.send({ collabId: 'collab-f3', text: '乙的帖' });
+  assert.equal(posted.ok, true);
+  const results = Object.fromEntries(posted.results.map((entry) => [entry.instanceId, entry]));
+  assert.equal(results['inst-a'].ok, true);
+  assert.equal(results['inst-c'].ok, false);
+  assert.ok(results['inst-c'].reason.includes('待对表'), results['inst-c'].reason);
+  assert.equal(made.direct.length, 1, '仅对端点已知成员直投');
+  assert.equal(made.direct[0].to.instanceId, 'inst-a');
+});
+
+test('讨论发帖：直投面不可用（注入缺失）——帖仍落本机列表、计数留痕、结果逐目标如实标注', async (t) => {
+  const made = makeService(t, { sendDirect: null });
+  const collabId = createForum(made.service);
+  const posted = await made.service.send({ collabId, text: '降级帖' });
+  assert.equal(posted.ok, true, '帖的事务点在本机列表（直投尽力）');
+  assert.equal(posted.results[0].ok, false);
+  assert.ok(posted.results[0].reason.includes('直投面不可用'));
+  assert.equal(made.service.stats().postFanoutSkipped, 1);
+  assert.equal((await made.service.view({ collabId })).posts.length, 1);
+});
+
+test('讨论发帖：帖子列表落盘、重载恢复（序号续增、重复副本判定仍生效）', async (t) => {
+  const made = makeService(t);
+  const collabId = createForum(made.service);
+  const posted = await made.service.send({ collabId, text: '第一条' });
+  assert.equal(existsSync(collabFilePath(made.dir, collabId, POSTS_FILE_NAME)), true);
+  const reloaded = reloadService(made);
+  const view = await reloaded.view({ collabId });
+  assert.equal(view.posts.length, 1);
+  assert.equal(view.posts[0].entryId, posted.postId);
+  const next = await reloaded.send({ collabId, text: '第二条' });
+  assert.equal(next.seq, 2, '重载后序号自作者基线续增');
+  await receive(reloaded, forumPostFrame(collabId, peer('inst-self', '本机', 17321), { postId: posted.postId, postSeq: 1, text: '第一条' }));
+  assert.equal((await reloaded.view({ collabId })).posts.length, 2, '重载后同（作者, postId）的重复副本仍不入列');
+  assert.equal(reloaded.stats().postsDuplicated, 1);
 });

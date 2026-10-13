@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, existsSync } from 'node:fs';
 import { createDispatch } from '../src/net/dispatch.js';
 import { newMsgId } from '../src/net/protocol.js';
 import { OUTBOX_FILE_NAME } from '../src/net/outbox.js';
@@ -52,8 +52,31 @@ function createFakeConnection(address) {
   };
 }
 
+/* 拨号失败注入（两种口径共用一份计数）：setNextDialFails 常开（用例自行复位）、failDials 按次递减。 */
+function createDialFailures() {
+  let sticky = false;
+  let remaining = 0;
+  return {
+    stickyOn(value) {
+      sticky = value;
+    },
+    setCount(count) {
+      remaining = count;
+    },
+    due() {
+      if (!sticky && remaining === 0) {
+        return false;
+      }
+      if (remaining > 0) {
+        remaining--;
+      }
+      return true;
+    },
+  };
+}
+
 function createFakeTransport() {
-  let nextDialFails = false;
+  const failures = createDialFailures();
   let deferred = null;   // 挂起拨号：构造「stop / ack / 重入检查与在途拨号并发」的时间窗口
   const dials = [];
   const connections = [];
@@ -61,7 +84,10 @@ function createFakeTransport() {
     dials,
     connections,
     setNextDialFails(value) {
-      nextDialFails = value;
+      failures.stickyOn(value);
+    },
+    failDials(count) {
+      failures.setCount(count);
     },
     deferNextDial() {
       const gate = {};
@@ -75,7 +101,7 @@ function createFakeTransport() {
     stats: () => ({ fake: true }),
     dial({ address, port }) {
       dials.push({ address, port });
-      if (nextDialFails) {
+      if (failures.due()) {
         return Promise.reject(Object.assign(new Error('连接被拒'), { code: 'ECONNREFUSED' }));
       }
       const connection = createFakeConnection(address);
@@ -90,7 +116,7 @@ function createFakeTransport() {
   };
 }
 
-function makeDispatch(t, { transport, config, self } = {}) {
+function makeDispatch(t, { transport, config, self, direct } = {}) {
   const dataDir = makeTempDir(t);
   const logs = [];
   const log = {
@@ -104,6 +130,7 @@ function makeDispatch(t, { transport, config, self } = {}) {
     transport: transport ?? createFakeTransport(),
     self: self ?? { instanceId: 'inst-self', identityName: '本机', port: 7321 },
     log,
+    ...(direct ?? {}),
   });
   return { dispatch, dataDir, logs, log };
 }
@@ -659,4 +686,218 @@ test('send：携带原发身份（治理转达）时投递帧 from 为原发者�
   const frame = transport.connections[0].frames[0];
   assert.equal(frame.msgId, sent.msgId);
   assert.deepEqual(frame.from, originFrom, '转达帧的原发身份在重启续投后仍保留');
+});
+
+/* —— 直投（讨论模式帖通道）：不落队列、短重试、短时投递记录 —— */
+
+function directTarget(overrides = {}) {
+  return {
+    collabId: 'collab-f',
+    to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 },
+    type: 'post',
+    payload: { post: { postId: 'post-1', seq: 1, kind: 'reply', text: '你好' } },
+    ...overrides,
+  };
+}
+
+/* 直投参数快节律（测试收敛）：60ms 等待窗 / 间隔。 */
+function directOptions(overrides = {}) {
+  return { directRetryIntervalMs: 60, directMaxAttempts: 3, ...overrides };
+}
+
+test('sendDirect：即时投出（不落队列）、帧 ts 随帖携带、ack 推进 at-peer、回报推进 session', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const { dispatch, dataDir } = makeDispatch(t, { transport, direct: directOptions() });
+  t.after(() => dispatch.stop());
+  const ts = new Date(Date.now() - 1000).toISOString();   // 帖的落盘 ts（帧 ts 随帖携带；落在保留窗内）
+  const sent = dispatch.sendDirect(directTarget({ createdAt: ts }));
+  assert.equal(sent.ok, true);
+  assert.equal(typeof sent.msgId, 'string');
+  const early = dispatch.deliveryStatus({ msgId: sent.msgId })[0];
+  assert.equal(early.tier, 'inflight', '受理即登记短时记录（直投中）');
+  await waitFor(() => transport.connections[0]?.frames.length === 1);
+  const frame = transport.connections[0].frames[0];
+  assert.equal(frame.msgId, sent.msgId);
+  assert.equal(frame.type, 'post');
+  assert.equal(frame.collabId, 'collab-f');
+  assert.equal(frame.ts, ts, '帧 ts 随帖携带（作者侧强制单调的落盘 ts）');
+  assert.equal(frame.payload.post.text, '你好');
+  assert.deepEqual(frame.from, { instanceId: 'inst-self', identityName: '本机', port: 7321 });
+  assert.equal(existsSync(collabFilePath(dataDir, 'collab-f', OUTBOX_FILE_NAME)), false, '直投不落持久队列');
+  dispatch.onAck(sent.msgId);
+  const acked = dispatch.deliveryStatus({ msgId: sent.msgId })[0];
+  assert.equal(acked.tier, 'at-peer');
+  assert.equal(acked.toInstanceId, 'inst-b');
+  assert.ok(acked.ackedAt !== null);
+  assert.equal(acked.note, null);
+  dispatch.onAck(sent.msgId);
+  assert.equal(dispatch.deliveryStatus({ msgId: sent.msgId })[0].tier, 'at-peer', '重复确认幂等');
+  dispatch.onDeliveryReport({ refMsgId: sent.msgId, tier: 'session' });
+  const delivered = dispatch.deliveryStatus({ msgId: sent.msgId })[0];
+  assert.equal(delivered.tier, 'session');
+  assert.ok(delivered.deliveredAt !== null);
+  dispatch.onDeliveryReport({ refMsgId: sent.msgId, tier: 'session' });
+  assert.equal(dispatch.deliveryStatus({ msgId: sent.msgId })[0].tier, 'session', '重复回报幂等');
+  assert.equal(dispatch.stats().directAcked >= 1, true);
+  assert.equal(dispatch.stats().directSession >= 1, true);
+});
+
+test('sendDirect：会话回报先于 ack 观测到达——直接进第三档（ackedAt 按同一时刻记）', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const { dispatch } = makeDispatch(t, { transport, direct: directOptions() });
+  t.after(() => dispatch.stop());
+  const sent = dispatch.sendDirect(directTarget({ to: { instanceId: 'inst-e', address: '127.0.0.5', port: 7321 } }));
+  dispatch.onDeliveryReport({ refMsgId: sent.msgId, tier: 'session' });
+  const upgraded = dispatch.deliveryStatus({ msgId: sent.msgId })[0];
+  assert.equal(upgraded.tier, 'session', '会话回报蕴含驿站已确认（先 ack 后回报）');
+  assert.ok(upgraded.ackedAt !== null, 'ack 未被本机观测到时按同一时刻记');
+  dispatch.onDeliveryReport({ refMsgId: sent.msgId, tier: 'session' });
+  assert.equal(dispatch.deliveryStatus({ msgId: sent.msgId })[0].tier, 'session', '重复回报幂等');
+});
+
+test('sendDirect：拨号失败按短节律重试并重拨、恢复后送达；尝试计数含失败', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  transport.failDials(2);
+  const { dispatch } = makeDispatch(t, { transport, direct: directOptions() });
+  t.after(() => dispatch.stop());
+  const sent = dispatch.sendDirect(directTarget());
+  await waitFor(() => transport.connections.length === 1, { timeoutMs: 3000 });
+  assert.equal(transport.dials.length, 3, '两次失败 + 一次成功');
+  const row = dispatch.deliveryStatus({ msgId: sent.msgId })[0];
+  assert.equal(row.attempts, 3, '拨号失败也计一次尝试');
+  assert.ok(row.reason.includes('拨号失败'), '失败原因如实登记');
+  dispatch.onAck(sent.msgId);
+  const settled = dispatch.deliveryStatus({ msgId: sent.msgId })[0];
+  assert.equal(settled.tier, 'at-peer');
+  assert.equal(settled.reason, null, '投达后清掉历史失败原因');
+});
+
+test('sendDirect：无 ack 即重试（重拨）；尝试耗尽收尾为未达（待对表）且不再重试', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const { dispatch } = makeDispatch(t, { transport, direct: directOptions({ directMaxAttempts: 2 }) });
+  t.after(() => dispatch.stop());
+  const sent = dispatch.sendDirect(directTarget());
+  await waitFor(() => transport.connections.length === 2, { timeoutMs: 3000 });
+  assert.ok(transport.connections[0].closed, '重试必重拨（半开连接检测口径）');
+  assert.equal(transport.connections[0].frames[0].msgId, sent.msgId);
+  assert.equal(transport.connections[1].frames[0].msgId, sent.msgId);
+  await waitFor(() => dispatch.deliveryStatus({ msgId: sent.msgId })[0].tier === 'undelivered', { timeoutMs: 3000 });
+  const row = dispatch.deliveryStatus({ msgId: sent.msgId })[0];
+  assert.equal(row.attempts, 2);
+  assert.equal(row.expired, false);
+  assert.ok(row.note.includes('待对表'));
+  assert.ok(row.reason.includes('超时'));
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(transport.connections.length, 2, '尝试耗尽后不再重试（不逐帖承诺送达）');
+});
+
+test('sendDirect：迟到 ack 把未达升级为已投达（如实呈现、不回退）', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const { dispatch } = makeDispatch(t, { transport, direct: directOptions({ directMaxAttempts: 1 }) });
+  t.after(() => dispatch.stop());
+  const sent = dispatch.sendDirect(directTarget());
+  await waitFor(() => dispatch.deliveryStatus({ msgId: sent.msgId })[0].tier === 'undelivered', { timeoutMs: 3000 });
+  dispatch.onAck(sent.msgId);
+  const row = dispatch.deliveryStatus({ msgId: sent.msgId })[0];
+  assert.equal(row.tier, 'at-peer', '等待面收尾后到达的确认：真实送达不得呈现为未达');
+  assert.equal(row.note, null);
+});
+
+test('sendDirect：调度器停止即在途直投收尾为未达、不再重试', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const { dispatch } = makeDispatch(t, { transport, direct: directOptions() });
+  const sent = dispatch.sendDirect(directTarget());
+  await waitFor(() => transport.connections[0]?.frames.length === 1);
+  await dispatch.stop();
+  await waitFor(() => dispatch.deliveryStatus({ msgId: sent.msgId })[0].tier === 'undelivered', { timeoutMs: 2000 });
+  const row = dispatch.deliveryStatus({ msgId: sent.msgId })[0];
+  assert.ok(row.reason.includes('停止'));
+});
+
+test('sendDirect：参数与终帧预检逐拒（传输类 / 本机 / 未知类型 / 帧不合协议），拒绝不拨号不登记', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const { dispatch } = makeDispatch(t, { transport, direct: directOptions() });
+  t.after(() => dispatch.stop());
+  const cases = [
+    directTarget({ type: 'ping' }),
+    directTarget({ to: { instanceId: 'inst-self', address: '127.0.0.1', port: 7321 } }),
+    directTarget({ type: '未知' }),
+    directTarget({ payload: { text: '缺帖形态' } }),
+    directTarget({ to: { instanceId: 'inst-b', address: 'not-an-ip', port: 7321 } }),
+    { collabId: 'bad id!', to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 }, type: 'post', payload: { post: { postId: 'p1', seq: 1, kind: 'reply', text: 'x' } } },
+  ];
+  for (const input of cases) {
+    const rejected = dispatch.sendDirect(input);
+    assert.equal(rejected.ok, false, JSON.stringify(input).slice(0, 80));
+    assert.equal(typeof rejected.reason, 'string', JSON.stringify(input).slice(0, 80));
+  }
+  assert.deepEqual(dispatch.deliveryStatus({}), [], '拒绝路径不登记投递记录');
+  assert.equal(transport.dials.length, 0);
+  assert.equal(dispatch.stats().directRejected, 6);
+  const brokenPort = makeDispatch(t, { transport: createFakeTransport(), direct: directOptions(), self: { instanceId: 'inst-self', identityName: '本机', port: 0 } });
+  const rejected = brokenPort.dispatch.sendDirect(directTarget());
+  assert.equal(rejected.ok, false);
+  assert.ok(rejected.reason.includes('from.port'), rejected.reason);
+});
+
+test('sendDirect：投递记录按保留窗剪枝、按容量淘汰最旧；collabId 过滤生效', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const { dispatch } = makeDispatch(t, { transport, direct: directOptions({ directRecordTtlMs: 100, directRecordMax: 2 }) });
+  t.after(() => dispatch.stop());
+  const first = dispatch.sendDirect(directTarget());
+  const second = dispatch.sendDirect(directTarget({ to: { instanceId: 'inst-c', address: '127.0.0.3', port: 7321 } }));
+  const third = dispatch.sendDirect(directTarget({ collabId: 'collab-g', to: { instanceId: 'inst-d', address: '127.0.0.4', port: 7321 } }));
+  assert.deepEqual(dispatch.deliveryStatus({ msgId: first.msgId }), [], '容量 2：最旧记录被淘汰');
+  assert.deepEqual(dispatch.deliveryStatus({ collabId: 'collab-f' }).map((row) => row.msgId), [second.msgId]);
+  assert.equal(dispatch.deliveryStatus({ collabId: 'collab-g' })[0].msgId, third.msgId, 'collabId 过滤逐记录生效');
+  assert.equal(dispatch.stats().directRecords, 2);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.deepEqual(dispatch.deliveryStatus({ collabId: 'collab-f' }), [], '超保留窗的记录从查询面消失（短时记录）');
+});
+
+test('sendDirect：重试间隙收到确认即收尾——不再重发（等待面之外的确认路径）', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const { dispatch } = makeDispatch(t, { transport, direct: directOptions({ directRetryIntervalMs: 300 }) });
+  t.after(() => dispatch.stop());
+  const sent = dispatch.sendDirect(directTarget());
+  await waitFor(() => transport.connections[0]?.frames.length === 1);
+  await waitFor(() => (dispatch.deliveryStatus({ msgId: sent.msgId })[0].reason ?? '').includes('超时'), { timeoutMs: 2000 });
+  dispatch.onAck(sent.msgId);   // 等待窗超时之后、下一次尝试之前：确认在重试间隙到达
+  await new Promise((resolve) => setTimeout(resolve, 450));
+  assert.equal(transport.connections.length, 1, '确认已收：不再重拨重发');
+  assert.equal(dispatch.deliveryStatus({ msgId: sent.msgId })[0].tier, 'at-peer');
+});
+
+test('sendDirect：拨号在途时调度器停止——不发帧、收尾为未达（发送截止点）', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const { dispatch } = makeDispatch(t, { transport, direct: directOptions() });
+  const gate = transport.deferNextDial();
+  const sent = dispatch.sendDirect(directTarget());
+  await waitFor(() => transport.dials.length === 1);
+  const stopping = dispatch.stop();
+  gate.release();
+  await stopping;
+  await waitFor(() => dispatch.deliveryStatus({ msgId: sent.msgId })[0].tier === 'undelivered', { timeoutMs: 2000 });
+  assert.equal(transport.connections[0].frames.length, 0, '停止后完成的拨号不发帧');
+  assert.ok(transport.connections[0].closed, '拨号收口就地关闭（不留无主连接）');
+});
+
+test('sendDirect：同对端两条并发——连接复用、活动计数正确收敛；队列 ack 不误关在途直投的连接', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const { dispatch } = makeDispatch(t, { transport, direct: directOptions({ directRetryIntervalMs: 2000 }) });
+  t.after(() => dispatch.stop());
+  dispatch.start();   // 启 tick：空闲连接回收在跑，直投连接不得被误关
+  const first = dispatch.sendDirect(directTarget());
+  const second = dispatch.sendDirect(directTarget({ payload: { post: { postId: 'post-2', seq: 2, kind: 'reply', text: '第二条' } } }));
+  await waitFor(() => transport.connections.length === 1 && transport.connections[0].frames.length === 2);
+  assert.equal(transport.dials.length, 1, '并发同单元共享同一次拨号（不双拨）');
+  const queued = dispatch.send({ collabId: 'collab-f', to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 }, type: 'reply', payload: { text: '排队消息' } });
+  await waitFor(() => transport.connections[0].frames.length === 3);
+  dispatch.onAck(queued.msgId);   // 队列 ack 触发的空闲回收：同对端仍有在途直投 → 连接保留
+  assert.equal(transport.connections[0].closed, false);
+  dispatch.onAck(first.msgId);
+  assert.equal(transport.connections[0].closed, false, '另一条直投仍在途');
+  dispatch.onAck(second.msgId);
+  await waitFor(() => transport.connections[0].closed, { timeoutMs: 2000 });   // 直投清零 + 队列无待投 → tick 回收
+  assert.equal(dispatch.deliveryStatus({ collabId: 'collab-f' }).length, 3);
 });
