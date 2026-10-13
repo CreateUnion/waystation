@@ -11,6 +11,10 @@ const repoRoot = fileURLToPath(new URL('..', import.meta.url));
  * 都写 stdout——一律违例。白名单取反意味着新增 console 方法默认被拦截（保守正确）。 */
 const STDOUT_PATTERN = /console\.(?!(?:error|warn|trace|assert)\b)[A-Za-z_$][\w$]*|console\s*\[|process\.stdout/;
 
+/* 扫描豁免（显式、可审）：src/uninstall.js 是 CLI 子命令模块——stdout 是它的用户输出通道、
+ * 不是 MCP 协议通道；该模块仅由 bin 在 uninstall 分支动态导入，不参与服务路径（index.js 不引用它）。 */
+const STDOUT_EXEMPT_FILES = ['src/uninstall.js'];
+
 // 目录缺失时返回空列表：起步阶段 src/ 可能尚不存在属预期；终态由下方「扫描非空」断言兜底
 function listSourceFiles(relativeDir) {
   const root = join(repoRoot, relativeDir);
@@ -41,9 +45,12 @@ test('stdout 纪律 matcher 自检：白名单语义正确（防止扫描本身�
   assert.equal(STDOUT_PATTERN.test('console.assert(1)'), false);
 });
 
-test('stdout 纪律：src/ 与 bin/ 中不得出现写 stdout 的 console 方法或 process.stdout', () => {
+test('stdout 纪律：src/ 与 bin/ 中不得出现写 stdout 的 console 方法或 process.stdout（豁免清单除外）', () => {
   const scanned = [...listSourceFiles('src'), ...listSourceFiles('bin')];
   assert.ok(scanned.length >= 1, '未扫描到任何源码文件——扫描根缺失或路径写错，测试不得静默通过');
-  const offenders = scanned.filter((file) => STDOUT_PATTERN.test(readFileSync(file, 'utf8')));
+  const exempt = new Set(STDOUT_EXEMPT_FILES.map((rel) => join(repoRoot, rel)));
+  const offenders = scanned
+    .filter((file) => !exempt.has(file))
+    .filter((file) => STDOUT_PATTERN.test(readFileSync(file, 'utf8')));
   assert.deepEqual(offenders, []);
 });
