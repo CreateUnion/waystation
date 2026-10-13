@@ -537,8 +537,9 @@ function degradedRoute(state, local, post, reason) {
  * 投稿标记（payload.relay）是唯一转达触发——直投副本与转达目标重叠，再转达只增重复流量，
  * 漏者由对表兜底。 */
 export function relayRedistribute(state, local, frame) {
+  state.counters.relayRedistributed++;
   if (typeof state.sendDirect !== 'function') {
-    state.counters.postFanoutSkipped++;
+    state.counters.postFanoutSkipped++;   // 转达面缺失同帖直投面口径（计数留痕、不静默）
     return 0;
   }
   const origin = { instanceId: frame.from.instanceId, identityName: frame.from.identityName, port: frame.from.port };
@@ -564,7 +565,6 @@ export function relayRedistribute(state, local, frame) {
       relayed++;
     }
   }
-  state.counters.relayRedistributed++;
   return relayed;
 }
 

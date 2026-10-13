@@ -37,6 +37,12 @@ function makeService(t, overrides = {}) {
   const sent = [];
   const direct = [];
   const notices = [];
+  const sendDirect = overrides.sendDirect === undefined
+    ? (message) => {
+        direct.push(message);
+        return { ok: true, msgId: `d-${direct.length}` };
+      }
+    : overrides.sendDirect;
   const service = createCollabService({
     dataDir: dir,
     config: { inviteTtlMs: DAY },
@@ -45,10 +51,7 @@ function makeService(t, overrides = {}) {
       sent.push(message);
       return { ok: true, msgId: `q-${sent.length}` };
     },
-    sendDirect: overrides.sendDirect ?? ((message) => {
-      direct.push(message);
-      return { ok: true, msgId: `d-${direct.length}` };
-    }),
+    sendDirect,
     probe: overrides.probe ?? null,
     notify: (frame) => {
       notices.push(frame);
@@ -152,9 +155,11 @@ function makeWire(up) {
   };
 }
 
-/* 可控探测面：可达集合 up 为唯一判据（与直投线同一把尺——「拨号失败/探测不可达」同类降级触发）。 */
-function probeFor(up) {
+/* 可控探测面：可达集合 up 为唯一判据（与直投线同一把尺——「拨号失败/探测不可达」同类降级触发）；
+ * stats.calls 记录探测次数（「降级中不重复探测」的判据面）。 */
+function probeFor(up, stats) {
   return async (address, port) => {
+    stats.calls++;
     const seat = SEATS.find((entry) => entry.port === port);
     if (seat === undefined || !up.has(seat.instanceId)) {
       return { reachable: false, reason: '测试：探测不可达' };
@@ -163,10 +168,11 @@ function probeFor(up) {
   };
 }
 
-/* 一轮对表并取本轮结论（同意即回填与 join 触发的在途轮次可能占位——同一实例同时只跑一轮）。 */
+/* 一轮对表并取本轮结论（同意即回填与 join 触发的在途轮次可能占位——同一实例同时只跑一轮）。
+ * 经 awaitSync 保活：应答等待面是 unref 定时器，纯等待会被 runner 判为空事件循环而取消。 */
 async function syncWhenIdle(service, collabId) {
   for (let attempt = 0; attempt < 40; attempt++) {
-    const outcome = await service.sync({ collabId });
+    const outcome = await awaitSync(service.sync({ collabId }));
     if (outcome.reason !== 'already-running') {
       return outcome;
     }
@@ -186,14 +192,18 @@ async function awaitSync(pending) {
 }
 
 /* 三节点工作室：A=发起人（中继）、B/C=成员。B/C 经实际邀请载荷（含成员/端点/发起人标识）加入，
- * join 自播手工投递到 A，B/C 各对表一轮拉回事件集与元状态——装配完成（折叠成员表三人齐）。 */
+ * join 自播手工投递到 A，B/C 各对表一轮拉回事件集与元状态——装配完成（折叠成员表三人齐）。
+ * options.probes 可逐席位替换探测面；options.noDirect 圈定无直投注入的席位（降级面用例）。 */
 async function makeStudio(t, options = {}) {
   const up = options.up ?? new Set(SEATS.map((seat) => seat.instanceId));
   const wire = makeWire(up);
-  const probe = probeFor(up);
-  const madeA = makeService(t, { self: SELF_A, sendDirect: wire.sendDirectFor(SELF_A), probe, syncPeerPicker: () => [SELF_B.instanceId, SELF_C.instanceId] });
-  const madeB = makeService(t, { self: SELF_B, sendDirect: wire.sendDirectFor(SELF_B), probe, syncPeerPicker: () => [SELF_A.instanceId, SELF_C.instanceId] });
-  const madeC = makeService(t, { self: SELF_C, sendDirect: wire.sendDirectFor(SELF_C), probe, syncPeerPicker: () => [SELF_A.instanceId, SELF_B.instanceId] });
+  const probeStats = { calls: 0 };
+  const probe = probeFor(up, probeStats);
+  const probeOf = (seat) => options.probes?.[seat.instanceId] ?? probe;
+  const directOf = (seat) => (options.noDirect?.has(seat.instanceId) ? null : wire.sendDirectFor(seat));
+  const madeA = makeService(t, { self: SELF_A, sendDirect: directOf(SELF_A), probe: probeOf(SELF_A), syncPeerPicker: () => [SELF_B.instanceId, SELF_C.instanceId] });
+  const madeB = makeService(t, { self: SELF_B, sendDirect: directOf(SELF_B), probe: probeOf(SELF_B), syncPeerPicker: () => [SELF_A.instanceId, SELF_C.instanceId] });
+  const madeC = makeService(t, { self: SELF_C, sendDirect: directOf(SELF_C), probe: probeOf(SELF_C), syncPeerPicker: () => [SELF_A.instanceId, SELF_B.instanceId] });
   wire.register(SELF_A, madeA.service);
   wire.register(SELF_B, madeB.service);
   wire.register(SELF_C, madeC.service);
@@ -207,11 +217,17 @@ async function makeStudio(t, options = {}) {
   await madeB.service.approve({ collabId, approve: true });
   await deliverInvite(wire, madeA, madeC, collabId);
   await madeC.service.approve({ collabId, approve: true });
-  await wire.hop(sentOf(madeB.sent, 'join', collabId)[0], SELF_B, madeA.service);
-  await wire.hop(sentOf(madeC.sent, 'join', collabId)[0], SELF_C, madeA.service);
+  const joinB = sentOf(madeB.sent, 'join', collabId)[0];
+  const joinC = sentOf(madeC.sent, 'join', collabId)[0];
+  await wire.hop(joinB, SELF_B, madeA.service);
+  await wire.hop(joinC, SELF_C, madeA.service);
+  /* 成员之间的 join 也直接投递一份：折叠成员表三人齐不依赖对表应答（无直投面的降级面用例
+   * 里应答方可能不可用，装配不得因此半途）。 */
+  await wire.hop(joinC, SELF_C, madeB.service);
+  await wire.hop(joinB, SELF_B, madeC.service);
   await syncWhenIdle(madeB.service, collabId);
   await syncWhenIdle(madeC.service, collabId);
-  return { wire, up, probe, collabId, a: madeA, b: madeB, c: madeC };
+  return { wire, up, probe, probeStats, collabId, a: madeA, b: madeB, c: madeC };
 }
 
 /* 邀请帧上线：取发送侧实际入队的 invite 消息（载荷与真实链路同源——含成员/端点/发起人标识）。 */
@@ -283,12 +299,12 @@ test('②降级：中继不可达（探测失败）→ 当场降级直投、本�
 
   /* 中继缺席期间的帖：不承诺中继收到——回归后经对表追平（拉取兜底不变）。 */
   up.add(SELF_A.instanceId);
-  await awaitSync(a.service.sync({ collabId }));
+  await syncWhenIdle(a.service, collabId);   // 单轮可能撞上在途轮次（join 触发行）——等到本轮真跑起来
   assert.equal((await a.service.view({ collabId })).posts.length, 1, '中继回归经对表追平降级期的帖');
 
   /* ③恢复：降级态下周期对表顺带探测 → 可达 → 清除降级态（计数），下一帖回中继路径。 */
   const beforeRecovery = b.service.stats().relayRecoveries;
-  await awaitSync(b.service.sync({ collabId }));
+  await syncWhenIdle(b.service, collabId);
   assert.equal(b.service.stats().relayRecoveries, beforeRecovery + 1, '恢复检测通过（可观测计数）');
   const back = await b.service.send({ collabId, text: '恢复后的帖' });
   assert.equal(back.route, 'relay', '路径切回中继');
@@ -298,6 +314,55 @@ test('②降级：中继不可达（探测失败）→ 当场降级直投、本�
   await waitFor(async () => ((await c.service.view({ collabId })).posts.length === 2 ? true : null), { timeoutMs: 2000 });
   assert.equal(a.service.stats().relayRedistributed, 1, '恢复后的帖经转达分发（降级期的帖不经转达）');
   assert.equal(c.service.stats().postsIn, 2, '降级直投副本 + 恢复后转达副本各一份（重复吸收）');
+});
+
+test('降级持续期：降级态下发帖不重复探测（直投照走），计数不重复累积', async (t) => {
+  const { up, probeStats, collabId, b, c } = await makeStudio(t);
+  up.delete(SELF_A.instanceId);
+  const first = await b.service.send({ collabId, text: '降级一' });
+  assert.equal(first.route, 'degraded');
+  const probesAfterFirst = probeStats.calls;
+  assert.equal(probesAfterFirst > 0, true, '首帖探测中继（不可达判定）');
+  const second = await b.service.send({ collabId, text: '降级二' });
+  assert.equal(second.route, 'degraded');
+  assert.ok(second.note.includes('降级中'), second.note);
+  assert.equal(probeStats.calls, probesAfterFirst, '降级中不重复探测（恢复检测归周期对表 tick）');
+  assert.equal(b.service.stats().relayDegrades, 1, '不重复置降级态');
+  assert.equal(b.service.stats().relayDegradedPosts, 2);
+  await waitFor(async () => ((await c.service.view({ collabId })).posts.length === 2 ? true : null));
+});
+
+test('探测异常一律归「不可达」（不穿出调用链）：当场降级直投', async (t) => {
+  const { collabId, b, c } = await makeStudio(t, {
+    probes: { [SELF_B.instanceId]: async () => { throw new Error('探测面故障'); } },
+  });
+  const posted = await b.service.send({ collabId, text: '探测异常帖' });
+  assert.equal(posted.route, 'degraded');
+  assert.ok(posted.note.includes('探测异常'), posted.note);
+  assert.equal(b.service.stats().relayDegrades, 1);
+  await waitFor(async () => ((await c.service.view({ collabId })).posts.length === 1 ? true : null));
+});
+
+test('直投面不可用（注入缺失）：投稿面与直投面各自如实标注、帖仍落本机列表', async (t) => {
+  const memberSide = await makeStudio(t, { noDirect: new Set([SELF_B.instanceId]) });
+  const posted = await memberSide.b.service.send({ collabId: memberSide.collabId, text: '无直投面的帖' });
+  assert.equal(posted.route, 'degraded', '投稿未受理 → 本次直投（同样无直投面）');
+  assert.ok(posted.note.includes('投稿未受理'), posted.note);
+  assert.ok(posted.results.every((entry) => entry.reason.includes('直投面不可用')), JSON.stringify(posted.results));
+  assert.equal((await memberSide.b.service.view({ collabId: memberSide.collabId })).posts.length, 1, '帖的事务点在本机列表');
+});
+
+test('中继侧直投面不可用：转达跳过并计数，其余副本不受影响（对方经对表追平）', async (t) => {
+  const { wire, collabId, a, b, c } = await makeStudio(t, { noDirect: new Set([SELF_A.instanceId]) });
+  const posted = await b.service.send({ collabId, text: '中继无直投面' });
+  assert.equal(posted.route, 'relay', '投稿本身经作者侧直投面送达中继');
+  await waitFor(async () => ((await a.service.view({ collabId })).posts.length === 1 ? true : null));
+  assert.equal(a.service.stats().postFanoutSkipped, 1, '转达面缺失计数留痕');
+  assert.equal(a.service.stats().relayRedistributed, 1, '入列与计数照走（不得静默死锁）');
+  assert.equal(c.service.stats().postsIn, 0, '实时副本未达（中继侧无直投面）');
+  await syncWhenIdle(c.service, collabId);
+  assert.equal((await c.service.view({ collabId })).posts.length, 1, '对方经周期对表追平');
+  assert.equal(wire.postsTo(SELF_C.instanceId).length, 0);
 });
 
 test('④重复分发幂等：同一投稿重复到达不重复转达；多路副本按（作者, postId）吸收无害', async (t) => {
@@ -344,7 +409,7 @@ test('⑥与水位拉取正交：中继路径下离线成员回归仍经对表�
   await b.service.send({ collabId, text: '离线期的帖' });
   assert.equal(c.service.stats().postsIn, 0, '离线成员未收到实时副本');
   up.add(SELF_C.instanceId);
-  await awaitSync(c.service.sync({ collabId }));
+  await syncWhenIdle(c.service, collabId);
   const view = await c.service.view({ collabId });
   assert.equal(view.posts.length, 1, '回归经拉取追平（传输切换与水位拉取正交）');
   assert.equal(c.service.stats().syncPostsBackfilled, 1);

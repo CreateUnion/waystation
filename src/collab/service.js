@@ -474,7 +474,7 @@ function emptyFlowCounters() {
     relayRecoveries: 0,       // 恢复中继路径次数（后台恢复检测）
     relayEndpointUnknown: 0,  // 中继端点未知的降级次数（发起人标识已学但端点缺）
     relaySubmissionsIn: 0,    // 收到的投稿数（中继侧，首发入列时计）
-    relayRedistributed: 0,    // 转达的帖数（每（作者, postId）至多一次）
+    relayRedistributed: 0,    // 转达处理的帖数（每（作者, postId）至多一次）
     relayFanoutSkipped: 0,    // 转达时端点未知跳过的目标数
   };
 }
