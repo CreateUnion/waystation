@@ -1,3 +1,4 @@
 node_modules/
 poc/out/
 npm-debug.log*
+docs/logs/
