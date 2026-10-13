@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { COLLABS_DIR_NAME, LOGS_DIR_NAME, collabDir, collabFilePath, resolveDataDir, resolveLogDir, ensureDir, siteDataDir } from '../src/paths.js';
+import { COLLABS_DIR_NAME, LOGS_DIR_NAME, collabDir, collabFilePath, resolveDataDir, resolveLogDir, ensureDir, sessionFilePath, siteDataDir } from '../src/paths.js';
 import { makeTempDir } from './helpers.js';
 
 test('resolveDataDir：无环境变量时默认 ~/.waystation', () => {
@@ -76,4 +76,11 @@ test('siteDataDir：槽位 1（主目录）与非法值抛 TypeError——不做
   for (const slot of [1, 0, -1, '2', 2.5, null]) {
     assert.throws(() => siteDataDir(dir, slot), TypeError, String(slot));
   }
+});
+
+test('sessionFilePath：非法会话标识抛出，合法拼接主数据目录 sessions/ 下', () => {
+  assert.throws(() => sessionFilePath('/data', '../evil'), /sessionId 非法/);
+  assert.throws(() => sessionFilePath('/data', ''), /sessionId 非法/);
+  assert.throws(() => sessionFilePath('/data', 42), /sessionId 非法/);
+  assert.equal(sessionFilePath('/data', 'session-abc-1'), join('/data', 'sessions', 'session-abc-1.json'));
 });

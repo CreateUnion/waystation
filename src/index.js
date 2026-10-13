@@ -25,6 +25,7 @@ import { createInbound } from './net/inbound.js';
 import { createNetStack } from './net/stack.js';
 import { createClaudeCodeAdapter } from './adapters/claude-code.js';
 import { createCollabService } from './collab/service.js';
+import { createSessionStatusWriter } from './session-status.js';
 
 // 版本单一来源：包元数据（不另设常量，避免与 package.json 漂移）
 const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
@@ -168,6 +169,24 @@ const net = createNetStack({
   degraded: site.ok ? null : { reason: site.reason, message: site.message },
   log,
 });
+/* 会话级状态文件（状态栏「协作中」指示的写入端）：启动即写、周期心跳、会话关闭删除。
+ * 文件落主数据目录的 sessions/（槽位站点 k≥2 也在此共享目录；会话标识全局唯一）。
+ * 归档协作不进指示面；快照裁剪为指示所需字段（读取端与写入端只共用这一份形态）。 */
+const sessionStatus = createSessionStatusWriter({
+  mainDataDir: resolveDataDir(process.env),
+  sessionId: process.env.CLAUDE_CODE_SESSION_ID,
+  collect: () => ({
+    instanceId: self.instanceId,
+    identityName: self.identityName,
+    site: site.ok ? { mode: site.mode, slot: site.slot, port: site.port, takeover: site.takeover } : null,
+    port: config.port,
+    collabs: collab.list().collabs
+      .filter((entry) => entry.archived !== true)
+      .map((entry) => ({ collabId: entry.collabId, name: entry.name, state: entry.state, role: entry.role, memberCount: entry.memberCount })),
+  }),
+  log,
+});
+sessionStatus.start();
 const bind = await net.start();
 if (!bind.ok) {
   log.warn('局域网功能不可用（降级为本地 MCP 服务）', { reason: bind.reason, message: bind.message });
@@ -218,6 +237,7 @@ function closeOnSessionEnd() {
     return;
   }
   sessionEnded = true;
+  sessionStatus.close();
   collab.close();
   void net.close();
 }

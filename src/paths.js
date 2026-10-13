@@ -73,3 +73,15 @@ export function siteDataDir(mainDataDir, slot) {
   }
   return join(mainDataDir, SITES_DIR_NAME, String(slot));
 }
+
+export const SESSIONS_DIR_NAME = 'sessions';
+
+/** 会话级状态文件（状态栏「协作中」指示的载体）：按会话标识一文件、落在主数据目录的 sessions/ 下——
+ * 槽位站点共享主数据目录，会话标识全局唯一，读取端按标识直接命中、无需扫描槽位目录。
+ * sessionId 来自会话注入的环境变量、会成为文件名——与 collabId 同一硬边界：形态不符一律抛错，不做清洗。 */
+export function sessionFilePath(mainDataDir, sessionId) {
+  if (typeof sessionId !== 'string' || !ID_PATTERN.test(sessionId)) {
+    throw new TypeError(`sessionId 非法，不得用于路径拼接：${String(sessionId).slice(0, 32)}`);
+  }
+  return join(mainDataDir, SESSIONS_DIR_NAME, `${sessionId}.json`);
+}
