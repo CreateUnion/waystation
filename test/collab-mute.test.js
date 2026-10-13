@@ -224,18 +224,42 @@ test('静音栅栏判定：讨论帖与协作六类内容抑制；结束 / 邀�
   assert.equal(suppressedOf(made.service, { type: 'post', collabId: forumId }), false, '取消后即时恢复判定');
 });
 
-test('被忽略治理帧：命中静音讨论抑制；未静音照常；同名 managed 命中时照常（待办价值优先）', async (t) => {
-  const made = makeService(t);
+test('被忽略治理帧不注入会话：命中讨论即置抑制（未静音也如此）；同名 managed 命中照常注入（待办价值优先）', async (t) => {
+  const made = makePipedService(t);
   /* 先建 managed（同名冲突检查只施于 managed），后建讨论（讨论创建跳过检查）。 */
   makeManaged(made, { name: '联调项目' });
   const forumId = await makeMemberForum(made, { collabId: 'collab-freeze-forum', name: '联调项目' });
+  const connection = fakeConnection();
   const from = peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port);
-  const forumHit = freezeFrameOf(from, '联调项目', [SELF_A]);      // 只在讨论名单内（成员侧 roster = 发起人 + 本机）
-  const managedHit = freezeFrameOf(from, '联调项目', [SELF_B]);    // 只在 managed 名册内
-  assert.equal(suppressedOf(made.service, forumHit), false, '未静音：讨论忽略面照常注入');
+  /* 冻结族三型（freeze / unfreeze / decision）命中讨论：受理 + ack、忽略计数、不注入、无终态回报。 */
+  const types = ['freeze', 'unfreeze', 'decision'];
+  for (const [index, type] of types.entries()) {
+    const frame = { ...freezeFrameOf(from, '联调项目', [SELF_A]), type };   // 只在讨论名单内（成员侧 roster = 发起人 + 本机）
+    const sessionBefore = made.session.length;
+    made.inbound.onFrame(connection, frame);
+    await waitFor(() => (made.service.stats().forumGovernanceIgnored === index + 1 ? true : null));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(connection.sent.some((entry) => entry.type === 'ack' && entry.ackFor === frame.msgId), true, `${type}：受理 + ack（防治理重试钉死）`);
+    assert.equal(made.session.length, sessionBefore, `${type}：被忽略帧不注入会话（未静音也如此）`);
+    assert.equal(made.inbound.stats().sessionSuppressed, index + 1, `${type}：抑制走消费侧声明（sessionSuppressed）`);
+    assert.equal(reportFor(made, frame.msgId), false, `${type}：不发终态回报（发送侧维持第二档）`);
+    assert.equal(suppressedOf(made.service, frame), false, '栅栏层未静音不抑制——不注入由消费侧声明保证');
+  }
+  /* 栅栏层的静音兜底仍在（T3M 冻结面）：静音期命中讨论由栅栏层再抑制一层。 */
   made.service.setMute({ collabId: forumId, muted: true });
-  assert.equal(suppressedOf(made.service, forumHit), true, '命中静音讨论的忽略帧：静音期不注入');
-  assert.equal(suppressedOf(made.service, managedHit), false, '同名 managed 命中：本机有处置面，照常注入');
+  const mutedHit = { ...freezeFrameOf(from, '联调项目', [SELF_A]), type: 'freeze' };
+  assert.equal(suppressedOf(made.service, mutedHit), true, '静音期命中讨论：栅栏层同样抑制');
+  made.service.setMute({ collabId: forumId, muted: false });
+
+  /* 同名 managed 命中：帧有处置意义——照常注入（忽略计数与抑制计数均不增）。 */
+  const ignoredBefore = made.service.stats().forumGovernanceIgnored;
+  const suppressedBefore = made.inbound.stats().sessionSuppressed;
+  const managedHit = freezeFrameOf(from, '联调项目', [SELF_B]);   // 只在 managed 名册内
+  managedHit.payload.reason = '同名冲突';
+  made.inbound.onFrame(connection, managedHit);
+  await waitFor(() => (made.session.some((entry) => entry.msgId === managedHit.msgId) ? true : null));
+  assert.equal(made.service.stats().forumGovernanceIgnored, ignoredBefore, 'managed 命中不落讨论忽略计数');
+  assert.equal(made.inbound.stats().sessionSuppressed, suppressedBefore, 'managed 命中不落抑制计数');
 });
 
 test('取消静音的错过内容摘要：N=静音期新增（讨论=帖 / 协作=内容消息）；重复设静音不重置基线；重复取消不发摘要', async (t) => {

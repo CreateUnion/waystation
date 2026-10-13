@@ -538,13 +538,13 @@ function handleRelaySubmission(state, local, frame) {
 
 /* 冻结接收（设计 §6）：匹配 → 记下对端名单（合并并集的输入）→ 本地冻结（幂等）→ 转达
  * （每节点对同一原帧至多一次）。命中讨论实例（准入已受理 + ack）：忽略并计数——冻结规程
- * 不施于讨论、转达面也不进入（讨论无治理面）。 */
+ * 不施于讨论、转达面也不进入（讨论无治理面）；忽略的帧以 sessionDeliver:false 声明不注入
+ * 会话（设计 §5.7「T4a 待钉」裁定：讨论无冻结概念，注入只会困惑接收模型）。 */
 function handleFreeze(state, frame) {
   const payload = frame.payload;
   const matched = matchConflictCollabs(state, payload.name, payload.members.map((entry) => entry.instanceId));
   if (matched.length === 0) {
-    noteForumGovernanceIgnored(state, frame);
-    return;
+    return noteForumGovernanceIgnored(state, frame) ? { sessionDeliver: false } : undefined;
   }
   let applied = 0;
   for (const local of matched) {

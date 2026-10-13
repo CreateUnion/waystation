@@ -253,7 +253,7 @@ export async function handleDecision(state, frame) {
   const matched = matchConflictCollabs(state, payload.name, memberIds);
   if (matched.length === 0) {
     if (noteForumGovernanceIgnored(state, frame)) {
-      return;
+      return { sessionDeliver: false };   // 讨论侧忽略的裁定帧不注入会话（设计 §5.7）
     }
     state.counters.freezeUnmatched++;
     return;
@@ -358,7 +358,7 @@ export async function handleUnfreeze(state, frame) {
   const matched = matchConflictCollabs(state, payload.name, payload.members.map((entry) => entry.instanceId));
   if (matched.length === 0) {
     if (noteForumGovernanceIgnored(state, frame)) {
-      return;
+      return { sessionDeliver: false };   // 讨论侧忽略的解冻帧不注入会话（设计 §5.7）
     }
     state.counters.freezeUnmatched++;
     return;

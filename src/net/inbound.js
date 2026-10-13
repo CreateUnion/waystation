@@ -1,6 +1,7 @@
 import { collabDir, collabFilePath, ensureDir } from '../paths.js';
 import { appendLine, loadLines, replaceFile } from '../storage.js';
 import { ID_PATTERN, PROTOCOL_VERSION, isPort, newMsgId } from './protocol.js';
+import { CONFLICT_FRAME_TYPES } from '../collab/gate.js';
 
 export const INBOX_FILE_NAME = 'inbox.jsonl';
 
@@ -24,9 +25,11 @@ const COMPACT_LINE_FACTOR = 2;
  * 「重放不乱序」由此闭合；不同连接之间互不阻塞。
  * ack 语义 = 「已到对方驿站」：先落盘再确认（确认即承诺已持久化）；准入拒绝 / 落盘失败一律不 ack，
  * 由发送侧按重试与过期收敛（设计 §10 拒绝并计数留痕，协议无 NACK）。
- * 会话注入有三条分流（两条见 isSessionSuppressed，第三条是 runDeliver 里的静音栅栏）：拉取两件套
- * 按类型从不注入；帖去重命中的副本由 consume 声明抑制——managed 的既有「受理帧仍注入」行为不受
- * 影响（栅栏限帖通道、不泛化）；静音抑制由服务钩子 sessionGate 声明（本层不掌握模式与静音态）。
+ * 会话注入分流（三支见 isSessionSuppressed，第四支是 runDeliver 里的静音栅栏）：拉取两件套
+ * 按类型从不注入；帖去重命中的副本由 consume 声明抑制（栅栏限帖通道、不泛化）；讨论侧被忽略的
+ * 冻结族帧同样由 consume 声明抑制（无待办价值，设计 §5.7）——managed 的既有「受理帧仍注入」
+ * 行为不受影响（两类声明只在其词表内被采信，managed 侧 consume 不发出这两种声明）；
+ * 静音抑制由服务钩子 sessionGate 声明（本层不掌握模式与静音态）。
  * 准入与「写入会话收件箱」都是可注入钩子：协作台账与投递适配器接入前，以安全默认（拒绝 / 不投递）占位。 */
 /**
  * @param {{ dataDir: string, config: any, self: any, dispatch: any, hooks?: InboundHooks, log: any }} options
@@ -224,9 +227,12 @@ function isAbsorbedDuplicate(frame, consumed) {
  *    从不注入会话——按类型判定，与 consume 结果无关；
  * ② 去重栅栏（限帖通道、不泛化）：帖的（作者, postId）去重命中时抑制再次注入——由 consume
  *    以 { sessionDeliver: false } 显式声明（处理链的唯一知情方），本层只在该类型上采信；
- * ③ 静音栅栏（runDeliver 内的独立分支）：由服务钩子 sessionGate 声明——本层不掌握模式与
- *    静音态，只认 { suppress: true }；被抑制帧不进会话也不回报（维持第二档，会话主动查兜底）。
- * 非静音期其余类型一律照旧注入——managed 的「受理帧（含被忽略的治理帧）仍注入」行为不变。 */
+ * ③ 被忽略的冻结族帧（讨论侧）：讨论无冻结概念、忽略帧无待办价值——consume 在忽略分支以
+ *    { sessionDeliver: false } 声明不注入（设计 §5.7 裁定）；词表取自 gate.js 单一权威
+ *    （与静音栅栏的忽略判定同一词表——分叉即判据分叉）。managed 侧冻结族 consume 不声明，
+ *    照旧注入（需处置的治理帧）；
+ * ④ 静音栅栏（runDeliver 内的独立分支）：由服务钩子 sessionGate 声明——本层不掌握模式与
+ *    静音态，只认 { suppress: true }；被抑制帧不进会话也不回报（维持第二档，会话主动查兜底）。 */
 const SESSION_GATED_TYPES = new Set(['post', 'join']);
 const CHANNEL_ROUTED_TYPES = new Set(['history-request', 'history-bundle']);
 
@@ -234,7 +240,10 @@ function isSessionSuppressed(frame, consumed) {
   if (CHANNEL_ROUTED_TYPES.has(frame.type)) {
     return true;
   }
-  return SESSION_GATED_TYPES.has(frame.type) && consumed?.sessionDeliver === false;
+  if (SESSION_GATED_TYPES.has(frame.type) && consumed?.sessionDeliver === false) {
+    return true;
+  }
+  return CONFLICT_FRAME_TYPES.has(frame.type) && consumed?.sessionDeliver === false;
 }
 
 /* 准入钩子包装：钩子异常一律按「未通过准入」归类——拒绝方向不变（不落盘、不 ack），
