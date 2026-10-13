@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -14,6 +14,59 @@ const INDEX_ENTRY = join(repoRoot, 'src', 'index.js');
 const BIN_ENTRY = join(repoRoot, 'bin', 'waystation.js');
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
+/* 站点进程收尾：node:test 的收尾钩子按注册序执行，而临时目录的删除钩子由 makeTempDir 在其调用点先行
+ * 注册——「先关站点、后删目录」要求站点收尾钩子抢在删除钩子之前注册（与 collab-e2e.test.js 同一模式），
+ * 否则删除会与存活站点的并发写盘（sessions/、known-hosts.json、日志）相撞在 Windows 下抛错；
+ * 而钩子一旦抛错，其后所有钩子（含站点关闭）全部被跳过——泄漏的站点子进程拖住测试进程永不退出，
+ * runner 会无限等待该文件（整轮运行冻结）。 */
+const stationCleanupByTest = new WeakMap();
+
+function stationCleanupOf(t) {
+  let cleanup = stationCleanupByTest.get(t);
+  if (cleanup === undefined) {
+    cleanup = { clients: [] };
+    stationCleanupByTest.set(t, cleanup);
+    t.after(async () => {
+      for (const client of cleanup.clients) {
+        try {
+          await client.close();
+        } catch {
+          // 用例中已显式关闭：忽略重复关闭
+        }
+      }
+    });
+  }
+  return cleanup;
+}
+
+/* 站点数据目录：收尾钩子先于 makeTempDir 的删除钩子注册（见上）。 */
+function makeStationHome(t) {
+  stationCleanupOf(t);
+  return makeTempDir(t);
+}
+
+/* 文件级兜底：任何收尾钩子被跳过（如钩子抛错）都会留下未关闭的站点进程——此处强制关闭并响亮失败，
+ * 绝不让泄漏把整轮运行拖进永不退出的等待（正常路径所有站点已在用例收尾时关闭，兜底无事可做）。 */
+const stationTransports = [];
+const stationChildren = [];
+
+after(async () => {
+  const leakedPids = [];
+  for (const transport of stationTransports) {
+    if (transport.pid !== null) {
+      leakedPids.push(transport.pid);
+      await transport.close();
+    }
+  }
+  for (const child of stationChildren) {
+    if (child.exitCode === null && child.signalCode === null) {
+      leakedPids.push(child.pid);
+      child.kill('SIGKILL');
+    }
+  }
+  assert.equal(leakedPids.length, 0, `站点进程未被用例收尾（收尾钩子被跳过？）：${leakedPids.join(',')}——已兜底强制关闭，检查用例清理`);
+});
+
 // 用 SDK 官方 client 真实握手——能握手成功即同时证明 stdout 未被任何日志污染
 async function connectClient(t, entry, home, extraConfig = {}) {
   writeFileSync(
@@ -27,13 +80,8 @@ async function connectClient(t, entry, home, extraConfig = {}) {
     env: { ...process.env, WAYSTATION_HOME: home },
   });
   const client = new Client({ name: 'waystation-m2-test', version: '0.0.0' });
-  t.after(async () => {
-    try {
-      await client.close();
-    } catch {
-      // 用例中已显式关闭：忽略重复关闭
-    }
-  });
+  stationTransports.push(transport);
+  stationCleanupOf(t).clients.push(client);   // 纳管先于 connect：启动中途失败的站点也收尾
   await client.connect(transport);
   return client;
 }
@@ -96,7 +144,7 @@ const PORT_SETUP_ATTEMPTS = 3;
 async function startExplicitPortStation(t) {
   for (let attempt = 0; attempt < PORT_SETUP_ATTEMPTS; attempt++) {
     const port = await pickFreePort();
-    const clientA = await connectClient(t, INDEX_ENTRY, makeTempDir(t), { port });
+    const clientA = await connectClient(t, INDEX_ENTRY, makeStationHome(t), { port });
     if ((await fetchStatus(clientA)).net.available) {
       return { port, clientA };
     }
@@ -133,7 +181,7 @@ async function startPortOccupier(t) {
 }
 
 test('stdio 骨架：进程可起、ws_status 可调、网络层就绪、数据目录初始化（instance-id/logs/collabs）+ 预写配置读取生效', { timeout: 30000 }, async (t) => {
-  const home = makeTempDir(t);
+  const home = makeStationHome(t);
   const port = await pickFreePort();
   const client = await connectClient(t, INDEX_ENTRY, home, { port });
   const { tools } = await client.listTools();
@@ -172,7 +220,7 @@ test('stdio 骨架：进程可起、ws_status 可调、网络层就绪、数据�
 });
 
 test('机器实例标识：跨进程重启不变（持久化生效）', { timeout: 30000 }, async (t) => {
-  const home = makeTempDir(t);
+  const home = makeStationHome(t);
   const first = await connectClient(t, INDEX_ENTRY, home, { port: await pickFreePort() });
   const firstStatus = await fetchStatus(first);
   await first.close();
@@ -183,14 +231,14 @@ test('机器实例标识：跨进程重启不变（持久化生效）', { timeou
 });
 
 test('bin 入口与 src/index.js 等价可用', { timeout: 30000 }, async (t) => {
-  const home = makeTempDir(t);
+  const home = makeStationHome(t);
   const client = await connectClient(t, BIN_ENTRY, home, { port: await pickFreePort() });
   const status = await fetchStatus(client);
   assert.equal(status.name, 'waystation');
 });
 
 test('数据目录不可写：启动自检拒绝服务（退出码 1 + stderr 明确报错 + stdout 零输出）', { timeout: 30000 }, (t) => {
-  const home = makeTempDir(t);
+  const home = makeStationHome(t);
   const blocker = join(home, 'blocker.txt');
   writeFileSync(blocker, 'not a directory\n');
   const run = spawnSync(process.execPath, [INDEX_ENTRY], {
@@ -205,7 +253,7 @@ test('数据目录不可写：启动自检拒绝服务（退出码 1 + stderr �
 });
 
 test('ws_list_hosts：扫描可用、排除自答（自播自答不产生条目）', { timeout: 30000 }, async (t) => {
-  const home = makeTempDir(t);
+  const home = makeStationHome(t);
   const port = await pickFreePort();
   const client = await connectClient(t, INDEX_ENTRY, home, { port });
   const status = await fetchStatus(client);
@@ -217,7 +265,7 @@ test('ws_list_hosts：扫描可用、排除自答（自播自答不产生条目�
 });
 
 test('ws_ping：自环可达（同端口监听服务自身）、不可达地址与非法地址', { timeout: 30000 }, async (t) => {
-  const home = makeTempDir(t);
+  const home = makeStationHome(t);
   const port = await pickFreePort();
   const client = await connectClient(t, INDEX_ENTRY, home, { port });
   const selfPing = JSON.parse((await client.callTool({ name: 'ws_ping', arguments: { address: '127.0.0.1', port } })).content[0].text);
@@ -232,7 +280,7 @@ test('ws_ping：自环可达（同端口监听服务自身）、不可达地址�
 });
 
 test('ws_delivery_status：无已发消息返回空行集', { timeout: 30000 }, async (t) => {
-  const home = makeTempDir(t);
+  const home = makeStationHome(t);
   const client = await connectClient(t, INDEX_ENTRY, home, { port: await pickFreePort() });
   const called = await client.callTool({ name: 'ws_delivery_status', arguments: {} });
   assert.deepEqual(JSON.parse(called.content[0].text), { ok: true, rows: [], reportRows: 0 });
@@ -241,7 +289,7 @@ test('ws_delivery_status：无已发消息返回空行集', { timeout: 30000 }, 
 test('端口占用一：显式端口被另一驿站站点占 → 降级、takeover-taken 文案、LAN 工具明确报错', { timeout: 40000 }, async (t) => {
   const { port, clientA } = await startExplicitPortStation(t);
   assert.equal((await fetchStatus(clientA)).net.available, true);
-  const clientB = await connectClient(t, INDEX_ENTRY, makeTempDir(t), { port });
+  const clientB = await connectClient(t, INDEX_ENTRY, makeStationHome(t), { port });
   const statusB = await fetchStatus(clientB);
   assert.equal(statusB.net.available, false);
   assert.equal(statusB.net.reason, 'takeover-taken');
@@ -255,7 +303,7 @@ test('端口占用一：显式端口被另一驿站站点占 → 降级、takeov
 
 test('端口占用二：显式端口被无关程序占 → 同一降级结论（不区分占用者）', { timeout: 40000 }, async (t) => {
   const port = await startPortOccupier(t);
-  const client = await connectClient(t, INDEX_ENTRY, makeTempDir(t), { port });
+  const client = await connectClient(t, INDEX_ENTRY, makeStationHome(t), { port });
   const status = await fetchStatus(client);
   assert.equal(status.net.available, false);
   assert.equal(status.net.reason, 'takeover-taken');
@@ -269,7 +317,7 @@ test('端口占用二：显式端口被无关程序占 → 同一降级结论（
 });
 
 test('ws_check_inbox：进程级读取收件流水（未投递消息的会话主动查出口）', { timeout: 30000 }, async (t) => {
-  const home = makeTempDir(t);
+  const home = makeStationHome(t);
   const client = await connectClient(t, INDEX_ENTRY, home, { port: await pickFreePort() });
   mkdirSync(join(home, 'collabs', 'collab-1'), { recursive: true });
   const record = {
@@ -292,7 +340,7 @@ test('ws_check_inbox：进程级读取收件流水（未投递消息的会话主
 });
 
 test('会话关闭（stdin 关闭）→ 进程退出（退出码 0）并释放 TCP/UDP 端口', { timeout: 30000 }, async (t) => {
-  const home = makeTempDir(t);
+  const home = makeStationHome(t);
   const port = await pickFreePort();
   writeFileSync(join(home, 'config.json'), JSON.stringify({ scanWindowMs: 300, dialTimeoutMs: 1500, port }));
   const child = spawn(process.execPath, [INDEX_ENTRY], {
@@ -300,6 +348,7 @@ test('会话关闭（stdin 关闭）→ 进程退出（退出码 0）并释放 T
     env: { ...process.env, WAYSTATION_HOME: home },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
+  stationChildren.push(child);   // 文件级兜底纳管：收尾钩子被跳过时由文件末尾统一杀灭
   let stderr = '';
   child.stderr.on('data', (chunk) => {
     stderr += chunk;
@@ -319,7 +368,7 @@ test('会话关闭（stdin 关闭）→ 进程退出（退出码 0）并释放 T
 });
 
 test('ws_list_collabs：新装返回空清单（协作工具面已接线）', { timeout: 30000 }, async (t) => {
-  const home = makeTempDir(t);
+  const home = makeStationHome(t);
   const client = await connectClient(t, INDEX_ENTRY, home, { port: await pickFreePort() });
   const called = await client.callTool({ name: 'ws_list_collabs', arguments: {} });
   assert.equal(called.isError, undefined);
@@ -327,7 +376,7 @@ test('ws_list_collabs：新装返回空清单（协作工具面已接线）', { 
 });
 
 test('ws_create_collab：参数非法 → isError（不建立任何协作）', { timeout: 30000 }, async (t) => {
-  const home = makeTempDir(t);
+  const home = makeStationHome(t);
   const client = await connectClient(t, INDEX_ENTRY, home, { port: await pickFreePort() });
   const bad = await client.callTool({ name: 'ws_create_collab', arguments: { name: '项目', topic: '主题', targets: [] } });
   assert.equal(bad.isError, true);
@@ -336,7 +385,7 @@ test('ws_create_collab：参数非法 → isError（不建立任何协作）', {
 });
 
 test('ws_view_ledger / ws_send_message：未知协作 → isError（明确提示）', { timeout: 30000 }, async (t) => {
-  const home = makeTempDir(t);
+  const home = makeStationHome(t);
   const client = await connectClient(t, INDEX_ENTRY, home, { port: await pickFreePort() });
   const viewed = await client.callTool({ name: 'ws_view_ledger', arguments: { collabId: 'collab-none' } });
   assert.equal(viewed.isError, true);
@@ -346,7 +395,7 @@ test('ws_view_ledger / ws_send_message：未知协作 → isError（明确提示
 });
 
 test('治理工具：未知协作的裁定 / 移交 / 抢接 → isError（明确提示，不触达网络）', { timeout: 30000 }, async (t) => {
-  const home = makeTempDir(t);
+  const home = makeStationHome(t);
   const client = await connectClient(t, INDEX_ENTRY, home, { port: await pickFreePort() });
   const decided = await client.callTool({ name: 'ws_decide', arguments: { collabId: 'collab-none', choice: 'keep' } });
   assert.equal(decided.isError, true);
