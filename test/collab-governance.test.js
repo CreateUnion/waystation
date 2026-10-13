@@ -722,3 +722,57 @@ test('交接端点互盲修复：manager-changed 携带新驿丞端点、offer �
   assert.equal(sent.to[0], 'inst-b');
   c.service.close();
 });
+
+test('端点留痕：治理载荷携带非法端点项（地址 / 端口两分支）→ 忽略并计数、不入表', async (t) => {
+  /* M7-F1 审查 Minor-1①：载荷端点的留痕忽略行为直覆盖——驿丞变更本身照常生效（端点属
+   * 辅助面），非法项不污染端点表。 */
+  const harness = makeHarness(t);
+  const collabId = 'collab-endpoint';
+  await memberActiveAt(harness, collabId);
+  const rejectedBefore = harness.service.stats().endpointRejected;
+  await receive(harness.service, collabFrame('notice', collabId, peer('inst-a', '主机甲'), {
+    event: 'manager-changed',
+    version: 3,
+    manager: { instanceId: 'inst-b', identityName: '主机乙' },
+    endpoint: { address: 'not-an-ip', port: 17321 },
+  }));
+  assert.equal(harness.service.stats().endpointRejected, rejectedBefore + 1, '地址非法 → 忽略并计数');
+  let member = JSON.parse(readFileSync(join(harness.dir, 'collabs', collabId, 'member.json'), 'utf8'));
+  assert.equal(member.manager.instanceId, 'inst-b', '驿丞变更本身照常生效（端点属辅助面）');
+  assert.equal(member.endpoints['inst-b'], undefined, '非法端点不入表');
+
+  await receive(harness.service, collabFrame('notice', collabId, peer('inst-b', '主机乙'), {
+    event: 'manager-changed',
+    version: 4,
+    manager: { instanceId: 'inst-c', identityName: '主机丙' },
+    endpoint: { address: '127.0.0.9', port: 70000 },
+  }));
+  assert.equal(harness.service.stats().endpointRejected, rejectedBefore + 2, '端口非法 → 忽略并计数');
+  member = JSON.parse(readFileSync(join(harness.dir, 'collabs', collabId, 'member.json'), 'utf8'));
+  assert.equal(member.manager.instanceId, 'inst-c');
+  assert.equal(member.endpoints['inst-c'], undefined, '非法端口不入表');
+});
+
+test('载荷学习触发陈旧队列重投：manager-changed 学到新驿丞端点后原队列条目自动改投', async (t) => {
+  /* M7-F1 审查 Minor-1②（真机复验第③步的机制）：指向旧驿丞的未确认条目在换驿丞瞬间因新端点
+   * 未知而暂存（staleManagerId）；载荷携带端点学得后必须自动重定向补投——否则排队样本永不
+   * 投递（互盲死结的投递侧）。判别方式：观测注入的 reassign 改投原语——旧实现（载荷端点不
+   * 学习）下 resumeStaleRetarget 无触发，reassign 永不被调用（必红）。 */
+  const harness = makeHarness(t, { moved: 2 });
+  const collabId = 'collab-retarget';
+  await memberActiveAt(harness, collabId);
+  const queued = await harness.service.send({ collabId, text: '发往旧驿丞的排队样本' });
+  assert.equal(queued.ok, true, '换驿丞前条目已入队（指向旧驿丞）');
+  harness.reassigns.length = 0;
+  await receive(harness.service, collabFrame('notice', collabId, peer('inst-a', '主机甲'), {
+    event: 'manager-changed',
+    version: 3,
+    manager: { instanceId: 'inst-b', identityName: '主机乙' },
+    endpoint: { address: '127.0.0.9', port: 17321 },
+  }));
+  assert.equal(harness.service.stats().queueStaleKept >= 1, true, '换驿丞瞬间新端点未知 → 条目先暂存');
+  assert.equal(harness.reassigns.length, 1, '载荷学得端点即触发陈旧队列重定向（resumeStaleRetarget）');
+  assert.equal(harness.reassigns[0].fromInstanceId, 'inst-a');
+  assert.deepEqual(harness.reassigns[0].to, { instanceId: 'inst-b', address: '127.0.0.9', port: 17321 }, '改投目标 = 学得的新驿丞端点');
+  assert.equal(harness.service.stats().queueRetargeted, 2, '改投条目数入账（补投生效面）');
+});
