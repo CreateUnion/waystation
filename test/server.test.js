@@ -55,7 +55,13 @@ after(async () => {
   for (const transport of stationTransports) {
     if (transport.pid !== null) {
       leakedPids.push(transport.pid);
-      await transport.close();
+      try {
+        await transport.close();
+      } catch (error) {
+        /* 兜底自身不得中断：close 抛错也要继续走到子进程强杀与响亮断言，
+         * 否则恰在需要兜底的场景里恢复「静默泄漏」 */
+        console.error(`[测试收尾] 兜底关闭站点失败：pid=${transport.pid}（${error.message}）`);
+      }
     }
   }
   for (const child of stationChildren) {
@@ -302,8 +308,9 @@ test('端口占用一：显式端口被另一驿站站点占 → 降级、takeov
 });
 
 test('端口占用二：显式端口被无关程序占 → 同一降级结论（不区分占用者）', { timeout: 40000 }, async (t) => {
+  const home = makeStationHome(t);   // 站点收尾钩子先于占位收尾钩子注册：占位收尾抛错也不跳过站点关闭（钩子跳过语义）
   const port = await startPortOccupier(t);
-  const client = await connectClient(t, INDEX_ENTRY, makeStationHome(t), { port });
+  const client = await connectClient(t, INDEX_ENTRY, home, { port });
   const status = await fetchStatus(client);
   assert.equal(status.net.available, false);
   assert.equal(status.net.reason, 'takeover-taken');
@@ -340,10 +347,18 @@ test('ws_check_inbox：进程级读取收件流水（未投递消息的会话主
 });
 
 test('会话关闭（stdin 关闭）→ 进程退出（退出码 0）并释放 TCP/UDP 端口', { timeout: 30000 }, async (t) => {
+  /* 裸子进程的收尾钩子同样必须抢在 makeTempDir 删除钩子前注册（否则删除钩子抛错会跳过它）；
+   * 注册时 child 尚未创建，经引用回填 */
+  let child = null;
+  t.after(() => {
+    if (child !== null && child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGKILL');
+    }
+  });
   const home = makeStationHome(t);
   const port = await pickFreePort();
   writeFileSync(join(home, 'config.json'), JSON.stringify({ scanWindowMs: 300, dialTimeoutMs: 1500, port }));
-  const child = spawn(process.execPath, [INDEX_ENTRY], {
+  child = spawn(process.execPath, [INDEX_ENTRY], {
     cwd: repoRoot,
     env: { ...process.env, WAYSTATION_HOME: home },
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -352,11 +367,6 @@ test('会话关闭（stdin 关闭）→ 进程退出（退出码 0）并释放 T
   let stderr = '';
   child.stderr.on('data', (chunk) => {
     stderr += chunk;
-  });
-  t.after(() => {
-    if (child.exitCode === null && child.signalCode === null) {
-      child.kill('SIGKILL');
-    }
   });
   await waitPortListening(port);
   child.stdin.end();
