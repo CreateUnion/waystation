@@ -162,30 +162,42 @@ function reportFor(made, msgId) {
   return made.reports.some((message) => message.payload?.refMsgId === msgId);
 }
 
-/* 成员侧讨论（经邀请 + 同意）：默认名 联调项目、邀请者 主机甲。 */
+/* 成员侧讨论（经邀请 + 同意）：默认名 联调项目、邀请者 主机甲。
+ * 入席即默认静音（本文件主题即静音面）——夹具代表「普通（未静音）」基线，随即显式取消：
+ * 断言不许依赖系统默认值，静音态的建立由用例自己显式给出。 */
 async function makeMemberForum(made, { collabId, name = '联调项目' } = {}) {
   await receive(made.service, inviteFrame({ collabId, name, mode: 'forum' }));
   await made.service.approve({ collabId, approve: true });
+  made.service.setMute({ collabId, muted: false });
   return collabId;
 }
 
-/* 管理席位侧协作（managed）：本机发起、单目标。 */
+/* 管理席位侧协作（managed）：本机发起、单目标（同上前置：显式取消入席默认静音）。 */
 function makeManaged(made, { name = '协作甲', target = SELF_B } = {}) {
-  return made.service.create({ name, topic: '主题', targets: [targetOf(target)] }).collabId;
+  const collabId = made.service.create({ name, topic: '主题', targets: [targetOf(target)] }).collabId;
+  made.service.setMute({ collabId, muted: false });
+  return collabId;
 }
 
-/* 管理席位侧讨论：本机发起（讨论创建跳过同名冲突检查）、成员 join。 */
+/* 管理席位侧讨论：本机发起（讨论创建跳过同名冲突检查）、成员 join（同上前置：显式取消入席默认静音）。 */
 async function makeManagerForum(made, { name = '联调项目', member = SELF_B } = {}) {
   const collabId = made.service.create({ name, topic: '议题', mode: 'forum', targets: [targetOf(member)] }).collabId;
+  made.service.setMute({ collabId, muted: false });
   const joined = joinFrameOf(collabId, peer(member.instanceId, member.identityName, member.port));
   await receive(made.service, joined);
   return { collabId, joined };
 }
 
-test('静音开关：默认不静音、设静音落盘形态、重建服务后仍静音、校验面明确报错', async (t) => {
+test('静音开关：入席默认静音、显式取消后不抑制、设静音落盘形态、重建服务后仍静音、校验面明确报错', async (t) => {
   const made = makeService(t);
-  const collabId = await makeMemberForum(made, { collabId: 'collab-mute-persist' });
-  assert.equal(suppressedOf(made.service, { type: 'post', collabId }), false, '默认不静音');
+  /* 入席（受邀 + 同意）不走夹具：本用例要断言默认态本身，前置与断言都显式——先看默认静音，
+   * 再显式取消得到「普通（未静音）」基线，后续断言全部建立在这个显式前置上。 */
+  const collabId = 'collab-mute-persist';
+  await receive(made.service, inviteFrame({ collabId, mode: 'forum' }));
+  await made.service.approve({ collabId, approve: true });
+  assert.equal(suppressedOf(made.service, { type: 'post', collabId }), true, '入席即默认静音');
+  made.service.setMute({ collabId, muted: false });
+  assert.equal(suppressedOf(made.service, { type: 'post', collabId }), false, '显式取消静音后不抑制');
   assert.deepEqual(made.service.setMute({ collabId, muted: true }), { ok: true, collabId, muted: true });
   assert.deepEqual(JSON.parse(readFileSync(mutePath(made.dir, collabId), 'utf8')), { v: 1, muted: true, baseline: 0 }, '落盘形态：v/muted/baseline');
   const reloaded = makeService(t, { dir: made.dir });

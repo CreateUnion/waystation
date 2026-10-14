@@ -9,7 +9,7 @@ import { POST_KINDS } from '../net/protocol.js';
 import { decideAdmission, SYNC_REQUEST_MAX, SYNC_REQUEST_WINDOW_MS } from './gate.js';
 import { handleEvent } from './events.js';
 import { localModeOf, localNameOf, localRosterOf, localStateOf, persistLedger } from './local.js';
-import { applyRelayedReport, approveInvite, countLiveCollabs, createCollab, endCollab, handleJoinKnock, inviteMembers, leaveCollab, notifyLocal, sendMessage, viewLedger, withdrawInvite } from './outgoing.js';
+import { applyRelayedReport, approveInvite, contentCountOf, countLiveCollabs, createCollab, endCollab, handleJoinKnock, inviteMembers, leaveCollab, notifyLocal, sendMessage, viewLedger, withdrawInvite } from './outgoing.js';
 import { JOIN_REPLAY_INTERVALS_MS, SYNC_MAX_REQUESTS_PER_CYCLE, SYNC_MAX_SOURCES_PER_CYCLE, SYNC_REPLY_TIMEOUT_MS, SYNC_SOFT_BUNDLE_BYTES, SYNC_TAIL_POSTS, SYNC_TAIL_WINDOW_MS, runSyncCycle, runSyncSweep, startSyncEngine, stopSyncEngine, triggerSync } from './sync.js';
 import { HANDSHAKE_REPLY_TIMEOUT_MS, TAKEOVER_PROBE_INTERVAL_MS, runHandshake, startLiveness, stopLiveness, takeOver } from './takeover.js';
 import { decide, decideMergeOffer } from './freeze.js';
@@ -469,7 +469,7 @@ function setMuteNow(state, input) {
   if (local === undefined) {
     return { ok: false, message: '本机没有该协作（collabId 不存在）——先看 ws_list_collabs' };
   }
-  const countNow = localModeOf(local) === 'forum' ? local.posts.size() : local.counter.count();
+  const countNow = contentCountOf(local);
   const before = local.mute.setMuted(muted, countNow);
   if (muted === false && before.wasMuted) {
     notifyLocal(state, local, resumeNoticeText(local, countNow, before.baseline));

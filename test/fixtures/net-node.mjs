@@ -114,6 +114,7 @@ const COMMANDS = {
   withdraw_invite: async (command) => collab.withdraw({ collabId: command.collabId, target: command.target }),
   send_message: async (command) => collab.send({ collabId: command.collabId, text: command.text, type: command.type, to: command.to }),
   view_ledger: async (command) => collab.view({ collabId: command.collabId }),
+  set_mute: async (command) => collab.setMute({ collabId: command.collabId, muted: command.muted }),
   list_collabs: async () => collab.list(),
   end_collab: async (command) => collab.end({ collabId: command.collabId }),
   leave_collab: async (command) => collab.leave({ collabId: command.collabId }),

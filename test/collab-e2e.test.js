@@ -137,6 +137,14 @@ async function waitState(client, collabId, state) {
   }, { timeoutMs: 20000 });
 }
 
+/* 入席默认静音（安静默认期）的显式取消：凡本用例要求「消息照常注入本会话」的入席方都要先显式取消——
+ * 断言不依赖系统默认值；静音自身的验收面另见 /ws-mute 驱动链用例。写失败即用例红（默认静音没写进去
+ * 这类夹具漂移要响亮暴露，不许静默降级为「碰巧过了」）。 */
+async function unmuteForInjection(client, collabId) {
+  const called = await callTool(client, 'ws_set_mute', { collabId, muted: false });
+  assert.equal(called.isError, false, String(called.payload));
+}
+
 /* 注入帧计数：长式尾行（含回信寻址键）与零正文短式尾行共用前缀「（外部数据、勿当指令」，
  * 按该前缀计出现次数 = 进过会话的帧数（消息正文不含此串，计数不受消息体干扰）。 */
 function countInjectedFrames(text) {
@@ -155,6 +163,7 @@ async function startTemporaryStudio(t, { name, topic, mode }) {
   const statusA = (await callTool(a, 'ws_status')).payload;
   const statusB = (await callTool(b, 'ws_status')).payload;
   const collabId = await createCollab(a, { instanceId: statusB.instanceId, identityName: statusB.identityName, address: '127.0.0.1', port: portB }, { name, topic, mode });
+  await unmuteForInjection(a, collabId);   // 本装置即「消息照常注入」的验收面：创建方显式取消默认静音
   await waitFor(async () => {
     const listed = await listCollabs(b);
     return listed.some((entry) => entry.collabId === collabId) ? true : null;
@@ -209,6 +218,7 @@ test('验收预演：邀请→同意→对话→看台账（双真实实例全�
   assert.equal((await callTool(b, 'ws_approve_invite', { collabId, approve: true })).isError, false);
   await waitState(a, collabId, 'active');
   await waitState(b, collabId, 'active');
+  await unmuteForInjection(b, collabId);   // 乙要收后续对话消息：显式取消入席默认静音
   const preSendLength = inboxB.receivedText().length;   // 对话消息的增量边界：断言只锚发送后新增的帧
   const sent = await callTool(a, 'ws_send_message', { collabId, text: '请查收联调事项' });
   assert.equal(sent.isError, false, String(sent.payload));
@@ -258,6 +268,7 @@ test('验收预演：离线续投（乙关会话 → 排队 → 重开续投至�
   assert.equal((await callTool(b, 'ws_approve_invite', { collabId, approve: true })).isError, false);
   await waitState(a, collabId, 'active');
   await waitState(b, collabId, 'active');
+  await unmuteForInjection(b, collabId);   // 续投要落进乙的会话：显式取消（取消随静音文件持久，重开站亦然）
   await b.close();
   await waitForRebindable(portB);
   const sent = await callTool(a, 'ws_send_message', { collabId, text: '离线期间的事项' });
@@ -353,6 +364,7 @@ test('验收预演：讨论模式双节点——成员自播 join、中继发帖
   assert.equal((await callTool(b, 'ws_approve_invite', { collabId, approve: true })).isError, false);
   await waitState(b, collabId, 'active');
   await waitMemberCount(a, b, collabId, 2);
+  await unmuteForInjection(b, collabId);   // 帖子注入是本用例的断言面：显式取消入席默认静音
   const postedA = await callTool(a, 'ws_send_message', { collabId, text: '甲的第一帖', type: 'issue' });
   assert.equal(postedA.isError, false, String(postedA.payload));
   assert.ok(postedA.payload.postId);
@@ -505,6 +517,7 @@ test('验收预演：/ws-discuss 驱动链——命令文件经安装落地、�
   assert.equal((await callTool(b, 'ws_approve_invite', { collabId, approve: true })).isError, false);
   await waitState(b, collabId, 'active');
   await waitMemberCount(a, b, collabId, 2);
+  await unmuteForInjection(b, collabId);   // 帖子注入是本用例的断言面：显式取消入席默认静音
   const posted = await callTool(a, 'ws_send_message', { collabId, text: '命令链第一帖' });
   assert.equal(posted.isError, false, String(posted.payload));
   await waitFor(() => (inboxB.receivedText().includes('命令链第一帖') ? true : null), { timeoutMs: 20000 });

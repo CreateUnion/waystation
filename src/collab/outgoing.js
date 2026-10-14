@@ -21,6 +21,20 @@ const MESSAGING_MEMBER_STATES = ['invited', 'approved', 'member'];
  * 每条治理通告的每跳只在首次收到时转达一次，重复副本不再向外扩散（本地应用仍幂等执行）。 */
 const RELAYED_ORIGINS_MAX = 256;
 
+/* 本机该协作的内容累计读数（讨论 = 帖子列表 size（含回填帖）、managed = 内容消息计数）。
+ * 静音基线与取消摘要、入席默认静音的基线都必须经这一处取数——两处各算一次必然分叉，
+ * 随后就是「默认静音的窗口起点与 /ws-mute 对不上」这类难查的错位。 */
+export function contentCountOf(local) {
+  return localModeOf(local) === 'forum' ? local.posts.size() : local.counter.count();
+}
+
+/* 入席默认静音（设计 §3.1）：本机成为参与者时默认写入静音，基线 = 写入时刻的当下累计读数。
+ * 只在「创建成功」与「同意加入成功」两处调用——挂到记录创建 / 成员落盘这类宽调用点，
+ * 会把受邀未同意者也静音、在拒绝路径留下 mute.json 残留（本机不同意还被静音的故障形态）。 */
+export function applyDefaultMute(local) {
+  local.mute.setMuted(true, contentCountOf(local));
+}
+
 export function createCollab(state, { name, topic, targets, mode }) {
   const collabMode = mode ?? DEFAULT_COLLAB_MODE;
   const rejected = createRejection(state, name, topic, targets, collabMode);
@@ -59,6 +73,7 @@ export function createCollab(state, { name, topic, targets, mode }) {
   persistLedger(state, local);
   const invited = inviteInitialTargets(state, ledger, targets, collabMode, local);
   state.counters.collabsCreated++;
+  applyDefaultMute(local);   // 写点一：创建成功（邀请发送结果不影响入席事实）
   return { ok: true, collabId: ledger.collabId, invited };
 }
 
@@ -251,10 +266,19 @@ export function approveInvite(state, { collabId, approve, reason }) {
   if (decided !== null) {
     return { ok: false, message: `已回应过（${decided}）——不能改口` };
   }
-  if (localModeOf(local) === 'forum') {
-    return decideForumInvite(state, local, wanted, reason);
+  return applyInviteDecision(state, local, approve, wanted, reason);
+}
+
+/* 表态的落地与入席副作用（设计 §3.1）：分派到讨论 / 协作各自的实现；同意且成功时写入默认静音。
+ * 入席事实以「同意 + 实现成功」为准——拒绝、参数非法、端点未知等失败分支一律不写（不留残留）。 */
+function applyInviteDecision(state, local, approve, wanted, reason) {
+  const result = localModeOf(local) === 'forum'
+    ? decideForumInvite(state, local, wanted, reason)
+    : sendDecision(state, local, approve, wanted, reason);
+  if (approve === true && result.ok === true) {
+    applyDefaultMute(local);   // 写点二：同意加入成功
   }
-  return sendDecision(state, local, approve, wanted, reason);
+  return result;
 }
 
 /* 讨论的邀请回应（设计 §5.1/§5.4）：同意 = 加入**立即生效**——本地转进行中、自播 join
