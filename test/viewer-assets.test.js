@@ -80,12 +80,15 @@ test('嵌入纪律：三资产零外部资源（协议相对 / data: / 内联资
 });
 
 /* 页面壳里的每个 src/href 值都必须是同源相对路径（以 / 开头且非 //）：覆盖单引号属性与
- * 大写 SRC=/HREF= 写法——任何外部来源（http(s)、协议相对、data:）都通不过。 */
-test('页面壳：全部 src/href 引用值同源相对', () => {
+ * 大写 SRC=/HREF= 写法——任何外部来源（http(s)、协议相对、data:）都通不过。
+ * 无引号属性值（如 src= //evil…，HTML5 合法且浏览器会真实外发）不带引号、躲开带引号匹配，
+ * 一并按无引号形态扫描——否则未来编辑引入无引号外链不会被任何断言拦下。 */
+test('页面壳：全部 src/href 引用值同源相对（含无引号形态）', () => {
   const values = [...INDEX_HTML.matchAll(/\b(?:src|href)\s*=\s*(["'])([^"']*)\1/gi)].map((match) => match[2]);
   assert.ok(values.length >= 2, '页面壳应至少含样式与脚本两条引用，实际 ' + values.length + ' 条');
-  for (const value of values) {
-    assert.ok(value.startsWith('/') && !value.startsWith('//'), '引用值必须是同源相对路径：' + value);
+  const bare = [...INDEX_HTML.matchAll(/\b(?:src|href)\s*=\s*([^\s"'>]+)/gi)].map((match) => match[1]);
+  for (const value of [...values, ...bare]) {
+    assert.ok(value.startsWith('/') && !value.startsWith('//'), '引用值必须是同源相对路径（含无引号形态）：' + value);
   }
 });
 
