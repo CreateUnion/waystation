@@ -206,6 +206,56 @@ test('基线口径与取消摘要：基线 = 入席时刻读数，摘要只计�
   assert.ok(made.notices.at(-1).payload.text.includes('静音期间本协作新增 1 条'), made.notices.at(-1).payload.text);
 });
 
+test('非布尔真值同意：入席、默认静音与提醒三者同谓词（服务 API 直调）', async (t) => {
+  const made = makeService(t);
+  const forumId = 'collab-truthy-forum';
+  await receive(made.service, inviteFrame({ collabId: forumId, mode: 'forum' }));
+  const joined = await made.service.approve({ collabId: forumId, approve: 1 });
+  assert.equal(joined.ok, true, String(joined.message));
+  assert.equal(joined.decision, 'approved', '按真值判定为同意（既有判据不变）');
+  assert.equal(joined.joined, true, '入席生效');
+  assert.equal(suppressedOf(made.service, { type: 'post', collabId: forumId }), true, '默认静音跟着生效');
+  assert.deepEqual(muteFileOf(made.dir, forumId), { v: 1, muted: true, baseline: 0 }, '落盘形态一致');
+  assert.equal(typeof joined.notice, 'string', '提醒跟着生效（不得只剩半套）');
+  assert.ok(joined.notice.includes('已默认静音'), joined.notice);
+  const managedId = 'collab-truthy-managed';
+  await receive(made.service, inviteFrame({ collabId: managedId }));
+  const accepted = await made.service.approve({ collabId: managedId, approve: 'yes' });
+  assert.equal(accepted.ok, true, String(accepted.message));
+  assert.equal(accepted.decision, 'approved', '非布尔真值同样按同意落地');
+  assert.equal(suppressedOf(made.service, { type: 'progress', collabId: managedId }), true, '协作链路同样写静音');
+  assert.equal(typeof accepted.notice, 'string', '协作链路同样给提醒');
+});
+
+test('幂等重入不重写静音：显式取消后重复同意成功但无提醒（用户意愿不被覆盖）', async (t) => {
+  const made = makeService(t);
+  const collabId = 'collab-idempotent-mute';
+  await receive(made.service, inviteFrame({ collabId }));
+  const first = await made.service.approve({ collabId, approve: true });
+  assert.equal(first.ok, true, String(first.message));
+  assert.equal(typeof first.notice, 'string', '首次同意：写入且给提醒');
+  assert.equal((await made.service.setMute({ collabId, muted: false })).ok, true);
+  assert.equal(muteFileOf(made.dir, collabId).muted, false, '已显式取消静音');
+  const second = await made.service.approve({ collabId, approve: true });
+  assert.equal(second.ok, true, '重复同意：幂等成功（未改口）');
+  assert.equal(second.decision, 'approved');
+  assert.equal(Object.hasOwn(second, 'notice'), false, '本次没有任何写入：不给提醒');
+  assert.equal(muteFileOf(made.dir, collabId).muted, false, '用户取消的静音不被覆盖');
+  assert.equal(suppressedOf(made.service, { type: 'progress', collabId }), false, '内容照常注入本会话');
+});
+
+test('受邀期已自行静音再同意：不重复写、不重置窗口、也不虚报提醒', async (t) => {
+  const made = makeService(t);
+  const collabId = 'collab-premuted-approve';
+  await receive(made.service, inviteFrame({ collabId }));
+  assert.equal((await made.service.setMute({ collabId, muted: true })).ok, true, '受邀期本机自行静音');
+  const joined = await made.service.approve({ collabId, approve: true });
+  assert.equal(joined.ok, true, String(joined.message));
+  assert.equal(suppressedOf(made.service, { type: 'progress', collabId }), true, '静音态保持');
+  assert.deepEqual(muteFileOf(made.dir, collabId), { v: 1, muted: true, baseline: 0 }, '先前的静音窗口不被重写');
+  assert.equal(Object.hasOwn(joined, 'notice'), false, '本次没有新写入：不虚报「已默认静音」');
+});
+
 test('成功载荷的 notice：创建与同意各增一字段，既有字段原样', async (t) => {
   const made = makeService(t);
   const created = payloadOf(await callCollabTool(createCollabTool(), { name: '协作甲', topic: '主题', targets: [targetOf(SELF_B)] }, made.service));

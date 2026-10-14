@@ -33,16 +33,6 @@ export function listCollabsTool() {
   };
 }
 
-/* 入席默认静音的提醒（设计 §3.3）：创建与同意两处成功载荷加一行 notice——要素写死为
- * 「已默认静音／消息不注入本会话／实时观看走观察窗／要本会话实时跟进用 /ws-mute 取消静音」。
- * 提醒只加字段、不动既有字段（工具载荷仍是可直接 JSON.parse 的对象——文本追加会破坏解析面）。 */
-const DEFAULT_MUTE_NOTICE = '已默认静音——消息不注入本会话；实时观看走观察窗（/ws-view），要本会话实时跟进用 /ws-mute 取消静音';
-
-/* 成功才加提醒：失败载荷保持纯 message（失败路径没有「已默认静音」可承诺）。 */
-function withDefaultMuteNotice(result) {
-  return result.ok === true ? { ...result, notice: DEFAULT_MUTE_NOTICE } : result;
-}
-
 export function createCollabTool() {
   return {
     name: 'ws_create_collab',
@@ -71,7 +61,7 @@ export function createCollabTool() {
       if (targets === null) {
         return errorResult(targetsErrorMessage());
       }
-      return resultOf(withDefaultMuteNotice(await context.collab.create({ name, topic, targets, mode })));
+      return resultOf(await context.collab.create({ name, topic, targets, mode }));
     },
   };
 }
@@ -162,9 +152,7 @@ export function approveInviteTool() {
       /* reason 按描述语义归一：approve=true 时在工具层丢弃（服务层该分支本就不消费）——宁可少传，
        * 不让「同意 + 理由」这种无定义组合穿到线上。 */
       const reason = args.approve === false ? optionalTextArg(args, 'reason') : undefined;
-      const result = await context.collab.approve({ collabId, approve: args.approve, reason });
-      /* 提醒只随「同意」：拒绝不入席、不写静音，带上提醒会与事实相反。 */
-      return resultOf(args.approve === true ? withDefaultMuteNotice(result) : result);
+      return resultOf(await context.collab.approve({ collabId, approve: args.approve, reason }));
     },
   };
 }

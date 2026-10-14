@@ -28,11 +28,18 @@ export function contentCountOf(local) {
   return localModeOf(local) === 'forum' ? local.posts.size() : local.counter.count();
 }
 
+/* 提醒文案（设计 §3.3 的承载形态）：要素写死——已默认静音／消息不注入本会话／实时观看走
+ * 观察窗（/ws-view）／要本会话实时跟进用 /ws-mute 取消静音。随成功载荷的 notice 字段承载；
+ * 与静音写入同谓词产出（工具层只做输出封装，不另立一份「本次是否写了静音」的判定）。 */
+const DEFAULT_MUTE_NOTICE = '已默认静音——消息不注入本会话；实时观看走观察窗（/ws-view），要本会话实时跟进用 /ws-mute 取消静音';
+
 /* 入席默认静音（设计 §3.1）：本机成为参与者时默认写入静音，基线 = 写入时刻的当下累计读数。
+ * 返回本次是否真写了（前态未静音即本次落笔；已在静音中不重复写）——提醒据此如实给，不虚报。
  * 只在「创建成功」与「同意加入成功」两处调用——挂到记录创建 / 成员落盘这类宽调用点，
  * 会把受邀未同意者也静音、在拒绝路径留下 mute.json 残留（本机不同意还被静音的故障形态）。 */
 export function applyDefaultMute(local) {
-  local.mute.setMuted(true, contentCountOf(local));
+  const before = local.mute.setMuted(true, contentCountOf(local));
+  return before.wasMuted !== true;
 }
 
 export function createCollab(state, { name, topic, targets, mode }) {
@@ -75,7 +82,8 @@ export function createCollab(state, { name, topic, targets, mode }) {
   state.counters.collabsCreated++;
   applyDefaultMute(local);   // 写点一：创建成功（邀请发送结果不影响入席事实）
   state.openViewer?.({ root: state.viewerRoot, id: ledger.collabId });   // 触发 A：建立即开该协作页（开关在出口内现读）
-  return { ok: true, collabId: ledger.collabId, invited };
+  /* 新建实例的静音状态必为空（新 collabId 无旧文件），写点一的默认静音必然落笔——提醒同发。 */
+  return { ok: true, collabId: ledger.collabId, invited, notice: DEFAULT_MUTE_NOTICE };
 }
 
 /* 创建邀请的发送面：逐目标发 invite（单条入队失败只如实标注，不回滚已建协作）；
@@ -270,17 +278,22 @@ export function approveInvite(state, { collabId, approve, reason }) {
   return applyInviteDecision(state, local, approve, wanted, reason);
 }
 
-/* 表态的落地与入席副作用（设计 §3.1）：分派到讨论 / 协作各自的实现；同意且成功时写入默认静音。
- * 入席事实以「同意 + 实现成功」为准——拒绝、参数非法、端点未知等失败分支一律不写（不留残留）。 */
+/* 表态的落地与入席副作用（设计 §3.1/§3.3）：分派到讨论 / 协作各自的实现；同意且实现成功时
+ * 写默认静音、给一行提醒。入席、写静音、提醒三者同谓词——判据取**决策结果**（wanted）而非
+ * 原始入参的真值：服务 API 直调传非布尔真值时入席照旧生效，静音与提醒必须跟着生效，
+ * 不得只剩半套（拒绝、参数非法、端点未知等分支则一律不写，不留残留）。 */
 function applyInviteDecision(state, local, approve, wanted, reason) {
   const result = localModeOf(local) === 'forum'
     ? decideForumInvite(state, local, wanted, reason)
     : sendDecision(state, local, approve, wanted, reason);
-  if (approve === true && result.ok === true) {
-    applyDefaultMute(local);   // 写点二：同意加入成功
-    state.openViewer?.({ root: state.viewerRoot, id: local.collabId });   // 触发 A：同意入席即开该协作页（开关在出口内现读）
+  if (wanted !== 'approved' || result.ok !== true) {
+    return result;
   }
-  return result;
+  const wrote = applyDefaultMute(local);   // 写点二：同意加入成功
+  state.openViewer?.({ root: state.viewerRoot, id: local.collabId });   // 触发 A：同意入席即开该协作页（开关在出口内现读）
+  /* 提醒只在本次真的写了静音时给：幂等重入的早返回根本到不了这里（本次什么都没写），
+   * 说「已默认静音」会与事实相反。 */
+  return wrote ? { ...result, notice: DEFAULT_MUTE_NOTICE } : result;
 }
 
 /* 讨论的邀请回应（设计 §5.1/§5.4）：同意 = 加入**立即生效**——本地转进行中、自播 join
