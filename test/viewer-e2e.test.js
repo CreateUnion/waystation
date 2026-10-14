@@ -163,7 +163,9 @@ function tsPlus(offsetMs) {
   return new Date(Date.parse(T0) + offsetMs).toISOString();
 }
 
-function collabDirIn(home, root, collabId) {
+/* 夹具路径：本文件的夹具全在主根——sites/<k> 面由数据层/服务层单测覆盖，e2e 场景不铺第二根；
+ * 真需要时再按 viewer-server.test.js 的同名 helper 先例补 root 分支。 */
+function collabDirIn(home, collabId) {
   return join(home, COLLABS_DIR_NAME, collabId);
 }
 
@@ -269,7 +271,7 @@ function writeForumFixture(home, collabId, { posts = 3, tailWithoutNewline = fal
     lines.push(`${JSON.stringify(postOf(index))}\n`);
   }
   const postsText = tailWithoutNewline ? lines.join('') + JSON.stringify(postOf(posts + 1)) : lines.join('');
-  writeFiles(collabDirIn(home, 'main', collabId), {
+  writeFiles(collabDirIn(home, collabId), {
     [POSTS_FILE_NAME]: postsText,
     [MEMBERS_FILE_NAME]: jsonl(memberEvent()),
     [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ mode: 'forum', collabId })),
@@ -278,7 +280,7 @@ function writeForumFixture(home, collabId, { posts = 3, tailWithoutNewline = fal
 
 /* 协作夹具（管理席位）：台账两行（一条迁移）＋累计收到＋收/发各一条内容消息。 */
 function writeManagedFixture(home, collabId) {
-  writeFiles(collabDirIn(home, 'main', collabId), {
+  writeFiles(collabDirIn(home, collabId), {
     [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ mode: 'managed', collabId, name: '协作甲' })),
     [LEDGER_FILE_NAME]: jsonl(
       ledgerOf({ collabId }),
