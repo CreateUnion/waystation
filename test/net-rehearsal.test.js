@@ -156,8 +156,8 @@ async function startNodesGuarded(t, size, startNodes) {
 }
 
 /* 预演节点的配置：随机高位端口 + 加速参数（扫描窗口 / 重传节律 / 调度周期），压缩整轮预演的等待时间；
- * 用例可经 config 逐项透传覆盖（如拉高快重传次数加速离线续投）。viewerAutoOpen 关闭：起站夹具
- * 统一不拉起真实观察窗（该夹具自装配未接开窗钩子，此键为纪律统一，防日后接线时静默回归）。 */
+ * 用例可经 config 逐项透传覆盖（如拉高快重传次数加速离线续投）。viewerAutoOpen 固定关闭（置展开
+ * 之后、不可被改写）：起站夹具统一不拉起真实观察窗（该夹具自装配未接开窗钩子，此键为纪律统一，防日后接线时静默回归）。 */
 function writeNodeConfig(dataDir, { identityName, port, ...overrides }) {
   writeFileSync(
     join(dataDir, 'config.json'),
@@ -170,8 +170,8 @@ function writeNodeConfig(dataDir, { identityName, port, ...overrides }) {
       retryFastCount: 2,
       dispatchTickMs: 40,
       dialTimeoutMs: 1000,
-      viewerAutoOpen: false,
       ...overrides,
+      viewerAutoOpen: false,
     }),
   );
 }

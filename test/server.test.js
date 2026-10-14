@@ -78,7 +78,7 @@ after(async () => {
 async function connectClient(t, entry, home, extraConfig = {}) {
   writeFileSync(
     join(home, 'config.json'),
-    JSON.stringify({ scanWindowMs: 300, dialTimeoutMs: 1500, viewerAutoOpen: false, ...extraConfig }),
+    JSON.stringify({ scanWindowMs: 300, dialTimeoutMs: 1500, ...extraConfig, viewerAutoOpen: false }),
   );
   const transport = new StdioClientTransport({
     command: process.execPath,

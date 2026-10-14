@@ -88,7 +88,7 @@ after(async () => {
 
 /* 治理节奏：短探测 / 短窗口（探针与窗口节律压到秒级以内；行为语义与默认定案一致）。
  * 显式端口写死：测试要按可预期端口寻址——显式目录首跑会自动取段内最低空闲并写回，端口不确定。
- * viewerAutoOpen 关闭：起站夹具不拉起真实观察窗（配置驱动的主保障）。 */
+ * viewerAutoOpen 关闭：起站夹具不拉起真实观察窗（配置驱动的主保障；置展开之后，不可被 extra 改写）。 */
 function writeStationConfig(home, port, extra = {}) {
   writeFileSync(join(home, 'config.json'), JSON.stringify({
     port,
@@ -101,8 +101,8 @@ function writeStationConfig(home, port, extra = {}) {
     managerProbeIntervalMs: 100,
     managerOfflineMs: 300,
     takeoverWindowMs: 1500,
-    viewerAutoOpen: false,
     ...extra,
+    viewerAutoOpen: false,
   }));
 }
 
