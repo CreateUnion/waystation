@@ -112,8 +112,9 @@ if (configCreated || identityDefaulted || (site.ok && site.writeBackPort)) {
 
 /* 观察窗自动打开的入口与站点根：入口按安装布局相对解析
  * （<app|repo>/scripts/ws-viewer.js 相对本模块），不依赖 PATH/工作目录；站点根映射取站点解析
- * 结果（显式目录与槽位 1 = 主根 main、槽位 k≥2 = s<k>，降级启动按主目录解释——活动目录即主
- * 目录）。触发 A（建立协作即开该协作页）由协作服务经注入钩子调用，触发 B（新会话启动按规则
+ * 结果（显式目录与槽位 1 = 主根 main、槽位 k≥2 = s<k>；降级启动按活动目录解释——子进程 env
+ * 不动、其缺省解析恒等于本进程的活动目录）。触发 A（建立协作即开该协作页）由协作服务经注入
+ * 钩子调用，触发 B（新会话启动按规则
  * 拉起）在本组合根启动时判定一次。 */
 const viewerScriptPath = fileURLToPath(new URL('../scripts/ws-viewer.js', import.meta.url));
 const viewerSiteMode = site.ok ? site.mode : null;
@@ -230,8 +231,9 @@ if (!bind.ok) {
 }
 /* 触发 B（新会话启动，每会话一次）：本站点存在待拉的进行中协作且同根观察窗未在跑才拉起——
  * 后台执行不阻塞 MCP 启动（探测多是连接拒绝、即时返回），异常由出口内部消化（绝不抛出）。
- * 「同根」摘要取主数据目录：观察窗的根契约＝主目录（槽位模式子进程缺省解析同址），本站在
- * 观察窗里由 focus 根定位；槽位站点的开关仍读本站点（槽位目录）config.json。 */
+ * 「同根」摘要取子进程解析所得的数据目录（＝本进程 resolveDataDir(process.env)：显式/降级下
+ * 即活动目录、槽位模式下即主目录——与观察窗子进程的缺省解析同址），本站在观察窗里由 focus
+ * 根定位；槽位站点的开关仍读本站点（槽位目录）config.json。 */
 void openViewerOnStart({
   collabs: collab.list().collabs,
   root: viewerRoot,
