@@ -385,6 +385,18 @@ test('managed：正文取数——stop 取 payload.reason；缺文本/超长按�
   assert.equal(feed.skipped, 2);
 });
 
+test('managed：inbox/outbox 坏行（非法 JSON／形态不符／缺 from／缺文本）跳过并计数，行集不受影响', (t) => {
+  const dataDir = makeTempDir(t);
+  const inboxNoFrom = { v: 1, type: 'reply', msgId: 'no-from', collabId: 'c-1', ts: tsPlus(3000), payload: { text: '无 from' }, receivedAt: T0 };
+  writeManagedFixture(dataDir, 'c-1', {
+    [INBOX_FILE_NAME]: `${jsonl(inboxRow({ msgId: 'ok-in', ts: tsPlus(1000) }))}不是 JSON\n${JSON.stringify(inboxRow({ msgId: '坏 id', ts: tsPlus(2000) }))}\n${JSON.stringify(inboxNoFrom)}\n`,
+    [OUTBOX_FILE_NAME]: `${jsonl(outboxRow({ msgId: 'ok-out' }))}{不是 JSON\n${JSON.stringify(outboxRow({ msgId: 'msg-out-2', createdAt: '不是时间' }))}\n${JSON.stringify(outboxRow({ msgId: 'no-text', payload: {} }))}\n`,
+  });
+  const feed = createData(dataDir).readFeed('main', 'c-1', null);
+  assert.deepEqual(rowIds(feed), ['ok-out', 'ok-in']);
+  assert.equal(feed.skipped, 6);
+});
+
 test('managed：并集排序（ts 升序、同 ts 按 id）与跨文件同 msgId（取晚者、平局 inbox）', (t) => {
   const dataDir = makeTempDir(t);
   writeManagedFixture(dataDir, 'c-1', {
@@ -771,6 +783,24 @@ test('缓存：小 JSON 直读不缓存——counter/member/config 同尺寸改�
   assert.equal(data.readMeta('main', 'c-1', null).count, 7);
   assert.equal(data.readMeta('main', 'c-1', null).name, '乙机');
   assert.equal(data.readFeed('main', 'c-1', null).rows[0].fromName, '乙机');
+});
+
+test('小 JSON 读故障（非缺失，位置是目录）留痕降级：warn 被调、不抛、按未就绪语义', (t) => {
+  const dataDir = makeTempDir(t);
+  const dir = collabDirIn(dataDir, 'main', 'c-1');
+  writeFiles(dir, {
+    [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ collabId: 'c-1', role: 'member' })),
+    [OUTBOX_FILE_NAME]: jsonl(outboxRow()),
+  });
+  mkdirSync(join(dir, COUNTER_FILE_NAME), { recursive: true });   // 小 JSON 位置是目录：读取必抛（非 ENOENT）
+  const warnings = [];
+  const data = createViewerData({ dataDir, log: { warn: (...args) => warnings.push(args) } });
+  const meta = data.readMeta('main', 'c-1', null);
+  assert.equal(meta.count, null);   // 读故障按未就绪降级，不抛
+  assert.equal(meta.name, '甲机');   // 其余取数不受影响
+  assert.equal(warnings.length, 1);
+  assert.match(String(warnings[0][0]), /小 JSON 读取失败/);
+  assert.equal(String(warnings[0][1].file).endsWith(COUNTER_FILE_NAME), true);
 });
 
 test('工厂：接口键与 stats 形态（cacheHits/cacheMisses）', (t) => {

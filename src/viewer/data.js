@@ -91,14 +91,17 @@ function readTextOrNull(state, file) {
 }
 
 /* 小 JSON 直读（member/snapshot/counter/config）：缺失/损坏统一 null——「未就绪」是合法呈现态，
- * 不告警；同尺寸原子替换能骗过 (path,size,mtime) 键，所以这类文件不缓存、每次现读。 */
-function readJsonOrNull(file) {
+ * 不告警；非 ENOENT 的读故障（EISDIR/EACCES 等）与 JSONL 面同纪律：留痕 log?.warn 后按缺失降级。
+ * 同尺寸原子替换能骗过 (path,size,mtime) 键，所以这类文件不缓存、每次现读。 */
+function readJsonOrNull(state, file) {
   /** @type {string | null} */
   let text = null;
   try {
     text = readFileSync(file, 'utf8');
-  } catch {
-    // 不存在 / 不可读：按缺失处理
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      state.log?.warn?.('查看器小 JSON 读取失败（按缺失处理）', { file, reason: error.message });
+    }
   }
   if (text === null) {
     return null;
@@ -212,8 +215,9 @@ function hasContentHead(parsed, ts) {
 }
 
 /* 内容正文取数：stop 的正文在 payload.reason（发送侧 payloadOf 的构造形态），其余内容类在
- * payload.text；长度上限取协议常量（不自设）——超长/缺失/空白一律「取不到文本」，计入 skipped
- * （协议保证内容帧必带文本，取不到即文件被手改过）。 */
+ * payload.text；长度上限统一按并集上限 MAX_MESSAGE_TEXT_CHARS 防御——协议面各类型上限
+ * （如 stop 的 MAX_REASON_CHARS）见 protocol.js，本上限只做内存/渲染防御、不做协议校验。
+ * 超长/缺失/空白一律「取不到文本」，计入 skipped（协议保证内容帧必带文本，取不到即文件被手改过）。 */
 function contentTextOf(type, payload) {
   if (!isPlainObject(payload)) {
     return null;
@@ -401,7 +405,7 @@ function anchorOf(rows, after) {
 function ledgerSourceOf(state, base, collabId, member) {
   const role = member === null ? null : member.role;
   if (role === 'member') {
-    const snapshotLedger = snapshotLedgerOf(base, collabId);
+    const snapshotLedger = snapshotLedgerOf(state, base, collabId);
     return { ledgerRows: snapshotLedger === null ? [] : [snapshotLedger], skipped: 0 };
   }
   const parsed = readParsedFile(state, collabFilePath(base, collabId, LEDGER_FILE_NAME), classifyLedgerLine);
@@ -409,15 +413,15 @@ function ledgerSourceOf(state, base, collabId, member) {
   if (parsed !== null && parsed.rows.length > 0) {
     return { ledgerRows: parsed.rows, skipped };
   }
-  const snapshotLedger = role === null ? snapshotLedgerOf(base, collabId) : null;
+  const snapshotLedger = role === null ? snapshotLedgerOf(state, base, collabId) : null;
   if (snapshotLedger !== null) {
     return { ledgerRows: [snapshotLedger], skipped };
   }
   return { ledgerRows: [], skipped };
 }
 
-function snapshotLedgerOf(base, collabId) {
-  const parsed = readJsonOrNull(collabFilePath(base, collabId, SNAPSHOT_FILE_NAME));
+function snapshotLedgerOf(state, base, collabId) {
+  const parsed = readJsonOrNull(state, collabFilePath(base, collabId, SNAPSHOT_FILE_NAME));
   return isPlainObject(parsed) && isLedgerShape(parsed.ledger) ? parsed.ledger : null;
 }
 
@@ -427,8 +431,8 @@ function lastOf(rows) {
 
 /* 累计收到计数（counter.json）：只读自行 JSON.parse＋{v:1, messageCount} 守卫（counter 模块的
  * import 面含写能力，白名单禁其符号）；缺失/损坏 → null（服务层省略该字段）。 */
-function counterOf(base, collabId) {
-  const parsed = readJsonOrNull(collabFilePath(base, collabId, COUNTER_FILE_NAME));
+function counterOf(state, base, collabId) {
+  const parsed = readJsonOrNull(state, collabFilePath(base, collabId, COUNTER_FILE_NAME));
   if (isPlainObject(parsed) && parsed.v === 1 && Number.isInteger(parsed.messageCount) && parsed.messageCount >= 0) {
     return parsed.messageCount;
   }
@@ -437,8 +441,8 @@ function counterOf(base, collabId) {
 
 /* 本机身份名（发出行作者）：读对应根的 config.json，仅 JSON.parse＋字符串守卫——严禁 loadConfig
  * （其损坏分支会改名写盘）；缺失/损坏/空值回退「本机」。 */
-function identityNameOf(base) {
-  const parsed = readJsonOrNull(join(base, CONFIG_FILE_NAME));
+function identityNameOf(state, base) {
+  const parsed = readJsonOrNull(state, join(base, CONFIG_FILE_NAME));
   if (isPlainObject(parsed) && typeof parsed.identityName === 'string' && parsed.identityName.trim() !== '') {
     return parsed.identityName;
   }
@@ -551,7 +555,7 @@ function readFeed(state, root, collabId, after) {
   const rows = assembleManagedRows(
     inbox === null ? [] : inbox.rows,
     outbox === null ? [] : outbox.rows,
-    identityNameOf(base),
+    identityNameOf(state, base),
   );
   const anchored = anchorOf(rows, after);
   return {
@@ -604,7 +608,7 @@ function managedMetaOf(state, base, collabId, member, after) {
     state: view === null ? null : view.state,
     mode: 'managed',
     memberCount: ledger === null ? 0 : ledger.members.length,
-    count: counterOf(base, collabId),
+    count: counterOf(state, base, collabId),
     topic: topicOf(ledger, member),
     events: anchorOf(migrationRowsOf(source.ledgerRows), after),
     skipped: source.skipped,
@@ -664,7 +668,7 @@ function forumSummaryOf(state, base, collabId, posts) {
 function managedSummaryOf(state, base, collabId, member) {
   const source = ledgerSourceOf(state, base, collabId, member);
   const ledger = lastOf(source.ledgerRows);
-  return { ledger, memberCount: ledger === null ? 0 : ledger.members.length, count: counterOf(base, collabId) };
+  return { ledger, memberCount: ledger === null ? 0 : ledger.members.length, count: counterOf(state, base, collabId) };
 }
 
 function summarizeCollab(state, site, collabId) {
