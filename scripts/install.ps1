@@ -227,7 +227,7 @@ function Test-PathOnPath([string]$Dir) {
 function Install-Files {
     Write-Step '2/6' "安装运行文件到 $AppDir"
     if ($DryRun) {
-        Write-Note '将清理并重新拷贝：bin\ src\ scripts\statusline.js package.json package-lock.json'
+        Write-Note '将清理并重新拷贝：bin\ src\ scripts\statusline.js scripts\ws-viewer.js package.json package-lock.json'
         Write-Note '将在安装目录执行：npm ci --omit=dev --no-audit --no-fund'
         return
     }
@@ -243,6 +243,7 @@ function Install-Files {
     }
     New-Item -ItemType Directory -Force -Path (Join-Path $AppDir 'scripts') | Out-Null
     Copy-Item -Force -Path (Join-Path $RepoRoot 'scripts\statusline.js') -Destination (Join-Path $AppDir 'scripts')
+    Copy-Item -Force -Path (Join-Path $RepoRoot 'scripts\ws-viewer.js') -Destination (Join-Path $AppDir 'scripts')
     Copy-Item -Force -Path (Join-Path $RepoRoot 'package.json') -Destination $AppDir
     Copy-Item -Force -Path (Join-Path $RepoRoot 'package-lock.json') -Destination $AppDir
     if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
@@ -349,6 +350,25 @@ function Install-ClaudeCommands {
     if ($run.ExitCode -ne 0) {
         Write-Warn '斜杠命令安装失败（退出码非 0，不中断安装——重跑本脚本即可重试）'
         Write-Note "  或手工执行：把 $commandsSourceDir 下的受管命令文件拷到 ~\.claude\commands\"
+    }
+}
+
+function Install-ViewerShims {
+    # 观察窗启动器的「生成什么/放哪里」全部在 src/install-shims.js（唯一权威）；本步只调入口并转发输出。
+    # 不随 claude CLI 缺失跳过：启动器与本机 shell 有关、与 Claude Code 无关。
+    Write-Note '观察窗启动器：'
+    $shimModulePath = Join-Path $RepoRoot 'src\install-shims.js'
+    $shimArgs = @($shimModulePath, 'install', '--home', $HOME)
+    if ($DryRun) {
+        $shimArgs += '--dry-run'
+    }
+    $shimRun = Invoke-Native -Command 'node' -CommandArgs $shimArgs
+    foreach ($line in $shimRun.Output) {
+        Write-Note "$line"
+    }
+    if ($shimRun.ExitCode -ne 0) {
+        Write-Warn '观察窗启动器安装失败（退出码非 0，不中断安装——重跑本脚本即可重试）'
+        Write-Note '  或手工执行：node src\install-shims.js install --home <你的家目录>'
     }
 }
 
@@ -482,6 +502,29 @@ function Show-ClientSnippets {
     Write-Note '（示例依据 opencode 官方文档 mcp-servers 页，2026-10-13 核对；客户端版本演进可能变化。）'
 }
 
+function Remove-ViewerShims {
+    # 观察窗三件套（ws-view.cmd / ws-view.vbs / ~/.local/bin/ws-view）：移除规格与安装面同一权威
+    # （src/install-shims.js 的 remove）；node 缺失或模块失败只提示手工删除，不中断卸载。
+    if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+        Write-Warn '未找到 node——跳过观察窗启动器删除（不中断卸载）'
+        Write-Note '手工删除：~\.waystation\bin\ws-view.cmd、~\.waystation\bin\ws-view.vbs、~\.local\bin\ws-view'
+        return
+    }
+    $shimModulePath = Join-Path $RepoRoot 'src\install-shims.js'
+    $shimArgs = @($shimModulePath, 'remove', '--home', $HOME)
+    if ($DryRun) {
+        $shimArgs += '--dry-run'
+    }
+    $shimRun = Invoke-Native -Command 'node' -CommandArgs $shimArgs
+    foreach ($line in $shimRun.Output) {
+        Write-Note "$line"
+    }
+    if ($shimRun.ExitCode -ne 0) {
+        Write-Warn '观察窗启动器删除失败（不中断卸载）'
+        Write-Note '手工删除：~\.waystation\bin\ws-view.cmd、~\.waystation\bin\ws-view.vbs、~\.local\bin\ws-view'
+    }
+}
+
 function Invoke-Uninstall {
     if ($DryRun) {
         Write-Say '=== waystation 卸载（dry-run：只打印，不改动）==='
@@ -533,6 +576,7 @@ function Invoke-Uninstall {
     } else {
         Write-Note "不存在，跳过：$ShimPath"
     }
+    Remove-ViewerShims
 
     Write-Step '4/5' '删除安装目录'
     if ($DryRun) {
@@ -596,6 +640,7 @@ Install-Files
 Install-Shim
 Register-Mcp
 Install-ClaudeCommands
+Install-ViewerShims
 if ($DryRun) {
     Write-Note '（dry-run：自检从略——真实运行时将核对入口、运行依赖、可执行、状态栏脚本、斜杠命令与 MCP 注册六项）'
 } else {

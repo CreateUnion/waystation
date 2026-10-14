@@ -48,8 +48,14 @@ test('安装脚本 --dry-run：5/6 走到命令行模块（含五个受管文件
   assert.ok(result.stdout.includes('斜杠命令'), '安装流程应含斜杠命令步骤');
   assert.ok(
     result.stdout.includes('ws-collab') && result.stdout.includes('ws-discuss') && result.stdout.includes('ws-list')
-      && result.stdout.includes('ws-mute') && result.stdout.includes('ws-purge'),
-    `应打印模块安装计划（五个受管文件名）：${result.stdout}`,
+      && result.stdout.includes('ws-mute') && result.stdout.includes('ws-purge') && result.stdout.includes('ws-view.md'),
+    `应打印模块安装计划（六个受管文件名）：${result.stdout}`,
+  );
+  assert.ok(result.stdout.includes('scripts/ws-viewer.js'), `dry-run 应打印 ws-viewer.js 拷贝：${result.stdout}`);
+  assert.match(
+    result.stdout,
+    /观察窗启动器：[\s\S]*将安装：[^\n]*ws-view/,
+    `应打印启动器安装计划（观察窗启动器标签之后、经 install-shims 调用）：${result.stdout}`,
   );
   assert.equal(existsSync(join(home, '.claude')), false, 'dry-run 不得创建 ~/.claude');
   assert.equal(existsSync(join(home, '.waystation')), false, 'dry-run 不得创建安装目录');
@@ -71,6 +77,12 @@ test('卸载脚本 --uninstall --dry-run：2/5 走到命令行模块（将删除
   assert.ok(
     result.stdout.includes('将删除') && result.stdout.includes('ws-list.md'),
     `应打印模块删除计划（将删除 + 受管文件名）：${result.stdout}`,
+  );
+  assert.ok(
+    result.stdout.includes(`不存在，跳过：${join(home, '.waystation', 'bin', 'ws-view.cmd')}`)
+      && result.stdout.includes(`不存在，跳过：${join(home, '.waystation', 'bin', 'ws-view.vbs')}`)
+      && result.stdout.includes(`不存在，跳过：${join(home, '.local', 'bin', 'ws-view')}`),
+    `卸载臂应经 install-shims 列出观察窗三件套：${result.stdout}`,
   );
   assert.equal(existsSync(managedPath), true, 'dry-run 不得删除受管命令');
   assert.equal(existsSync(join(home, '.waystation')), false, 'dry-run 不得创建安装目录');

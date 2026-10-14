@@ -48,8 +48,12 @@ function makeInstalledHome(t) {
   writeFileSync(join(installDir, 'app', 'src', 'index.js'), '// 占位');
   mkdirSync(join(installDir, 'bin'), { recursive: true });
   writeFileSync(join(installDir, 'bin', 'waystation.cmd'), '@echo off');
+  /* 观察窗三件套：卸载面经 install-shims 的 remove 移除——安装面落点多平台共存场景同夹具覆盖 */
+  writeFileSync(join(installDir, 'bin', 'ws-view.cmd'), '@echo off\r\n');
+  writeFileSync(join(installDir, 'bin', 'ws-view.vbs'), 'shell.Run "cmd /c node"\r\n');
   mkdirSync(join(home, '.local', 'bin'), { recursive: true });
   writeFileSync(join(home, '.local', 'bin', 'waystation'), '#!/bin/sh');
+  writeFileSync(join(home, '.local', 'bin', 'ws-view'), '#!/bin/sh\n');
   mkdirSync(commandsDir, { recursive: true });
   writeFileSync(join(commandsDir, 'ws-list.md'), `---\ndescription: 列表\n---\n${MANAGED_MARKER}\n正文\n`);
   writeFileSync(join(commandsDir, 'note.md'), '用户手工文件\n');
@@ -88,8 +92,13 @@ test('dry-run：只打印、不执行命令、不删任何文件', async (t) => 
   assert.ok(output.includes('将执行：claude mcp remove -s user waystation'));
   assert.ok(output.includes('斜杠命令'));
   assert.ok(output.includes(`将删除：${join(commandsDir, 'ws-list.md')}`));
+  assert.ok(output.includes(`将删除：${join(installDir, 'bin', 'ws-view.cmd')}`), 'dry-run 应打印观察窗启动器删除计划');
+  assert.ok(output.includes(`将删除：${join(home, '.local', 'bin', 'ws-view')}`), 'dry-run 应打印 POSIX 包装删除计划');
   assert.equal(existsSync(join(installDir, 'app')), true);
   assert.equal(existsSync(join(installDir, 'bin', 'waystation.cmd')), true);
+  assert.equal(existsSync(join(installDir, 'bin', 'ws-view.cmd')), true, 'dry-run 不删观察窗启动器');
+  assert.equal(existsSync(join(installDir, 'bin', 'ws-view.vbs')), true, 'dry-run 不删观察窗启动器');
+  assert.equal(existsSync(join(home, '.local', 'bin', 'ws-view')), true, 'dry-run 不删 POSIX 包装');
   assert.equal(existsSync(join(commandsDir, 'ws-list.md')), true, 'dry-run 不删受管斜杠命令');
 });
 
@@ -101,10 +110,14 @@ test('真实路径：注销注册、删两平台 shim 与安装目录、数据�
   assert.deepEqual(calls, ['claude mcp remove -s user waystation']);
   assert.ok(output.includes('已注销：waystation'));
   assert.ok(output.includes('2/5 删除斜杠命令'));
+  assert.ok(output.includes(`已删除：${join(installDir, 'bin', 'ws-view.cmd')}`), '观察窗启动器删除应逐文件留痕');
   assert.equal(existsSync(join(commandsDir, 'ws-list.md')), false, '受管斜杠命令随卸载删除');
   assert.equal(existsSync(join(commandsDir, 'note.md')), true, '无标记文件一律不动');
   assert.equal(existsSync(join(installDir, 'app')), false);
   assert.equal(existsSync(join(installDir, 'bin', 'waystation.cmd')), false);
+  assert.equal(existsSync(join(installDir, 'bin', 'ws-view.cmd')), false, '观察窗启动器随卸载删除');
+  assert.equal(existsSync(join(installDir, 'bin', 'ws-view.vbs')), false, '观察窗启动器随卸载删除');
+  assert.equal(existsSync(join(home, '.local', 'bin', 'ws-view')), false, '观察窗 POSIX 包装随卸载删除');
   assert.equal(existsSync(join(home, '.local', 'bin', 'waystation')), false, 'Linux shim 同删');
   assert.equal(existsSync(dataDir), true, '数据目录默认保留（WAYSTATION_HOME 另位不受安装面清理影响）');
 });
@@ -117,6 +130,7 @@ test('无 claude CLI：手工步骤提示、不失败退出（退出码 0）', a
   assert.ok(output.includes('未找到 claude CLI'));
   assert.ok(output.includes('claude mcp remove -s user waystation'));
   assert.equal(existsSync(join(installDir, 'app')), false, '无 claude CLI 不影响其余清理面');
+  assert.equal(existsSync(join(installDir, 'bin', 'ws-view.cmd')), false, '无 claude CLI 不影响观察窗启动器清理');
 });
 
 test('--purge-data：数据目录一并删除（家目录不受影响）', async (t) => {

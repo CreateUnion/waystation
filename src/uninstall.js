@@ -3,6 +3,7 @@ import { existsSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { MANAGED_MARKER, applyRemoveCommands, planRemoveCommands } from './claude-commands.js';
+import { removeShims } from './install-shims.js';
 import { looksLikeStationDataDir, purgePathRefusal } from './purge.js';
 import { resolveDataDir } from './paths.js';
 
@@ -140,6 +141,31 @@ function removeExecutables(parsed, installDir, home) {
     } catch (error) {
       write(`    删除失败：${error?.message}——请手动删除：${shim}`);
     }
+  }
+  removeViewerShims(parsed, home);
+}
+
+/* 观察窗三件套（ws-view.cmd / ws-view.vbs / ~/.local/bin/ws-view）：移除规格与安装面同一权威
+ * （src/install-shims.js 的 removeShims），此处只消费结果、不复制路径清单；三件套一并清理，
+ * 与上面两个主 shim 的两平台口径一致。逐文件记账：单文件失败不中断其余（失败行承担详情，
+ * 不误报「已删除」）。 */
+function removeViewerShims(parsed, home) {
+  try {
+    const viewer = removeShims({ home, dryRun: parsed.dryRun });
+    for (const entry of viewer.entries) {
+      if (entry.status === 'planned') {
+        write(`    将删除：${entry.path}`);
+      } else if (entry.status === 'removed') {
+        write(`    已删除：${entry.path}`);
+      } else if (entry.status === 'absent') {
+        write(`    不存在，跳过：${entry.path}`);
+      }
+    }
+    for (const failure of viewer.failures) {
+      write(`    ${failure}`);
+    }
+  } catch (error) {
+    write(`    失败：${error?.message}——请手动删除 ~/.waystation/bin 与 ~/.local/bin 下的 ws-view 启动器`);
   }
 }
 

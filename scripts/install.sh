@@ -198,7 +198,7 @@ check_port() {
 install_files() {
   step "2/6" "安装运行文件到 ${APP_DIR}"
   if [ "$DRY_RUN" = 1 ]; then
-    note "将清理并重新拷贝：bin/ src/ scripts/statusline.js package.json package-lock.json"
+    note "将清理并重新拷贝：bin/ src/ scripts/statusline.js scripts/ws-viewer.js package.json package-lock.json"
     note "将在安装目录执行：npm ci --omit=dev --no-audit --no-fund"
     return 0
   fi
@@ -208,6 +208,7 @@ install_files() {
   cp -R "${REPO_ROOT}/src" "${APP_DIR}/src"
   mkdir -p "${APP_DIR}/scripts"
   cp "${REPO_ROOT}/scripts/statusline.js" "${APP_DIR}/scripts/statusline.js"
+  cp "${REPO_ROOT}/scripts/ws-viewer.js" "${APP_DIR}/scripts/ws-viewer.js"
   cp "${REPO_ROOT}/package.json" "${APP_DIR}/package.json"
   cp "${REPO_ROOT}/package-lock.json" "${APP_DIR}/package-lock.json"
   chmod +x "${APP_DIR}/bin/waystation.js"
@@ -299,6 +300,24 @@ install_claude_commands() {
     note_lines "$output"
     warn "斜杠命令安装失败（退出码非 0，不中断安装——重跑本脚本即可重试）"
     note "  或手工执行：把 ${source_dir}/ 下的受管命令文件拷到 ~/.claude/commands/"
+  fi
+}
+
+install_viewer_shims() {
+  # 观察窗启动器的「生成什么/放哪里」全部在 src/install-shims.js（唯一权威）；本步只调入口并转发输出。
+  # 不随 claude CLI 缺失跳过：启动器与本机 shell 有关、与 Claude Code 无关。
+  note "观察窗启动器："
+  local args=(install --home "$HOME")
+  if [ "$DRY_RUN" = 1 ]; then
+    args+=(--dry-run)
+  fi
+  local output=""
+  if output="$(node "${REPO_ROOT}/src/install-shims.js" "${args[@]}" 2>&1)"; then
+    note_lines "$output"
+  else
+    note_lines "$output"
+    warn "观察窗启动器安装失败（退出码非 0，不中断安装——重跑本脚本即可重试）"
+    note "  或手工执行：node src/install-shims.js install --home <你的家目录>"
   fi
 }
 
@@ -456,6 +475,28 @@ remove_claude_commands() {
   fi
 }
 
+remove_viewer_shims() {
+  # 观察窗三件套（ws-view.cmd / ws-view.vbs / ~/.local/bin/ws-view）：移除规格与安装面同一权威
+  # （src/install-shims.js 的 remove）；node 缺失或模块失败只提示手工删除，不中断卸载。
+  if ! command -v node >/dev/null 2>&1; then
+    warn "未找到 node——跳过观察窗启动器删除（不中断卸载）"
+    note "手工删除：~/.waystation/bin/ws-view.cmd、~/.waystation/bin/ws-view.vbs、~/.local/bin/ws-view"
+    return 0
+  fi
+  local args=(remove --home "$HOME")
+  if [ "$DRY_RUN" = 1 ]; then
+    args+=(--dry-run)
+  fi
+  local output=""
+  if output="$(node "${REPO_ROOT}/src/install-shims.js" "${args[@]}" 2>&1)"; then
+    note_lines "$output"
+  else
+    note_lines "$output"
+    warn "观察窗启动器删除失败（不中断卸载）"
+    note "手工删除：~/.waystation/bin/ws-view.cmd、~/.waystation/bin/ws-view.vbs、~/.local/bin/ws-view"
+  fi
+}
+
 do_uninstall() {
   local title="=== waystation 卸载 ==="
   if [ "$DRY_RUN" = 1 ]; then
@@ -487,6 +528,7 @@ do_uninstall() {
   else
     note "不存在，跳过：${SHIM_PATH}"
   fi
+  remove_viewer_shims
 
   step "4/5" "删除安装目录"
   if [ "$DRY_RUN" = 1 ]; then
@@ -549,6 +591,7 @@ install_files
 place_executable
 register_mcp
 install_claude_commands
+install_viewer_shims
 if [ "$DRY_RUN" = 1 ]; then
   note "（dry-run：自检从略——真实运行时将核对入口、运行依赖、可执行、状态栏脚本、斜杠命令与 MCP 注册六项）"
 else
