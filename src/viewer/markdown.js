@@ -50,6 +50,7 @@ const LINK_TAIL_PUNCTUATION = new Set(['.', ',', ';', ':', '!', '?', ')']);
 
 const ESCAPED_QUOTE = '&quot;';
 const ESCAPED_APOSTROPHE = '&#39;';
+const ENTITY_NAME_CHAR_RE = /[A-Za-z0-9#]/;
 
 /**
  * 把消息正文渲染为 HTML 片段（设计 §7 封闭清单）。
@@ -527,6 +528,9 @@ function matchDelimited(text, index, marker, tag) {
   return { html: `<${tag}>${renderInline(content)}</${tag}>`, next: close + marker.length };
 }
 
+/* 链接文字（图片 alt 同理）按行内规则再解析：文字里若还有裸链或链接，会产出嵌套 <a>——
+ * 已知结果，有意不改：浏览器解析器按规范自动把内层 <a> 修正为兄弟节点，观察窗只读呈现、
+ * 不依赖该结构；要规避得给文字单独一套「禁链接」扫描，属超出封闭清单的新机制。 */
 function matchLink(text, index) {
   const target = scanBracketTarget(text, index);
   if (target === null) {
@@ -653,7 +657,9 @@ function isBareLinkStop(text, index) {
 }
 
 /* 尾随句读不并入链接（句中 URL 后跟句号 / 逗号 / 右括号等）；剥离可连做（`http://a.)` 这类）。
- * 转义文本里 `"` / `'` 是 &quot; / &#39;：先按实体整段剥，否则实体的收尾分号会被当成分号句读先剥掉。 */
+ * 两条实体保全规则：`"` / `'` 在转义文本里是 &quot; / &#39;，先按实体整段剥（它们本身就是栏里的
+ * 句读，剥掉即去掉那个字符）；而 `&名字;` 形状的收尾（对端正文里的每个 `&` 都转义成 &amp;，
+ * 天然长这样）整体保留——那里的分号属模块自己转义的实体，按句读剥会把 URL 断成半个实体。 */
 function trimLinkTail(text, end) {
   let trimmed = end;
   while (trimmed > 0) {
@@ -665,6 +671,9 @@ function trimLinkTail(text, end) {
       trimmed -= ESCAPED_APOSTROPHE.length;
       continue;
     }
+    if (isEntityTerminator(text, trimmed)) {
+      break;
+    }
     if (LINK_TAIL_PUNCTUATION.has(text[trimmed - 1])) {
       trimmed--;
       continue;
@@ -672,4 +681,16 @@ function trimLinkTail(text, end) {
     break;
   }
   return trimmed;
+}
+
+/* 收尾的 `;` 是不是 `&名字;` 实体的终止符（名字非空、以 `&` 起）——是则不剥、不切开。 */
+function isEntityTerminator(text, end) {
+  if (text[end - 1] !== ';') {
+    return false;
+  }
+  let index = end - 2;
+  while (index >= 0 && ENTITY_NAME_CHAR_RE.test(text[index])) {
+    index--;
+  }
+  return index < end - 2 && index >= 0 && text[index] === '&';
 }

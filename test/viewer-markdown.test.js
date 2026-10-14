@@ -2,16 +2,22 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { renderMarkdown } from '../src/viewer/markdown.js';
 
-/* T2 判别语料（设计 §7 封闭清单）：结构 golden、非标准语法字面语料、XSS 语料、边界与压测。
+/* 判别语料（设计 §7 封闭清单）：结构 golden、非标准语法字面语料、XSS 语料、边界与压测。
  * 输入前提＝已过 displayText(text, { newlines: 'keep' })：控制 / 格式字符已剥、换行归一为 \n。 */
 
-/* 不变量：输出里的标签只允许来自渲染器自身——剥去本模块会产出的标签后，正文不得残留原始 < > " '。
+/* 不变量一：输出里的标签只允许来自渲染器自身——剥去本模块会产出的标签后，正文不得残留原始 < > " '。
  * 逃逸优先下任何注入都逃不出文本区，这条不变量即是 XSS 语料的公共判据。 */
 const OWN_TAG_PATTERN = /<\/?(?:p|h[1-6]|ul|ol|li|blockquote|pre|code|div|span|table|thead|tbody|tr|th|td|a|strong|em|del|br|hr)(?:\s[^<>]*)?>/g;
+
+/* 不变量二：整段输出（含属性值）里的每个 `&` 都必须起一个完整实体（转义表只产出这五个）——
+ * 防「剥尾读切开实体」把 URL 断成半个实体（&amp 这种）而无人察觉；属性值也要查，切开实体的
+ * 现场往往就在 href 里。 */
+const DANGLING_AMPERSAND_PATTERN = /&(?!(?:amp|lt|gt|quot|#39);)/;
 
 function assertTextOnly(html) {
   const text = html.replace(OWN_TAG_PATTERN, '');
   assert.ok(!/[<>"']/.test(text), `正文残留原始标记字符：${text}`);
+  assert.ok(!DANGLING_AMPERSAND_PATTERN.test(html), `出现被切开的实体（含属性内）：${html}`);
 }
 
 /* ── 结构 golden：标题 ───────────────────────────────────── */
@@ -389,6 +395,34 @@ test('裸链：只剩 scheme 不成链接；中间句点与路径不切断', () 
   assert.equal(
     renderMarkdown('http://e.com/a.b?x=1.5'),
     '<p><a href="http://e.com/a.b?x=1.5" target="_blank" rel="noopener">http://e.com/a.b?x=1.5</a></p>'
+  );
+});
+
+test('裸链：`&名字;` 形状的收尾不剥——正文里的 `&` 转义成 &amp;，切开它 URL 会断成半个实体', () => {
+  assert.equal(
+    renderMarkdown('http://a&'),
+    '<p><a href="http://a&amp;" target="_blank" rel="noopener">http://a&amp;</a></p>'
+  );
+  /* 实体完整性与句读剥离并存：`&amp;` 留在链接里（那是 `&` 的转义形态），用户多写的那枚 `;` 照剥 */
+  assert.equal(
+    renderMarkdown('http://a&;'),
+    '<p><a href="http://a&amp;" target="_blank" rel="noopener">http://a&amp;</a>;</p>'
+  );
+});
+
+test('裸链：实体以外的收尾分号仍按句读剥（含用户字面键入的实体写法）', () => {
+  assert.equal(
+    renderMarkdown('http://a.com;'),
+    '<p><a href="http://a.com" target="_blank" rel="noopener">http://a.com</a>;</p>'
+  );
+  assert.equal(
+    renderMarkdown('http://x&y;'),
+    '<p><a href="http://x&amp;y" target="_blank" rel="noopener">http://x&amp;y</a>;</p>'
+  );
+  /* `&lt;` 由用户字面键入：转义后字面量在 `&amp;` 之后（`&amp;lt;`），收尾分号属用户正文（句读） */
+  assert.equal(
+    renderMarkdown('https://&lt;'),
+    '<p><a href="https://&amp;lt" target="_blank" rel="noopener">https://&amp;lt</a>;</p>'
   );
 });
 
