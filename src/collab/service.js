@@ -32,6 +32,8 @@ const INVITE_MIN_INTERVAL_MS = 1000;
  *   notify?: ((frame: object) => unknown) | null,
  *   sendDirect?: ((message: object) => { ok: boolean, msgId?: string, tier?: string, reason?: string }) | null,
  *   onIndicatorChange?: (() => void) | null,
+ *   openViewer?: ((ref: { root: string | null, id: string }) => unknown) | null,
+ *   viewerRoot?: string | null,
  *   ledgerFetchTimeoutMs?: number, inviteMinIntervalMs?: number, takeoverProbeIntervalMs?: number,
  *   handshakeReplyTimeoutMs?: number, handoverConfirmTimeoutMs?: number,
  *   pullReplyTimeoutMs?: number, syncMaxRequestsPerCycle?: number, syncMaxSourcesPerCycle?: number,
@@ -71,6 +73,10 @@ function coreStateOf(options) {
     probe: options.probe ?? null,
     reassign: options.reassign ?? null,
     notify: options.notify ?? null,
+    /* 观察窗自动打开（触发 A）：组合根注入的拉起钩子与本站点根（观察窗 URL 里的 main/s<k>）——
+     * 钩子不抛出、开关在钩子出口内现读；本层只传 ref＝{ root, id }。 */
+    openViewer: pickOption(options, 'openViewer', null),
+    viewerRoot: pickOption(options, 'viewerRoot', null),
     ledgerFetchTimeoutMs: options.ledgerFetchTimeoutMs ?? LEDGER_FETCH_TIMEOUT_MS,
     inviteMinIntervalMs: options.inviteMinIntervalMs ?? INVITE_MIN_INTERVAL_MS,
     takeoverProbeIntervalMs: options.takeoverProbeIntervalMs ?? TAKEOVER_PROBE_INTERVAL_MS,

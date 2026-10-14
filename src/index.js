@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { COLLABS_DIR_NAME, ensureDir, resolveDataDir, resolveLogDir } from './paths.js';
 import { checkWritableDir } from './selfcheck.js';
@@ -26,6 +27,7 @@ import { createNetStack } from './net/stack.js';
 import { createClaudeCodeAdapter } from './adapters/claude-code.js';
 import { createCollabService } from './collab/service.js';
 import { createSessionStatusWriter, indicatedEntriesOf, isIndicatedCollab } from './session-status.js';
+import { openViewerOnStart, openViewerWindow, rootDigest, viewerRootOf } from './viewer/launch.js';
 
 // 版本单一来源：包元数据（不另设常量，避免与 package.json 漂移）
 const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
@@ -108,6 +110,16 @@ if (configCreated || identityDefaulted || (site.ok && site.writeBackPort)) {
   }
 }
 
+/* 观察窗自动打开（安静默认期）的入口与站点根：入口按安装布局相对解析
+ * （<app|repo>/scripts/ws-viewer.js 相对本模块），不依赖 PATH/工作目录；站点根映射取站点解析
+ * 结果（显式目录与槽位 1 = 主根 main、槽位 k≥2 = s<k>，降级启动按主目录解释——活动目录即主
+ * 目录）。触发 A（建立协作即开该协作页）由协作服务经注入钩子调用，触发 B（新会话启动按规则
+ * 拉起）在本组合根启动时判定一次。 */
+const viewerScriptPath = fileURLToPath(new URL('../scripts/ws-viewer.js', import.meta.url));
+const viewerSiteMode = site.ok ? site.mode : null;
+const viewerSlot = site.ok ? site.slot : null;
+const viewerRoot = viewerRootOf({ siteMode: viewerSiteMode, slot: viewerSlot });
+
 /* 网络层与协作层组合根：构造组件、注入装配层（接线与生命周期归 stack——循环依赖在那里解除）。
  * 适配器先于协作服务构造：协作服务的 notify（本机提示注入面）需要它；其 describeCollab 闭包
  * 延迟引用协作服务（TDZ 安全——描述器只在投递渲染时调用，启动期不触达）。
@@ -146,6 +158,10 @@ const collab = createCollabService({
   notify: (frame) => adapter.deliverFrame(frame),
   knownHosts,
   log,
+  /* 触发 A（建立协作即开该协作页）：创建/同意成功点经 openViewer(ref) 落下——本站点根随 ref
+   * 传入（服务层不复制根映射）；开关由拉起出口现读，失败静默降级（钩子不抛出）。 */
+  viewerRoot,
+  openViewer: (ref) => openViewerWindow({ ref, dataDir: activeDir, siteMode: viewerSiteMode, slot: viewerSlot, scriptPath: viewerScriptPath, log }),
   /* 观察面变化（内容消息计数 / 帖入列 / 成员事件）→ 会话状态文件即时刷新（计数变化不等心跳）；
    * 声明顺序无碍（同 describeCollab 先例）：回调只在运行期触发，sessionStatus 彼时已就绪。 */
   onIndicatorChange: () => sessionStatus.refresh(),
@@ -212,6 +228,20 @@ if (!bind.ok) {
 } else {
   collab.start();   // 探测定时器 + 启动握手（常驻收敛机制；降级不启动——无 LAN 面对表）
 }
+/* 触发 B（新会话启动，每会话一次）：本站点存在待拉的进行中协作且同根观察窗未在跑才拉起——
+ * 后台执行不阻塞 MCP 启动（探测多是连接拒绝、即时返回），异常由出口内部消化（绝不抛出）。
+ * 「同根」摘要取主数据目录：观察窗的根契约＝主目录（槽位模式子进程缺省解析同址），本站在
+ * 观察窗里由 focus 根定位；槽位站点的开关仍读本站点（槽位目录）config.json。 */
+void openViewerOnStart({
+  collabs: collab.list().collabs,
+  root: viewerRoot,
+  digest: rootDigest(resolveDataDir(process.env)),
+  dataDir: activeDir,
+  siteMode: viewerSiteMode,
+  slot: viewerSlot,
+  scriptPath: viewerScriptPath,
+  log,
+});
 
 const registry = createToolRegistry();
 registry.register(statusTool());

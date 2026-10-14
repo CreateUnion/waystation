@@ -3,20 +3,25 @@ import assert from 'node:assert/strict';
 import { win32 } from 'node:path';
 import {
   buildOpenCommand,
+  buildViewerSpawn,
   classifyBusyPort,
   DEFAULT_VIEWER_PORT,
+  inProgressCollabsOf,
   locateEdge,
   openWindow,
   PORT_TRIES,
   probeViewer,
+  readViewerAutoOpen,
   rootDigest,
   STOP_RELEASE_WAIT_MS,
   stopViewer,
+  viewerRootOf,
 } from '../src/viewer/launch.js';
 import { rootDigest as serverRootDigest } from '../src/viewer/server.js';
 
-/* 启动链纯函数的判别用例：全部副作用注入桩（fetch / spawn / kill / sleep / exists）——
- * 不碰网络、不碰真实文件系统、不起进程；spawn 真脚本的判别面在 viewer-e2e.test.js。 */
+/* 启动链纯函数的判别用例：全部副作用注入桩（fetch / spawn / kill / sleep / exists / readFile）——
+ * 不碰网络、不碰真实文件系统、不起进程；spawn 真脚本的判别面在 viewer-e2e.test.js，
+ * 自动开窗的拉起出口与触发 B 规则（真实临时目录＋spawn 桩）在 viewer-auto-open.test.js。 */
 
 const DIGEST = 'abcd1234';
 
@@ -291,4 +296,108 @@ test('rootDigest：launch 的再导出与 server.js 定义是同一函数（单�
 test('端口段常量：基址 7330、试探 10 个（组合根与文档共用的契约值）', () => {
   assert.equal(DEFAULT_VIEWER_PORT, 7330);
   assert.equal(PORT_TRIES, 10);
+});
+
+/* —— 自动开窗构造（安静默认） —— */
+
+test('viewerRootOf：显式与槽位 1 → main，槽位 k≥2 → s<k>，站点降级（无站点信息）→ main', () => {
+  assert.equal(viewerRootOf({ siteMode: 'explicit', slot: null }), 'main');
+  assert.equal(viewerRootOf({ siteMode: 'slot', slot: 1 }), 'main');
+  assert.equal(viewerRootOf({ siteMode: 'slot', slot: 3 }), 's3');
+  assert.equal(viewerRootOf({ siteMode: null, slot: null }), 'main');
+});
+
+test('buildViewerSpawn：root 映射三形态（explicit / slot1 / s≥2）进 --focus', () => {
+  const argsFor = (site) => buildViewerSpawn({ ...site, ref: { id: 'c-abc' }, scriptPath: 'S' }).args;
+  assert.deepEqual(argsFor({ siteMode: 'explicit', slot: null }), ['S', '--focus', 'main/c-abc']);
+  assert.deepEqual(argsFor({ siteMode: 'slot', slot: 1 }), ['S', '--focus', 'main/c-abc']);
+  assert.deepEqual(argsFor({ siteMode: 'slot', slot: 3 }), ['S', '--focus', 's3/c-abc']);
+});
+
+test('buildViewerSpawn：ref.root 注入值优先（与缺省推导同源）；id 缺省＝列表页不带 --focus', () => {
+  assert.deepEqual(
+    buildViewerSpawn({ siteMode: 'explicit', slot: null, ref: { root: 's4', id: 'c-1' }, scriptPath: 'S' }).args,
+    ['S', '--focus', 's4/c-1'],
+  );
+  assert.deepEqual(buildViewerSpawn({ siteMode: 'slot', slot: 2, ref: null, scriptPath: 'S' }).args, ['S']);
+  assert.deepEqual(buildViewerSpawn({ siteMode: 'slot', slot: 2, ref: { id: null }, scriptPath: 'S' }).args, ['S']);
+});
+
+test('buildViewerSpawn：env 两支——显式不改写 WAYSTATION_HOME、槽位不注入，且不动父进程环境', () => {
+  const saved = process.env.WAYSTATION_HOME;
+  process.env.WAYSTATION_HOME = 'D:\\tmp\\ws-home';
+  try {
+    const explicit = buildViewerSpawn({ siteMode: 'explicit', slot: null, ref: null, scriptPath: 'S' });
+    assert.equal(explicit.env.WAYSTATION_HOME, 'D:\\tmp\\ws-home', '显式模式自然继承，不改写');
+    const slot = buildViewerSpawn({ siteMode: 'slot', slot: 2, ref: null, scriptPath: 'S' });
+    assert.equal(slot.env.WAYSTATION_HOME, undefined, '槽位模式不注入——子进程缺省解析＝主目录');
+    assert.equal(process.env.WAYSTATION_HOME, 'D:\\tmp\\ws-home', '不得改写父进程环境');
+  } finally {
+    if (saved === undefined) {
+      delete process.env.WAYSTATION_HOME;
+    } else {
+      process.env.WAYSTATION_HOME = saved;
+    }
+  }
+});
+
+test('buildViewerSpawn：command/options 契约（当前 node、detached＋windowsHide＋stdio ignore）', () => {
+  const plan = buildViewerSpawn({ siteMode: 'explicit', slot: null, ref: { id: 'c-1' }, scriptPath: 'S' });
+  assert.equal(plan.command, process.execPath);
+  assert.deepEqual(plan.options, { detached: true, windowsHide: true, stdio: 'ignore' });
+});
+
+/* —— viewerAutoOpen 现读（读文件注入桩：本文件不碰真实文件系统） —— */
+
+function readWith(content) {
+  const warns = [];
+  const value = readViewerAutoOpen({ dataDir: 'X', readFile: () => content, warn: (message) => warns.push(message) });
+  return { value, warns };
+}
+
+test('readViewerAutoOpen：true/false 原值透传、不留告警', () => {
+  assert.deepEqual(readWith('{"viewerAutoOpen": true}'), { value: true, warns: [] });
+  assert.deepEqual(readWith('{"viewerAutoOpen": false}'), { value: false, warns: [] });
+});
+
+test('readViewerAutoOpen：缺省/缺失/非法一律 true＋warn 留痕', () => {
+  const missing = () => {
+    const error = new Error('ENOENT');
+    error.code = 'ENOENT';
+    throw error;
+  };
+  const cases = [
+    ['字段缺省', () => '{"identityName": "本机"}'],
+    ['文件缺失', missing],
+    ['值非法（字符串）', () => '{"viewerAutoOpen": "yes"}'],
+    ['根非对象', () => '[true]'],
+    ['JSON 损坏', () => '{损坏'],
+  ];
+  for (const [name, readFile] of cases) {
+    const warns = [];
+    const value = readViewerAutoOpen({ dataDir: 'X', readFile, warn: (message) => warns.push(message) });
+    assert.equal(value, true, `${name}：按默认开启`);
+    assert.equal(warns.length, 1, `${name}：warn 留痕一次`);
+  }
+});
+
+/* —— 触发 B 的「进行中」筛选 —— */
+
+test('inProgressCollabsOf：manager 含 proposed、member 排除；归档态两侧都不算', () => {
+  const entries = [
+    { collabId: 'm-proposed', role: 'manager', state: 'proposed' },
+    { collabId: 'm-active', role: 'manager', state: 'active' },
+    { collabId: 'm-frozen', role: 'manager', state: 'frozen' },
+    { collabId: 'm-completed', role: 'manager', state: 'completed' },
+    { collabId: 'm-terminated', role: 'manager', state: 'terminated' },
+    { collabId: 'j-proposed', role: 'member', state: 'proposed' },
+    { collabId: 'j-active', role: 'member', state: 'active' },
+    { collabId: 'j-frozen', role: 'member', state: 'frozen' },
+    { collabId: 'j-left', role: 'member', state: 'left' },
+  ];
+  assert.deepEqual(inProgressCollabsOf(entries).map((entry) => entry.collabId), [
+    'm-proposed', 'm-active', 'm-frozen', 'j-active', 'j-frozen',
+  ]);
+  assert.deepEqual(inProgressCollabsOf([]), []);
+  assert.deepEqual(inProgressCollabsOf(null), []);
 });

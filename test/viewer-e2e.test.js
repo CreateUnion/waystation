@@ -395,6 +395,131 @@ test('--port 命中自家＋--no-open：第二个进程打印地址退出 0，�
   assert.equal(first.child.exitCode, null, '第一个进程仍存活');
 });
 
+/* —— --focus（定位开窗：自动开窗拉起时的详情页入口） —— */
+
+test('--focus：未跑→起服务后打印含 hash 的详情页地址（--no-open），端点可用、q 收尾', async (t) => {
+  const home = makeTempDir(t);
+  writeForumFixture(home, 'c-forum');
+  const port = await pickFreePort();
+  const viewer = spawnViewer(t, { home, args: ['--focus', 'main/c-forum', '--no-open', '--port', String(port)] });
+  const line = await waitFor(() => readyLineOf(viewer.out()), WAIT);
+  assert.ok(
+    line.includes(`http://127.0.0.1:${port}/#/c/main/c-forum`),
+    `就绪行应含详情页地址（含 hash）：${JSON.stringify(line)}`,
+  );
+  assert.match(line, /（协作与讨论 1 台）$/);
+
+  const health = await fetchJson(`http://127.0.0.1:${port}/api/health`);
+  assert.equal(health.root, rootDigest(home));
+  const meta = await fetchJson(`http://127.0.0.1:${port}/api/collab/main/c-forum/meta`);
+  assert.equal(meta.name, '讨论甲', '目标协作页的数据面照常可用');
+
+  await stopChild(viewer.child);
+  assert.equal(await exitOf(viewer.child), 0, 'q 通道优雅退出');
+  assert.equal(viewer.err(), '');
+});
+
+test('--focus：同根在跑 → 只打印含 hash 地址、退出 0，不再起服务', async (t) => {
+  const home = makeTempDir(t);
+  writeForumFixture(home, 'c-forum');
+  const port = await pickFreePort();
+  const first = spawnViewer(t, { home, args: ['--no-open', '--port', String(port)] });
+  await waitForReady(first, port);
+
+  const second = await runViewerToExit(t, { home, args: ['--focus', 'main/c-forum', '--no-open', '--port', String(port)] });
+  assert.equal(second.code, 0);
+  assert.match(second.stdout, new RegExp(`观察窗已在运行：http://127\\.0\\.0\\.1:${port}/#/c/main/c-forum`));
+  assert.equal(second.stdout.includes('已就绪'), false, '不给已在跑的端口再起服务');
+  assert.equal(second.stderr, '');
+  assert.equal(first.child.exitCode, null, '第一个进程仍存活');
+});
+
+test('viewerAutoOpen=false 不影响手开：脚本照常起服务并打印含 hash 地址', async (t) => {
+  const home = makeTempDir(t);
+  writeForumFixture(home, 'c-forum');
+  writeFileSync(join(home, CONFIG_FILE_NAME), `${JSON.stringify({ viewerAutoOpen: false })}\n`);
+  const port = await pickFreePort();
+  const viewer = spawnViewer(t, { home, args: ['--focus', 'main/c-forum', '--no-open', '--port', String(port)] });
+  const line = await waitFor(() => readyLineOf(viewer.out()), WAIT);
+  assert.ok(line.includes(`http://127.0.0.1:${port}/#/c/main/c-forum`), '手开不吃开关（开关只作用于自动拉起）');
+  await stopChild(viewer.child);
+  assert.equal(await exitOf(viewer.child), 0);
+});
+
+test('--focus：与 --stop 组合、root 越界、id 非法、缺值 → 用法错误退出码 2', async (t) => {
+  const home = makeTempDir(t);
+  const cases = [
+    ['--focus', 'main/c-1', '--stop'],
+    ['--focus', 'main'],
+    ['--focus', 's9/c-1'],
+    ['--focus', 's1/c-1'],
+    ['--focus', 'main/c-1/../../x'],
+    ['--focus'],
+  ];
+  for (const args of cases) {
+    const result = await runViewerToExit(t, { home, args });
+    assert.equal(result.code, 2, `参数 [${args.join(' ')}] 应判用法错误`);
+    assert.match(result.stderr, /用法：/);
+    assert.equal(result.stdout, '');
+  }
+});
+
+/* —— detached 存活（机器代证：短命父进程 spawn 后退出，子进程仍在） —— */
+
+/* 短命父进程代码：走 launch.js 的拉起出口（生产 spawn 选项＋unref），参数换成测试口径
+ * （--no-open 纪律＋注入端口）；随后父进程不主动结束——只靠事件循环自然收敛，unref 未生效
+ * （子进程句柄拖住循环）即永不退出、用例超时。 */
+const DETACHED_PARENT_CODE = `Promise.all([import(process.argv[1]), import('node:child_process')]).then(([launch, childProcess]) => {
+  launch.openViewerWindow({
+    ref: null,
+    dataDir: process.argv[3],
+    siteMode: 'explicit',
+    slot: null,
+    scriptPath: process.argv[2],
+    log: { warn: () => {} },
+    env: {},
+    spawnFn: (command, args, options) => childProcess.spawn(command, [...args, '--no-open', '--port', process.argv[4]], options),
+  });
+});`;
+
+test('detached 存活：短命父进程 spawn 后退出，观察窗仍应答 health；--stop 收尾', { timeout: 30000 }, async (t) => {
+  const home = makeTempDir(t);
+  writeForumFixture(home, 'c-forum');
+  writeFileSync(join(home, CONFIG_FILE_NAME), `${JSON.stringify({ viewerAutoOpen: true })}\n`);
+  const port = await pickFreePort();
+  const launchUrl = new URL('../src/viewer/launch.js', import.meta.url).href;
+  const parent = spawn(process.execPath, ['-e', DETACHED_PARENT_CODE, launchUrl, VIEWER, home, String(port)], {
+    cwd: repoRoot,
+    env: { ...process.env, WAYSTATION_HOME: home },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let parentErr = '';
+  parent.stderr.on('data', (chunk) => {
+    parentErr += chunk.toString('utf8');
+  });
+  const parentExit = await new Promise((resolve, reject) => {
+    parent.once('error', reject);
+    parent.once('exit', (code) => resolve(code));
+  });
+  assert.equal(parentExit, 0, `短命父进程应自然退出（unref 未拖住事件循环）；stderr=${JSON.stringify(parentErr)}`);
+
+  const health = await waitFor(async () => {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/api/health`);
+      return response.status === 200 ? response.json() : null;
+    } catch {
+      return null;
+    }
+  }, WAIT);
+  assert.equal(health.app, 'waystation-viewer', '父进程退出后子进程仍应答');
+  assert.equal(health.root, rootDigest(home), '子进程按 WAYSTATION_HOME 定根（显式模式继承）');
+
+  const stopped = await runViewerToExit(t, { home, args: ['--stop', '--port', String(port)] });
+  assert.equal(stopped.code, 0, `--stop 收尾应成功：${JSON.stringify(stopped.stdout)}${JSON.stringify(stopped.stderr)}`);
+  assert.match(stopped.stdout, /已停止/);
+  await waitForRebindable(port);
+});
+
 test('q 双字节单块：shutdown 单点化防双触发（server.close 非幂等），仍优雅退出 0', async (t) => {
   const home = makeTempDir(t);
   writeForumFixture(home, 'c-forum');
@@ -452,7 +577,7 @@ test('用法错误：--port 取值非法或未知选项→stderr 用法＋退出
   const home = makeTempDir(t);
   const badPort = await runViewerToExit(t, { home, args: ['--port', 'abc'] });
   assert.equal(badPort.code, 2);
-  assert.match(badPort.stderr, /^用法：node scripts\/ws-viewer\.js \[--port N\] \[--no-open\] \[--stop\]$/m);
+  assert.match(badPort.stderr, /^用法：node scripts\/ws-viewer\.js \[--focus <root>\/<id>\] \[--port N\] \[--no-open\] \[--stop\]$/m);
   assert.equal(badPort.stdout, '');
 
   const outOfRange = await runViewerToExit(t, { home, args: ['--port', '70000'] });

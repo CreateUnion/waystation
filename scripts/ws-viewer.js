@@ -1,5 +1,5 @@
-/* 人类观察窗的组合根入口：参数解析（--port / --no-open / --stop）、端口协商、就绪行、开窗
- * 与退出通道。启动链的判定（探针 / 归属 / 开窗计划 / 停止）都在 src/viewer/launch.js 的
+/* 人类观察窗的组合根入口：参数解析（--focus / --port / --no-open / --stop）、端口协商、就绪行、
+ * 开窗与退出通道。启动链的判定（探针 / 归属 / 开窗计划 / 停止）都在 src/viewer/launch.js 的
  * 注入式函数里，本文件只做接线与输出。
  *
  * 退出通道单点化：stdin 的 q 字节与 POSIX 信号共用同一个 shutdown——server.close 非幂等
@@ -20,15 +20,18 @@ import {
 import { INDEX_HTML, APP_JS, STYLE_CSS } from '../src/viewer/assets.js';
 import { createViewerData } from '../src/viewer/data.js';
 import { startViewerServer } from '../src/viewer/server.js';
+import { ID_PATTERN } from '../src/net/protocol.js';
 import { resolveDataDir } from '../src/paths.js';
 
-const USAGE = '用法：node scripts/ws-viewer.js [--port N] [--no-open] [--stop]';
+const USAGE = '用法：node scripts/ws-viewer.js [--focus <root>/<id>] [--port N] [--no-open] [--stop]';
 /* 用户可见故障统一退出码 2（用法错误、端口不可得、kill 失败——设计 §4.1/§4.2）。 */
 const EXIT_ERROR = 2;
 /* q 字节（ASCII 0x71）＝e2e 收尾的优雅退出通道；只认显式字节，EOF/关闭不触发退出
  * （双击启动等无 stdin 场景不受影响）。 */
 const QUIT_BYTE = 0x71;
 const MAX_PORT = 65535;
+/* --focus 的 root 白名单（main｜s<2..8>——槽位 1 即 main，槽位上限 8）：URL 只由受控取值拼接。 */
+const FOCUS_ROOT_PATTERN = /^(main|s[2-8])$/;
 
 /* 端口值：十进制正整数 1–65535；其余（含缺值 undefined、带符号、超界）＝null → 用法错误。 */
 function parsePortValue(value) {
@@ -39,10 +42,26 @@ function parsePortValue(value) {
   return port >= 1 && port <= MAX_PORT ? port : null;
 }
 
-/* 参数解析：三开关，未知选项/位置参数/--port 取值非法 → null（调用方按用法错误处置——
- * 用户显式调用的程序，错误必须可见）。重复 --port 以最后一个为准。 */
+/* --focus 取值 `<root>/<id>` 的形态校验：root 白名单＋id 过 ID_PATTERN（与协作面路由同一权威）。
+ * 非法＝null → 用法错误：URL 只由受控取值拼接。 */
+function parseFocusValue(value) {
+  const slash = typeof value === 'string' ? value.indexOf('/') : -1;
+  if (slash < 0) {
+    return null;
+  }
+  const root = value.slice(0, slash);
+  const id = value.slice(slash + 1);
+  if (!FOCUS_ROOT_PATTERN.test(root) || !ID_PATTERN.test(id)) {
+    return null;
+  }
+  return { root, id };
+}
+
+/* 参数解析：四开关，未知选项/位置参数/--port、--focus 取值非法 → null（调用方按用法错误处置——
+ * 用户显式调用的程序，错误必须可见）。重复 --port/--focus 以最后一个为准；--focus 与 --stop
+ * 语义互斥（停止不涉及定位）→ 同按用法错误。 */
 function parseArgs(args) {
-  const options = { port: null, noOpen: false, stop: false };
+  const options = { port: null, noOpen: false, stop: false, focus: null };
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
     if (arg === '--no-open') {
@@ -56,9 +75,19 @@ function parseArgs(args) {
       }
       options.port = port;
       index++;
+    } else if (arg === '--focus') {
+      const focus = parseFocusValue(args[index + 1]);
+      if (focus === null) {
+        return null;
+      }
+      options.focus = focus;
+      index++;
     } else {
       return null;
     }
+  }
+  if (options.focus !== null && options.stop) {
+    return null;
   }
   return options;
 }
@@ -71,8 +100,10 @@ function candidatePortsOf(options) {
   return Array.from({ length: PORT_TRIES }, (_, offset) => DEFAULT_VIEWER_PORT + offset);
 }
 
-function viewerUrlOf(port) {
-  return `http://127.0.0.1:${port}/`;
+/* 打开的地址：带 --focus 时指向该协作详情页（含 hash），否则列表页。 */
+function viewerUrlOf(port, focus) {
+  const base = `http://127.0.0.1:${port}/`;
+  return focus === null ? base : `${base}#/c/${focus.root}/${focus.id}`;
 }
 
 function openBrowser({ url }) {
@@ -83,18 +114,20 @@ function openBrowser({ url }) {
   }
 }
 
-function reportReady({ port, data, noOpen }) {
-  console.log(`观察窗已就绪：${viewerUrlOf(port)}（协作与讨论 ${data.listCollabs().collabs.length} 台）`);
+function reportReady({ port, data, noOpen, focus }) {
+  const url = viewerUrlOf(port, focus);
+  console.log(`观察窗已就绪：${url}（协作与讨论 ${data.listCollabs().collabs.length} 台）`);
   if (!noOpen) {
-    openBrowser({ url: viewerUrlOf(port) });
+    openBrowser({ url });
   }
 }
 
 /* 已在跑（同根同端口）分支：不再起服务，只打印地址（--no-open）或再开一个窗。 */
-function reportRunning({ port, noOpen }) {
-  console.log(`观察窗已在运行：${viewerUrlOf(port)}`);
+function reportRunning({ port, noOpen, focus }) {
+  const url = viewerUrlOf(port, focus);
+  console.log(`观察窗已在运行：${url}`);
   if (!noOpen) {
-    openBrowser({ url: viewerUrlOf(port) });
+    openBrowser({ url });
   }
 }
 
@@ -165,10 +198,10 @@ async function runLaunch({ dataDir, options }) {
     return;
   }
   if (outcome.kind === 'running') {
-    reportRunning({ port: outcome.port, noOpen: options.noOpen });
+    reportRunning({ port: outcome.port, noOpen: options.noOpen, focus: options.focus });
     return;
   }
-  reportReady({ port: outcome.server.port, data, noOpen: options.noOpen });
+  reportReady({ port: outcome.server.port, data, noOpen: options.noOpen, focus: options.focus });
   wireShutdown(outcome.server);
 }
 

@@ -74,6 +74,7 @@ export function createCollab(state, { name, topic, targets, mode }) {
   const invited = inviteInitialTargets(state, ledger, targets, collabMode, local);
   state.counters.collabsCreated++;
   applyDefaultMute(local);   // 写点一：创建成功（邀请发送结果不影响入席事实）
+  state.openViewer?.({ root: state.viewerRoot, id: ledger.collabId });   // 触发 A：建立即开该协作页（开关在出口内现读）
   return { ok: true, collabId: ledger.collabId, invited };
 }
 
@@ -277,6 +278,7 @@ function applyInviteDecision(state, local, approve, wanted, reason) {
     : sendDecision(state, local, approve, wanted, reason);
   if (approve === true && result.ok === true) {
     applyDefaultMute(local);   // 写点二：同意加入成功
+    state.openViewer?.({ root: state.viewerRoot, id: local.collabId });   // 触发 A：同意入席即开该协作页（开关在出口内现读）
   }
   return result;
 }
