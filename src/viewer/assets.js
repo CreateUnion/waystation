@@ -79,6 +79,10 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
 
   const NOT_READY_TEXT = '数据未就绪';
   const NOT_READY_ENTRY = '（数据未就绪）';
+  /* 标题与静音横幅文案（设计 §3.3／§3.5 写死的要素；反引号属设计文档的 Markdown 代码标记，
+   * 页面按纯文本呈现命令名）。 */
+  const DEFAULT_TITLE = 'waystation 观察窗';
+  const MUTE_BANNER_TEXT = '🔇 本协作已静音——消息不注入 AI 会话（观察窗照常显示）；要让本会话实时跟进，用 /ws-mute 取消静音';
 
   /* 状态词表对齐终端查看器与状态栏的既有口径；词表外取值原样呈现，不自造词。 */
   const MODE_LABELS = new Map([['forum', '讨论'], ['managed', '协作']]);
@@ -272,6 +276,7 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     dom.listView.hidden = route.view !== 'list';
     dom.detailView.hidden = route.view !== 'detail';
     dom.pause.hidden = route.view !== 'detail';
+    applyTitle(null);
     if (route.view === 'detail') {
       startDetail();
       return;
@@ -296,6 +301,9 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
       name.appendChild(el('span', 'collab-site', '站点#' + item.root.slice(1)));
     }
     row.appendChild(name);
+    if (item.muted === true) {
+      row.appendChild(el('span', 'collab-muted', '🔇'));
+    }
     appendText(row, ' — ');
     row.appendChild(el('span', 'collab-mode', modeLabel(item.mode)));
     appendText(row, ' — ');
@@ -362,6 +370,17 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     if (meta.topic !== null && meta.topic !== undefined && meta.topic !== '') {
       dom.banner.appendChild(el('div', 'banner-topic', meta.topic));
     }
+    /* 静音横幅随 meta 每拍重渲：false 时不渲染即天然移除（无需另写撤销路径）。 */
+    if (meta.muted === true) {
+      dom.banner.appendChild(el('div', 'banner-muted', MUTE_BANNER_TEXT));
+    }
+  }
+
+  /* 窗口标题（设计 §3.5）：meta 就位后带协作名；名称未就绪（null/缺失/空）保持默认标题——
+   * 路由切换先归默认，避免详情间切换时短暂挂着上一协作的名字。 */
+  function applyTitle(name) {
+    const named = typeof name === 'string' && name !== '';
+    document.title = named ? DEFAULT_TITLE + ' · ' + name : DEFAULT_TITLE;
   }
 
   /* 一行流：时间（悬停完整 ISO）＋方向（协作行）＋作者色签＋kind 徽标＋正文。
@@ -462,6 +481,7 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     applySkipped(data.skipped);
     applyFeedSkipped();   // feed 可能先于 meta 落地：mode 就位后再看会话流计数行
     renderBanner(data);
+    applyTitle(data.name);
   }
 
   /* —— 跟随与浮标 —— */
@@ -825,6 +845,9 @@ button:hover { border-color: var(--accent); }
 
 .collab-mode, .collab-people, .collab-count, .collab-state, .collab-updated { color: var(--fg-dim); }
 
+/* 静音标记：行内小间距即可，颜色从简（emoji 自带字形色） */
+.collab-muted { margin-left: 0.35rem; font-weight: 400; }
+
 .empty-note { padding: 1.2rem; color: var(--fg-dim); text-align: center; }
 
 /* —— 详情视图 —— */
@@ -844,6 +867,9 @@ button:hover { border-color: var(--accent); }
 .banner-mode, .banner-people, .banner-count { color: var(--fg-dim); font-weight: 400; }
 
 .banner-topic { margin-top: 0.15rem; color: var(--fg-dim); font-size: 0.85rem; font-weight: 400; }
+
+/* 静音提醒行：与顶栏状态提示同用 --warn（同为「需要注意的运行态」语义） */
+.banner-muted { margin-top: 0.15rem; color: var(--warn); font-size: 0.85rem; font-weight: 400; }
 
 #detail-body {
   flex: 1;

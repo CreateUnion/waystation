@@ -218,6 +218,19 @@ test('列表视图：空态文案', async () => {
   assert.equal(textOf(env.byId['list-view']), '本机暂无协作或讨论');
 });
 
+test('列表视图：muted 行加 🔇 标记，非静音行无标记', async () => {
+  const env = createEnv();
+  await bootList(env, [
+    { root: 'main', id: 'demo', name: '演示', mode: 'managed', state: 'active', memberCount: 2, count: 5, updatedAt: 1760000000000, muted: true },
+    { root: 'main', id: 'calm', name: '平静', mode: 'managed', state: 'active', memberCount: 1, count: 1, updatedAt: 1760000001000, muted: false },
+  ]);
+  const rows = findAll(env.byId['list-view'], 'collab-row');
+  assert.equal(findAll(rows[0], 'collab-muted').length, 1, '静音行应有 🔇 标记');
+  assert.ok(textOf(rows[0]).includes('🔇'), textOf(rows[0]));
+  assert.equal(findAll(rows[1], 'collab-muted').length, 0, '非静音行不得出现标记');
+  assert.ok(!textOf(rows[1]).includes('🔇'), textOf(rows[1]));
+});
+
 test('详情首屏：并发发起、横幅、跨日分隔、注入面分界', async () => {
   const env = createEnv();
   await bootDetail(env, {
@@ -240,6 +253,46 @@ test('详情首屏：并发发起、横幅、跨日分隔、注入面分界', as
   assert.ok(textOf(streamRows(env)[1]).includes('乙<script>'), '作者名按文本注入（textContent）');
   assert.equal(findAll(env.byId['event-track'], 'event-row').length, 1);
   assert.equal(findAll(env.byId['stream'], 'feed-time')[0].attrs.title, TS_MORNING, '悬停 title 为原始 ISO');
+});
+
+test('横幅：muted=true 显示静音提醒（含 /ws-mute 要素），翻回 false 即移除', async () => {
+  const env = createEnv();
+  await bootDetail(env, { rows: [], reset: true, skipped: 0 }, metaBody({ muted: true }));
+  const banner = textOf(env.byId['banner']);
+  assert.ok(banner.includes('🔇 本协作已静音'), banner);
+  assert.ok(banner.includes('消息不注入 AI 会话') && banner.includes('/ws-mute'), banner);
+  env.plan(
+    { match: '/feed', body: { rows: [], reset: false, skipped: 0 } },
+    { match: '/meta', body: metaBody({ muted: false }) },
+  );
+  env.timer();
+  await env.flush();
+  const after = textOf(env.byId['banner']);
+  assert.ok(!after.includes('🔇'), '取消静音后横幅必须移除：' + after);
+  assert.ok(after.includes('【演示】进行中'), '常规横幅行不受影响：' + after);
+});
+
+test('窗口标题：详情 meta 就位后带协作名；meta 未返回与列表路由保持默认', async () => {
+  const env = createEnv();
+  await bootList(env, []);
+  assert.equal(env.document.title, 'waystation 观察窗', '列表路由为默认标题');
+  env.plan({ match: '/feed', body: { rows: [], reset: true, skipped: 0 } }, { match: '/meta', body: metaBody() });
+  env.window.location.hash = '#/c/main/demo';
+  env.fireWindow('hashchange');
+  assert.equal(env.document.title, 'waystation 观察窗', 'meta 返回前保持默认标题');
+  await env.flush();
+  assert.equal(env.document.title, 'waystation 观察窗 · 演示');
+  env.plan({ match: '/api/collabs', body: { collabs: [] } });
+  env.window.location.hash = '#/';
+  env.fireWindow('hashchange');
+  await env.flush();
+  assert.equal(env.document.title, 'waystation 观察窗', '回列表恢复默认标题');
+});
+
+test('窗口标题：名称未就绪（name=null）保持默认标题', async () => {
+  const env = createEnv();
+  await bootDetail(env, { rows: [], reset: true, skipped: 0 }, metaBody({ name: null, state: null }));
+  assert.equal(env.document.title, 'waystation 观察窗');
 });
 
 test('协作行：方向标与（N 人）标记，count 缺省不显示', async () => {

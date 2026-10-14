@@ -24,6 +24,7 @@ import { isPostEntryShape } from '../collab/posts.js';
 import { foldMemberEvents, isMemberEventShape } from '../collab/members.js';
 import { isLedgerShape, isTimestamp } from '../collab/model.js';
 import { loadMember } from '../collab/store.js';
+import { isMuteShape } from '../collab/mute.js';
 import { displayText } from './text.js';
 import { metaViewOf } from './meta.js';
 
@@ -41,6 +42,7 @@ const MEMBERS_FILE_NAME = 'members.jsonl';
 const LEDGER_FILE_NAME = 'ledger.jsonl';
 const SNAPSHOT_FILE_NAME = 'snapshot.json';
 const COUNTER_FILE_NAME = 'counter.json';
+const MUTE_FILE_NAME = 'mute.json';
 const INBOX_FILE_NAME = 'inbox.jsonl';
 const OUTBOX_FILE_NAME = 'outbox.jsonl';
 
@@ -397,7 +399,7 @@ function anchorOf(rows, after) {
   return { rows: rows.slice(found + 1), reset: false };
 }
 
-/* —— 小 JSON 取数（member/snapshot/counter/config）—— */
+/* —— 小 JSON 取数（member/snapshot/counter/config/mute）—— */
 
 /* 台账来源三分支（设计 §5.3）：manager→ledger.jsonl 末条合法行；member→snapshot.ledger
  * （成员席位的主体数据源）；role 不可知（参与记录缺失/损坏）→ledger 优先、无则 snapshot、
@@ -437,6 +439,14 @@ function counterOf(state, base, collabId) {
     return parsed.messageCount;
   }
   return null;
+}
+
+/* 静音态（mute.json）：纯读同一小 JSON 纪律（直读不缓存、非 ENOENT 读故障留痕降级）。形态判据
+ * 只引 collab/mute.js 的 isMuteShape 单点——写面符号（createMuteStore）一律不引（白名单硬闸）；
+ * 缺失/损坏/形态不符统一 false：坏文件与「静音存储自身的加载失败」同归默认（不静音）。 */
+function mutedOf(state, base, collabId) {
+  const parsed = readJsonOrNull(state, collabFilePath(base, collabId, MUTE_FILE_NAME));
+  return isMuteShape(parsed) ? parsed.muted : false;
 }
 
 /* 本机身份名（发出行作者）：读对应根的 config.json，仅 JSON.parse＋字符串守卫——严禁 loadConfig
@@ -573,9 +583,12 @@ function readMeta(state, root, collabId, after) {
   const { base } = resolved;
   const member = loadMember(base, collabId);
   const posts = readParsedFile(state, collabFilePath(base, collabId, POSTS_FILE_NAME), classifyPostLine);
-  return modeOf(member, posts !== null) === 'forum'
+  const meta = modeOf(member, posts !== null) === 'forum'
     ? forumMetaOf(state, base, collabId, member, posts, after)
     : managedMetaOf(state, base, collabId, member, after);
+  /* 静音态与模式无关（讨论/协作同面），统一在 meta 组装末尾附加——两个模式分支各自增字段
+   * 会把同一条取数纪律复制两份。 */
+  return { ...meta, muted: mutedOf(state, base, collabId) };
 }
 
 /* 讨论元状态：席面名/态取参与记录（讨论无台账）；成员数＝事件折叠；计数＝合法完整帖行数
@@ -684,6 +697,7 @@ function summarizeCollab(state, site, collabId) {
     id: collabId,
     name: view === null ? null : view.name,
     state: view === null ? null : view.state,
+    muted: mutedOf(state, site.base, collabId),
     mode,
     memberCount: summary.memberCount,
     count: summary.count,

@@ -14,6 +14,7 @@ import { POSTS_FILE_NAME } from '../src/collab/posts.js';
 import { MEMBERS_FILE_NAME } from '../src/collab/members.js';
 import { LEDGER_FILE_NAME, MEMBER_FILE_NAME } from '../src/collab/store.js';
 import { COUNTER_FILE_NAME } from '../src/collab/counter.js';
+import { MUTE_FILE_NAME } from '../src/collab/mute.js';
 import { INBOX_FILE_NAME } from '../src/net/inbound.js';
 import { OUTBOX_FILE_NAME } from '../src/net/outbox.js';
 
@@ -301,10 +302,11 @@ test('health：形态与根摘要（8 hex、同目录两次一致、不同目录
   assert.notEqual(elsewhere.root, first.root);
 });
 
-test('collabs：列表原样透传（含 root 标记与 mode 判定）', async (t) => {
+test('collabs：列表原样透传（含 root 标记、mode 判定与 muted 字段）', async (t) => {
   const dataDir = makeTempDir(t);
   writeForumFixture(dataDir);
   writeManagedFixture(dataDir);
+  writeFileSync(join(collabDirIn(dataDir, 'main', 'c-managed'), MUTE_FILE_NAME), JSON.stringify({ v: 1, muted: true, baseline: 0 }));
   const data = createViewerData({ dataDir });
   const viewer = await startTestViewer(t, { dataDir, data });
   const body = JSON.parse((await fetchText(viewer.origin, '/api/collabs')).body);
@@ -313,6 +315,8 @@ test('collabs：列表原样透传（含 root 标记与 mode 判定）', async (
   assert.equal(body.collabs.find((entry) => entry.id === 'c-forum').mode, 'forum');
   assert.equal(body.collabs.find((entry) => entry.id === 'c-managed').mode, 'managed');
   assert.ok(body.collabs.every((entry) => entry.root === 'main'));
+  assert.equal(body.collabs.find((entry) => entry.id === 'c-managed').muted, true);
+  assert.equal(body.collabs.find((entry) => entry.id === 'c-forum').muted, false);
 });
 
 /* —— feed —— */
@@ -390,15 +394,17 @@ test('meta（讨论）：字段与事件轨纯文本原样透传、skipped 计�
     topic: '讨论主题',
     events: { rows: [{ id: 'ev-1', ts: T0, text: '甲机 加入（现 1 人）' }], reset: true },
     skipped: 1,
+    muted: false,
   });
   const anchored = JSON.parse((await fetchText(viewer.origin, '/api/collab/main/c-forum/meta?after=ev-1')).body);
   assert.deepEqual(anchored.events.rows, []);
   assert.equal(anchored.events.reset, false);
 });
 
-test('meta（协作）：台账口径、迁移行与累计收到计数原样透传', async (t) => {
+test('meta（协作）：台账口径、迁移行、累计收到计数与 muted 原样透传', async (t) => {
   const dataDir = makeTempDir(t);
   writeManagedFixture(dataDir);
+  writeFileSync(join(collabDirIn(dataDir, 'main', 'c-managed'), MUTE_FILE_NAME), JSON.stringify({ v: 1, muted: true, baseline: 0 }));
   const viewer = await startTestViewer(t, { dataDir });
   const meta = JSON.parse((await fetchText(viewer.origin, '/api/collab/main/c-managed/meta')).body);
   assert.deepEqual(meta, {
@@ -410,6 +416,7 @@ test('meta（协作）：台账口径、迁移行与累计收到计数原样透�
     topic: '主题甲',
     events: { rows: [{ id: '1:0', ts: tsPlus(1000), text: '状态：active → frozen' }], reset: true },
     skipped: 0,
+    muted: true,
   });
 });
 
@@ -488,6 +495,7 @@ test('未就绪：目录在而数据未落盘 → 200 空数据（与目录缺�
     topic: null,
     events: { rows: [], reset: true },
     skipped: 0,
+    muted: false,
   });
 });
 

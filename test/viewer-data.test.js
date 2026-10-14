@@ -10,6 +10,7 @@ import { POSTS_FILE_NAME } from '../src/collab/posts.js';
 import { MEMBERS_FILE_NAME } from '../src/collab/members.js';
 import { LEDGER_FILE_NAME, MEMBER_FILE_NAME, SNAPSHOT_FILE_NAME } from '../src/collab/store.js';
 import { COUNTER_FILE_NAME } from '../src/collab/counter.js';
+import { MUTE_FILE_NAME } from '../src/collab/mute.js';
 import { INBOX_FILE_NAME } from '../src/net/inbound.js';
 import { OUTBOX_FILE_NAME } from '../src/net/outbox.js';
 
@@ -478,6 +479,7 @@ test('managed：管理席位——台账末条为名/态权威，人数取名单
       reset: true,
     },
     skipped: 1,
+    muted: false,
   });
   const anchored = createData(dataDir).readMeta('main', 'c-1', '1:0');
   assert.equal(anchored.events.reset, false);
@@ -646,6 +648,7 @@ test('null 语义：目录不存在／id 形态非法／root 非法 → null 不
     topic: null,
     events: { rows: [], reset: true },
     skipped: 0,
+    muted: false,
   });
   assert.equal(data.readFeed('s2', 'ok-1', null), null);   // sites 槽位目录不存在
   mkdirSync(collabDirIn(dataDir, 's2', 'ok-1'), { recursive: true });
@@ -684,9 +687,9 @@ test('listCollabs：主目录＋sites 双根（同名 id 两目录）、非 ID_P
   stampAllFiles(collabDirIn(dataDir, 's2', 'c-1'), 1700000300);
   const { collabs } = createData(dataDir).listCollabs();
   assert.deepEqual(collabs, [
-    { root: 's2', id: 'c-1', name: '成员乙', state: 'active', mode: 'managed', memberCount: 2, count: null, updatedAt: 1700000300000 },
-    { root: 'main', id: 'c-2', name: '协作甲', state: 'frozen', mode: 'managed', memberCount: 2, count: 5, updatedAt: 1700000200000 },
-    { root: 'main', id: 'c-1', name: '甲机', state: 'active', mode: 'forum', memberCount: 2, count: 2, updatedAt: 1700000100000 },
+    { root: 's2', id: 'c-1', name: '成员乙', state: 'active', muted: false, mode: 'managed', memberCount: 2, count: null, updatedAt: 1700000300000 },
+    { root: 'main', id: 'c-2', name: '协作甲', state: 'frozen', muted: false, mode: 'managed', memberCount: 2, count: 5, updatedAt: 1700000200000 },
+    { root: 'main', id: 'c-1', name: '甲机', state: 'active', muted: false, mode: 'forum', memberCount: 2, count: 2, updatedAt: 1700000100000 },
   ]);
 });
 
@@ -764,24 +767,28 @@ test('缓存：缺失态不入缓存——文件随后出现即能读到；已�
   assert.deepEqual(data.readFeed('main', 'c-1', null).rows.map((row) => row.text), ['重建后的新内容']);
 });
 
-test('缓存：小 JSON 直读不缓存——counter/member/config 同尺寸改写后即读到', (t) => {
+test('缓存：小 JSON 直读不缓存——counter/member/config/mute 同尺寸改写后即读到', (t) => {
   const dataDir = makeTempDir(t);
   writeConfigAt(dataDir, '甲机');
   const dir = collabDirIn(dataDir, 'main', 'c-1');
   writeFiles(dir, {
     [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ collabId: 'c-1', role: 'member', name: '甲机' })),
     [COUNTER_FILE_NAME]: JSON.stringify({ v: 1, messageCount: 5 }),
+    [MUTE_FILE_NAME]: JSON.stringify({ v: 1, muted: false, baseline: null }),
     [OUTBOX_FILE_NAME]: jsonl(outboxRow()),
   });
   const data = createData(dataDir);
   assert.equal(data.readMeta('main', 'c-1', null).count, 5);
   assert.equal(data.readMeta('main', 'c-1', null).name, '甲机');
+  assert.equal(data.readMeta('main', 'c-1', null).muted, false);
   assert.equal(data.readFeed('main', 'c-1', null).rows[0].fromName, '甲机');
   writeFileSync(join(dir, COUNTER_FILE_NAME), JSON.stringify({ v: 1, messageCount: 7 }));
   writeFileSync(join(dir, MEMBER_FILE_NAME), JSON.stringify(memberRecord({ collabId: 'c-1', role: 'member', name: '乙机' })));
+  writeFileSync(join(dir, MUTE_FILE_NAME), JSON.stringify({ v: 1, muted: true, baseline: null }));   // 同尺寸改写
   writeConfigAt(dataDir, '乙机');
   assert.equal(data.readMeta('main', 'c-1', null).count, 7);
   assert.equal(data.readMeta('main', 'c-1', null).name, '乙机');
+  assert.equal(data.readMeta('main', 'c-1', null).muted, true);
   assert.equal(data.readFeed('main', 'c-1', null).rows[0].fromName, '乙机');
 });
 
@@ -801,6 +808,59 @@ test('小 JSON 读故障（非缺失，位置是目录）留痕降级：warn 被
   assert.equal(warnings.length, 1);
   assert.match(String(warnings[0][0]), /小 JSON 读取失败/);
   assert.equal(String(warnings[0][1].file).endsWith(COUNTER_FILE_NAME), true);
+});
+
+/* —— 静音态（mute.json 纯读） —— */
+
+/* 协作夹具＋可选 mute.json：muteContent 为 null 时不落文件（缺失态），否则按原文写入（可给损坏文）。 */
+function writeMuteCollab(dataDir, collabId, muteContent) {
+  const files = { [LEDGER_FILE_NAME]: jsonl(ledgerOf({ collabId })) };
+  if (muteContent !== null) {
+    files[MUTE_FILE_NAME] = muteContent;
+  }
+  writeFiles(collabDirIn(dataDir, 'main', collabId), files);
+}
+
+test('muted：正常读取布尔（论坛/协作同面、baseline 不影响呈现）；缺失/损坏/形态不符一律 false', (t) => {
+  const dataDir = makeTempDir(t);
+  writeMuteCollab(dataDir, 'c-on', JSON.stringify({ v: 1, muted: true, baseline: 3 }));
+  writeMuteCollab(dataDir, 'c-off', JSON.stringify({ v: 1, muted: false, baseline: null }));
+  writeMuteCollab(dataDir, 'c-none', null);
+  writeMuteCollab(dataDir, 'c-corrupt', '{不是 JSON');
+  writeMuteCollab(dataDir, 'c-shape', JSON.stringify({ v: 2, muted: true, baseline: null }));   // 版本不符＝形态不符
+  writeFiles(collabDirIn(dataDir, 'main', 'c-forum-on'), {
+    [MUTE_FILE_NAME]: JSON.stringify({ v: 1, muted: true, baseline: null }),
+    [POSTS_FILE_NAME]: jsonl(postEntry()),
+    [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ mode: 'forum', collabId: 'c-forum-on' })),
+  });
+  const data = createData(dataDir);
+  assert.equal(data.readMeta('main', 'c-on', null).muted, true);
+  assert.equal(data.readMeta('main', 'c-off', null).muted, false);
+  assert.equal(data.readMeta('main', 'c-none', null).muted, false);
+  assert.equal(data.readMeta('main', 'c-corrupt', null).muted, false);
+  assert.equal(data.readMeta('main', 'c-shape', null).muted, false);
+  assert.equal(data.readMeta('main', 'c-forum-on', null).muted, true);   // 讨论面同取数
+  const byId = new Map(data.listCollabs().collabs.map((entry) => [entry.id, entry.muted]));
+  assert.deepEqual([...byId.keys()].sort(), ['c-corrupt', 'c-forum-on', 'c-none', 'c-off', 'c-on', 'c-shape']);
+  assert.equal(byId.get('c-on'), true);
+  assert.equal(byId.get('c-forum-on'), true);
+  for (const id of ['c-off', 'c-none', 'c-corrupt', 'c-shape']) {
+    assert.equal(byId.get(id), false, id);
+  }
+});
+
+test('muted：读故障（位置是目录）留痕并按 false 降级，不抛', (t) => {
+  const dataDir = makeTempDir(t);
+  const dir = collabDirIn(dataDir, 'main', 'c-1');
+  writeFiles(dir, { [LEDGER_FILE_NAME]: jsonl(ledgerOf({ collabId: 'c-1' })) });
+  mkdirSync(join(dir, MUTE_FILE_NAME), { recursive: true });   // 位置是目录：读取必抛（非 ENOENT）
+  const warnings = [];
+  const data = createViewerData({ dataDir, log: { warn: (...args) => warnings.push(args) } });
+  assert.equal(data.readMeta('main', 'c-1', null).muted, false);
+  assert.equal(data.listCollabs().collabs[0].muted, false);
+  assert.equal(warnings.length, 2);   // meta 与列表各现读一次，各留一条痕
+  assert.match(String(warnings[0][0]), /小 JSON 读取失败/);
+  assert.equal(String(warnings[0][1].file).endsWith(MUTE_FILE_NAME), true);
 });
 
 test('工厂：接口键与 stats 形态（cacheHits/cacheMisses）', (t) => {
@@ -858,6 +918,7 @@ test('只读白名单：data.js 的 import 只含白名单符号（防未来漂�
     ['../collab/members.js', ['foldMemberEvents', 'isMemberEventShape']],
     ['../collab/model.js', ['isLedgerShape', 'isTimestamp']],
     ['../collab/store.js', ['loadMember']],
+    ['../collab/mute.js', ['isMuteShape']],   // 纯判据符号；写面 createMuteStore 不在此列
     ['./text.js', ['displayText']],
     ['./meta.js', ['metaViewOf']],
   ]);
