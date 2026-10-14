@@ -56,14 +56,23 @@ function makeCommandsDir(home, files) {
   return commandsDir;
 }
 
-test('仓库命令源：五个文件存在且带受管标记（防源集合与标记漂移）', () => {
-  for (const name of ['ws-collab.md', 'ws-discuss.md', 'ws-list.md', 'ws-mute.md', 'ws-purge.md']) {
+test('仓库命令源：六个文件存在且带受管标记（防源集合与标记漂移）', () => {
+  for (const name of ['ws-collab.md', 'ws-discuss.md', 'ws-list.md', 'ws-mute.md', 'ws-purge.md', 'ws-view.md']) {
     const filePath = join(repoRoot, 'scripts', 'claude-commands', name);
     assert.equal(existsSync(filePath), true, `缺少命令源文件：${name}`);
     const text = readFileSync(filePath, 'utf8');
     assert.ok(text.startsWith('---'), `${name} 应以 frontmatter 开头`);
     assert.ok(text.includes(MANAGED_MARKER), `${name} 应带受管标记`);
   }
+});
+
+test('ws-view 命令文：后台启动/启动验证/停止方法三要素齐备（防正文漂移）', () => {
+  const text = readFileSync(join(repoRoot, 'scripts', 'claude-commands', 'ws-view.md'), 'utf8');
+  assert.ok(text.includes('run_in_background'), '必须写明后台/分离启动（前台会挂死会话）');
+  assert.ok(text.includes('观察窗已就绪'), '必须写明启动验证的就绪行');
+  assert.ok(text.includes('--stop'), '必须写明停止方法');
+  assert.ok(text.includes('$HOME/.waystation/app/scripts/ws-viewer.js'), '必须优先已安装路径');
+  assert.ok(text.includes('scripts/ws-viewer.js'), '必须写明回退仓库路径');
 });
 
 test('install：首次写入（含建目录），重跑覆盖幂等', (t) => {
