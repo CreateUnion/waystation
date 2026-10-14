@@ -405,13 +405,13 @@ function inviteViewOf(local, now) {
   return { decision, invitedAt, expiresAt, expired: pending && Number.isFinite(expiresAtMs) && now > expiresAtMs };
 }
 
-/* 适配器描述器（上下文头项目名）：本机已知协作的名称；未知返回 null（头行退化为「身份名 时间戳」）。 */
+/* 适配器描述器（上下文头项目名与模式）：本机已知协作的名称与模式；未知返回 null（头行退化为「身份名 时间戳」）。 */
 function describeCollab(state, collabId) {
   const local = state.collabs.get(collabId);
   if (local === undefined) {
     return null;
   }
-  return { name: localNameOf(local) };
+  return { name: localNameOf(local), mode: localModeOf(local) };
 }
 
 function statsOf(state) {

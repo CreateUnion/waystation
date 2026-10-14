@@ -802,9 +802,9 @@ test('send 路由与状态门控：成员只发管理者、管理者可发指定
   assert.equal(broadcast.note.includes('已排队'), true);
 });
 
-test('describe / count / stats：描述器缺省 null、计数排除归档', async (t) => {
+test('describe / count / stats：描述器含名称与模式、缺省 null、计数排除归档', async (t) => {
   const { service, collabId } = managerWithTwoInvites(t);
-  assert.deepEqual(service.describe(collabId), { name: '联调项目' });
+  assert.deepEqual(service.describe(collabId), { name: '联调项目', mode: 'managed' });
   assert.equal(service.describe('collab-none'), null);
   assert.equal(service.count(), 1);
   await service.withdraw({ collabId });
