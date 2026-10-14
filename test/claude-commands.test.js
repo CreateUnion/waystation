@@ -72,7 +72,7 @@ test('ws-view 命令文：后台启动/启动验证/停止方法三要素齐备�
   assert.ok(text.includes('观察窗已就绪'), '必须写明启动验证的就绪行');
   assert.ok(text.includes('--stop'), '必须写明停止方法');
   assert.ok(text.includes('$HOME/.waystation/app/scripts/ws-viewer.js'), '必须优先已安装路径');
-  assert.ok(text.includes('scripts/ws-viewer.js'), '必须写明回退仓库路径');
+  assert.ok(text.includes('当前目录') && text.includes('仓库'), '必须写明回退仓库路径（「当前目录/仓库」字样为锚，防被上一行安装路径误满足）');
 });
 
 test('install：首次写入（含建目录），重跑覆盖幂等', (t) => {

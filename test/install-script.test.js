@@ -38,7 +38,7 @@ function runInstallScript(t, args, home = makeTempDir(t)) {
   return { home, result };
 }
 
-test('安装脚本 --dry-run：5/6 走到命令行模块（含五个受管文件名）、HOME 下零写入', (t) => {
+test('安装脚本 --dry-run：5/6 走到命令行模块（含六个受管文件名）、HOME 下零写入', (t) => {
   if (!bashAvailable) {
     t.skip('bash 不可用（Windows 需 git-bash；.ps1 臂由主控真机验证）');
     return;
