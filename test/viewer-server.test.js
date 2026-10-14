@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
-import { createServer as createNetServer } from 'node:net';
+import { connect, createServer as createNetServer } from 'node:net';
 import { join } from 'node:path';
 import { makeTempDir } from './helpers.js';
 import { createViewerData } from '../src/viewer/data.js';
@@ -211,6 +211,56 @@ function requestWithHost(port, hostHeader, path = '/api/health', method = 'GET')
   });
 }
 
+/* 原始字节客户端：`GET // HTTP/1.1` 这类请求目标经 node:http 客户端表达不出来（它按 URL 处理
+ * 目标）——直写请求行。 */
+function rawRequest(port, requestLine) {
+  return new Promise((resolveRequest, rejectRequest) => {
+    const socket = connect(port, '127.0.0.1', () => {
+      socket.write(`${requestLine}\r\nHost: localhost\r\nConnection: close\r\n\r\n`);
+    });
+    let raw = '';
+    socket.setEncoding('utf8');
+    socket.on('data', (chunk) => { raw += chunk; });
+    socket.on('end', () => resolveRequest(raw));
+    socket.on('error', rejectRequest);
+  });
+}
+
+/* chunked 体解码：Node 对 HTTP/1.1 未定长响应默认分块传输，原始报文里体带分块框架；
+ * 分块尺寸按字节计、字符串按 UTF-16 码元计——先还原字节再切块（多字节正文下两者会错位）。 */
+function decodeChunked(text) {
+  const body = Buffer.from(text, 'utf8');
+  const parts = [];
+  let index = 0;
+  while (index < body.length) {
+    const lineEnd = body.indexOf('\r\n', index);
+    const size = Number.parseInt(body.subarray(index, lineEnd).toString('ascii'), 16);
+    if (!(size > 0)) {
+      break;
+    }
+    parts.push(body.subarray(lineEnd + 2, lineEnd + 2 + size));
+    index = lineEnd + 2 + size + 2;
+  }
+  return Buffer.concat(parts).toString('utf8');
+}
+
+/* 原始响应按报文结构拆分：状态行、头（键小写）、体。 */
+function parseRawResponse(raw) {
+  const splitAt = raw.indexOf('\r\n\r\n');
+  const lines = raw.slice(0, splitAt).split('\r\n');
+  const headers = {};
+  for (const line of lines.slice(1)) {
+    const colon = line.indexOf(':');
+    headers[line.slice(0, colon).toLowerCase()] = line.slice(colon + 1).trim();
+  }
+  const body = raw.slice(splitAt + 4);
+  return {
+    status: Number(lines[0].split(' ')[1]),
+    headers,
+    body: headers['transfer-encoding'] === 'chunked' ? decodeChunked(body) : body,
+  };
+}
+
 /* —— 资产、health、列表 —— */
 
 test('资产与头：三份资产直出且 Content-Type 正确，全部响应带 no-store', async (t) => {
@@ -376,11 +426,17 @@ const NOT_FOUND_PATHS = [
   '/api/collab/s99/c-forum/feed',
 ];
 
-/* 编码段：必须以原始字节送达服务端（fetch 的 URL 解析会先规范化）——走 node:http 的 path。 */
+/* 编码段：以原始字节送达服务端——fetch 的 URL 解析会先做 WHATWG 规范化，走 node:http 的 path 直发。
+ * 四种形态各钉一个点：
+ * ① %2e%2e：点段在 URL 解析期就被归一化弹出路径，形状不匹配 → 404（成因是归一化，不是字节不匹配）；
+ * ② %6d、%2D：非点段原样保留，字符（% 等）不在 root/ID_PATTERN 合法集 → 404（不满足即不解码）；
+ * ③ %2F：编码斜杠不构成段边界；若实现先解码再分段，main%2Fc-forum 会被解读为 main/c-forum 两段
+ *    而命中该协作（200）——此处仍 404，钉死的是「不解码」而非「恰巧不匹配」。 */
 const ENCODED_PATHS = [
   '/api/collab/main/%2e%2e/feed',
   '/api/collab/%6dain/c-forum/feed',
   '/api/collab/main/c%2Dforum/feed',
+  '/api/collab/main%2Fc-forum/feed',
 ];
 
 test('404 族：未知路径、非法 root/id、目录缺失、编码段、大小写敏感', async (t) => {
@@ -400,6 +456,20 @@ test('404 族：未知路径、非法 root/id、目录缺失、编码段、大�
   }
   const metaMissing = await fetchText(viewer.origin, '/api/collab/s99/c-forum/meta');
   assert.equal(metaMissing.status, 404);
+});
+
+/* 空授权形态的请求目标（`//` 等）在 URL 解析期抛错：按未知路径 404 呈现，不落请求级 500。 */
+const UNPARSEABLE_TARGETS = ['//', '///', '/\\'];
+
+test('不可解析的请求目标 → 404（不落 500）', async (t) => {
+  const dataDir = makeTempDir(t);
+  const viewer = await startTestViewer(t, { dataDir });
+  for (const target of UNPARSEABLE_TARGETS) {
+    const response = parseRawResponse(await rawRequest(viewer.port, `GET ${target} HTTP/1.1`));
+    assert.equal(response.status, 404, target);
+    assert.equal(response.headers['cache-control'], 'no-store', target);
+    assert.deepEqual(JSON.parse(response.body), { error: '未知路径' }, target);
+  }
 });
 
 test('未就绪：目录在而数据未落盘 → 200 空数据（与目录缺失的 404 成对）', async (t) => {

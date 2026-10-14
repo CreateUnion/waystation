@@ -84,6 +84,16 @@ function isLocalHostName(name) {
 
 /* —— query 与路由匹配 —— */
 
+/* 请求目标解析（origin-form 与 absolute-form 都可解析）：`//`、`/\` 这类空授权形态会抛错——
+ * 按未知路径 404 呈现，不落入请求级 500（500 留给处理故障，畸形请求目标不属服务端故障）。 */
+function pathOf(rawUrl) {
+  try {
+    return new URL(rawUrl, URL_SHELL).pathname;
+  } catch {
+    return null;
+  }
+}
+
 /* after 原样截取、不做百分号解码（与路径段同一口径）。行 id 的字符集（十六进制、'-'、'@'、':'）
  * 不含 % 与 +，故原样取串与 searchParams.get 对合法锚点同解。 */
 function afterOf(rawUrl) {
@@ -153,7 +163,11 @@ function serveCollabFace(context, face, after, res) {
 
 function routeGetRequest(context, req, res) {
   const rawUrl = req.url ?? '';
-  const path = new URL(rawUrl, URL_SHELL).pathname;
+  const path = pathOf(rawUrl);
+  if (path === null) {
+    respondJson(res, 404, { error: '未知路径' });
+    return;
+  }
   const assetRoute = ASSET_ROUTES.get(path);
   if (assetRoute !== undefined) {
     respondText(res, 200, assetRoute.contentType, context.assets[assetRoute.assetKey]);
