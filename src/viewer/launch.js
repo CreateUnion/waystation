@@ -203,8 +203,9 @@ const AUTO_OPEN_KEY = 'viewerAutoOpen';
 
 /**
  * 站点根在观察窗 URL 里的名字（设计 §3.2 的根映射）：显式数据目录与槽位 1 = 主根 main（槽位 1
- * 即主数据目录本身）；槽位 k≥2 = s<k>；站点解析降级（无站点信息）按主目录解释——降级启动的
- * 活动目录就是主目录。
+ * 即主数据目录本身）；槽位 k≥2 = s<k>；站点解析降级（无站点信息）也记 main——main 是观察窗
+ * 进程自己数据根的名字，降级时该根即站点活动目录（显式目录降级时子进程继承 WAYSTATION_HOME，
+ * 无该变量时即主目录；见 buildViewerSpawn 的 env 三支）。
  * @param {{ siteMode?: string | null, slot?: number | null }} options
  * @returns {string}
  */
@@ -215,9 +216,11 @@ export function viewerRootOf({ siteMode, slot }) {
 /**
  * 观察窗拉起的 spawn 计划（纯构造；真实 spawn 在 openViewerWindow）。命令＝当前 node 可执行
  * 文件＋脚本绝对路径——入口按安装布局解析，不依赖 PATH 与工作目录。
- * env 两支（设计 §3.2）：显式数据目录模式自然继承 env（不改写）；槽位模式不注入
- * WAYSTATION_HOME——子进程缺省解析＝主目录，正是观察窗的根契约（绝不注入槽位目录，否则观察窗
- * 根错位、与其他槽位窗口互为「他人」）。
+ * env 三支（设计 §3.2）：显式数据目录与站点解析降级（无站点信息）都不改写 env——两态的站点
+ * 活动目录都由 WAYSTATION_HOME 决定（降级时是显式目录、无该变量时即主目录），子进程必须与父
+ * 进程解析同址（观察窗根契约＝站点数据根）；仅槽位模式删除该变量——槽位模式下它必空（解析见
+ * 非空即走显式分支，删与不删等价），保留删除是一道防线：绝不注入槽位目录，否则观察窗根错位、
+ * 与其他槽位窗口互为「他人」。
  * ref＝{ root, id }：root 为观察窗内的站点根（调用方注入值优先，缺省按站点模式推导，两径同源
  * 同值）；id 缺省＝列表页（不带 --focus）。
  * @param {{ siteMode?: string | null, slot?: number | null, ref?: { root?: string | null, id?: string | null } | null, scriptPath: string }} options
@@ -227,8 +230,10 @@ export function buildViewerSpawn({ siteMode, slot, ref, scriptPath }) {
   const root = typeof ref?.root === 'string' && ref.root !== '' ? ref.root : viewerRootOf({ siteMode, slot });
   const id = ref?.id ?? null;
   const args = typeof id === 'string' && id !== '' ? [scriptPath, '--focus', `${root}/${id}`] : [scriptPath];
+  /* 子进程环境恒由 process.env 派生（openViewerWindow 的注入 env 只作测试上下文闸、不参与此处
+   * 组装——生产两者同源：出口 env 缺省即 process.env；经该缝传环境不会改到这里）。 */
   const env = { ...process.env };
-  if (siteMode !== 'explicit') {
+  if (siteMode === 'slot') {
     delete env.WAYSTATION_HOME;
   }
   return { command: process.execPath, args, env, options: { detached: true, windowsHide: true, stdio: 'ignore' } };
@@ -320,15 +325,16 @@ export function openViewerWindow({ ref, dataDir, siteMode, slot, scriptPath, log
  * 新会话启动时的观察窗拉起（触发 B，设计 §3.2）：本站点进行中协作按角色判定——0 个不做；
  * 同根观察窗已在跑（默认端口段探测＋根摘要比对；别根/他人一律视为未在跑）不重复弹；未在跑则
  * 恰 1 个开其详情页、≥2 开列表页。绝不抛出，失败静默降级（探测异常同走告警出口）。
- * @param {{ collabs: Array<{ collabId: string, role: string, state: string }> | null | undefined, root: string, digest: string, dataDir: string, siteMode?: string | null, slot?: number | null, scriptPath: string, log: { warn: (...args: any[]) => void }, probe?: (options: { port: number }) => Promise<{ root?: string, pid?: number } | null>, spawnFn?: typeof spawn, env?: Record<string, string | undefined>, candidatePorts?: number[] }} options
+ * @param {{ collabs: Array<{ collabId: string, role: string, state: string }> | null | undefined, root: string, digest: string, dataDir: string, siteMode?: string | null, slot?: number | null, scriptPath: string, log: { warn: (...args: any[]) => void }, probe?: (options: { port: number }) => Promise<{ root?: string, pid?: number } | null>, spawnFn?: typeof spawn, env?: Record<string, string | undefined> }} options
  * @returns {Promise<{ opened: boolean, reason?: string }>}
  */
-export async function openViewerOnStart({ collabs, root, digest, dataDir, siteMode, slot, scriptPath, log, probe = probeViewer, spawnFn = spawn, env = process.env, candidatePorts = Array.from({ length: PORT_TRIES }, (_, offset) => DEFAULT_VIEWER_PORT + offset) }) {
+export async function openViewerOnStart({ collabs, root, digest, dataDir, siteMode, slot, scriptPath, log, probe = probeViewer, spawnFn = spawn, env = process.env }) {
   try {
     const inProgress = inProgressCollabsOf(collabs);
     if (inProgress.length === 0) {
       return { opened: false, reason: 'none' };
     }
+    const candidatePorts = Array.from({ length: PORT_TRIES }, (_, offset) => DEFAULT_VIEWER_PORT + offset);
     if (await findSameRootViewer({ candidatePorts, digest, probe }) !== null) {
       return { opened: false, reason: 'running' };
     }

@@ -323,12 +323,14 @@ test('buildViewerSpawn：ref.root 注入值优先（与缺省推导同源）；i
   assert.deepEqual(buildViewerSpawn({ siteMode: 'slot', slot: 2, ref: { id: null }, scriptPath: 'S' }).args, ['S']);
 });
 
-test('buildViewerSpawn：env 两支——显式不改写 WAYSTATION_HOME、槽位不注入，且不动父进程环境', () => {
+test('buildViewerSpawn：env 三支——显式与站点降级不改写 WAYSTATION_HOME、槽位不注入，且不动父进程环境', () => {
   const saved = process.env.WAYSTATION_HOME;
   process.env.WAYSTATION_HOME = 'D:\\tmp\\ws-home';
   try {
     const explicit = buildViewerSpawn({ siteMode: 'explicit', slot: null, ref: null, scriptPath: 'S' });
     assert.equal(explicit.env.WAYSTATION_HOME, 'D:\\tmp\\ws-home', '显式模式自然继承，不改写');
+    const degraded = buildViewerSpawn({ siteMode: null, slot: null, ref: null, scriptPath: 'S' });
+    assert.equal(degraded.env.WAYSTATION_HOME, 'D:\\tmp\\ws-home', '站点降级（无站点信息）：活动目录由 env 决定（显式目录或主目录），子进程解析必须与父同址');
     const slot = buildViewerSpawn({ siteMode: 'slot', slot: 2, ref: null, scriptPath: 'S' });
     assert.equal(slot.env.WAYSTATION_HOME, undefined, '槽位模式不注入——子进程缺省解析＝主目录');
     assert.equal(process.env.WAYSTATION_HOME, 'D:\\tmp\\ws-home', '不得改写父进程环境');

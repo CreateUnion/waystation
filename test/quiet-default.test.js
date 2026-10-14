@@ -246,13 +246,18 @@ test('幂等重入不重写静音：显式取消后重复同意成功但无提�
 
 test('受邀期已自行静音再同意：不重复写、不重置窗口、也不虚报提醒', async (t) => {
   const made = makeService(t);
+  const fromA = peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port);
   const collabId = 'collab-premuted-approve';
   await receive(made.service, inviteFrame({ collabId }));
+  /* 预静音前先来 1 条内容：基线＝1（非零，排除「重写与否都是 0」的巧合），且同意时读数已增至 2——
+   * 一旦同意重写窗口，基线会被挪到 2（静音窗口起点后移、漏计受邀期内的内容）。 */
+  await receive(made.service, contentFrame('progress', collabId, fromA, { text: '受邀期进度一' }));
   assert.equal((await made.service.setMute({ collabId, muted: true })).ok, true, '受邀期本机自行静音');
+  await receive(made.service, contentFrame('progress', collabId, fromA, { text: '静音期进度二' }));
   const joined = await made.service.approve({ collabId, approve: true });
   assert.equal(joined.ok, true, String(joined.message));
   assert.equal(suppressedOf(made.service, { type: 'progress', collabId }), true, '静音态保持');
-  assert.deepEqual(muteFileOf(made.dir, collabId), { v: 1, muted: true, baseline: 0 }, '先前的静音窗口不被重写');
+  assert.deepEqual(muteFileOf(made.dir, collabId), { v: 1, muted: true, baseline: 1 }, '先前的静音窗口不被重写（基线停在写入时刻的读数）');
   assert.equal(Object.hasOwn(joined, 'notice'), false, '本次没有新写入：不虚报「已默认静音」');
 });
 

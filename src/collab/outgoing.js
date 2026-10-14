@@ -37,7 +37,7 @@ const DEFAULT_MUTE_NOTICE = '已默认静音——消息不注入本会话；实
  * 返回本次是否真写了（前态未静音即本次落笔；已在静音中不重复写）——提醒据此如实给，不虚报。
  * 只在「创建成功」与「同意加入成功」两处调用——挂到记录创建 / 成员落盘这类宽调用点，
  * 会把受邀未同意者也静音、在拒绝路径留下 mute.json 残留（本机不同意还被静音的故障形态）。 */
-export function applyDefaultMute(local) {
+function applyDefaultMute(local) {
   const before = local.mute.setMuted(true, contentCountOf(local));
   return before.wasMuted !== true;
 }
