@@ -96,9 +96,12 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     view: 'list',
     root: '',
     id: '',
+    mode: '',
     feedAnchor: null,
     metaAnchor: null,
     lastSkipped: 0,
+    feedSkipped: 0,
+    lastFeedSkipped: 0,
     lastDate: null,
     follow: true,
     pending: 0,
@@ -233,17 +236,23 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     return { view: 'unknown' };
   }
 
-  /* 视图间共用状态归零：锚点、跟随与浮标、错误标记——新视图从干净态起步。 */
+  /* 视图间共用状态归零：锚点、跟随与浮标、错误标记——新视图从干净态起步。
+   * 忙标记一并归零：新视图首屏不被旧视图的在途请求迟滞（旧请求的 finally 有代次守卫，不会误清新拍标记）。 */
   function resetViewState() {
     state.feedAnchor = null;
     state.metaAnchor = null;
+    state.mode = '';
     state.lastSkipped = 0;
+    state.feedSkipped = 0;
+    state.lastFeedSkipped = 0;
     state.lastDate = null;
     state.follow = true;
     state.pending = 0;
     state.paused = false;
     state.gone = false;
     state.errors = { feed: false, meta: false };
+    state.feedBusy = false;
+    state.metaBusy = false;
     dom.status.textContent = '';
     dom.badge.hidden = true;
     dom.pause.textContent = '暂停';
@@ -396,13 +405,36 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     return row;
   }
 
-  /* 事件轨坏行提示只认 meta.skipped（事件轨属元状态面）：计数有增才补一行，绝不重复刷屏。 */
+  /* reset 清屏按 class token 只清本面节点：两面同拍重渲时不误清另一面的计数行与水位。
+   * 先收集后重设——不边遍历边改（HTMLCollection 是活集合）。 */
+  function clearByClass(token) {
+    const kept = [];
+    for (const node of dom.eventTrack.children) {
+      if (!String(node.className).split(' ').includes(token)) {
+        kept.push(node);
+      }
+    }
+    dom.eventTrack.replaceChildren(...kept);
+  }
+
+  /* 元状态面坏行提示（meta.skipped：成员的加入/退出事件、台账行；讨论的帖行也并入本面）：
+   * 计数有增才补一行，绝不重复刷屏；reset 清屏时水位归零，提示可在重渲后重现。 */
   function applySkipped(skipped) {
     if (typeof skipped !== 'number' || skipped <= state.lastSkipped) {
       return;
     }
     state.lastSkipped = skipped;
-    dom.eventTrack.appendChild(el('div', 'event-skipped', '跳过 ' + skipped + ' 条无法解析的记录'));
+    dom.eventTrack.appendChild(el('div', 'event-skipped event-skipped-meta', '跳过 ' + skipped + ' 条无法解析的记录'));
+  }
+
+  /* 会话流面坏行提示（feed.skipped）：只对协作显示——讨论的帖行坏行已并入 meta 行，
+   * 不分面门控会在讨论里出现两行同一个数。水位独立于 meta 行，有增才显示。 */
+  function applyFeedSkipped() {
+    if (state.mode !== 'managed' || state.feedSkipped <= state.lastFeedSkipped) {
+      return;
+    }
+    state.lastFeedSkipped = state.feedSkipped;
+    dom.eventTrack.appendChild(el('div', 'event-skipped event-skipped-feed', '会话流跳过 ' + state.feedSkipped + ' 条无法解析的记录'));
   }
 
   function applyEvents(events) {
@@ -410,8 +442,10 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
       return;
     }
     if (events.reset === true) {
-      dom.eventTrack.replaceChildren();
+      clearByClass('event-row');
+      clearByClass('event-skipped-meta');
       state.metaAnchor = null;
+      state.lastSkipped = 0;
     }
     const rows = events.rows || [];
     for (const row of rows) {
@@ -423,8 +457,10 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
   }
 
   function applyMeta(data) {
+    state.mode = data.mode === undefined ? '' : data.mode;
     applyEvents(data.events);
     applySkipped(data.skipped);
+    applyFeedSkipped();   // feed 可能先于 meta 落地：mode 就位后再看会话流计数行
     renderBanner(data);
   }
 
@@ -519,18 +555,22 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     const gen = state.routeGen;
     state.feedBusy = true;
     fetchJson(faceUrl('feed', state.feedAnchor)).then(function (data) {
-      if (gen !== state.routeGen) {
+      // 暂停期间结算的响应丢弃且不推进锚点：恢复补拉从暂停前的锚点接上，一笔不漏
+      if (gen !== state.routeGen || state.paused) {
         return;
       }
       applyFeed(data);
       state.errors.feed = false;
       refreshStatus();
     }).catch(function (error) {
-      if (gen === state.routeGen) {
+      if (gen === state.routeGen && !state.paused) {
         handlePollFailure(error, 'feed');
       }
     }).finally(function () {
-      state.feedBusy = false;
+      // 代次守卫：路由切换已把忙标记归零，旧请求结算不得误清新视图的标记
+      if (gen === state.routeGen) {
+        state.feedBusy = false;
+      }
     });
   }
 
@@ -541,18 +581,20 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     const gen = state.routeGen;
     state.metaBusy = true;
     fetchJson(faceUrl('meta', state.metaAnchor)).then(function (data) {
-      if (gen !== state.routeGen) {
+      if (gen !== state.routeGen || state.paused) {
         return;
       }
       applyMeta(data);
       state.errors.meta = false;
       refreshStatus();
     }).catch(function (error) {
-      if (gen === state.routeGen) {
+      if (gen === state.routeGen && !state.paused) {
         handlePollFailure(error, 'meta');
       }
     }).finally(function () {
-      state.metaBusy = false;
+      if (gen === state.routeGen) {
+        state.metaBusy = false;
+      }
     });
   }
 
@@ -564,9 +606,11 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     const distanceFromBottom = isReset ? dom.stream.scrollHeight - dom.stream.scrollTop : 0;
     if (isReset) {
       dom.stream.replaceChildren();
+      clearByClass('event-skipped-feed');
       state.feedAnchor = null;
       state.lastDate = null;
       state.pending = 0;
+      state.lastFeedSkipped = 0;   // reset 后会话流计数行可重现（旧行清掉、水位归零）
       updateBadge();
     }
     const rows = data.rows || [];
@@ -574,6 +618,8 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     if (rows.length > 0) {
       state.feedAnchor = rows[rows.length - 1].id;
     }
+    state.feedSkipped = typeof data.skipped === 'number' ? data.skipped : 0;
+    applyFeedSkipped();
     if (!isReset) {
       markArrived(rows.length);
       return;
