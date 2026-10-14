@@ -446,3 +446,38 @@ test('渲染安全：innerHTML 只接服务端 html 字段，其余字段按文�
   assert.ok(textOf(head).includes(hostileName), '作者名按文本呈现');
   assert.ok(textOf(head).includes('<b>粗</b>'), 'kind 按文本呈现');
 });
+
+test('路由切换：旧在途不迟滞新视图、不污染呈现、不误清忙标记', async () => {
+  const env = createEnv();
+  await bootDetail(env, { rows: [feedRow('a1')], reset: true, skipped: 0 }, metaBody());
+  let settleOld = () => {};
+  const oldGate = new Promise((resolve) => {
+    settleOld = () => resolve({ ok: true, status: 200, json: () => Promise.resolve({ rows: [feedRow('a2')], reset: false, skipped: 0 }) });
+  });
+  env.plan({ match: '/feed', gate: oldGate }, { match: '/meta', gate: oldGate });   // A 两路在途
+  env.timer();
+  let settleFeed = () => {};
+  let settleMeta = () => {};
+  const newFeed = new Promise((resolve) => {
+    settleFeed = () => resolve({ ok: true, status: 200, json: () => Promise.resolve({ rows: [feedRow('b1')], reset: true, skipped: 0 }) });
+  });
+  const newMeta = new Promise((resolve) => {
+    settleMeta = () => resolve({ ok: true, status: 200, json: () => Promise.resolve(metaBody({ name: '乙协作' })) });
+  });
+  env.plan({ match: 'beta/feed', gate: newFeed }, { match: 'beta/meta', gate: newMeta });
+  env.window.location.hash = '#/c/main/beta';
+  env.fireWindow('hashchange');
+  assert.equal(env.requests.length, 6, '切到 B 立即发起两路，不被 A 的忙标记迟滞');
+  settleOld();
+  await env.flush();
+  assert.equal(streamRows(env).length, 0, '旧 A 响应不得落进 B（代次作废）');
+  const dispatched = env.requests.length;
+  env.timer();
+  await env.flush();
+  assert.equal(env.requests.length, dispatched, 'B 在途时不得重复并发（旧 finally 未误清忙标记）');
+  settleFeed();
+  settleMeta();
+  await env.flush();
+  assert.equal(streamRows(env).length, 1, 'B 首屏数据落屏');
+  assert.ok(textOf(env.byId['banner']).includes('【乙协作】'), textOf(env.byId['banner']));
+});

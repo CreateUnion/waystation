@@ -74,6 +74,9 @@ test('嵌入纪律：三资产零外部资源（协议相对 / data: / 内联资
     assert.ok(!asset.includes('"//'), '出现协议相对 URL（双引号形态）');
     assert.ok(!asset.includes("'//"), '出现协议相对 URL（单引号形态）');
   }
+  // 无引号属性值的协议相对 URL（如 <script src=//evil…>、meta refresh 的 content=…url=//evil…）
+  // 不带任何引号，上面两种带引号形态都扫不到——按 "=//" 直接拦下这最后一个缝隙。
+  assert.ok(!INDEX_HTML.includes('=//'), '页面壳出现无引号形态的协议相对 URL（=//）');
 });
 
 /* 页面壳里的每个 src/href 值都必须是同源相对路径（以 / 开头且非 //）：覆盖单引号属性与
