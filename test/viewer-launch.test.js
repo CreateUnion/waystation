@@ -360,7 +360,7 @@ test('readViewerAutoOpen：true/false 原值透传、不留告警', () => {
   assert.deepEqual(readWith('{"viewerAutoOpen": false}'), { value: false, warns: [] });
 });
 
-test('readViewerAutoOpen：缺省/缺失/非法一律 true＋warn 留痕', () => {
+test('readViewerAutoOpen：缺失（无文件）/缺省（无字段）→ true 静默', () => {
   const missing = () => {
     const error = new Error('ENOENT');
     error.code = 'ENOENT';
@@ -369,9 +369,27 @@ test('readViewerAutoOpen：缺省/缺失/非法一律 true＋warn 留痕', () =>
   const cases = [
     ['字段缺省', () => '{"identityName": "本机"}'],
     ['文件缺失', missing],
+    ['根非对象（无字段）', () => '[true]'],
+  ];
+  for (const [name, readFile] of cases) {
+    const warns = [];
+    const value = readViewerAutoOpen({ dataDir: 'X', readFile, warn: (message) => warns.push(message) });
+    assert.equal(value, true, `${name}：按默认开启`);
+    assert.deepEqual(warns, [], `${name}：缺省不告警（沿 config 既有回落样式）`);
+  }
+});
+
+test('readViewerAutoOpen：值非法（非布尔）/读不出解析不了 → true＋warn 一次', () => {
+  const readFailure = (code) => () => {
+    const error = new Error(code);
+    error.code = code;
+    throw error;
+  };
+  const cases = [
     ['值非法（字符串）', () => '{"viewerAutoOpen": "yes"}'],
-    ['根非对象', () => '[true]'],
+    ['值非法（数字）', () => '{"viewerAutoOpen": 1}'],
     ['JSON 损坏', () => '{损坏'],
+    ['读取故障（非 ENOENT）', readFailure('EACCES')],
   ];
   for (const [name, readFile] of cases) {
     const warns = [];

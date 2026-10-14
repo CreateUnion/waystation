@@ -1,6 +1,6 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { makeTempDir, pickFreePort, repoRoot, waitFor, waitForRebindable } from './helpers.js';
@@ -482,11 +482,34 @@ const DETACHED_PARENT_CODE = `Promise.all([import(process.argv[1]), import('node
   });
 });`;
 
+/* 等健康面应答（子进程就绪判定）：连接拒绝/未就绪返回 null 继续轮询。 */
+async function waitHealth(port) {
+  return waitFor(async () => {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/api/health`);
+      return response.status === 200 ? response.json() : null;
+    } catch {
+      return null;
+    }
+  }, WAIT);
+}
+
 test('detached 存活：短命父进程 spawn 后退出，观察窗仍应答 health；--stop 收尾', { timeout: 30000 }, async (t) => {
   const home = makeTempDir(t);
   writeForumFixture(home, 'c-forum');
   writeFileSync(join(home, CONFIG_FILE_NAME), `${JSON.stringify({ viewerAutoOpen: true })}\n`);
   const port = await pickFreePort();
+  /* 兜底收尾：用例中途失败时也不留下 detached 子进程（正常路径已 --stop，二次 stop 输出
+   * 「未发现运行中的观察窗」仍码 0）。同步子进程＋超时上界：收尾钩子内不再注册收尾面，
+   * dataDir 只作根摘要输入，目录即便已删也不影响停止判定。 */
+  t.after(() => {
+    spawnSync(process.execPath, [VIEWER, '--stop', '--port', String(port)], {
+      cwd: repoRoot,
+      env: { ...process.env, WAYSTATION_HOME: home },
+      stdio: 'ignore',
+      timeout: 10000,
+    });
+  });
   const launchUrl = new URL('../src/viewer/launch.js', import.meta.url).href;
   const parent = spawn(process.execPath, ['-e', DETACHED_PARENT_CODE, launchUrl, VIEWER, home, String(port)], {
     cwd: repoRoot,
@@ -503,14 +526,7 @@ test('detached 存活：短命父进程 spawn 后退出，观察窗仍应答 hea
   });
   assert.equal(parentExit, 0, `短命父进程应自然退出（unref 未拖住事件循环）；stderr=${JSON.stringify(parentErr)}`);
 
-  const health = await waitFor(async () => {
-    try {
-      const response = await fetch(`http://127.0.0.1:${port}/api/health`);
-      return response.status === 200 ? response.json() : null;
-    } catch {
-      return null;
-    }
-  }, WAIT);
+  const health = await waitHealth(port);
   assert.equal(health.app, 'waystation-viewer', '父进程退出后子进程仍应答');
   assert.equal(health.root, rootDigest(home), '子进程按 WAYSTATION_HOME 定根（显式模式继承）');
 

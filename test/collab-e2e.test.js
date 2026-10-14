@@ -94,9 +94,11 @@ after(async () => {
 });
 
 /* 真实组合根 + 假会话收件箱 + SDK 客户端：与生产装配同参（唯一差异 = 消息套接字指向假收件箱）。
- * 端口与数据目录经预写配置 + WAYSTATION_HOME 注入（显式目录模式，与 server.test.js 同法）。 */
+ * 端口与数据目录经预写配置 + WAYSTATION_HOME 注入（显式目录模式，与 server.test.js 同法）。
+ * viewerAutoOpen 一律关闭：测试不得拉起真实观察窗与浏览器窗口（配置驱动的主保障，
+ * 任何运行器下成立；组合根的测试上下文闸只作纵深）。 */
 async function startStation(t, { home, port, inbox }) {
-  writeFileSync(join(home, 'config.json'), JSON.stringify({ port, scanWindowMs: 300, dialTimeoutMs: 1500, dispatchTickMs: 100, retryIntervalMs: 200, retryFastCount: 100, messageTtlMs: 3600000, forumSyncIntervalMs: 4000 }));
+  writeFileSync(join(home, 'config.json'), JSON.stringify({ port, scanWindowMs: 300, dialTimeoutMs: 1500, dispatchTickMs: 100, retryIntervalMs: 200, retryFastCount: 100, messageTtlMs: 3600000, forumSyncIntervalMs: 4000, viewerAutoOpen: false }));
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [INDEX_ENTRY],

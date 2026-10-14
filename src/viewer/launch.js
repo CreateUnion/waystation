@@ -1,5 +1,5 @@
 /* 观察窗启动链的纯函数层：端口探针与归属判定、Edge 定位与开窗命令计划、停止（--stop）、
- * 自动开窗（安静默认期）——站点根映射、spawn 计划构造、开关现读、触发时拉起与启动判定。
+ * 自动开窗——站点根映射、spawn 计划构造、开关现读、触发时拉起与启动判定。
  * 全部副作用经参数注入（fetch / spawn / kill / sleep / exists / readFile），组合根
  * （scripts/ws-viewer.js 与 src/index.js）装配真实实现，单测注入桩。
  *
@@ -190,7 +190,7 @@ export async function stopViewer({ candidatePorts, digest, probe = probeViewer, 
   return { stopped: false, port: target.port, pid: target.pid, reason: `进程 ${target.pid} 已终止但端口 ${target.port} 在 ${STOP_RELEASE_WAIT_MS}ms 内未释放` };
 }
 
-/* —— 自动开窗（安静默认期）：触发 A/B 的构造与出口 —— */
+/* —— 自动开窗：触发 A/B 的构造与出口 —— */
 
 /* 触发 B「进行中」状态集，按角色写死（设计 §3.2）：管理侧 = 尚未归档的全部状态——自己创建的
  * 协作在等对方同意（proposed）期间开新会话照样拉起；成员侧 = 已入席——受邀未同意不弹，防与
@@ -198,13 +198,8 @@ export async function stopViewer({ candidatePorts, digest, probe = probeViewer, 
 const MANAGER_IN_PROGRESS_STATES = ['proposed', 'active', 'frozen'];
 const MEMBER_IN_PROGRESS_STATES = ['active', 'frozen'];
 
-/* viewerAutoOpen 的字段名（config.json，每站点一份；缺省/缺失/非法＝true——设计 §3.4）。 */
+/* viewerAutoOpen 的字段名（config.json，每站点一份；缺省/缺失＝true 静默、非法＝true＋warn）。 */
 const AUTO_OPEN_KEY = 'viewerAutoOpen';
-
-/* 默认端口段（探针/协商/停止共用）：基址 7330 起 PORT_TRIES 个。 */
-function viewerCandidatePorts() {
-  return Array.from({ length: PORT_TRIES }, (_, offset) => DEFAULT_VIEWER_PORT + offset);
-}
 
 /**
  * 站点根在观察窗 URL 里的名字（设计 §3.2 的根映射）：显式数据目录与槽位 1 = 主根 main（槽位 1
@@ -241,24 +236,28 @@ export function buildViewerSpawn({ siteMode, slot, ref, scriptPath }) {
 
 /**
  * viewerAutoOpen 现读（设计 §3.4）：纯 JSON.parse＋类型判定，不落任何写副作用——禁用 loadConfig
- * （其损坏分支会把原文件改名重建，自动开窗钩子不得触发写盘）。缺省（无字段）/缺失（无文件）/
- * 非法（非布尔）一律按默认 true 并 warn 留痕；显式 false 才关闭（触发 A/B 全关，手开不受影响）。
+ * （其损坏分支会把原文件改名重建，自动开窗钩子不得触发写盘）。缺失（无文件）与缺省（无字段）
+ * 都按默认 true **静默**处理（沿 config.js 既有样式：缺省不告警）；只有值非法（非布尔）或文件
+ * 存在但读不出/解析不了才 warn 一次。显式 false 才关闭（触发 A/B 全关，手开不受影响）。
  * @param {{ dataDir: string, warn: (message: string) => void, readFile?: (path: string, encoding: 'utf8') => string }} options
  * @returns {boolean}
  */
 export function readViewerAutoOpen({ dataDir, warn, readFile = readFileSync }) {
   try {
     const parsed = JSON.parse(readFile(join(dataDir, CONFIG_FILE_NAME), 'utf8'));
-    const value = parsed !== null && typeof parsed === 'object' ? parsed[AUTO_OPEN_KEY] : undefined;
-    if (value === true) {
+    const value = parsed?.[AUTO_OPEN_KEY];
+    if (value === undefined || value === true) {
       return true;
     }
     if (value === false) {
       return false;
     }
-    warn('viewerAutoOpen 缺省或非法（非布尔），按默认开启处理');
+    warn('viewerAutoOpen 值非法（非布尔），按默认开启处理');
     return true;
   } catch (error) {
+    if (error.code === 'ENOENT') {
+      return true;
+    }
     warn(`viewerAutoOpen 不可读（${error.message}），按默认开启处理`);
     return true;
   }
@@ -295,6 +294,7 @@ export function inProgressCollabsOf(entries) {
 export function openViewerWindow({ ref, dataDir, siteMode, slot, scriptPath, log, spawnFn = spawn, env = process.env }) {
   try {
     if (typeof env.NODE_TEST_CONTEXT === 'string') {
+      log.warn('测试上下文（NODE_TEST_CONTEXT）：跳过观察窗自动打开');
       return { opened: false, reason: 'test-context' };
     }
     if (readViewerAutoOpen({ dataDir, warn: (message) => log.warn(message) }) === false) {
@@ -323,7 +323,7 @@ export function openViewerWindow({ ref, dataDir, siteMode, slot, scriptPath, log
  * @param {{ collabs: Array<{ collabId: string, role: string, state: string }> | null | undefined, root: string, digest: string, dataDir: string, siteMode?: string | null, slot?: number | null, scriptPath: string, log: { warn: (...args: any[]) => void }, probe?: (options: { port: number }) => Promise<{ root?: string, pid?: number } | null>, spawnFn?: typeof spawn, env?: Record<string, string | undefined>, candidatePorts?: number[] }} options
  * @returns {Promise<{ opened: boolean, reason?: string }>}
  */
-export async function openViewerOnStart({ collabs, root, digest, dataDir, siteMode, slot, scriptPath, log, probe = probeViewer, spawnFn = spawn, env = process.env, candidatePorts = viewerCandidatePorts() }) {
+export async function openViewerOnStart({ collabs, root, digest, dataDir, siteMode, slot, scriptPath, log, probe = probeViewer, spawnFn = spawn, env = process.env, candidatePorts = Array.from({ length: PORT_TRIES }, (_, offset) => DEFAULT_VIEWER_PORT + offset) }) {
   try {
     const inProgress = inProgressCollabsOf(collabs);
     if (inProgress.length === 0) {

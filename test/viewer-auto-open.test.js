@@ -88,15 +88,18 @@ test('openViewerWindow：viewerAutoOpen=false → 不 spawn（手开不受影响
   assert.deepEqual(log.warns, [], '显式 false 是正常配置，不属回落告警面');
 });
 
-test('openViewerWindow：测试上下文（NODE_TEST_CONTEXT）→ 不 spawn（e2e 站点安全阀）', (t) => {
+test('openViewerWindow：测试上下文（NODE_TEST_CONTEXT）→ 不 spawn（e2e 站点安全阀）＋诊断留痕', (t) => {
   const home = makeTempDir(t);
   writeConfig(home, { viewerAutoOpen: true });
   const { calls, spawnFn } = fakeSpawn();
+  const log = captureLog();
   assert.deepEqual(
-    openCall({ home, spawnFn, log: captureLog(), env: { NODE_TEST_CONTEXT: 'child-v8' } }),
+    openCall({ home, spawnFn, log, env: { NODE_TEST_CONTEXT: 'child-v8' } }),
     { opened: false, reason: 'test-context' },
   );
   assert.equal(calls.length, 0);
+  assert.equal(log.warns.length, 1, '跳过拉起须留诊断一行（返回值无人消费）');
+  assert.match(String(log.warns[0]), /测试上下文/);
 });
 
 test('openViewerWindow：开关现读——改 config.json 后下一次触发即生效；非法值经出口 warn 留痕', (t) => {

@@ -250,7 +250,8 @@ function writeMemberFixture(home, { collabId, name, mode }) {
 test('进程级：讨论参与随模式标签进入会话状态文件（缺 mode 的旧记录按 managed 解释）', { timeout: 30000 }, async (t) => {
   const home = makeStationDir(t);
   const port = await pickFreePort();
-  writeFileSync(join(home, 'config.json'), JSON.stringify({ port, scanWindowMs: 300, dialTimeoutMs: 1500 }));
+  // viewerAutoOpen: false——起站夹具不拉起真实观察窗（配置驱动的主保障）
+  writeFileSync(join(home, 'config.json'), JSON.stringify({ port, scanWindowMs: 300, dialTimeoutMs: 1500, viewerAutoOpen: false }));
   writeMemberFixture(home, { collabId: 'collab-forum-fx', name: '联调讨论', mode: 'forum' });
   writeMemberFixture(home, { collabId: 'collab-legacy-fx', name: '联调项目' });
   const sessionId = 'session-forum-fx';
@@ -283,7 +284,8 @@ test('进程级：讨论参与随模式标签进入会话状态文件（缺 mode
 test('进程级：会话标识经环境注入 → 文件出现且字段正确；stdin 关闭 → 进程退出并清除文件', { timeout: 30000 }, async (t) => {
   const home = makeStationDir(t);
   const port = await pickFreePort();
-  writeFileSync(join(home, 'config.json'), JSON.stringify({ port, scanWindowMs: 300, dialTimeoutMs: 1500 }));
+  // viewerAutoOpen: false——同起站夹具纪律
+  writeFileSync(join(home, 'config.json'), JSON.stringify({ port, scanWindowMs: 300, dialTimeoutMs: 1500, viewerAutoOpen: false }));
   const sessionId = 'session-process-1';
   const child = spawn(process.execPath, [join(repoRoot, 'src', 'index.js')], {
     cwd: repoRoot,

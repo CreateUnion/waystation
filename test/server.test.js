@@ -74,10 +74,11 @@ after(async () => {
 });
 
 // 用 SDK 官方 client 真实握手——能握手成功即同时证明 stdout 未被任何日志污染
+// viewerAutoOpen：起站夹具统一关闭自动开窗（测试不拉起真实观察窗；配置驱动、任何运行器下成立）
 async function connectClient(t, entry, home, extraConfig = {}) {
   writeFileSync(
     join(home, 'config.json'),
-    JSON.stringify({ scanWindowMs: 300, dialTimeoutMs: 1500, ...extraConfig }),
+    JSON.stringify({ scanWindowMs: 300, dialTimeoutMs: 1500, viewerAutoOpen: false, ...extraConfig }),
   );
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -357,7 +358,8 @@ test('会话关闭（stdin 关闭）→ 进程退出（退出码 0）并释放 T
   });
   const home = makeStationHome(t);
   const port = await pickFreePort();
-  writeFileSync(join(home, 'config.json'), JSON.stringify({ scanWindowMs: 300, dialTimeoutMs: 1500, port }));
+  // viewerAutoOpen: false——同起站夹具纪律（不拉起观察窗）
+  writeFileSync(join(home, 'config.json'), JSON.stringify({ scanWindowMs: 300, dialTimeoutMs: 1500, port, viewerAutoOpen: false }));
   child = spawn(process.execPath, [INDEX_ENTRY], {
     cwd: repoRoot,
     env: { ...process.env, WAYSTATION_HOME: home },
