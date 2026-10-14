@@ -1,5 +1,5 @@
 ---
-description: 观察窗启动/打开（用法：/ws-view [--port N] [--no-open] [--stop]）
+description: 观察窗启动/打开（用法：/ws-view [--port N] [--no-open] [--stop] [--focus <root>/<id>]）
 ---
 <!-- waystation-managed-command -->
 用户要启动或打开人类观察窗（本机只读 Web 查看器）。参数原文：$ARGUMENTS
