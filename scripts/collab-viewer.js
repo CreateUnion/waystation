@@ -6,6 +6,8 @@ import { isPostEntryShape, POSTS_FILE_NAME } from '../src/collab/posts.js';
 import { foldMemberEvents, isMemberEventShape, MEMBERS_FILE_NAME } from '../src/collab/members.js';
 import { isLedgerShape } from '../src/collab/model.js';
 import { LEDGER_FILE_NAME, loadMember } from '../src/collab/store.js';
+import { metaViewOf } from '../src/viewer/meta.js';
+import { displayText } from '../src/viewer/text.js';
 
 /* 讨论查看器（本地只读观战窗）：把一台讨论的本地数据面增量渲染成「时间戳＋正文」两栏帖流，
  * 成员与元状态变化以暗色系统行追加。独立零依赖程序——不与服务层的运行期部件发生关系
@@ -87,27 +89,6 @@ function formatTime(ts) {
   const at = new Date(ts);
   const twoDigits = (value) => String(value).padStart(2, '0');
   return `${twoDigits(at.getHours())}:${twoDigits(at.getMinutes())}:${twoDigits(at.getSeconds())}`;
-}
-
-/* 帖正文按单行呈现：换行类字符（LF / CR / U+2028 / U+2029）替换为 ⏎（一帖一行是两栏形态的约束）；
- * 控制类（C0 / DEL / C1，含可作终端 CSI 的 U+009B）与格式类（Cf——双向文本重排、零宽类，
- * Trojan Source 一类）字符剔除：远程内容不可信，终端控制与显示重排一律不得进观战窗输出。
- * U+200D（零宽连接符）同属 Cf 但有意保留：ZWJ emoji 组合序列靠它成串，剥掉会把一个合法表情
- * 拆散——渲染失真的代价高于该字符本身的可滥用面。 */
-const CONTROL_OR_FORMAT = /^[\p{Cc}\p{Cf}]$/u;
-const ZERO_WIDTH_JOINER = '\u200d';
-
-function singleLineText(text) {
-  let presented = '';
-  for (const char of text) {
-    const code = char.codePointAt(0);
-    if (code === 0x0a || code === 0x0d || code === 0x2028 || code === 0x2029) {
-      presented += '⏎';
-    } else if (char === ZERO_WIDTH_JOINER || !CONTROL_OR_FORMAT.test(char)) {
-      presented += char;
-    }
-  }
-  return presented;
 }
 
 /* —— 字节级尾读器（零写盘的增量行读取）—— */
@@ -199,22 +180,6 @@ function emitLines(state, bytes) {
 
 /* —— 呈现 —— */
 
-/* 元状态取数（口径对齐 local.js 的 localNameOf / localStateOf）：管理席位名一律取台账
- * （localNameOf——名以台账为权威，「已退出」只改状态不改名源）；状态在成员记录为 left 时
- * 取 left（localStateOf 的退出优先），否则取台账状态；成员席位取参与记录的名与态；
- * 两者都不可读 = 未就绪。管理席位在台账缺失时退回参与记录（降级但不静默——状态按成员记录
- * 如实呈现）。「管理席位 + 已退出」此前名取参与记录、与 localNameOf 是两个来源（现形态下
- * 不可达的取数差异），对齐防后续把它当成有意口径。 */
-function metaViewOf(ledger, member) {
-  if (member === null) {
-    return ledger === null ? null : { name: ledger.name, state: ledger.status };
-  }
-  if (member.role === 'manager' && ledger !== null) {
-    return { name: ledger.name, state: member.state === 'left' ? member.state : ledger.status };
-  }
-  return { name: member.name, state: member.state };
-}
-
 function stateLabelOf(state) {
   return STATE_LABELS[state] ?? String(state);
 }
@@ -244,7 +209,7 @@ function onPostLine(view, line) {
   if (view.withAuthor) {
     columns.push(entry.from.identityName);
   }
-  columns.push(singleLineText(entry.text));
+  columns.push(displayText(entry.text, { newlines: 'marker' }));
   writeLine(columns.join(COLUMN_SEPARATOR));
 }
 
