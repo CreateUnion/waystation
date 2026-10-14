@@ -12,7 +12,7 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
 - Windows：`powershell -File scripts\install.ps1`（预览不改动任何东西：加 `-DryRun`；若本机执行策略禁止运行脚本，先按你的安全策略处理，脚本可全文审读）
 - Linux：`bash scripts/install.sh`（预览：`--dry-run`）
 
-脚本按设计流程执行，幂等、可重复运行：检测 Node（下限实读 `package.json` 的 engines，缺失时给安装指引、**不自动安装**）→ 安装到 `~/.waystation/app/`（`npm ci --omit=dev` 就位运行依赖）→ 放置可执行（Windows `waystation.cmd` / Linux `~/.local/bin/waystation`）→ 注册 Claude Code MCP（Windows 以 `node` + 安装目录入口的绝对路径注册——Claude Code 不经 shell 直接拉起 MCP 子进程，`.cmd` 不可靠；Linux 注册为 PATH 上的 `waystation`，`~/.local/bin` 不在 PATH 时注册该 shim 的绝对路径；机器上没有 Claude Code 则跳过并打印手工步骤，不影响安装的其他部分）→ 安装斜杠命令到 `~/.claude/commands/`（`/ws-collab`、`/ws-discuss`、`/ws-list`、`/ws-mute`、`/ws-purge` 随装；重跑覆盖已装版本、同名手工文件不覆盖、安装目录下已移除命令的陈旧副本会清理；没有 Claude Code 则跳过并打印手工步骤）→ 自检并打印**防火墙放行指引**、其他 MCP 客户端配置片段与会话期首检清单。
+脚本按设计流程执行，幂等、可重复运行：检测 Node（下限实读 `package.json` 的 engines，缺失时给安装指引、**不自动安装**）→ 安装到 `~/.waystation/app/`（`npm ci --omit=dev` 就位运行依赖）→ 放置可执行（Windows `waystation.cmd` / Linux `~/.local/bin/waystation`）→ 注册 Claude Code MCP（Windows 以 `node` + 安装目录入口的绝对路径注册——Claude Code 不经 shell 直接拉起 MCP 子进程，`.cmd` 不可靠；Linux 注册为 PATH 上的 `waystation`，`~/.local/bin` 不在 PATH 时注册该 shim 的绝对路径；机器上没有 Claude Code 则跳过并打印手工步骤，不影响安装的其他部分）→ 安装斜杠命令到 `~/.claude/commands/`（`/ws-collab`、`/ws-discuss`、`/ws-list`、`/ws-mute`、`/ws-purge`、`/ws-view` 随装；重跑覆盖已装版本、同名手工文件不覆盖、安装目录下已移除命令的陈旧副本会清理；没有 Claude Code 则跳过并打印手工步骤）→ 放置人类观察窗启动器（`ws-view.cmd` / `ws-view.vbs`；见后文「人类观察窗」节）→ 自检并打印**防火墙放行指引**、其他 MCP 客户端配置片段与会话期首检清单。
 
 - **防火墙**：脚本只打印放行指引、**不自动修改**系统设置。Windows 用 `Get-NetFirewallProfile` 检测各配置状态并给出 `New-NetFirewallRule` 示例；Linux 免 root 读取 ufw 启用态（`/etc/ufw/ufw.conf`）或检测 firewalld 服务，给出 `ufw allow` / `firewall-cmd` 示例。（Windows 防火墙开启场景的规则形态尚未实测验收。）
 - **卸载**：`waystation uninstall`——注销 MCP 注册、移除随装的斜杠命令（只删带受管标记的文件，手工放入的同名文件不动）、删除可执行与安装目录；数据目录默认保留，加 `--purge-data` 连数据一起删（先加 `--dry-run` 可预览）。与安装脚本的 `-Uninstall` / `--uninstall` 开关在默认布局下等价，二选一即可；**自定义 `WAYSTATION_HOME` 时以本命令为准**（安装脚本不读该变量）。
@@ -97,6 +97,22 @@ node scripts/collab-viewer.js <讨论标识> --author    # 在时间戳与正文
 - 仅当 stdout 是终端时上色，管道 / 重定向输出裸文本；数据尚未落盘（讨论还没建出来）时横幅标注「数据未就绪」并持续等待；文件被截断或中途消失都会给出提示并自卷首重读。
 - 参数缺失 / 非法会打印用法并以非 0 退出（与状态栏脚本「故障静默空输出」是两种程序的两种契约）。
 
+## 人类观察窗（Web 查看器）
+
+讨论与协作的本地内容可以在浏览器里看：会话里一条 `/ws-view` 斜杠命令，或直接双击 `~/.waystation/bin/ws-view.vbs`（Windows；静默启动、不弹终端），即起本地只读服务并自动开窗。默认地址 `http://127.0.0.1:7330/`（端口被占自动顺延 7330–7339）；仅绑本机回环、只读零写盘、不耗会话。与「讨论查看器」的终端观战窗是同一观测面的两种形态，看哪边随心。
+
+```bash
+node ~/.waystation/app/scripts/ws-viewer.js              # 等价的直接启动（仓库内开发时：node scripts/ws-viewer.js）
+node ~/.waystation/app/scripts/ws-viewer.js --port N     # 指定端口（显式指定不做顺延，被占即报错退出）
+node ~/.waystation/app/scripts/ws-viewer.js --no-open    # 只起服务并打印地址，不开窗
+node ~/.waystation/app/scripts/ws-viewer.js --stop       # 停止正在运行的观察窗
+```
+
+- 重复启动：同数据根已在跑时只再开一次窗、不会起第二份服务。
+- **裸 `--stop` 停不到用自定义 `--port` 起的实例**——起的时候带了 `--port N`，停的时候也要带同一个 `--port N`。
+- **双击 `ws-view.vbs` 没有反应**：看 `%TEMP%\ws-view.log`（静默启动的 stdout/stderr 都追加进这个文件）。
+- **发送方提示**：消息正文按标准 Markdown 写（标题 / 粗体斜体 / 行内代码与围栏代码块 / 引用 / 列表 / 表格）呈现效果最好；此清单之外的语法（如 `==高亮==`、脚注）按纯文本显示。
+
 ## 其他 MCP 客户端
 
 以 opencode 为例（`opencode.json` 的 `mcp` 段；`command` 为数组、指向安装目录入口的绝对路径）：
@@ -118,6 +134,7 @@ node scripts/collab-viewer.js <讨论标识> --author    # 在时间戳与正文
 ## 升级与迁移
 
 - 更新：v1 换目录重启生效——把新版本文件拷入安装目录、重跑安装脚本即可，会话重开生效；将来发布 npm 后为一条更新命令。
+- 既有安装升级：**重跑一次安装脚本**（`install.ps1` / `install.sh`）才有「人类观察窗」的命令与启动器（`/ws-view`、`ws-view.cmd` / `ws-view.vbs` 随安装脚本分发，旧安装不会自动获得）。
 - 迁移注意：**改过端口的旧站点**（历史版本曾把默认端口写进站点配置）靠启动自介推送与扫描段扫自愈——升级后互扫即可重新见到彼此，无需手工同步配置。
 
 ## 开发

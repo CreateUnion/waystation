@@ -39,3 +39,16 @@ test('README：披露锚句与安装/状态栏/卸载/迁移文档面齐备（�
   assert.ok(text.includes('以本命令为准'), '卸载命令交付口径在文档（自定义 WAYSTATION_HOME 时以本命令为准，非「设计中」措辞）');
   assert.ok(text.includes('自介') && text.includes('升级与迁移'), '改端口旧站点的迁移注意在文档');
 });
+
+test('README：人类观察窗节齐备（命令/启动器/开关/日志排查/发送方提示/升级重跑）', () => {
+  const text = readFileSync(join(repoRoot, 'README.md'), 'utf8');
+  assert.ok(text.includes('/ws-view'), '观察窗命令（/ws-view）写入文档');
+  assert.ok(text.includes('## 人类观察窗（Web 查看器）'), '观察窗节写入文档');
+  assert.ok(text.includes('ws-view.vbs'), '双击启动器（ws-view.vbs）写入文档');
+  assert.ok(text.includes('http://127.0.0.1:7330/'), '默认地址写入文档');
+  assert.ok(text.includes('--no-open') && text.includes('--stop'), '观察窗开关（--no-open / --stop）写入文档');
+  assert.ok(text.includes('裸 `--stop` 停不到'), '裸 --stop 停不到自定义端口实例的边界写入文档');
+  assert.ok(text.includes('%TEMP%\\ws-view.log'), '双击无反应看 %TEMP%\\ws-view.log 写入文档');
+  assert.ok(text.includes('==高亮=='), '发送方标准 Markdown 提示写入文档');
+  assert.ok(text.includes('重跑一次安装脚本'), '升级与迁移节补「既有安装需重跑安装脚本」');
+});
