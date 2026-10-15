@@ -362,10 +362,10 @@ test('验收预演：结束与终态门控（通告投递、双侧拒绝、归�
   assert.equal((await callTool(b, 'ws_approve_invite', { collabId, approve: true })).isError, false);
   await waitState(a, collabId, 'active');
   await waitState(b, collabId, 'active');
-  /* 结束通告达会话（end 帧注入）：零正文帧呈一行事件叙述——结束前已有邀请与状态回执注入，
-   * 锚＝end 叙述串本身（弃「注入帧计数 +1」——并发注入到达时计数锚点会竞争）。
+  /* 结束通告达会话（end 帧注入）：零正文帧呈一行事件叙述——结束前已有邀请与状态回执注入（前置
+   * 以等待而非快照读），锚＝end 叙述串本身（弃「注入帧计数 +1」——并发注入到达时计数锚点会竞争）。
    *（空对象正文与回信指引已不再渲染）。本用例协作未指定模式 → 默认 managed → 措辞「协作」、发送方为 A。 */
-  assert.ok(countInjectedFrames(inboxB.receivedText()) >= 1, '结束前已有注入帧（邀请 / 状态回执）');
+  await waitFor(() => (countInjectedFrames(inboxB.receivedText()) >= 1 ? true : null), { timeoutMs: 20000 });
   assert.equal((await callTool(a, 'ws_end_collab', { collabId })).isError, false);
   await waitState(b, collabId, 'completed');
   await waitFor(() => (inboxB.receivedText().includes(`${statusA.identityName}结束了协作`) ? true : null), { timeoutMs: 20000 });

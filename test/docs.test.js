@@ -19,11 +19,20 @@ test('编码规范文档无模板占位符残留（【】形态）', () => {
   assert.equal(/【[^】]*】/u.test(text), false, '不得残留模板占位符——所有决策须替换为项目实际值');
 });
 
-test('README：数据目录与多站点说明（WAYSTATION_HOME 与槽位目录）', () => {
+test('README：数据目录与单核说明（WAYSTATION_HOME、槽位历史布局与身份名）', () => {
   const text = readFileSync(join(repoRoot, 'README.md'), 'utf8');
   assert.ok(text.includes('WAYSTATION_HOME'), 'README 开发节须说明显式数据目录');
-  assert.ok(text.includes('sites/'), 'README 开发节须说明一机多站点目录布局');
+  assert.ok(text.includes('sites/'), 'README 须说明旧槽位目录布局（停用为历史只读面）');
   assert.ok(text.includes('identityName'), 'README 须说明身份名默认为机器名、可用 identityName 自定义');
+});
+
+test('README：单机一核与桥节齐备（核心管理口 / 常驻开关 / 离线语义 / 逃生门）', () => {
+  const text = readFileSync(join(repoRoot, 'README.md'), 'utf8');
+  assert.ok(text.includes('## 单机一核与桥'), '单核与桥节写入文档');
+  assert.ok(text.includes('waystation core status') && text.includes('waystation core stop'), '核心管理口（core status / core stop）写入文档');
+  assert.ok(text.includes('persistentCore'), '常驻开关（persistentCore）写入文档');
+  assert.ok(text.includes('推停拉不停'), '离线语义修订（推停拉不停、不追发）写入文档');
+  assert.ok(text.includes('关全部旧会话 → 重跑安装脚本 → 重开'), '升级换代推荐顺序写入文档');
 });
 
 test('README：披露锚句与安装/状态栏/卸载/迁移文档面齐备（防腐化）', () => {

@@ -34,6 +34,11 @@ test('注释编号扫描 matcher 自检：语义正确（防止扫描本身失�
   assert.equal(PLAN_REFERENCE_PATTERN.test('WP-14 要求'), true);
   assert.equal(PLAN_REFERENCE_PATTERN.test('G25'), true);
   assert.equal(PLAN_REFERENCE_PATTERN.test('T6 M-2'), true);
+  /* 裸任务编号分支（T+数字）的正/负例：该分支被误删时本自检必须红（判别力） */
+  assert.equal(PLAN_REFERENCE_PATTERN.test('T6 的接线'), true, '裸任务编号命中');
+  assert.equal(PLAN_REFERENCE_PATTERN.test('T12 收口'), true, '两位编号命中');
+  assert.equal(PLAN_REFERENCE_PATTERN.test('UTF-8 编码'), false, '词内 T+数字不误报（词边界）');
+  assert.equal(PLAN_REFERENCE_PATTERN.test('fmt2 模板'), false, '小写 t 不误报（大小写敏感）');
   assert.equal(PLAN_REFERENCE_PATTERN.test('M2 接入台账'), true);
   assert.equal(PLAN_REFERENCE_PATTERN.test('设计 §13 尾部半行截断'), false);
   assert.equal(PLAN_REFERENCE_PATTERN.test('端口 7321'), false);
