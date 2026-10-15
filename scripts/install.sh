@@ -13,9 +13,10 @@
 #   - 幂等：重复运行安全（重新拷贝、重装依赖、重新注册）。
 #   - --dry-run：只做只读检测并打印将执行的动作，不改动任何文件或系统设置。
 #   - 防火墙只打印指引、绝不自动修改。
-#   - 卸载：--uninstall（注销 MCP、删斜杠命令、删安装目录与可执行）；数据目录默认保留，
-#     加 --purge-data 才连数据目录一起删。「waystation uninstall」命令（驿站本体提供：
-#     注销注册 + 清理 + 数据可选保留）在默认布局下与之等价可选——已装驿站二选一即可；
+#   - 卸载：--uninstall（先停核心，再注销 MCP、删斜杠命令、删安装目录与可执行；核心拒绝
+#     停止时拒绝卸载并提示）；数据目录默认保留，加 --purge-data 才连数据目录一起删。
+#     「waystation uninstall」命令（驿站本体提供：停核 + 注销注册 + 清理 + 数据可选保留）
+#     在默认布局下与之等价可选——已装驿站二选一即可；
 #     自定义 WAYSTATION_HOME 时以该命令为准（本脚本不读该变量）。
 #   - macOS 暂不在支持范围（随公开发布补齐）。
 #
@@ -70,7 +71,7 @@ waystation 安装脚本（Linux）
 用法：
   bash scripts/install.sh                            安装（幂等，可重复运行）
   bash scripts/install.sh --dry-run                  预览：只做只读检测并打印将执行的动作
-  bash scripts/install.sh --uninstall                卸载（注销 MCP、删斜杠命令、删安装目录与可执行；保留数据目录）
+  bash scripts/install.sh --uninstall                卸载（先停核心，再注销 MCP、删斜杠命令、删安装目录与可执行；保留数据目录）
   bash scripts/install.sh --uninstall --purge-data   卸载并删除数据目录（含全部协作数据）
   bash scripts/install.sh --help                     显示本帮助
 
@@ -138,23 +139,19 @@ check_node() {
 }
 
 read_port_anchor() {
-  # 端口锚点与槽位数的唯一权威源是 src/site.js 的导出常量——实读以免脚本里的副本漂移；
-  # 读不到时退回内置默认值并在输出里明示（不改脚本行为，只影响打印的指引数字）
+  # 端口锚点的唯一权威源是 src/site.js 的导出常量——实读以免脚本里的副本漂移；读不到时退回
+  # 内置默认值并在输出里明示（不改脚本行为，只影响打印的指引数字）。单核口径：端口＝config.json
+  # 显式值或锚点、无槽位段（槽位已退役，脚本不再读 SLOT_COUNT）。
   local site_file="${REPO_ROOT}/src/site.js"
   local anchor=""
-  local slots=""
   if [ -f "$site_file" ]; then
     anchor="$(grep -oE 'export const ANCHOR_PORT = [0-9]+' "$site_file" 2>/dev/null | grep -oE '[0-9]+' | head -n 1 || true)"
-    slots="$(grep -oE 'export const SLOT_COUNT = [0-9]+' "$site_file" 2>/dev/null | grep -oE '[0-9]+' | head -n 1 || true)"
   fi
-  if [ -n "$anchor" ] && [ -n "$slots" ]; then
+  if [ -n "$anchor" ]; then
     ANCHOR_PORT="$anchor"
-    SLOT_COUNT="$slots"
   else
-    SLOT_COUNT=8
     ANCHOR_FALLBACK=1
   fi
-  SEGMENT_END=$((ANCHOR_PORT + SLOT_COUNT - 1))
 }
 
 probe_port() {
@@ -182,12 +179,13 @@ check_port() {
   [ -n "$TCP_STATE" ] || TCP_STATE="unknown"
   [ -n "$UDP_STATE" ] || UDP_STATE="unknown"
   if [ "$TCP_STATE" = "free" ] && [ "$UDP_STATE" = "free" ]; then
-    note "默认端口 ${ANCHOR_PORT}（TCP+UDP）：当前可绑（槽位 1 可用）"
+    note "锚点端口 ${ANCHOR_PORT}（TCP+UDP）：当前可绑（未显式配置端口时核心用此端口）"
   elif [ "$TCP_STATE" = "occupied" ] && [ "$UDP_STATE" = "occupied" ]; then
-    note "默认端口 ${ANCHOR_PORT}（TCP+UDP）：已被占用——若本机已有驿站会话在跑属正常；否则驿站启动时会按端口规程处理（占用者分类、降级指引）"
+    note "锚点端口 ${ANCHOR_PORT}（TCP+UDP）：已被占用——若本机核心在跑属正常；否则核心启动时会按端口规程处理（占用者分类：降级服务或等待接管）"
   else
-    note "默认端口 ${ANCHOR_PORT}：TCP=${TCP_STATE}、UDP=${UDP_STATE}——驿站启动时会按端口规程处理"
+    note "锚点端口 ${ANCHOR_PORT}：TCP=${TCP_STATE}、UDP=${UDP_STATE}——核心启动时会按端口规程处理"
   fi
+  note "单核端口口径：config.json 显式配置的 port 优先，未配时主根用锚点 ${ANCHOR_PORT}；无槽位段（显式多根须各自配端口）"
   if [ "$ANCHOR_FALLBACK" = 1 ]; then
     warn "未能从 src/site.js 读取端口锚点，以上按内置默认值（${ANCHOR_PORT}）打印"
   fi
@@ -413,26 +411,27 @@ show_firewall_guidance() {
     firewalld-active) note "检测到 firewalld 正在运行——请做等效放行：" ;;
     *) note "未检测到可判读的防火墙状态（ufw / firewalld 均不可判读）——请自行确认；放行参考如下：" ;;
   esac
-  note "驿站需要入站 TCP 与 UDP 同号端口（发现走 UDP、消息走 TCP），默认端口段 ${ANCHOR_PORT}–${SEGMENT_END}（${SLOT_COUNT} 个槽位）；显式改过端口的站点按实际端口放行。"
+  note "驿站需要入站 TCP 与 UDP 同号端口（发现走 UDP、消息走 TCP）——端口＝config.json 显式配置的 port，缺省为主根锚点 ${ANCHOR_PORT}（单核：无槽位段）；显式改过端口的站点按实际端口放行。"
   note "使用 ufw（Ubuntu/Debian 等）："
-  note "  sudo ufw allow ${ANCHOR_PORT}:${SEGMENT_END}/tcp"
-  note "  sudo ufw allow ${ANCHOR_PORT}:${SEGMENT_END}/udp"
+  note "  sudo ufw allow ${ANCHOR_PORT}/tcp"
+  note "  sudo ufw allow ${ANCHOR_PORT}/udp"
   note "使用 firewalld（示例）："
-  note "  sudo firewall-cmd --permanent --add-port=${ANCHOR_PORT}-${SEGMENT_END}/tcp"
-  note "  sudo firewall-cmd --permanent --add-port=${ANCHOR_PORT}-${SEGMENT_END}/udp && sudo firewall-cmd --reload"
+  note "  sudo firewall-cmd --permanent --add-port=${ANCHOR_PORT}/tcp"
+  note "  sudo firewall-cmd --permanent --add-port=${ANCHOR_PORT}/udp && sudo firewall-cmd --reload"
   note "nftables 等直配置场景请做等效放行。"
   note "出站方向默认放行即可，无需额外规则。"
 }
 
 show_session_checklist() {
   step "指引" "会话期首检清单（脚本期无法代验，需在 Claude Code 会话里做）"
-  note "1) 新开一个会话（会话启动时会拉起驿站进程）"
+  note "1) 新开一个会话（会话启动时拉起会话桥；驿站核心按需自动启动）"
   note "2) 查看 MCP 连接：会话里执行 /mcp，waystation 应显示已连接"
   note "3) 让 Claude 调用驿站工具：ws_status 应返回本站点状态；ws_list_hosts 应能扫到局域网在线站点；ws_list_collabs 应返回空清单（新装）——工具面共 19 项"
-  note "4) 同机多终端时端口自动落在槽位段 ${ANCHOR_PORT}–${SEGMENT_END}（首终端用 ${ANCHOR_PORT}）；跨机互扫端口段覆盖"
+  note "4) 单核：同机多终端共用一个核心（不再按终端分配端口/槽位）；跨机互扫用同一端口（缺省锚点 ${ANCHOR_PORT}）"
   note "5) 两台机器互扫可见后，再按设计验收场景走「建立协作」流程"
   note "6)（可选）状态栏「协作中」指示：把 ${APP_DIR}/scripts/statusline.js 配为 statusLine 命令（见 README 状态栏节）；进入协作后应显示「协作中：⋯」"
   note "7) 身份名默认为机器名：首个会话会提示一次；可用数据目录 config.json 的 identityName 自定义（下次会话生效）"
+  note "8) 升级（重跑本脚本覆盖安装）：升级后重开会话即自动换代（老核退场、新核启动）——推荐顺序「关全部旧会话 → 重装 → 重开」；升级期间避免新建会话 / 开观察窗（文件替换窗口）"
 }
 
 show_client_snippets() {
@@ -453,9 +452,53 @@ show_client_snippets() {
 
 # ---- 卸载 ------------------------------------------------------------------
 
+run_stop_entry() {
+  # stdin 接 /dev/null（不给「误把子命令当服务拉起」的入口留交互读流的机会）；有 timeout 就加 30s 上限
+  # （124＝超时，由调用方按失败处置——停核失败＝拒绝卸载，绝不假绿）。
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 30 node "$1" core stop </dev/null
+  else
+    node "$1" core stop </dev/null
+  fi
+}
+
+stop_core_for_uninstall() {
+  # 先停核心再删文件：残留 detached 核心会持有已删目录（与观察窗启动器残留同族）。
+  # 入口按「脚本自身树优先」解析（沿本文件 claude-commands / install-shims 调用的同一先例）：
+  # 安装副本可能是旧版、不理解 core 子命令——会把整套服务误拉起（交互下挂起；stdin EOF 下假成功，
+  # 恰是「旧驿站仍持有已删目录」的假绿）。停核判据全在 CLI 模块（src/core-cli.js，唯一权威）。
+  # 范围边界：只管单核形态的核心；升级窗口里旧版「每会话站点」进程不在本步骤内。
+  step "1/6" "停止核心"
+  if [ "$DRY_RUN" = 1 ]; then
+    note "将停止核心（若在运行）：node <脚本树入口> core stop（无核心时跳过；核心拒绝停止时将拒绝卸载）"
+    note "（范围＝单核形态；旧版「每会话站点」进程请先关闭旧会话）"
+    return 0
+  fi
+  if ! command -v node >/dev/null 2>&1; then
+    warn "未找到 node——跳过自动停止核心；若有核心在跑，请先手动执行 waystation core stop 后重跑本脚本"
+    return 0
+  fi
+  local entry="${REPO_ROOT}/bin/waystation.js"
+  [ -f "$entry" ] || entry="${APP_DIR}/bin/waystation.js"
+  if [ ! -f "$entry" ]; then
+    warn "找不到停核入口（${REPO_ROOT}/bin/waystation.js）；跳过自动停止核心"
+    return 0
+  fi
+  local output=""
+  local exit_code=0
+  output="$(run_stop_entry "$entry" 2>&1)" || exit_code=$?
+  note_lines "$output"
+  if [ "$exit_code" -eq 124 ]; then
+    fail "停核调用超时（30s 未返回）——核心可能仍在运行；请人工处理（waystation core stop --force）后重跑卸载"
+  fi
+  if [ "$exit_code" -ne 0 ]; then
+    fail "核心拒绝停止（原因见上）——请先处理（waystation core stop --force 可强制处理）后重跑卸载；未做任何改动"
+  fi
+}
+
 remove_claude_commands() {
   # 只删受管文件（标记判定在 src/claude-commands.js 模块内）；node 缺失或入口失败只提示手工删除，不中断卸载
-  step "2/5" "删除斜杠命令"
+  step "3/6" "删除斜杠命令"
   if ! command -v node >/dev/null 2>&1; then
     warn "未找到 node——跳过自动删除（不中断卸载）"
     note "手工删除：删除 ~/.claude/commands/ 下带 <!-- waystation-managed-command --> 标记的文件"
@@ -504,7 +547,9 @@ do_uninstall() {
   fi
   say "$title"
 
-  step "1/5" "注销 MCP 注册"
+  stop_core_for_uninstall
+
+  step "2/6" "注销 MCP 注册"
   if [ "$DRY_RUN" = 1 ]; then
     note "将执行：claude mcp remove -s user waystation（未注册时该命令报错，属预期；未安装 claude CLI 时改为提示手工步骤）"
   elif command -v claude >/dev/null 2>&1; then
@@ -519,7 +564,7 @@ do_uninstall() {
 
   remove_claude_commands
 
-  step "3/5" "删除可执行"
+  step "4/6" "删除可执行"
   if [ "$DRY_RUN" = 1 ]; then
     note "将删除：${SHIM_PATH}"
   elif [ -e "$SHIM_PATH" ]; then
@@ -530,7 +575,7 @@ do_uninstall() {
   fi
   remove_viewer_shims
 
-  step "4/5" "删除安装目录"
+  step "5/6" "删除安装目录"
   if [ "$DRY_RUN" = 1 ]; then
     note "将删除：${APP_DIR}"
   elif [ -d "$APP_DIR" ]; then
@@ -540,7 +585,7 @@ do_uninstall() {
     note "不存在，跳过：${APP_DIR}"
   fi
 
-  step "5/5" "数据目录"
+  step "6/6" "数据目录"
   if [ "$PURGE_DATA" = 1 ]; then
     # 数据目录位置由 HOME 派生、不接受参数覆盖——这才是防护的真正来源；本守卫只作纵深防御
     case "$DATA_DIR" in

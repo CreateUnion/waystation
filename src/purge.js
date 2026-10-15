@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path';
 import { COLLABS_DIR_NAME, CONFIG_FILE_NAME, SESSIONS_DIR_NAME, SITES_DIR_NAME, resolveDataDir } from './paths.js';
 import { INSTANCE_ID_FILE } from './instance-id.js';
 import { SLOT_COUNT } from './site.js';
+import { readCoreStatus, stopCore as defaultStopCore, stopOutcomeSettled } from './core-cli.js';
 
 /* `waystation purge-data` 子命令：清空数据目录下的一切协作数据，只保留身份与安装面。
  * 保留清单（默认布局与自定义 WAYSTATION_HOME 同一套算法）：config.json、instance-id、app/、
@@ -24,6 +25,7 @@ const USAGE_LINES = [
   '  waystation purge-data --yes  执行清理（保留身份与安装面，其余全部删除；不可恢复）',
   '',
   '（数据目录按 WAYSTATION_HOME 环境变量解析，默认 ~/.waystation；不接受参数覆盖。）',
+  '（执行前先停止本机核心；核心拒绝停止时拒绝清理。）',
 ];
 
 /* 保留清单的两个名字组：身份二件套与安装面都按名字判定，与条目类型无关（同名目录 / 链接也保留
@@ -83,9 +85,10 @@ export function looksLikeStationDataDir(resolved) {
 
 /**
  * @param {{ argv?: string[], env?: Record<string, string | undefined>, home?: string,
- *   platform?: NodeJS.Platform }} [options]
+ *   platform?: NodeJS.Platform,
+ *   stopCore?: (options: { env: Record<string, string | undefined>, allowForceOnWaiting: boolean }) => Promise<{ outcome: string, message: string }> }} [options]
  */
-export function runPurgeCli({ argv = [], env = process.env, home = homedir(), platform = process.platform } = {}) {
+export async function runPurgeCli({ argv = [], env = process.env, home = homedir(), platform = process.platform, stopCore = defaultStopCore } = {}) {
   guardBrokenPipe();
   const options = parsePurgeArgs(argv);
   const argExit = preflightArgs(options);
@@ -97,11 +100,39 @@ export function runPurgeCli({ argv = [], env = process.env, home = homedir(), pl
     write(checked.message);
     return checked.code;
   }
-  const plan = planPurgeOrRefuse(checked.dataDir, platform);
+  return runPurgePipeline(options, checked.dataDir, { env, platform, stopCore });
+}
+
+/* 守卫通过后的执行链：先停核心 → 算计划（读不出即整体拒绝）→ 预览或执行。 */
+async function runPurgePipeline(options, dataDir, { env, platform, stopCore }) {
+  const stopExit = await handleCoreFirst(options, { env, stopCore });
+  if (stopExit !== null) {
+    return stopExit;
+  }
+  const plan = planPurgeOrRefuse(dataDir, platform);
   if (plan === null) {
     return 1;
   }
   return previewOrApply(options, plan);
+}
+
+/* 先停核心：核心持有被删目录会让旧进程继续写/持句柄（卸载面已确立同族先例）。预览只做只读探测
+ * 与提示；执行先停核心、停不住即拒绝清理（等待核走清数据面的授权通道直接终止——它是零写驻留态）。 */
+async function handleCoreFirst(options, { env, stopCore }) {
+  if (!options.execute) {
+    const status = readCoreStatus({ env });
+    if (status.kind === 'healthy' || status.kind === 'zombie') {
+      write(`注意：检测到核心在运行（pid ${status.record.pid}）——执行时将先停止核心；核心拒绝停止时将拒绝清理。`);
+    }
+    return null;
+  }
+  const result = await stopCore({ env, allowForceOnWaiting: true });
+  write(`先停核心：${result.message}`);
+  if (stopOutcomeSettled(result.outcome)) {
+    return null;
+  }
+  write('拒绝清理：核心未能停止——请按上面的指引处理后重跑（未做任何改动）。');
+  return 1;
 }
 
 /* 参数前置：--help / 未知参数先于一切文件系统动作处理；返回退出码，null = 参数无误、继续。 */

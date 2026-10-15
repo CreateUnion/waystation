@@ -3,15 +3,15 @@
  * 全部副作用经参数注入（fetch / spawn / kill / sleep / exists / readFile / startServer），组合根
  * （scripts/ws-viewer.js 与 src/index.js）装配真实实现，单测注入桩。
  *
- * rootDigest 的唯一定义在 server.js（health 字段、端口自发现与停止匹配三处共用）；本模块只
- * 再导出，不复制实现，防止口径漂移。 */
+ * rootDigest 的唯一定义在中立模块 util/digest.js（health 字段、端口自发现、停止匹配与核心的
+ * IPC 端点命名共用同一函数）；本模块只再导出，不复制实现，防止口径漂移。 */
 
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join, win32 } from 'node:path';
 import { CONFIG_FILE_NAME } from '../paths.js';
 
-export { rootDigest } from './server.js';
+export { rootDigest } from '../util/digest.js';
 
 /* 默认端口段：基址 7330、顺序试探 10 个（设计 §4.2 裁定）——在站点槽位段 7321–7328 之外且
  * 留 7329 作缓冲、低于 Windows 动态端口区（49152 起）、避开常见开发端口。 */

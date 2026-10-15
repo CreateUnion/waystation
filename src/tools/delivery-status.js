@@ -1,3 +1,5 @@
+import { WS_DELIVERY_STATUS_SPEC } from './specs.js';
+
 const FILTER_PARAMS = ['msgId', 'collabId'];
 /* 系统内部回报帧（第三档回执）自身也经发送队列、同样出现在查询行集里：每条送达消息因此多出
  * 一行自身回报（约 14 天可见、量级≈消息数）。回报是系统内部往返、对发送侧无信息增量——
@@ -10,15 +12,7 @@ const REPORT_ROW_TYPE = 'delivery-status';
  * 「该标识下有这么多条记录」。 */
 export function deliveryStatusTool() {
   return {
-    name: 'ws_delivery_status',
-    description: '查询已发消息的投递状态（已排队 / 已到对方驿站 / 已投进对方会话——「已投进会话」不等于已被阅读）；讨论模式的帖不落持久队列，两路投递（经中继投稿、降级直投）共用同一档位面：投递中 / 已到对方驿站 / 已投进对方会话 / 未达（待对表收敛，note 字段说明）——中继路径下「已到对方驿站」= 投稿达中继（成员级结果由中继聚合捎回），「已排队」档不适用；系统内部回报条目不逐行列出（其条数见 reportRows）',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        msgId: { type: 'string', description: '按消息标识过滤（可选）' },
-        collabId: { type: 'string', description: '按协作过滤（可选）' },
-      },
-    },
+    ...WS_DELIVERY_STATUS_SPEC,
     handler: async (args, context) => {
       const invalid = FILTER_PARAMS.filter((name) => {
         const value = args[name];

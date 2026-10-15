@@ -18,8 +18,11 @@ const STDOUT_PATTERN = /console\.(?!(?:error|warn|trace|assert)\b)[A-Za-z_$][\w$
  * src/purge.js 是 purge-data 子命令的 CLI 模块，同型——stdout 是它的用户输出通道，
  * 仅由 bin 在 purge-data 分支动态导入，不参与服务路径。
  * src/install-shims.js 是观察窗启动器随安装分发的 CLI 模块，同型——stdout 是它的用户/脚本
- * 输出通道（安装脚本经进程调用逐行转发），只 import node 内置模块、不参与服务路径。 */
-const STDOUT_EXEMPT_FILES = ['src/uninstall.js', 'src/claude-commands.js', 'src/purge.js', 'src/install-shims.js'];
+ * 输出通道（安装脚本经进程调用逐行转发），只 import node 内置模块、不参与服务路径。
+ * src/core-cli.js 是 `waystation core status|stop` 子命令的 CLI 模块，同型——stdout 是它的用户
+ * 输出通道，仅由 bin 在 core 分支动态导入；它 import 核心侧模块（IPC 客户端/生命周期原语）但
+ * 不参与服务路径（index.js 不引用它）。 */
+const STDOUT_EXEMPT_FILES = ['src/uninstall.js', 'src/claude-commands.js', 'src/purge.js', 'src/install-shims.js', 'src/core-cli.js'];
 
 // 目录缺失时返回空列表：起步阶段 src/ 可能尚不存在属预期；终态由下方「扫描非空」断言兜底
 function listSourceFiles(relativeDir) {

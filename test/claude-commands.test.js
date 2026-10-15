@@ -75,6 +75,13 @@ test('ws-view 命令文：后台启动/启动验证/停止方法三要素齐备�
   assert.ok(text.includes('当前目录') && text.includes('仓库'), '必须写明回退仓库路径（「当前目录/仓库」字样为锚，防被上一行安装路径误满足）');
 });
 
+test('ws-purge 命令文：先停核心及其拒绝语义、复起路径齐备（防正文漂移）', () => {
+  const text = readFileSync(join(repoRoot, 'scripts', 'claude-commands', 'ws-purge.md'), 'utf8');
+  assert.ok(text.includes('先停止本机核心'), '必须写明执行时会先停核心（单核：核心持有被删目录）');
+  assert.ok(text.includes('拒绝清理'), '必须写明核心拒停时的拒绝语义（不得绕过）');
+  assert.ok(text.includes('自动拉起新核心'), '必须写明停核后会话下一次工具调用自动拉起新核心');
+});
+
 test('install：首次写入（含建目录），重跑覆盖幂等', (t) => {
   const home = makeTempDir(t);
   const sourceDir = makeSourceDir(t);

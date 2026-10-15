@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { COLLABS_DIR_NAME, LOGS_DIR_NAME, collabDir, collabFilePath, resolveDataDir, resolveLogDir, ensureDir, sessionFilePath, siteDataDir } from '../src/paths.js';
+import { COLLABS_DIR_NAME, LOGS_DIR_NAME, BINDINGS_FILE_NAME, CORE_JSON_FILE_NAME, RUN_DIR_NAME, bindingsFilePath, collabDir, collabFilePath, coreJsonPath, resolveDataDir, resolveLogDir, ensureDir, runDir, sessionFilePath, siteDataDir } from '../src/paths.js';
 import { makeTempDir } from './helpers.js';
 
 test('resolveDataDir：无环境变量时默认 ~/.waystation', () => {
@@ -83,4 +83,14 @@ test('sessionFilePath：非法会话标识抛出，合法拼接主数据目录 s
   assert.throws(() => sessionFilePath('/data', ''), /sessionId 非法/);
   assert.throws(() => sessionFilePath('/data', 42), /sessionId 非法/);
   assert.equal(sessionFilePath('/data', 'session-abc-1'), join('/data', 'sessions', 'session-abc-1.json'));
+});
+
+test('run/ 常量：运行态目录与核心锁/绑定表文件（设计 §2.3/§6.1）', (t) => {
+  const dir = makeTempDir(t);
+  assert.equal(RUN_DIR_NAME, 'run');
+  assert.equal(CORE_JSON_FILE_NAME, 'core.json');
+  assert.equal(BINDINGS_FILE_NAME, 'bindings.json');
+  assert.equal(runDir(dir), join(dir, 'run'));
+  assert.equal(coreJsonPath(dir), join(dir, 'run', 'core.json'));
+  assert.equal(bindingsFilePath(dir), join(dir, 'run', 'bindings.json'));
 });

@@ -45,6 +45,13 @@ test('bin/waystation.js：存在且带 node shebang', () => {
   assert.equal(firstLine, '#!/usr/bin/env node');
 });
 
+test('bin/waystation-core.js：核心入口存在且带 node shebang（随 bin/ 整目录分发）', () => {
+  const corePath = join(repoRoot, 'bin', 'waystation-core.js');
+  assert.equal(existsSync(corePath), true);
+  const firstLine = readFileSync(corePath, 'utf8').split('\n')[0];
+  assert.equal(firstLine, '#!/usr/bin/env node');
+});
+
 test('package.json：运行时依赖为 caret 钉版 semver 区间（发行复核）', () => {
   const pkg = readJson('package.json');
   assert.match(pkg.dependencies['@modelcontextprotocol/sdk'], /^\^\d+\.\d+\.\d+$/);

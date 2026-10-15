@@ -8,23 +8,50 @@ import { join, resolve } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { loadConfig } from '../src/config.js';
-import { makeTempDir, pickFreePort, repoRoot, waitFor } from './helpers.js';
+import { coreJsonPath } from '../src/paths.js';
+import { makeTempDir, pickFreePort, repoRoot, waitFor, waitForRebindable } from './helpers.js';
 
 const INDEX_ENTRY = join(repoRoot, 'src', 'index.js');
 const BIN_ENTRY = join(repoRoot, 'bin', 'waystation.js');
+const CORE_ENTRY = join(repoRoot, 'bin', 'waystation-core.js');
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-/* 站点进程收尾：node:test 的收尾钩子按注册序执行，而临时目录的删除钩子由 makeTempDir 在其调用点先行
- * 注册——「先关站点、后删目录」要求站点收尾钩子抢在删除钩子之前注册（与 collab-e2e.test.js 同一模式），
- * 否则删除会与存活站点的并发写盘（sessions/、known-hosts.json、日志）相撞在 Windows 下抛错；
- * 而钩子一旦抛错，其后所有钩子（含站点关闭）全部被跳过——泄漏的站点子进程拖住测试进程永不退出，
- * runner 会无限等待该文件（整轮运行冻结）。 */
+/* 站点收尾（单核形态）：node:test 的收尾钩子按注册序执行，而临时目录的删除钩子由 makeTempDir 在其
+ * 调用点先行注册——「先关桥、再收核、后删目录」要求本收尾钩子抢在删除钩子之前注册（与
+ * collab-e2e.test.js 同一模式），否则删除会与存活核心的并发写盘（sessions/、known-hosts.json、日志、
+ * 心跳）相撞在 Windows 下抛错；而钩子一旦抛错，其后所有钩子（含站点关闭）全部被跳过——泄漏的子进程
+ * 拖住测试进程永不退出，runner 会无限等待该文件（整轮运行冻结）。
+ * 收核必须晚于「桥进程退出」：桥仍存活时杀核会触发桥督视重生（孤儿核心）。 */
 const stationCleanupByTest = new WeakMap();
+
+function isProcessAlive(pid) {
+  if (pid === null) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/* 按 core.json 收核（桥已退场后用；无描述符/已退出＝核心已自行收尾，静默无事）。 */
+function killCoreOf(home) {
+  try {
+    const record = JSON.parse(readFileSync(coreJsonPath(home), 'utf8'));
+    if (Number.isInteger(record.pid) && isProcessAlive(record.pid)) {
+      process.kill(record.pid, 'SIGKILL');
+    }
+  } catch {
+    // 无描述符：核心已自行退出
+  }
+}
 
 function stationCleanupOf(t) {
   let cleanup = stationCleanupByTest.get(t);
   if (cleanup === undefined) {
-    cleanup = { clients: [] };
+    cleanup = { clients: [], pids: [], homes: [] };
     stationCleanupByTest.set(t, cleanup);
     t.after(async () => {
       for (const client of cleanup.clients) {
@@ -34,15 +61,30 @@ function stationCleanupOf(t) {
           // 用例中已显式关闭：忽略重复关闭
         }
       }
+      for (const pid of cleanup.pids) {
+        try {
+          await waitFor(() => !isProcessAlive(pid), { timeoutMs: 8000, intervalMs: 50 });
+        } catch {
+          // 桥未按预期退场：下方强杀兜底
+        }
+        if (isProcessAlive(pid)) {
+          process.kill(pid, 'SIGKILL');
+        }
+      }
+      for (const home of cleanup.homes) {
+        killCoreOf(home);
+      }
     });
   }
   return cleanup;
 }
 
-/* 站点数据目录：收尾钩子先于 makeTempDir 的删除钩子注册（见上）。 */
+/* 站点数据目录：收尾钩子先于 makeTempDir 的删除钩子注册（见上）；目录登记进本用例收尾（收核）。 */
 function makeStationHome(t) {
-  stationCleanupOf(t);
-  return makeTempDir(t);
+  const cleanup = stationCleanupOf(t);
+  const home = makeTempDir(t);
+  cleanup.homes.push(home);
+  return home;
 }
 
 /* 文件级兜底：任何收尾钩子被跳过（如钩子抛错）都会留下未关闭的站点进程——此处强制关闭并响亮失败，
@@ -75,6 +117,8 @@ after(async () => {
 
 // 用 SDK 官方 client 真实握手——能握手成功即同时证明 stdout 未被任何日志污染
 // viewerAutoOpen：起站夹具统一关闭自动开窗（测试不拉起真实观察窗；配置驱动、任何运行器下成立）
+// WAYSTATION_TEST_GRACE_MS：短宽限注入（NODE_TEST_CONTEXT 生效闸随 node --test 在场）——
+// 会话关后核心按短宽限退场，测试收尾不再等满 60s；收核仍按 core.json pid 显式执行。
 async function connectClient(t, entry, home, extraConfig = {}) {
   writeFileSync(
     join(home, 'config.json'),
@@ -84,12 +128,14 @@ async function connectClient(t, entry, home, extraConfig = {}) {
     command: process.execPath,
     args: [entry],
     cwd: repoRoot,
-    env: { ...process.env, WAYSTATION_HOME: home },
+    env: { ...process.env, WAYSTATION_HOME: home, WAYSTATION_TEST_GRACE_MS: '1500' },
   });
   const client = new Client({ name: 'waystation-m2-test', version: '0.0.0' });
+  const cleanup = stationCleanupOf(t);
   stationTransports.push(transport);
-  stationCleanupOf(t).clients.push(client);   // 纳管先于 connect：启动中途失败的站点也收尾
+  cleanup.clients.push(client);   // 纳管先于 connect：启动中途失败的站点也收尾
   await client.connect(transport);
+  cleanup.pids.push(transport.pid ?? null);
   return client;
 }
 
@@ -122,6 +168,21 @@ function waitProcessExit(child, timeoutMs) {
     child.once('exit', (code, signal) => {
       clearTimeout(timer);
       resolve({ code, signal });
+    });
+  });
+}
+
+// 真探针：连接尝试的结果（true＝端口仍被某进程监听）——与「进程存活」代理互补的直接证据
+function probeConnect(port) {
+  return new Promise((resolve) => {
+    const probe = connect({ host: '127.0.0.1', port });
+    probe.once('connect', () => {
+      probe.destroy();
+      resolve(true);
+    });
+    probe.once('error', () => {
+      probe.destroy();
+      resolve(false);
     });
   });
 }
@@ -211,8 +272,15 @@ test('stdio 骨架：进程可起、ws_status 可调、网络层就绪、数据�
   // 协作服务随组合根接线：状态块含协作计数（新装整机零协作）
   assert.deepEqual(status.collab.byState, {});
   assert.equal(status.collab.collabs, 0);
-  // WAYSTATION_HOME + 预写 port = 显式接管站点（站点块随状态输出，供多站点排障）
-  assert.deepEqual(status.site, { mode: 'explicit', slot: null, port, takeover: true });
+  // 单核形态（设计 §2.5）：site 恒 { mode:'single', slot:null, port, takeover:false }
+  assert.deepEqual(status.site, { mode: 'single', slot: null, port, takeover: false });
+  // 核心应答判据：载荷带 core 字段（桥合成的差错载荷只有 core.available:false，无 pid/app/endpoint）；
+  // core.pid 与 core.json 的真核心进程 pid 对证（不与载荷 pid 自比——同源同表达式恒真，无判别力）
+  const coreRecord = JSON.parse(readFileSync(coreJsonPath(home), 'utf8'));
+  assert.equal(status.core.pid, coreRecord.pid, 'core.pid 与核心真进程 pid 一致');
+  assert.equal(isProcessAlive(coreRecord.pid), true, '核心进程在场');
+  assert.equal(status.core.app, JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')).version, 'core.app 与安装树版本一致');
+  assert.equal(typeof status.core.endpoint, 'string');
   assert.equal(existsSync(join(home, 'config.json')), true);
   assert.equal(existsSync(join(home, 'instance-id')), true);
   assert.equal(existsSync(join(home, 'logs', 'waystation.log')), true);
@@ -244,19 +312,33 @@ test('bin 入口与 src/index.js 等价可用', { timeout: 30000 }, async (t) =>
   assert.equal(status.name, 'waystation');
 });
 
-test('数据目录不可写：启动自检拒绝服务（退出码 1 + stderr 明确报错 + stdout 零输出）', { timeout: 30000 }, (t) => {
+test('数据目录不可用：核心启动自检拒绝服务（退出码 1＋stderr 明确报错＋stdout 零输出）；桥侧工具即时报错（原因取 startupError）', { timeout: 30000 }, async (t) => {
   const home = makeStationHome(t);
-  const blocker = join(home, 'blocker.txt');
-  writeFileSync(blocker, 'not a directory\n');
-  const run = spawnSync(process.execPath, [INDEX_ENTRY], {
+  const port = await pickFreePort();
+  // 协作目录被文件占位 = 数据目录内容不可用（拒绝服务语义与既有「数据目录不可写」同面）；
+  // 端口显式配置：拒绝发生在自检步（而非「显式根未配端口」的前置拒绝）
+  writeFileSync(join(home, 'config.json'), JSON.stringify({ port, scanWindowMs: 300, dialTimeoutMs: 1500, viewerAutoOpen: false }));
+  writeFileSync(join(home, 'collabs'), 'not a directory\n');
+  const coreRun = spawnSync(process.execPath, [CORE_ENTRY], {
     cwd: repoRoot,
-    env: { ...process.env, WAYSTATION_HOME: join(blocker, 'nested') },
+    env: { ...process.env, WAYSTATION_HOME: home, WAYSTATION_TEST_GRACE_MS: '1500' },
     encoding: 'utf8',
     timeout: 20000,
   });
-  assert.equal(run.status, 1);
-  assert.ok(run.stderr.includes('拒绝服务'), `stderr 应含「拒绝服务」，实际：${run.stderr}`);
-  assert.equal(run.stdout, '');
+  assert.equal(coreRun.status, 1, `核心入口应拒绝服务退出 1；stderr：${coreRun.stderr}`);
+  assert.ok(coreRun.stderr.includes('拒绝服务'), `stderr 应含「拒绝服务」，实际：${coreRun.stderr}`);
+  assert.equal(coreRun.stdout, '');
+  // 桥全链：核心拒服 → 工具错误文案取 core.json.startupError（原因可得性：本例 run/ 可写，原因在场）
+  const client = await connectClient(t, INDEX_ENTRY, home, { port });
+  const called = await client.callTool({ name: 'ws_status', arguments: {} });
+  assert.equal(called.isError, true);
+  const payload = JSON.parse(called.content[0].text);
+  assert.deepEqual(Object.keys(payload), ['core', 'bridge']);
+  assert.equal(payload.core.available, false);
+  assert.ok(payload.core.reason.includes('协作目录不可用'), `reason 应取 startupError 原文，实际：${payload.core.reason}`);
+  const record = JSON.parse(readFileSync(coreJsonPath(home), 'utf8'));
+  assert.equal(typeof record.startupError, 'string');
+  assert.ok(record.startupError.includes('拒绝服务') || record.startupError.includes('协作目录不可用'));
 });
 
 test('ws_list_hosts：扫描可用、排除自答（自播自答不产生条目）', { timeout: 30000 }, async (t) => {
@@ -293,33 +375,48 @@ test('ws_delivery_status：无已发消息返回空行集', { timeout: 30000 }, 
   assert.deepEqual(JSON.parse(called.content[0].text), { ok: true, rows: [], reportRows: 0 });
 });
 
-test('端口占用一：显式端口被另一驿站站点占 → 降级、takeover-taken 文案、LAN 工具明确报错', { timeout: 40000 }, async (t) => {
+test('端口占用一：显式端口被另一驿站占 → ② 降级服务（ready＋net.degraded＋分类文案），LAN 工具明确报错', { timeout: 40000 }, async (t) => {
   const { port, clientA } = await startExplicitPortStation(t);
   assert.equal((await fetchStatus(clientA)).net.available, true);
-  const clientB = await connectClient(t, INDEX_ENTRY, makeStationHome(t), { port });
+  const homeB = makeStationHome(t);
+  const clientB = await connectClient(t, INDEX_ENTRY, homeB, { port });
   const statusB = await fetchStatus(clientB);
+  /* 降级服务态（设计 §6.1-②）：核心照常 ready（ws_status 由核心应答，core.pid 在场＝非等待接管态）；
+   * 单核形态 site 不退回 null，LAN 降级经 net 表达；分类文案落 core.json.statusDetail（T5 新语义）。 */
   assert.equal(statusB.net.available, false);
-  assert.equal(statusB.net.reason, 'takeover-taken');
-  assert.ok(statusB.net.message.includes('不自动改端口'));
+  assert.equal(statusB.net.reason, 'occupied-by-station');
+  /* degraded 由 net.available 同源推导（status.js）——此处固化「降级服务态带 degraded 标注」的契约在场 */
+  assert.equal('degraded' in statusB.core, true, '降级服务态：core 字段带 degraded 标注');
+  assert.equal(statusB.site.mode, 'single');
+  const record = JSON.parse(readFileSync(coreJsonPath(homeB), 'utf8'));
+  assert.equal(statusB.core.pid, record.pid, '降级服务＝核心照常应答（pid 与真进程一致）');
+  assert.equal(record.status, 'ready');
+  assert.ok(record.statusDetail.includes('本机另有驿站'), `statusDetail 应为别根占用分类文案，实际：${record.statusDetail}`);
+  assert.ok(record.statusDetail.includes('自动接管'), '指引含释放后自动接管');
   const listed = await clientB.callTool({ name: 'ws_list_hosts', arguments: {} });
   assert.equal(listed.isError, true);
-  assert.ok(listed.content[0].text.includes('不自动改端口'));
+  assert.ok(listed.content[0].text.includes(String(port)), 'LAN 工具错误文案含端口号');
   const probed = await clientB.callTool({ name: 'ws_ping', arguments: { address: '127.0.0.1', port } });
   assert.equal(probed.isError, true);
 });
 
-test('端口占用二：显式端口被无关程序占 → 同一降级结论（不区分占用者）', { timeout: 40000 }, async (t) => {
+test('端口占用二：显式端口被无关程序占 → ① 降级服务（分类文案指向无关程序），LAN 工具明确报错', { timeout: 40000 }, async (t) => {
   const home = makeStationHome(t);   // 站点收尾钩子先于占位收尾钩子注册：占位收尾抛错也不跳过站点关闭（钩子跳过语义）
   const port = await startPortOccupier(t);
   const client = await connectClient(t, INDEX_ENTRY, home, { port });
   const status = await fetchStatus(client);
   assert.equal(status.net.available, false);
-  assert.equal(status.net.reason, 'takeover-taken');
-  assert.ok(status.net.message.includes('不自动改端口'));
-  assert.ok(status.net.message.includes('config.json'));
+  assert.equal(status.net.reason, 'port-taken');
+  /* degraded 由 net.available 同源推导（status.js）——此处固化「降级服务态带 degraded 标注」的契约在场 */
+  assert.equal('degraded' in status.core, true, '降级服务态：core 字段带 degraded 标注');
+  assert.equal(status.site.mode, 'single');
+  const record = JSON.parse(readFileSync(coreJsonPath(home), 'utf8'));
+  assert.equal(status.core.pid, record.pid, '降级服务＝核心照常应答（pid 与真进程一致）');
+  assert.equal(record.status, 'ready');
+  assert.ok(record.statusDetail.includes('无关程序'), `statusDetail 应为无关程序分类文案，实际：${record.statusDetail}`);
   const listed = await client.callTool({ name: 'ws_list_hosts', arguments: {} });
   assert.equal(listed.isError, true);
-  assert.ok(listed.content[0].text.includes('不自动改端口'));
+  assert.ok(listed.content[0].text.includes(String(port)), 'LAN 工具错误文案含端口号');
   const probed = await client.callTool({ name: 'ws_ping', arguments: { address: '127.0.0.1', port } });
   assert.equal(probed.isError, true);
 });
@@ -347,7 +444,7 @@ test('ws_check_inbox：进程级读取收件流水（未投递消息的会话主
   assert.equal(bad.isError, true);
 });
 
-test('会话关闭（stdin 关闭）→ 进程退出（退出码 0）并释放 TCP/UDP 端口', { timeout: 30000 }, async (t) => {
+test('会话关闭（stdin 关闭）：桥退出码 0；核心按宽限窗退场后释放 TCP/UDP 端口（单核新语义）', { timeout: 40000 }, async (t) => {
   /* 裸子进程的收尾钩子同样必须抢在 makeTempDir 删除钩子前注册（否则删除钩子抛错会跳过它）；
    * 注册时 child 尚未创建，经引用回填 */
   let child = null;
@@ -358,11 +455,11 @@ test('会话关闭（stdin 关闭）→ 进程退出（退出码 0）并释放 T
   });
   const home = makeStationHome(t);
   const port = await pickFreePort();
-  // viewerAutoOpen: false——同起站夹具纪律（不拉起观察窗）
+  // viewerAutoOpen: false——同起站夹具纪律（不拉起观察窗）；短宽限注入使核心在可观察窗内退场
   writeFileSync(join(home, 'config.json'), JSON.stringify({ scanWindowMs: 300, dialTimeoutMs: 1500, port, viewerAutoOpen: false }));
   child = spawn(process.execPath, [INDEX_ENTRY], {
     cwd: repoRoot,
-    env: { ...process.env, WAYSTATION_HOME: home },
+    env: { ...process.env, WAYSTATION_HOME: home, WAYSTATION_TEST_GRACE_MS: '2000' },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   stationChildren.push(child);   // 文件级兜底纳管：收尾钩子被跳过时由文件末尾统一杀灭
@@ -373,9 +470,18 @@ test('会话关闭（stdin 关闭）→ 进程退出（退出码 0）并释放 T
   await waitPortListening(port);
   child.stdin.end();
   const exitResult = await waitProcessExit(child, 8000);
-  assert.notEqual(exitResult, null, `stdin 关闭后 8 秒进程未退出（疑似仍持端口 ${port}）；stderr：${stderr}`);
+  assert.notEqual(exitResult, null, `stdin 关闭后 8 秒桥进程未退出；stderr：${stderr}`);
   assert.equal(exitResult.code, 0);
   assert.equal(exitResult.signal, null);
+  /* 单核语义（设计 §3.2）：桥退场 ≠ 端口释放——核心仍在宽限窗内（描述符在场、进程存活）；
+   * 并以真探针断言端口此刻仍被监听（进程存活代理之外的直接证据） */
+  const record = JSON.parse(readFileSync(coreJsonPath(home), 'utf8'));
+  assert.equal(isProcessAlive(record.pid), true, '宽限窗内核心仍在（端口未释放）');
+  assert.equal(await probeConnect(port), true, '宽限窗内端口仍被监听（真探针）');
+  /* 宽限到期：核心有序收尾（退出码 0）并释放端口——真探针：连接应失败；TCP 帧通道 + UDP 发现
+   * 都能重新独占绑定 */
+  await waitForRebindable(port, { timeoutMs: 15000 });
+  assert.equal(await probeConnect(port), false, '释放后连接应被拒绝（真探针）');
   await assertPortRebindable(port);
 });
 

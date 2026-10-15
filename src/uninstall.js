@@ -6,8 +6,10 @@ import { MANAGED_MARKER, applyRemoveCommands, planRemoveCommands } from './claud
 import { removeShims } from './install-shims.js';
 import { looksLikeStationDataDir, purgePathRefusal } from './purge.js';
 import { resolveDataDir } from './paths.js';
+import { readCoreStatus, stopCore as defaultStopCore, stopOutcomeSettled } from './core-cli.js';
 
-/* `waystation uninstall` 子命令（设计「安装与配置」节的卸载命令形态）：注销 MCP 注册 →
+/* `waystation uninstall` 子命令（设计「安装与配置」节的卸载命令形态）：先停核心（有核心在跑且
+ * 拒停即拒绝卸载——否则残留 detached 核心持有已删目录，与观察窗启动器残留同族）→ 注销 MCP 注册 →
  * 移除随装的斜杠命令 → 删除可执行 shim → 尽力删除安装目录 → 数据目录默认保留（--purge-data 才删）。
  * **安装面与数据目录可能不同位**：两安装脚本恒把 app/shim 装到 <HOME>/.waystation 布局
  * （不读 WAYSTATION_HOME），数据目录则经 resolveDataDir 解析（尊重 WAYSTATION_HOME）——
@@ -21,7 +23,7 @@ import { resolveDataDir } from './paths.js';
 
 const USAGE_LINES = [
   '用法：',
-  '  waystation uninstall              卸载（注销 MCP 注册、移除斜杠命令、删可执行与安装目录；保留数据目录）',
+  '  waystation uninstall              卸载（先停核心，再注销 MCP 注册、移除斜杠命令、删可执行与安装目录；保留数据目录）',
   '  waystation uninstall --purge-data 连数据目录一起删除（含全部协作数据）',
   '  waystation uninstall --dry-run    预览：只打印将执行的动作，不改动任何文件与系统设置',
   '',
@@ -48,9 +50,10 @@ export function parseUninstallArgs(argv) {
 
 /**
  * @param {{ argv?: string[], env?: Record<string, string | undefined>, home?: string,
- *   runCommand?: (command: string, args: string[]) => { ok: boolean, code: number | null, output: string, missing: boolean } }} [options]
+ *   runCommand?: (command: string, args: string[]) => { ok: boolean, code: number | null, output: string, missing: boolean },
+ *   stopCore?: (options: { env: Record<string, string | undefined> }) => Promise<{ outcome: string, message: string }> }} [options]
  */
-export async function runUninstallCli({ argv = [], env = process.env, home = homedir(), runCommand = defaultRunCommand } = {}) {
+export async function runUninstallCli({ argv = [], env = process.env, home = homedir(), runCommand = defaultRunCommand, stopCore = defaultStopCore } = {}) {
   guardBrokenPipe();
   const parsed = parseUninstallArgs(argv);
   if (parsed.help) {
@@ -61,11 +64,20 @@ export async function runUninstallCli({ argv = [], env = process.env, home = hom
     write(`未知参数：${parsed.unknown.join('、')}\n${USAGE_LINES.join('\n')}\n`);
     return 1;
   }
+  return runUninstallSteps(parsed, { env, home, runCommand, stopCore });
+}
+
+/* 卸载步骤链（逐条打印进度与结果）：停核被拒即在此停手，其余步骤不执行。 */
+async function runUninstallSteps(parsed, { env, home, runCommand, stopCore }) {
   const dataDir = resolveDataDir(env);
   /* 安装面恒按 HOME 布局（两安装脚本都装到 <HOME>/.waystation，不读 WAYSTATION_HOME）——
    * 与数据目录可能不同位（WAYSTATION_HOME 显式场景）：app/shim 找安装布局、purge 走数据目录。 */
   const installDir = join(home, '.waystation');
   write(parsed.dryRun ? '=== waystation 卸载（dry-run：只打印，不改动）===' : '=== waystation 卸载 ===');
+  const refusal = await stopCoreStep(parsed, { env, stopCore });
+  if (refusal !== null) {
+    return refusal;
+  }
   removeRegistration(parsed, runCommand);
   removeCommands(parsed, home);
   removeExecutables(parsed, installDir, home);
@@ -73,8 +85,36 @@ export async function runUninstallCli({ argv = [], env = process.env, home = hom
   return handleDataDir(parsed, dataDir, home);
 }
 
+/* 步骤 1/6：先停核心（无核心跳过）。拒停即在上一步停手——删除安装目录会留下持有已删目录的
+ * detached 核心；dry-run 只做只读探测并把结果如实告知（执行时才真正停核心）。 */
+async function stopCoreStep(parsed, { env, stopCore }) {
+  write('1/6 停止核心');
+  if (parsed.dryRun) {
+    const status = readCoreStatus({ env });
+    if (status.kind === 'absent' || status.kind === 'stale') {
+      write('    当前无核心运行，将跳过（若执行时有核心在跑会先停止它）');
+    } else if (status.kind === 'unreadable') {
+      write('    运行描述符不可解析——执行时停核心将失败并据此拒绝卸载');
+    } else if (status.record.status === 'waiting') {
+      /* 等待核不监听 IPC，无授权时停核必被拒——预览即点明，免得用户执行时才撞上 */
+      write(`    检测到等待接管核（pid ${status.record.pid}，status=waiting）——执行时停核将被拒绝；请先运行 waystation core stop --force`);
+    } else {
+      write(`    检测到核心运行中（pid ${status.record.pid}）——执行时将先停止核心；核心拒绝停止时将拒绝卸载`);
+    }
+    write('    （范围＝单核形态的核心；升级窗口里旧版「每会话站点」进程请先关闭旧会话）');
+    return null;
+  }
+  const result = await stopCore({ env });
+  write(`    ${result.message}`);
+  if (stopOutcomeSettled(result.outcome)) {
+    return null;
+  }
+  write('    拒绝卸载：请先按上面的指引停止核心后重跑（waystation core stop --force 可强制处理）；未做任何改动');
+  return 1;
+}
+
 function removeRegistration(parsed, runCommand) {
-  write('1/5 注销 MCP 注册（claude mcp remove -s user waystation）');
+  write('2/6 注销 MCP 注册（claude mcp remove -s user waystation）');
   if (parsed.dryRun) {
     write('    将执行：claude mcp remove -s user waystation（未注册时该命令报错，属预期）');
     return;
@@ -95,7 +135,7 @@ function removeRegistration(parsed, runCommand) {
  * src/claude-commands.js 的单一权威），用户自放的同名/异名文件一律不动；目录读取异常不中断
  * 卸载，给手工指引后继续其余清理。 */
 function removeCommands(parsed, home) {
-  write('2/5 删除斜杠命令');
+  write('3/6 删除斜杠命令');
   try {
     const plan = planRemoveCommands({ home, dryRun: parsed.dryRun });
     if (!plan.dirExists) {
@@ -124,7 +164,7 @@ function removeCommands(parsed, home) {
 
 /* 两平台安装脚本的可执行放置点都在候选内：Windows shim 在 <HOME>/.waystation/bin 下、Linux shim 在家目录 .local/bin。 */
 function removeExecutables(parsed, installDir, home) {
-  write('3/5 删除可执行');
+  write('4/6 删除可执行');
   const shims = [join(installDir, 'bin', 'waystation.cmd'), join(home, '.local', 'bin', 'waystation')];
   for (const shim of shims) {
     if (parsed.dryRun) {
@@ -171,7 +211,7 @@ function removeViewerShims(parsed, home) {
 
 /* 删除自身安装目录：从安装副本内运行时可能被占用（如 Windows 文件锁）——失败给手动指引。 */
 function removeAppDir(parsed, appDir) {
-  write('4/5 删除安装目录');
+  write('5/6 删除安装目录');
   if (parsed.dryRun) {
     write(`    将删除：${appDir}`);
     return;
@@ -190,7 +230,7 @@ function removeAppDir(parsed, appDir) {
 }
 
 function handleDataDir(parsed, dataDir, home) {
-  write('5/5 数据目录');
+  write('6/6 数据目录');
   if (!parsed.purgeData) {
     write(`    按默认保留（含协作数据）：${dataDir}`);
     write('    如确认不再需要，加 --purge-data 重跑即可删除');

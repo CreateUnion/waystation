@@ -10,15 +10,16 @@
  * - 服务端唯一组装 HTML 的地方是 renderMarkdown 的产物；其余字段（作者名/kind/事件文本等）
  *   全部以纯文本 JSON 交付、由客户端 textContent 注入——不经 HTML 拼接就没有转义遗漏面。
  *
- * rootDigest 的规范化口径（path.resolve＋win32 大小写折叠后哈希）在本模块单一定义：health
- * 响应、组合根的端口自发现与 --stop 的根匹配共用同一函数，防止三处口径漂移。 */
+ * rootDigest 的唯一定义在中立模块 util/digest.js（health 响应、组合根的端口自发现、--stop 的
+ * 根匹配与核心的 IPC 端点命名共用同一函数）；本模块只再导出，不复制实现，防止口径漂移。 */
 
-import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { isIP } from 'node:net';
-import { resolve } from 'node:path';
 import { ID_PATTERN } from '../net/protocol.js';
+import { rootDigest } from '../util/digest.js';
 import { renderMarkdown } from './markdown.js';
+
+export { rootDigest };
 
 const APP_NAME = 'waystation-viewer';
 const HEALTH_VERSION = 1;
@@ -29,26 +30,12 @@ const AFTER_KEY = 'after';
 const JSON_CONTENT_TYPE = 'application/json; charset=utf-8';
 const SITE_ROOT_PATTERN = /^s\d+$/;
 const COLLAB_FACE_PATTERN = /^\/api\/collab\/([^/]+)\/([^/]+)\/(feed|meta)$/;
-/* 8 hex＝32 bit：摘要只作本机自发现的根标记（是否同根），不承担防碰撞职责。 */
-const ROOT_DIGEST_CHARS = 8;
 /* 资产路由表：路径 → 注入对象里的键与 Content-Type。 */
 const ASSET_ROUTES = new Map([
   ['/', { assetKey: 'INDEX_HTML', contentType: 'text/html; charset=utf-8' }],
   ['/app.js', { assetKey: 'APP_JS', contentType: 'text/javascript; charset=utf-8' }],
   ['/style.css', { assetKey: 'STYLE_CSS', contentType: 'text/css; charset=utf-8' }],
 ]);
-
-/**
- * 数据根的摘要（8 hex）：绝对化后按平台大小写折叠（Windows 路径大小写不敏感，同一目录的
- * 不同写法必须得同摘要——根匹配依赖它）再哈希。
- * @param {string} dataDir 数据根；相对路径按进程 cwd 解析
- * @returns {string}
- */
-export function rootDigest(dataDir) {
-  const absolute = resolve(dataDir);
-  const normalized = process.platform === 'win32' ? absolute.toLowerCase() : absolute;
-  return createHash('sha256').update(normalized, 'utf8').digest('hex').slice(0, ROOT_DIGEST_CHARS);
-}
 
 /* —— Host 头校验 —— */
 

@@ -11,6 +11,10 @@ import { writeJsonAtomic } from './storage.js';
  * 此处重导出只为保持既有导入点（status 工具与测试）不变——不要回迁定义。 */
 export { CONFIG_FILE_NAME };
 
+/* 抢接收集窗口的合法上界（具名导出＝单一权威）：核心侧工具执行安全期限按它派生
+ * （routing.js 的 CALL_SAFETY_DEADLINE_MS）——上界调整时两处同步由测试看护，不散写数字。 */
+export const MAX_TAKEOVER_WINDOW_MS = 600000;
+
 // 字段校验规则表：键与 buildDefaults 一一对应。类型校验挡住手改配置的笔误；
 // 数值范围取「能用」的边界（下界贴语义有效值、上界防荒唐值），具体语义上限在消费方表达
 const FIELD_RULES = {
@@ -41,7 +45,7 @@ const FIELD_RULES = {
   // 下界取「实用快节律」——测试与极小网络可用，防的是误配打爆探测定时器）
   managerProbeIntervalMs: { check: (value) => Number.isInteger(value) && value >= 100 && value <= 600000, reason: '需为 100–600000 的整数（毫秒）' },
   managerOfflineMs: { check: (value) => Number.isInteger(value) && value >= 200 && value <= 3600000, reason: '需为 200–3600000 的整数（毫秒）' },
-  takeoverWindowMs: { check: (value) => Number.isInteger(value) && value >= 200 && value <= 600000, reason: '需为 200–600000 的整数（毫秒）' },
+  takeoverWindowMs: { check: (value) => Number.isInteger(value) && value >= 200 && value <= MAX_TAKEOVER_WINDOW_MS, reason: `需为 200–${MAX_TAKEOVER_WINDOW_MS} 的整数（毫秒）` },
   // 冻结无裁定的单方处置提示时限（设计 §6 默认 48 小时）
   freezeUnresolvedMs: { check: (value) => Number.isInteger(value) && value >= 60000 && value <= 30 * DAY_MS, reason: '需为 60000–2592000000 的整数（毫秒，上限 30 天）' },
   // 讨论的周期对表节拍（设计 §5.4 anti-entropy 默认 60s 可配）

@@ -1,7 +1,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { MANAGED_MARKER } from '../src/claude-commands.js';
 import { defaultRunCommand, parseUninstallArgs, runUninstallCli } from '../src/uninstall.js';
@@ -83,6 +83,80 @@ test('默认命令执行器：真实进程映射（成功 / 非零退出 / 可�
   assert.equal(missing.missing, true, '可执行缺失映射为 missing（承载「未找到 claude CLI」UX 分支）');
 });
 
+test('先停核心（桩）：dry-run 只读探测不停核；拒停→拒绝卸载零改动；停稳→继续卸载', async (t) => {
+  const { home, installDir, dataDir, commandsDir } = makeInstalledHome(t);
+  const { runner } = recordingRunner();
+  let stopCalls = 0;
+  const stopNever = async () => {
+    stopCalls += 1;
+    return { outcome: 'stopped', message: '不应被调用' };
+  };
+  const dry = await runWithCapture(() => runUninstallCli({ argv: ['--dry-run'], env: { WAYSTATION_HOME: dataDir }, runCommand: runner, home, stopCore: stopNever }));
+  assert.equal(dry.code, 0, dry.output);
+  assert.equal(stopCalls, 0, 'dry-run 不得真正停核（零动作）');
+  assert.ok(dry.output.includes('1/6 停止核心'), dry.output);
+  assert.ok(dry.output.includes('当前无核心运行'), dry.output);
+
+  /* 拒停：拒绝卸载且停在最前——不得先动任何文件/注册（sequence 记动作次序）。 */
+  const sequence = [];
+  const refusing = async () => {
+    sequence.push('stop');
+    return { outcome: 'refused', message: '核心处于等待接管态（status=waiting，不监听 IPC）……' };
+  };
+  const orderedRunner = () => {
+    sequence.push('cmd');
+    return { ok: true, code: 0, output: '', missing: false };
+  };
+  const refused = await runWithCapture(() => runUninstallCli({ argv: [], env: { WAYSTATION_HOME: dataDir }, runCommand: orderedRunner, home, stopCore: refusing }));
+  assert.equal(refused.code, 1, refused.output);
+  assert.ok(refused.output.includes('拒绝卸载'), refused.output);
+  assert.ok(refused.output.includes('未做任何改动'), refused.output);
+  assert.deepEqual(sequence, ['stop'], '停核在最前、拒停即止：注销等动作不得先执行');
+  assert.equal(existsSync(join(installDir, 'app')), true, '拒停：安装目录原样');
+  assert.equal(existsSync(join(commandsDir, 'ws-list.md')), true, '拒停：受管命令原样');
+
+  const settled = async () => ({ outcome: 'stopped', message: '已停止核心（pid 1234，经 IPC 有序退出）' });
+  const ok = await runWithCapture(() => runUninstallCli({ argv: [], env: { WAYSTATION_HOME: dataDir }, runCommand: runner, home, stopCore: settled }));
+  assert.equal(ok.code, 0, ok.output);
+  assert.ok(ok.output.includes('已停止核心'), ok.output);
+  assert.equal(existsSync(join(installDir, 'app')), false, '停稳后照常卸载');
+});
+
+test('先停核心：dry-run 对「核心运行中 / 描述符不可解析」如实提示（只读）', async (t) => {
+  const { home, dataDir } = makeInstalledHome(t);
+  const { runner } = recordingRunner();
+  mkdirSync(join(dataDir, 'run'), { recursive: true });
+  writeFileSync(join(dataDir, 'run', 'core.json'), JSON.stringify({
+    v: 1,
+    ipcV: 1,
+    appVersion: '0.1.0',
+    pid: process.pid,
+    endpoint: 'test-endpoint',
+    token: 'test-token',
+    identity: null,
+    port: 19000,
+    startedAt: new Date().toISOString(),
+    status: 'ready',
+    startupDeadline: new Date(Date.now() + 15000).toISOString(),
+    heartbeatAt: new Date().toISOString(),
+  }));
+  const running = await runWithCapture(() => runUninstallCli({ argv: ['--dry-run'], env: { WAYSTATION_HOME: dataDir }, runCommand: runner, home }));
+  assert.equal(running.code, 0, running.output);
+  assert.ok(running.output.includes(`检测到核心运行中（pid ${process.pid}）`), running.output);
+  assert.ok(running.output.includes('每会话站点'), '范围边界应点明：旧版每会话站点进程不在本步骤内');
+  /* 等待核：无授权时停核必被拒——预览即点明并给 --force 指引。 */
+  const waitingRecord = JSON.parse(readFileSync(join(dataDir, 'run', 'core.json'), 'utf8'));
+  waitingRecord.status = 'waiting';
+  writeFileSync(join(dataDir, 'run', 'core.json'), JSON.stringify(waitingRecord));
+  const waiting = await runWithCapture(() => runUninstallCli({ argv: ['--dry-run'], env: { WAYSTATION_HOME: dataDir }, runCommand: runner, home }));
+  assert.equal(waiting.code, 0, waiting.output);
+  assert.ok(waiting.output.includes('等待接管核') && waiting.output.includes('core stop --force'), waiting.output);
+  writeFileSync(join(dataDir, 'run', 'core.json'), '{broken\n');
+  const broken = await runWithCapture(() => runUninstallCli({ argv: ['--dry-run'], env: { WAYSTATION_HOME: dataDir }, runCommand: runner, home }));
+  assert.equal(broken.code, 0, broken.output);
+  assert.ok(broken.output.includes('运行描述符不可解析'), broken.output);
+});
+
 test('dry-run：只打印、不执行命令、不删任何文件', async (t) => {
   const { home, installDir, dataDir, commandsDir } = makeInstalledHome(t);
   const { calls, runner } = recordingRunner();
@@ -109,7 +183,7 @@ test('真实路径：注销注册、删两平台 shim 与安装目录、数据�
   assert.equal(code, 0);
   assert.deepEqual(calls, ['claude mcp remove -s user waystation']);
   assert.ok(output.includes('已注销：waystation'));
-  assert.ok(output.includes('2/5 删除斜杠命令'));
+  assert.ok(output.includes('3/6 删除斜杠命令'));
   assert.ok(output.includes(`已删除：${join(installDir, 'bin', 'ws-view.cmd')}`), '观察窗启动器删除应逐文件留痕');
   assert.equal(existsSync(join(commandsDir, 'ws-list.md')), false, '受管斜杠命令随卸载删除');
   assert.equal(existsSync(join(commandsDir, 'note.md')), true, '无标记文件一律不动');

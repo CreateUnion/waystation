@@ -1,4 +1,5 @@
 import { CHECK_INBOX_DEFAULT_LIMIT, CHECK_INBOX_MAX_LIMIT } from '../net/inbound.js';
+import { WS_CHECK_INBOX_SPEC } from './specs.js';
 
 /* ws_check_inbox：会话主动查（设计 §4 的降级路径）——读取某协作的收件流水窗口
  * （「已到对方驿站」但可能未投进本会话的消息从这里取）。
@@ -6,16 +7,7 @@ import { CHECK_INBOX_DEFAULT_LIMIT, CHECK_INBOX_MAX_LIMIT } from '../net/inbound
  * collabId 必填：避免跨协作全量列举；协作标识以驿站台账/工具面为准。 */
 export function checkInboxTool() {
   return {
-    name: 'ws_check_inbox',
-    description: `读取某协作的收件流水（按保留期窗口）：返回最近的消息（含已投递与未投递；默认 ${CHECK_INBOX_DEFAULT_LIMIT} 条、上限 ${CHECK_INBOX_MAX_LIMIT} 条，以 limit 参数为准）`,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        collabId: { type: 'string', description: '协作标识（必填）' },
-        limit: { type: 'integer', description: `返回最近条数（可选，默认 ${CHECK_INBOX_DEFAULT_LIMIT}，上限 ${CHECK_INBOX_MAX_LIMIT}）` },
-      },
-      required: ['collabId'],
-    },
+    ...WS_CHECK_INBOX_SPEC,
     handler: async (args, context) => {
       const collabId = typeof args.collabId === 'string' ? args.collabId.trim() : '';
       if (collabId === '') {

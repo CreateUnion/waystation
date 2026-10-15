@@ -9,7 +9,7 @@ const repoRoot = fileURLToPath(new URL('..', import.meta.url));
 /* 开发过程编号不得进代码注释（CS-08）：溯源属于 commit 与文档，注释只讲「为什么」。
  * 技术文档出处（设计章节 / ADR / TRM 章节）是「为什么」的证据，不在拦截范围。
  * 只扫 src/ 与 bin/（同 stdout 纪律扫描口径）：测试夹具会刻意构造违规样本串。 */
-const PLAN_REFERENCE_PATTERN = /批次\s*\d|WP-\d+|\bG\d+\b|T\d+\s*M-\d+|\bM[1-9]\b/;
+const PLAN_REFERENCE_PATTERN = /批次\s*\d|WP-\d+|\bG\d+\b|\bT\d+\b|\bM[1-9]\b/;
 
 // 目录缺失返回空列表：起步阶段 src/ 可能尚不存在属预期；终态由下方「扫描非空」断言兜底
 function listSourceFiles(relativeDir) {

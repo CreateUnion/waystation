@@ -85,3 +85,21 @@ export function sessionFilePath(mainDataDir, sessionId) {
   }
   return join(mainDataDir, SESSIONS_DIR_NAME, `${sessionId}.json`);
 }
+
+/* 运行态目录（设计 §2.3/§6.1）：核心锁＋运行描述符＋凭据（core.json）、IPC 端点与绑定表（bindings.json）
+ * 的宿主。与业务数据分离——核心的等待接管态「数据面零写」只豁免 run/ 自身。 */
+export const RUN_DIR_NAME = 'run';
+export const CORE_JSON_FILE_NAME = 'core.json';
+export const BINDINGS_FILE_NAME = 'bindings.json';
+
+export function runDir(root) {
+  return join(root, RUN_DIR_NAME);
+}
+
+export function coreJsonPath(root) {
+  return join(root, RUN_DIR_NAME, CORE_JSON_FILE_NAME);
+}
+
+export function bindingsFilePath(root) {
+  return join(root, RUN_DIR_NAME, BINDINGS_FILE_NAME);
+}

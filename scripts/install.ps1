@@ -15,9 +15,10 @@
       - 幂等：重复运行安全（重新拷贝、重装依赖、重新注册）。
       - -DryRun：只做只读检测并打印将执行的动作，不改动任何文件或系统设置。
       - 防火墙只打印指引、绝不自动修改。
-      - 卸载：-Uninstall（注销 MCP、删斜杠命令、删安装目录与可执行）；数据目录默认保留，
-        加 -PurgeData 才连数据目录一起删。「waystation uninstall」命令（驿站本体提供：
-        注销注册 + 清理 + 数据可选保留）在默认布局下与之等价可选——已装驿站二选一即可；
+      - 卸载：-Uninstall（先停核心，再注销 MCP、删斜杠命令、删安装目录与可执行；核心拒绝
+        停止时拒绝卸载并提示）；数据目录默认保留，加 -PurgeData 才连数据目录一起删。
+        「waystation uninstall」命令（驿站本体提供：停核 + 注销注册 + 清理 + 数据可选保留）
+        在默认布局下与之等价可选——已装驿站二选一即可；
         自定义 WAYSTATION_HOME 时以该命令为准（本脚本不读该变量）。
 
 .PARAMETER DryRun
@@ -62,8 +63,6 @@ $ShimPath = Join-Path $BinDir 'waystation.cmd'
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 
 $script:AnchorPort = 7321    # Read-PortAnchor 会从源码实读覆盖；此处兜底值仅为变量初始化
-$script:SlotCount = 8
-$script:SegmentEnd = 7328
 $script:AnchorFallback = $false
 $script:McpState = 'pending'
 $script:McpCommandArgs = @()
@@ -154,26 +153,20 @@ function Assert-Node {
 }
 
 function Read-PortAnchor {
-    # 端口锚点与槽位数的唯一权威源是 src/site.js 的导出常量——实读以免脚本里的副本漂移；
-    # 读不到时退回内置默认值并在输出里明示（只影响打印的指引数字，不改脚本行为）
+    # 端口锚点的唯一权威源是 src/site.js 的导出常量——实读以免脚本里的副本漂移；读不到时退回内置
+    # 默认值并在输出里明示（只影响打印的指引数字，不改脚本行为）。单核口径：端口＝config.json 显式值
+    # 或锚点、无槽位段（槽位已退役，脚本不再读 SLOT_COUNT）。
     $siteFile = Join-Path $RepoRoot 'src\site.js'
     $text = ''
     if (Test-Path $siteFile) {
         $text = Get-Content -Raw -Encoding UTF8 -Path $siteFile
     }
     $anchor = [regex]::Match($text, 'export const ANCHOR_PORT = (\d+)')
-    $slots = [regex]::Match($text, 'export const SLOT_COUNT = (\d+)')
     if ($anchor.Success) {
         $script:AnchorPort = [int]$anchor.Groups[1].Value
     } else {
         $script:AnchorFallback = $true
     }
-    if ($slots.Success) {
-        $script:SlotCount = [int]$slots.Groups[1].Value
-    } else {
-        $script:AnchorFallback = $true
-    }
-    $script:SegmentEnd = $script:AnchorPort + $script:SlotCount - 1
 }
 
 function Get-PortState([int]$Port) {
@@ -199,16 +192,17 @@ function Get-PortState([int]$Port) {
 function Test-PortAvailability {
     $state = Get-PortState -Port $script:AnchorPort
     if ($state.TcpFree -and $state.UdpFree) {
-        Write-Note "默认端口 $($script:AnchorPort)（TCP+UDP）：当前可绑（槽位 1 可用）"
+        Write-Note "锚点端口 $($script:AnchorPort)（TCP+UDP）：当前可绑（未显式配置端口时核心用此端口）"
     } elseif (-not $state.TcpFree -and -not $state.UdpFree) {
-        Write-Note "默认端口 $($script:AnchorPort)（TCP+UDP）：已被占用——若本机已有驿站会话在跑属正常；否则驿站启动时会按端口规程处理（占用者分类、降级指引）"
+        Write-Note "锚点端口 $($script:AnchorPort)（TCP+UDP）：已被占用——若本机核心在跑属正常；否则核心启动时会按端口规程处理（占用者分类：降级服务或等待接管）"
     } else {
         $tcpText = '可绑'
         if (-not $state.TcpFree) { $tcpText = '被占用' }
         $udpText = '可绑'
         if (-not $state.UdpFree) { $udpText = '被占用' }
-        Write-Note "默认端口 $($script:AnchorPort)：TCP=$tcpText、UDP=$udpText——驿站启动时会按端口规程处理"
+        Write-Note "锚点端口 $($script:AnchorPort)：TCP=$tcpText、UDP=$udpText——核心启动时会按端口规程处理"
     }
+    Write-Note "单核端口口径：config.json 显式配置的 port 优先，未配时主根用锚点 $($script:AnchorPort)；无槽位段（显式多根须各自配端口）"
     if ($script:AnchorFallback) {
         Write-Warn "未能从 src/site.js 读取端口锚点，以上按内置默认值（$($script:AnchorPort)）打印"
     }
@@ -455,21 +449,22 @@ function Show-FirewallGuidance {
     } else {
         Write-Warn '无法读取防火墙状态（无 NetSecurity 模块或权限不足），请自行检查；放行规则参考如下：'
     }
-    Write-Note "  New-NetFirewallRule -DisplayName 'waystation LAN (TCP)' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $($script:AnchorPort)-$($script:SegmentEnd) -Profile Any"
-    Write-Note "  New-NetFirewallRule -DisplayName 'waystation LAN (UDP)' -Direction Inbound -Action Allow -Protocol UDP -LocalPort $($script:AnchorPort)-$($script:SegmentEnd) -Profile Any"
-    Write-Note "端口段 = 默认端口起的 $($script:SlotCount) 个槽位；显式改过端口的站点按实际端口放行；-Profile 可按需收窄（如 Private）。"
+    Write-Note "  New-NetFirewallRule -DisplayName 'waystation LAN (TCP)' -Direction Inbound -Action Allow -Protocol TCP -LocalPort $($script:AnchorPort) -Profile Any"
+    Write-Note "  New-NetFirewallRule -DisplayName 'waystation LAN (UDP)' -Direction Inbound -Action Allow -Protocol UDP -LocalPort $($script:AnchorPort) -Profile Any"
+    Write-Note "端口＝config.json 显式配置的 port，缺省为主根锚点 $($script:AnchorPort)（单核：无槽位段）；显式改过端口的站点按实际端口放行；-Profile 可按需收窄（如 Private）。"
     Write-Note '注：Windows 防火墙开启场景的规则形态尚未实测验收——若放行后仍互扫/投递不通，请回报。'
 }
 
 function Show-SessionChecklist {
     Write-Step '指引' '会话期首检清单（脚本期无法代验，需在 Claude Code 会话里做）'
-    Write-Note '1) 新开一个会话（会话启动时会拉起驿站进程）'
+    Write-Note '1) 新开一个会话（会话启动时拉起会话桥；驿站核心按需自动启动）'
     Write-Note '2) 查看 MCP 连接：会话里执行 /mcp，waystation 应显示已连接'
     Write-Note '3) 让 Claude 调用驿站工具：ws_status 应返回本站点状态；ws_list_hosts 应能扫到局域网在线站点；ws_list_collabs 应返回空清单（新装）——工具面共 19 项'
-    Write-Note "4) 同机多终端时端口自动落在槽位段 $($script:AnchorPort)-$($script:SegmentEnd)（首终端用 $($script:AnchorPort)）；跨机互扫端口段覆盖"
+    Write-Note "4) 单核：同机多终端共用一个核心（不再按终端分配端口/槽位）；跨机互扫用同一端口（缺省锚点 $($script:AnchorPort)）"
     Write-Note '5) 两台机器互扫可见后，再按设计验收场景走「建立协作」流程'
     Write-Note "6)（可选）状态栏「协作中」指示：把 $AppDir\scripts\statusline.js 配为 statusLine 命令（见 README 状态栏节）；进入协作后应显示「协作中：⋯」"
     Write-Note '7) 身份名默认为机器名：首个会话会提示一次；可用数据目录 config.json 的 identityName 自定义（下次会话生效）'
+    Write-Note '8) 升级（重跑本脚本覆盖安装）：升级后重开会话即自动换代（老核退场、新核启动）——推荐顺序「关全部旧会话 → 重装 → 重开」；升级期间避免新建会话 / 开观察窗（文件替换窗口）'
 }
 
 function Show-ClientSnippets {
@@ -525,6 +520,75 @@ function Remove-ViewerShims {
     }
 }
 
+function Resolve-StopEntry {
+    # 停核入口按「脚本自身树优先」解析（沿本脚本 claude-commands / install-shims 调用的同一先例）：
+    # 安装副本可能是旧版、不理解 core 子命令——会把整套服务误拉起（交互下挂起；stdin EOF 下假成功，
+    # 恰是「旧驿站仍持有已删目录」的假绿）。两处都找不到时返回空串（调用方按跳过＋告警处置）。
+    $repoEntry = Join-Path $RepoRoot 'bin\waystation.js'
+    if (Test-Path $repoEntry) {
+        return $repoEntry
+    }
+    $appEntry = Join-Path $AppDir 'bin\waystation.js'
+    if (Test-Path $appEntry) {
+        return $appEntry
+    }
+    return ''
+}
+
+function Invoke-StopCoreEntry([string]$Entry) {
+    # 经 .NET Process 调用：stdin 立即关闭（＝ sh 臂的 </dev/null，不给误拉服务的入口留交互读流）；
+    # 30s 未退即强杀并按失败处置——停核失败＝拒绝卸载，绝不假绿。
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = 'node'
+    $info.Arguments = "`"$Entry`" core stop"
+    $info.UseShellExecute = $false
+    $info.RedirectStandardInput = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $proc = [System.Diagnostics.Process]::Start($info)
+    $proc.StandardInput.Close()
+    $timedOut = -not $proc.WaitForExit(30000)
+    if ($timedOut) {
+        $proc.Kill()
+        $proc.WaitForExit()
+    }
+    $text = $proc.StandardOutput.ReadToEnd() + $proc.StandardError.ReadToEnd()
+    $lines = @($text -split "`r?`n" | Where-Object { $_ -ne '' })
+    return [pscustomobject]@{ ExitCode = $proc.ExitCode; TimedOut = $timedOut; Output = $lines }
+}
+
+function Stop-CoreForUninstall {
+    # 先停核心再删文件：残留 detached 核心会持有已删目录（与观察窗启动器残留同族）。
+    # 停核判据全在 CLI 模块（src/core-cli.js，唯一权威）——本步骤只调入口并按退出码决定去留；
+    # node 缺失时无法停核（核心也是 node 进程，无 node 时先人工处理）。
+    # 范围边界：只管单核形态的核心；升级窗口里旧版「每会话站点」进程不在本步骤内。
+    Write-Step '1/6' '停止核心'
+    if ($DryRun) {
+        Write-Note '将停止核心（若在运行）：node <脚本树入口> core stop（无核心时跳过；核心拒绝停止时将拒绝卸载）'
+        Write-Note '（范围＝单核形态；旧版「每会话站点」进程请先关闭旧会话）'
+        return
+    }
+    if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+        Write-Warn '未找到 node——跳过自动停止核心；若有核心在跑，请先手动执行 waystation core stop 后重跑本脚本'
+        return
+    }
+    $entry = Resolve-StopEntry
+    if ($entry -eq '') {
+        Write-Warn "找不到停核入口（$(Join-Path $RepoRoot 'bin\waystation.js')）；跳过自动停止核心"
+        return
+    }
+    $stopRun = Invoke-StopCoreEntry -Entry $entry
+    foreach ($line in $stopRun.Output) {
+        Write-Note "$line"
+    }
+    if ($stopRun.TimedOut) {
+        Fail '停核调用超时（30s 未返回）——核心可能仍在运行；请人工处理（waystation core stop --force）后重跑卸载'
+    }
+    if ($stopRun.ExitCode -ne 0) {
+        Fail '核心拒绝停止（原因见上）——请先处理（waystation core stop --force 可强制处理）后重跑卸载；未做任何改动'
+    }
+}
+
 function Invoke-Uninstall {
     if ($DryRun) {
         Write-Say '=== waystation 卸载（dry-run：只打印，不改动）==='
@@ -532,7 +596,9 @@ function Invoke-Uninstall {
         Write-Say '=== waystation 卸载 ==='
     }
 
-    Write-Step '1/5' '注销 MCP 注册'
+    Stop-CoreForUninstall
+
+    Write-Step '2/6' '注销 MCP 注册'
     if ($DryRun) {
         Write-Note '将执行：claude mcp remove -s user waystation（未注册时该命令报错，属预期；未安装 claude CLI 时改为提示手工步骤）'
     } elseif (Get-Command claude -ErrorAction SilentlyContinue) {
@@ -547,7 +613,7 @@ function Invoke-Uninstall {
     }
 
     # 只删受管文件（标记判定在 src/claude-commands.js 模块内）；node 缺失或入口失败只提示手工删除，不中断卸载
-    Write-Step '2/5' '删除斜杠命令'
+    Write-Step '3/6' '删除斜杠命令'
     if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
         Write-Warn '未找到 node——跳过自动删除（不中断卸载）'
         Write-Note '手工删除：删除 ~\.claude\commands\ 下带 <!-- waystation-managed-command --> 标记的文件'
@@ -567,7 +633,7 @@ function Invoke-Uninstall {
         }
     }
 
-    Write-Step '3/5' '删除可执行'
+    Write-Step '4/6' '删除可执行'
     if ($DryRun) {
         Write-Note "将删除：$ShimPath"
     } elseif (Test-Path $ShimPath) {
@@ -578,7 +644,7 @@ function Invoke-Uninstall {
     }
     Remove-ViewerShims
 
-    Write-Step '4/5' '删除安装目录'
+    Write-Step '5/6' '删除安装目录'
     if ($DryRun) {
         Write-Note "将删除：$AppDir"
     } elseif (Test-Path $AppDir) {
@@ -588,7 +654,7 @@ function Invoke-Uninstall {
         Write-Note "不存在，跳过：$AppDir"
     }
 
-    Write-Step '5/5' '数据目录'
+    Write-Step '6/6' '数据目录'
     if ($PurgeData) {
         # 数据目录位置由 HOME 派生、不接受参数覆盖——这才是防护的真正来源；本守卫只作纵深防御
         if ((Split-Path -Leaf $DataDir) -ne '.waystation') {

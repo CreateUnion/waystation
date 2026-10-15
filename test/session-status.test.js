@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createSessionStatusWriter, isIndicatedCollab } from '../src/session-status.js';
-import { sessionFilePath } from '../src/paths.js';
+import { coreJsonPath, sessionFilePath } from '../src/paths.js';
 import { makeTempDir, pickFreePort, repoRoot, waitFor } from './helpers.js';
 
 function quietLog() {
@@ -169,28 +169,56 @@ test('写入失败：sessions 路径被同名文件占位 → 计数告警、不
   writer.close();
 });
 
-/* 站点子进程收尾：node:test 的收尾钩子按注册序执行，而临时目录的删除钩子由 makeTempDir 在其调用点
- * 先行注册——「先杀站点进程、后删目录」要求收尾钩子抢在删除钩子之前注册（与 server.test.js 同一
- * 模式），否则删除撞上存活站点的写盘抛错会跳过其后全部钩子（含杀进程）——泄漏的站点拖住文件进程
- * 永不退出，runner 无限等待该文件（整轮运行冻结）。 */
-const childrenByTest = new WeakMap();
-const stationChildren = [];   // 文件级兜底：本文件启动过的全部站点进程
+/* 站点收尾（单核形态）：node:test 的收尾钩子按注册序执行，而临时目录的删除钩子由 makeTempDir 在其
+ * 调用点先行注册——「先杀桥进程、再收核、后删目录」要求收尾钩子抢在删除钩子之前注册（与
+ * server.test.js 同一模式），否则删除撞上存活核心的写盘抛错会跳过其后全部钩子（含杀进程）——
+ * 泄漏的子进程拖住文件进程永不退出，runner 无限等待该文件（整轮运行冻结）。
+ * 收核晚于桥退出：桥存活时杀核会触发桥督视重生（孤儿核心）。 */
+const cleanupByTest = new WeakMap();
+const stationChildren = [];   // 文件级兜底：本文件启动过的全部站点（桥）进程
+
+function isProcessAlive(pid) {
+  if (pid === null) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/* 按 core.json 收核（桥已退场后用；无描述符/已退出＝核心已自行收尾，静默无事）。 */
+function killCoreOf(home) {
+  try {
+    const record = JSON.parse(readFileSync(coreJsonPath(home), 'utf8'));
+    if (Number.isInteger(record.pid) && isProcessAlive(record.pid)) {
+      process.kill(record.pid, 'SIGKILL');
+    }
+  } catch {
+    // 无描述符：核心已自行退出
+  }
+}
 
 function cleanupRegistryOf(t) {
-  let children = childrenByTest.get(t);
-  if (children === undefined) {
-    children = [];
-    childrenByTest.set(t, children);
+  let cleanup = cleanupByTest.get(t);
+  if (cleanup === undefined) {
+    cleanup = { children: [], homes: [] };
+    cleanupByTest.set(t, cleanup);
     t.after(async () => {
-      for (const child of children) {
+      for (const child of cleanup.children) {
         await stopChild(child);
+      }
+      for (const home of cleanup.homes) {
+        killCoreOf(home);
       }
     });
   }
-  return children;
+  return cleanup;
 }
 
-/* 强杀并等 exit 落地（会话状态文件随进程收尾清除）；已退出的进程无操作。 */
+/* 强杀并等 exit 落地；已退出的进程无操作。 */
 async function stopChild(child) {
   if (child.exitCode !== null || child.signalCode !== null) {
     return;
@@ -200,15 +228,17 @@ async function stopChild(child) {
   await exited;
 }
 
-/* 站点数据目录：收尾钩子先于 makeTempDir 的删除钩子注册（见上）。 */
+/* 站点数据目录：收尾钩子先于 makeTempDir 的删除钩子注册（见上）；目录登记进本用例收尾（收核）。 */
 function makeStationDir(t) {
-  cleanupRegistryOf(t);
-  return makeTempDir(t);
+  const cleanup = cleanupRegistryOf(t);
+  const dir = makeTempDir(t);
+  cleanup.homes.push(dir);
+  return dir;
 }
 
 /* 新起的站点进程登记进用例清单与文件清单（用例收尾强杀；文件末兜底查漏）。 */
 function registerChild(t, child) {
-  cleanupRegistryOf(t).push(child);
+  cleanupRegistryOf(t).children.push(child);
   stationChildren.push(child);
 }
 
@@ -247,17 +277,38 @@ function writeMemberFixture(home, { collabId, name, mode }) {
   writeFileSync(join(home, 'collabs', collabId, 'member.json'), JSON.stringify(record));
 }
 
-test('进程级：讨论参与随模式标签进入会话状态文件（缺 mode 的旧记录按 managed 解释）', { timeout: 30000 }, async (t) => {
+/* 绑定表磁盘夹具（单核写面按绑定归属过滤会话文件的 collabs：绑定源＝run/bindings.json）。
+ * entries＝[collabId, sessionId] 对：归属可跨会话（负例＝绑到别的会话）。 */
+function writeBindingsFixture(home, entries) {
+  const now = new Date().toISOString();
+  const bindings = Object.fromEntries(entries.map(([collabId, sessionId], index) => [collabId, {
+    sessionId,
+    bridgeId: `bridge-fixture-${index + 1}`,
+    boundAt: now,
+    origin: 'join',
+  }]));
+  mkdirSync(join(home, 'run'), { recursive: true });
+  writeFileSync(join(home, 'run', 'bindings.json'), JSON.stringify(bindings));
+}
+
+test('进程级：讨论参与随模式标签进入会话状态文件（缺 mode 的旧记录按 managed 解释；单核写面按绑定归属）', { timeout: 30000 }, async (t) => {
   const home = makeStationDir(t);
   const port = await pickFreePort();
   // viewerAutoOpen: false——起站夹具不拉起真实观察窗（配置驱动的主保障）
   writeFileSync(join(home, 'config.json'), JSON.stringify({ port, scanWindowMs: 300, dialTimeoutMs: 1500, viewerAutoOpen: false }));
   writeMemberFixture(home, { collabId: 'collab-forum-fx', name: '联调讨论', mode: 'forum' });
   writeMemberFixture(home, { collabId: 'collab-legacy-fx', name: '联调项目' });
+  /* 负例：第三条协作在册（成员文件在场）但绑定归属另一会话——不得进入本会话文件 */
+  writeMemberFixture(home, { collabId: 'collab-other-fx', name: '别会话项目' });
   const sessionId = 'session-forum-fx';
+  writeBindingsFixture(home, [
+    ['collab-forum-fx', sessionId],
+    ['collab-legacy-fx', sessionId],
+    ['collab-other-fx', 'session-other-fx'],
+  ]);
   const child = spawn(process.execPath, [join(repoRoot, 'src', 'index.js')], {
     cwd: repoRoot,
-    env: { ...process.env, WAYSTATION_HOME: home, CLAUDE_CODE_SESSION_ID: sessionId },
+    env: { ...process.env, WAYSTATION_HOME: home, CLAUDE_CODE_SESSION_ID: sessionId, WAYSTATION_TEST_GRACE_MS: '1500' },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   registerChild(t, child);
@@ -265,6 +316,8 @@ test('进程级：讨论参与随模式标签进入会话状态文件（缺 mode
   await waitFor(() => (existsSync(file) ? true : null), { timeoutMs: 15000 });
   const payload = JSON.parse(readFileSync(file, 'utf8'));
   const byId = Object.fromEntries(payload.collabs.map((entry) => [entry.collabId, entry]));
+  assert.equal(payload.collabs.length, 2, '绑定归属本会话的两条协作进入文件（per-session 过滤）');
+  assert.equal(byId['collab-other-fx'], undefined, '绑到别会话的协作被过滤（负例）');
   assert.equal(byId['collab-forum-fx'].mode, 'forum', '讨论条目带模式标签');
   assert.equal(byId['collab-forum-fx'].state, 'proposed');
   /* 讨论的成员数 = 折叠成员表（成员事件并集折叠）——夹具只有名单、没有成员事件 → 0 人。 */
@@ -281,7 +334,7 @@ test('进程级：讨论参与随模式标签进入会话状态文件（缺 mode
   assert.equal(exit, 0);
 });
 
-test('进程级：会话标识经环境注入 → 文件出现且字段正确；stdin 关闭 → 进程退出并清除文件', { timeout: 30000 }, async (t) => {
+test('进程级：会话标识经环境注入 → 核心为注册桥写文件（字段正确）；stdin 关闭 → 桥退出 0 且核心删文件', { timeout: 30000 }, async (t) => {
   const home = makeStationDir(t);
   const port = await pickFreePort();
   // viewerAutoOpen: false——同起站夹具纪律
@@ -289,7 +342,7 @@ test('进程级：会话标识经环境注入 → 文件出现且字段正确；
   const sessionId = 'session-process-1';
   const child = spawn(process.execPath, [join(repoRoot, 'src', 'index.js')], {
     cwd: repoRoot,
-    env: { ...process.env, WAYSTATION_HOME: home, CLAUDE_CODE_SESSION_ID: sessionId },
+    env: { ...process.env, WAYSTATION_HOME: home, CLAUDE_CODE_SESSION_ID: sessionId, WAYSTATION_TEST_GRACE_MS: '1500' },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   registerChild(t, child);
@@ -299,6 +352,8 @@ test('进程级：会话标识经环境注入 → 文件出现且字段正确；
   assert.equal(payload.sessionId, sessionId);
   assert.equal(payload.port, port);
   assert.deepEqual(payload.collabs, []);
+  assert.equal(payload.site.mode, 'single', '核心写面的站点形态恒 single');
+  assert.notEqual(payload.pid, child.pid, '文件由核心写（桥不写数据根）');
   child.stdin.end();
   const exit = await new Promise((resolve) => {
     const timer = setTimeout(() => resolve(null), 15000);
@@ -308,5 +363,7 @@ test('进程级：会话标识经环境注入 → 文件出现且字段正确；
     });
   });
   assert.deepEqual(exit, { code: 0, signal: null });
-  assert.equal(existsSync(file), false, '会话关闭即离线：状态文件随进程收尾清除');
+  /* 桥断开 = 会话关闭：核心删除该会话状态文件（写面在核心，删除随断开通知——等待时序） */
+  await waitFor(() => (existsSync(file) ? null : true), { timeoutMs: 10000 });
+  assert.equal(existsSync(file), false, '桥断开后由核心清除会话状态文件（会话关闭即离线）');
 });

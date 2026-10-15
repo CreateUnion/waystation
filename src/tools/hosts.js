@@ -1,12 +1,12 @@
+import { WS_LIST_HOSTS_SPEC } from './specs.js';
+
 /* ws_list_hosts：扫描局域网在线驿站（广播段扫 + 已知主机单播兜底，窗口收应答）。
  * 清单按实例标识去重合并：身份名 + 端点（「地址:端口」）。端点而非裸地址是回信寻址的依据——
  * 多站点下端口按站点独立，只报地址无法定位到对端驿站。
  * 返回口径：成功载荷顶层恒含 ok:true（19 工具统一约定，见 tools/collab.js）。 */
 export function hostsTool() {
   return {
-    name: 'ws_list_hosts',
-    description: '扫描局域网中在线的驿站（广播段扫 + 单播兜底）：列出身份名、地址:端口与当前参与协作数',
-    inputSchema: { type: 'object', properties: {} },
+    ...WS_LIST_HOSTS_SPEC,
     handler: async (_args, context) => {
       const listed = await context.net.listHosts();
       if (!listed.ok) {

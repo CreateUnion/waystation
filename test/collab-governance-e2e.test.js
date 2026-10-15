@@ -2,13 +2,48 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
-import { existsSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { coreJsonPath } from '../src/paths.js';
 import { makeTempDir, pickFreePort, repoRoot, waitFor, waitForRebindable } from './helpers.js';
 
 const INDEX_ENTRY = join(repoRoot, 'src', 'index.js');
+
+/* 会话标识：同数据根稳定（重开站点＝原会话重连，绑定恢复活跃）；不同数据根互异。 */
+const sessionIdsByHome = new Map();
+
+function sessionIdFor(home) {
+  if (!sessionIdsByHome.has(home)) {
+    sessionIdsByHome.set(home, `session-gov-${sessionIdsByHome.size + 1}`);
+  }
+  return sessionIdsByHome.get(home);
+}
+
+function isProcessAlive(pid) {
+  if (pid === null) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/* 按 core.json 收核（桥已退场后用；无描述符/已退出＝核心已自行收尾，静默无事）。 */
+function killCoreOf(home) {
+  try {
+    const record = JSON.parse(readFileSync(coreJsonPath(home), 'utf8'));
+    if (Number.isInteger(record.pid) && isProcessAlive(record.pid)) {
+      process.kill(record.pid, 'SIGKILL');
+    }
+  } catch {
+    // 无描述符：核心已自行退出
+  }
+}
 
 /* 治理验收预演（真实组合根 × 2 + 假会话收件箱）：交接 / 抢接与握手降级 / 离线拒绝，
  * 走 ws_* 工具面全链——本机近似（真双机归 M7）。
@@ -29,30 +64,45 @@ async function startFakeSessionInbox(t) {
   return { path, token: `tok-${randomUUID()}`, receivedText: () => Buffer.concat(chunks).toString('utf8') };
 }
 
-/* 站点进程的统一收尾：先关客户端并等站点退出、后删目录（钩子注册序先于 makeTempDir，见 collab-e2e 注）。 */
+/* 站点收尾（单核形态）：先关桥并等桥退场、再收核、后删目录（钩子注册序先于 makeTempDir，见 collab-e2e 注）；
+ * 收核晚于桥退出：桥存活时杀核会触发桥督视重生（孤儿核心）。 */
 const clientsByTest = new WeakMap();
 
 function cleanupRegistryOf(t) {
-  let clients = clientsByTest.get(t);
-  if (clients === undefined) {
-    clients = [];
-    clientsByTest.set(t, clients);
+  let cleanup = clientsByTest.get(t);
+  if (cleanup === undefined) {
+    cleanup = { clients: [], pids: [], dirs: [] };
+    clientsByTest.set(t, cleanup);
     t.after(async () => {
-      for (const client of clients) {
+      for (const client of cleanup.clients) {
         try {
           await client.close();
         } catch {
           // 用例中已显式关闭：忽略重复关闭
         }
       }
+      for (const pid of cleanup.pids) {
+        try {
+          await waitFor(() => !isProcessAlive(pid), { timeoutMs: 8000, intervalMs: 50 });
+        } catch {
+          // 桥未按预期退场：下方强杀兜底
+        }
+        if (isProcessAlive(pid)) {
+          process.kill(pid, 'SIGKILL');
+        }
+      }
+      for (const dir of cleanup.dirs) {
+        killCoreOf(dir);
+      }
     });
   }
-  return clients;
+  return cleanup;
 }
 
 function makeStationDir(t) {
-  cleanupRegistryOf(t);
+  const cleanup = cleanupRegistryOf(t);
   const dir = makeTempDir(t);
+  cleanup.dirs.push(dir);
   stationDirs.push(dir);
   return dir;
 }
@@ -111,12 +161,21 @@ async function startStation(t, { home, inbox }) {
     command: process.execPath,
     args: [INDEX_ENTRY],
     cwd: repoRoot,
-    env: { ...process.env, WAYSTATION_HOME: home, CLAUDE_CODE_MESSAGING_SOCKET: inbox.path, CLAUDE_CODE_MESSAGING_TOKEN: inbox.token },
+    env: {
+      ...process.env,
+      WAYSTATION_HOME: home,
+      CLAUDE_CODE_SESSION_ID: sessionIdFor(home),
+      CLAUDE_CODE_MESSAGING_SOCKET: inbox.path,
+      CLAUDE_CODE_MESSAGING_TOKEN: inbox.token,
+      WAYSTATION_TEST_GRACE_MS: '1200',
+    },
   });
   stationTransports.push(transport);   // 文件级兜底纳管：收尾钩子被跳过时由文件末尾统一关闭
+  const cleanup = cleanupRegistryOf(t);
   const client = new Client({ name: 'waystation-m5-e2e', version: '0.0.0' });
-  cleanupRegistryOf(t).push(client);
+  cleanup.clients.push(client);
   await client.connect(transport);
+  cleanup.pids.push(transport.pid ?? null);
   return client;
 }
 

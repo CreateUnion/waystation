@@ -206,7 +206,9 @@ function forumInvitePayloadOf(state, local, topic, targets) {
  * 属放行链的触发面，不因静音被抑制。
  * 本地元数据不全（主题 / 发起人标识未知）的实例仍提示、但**不代发残缺应答**（沿邀请侧
  * 「不代发残缺帧」先例）：提示照发（放行路径不依赖应答内容），应答跳过并计数留痕——
- * 由申请人稍后重敲或待对表补齐后再答。 */
+ * 由申请人稍后重敲或待对表补齐后再答。
+ * 应答前件（单核路由面）：提示须有接收者（该协作的绑定会话活跃）——无接收者不回 join-ack，
+ * 提示照常经路由面按「丢弃＋留痕」处置（见 notifyLocal 返回值契约）。 */
 export function handleJoinKnock(state, knock) {
   const replies = [];
   for (const local of state.collabs.values()) {
@@ -214,7 +216,12 @@ export function handleJoinKnock(state, knock) {
       continue;
     }
     state.counters.joinKnockMatches++;
-    notifyLocal(state, local, joinKnockNoticeText(knock, localNameOf(local)));
+    /* 应答判据＝该协作的绑定会话是否活跃（经提示面的路由结论表达）：无接收者不回 join-ack——
+     * 如实表达无人值守，避免对端得到「有人应答但无人放行」的悬置态；休眠期丢弃由路由面留痕。 */
+    if (notifyLocal(state, local, joinKnockNoticeText(knock, localNameOf(local))) === false) {
+      state.log.warn('敲门命中但该协作无活跃绑定会话——不回应答（无人值守）', { collabId: local.collabId });
+      continue;
+    }
     const reply = joinKnockReplyOf(state, local);
     if (reply === null) {
       state.counters.joinKnockAckSkipped++;
@@ -624,7 +631,7 @@ function submitToRelay(state, local, relay, endpoint, post) {
   return { instanceId: relay.instanceId, ok: sent.ok === true, msgId: sent.msgId, reason: sent.reason };
 }
 
-/* 降级直投一帖（设计 §5.2「当场降级=对全成员直投」，复用 T2 直投通道）：帖已落本机列表，
+/* 降级直投一帖（设计 §5.2「当场降级=对全成员直投」，复用既有直投通道）：帖已落本机列表，
  * 直投对端点已知成员逐份发出；未达者由对表收敛。两态可观测：降级帖计数 + 结果逐目标标注。 */
 function degradedRoute(state, local, post, reason) {
   state.counters.relayDegradedPosts++;
@@ -1462,13 +1469,16 @@ export function sendMergeOffer(state, local, managerPeer, baseVersion) {
 }
 
 /* 本机提示（会话注入面；不经出站队列、不上网络）：notify 注入缺失或投递失败只计数与日志。
- * 帧形态为 notice + event:'local-alert'——该事件不入协议表（外发不存在；伪造入站被协议拒收）。 */
+ * 帧形态为 notice + event:'local-alert'——该事件不入协议表（外发不存在；伪造入站被协议拒收）。
+ * 返回值契约（join-ack 判据的通道，单核路由面消费）：false = 提示无接收者（路由面明示
+ * 「绑定会话不活跃 / 无绑定 / 调用者桥不在线」）；其余（true / undefined / 旧式注入面返回值）
+ * = 按已投出处理——旧注入面（如既有的 deliverFrame）零改动，只有显式 false 才是否决信号。 */
 export function notifyLocal(state, local, text) {
   if (typeof state.notify !== 'function') {
-    return;
+    return undefined;
   }
   try {
-    state.notify({
+    const routed = state.notify({
       v: PROTOCOL_VERSION,
       type: 'notice',
       msgId: newMsgId(),
@@ -1477,10 +1487,15 @@ export function notifyLocal(state, local, text) {
       ts: new Date().toISOString(),
       payload: { event: 'local-alert', text },
     });
+    if (routed === false) {
+      return false;
+    }
     state.counters.notificationsSent++;
+    return true;
   } catch (error) {
     state.counters.notificationsDropped++;
     state.log.warn('本机提示投递失败（已忽略）', { collabId: local.collabId, reason: error.message });
+    return false;
   }
 }
 
