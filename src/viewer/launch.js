@@ -1,6 +1,6 @@
-/* 观察窗启动链的纯函数层：端口探针与归属判定、Edge 定位与开窗命令计划、停止（--stop）、
- * 自动开窗——站点根映射、spawn 计划构造、开关现读、触发时拉起与启动判定。
- * 全部副作用经参数注入（fetch / spawn / kill / sleep / exists / readFile），组合根
+/* 观察窗启动链的纯函数层：端口探针与归属判定、启动协商（同根预扫＋顺序 bind）、Edge 定位与开窗
+ * 命令计划、停止（--stop）、自动开窗——站点根映射、spawn 计划构造、开关现读、触发时拉起与启动判定。
+ * 全部副作用经参数注入（fetch / spawn / kill / sleep / exists / readFile / startServer），组合根
  * （scripts/ws-viewer.js 与 src/index.js）装配真实实现，单测注入桩。
  *
  * rootDigest 的唯一定义在 server.js（health 字段、端口自发现与停止匹配三处共用）；本模块只
@@ -150,16 +150,21 @@ async function waitForPortRelease({ port, probe, sleep }) {
   return false;
 }
 
-/* 按端口序找出同根实例（多实例只取首个）：探测命中且同根后复探一次确认同 pid——缩 pid 复用
- * 窗口，复探不一致（或已消失）即视作换了进程、跳过继续扫。 */
-async function findSameRootViewer({ candidatePorts, digest, probe }) {
+/**
+ * 按端口序找出**首个**同根实例（「在跑」判定与停止循环共用；停全部由调用方循环收敛）：探测命中
+ * 且同根后复探一次确认同 pid——缩 pid 复用窗口，复探不一致、已消失或缺 pid（无从确认同一进程）
+ * 即视作换过了、跳过继续扫。
+ * @param {{ candidatePorts: number[], digest: string, probe?: (options: { port: number }) => Promise<{ root?: string, pid?: number } | null> }} options
+ * @returns {Promise<{ port: number, pid: number } | null>}
+ */
+export async function findSameRootViewer({ candidatePorts, digest, probe = probeViewer }) {
   for (const port of candidatePorts) {
     const health = await probe({ port });
     if (health === null || health.root !== digest) {
       continue;
     }
     const confirmed = await probe({ port });
-    if (confirmed === null || confirmed.pid !== health.pid) {
+    if (confirmed === null || confirmed.pid === undefined || confirmed.pid !== health.pid) {
       continue;
     }
     return { port, pid: confirmed.pid };
@@ -167,27 +172,80 @@ async function findSameRootViewer({ candidatePorts, digest, probe }) {
   return null;
 }
 
+/* —— 启动协商（手动启动路径：先段级同根预扫、后 bind 兜底） —— */
+
 /**
- * 停止运行中的观察窗：找到首个同根实例→kill→复验端口释放。
- * 别根/他人跳过；全无命中＝{stopped:false}；kill 抛错或释放复验失败＝{stopped:false, reason}
- * （调用方按失败上报）。
+ * 启动协商：先做段级同根预扫（快路径），未命中才走顺序 bind；bind 的 EADDRINUSE 归属判定保留
+ * 为竞态兜底。
+ *
+ * 预扫要解决什么：设计（安静默认设计 §3.2）承诺「同根观察窗服务已跑→只开窗」，只看 bind 结果
+ * 做不到——同根实例可能已在段内更高位运行（其启动时低位被占、顺序 bind 顺延过），低位腾空后的
+ * 新调用直接 bind 成功，就会起出第二个同根服务。
+ *
+ * 两层的边界：预扫命中即判 running、不再 bind（没有「探到空闲→稍后绑定」的竞态面）；预扫未命中
+ * 不等于端口空闲——候选端口归谁仍以 bind 结果为准（bind 成功即起服务；EADDRINUSE 再探 health
+ * 判定归属），承接预扫到 bind 之间状态变化的窗口。
+ *
+ * 代价：启动多出每候选一次 health 探测——本地回环上空闲端口的连接拒绝即时返回，常见场景只是
+ * 几次即时的探针；只有被「受理却不应答」的进程占着的候选才会耗到探测超时。
+ * @param {{ candidatePorts: number[], explicitPort: boolean, digest: string, probe?: (options: { port: number }) => Promise<{ root?: string, pid?: number } | null>, startServer: (port: number) => Promise<{ port: number, close: () => Promise<void> }> }} options
+ * @returns {Promise<{ kind: 'started', server: { port: number, close: () => Promise<void> } } | { kind: 'running', port: number } | { kind: 'failed', reason: string }>}
+ */
+export async function negotiateViewerPort({ candidatePorts, explicitPort, digest, probe = probeViewer, startServer }) {
+  const running = await findSameRootViewer({ candidatePorts, digest, probe });
+  if (running !== null) {
+    return { kind: 'running', port: running.port };
+  }
+  for (const port of candidatePorts) {
+    try {
+      const server = await startServer(port);
+      return { kind: 'started', server };
+    } catch (error) {
+      if (error.code !== 'EADDRINUSE') {
+        return { kind: 'failed', reason: `监听端口 ${port} 失败：${error.message}` };
+      }
+    }
+    if (await classifyBusyPort({ port, digest, probe }) === 'ours') {
+      return { kind: 'running', port };
+    }
+    if (explicitPort) {
+      return { kind: 'failed', reason: `端口 ${port} 属于另一数据根的观察窗或他人进程` };
+    }
+  }
+  return { kind: 'failed', reason: `端口段 ${DEFAULT_VIEWER_PORT}–${DEFAULT_VIEWER_PORT + PORT_TRIES - 1} 全部被占用，无法启动观察窗` };
+}
+
+/**
+ * 停止运行中的观察窗（停全部同根）：循环「找首个同根实例→kill→复验端口释放」直至段内无同根
+ * 命中；同根实例不多于候选端口数，轮数上限取候选数（防「kill 后同根立刻再现」类异常下死循环）。
+ * 别根/他人跳过；成功＝{stopped:true, ports, pids}（按停止顺序成对）；全无命中＝{stopped:false}；
+ * kill 抛错或释放复验失败＝{stopped:false, reason}（此前停掉的不回滚，失败如实上报）。
  * @param {{ candidatePorts: number[], digest: string, probe?: (options: { port: number }) => Promise<{ root: string, pid: number } | null>, kill?: (pid: number) => void, sleep?: (ms: number) => Promise<void> }} options
- * @returns {Promise<{ stopped: boolean, port?: number, pid?: number, reason?: string }>}
+ * @returns {Promise<{ stopped: true, ports: number[], pids: number[] } | { stopped: false, port?: number, pid?: number, reason?: string }>}
  */
 export async function stopViewer({ candidatePorts, digest, probe = probeViewer, kill = process.kill, sleep = delay }) {
-  const target = await findSameRootViewer({ candidatePorts, digest, probe });
-  if (target === null) {
+  const ports = [];
+  const pids = [];
+  for (let round = 0; round < candidatePorts.length; round++) {
+    const target = await findSameRootViewer({ candidatePorts, digest, probe });
+    if (target === null) {
+      break;
+    }
+    try {
+      kill(target.pid);
+    } catch (error) {
+      return { stopped: false, reason: `终止进程 ${target.pid} 失败：${error.message}` };
+    }
+    if (!(await waitForPortRelease({ port: target.port, probe, sleep }))) {
+      return { stopped: false, port: target.port, pid: target.pid, reason: `进程 ${target.pid} 已终止但端口 ${target.port} 在 ${STOP_RELEASE_WAIT_MS}ms 内未释放` };
+    }
+    ports.push(target.port);
+    pids.push(target.pid);
+  }
+  if (ports.length === 0) {
     return { stopped: false };
   }
-  try {
-    kill(target.pid);
-  } catch (error) {
-    return { stopped: false, reason: `终止进程 ${target.pid} 失败：${error.message}` };
-  }
-  if (await waitForPortRelease({ port: target.port, probe, sleep })) {
-    return { stopped: true, port: target.port, pid: target.pid };
-  }
-  return { stopped: false, port: target.port, pid: target.pid, reason: `进程 ${target.pid} 已终止但端口 ${target.port} 在 ${STOP_RELEASE_WAIT_MS}ms 内未释放` };
+  return { stopped: true, ports, pids };
 }
 
 /* —— 自动开窗：触发 A/B 的构造与出口 —— */

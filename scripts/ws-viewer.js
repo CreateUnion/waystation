@@ -1,6 +1,6 @@
-/* 人类观察窗的组合根入口：参数解析（--focus / --port / --no-open / --stop）、端口协商、就绪行、
- * 开窗与退出通道。启动链的判定（探针 / 归属 / 开窗计划 / 停止）都在 src/viewer/launch.js 的
- * 注入式函数里，本文件只做接线与输出。
+/* 人类观察窗的组合根入口：参数解析（--focus / --port / --no-open / --stop）、启动协商接线、就绪行、
+ * 开窗与退出通道。启动链的判定（探针 / 归属 / 端口协商 / 开窗计划 / 停止）都在 src/viewer/launch.js
+ * 的注入式函数里，本文件只做接线与输出。
  *
  * 退出通道单点化：stdin 的 q 字节与 POSIX 信号共用同一个 shutdown——server.close 非幂等
  * （重复调用 reject ERR_SERVER_NOT_RUNNING），双触发必须挡在单点之前。Windows 下 --stop 是
@@ -9,9 +9,9 @@
 
 import {
   buildOpenCommand,
-  classifyBusyPort,
   DEFAULT_VIEWER_PORT,
   locateEdge,
+  negotiateViewerPort,
   openWindow,
   PORT_TRIES,
   rootDigest,
@@ -122,39 +122,13 @@ function reportReady({ port, data, noOpen, focus }) {
   }
 }
 
-/* 已在跑（同根同端口）分支：不再起服务，只打印地址（--no-open）或再开一个窗。 */
+/* 已在跑（同根，段内命中）分支：不再起服务，只打印该实例的地址（--no-open）或再开一个窗。 */
 function reportRunning({ port, noOpen, focus }) {
   const url = viewerUrlOf(port, focus);
   console.log(`观察窗已在运行：${url}`);
   if (!noOpen) {
     openBrowser({ url });
   }
-}
-
-/* 端口协商（顺序 bind，不做先探后绑——避免 TOCTOU）：成功→{kind:'started'}；
- * EADDRINUSE→health 判定三分支：自家同根＝已在跑（{kind:'running'}）；显式端口遇别根/他人
- * 报错退出失败；默认段遇他人试下一端口。段内全占＝失败。 */
-async function negotiatePort({ dataDir, log, data, assets, digest, options }) {
-  for (const port of candidatePortsOf(options)) {
-    try {
-      const server = await startViewerServer({ dataDir, log, port, data, assets });
-      return { kind: 'started', server };
-    } catch (error) {
-      if (error.code !== 'EADDRINUSE') {
-        console.error(`监听端口 ${port} 失败：${error.message}`);
-        return { kind: 'failed' };
-      }
-      if (await classifyBusyPort({ port, digest }) === 'ours') {
-        return { kind: 'running', port };
-      }
-      if (options.port !== null) {
-        console.error(`端口 ${port} 属于另一数据根的观察窗或他人进程`);
-        return { kind: 'failed' };
-      }
-    }
-  }
-  console.error(`端口段 ${DEFAULT_VIEWER_PORT}–${DEFAULT_VIEWER_PORT + PORT_TRIES - 1} 全部被占用，无法启动观察窗`);
-  return { kind: 'failed' };
 }
 
 /* 退出通道单点化：q 字节与 POSIX 信号共用同一 shutdown，双触发被 shuttingDown 挡下。
@@ -187,13 +161,23 @@ function wireShutdown(server) {
   }
 }
 
+/* —— 启动 / 停止 —— */
+
+/* 启动：失败文案由协商层随 outcome 一并给出（分支知识不下放组合根），本处负责打印与退出码——
+ * 用户显式调用的程序，错误必须可见。 */
 async function runLaunch({ dataDir, options }) {
   const digest = rootDigest(dataDir);
   const log = { warn: (...args) => console.error(...args) };
   const data = createViewerData({ dataDir, log });
   const assets = { INDEX_HTML, APP_JS, STYLE_CSS };
-  const outcome = await negotiatePort({ dataDir, log, data, assets, digest, options });
+  const outcome = await negotiateViewerPort({
+    candidatePorts: candidatePortsOf(options),
+    explicitPort: options.port !== null,
+    digest,
+    startServer: (port) => startViewerServer({ dataDir, log, port, data, assets }),
+  });
   if (outcome.kind === 'failed') {
+    console.error(outcome.reason);
     process.exitCode = EXIT_ERROR;
     return;
   }
@@ -205,10 +189,15 @@ async function runLaunch({ dataDir, options }) {
   wireShutdown(outcome.server);
 }
 
+/* 停止：n=1 保持既有单实例文案逐字节不变（设计 §4.1 与 README 已写死该行形态），n≥2 汇总清单。 */
 async function runStop({ dataDir, options }) {
   const result = await stopViewer({ candidatePorts: candidatePortsOf(options), digest: rootDigest(dataDir) });
   if (result.stopped) {
-    console.log(`已停止（端口 ${result.port}，pid ${result.pid}）`);
+    if (result.ports.length === 1) {
+      console.log(`已停止（端口 ${result.ports[0]}，pid ${result.pids[0]}）`);
+    } else {
+      console.log(`已停止（${result.ports.length} 个：端口 ${result.ports.join('/')}）`);
+    }
     return;
   }
   if (result.reason !== undefined) {

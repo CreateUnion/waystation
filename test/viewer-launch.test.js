@@ -6,8 +6,10 @@ import {
   buildViewerSpawn,
   classifyBusyPort,
   DEFAULT_VIEWER_PORT,
+  findSameRootViewer,
   inProgressCollabsOf,
   locateEdge,
+  negotiateViewerPort,
   openWindow,
   PORT_TRIES,
   probeViewer,
@@ -50,6 +52,28 @@ function fakeSleep() {
     delays,
     sleep: async (ms) => {
       delays.push(ms);
+    },
+  };
+}
+
+/* bind 争用错误（Node 端口被占时的抛出形态）：code=EADDRINUSE 是归属判定兜底的触发条件。 */
+function portBusyError() {
+  return Object.assign(new Error('listen EADDRINUSE: address already in use'), { code: 'EADDRINUSE' });
+}
+
+/* 假服务启动器：记录调用端口；failFor 注入抛出（默认恒成功返回句柄）——协商用例断言
+ * 「不起服务/不绑定」的观察点。 */
+function fakeStartServer(failFor = () => null) {
+  const calls = [];
+  return {
+    calls,
+    startServer: async (port) => {
+      calls.push(port);
+      const error = failFor(port);
+      if (error !== null) {
+        throw error;
+      }
+      return { port, close: async () => {} };
     },
   };
 }
@@ -188,19 +212,95 @@ test('openWindow：spawn 收到 detached/stdio ignore、unref 被调用；同步
   }), false);
 });
 
+/* —— findSameRootViewer（段级扫描：启动协商与停止循环共用） —— */
+
+test('findSameRootViewer：低位空闲与别根不挡命中，高位同根命中并复探确认 pid', async () => {
+  const { ports, probe } = scriptedProbe([
+    null,
+    healthOf({ pid: 111, root: 'other000' }),
+    healthOf({ pid: 222 }),
+    healthOf({ pid: 222 }),
+  ]);
+  const found = await findSameRootViewer({ candidatePorts: [7330, 7331, 7332], digest: DIGEST, probe });
+  assert.deepEqual(found, { port: 7332, pid: 222 });
+  assert.deepEqual(ports, [7330, 7331, 7332, 7332], '空闲/别根单探跳过；命中位复探一次确认同 pid');
+});
+
+/* —— negotiateViewerPort（启动协商：段级同根预扫＋bind 兜底） —— */
+
+test('negotiateViewerPort：低位候选空闲＋高位候选同根在跑→判 running，不起服务、不绑定', async () => {
+  const { ports, probe } = scriptedProbe([null, healthOf({ pid: 111 }), healthOf({ pid: 111 })]);
+  const { calls, startServer } = fakeStartServer();
+  const outcome = await negotiateViewerPort({ candidatePorts: [7330, 7331], explicitPort: false, digest: DIGEST, probe, startServer });
+  assert.deepEqual(outcome, { kind: 'running', port: 7331 });
+  assert.deepEqual(calls, [], '预扫命中即判「已在跑」：不得起第二个服务（不 bind 任何端口）');
+  assert.deepEqual(ports, [7330, 7331, 7331], '低位空闲不误判，高位同根命中并复探确认');
+});
+
+test('negotiateViewerPort：预扫未命中→走 bind 协商，首选成功即 started', async () => {
+  const { ports, probe } = scriptedProbe([null]);
+  const { calls, startServer } = fakeStartServer();
+  const outcome = await negotiateViewerPort({ candidatePorts: [7330, 7331], explicitPort: false, digest: DIGEST, probe, startServer });
+  assert.equal(outcome.kind, 'started');
+  assert.equal(outcome.server.port, 7330);
+  assert.deepEqual(calls, [7330], '预扫未命中后由 bind 定夺：首选绑定成功');
+  assert.deepEqual(ports, [7330, 7331], '预扫扫完两候选（空扫）');
+});
+
+test('negotiateViewerPort：预扫与 bind 之间同根服务出现（竞态）→EADDRINUSE 归属判定兜底判 running', async () => {
+  const { ports, probe } = scriptedProbe([null, null, healthOf({ pid: 111 })]);
+  const { calls, startServer } = fakeStartServer(() => portBusyError());
+  const outcome = await negotiateViewerPort({ candidatePorts: [7330, 7331], explicitPort: false, digest: DIGEST, probe, startServer });
+  assert.deepEqual(outcome, { kind: 'running', port: 7330 });
+  assert.deepEqual(calls, [7330], 'bind 失败后先归属判定：同根即停，不再试下一端口');
+  assert.deepEqual(ports, [7330, 7331, 7330], '预扫两次空探＋占用位归属探');
+});
+
+test('negotiateViewerPort：显式端口预扫命中同根→running（不起服务），与 bind 判定路径等价', async () => {
+  const { ports, probe } = scriptedProbe([healthOf({ pid: 111 }), healthOf({ pid: 111 })]);
+  const { calls, startServer } = fakeStartServer();
+  const outcome = await negotiateViewerPort({ candidatePorts: [7330], explicitPort: true, digest: DIGEST, probe, startServer });
+  assert.deepEqual(outcome, { kind: 'running', port: 7330 });
+  assert.deepEqual(calls, []);
+  assert.deepEqual(ports, [7330, 7330]);
+});
+
+test('negotiateViewerPort：显式端口遇他根→failed（既有报错文案逐字保留）', async () => {
+  const { probe } = scriptedProbe([healthOf({ root: 'ffffffff' })]);
+  const { calls, startServer } = fakeStartServer(() => portBusyError());
+  const outcome = await negotiateViewerPort({ candidatePorts: [7330], explicitPort: true, digest: DIGEST, probe, startServer });
+  assert.deepEqual(outcome, { kind: 'failed', reason: '端口 7330 属于另一数据根的观察窗或他人进程' });
+  assert.deepEqual(calls, [7330]);
+});
+
+test('negotiateViewerPort：默认段逐位让位（别根/他占跳过），段内全占→failed（段全文案）', async () => {
+  const { probe } = scriptedProbe([healthOf({ root: 'ffffffff' })]);
+  const { calls, startServer } = fakeStartServer(() => portBusyError());
+  const outcome = await negotiateViewerPort({ candidatePorts: [7330, 7331], explicitPort: false, digest: DIGEST, probe, startServer });
+  assert.deepEqual(outcome, { kind: 'failed', reason: `端口段 ${DEFAULT_VIEWER_PORT}–${DEFAULT_VIEWER_PORT + PORT_TRIES - 1} 全部被占用，无法启动观察窗` });
+  assert.deepEqual(calls, [7330, 7331], '逐位试绑到段尾');
+});
+
+test('negotiateViewerPort：bind 非占用类错误→failed（原始消息透传）', async () => {
+  const { probe } = scriptedProbe([null]);
+  const { startServer } = fakeStartServer(() => Object.assign(new Error('listen EACCES'), { code: 'EACCES' }));
+  const outcome = await negotiateViewerPort({ candidatePorts: [7330], explicitPort: false, digest: DIGEST, probe, startServer });
+  assert.deepEqual(outcome, { kind: 'failed', reason: '监听端口 7330 失败：listen EACCES' });
+});
+
 /* —— stopViewer —— */
 
-test('stopViewer：多实例只停首个（端口序），后续端口不再探测', async () => {
+test('stopViewer：单实例——kill、释放复验、复扫无命中后收敛', async () => {
   const { ports, probe } = scriptedProbe([healthOf({ pid: 111 }), healthOf({ pid: 111 }), null]);
   const killed = [];
   const { sleep } = fakeSleep();
   const result = await stopViewer({ candidatePorts: [7330, 7331], digest: DIGEST, probe, kill: (pid) => killed.push(pid), sleep });
-  assert.deepEqual(result, { stopped: true, port: 7330, pid: 111 });
+  assert.deepEqual(result, { stopped: true, ports: [7330], pids: [111] });
   assert.deepEqual(killed, [111]);
-  assert.deepEqual(ports, [7330, 7330, 7330], '首端口命中即停：确认探与释放探都在 7330，7331 从未被探测');
+  assert.deepEqual(ports, [7330, 7330, 7330, 7330, 7331], '确认探/释放探在 7330；再复扫两候选无命中即收敛');
 });
 
-test('stopViewer：别根跳过继续扫，kill 的是同根那个', async () => {
+test('stopViewer：别根跳过继续扫，kill 的是同根那个；复扫无命中后收敛', async () => {
   const { ports, probe } = scriptedProbe([
     healthOf({ pid: 111, root: 'other000' }),
     healthOf({ pid: 222 }),
@@ -210,9 +310,44 @@ test('stopViewer：别根跳过继续扫，kill 的是同根那个', async () =>
   const killed = [];
   const { sleep } = fakeSleep();
   const result = await stopViewer({ candidatePorts: [7330, 7331], digest: DIGEST, probe, kill: (pid) => killed.push(pid), sleep });
-  assert.deepEqual(result, { stopped: true, port: 7331, pid: 222 });
+  assert.deepEqual(result, { stopped: true, ports: [7331], pids: [222] });
   assert.deepEqual(killed, [222]);
-  assert.deepEqual(ports, [7330, 7331, 7331, 7331]);
+  assert.deepEqual(ports, [7330, 7331, 7331, 7331, 7330, 7331]);
+});
+
+test('stopViewer：两个同根实例都被停（kill 两次），返回端口/pid 清单', async () => {
+  const { ports, probe } = scriptedProbe([
+    healthOf({ pid: 111 }),
+    healthOf({ pid: 111 }),
+    null,
+    null,
+    healthOf({ pid: 222 }),
+    healthOf({ pid: 222 }),
+    null,
+  ]);
+  const killed = [];
+  const { sleep } = fakeSleep();
+  const result = await stopViewer({ candidatePorts: [7330, 7331], digest: DIGEST, probe, kill: (pid) => killed.push(pid), sleep });
+  assert.deepEqual(result, { stopped: true, ports: [7330, 7331], pids: [111, 222] });
+  assert.deepEqual(killed, [111, 222], '停全部：两实例各被 kill 一次');
+  assert.deepEqual(ports, [7330, 7330, 7330, 7330, 7331, 7331, 7331], '7330 释放→复扫→7331 命中→释放');
+});
+
+test('stopViewer：轮数上限＝候选数——同端口反复出现同根也不超限循环', async () => {
+  let calls = 0;
+  const probe = async () => {
+    calls++;
+    if (calls > 3) {
+      throw new Error('停止循环超出候选数轮次——轮数上限失效');
+    }
+    return calls === 3 ? null : healthOf({ pid: 111 });
+  };
+  const killed = [];
+  const { sleep } = fakeSleep();
+  const result = await stopViewer({ candidatePorts: [7330], digest: DIGEST, probe, kill: (pid) => killed.push(pid), sleep });
+  assert.deepEqual(result, { stopped: true, ports: [7330], pids: [111] });
+  assert.deepEqual(killed, [111], '一个候选端口最多停一轮：上限挡住「kill 后同根立刻再现」的循环');
+  assert.equal(calls, 3, '确认探×2＋释放探×1 即收束——第 4 次探测（越限轮）不发生');
 });
 
 test('stopViewer：复探不同 pid 或探空（pid 复用窗口）→ 不 kill，继续扫', async () => {
@@ -242,7 +377,7 @@ test('stopViewer：kill 后轮询释放——两次仍活、第三次释放→st
   const killed = [];
   const { delays, sleep } = fakeSleep();
   const result = await stopViewer({ candidatePorts: [7330], digest: DIGEST, probe, kill: (pid) => killed.push(pid), sleep });
-  assert.deepEqual(result, { stopped: true, port: 7330, pid: 111 });
+  assert.deepEqual(result, { stopped: true, ports: [7330], pids: [111] });
   assert.deepEqual(killed, [111]);
   assert.equal(delays.length, 3, '第三次释放探测前共等三轮');
 });
