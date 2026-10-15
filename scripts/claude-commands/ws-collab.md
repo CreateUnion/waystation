@@ -12,7 +12,7 @@ description: 发起一次 waystation 协作（用法：/ws-collab <项目名> <�
 流程：
 
 1. 缺项目名或主题 → 一次问全再动手。
-2. 调用 waystation 的 `ws_list_hosts` 扫描在线驿站。若本会话没有 waystation 工具（`mcp__waystation__*` 不存在），提示用户：本会话未加载驿站工具，请**新开**一个 Claude Code 会话再试，不要继续。
+2. 调用 waystation 的 `ws_list_hosts` 扫描在线驿站（候选一律取载荷的 `hosts` 段——「其他驿站」；新载荷另含 `self` 本机段，不参与候选）。若本会话没有 waystation 工具（`mcp__waystation__*` 不存在），提示用户：本会话未加载驿站工具，请**新开**一个 Claude Code 会话再试，不要继续。
 3. 顺手调一次 `ws_status`：若载荷带 `identityHint`，向用户转达一次（想改名就帮他写入 config.json 的 `identityName`，说明**下次会话生效**）；不阻断流程，之后照常继续。
 4. 敲定协作者：
    - **没指定**（末尾没有能对上的词）→ 用 AskUserQuestion 多选（multiSelect: true）把当前在线驿站全部列为候选项（label = 身份名，description = 地址:端口、参与协作数）让用户挑；在线超过 4 个（选项上限）时改为文本列全清单请用户点名。一个都没扫到 → 报告「未扫到在线驿站」+ 排查提示（对方会话是否开着、防火墙是否放行），终止。

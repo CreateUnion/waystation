@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { createSessionStatusWriter, isIndicatedCollab } from '../src/session-status.js';
+import { createSessionStatusWriter, indicatedEntriesOf, isIndicatedCollab } from '../src/session-status.js';
 import { coreJsonPath, sessionFilePath } from '../src/paths.js';
 import { makeTempDir, pickFreePort, repoRoot, waitFor } from './helpers.js';
 
@@ -56,6 +56,18 @@ test('start：立即写入会话状态文件（字段完整、落在主数据目
   assert.deepEqual(payload.collabs, sampleSnapshot().collabs);
   assert.equal(writer.stats().writes, 1);
   writer.close();
+});
+
+test('指示条目投影：静音态只在 true 时带字段（缺字段按未静音——旧读取端与新读取端双向兼容）', () => {
+  const projected = indicatedEntriesOf(
+    [
+      { collabId: 'collab-1', name: '静音中', state: 'active', role: 'manager', mode: 'managed', memberCount: 2, muted: true },
+      { collabId: 'collab-2', name: '照常', state: 'active', role: 'member', mode: 'managed', memberCount: 2, muted: false },
+    ],
+    [{ collabId: 'collab-1', msgCount: 3 }],
+  );
+  assert.deepEqual(projected[0], { collabId: 'collab-1', name: '静音中', state: 'active', role: 'manager', mode: 'managed', memberCount: 2, muted: true, msgCount: 3 });
+  assert.deepEqual(projected[1], { collabId: 'collab-2', name: '照常', state: 'active', role: 'member', mode: 'managed', memberCount: 2 });
 });
 
 test('归档条目不进指示面：归档与非归档混合清单 → 文件 collabs 仅保留非归档', (t) => {

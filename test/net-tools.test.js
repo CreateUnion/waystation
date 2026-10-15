@@ -14,7 +14,7 @@ import { CONFIG_FILE_NAME, loadConfig } from '../src/config.js';
 import { makeTempDir } from './helpers.js';
 
 function contextWith(net) {
-  return { version: '0.1.0', instanceId: 'inst-self', dataDir: '/data', logDir: '/data/logs', config: { identityName: '本机', port: 17321 }, net, collab: { stats: () => ({ collabs: 0, byState: {} }) }, startedAt: '2026-10-12T00:00:00.000Z' };
+  return { version: '0.1.0', instanceId: 'inst-self', dataDir: '/data', logDir: '/data/logs', config: { identityName: '本机', port: 17321 }, net, collab: { stats: () => ({ collabs: 0, byState: {} }) }, activeSessions: () => [], startedAt: '2026-10-12T00:00:00.000Z' };
 }
 
 async function callTool(tool, args, net) {
@@ -242,6 +242,53 @@ test('ws_list_hosts：输出端点（address / port / 地址:端口 字符串数
   assert.equal(hosts[0].address, '127.0.0.2');
   assert.equal(hosts[0].port, 17321);
   assert.deepEqual(hosts[0].endpoints, ['127.0.0.2:17321', '127.0.0.3:17321']);
+});
+
+test('ws_list_hosts：载荷含本机段（身份/端口/活跃终端会话与计数；现取——会话变化即反映）', async () => {
+  const net = {
+    listHosts: async () => ({
+      ok: true,
+      hosts: [{ instanceId: 'inst-b', identityName: '主机乙', endpoints: [{ address: '127.0.0.2', port: 17321 }], collabCount: 1, lastSeenAt: '2026-10-12T00:00:00.000Z' }],
+    }),
+  };
+  const sessions = [{ sessionId: 'session-a', bridgeId: 'bridge-1', app: '0.1.0', platform: 'win32', pid: 101 }];
+  const context = { ...contextWith(net), activeSessions: () => sessions };
+  const payload = JSON.parse((await hostsTool().handler({}, context)).content[0].text);
+  assert.deepEqual(payload.self, {
+    instanceId: 'inst-self',
+    identityName: '本机',
+    port: 17321,
+    sessions: [{ sessionId: 'session-a', bridgeId: 'bridge-1', app: '0.1.0', platform: 'win32', pid: 101 }],
+    sessionCount: 1,
+  });
+  assert.equal(payload.hosts.length, 1, 'hosts 维持「其他驿站」语义不变');
+  assert.equal(payload.hosts[0].instanceId, 'inst-b');
+  sessions.push({ sessionId: 'session-b', bridgeId: 'bridge-2', app: '0.1.0', platform: 'linux', pid: 202 });
+  const again = JSON.parse((await hostsTool().handler({}, context)).content[0].text);
+  assert.equal(again.self.sessionCount, 2, '会话集合每次现取（不取样缓存）');
+});
+
+test('ws_list_hosts：零活跃终端——本机段如实为零集合（不省略字段）', async () => {
+  const net = { listHosts: async () => ({ ok: true, hosts: [] }) };
+  const payload = JSON.parse((await callTool(hostsTool(), {}, net)).content[0].text);
+  assert.deepEqual(payload.self.sessions, []);
+  assert.equal(payload.self.sessionCount, 0);
+  assert.deepEqual(payload.hosts, []);
+});
+
+test('ws_list_hosts：同机另一数据根条目带 sameMachine 标注（异机为 false，字段恒在场）', async () => {
+  const net = {
+    listHosts: async () => ({
+      ok: true,
+      hosts: [
+        { instanceId: 'inst-same', identityName: '同机邻居', endpoints: [{ address: '127.0.0.2', port: 17321 }], collabCount: 0, lastSeenAt: '2026-10-12T00:00:00.000Z', sameMachine: true },
+        { instanceId: 'inst-remote', identityName: '异机', endpoints: [{ address: '10.0.0.2', port: 17321 }], collabCount: 0, lastSeenAt: '2026-10-12T00:00:00.000Z', sameMachine: false },
+      ],
+    }),
+  };
+  const hosts = JSON.parse((await callTool(hostsTool(), {}, net)).content[0].text).hosts;
+  assert.equal(hosts[0].sameMachine, true);
+  assert.equal(hosts[1].sameMachine, false);
 });
 
 test('ws_status：输出含 site 站点块', async () => {

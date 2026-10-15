@@ -15,6 +15,7 @@ const ROLE_LABELS = { manager: '驿丞', member: '协作者' };
 const STATE_LABELS = { proposed: '待同意', frozen: '冻结' };
 const MODE_LABELS = { managed: '协作中', forum: '讨论中' };
 const FORUM_MODE = 'forum';
+const MUTE_MARK = '🔇';
 const MAX_INPUT_BYTES = 262144;   // 状态栏 JSON 体量上限：超限按解析失败处理，不做无界读
 
 async function readInput() {
@@ -80,16 +81,18 @@ function countLabelOf(entry) {
   return modeOf(entry) === FORUM_MODE ? `${count} 帖` : `${count} 条`;
 }
 
-/* 条目渲染（「讨论中：名称（人数）」与协作条目同形——人数是两侧的关键读数，消息数位次在人数后）。 */
+/* 条目渲染（「讨论中：名称（人数）」与协作条目同形——人数是两侧的关键读数，消息数位次在人数后）。
+ * 静音标记：静音态随会话状态文件携带（muted: true 才在场——旧文件缺字段按未静音，读取侧宽容）。 */
 function renderItem(entry) {
   const parts = itemPartsOf(entry);
   const name = typeof entry?.name === 'string' && entry.name !== '' ? entry.name : '未命名';
+  const mutedMark = entry?.muted === true ? `${MUTE_MARK} ` : '';
   parts.push(Number.isInteger(entry?.memberCount) ? `${entry.memberCount} 人` : '人数未知');
   const countLabel = countLabelOf(entry);
   if (countLabel !== null) {
     parts.push(countLabel);
   }
-  return `${name}（${parts.join('，')}）`;
+  return `${mutedMark}${name}（${parts.join('，')}）`;
 }
 
 /* 一行指示：按模式分段落（协作中 / 讨论中并列）——同模式的条目内以 ｜ 连接；两者皆无则不显示。 */

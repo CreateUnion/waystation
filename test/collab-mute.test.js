@@ -198,7 +198,9 @@ test('静音开关：入席默认静音、显式取消后不抑制、设静音�
   assert.equal(suppressedOf(made.service, { type: 'post', collabId }), true, '入席即默认静音');
   made.service.setMute({ collabId, muted: false });
   assert.equal(suppressedOf(made.service, { type: 'post', collabId }), false, '显式取消静音后不抑制');
+  assert.equal(made.service.list().collabs[0].muted, false, '清单行带当前静音态（供 ws_list_collabs 出参）');
   assert.deepEqual(made.service.setMute({ collabId, muted: true }), { ok: true, collabId, muted: true });
+  assert.equal(made.service.list().collabs[0].muted, true, '切换后清单行即时反映');
   assert.deepEqual(JSON.parse(readFileSync(mutePath(made.dir, collabId), 'utf8')), { v: 1, muted: true, baseline: 0 }, '落盘形态：v/muted/baseline');
   const reloaded = makeService(t, { dir: made.dir });
   assert.equal(suppressedOf(reloaded.service, { type: 'post', collabId }), true, '重建服务后仍静音（跨重启持久）');

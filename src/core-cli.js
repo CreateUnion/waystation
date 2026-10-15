@@ -386,8 +386,9 @@ function guardResultOf(result, record, allowOnce) {
     return { outcome: 'failed', message: `未终止：硬杀防护链复读校验不过（pid ${record.pid} 的运行描述符已被改写——可能刚被换代）——请重试` };
   }
   if (result === 'not-eligible') {
-    /* 此处对「IPC 已收下有序停止请求却未在期限内退出」不单独分档：核侧换代执行面接线前，健康核会走
-     * 这条路径（判据不通过＝宁可不杀，正确侧），接线后该窗口自然消失——换代接线复核时再看是否要分档文案。 */
+    /* 此处对「IPC 已收下有序停止请求却未在期限内退出」不单独分档：核侧换代执行面已接线——健康核
+     * 收下 replace{manual} 即经换届收尾有序退出；仍走到本路径的只剩「IPC 未应答而心跳仍新鲜」
+     * （瞬态不可达或慢启动窗口）——判据不通过＝宁可不杀，属正确侧。 */
     const advice = allowOnce ? '' : '——如需强制停止可加 --force';
     return { outcome: 'refused', message: `未终止：硬杀防护链判据不通过（核心可能仍在启动或正常应答${advice}）——请人工检查 pid ${record.pid}` };
   }

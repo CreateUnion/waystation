@@ -49,6 +49,14 @@ test('README：披露锚句与安装/状态栏/卸载/迁移文档面齐备（�
   assert.ok(text.includes('自介') && text.includes('升级与迁移'), '改端口旧站点的迁移注意在文档');
 });
 
+test('README：本机可见性与静音标记写入文档（列表本机段 / 同机标注与发现边界 / 状态栏 🔇）', () => {
+  const text = readFileSync(join(repoRoot, 'README.md'), 'utf8');
+  assert.ok(text.includes('本机段'), 'README 须说明 ws_list_hosts 列表含本机段');
+  assert.ok(text.includes('sameMachine'), 'README 须说明同机实例的标注字段');
+  assert.ok(text.includes('同机实例扫不到'), '同机实例的发现边界须如实写入（未接触且不在扫描段内则扫不到）');
+  assert.ok(text.includes('🔇'), '状态栏静音标记写入文档');
+});
+
 test('README：人类观察窗节齐备（命令/启动器/开关/日志排查/发送方提示/升级重跑）', () => {
   const text = readFileSync(join(repoRoot, 'README.md'), 'utf8');
   assert.ok(text.includes('/ws-view'), '观察窗命令（/ws-view）写入文档');

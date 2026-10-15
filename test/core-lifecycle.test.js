@@ -584,6 +584,42 @@ test('桥注册表：同 sessionId 新桥顶替旧桥（断开旧连接、删旧
   assert.equal(registry.count(), 2, '无 sessionId 的桥不参与顶替');
 });
 
+/* 会话视图（ws_list_hosts 本机段的数据源）：会话集＝带会话标识的注册桥，按注册序；
+ * 客户端字段只取注册记录里现成的（缺失如实为空值），无标识的桥不构成可指名的终端。 */
+function fakeClientRecord(bridgeId, sessionId, client = {}) {
+  return {
+    connId: bridgeId,
+    bridgeId,
+    sessionId,
+    app: '0.1.0',
+    platform: 'win32',
+    pid: 4242,
+    close: () => {},
+    ...client,
+  };
+}
+
+test('桥注册表·会话视图：形态与零桥边界（空集合）；随注册/退场/顶替实时变化', () => {
+  const registry = createBridgeRegistry({ log: null });
+  assert.deepEqual(registry.sessions(), [], '零桥：空集合（计数由调用方从集合长度得出）');
+  const first = fakeClientRecord('bridge-1', 'session-a');
+  registry.register(first);
+  assert.deepEqual(registry.sessions(), [{ sessionId: 'session-a', bridgeId: 'bridge-1', app: '0.1.0', platform: 'win32', pid: 4242 }]);
+  const second = fakeClientRecord('bridge-2', 'session-b', { app: undefined, platform: undefined, pid: undefined });
+  registry.register(second);
+  assert.deepEqual(
+    registry.sessions()[1],
+    { sessionId: 'session-b', bridgeId: 'bridge-2', app: null, platform: null, pid: null },
+    '客户端字段缺失时如实为空值（不伪造、不省略字段）',
+  );
+  registry.register(fakeClientRecord('bridge-anon', null));
+  assert.equal(registry.sessions().length, 2, '无会话标识的桥不入会话集（口径同会话状态写面：不进任何会话文件）');
+  registry.register(fakeClientRecord('bridge-1b', 'session-a'));
+  assert.deepEqual(registry.sessions().map((entry) => entry.bridgeId), ['bridge-2', 'bridge-1b'], '同会话顶替：视图只留当前桥');
+  registry.remove(second);
+  assert.deepEqual(registry.sessions().map((entry) => entry.sessionId), ['session-a'], '桥退场：会话实时移出');
+});
+
 /* —— persistentCore 读取 —— */
 
 test('persistentCore：缺省 false 静默；显式 true/false；非法值 warn 一次并回落 false', async (t) => {

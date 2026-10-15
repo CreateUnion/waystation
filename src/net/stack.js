@@ -1,4 +1,5 @@
 import { isIP } from 'node:net';
+import { networkInterfaces } from 'node:os';
 import { OCCUPIER_PROBE_TIMEOUT_MS } from '../site.js';
 import { PROTOCOL_VERSION, isIdentityName, isPort, newMsgId } from './protocol.js';
 
@@ -151,10 +152,35 @@ async function listHosts(state) {
     return { ok: false, message: state.message };
   }
   try {
-    return { ok: true, hosts: await state.discovery.scan({ windowMs: state.scanWindowMs }) };
+    const interfaces = networkInterfaces();
+    const hosts = (await state.discovery.scan({ windowMs: state.scanWindowMs }))
+      .map((host) => ({ ...host, sameMachine: host.endpoints.some((endpoint) => isLocalAddress(endpoint.address, interfaces)) }));
+    return { ok: true, hosts };
   } catch (error) {
     return { ok: false, message: `主机列表扫描失败：${error.message}` };
   }
+}
+
+/* 同机判定：地址属本机接口表（os.networkInterfaces）或回环段（127.0.0.0/8——只有本机可达，
+ * 探测应答与单播兜底都可能以回环地址呈现同机实例）即同机，用于给扫描条目加「同机」标注。
+ * 自身实例不靠本判定排除（那一层按实例标识在发现层完成）：这里标的是同一台机器上的其他
+ * 数据根实例——它们是合法协作对象，不得被任何地址过滤掉，只如实标注。
+ * 接口表经注入缝（单测喂表，生产现取）；地址缺失/非法一律 false（标注是呈现面，不改变清单本身）。 */
+export function isLocalAddress(address, interfaces = networkInterfaces()) {
+  if (typeof address !== 'string' || address === '') {
+    return false;
+  }
+  if (address.startsWith('127.')) {
+    return true;
+  }
+  for (const entries of Object.values(interfaces)) {
+    for (const entry of entries ?? []) {
+      if (entry?.address === address) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 async function pingHost(state, { address, port }) {

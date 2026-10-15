@@ -499,7 +499,24 @@ export function createBridgeRegistry({ onCountChange = null, onSupersede = null,
     count: () => state.byBridgeId.size,
     list: () => [...state.byBridgeId.values()],
     find: (sessionId) => state.bySessionId.get(sessionId) ?? null,
+    /* 活跃终端视图（ws_list_hosts 本机段的数据源）——口径见 sessionsOf。 */
+    sessions: () => sessionsOf(state),
   };
+}
+
+/* 活跃终端视图的口径：会话集＝带会话标识的注册桥，按注册序——无标识的桥不构成可指名的终端
+ * （口径同会话状态写面：不进任何会话文件）；顶替语义使同一会话至多一条，无需再排重。
+ * 字段只取注册记录里现成的客户端信息（缺失如实为空值）。 */
+function sessionsOf(state) {
+  return [...state.byBridgeId.values()]
+    .filter((entry) => typeof entry.sessionId === 'string')
+    .map((entry) => ({
+      sessionId: entry.sessionId,
+      bridgeId: entry.bridgeId,
+      app: typeof entry.record?.app === 'string' ? entry.record.app : null,
+      platform: typeof entry.record?.platform === 'string' ? entry.record.platform : null,
+      pid: Number.isInteger(entry.record?.pid) ? entry.record.pid : null,
+    }));
 }
 
 function closeQuietly(record, log) {

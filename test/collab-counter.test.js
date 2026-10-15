@@ -284,3 +284,17 @@ test('即时刷新：讨论的实时帖、回填帖与成员变化都不等心�
   await receive(station.service, joinFrameOf(created.collabId, peerB));
   assert.equal(station.entryOf(created.collabId).memberCount, 2, '成员变化同样即时刷新');
 });
+
+test('即时刷新：静音开关同样不等心跳——muted 随指示面进入会话状态文件（读取端缺字段按未静音）', (t) => {
+  const station = makeObservedStation(t);
+  const created = station.service.create({ name: '联调项目', topic: '发布联调', targets: [target('inst-b')] });
+  station.writer.start();
+  station.service.setMute({ collabId: created.collabId, muted: false });   // 新建即默认静音：显式取「未静音」基线
+  assert.equal('muted' in station.entryOf(created.collabId), false, '未静音：字段缺省（加性口径——旧读取端不受扰）');
+  const before = station.refreshes();
+  station.service.setMute({ collabId: created.collabId, muted: true });
+  assert.equal(station.entryOf(created.collabId).muted, true, '设静音即刷新');
+  assert.equal(station.refreshes(), before + 1, '静音切换触发一次观察面刷新');
+  station.service.setMute({ collabId: created.collabId, muted: false });
+  assert.equal('muted' in station.entryOf(created.collabId), false, '取消静音：字段随之缺省');
+});

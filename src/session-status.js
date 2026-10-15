@@ -29,12 +29,16 @@ export function isIndicatedCollab(entry) {
 
 /* 指示条目的成形与指标合并（写入端快照的裁剪面）：清单条目按 collabId 并入观察面读数
  * （msgCount）——读数缺失或非有效值时字段缺省，读取端按「计数不可得则省略」处理（加性变更，
- * 状态文件版本不动）。裁剪与合并同址的缘由：条目形态是写入端与读取端共用的唯一一份约定，
- * 组合根只负责取数、不再各自拼装字段。 */
+ * 状态文件版本不动）。静音态同走缺省口径（true 才带字段）：读取端缺字段按未静音——旧文件与
+ * 新读取端、新文件与旧读取端两个方向都兼容。裁剪与合并同址的缘由：条目形态是写入端与读取端
+ * 共用的唯一一份约定，组合根只负责取数、不再各自拼装字段。 */
 export function indicatedEntriesOf(entries, indicators) {
   const readings = new Map((indicators ?? []).map((reading) => [reading.collabId, reading.msgCount]));
   return entries.map((entry) => {
     const projected = { collabId: entry.collabId, name: entry.name, state: entry.state, role: entry.role, mode: entry.mode, memberCount: entry.memberCount };
+    if (entry.muted === true) {
+      projected.muted = true;
+    }
     const msgCount = readings.get(entry.collabId);
     if (Number.isInteger(msgCount) && msgCount >= 0) {
       projected.msgCount = msgCount;

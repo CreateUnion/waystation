@@ -126,7 +126,11 @@ async function sendMessageDefaultType() {
 }
 
 /* 冻结基准：19 工具注册后 JSON.stringify(registry.list(), null, 2) 的全量输出（改造前从当前树生成）。
- * 文本级固化——缩进与换行也是比对范围，故整段贴在此处、不手工编辑。 */
+ * 文本级固化——缩进与换行也是比对范围，故整段贴在此处、不手工编辑。
+ * 新增本机段带来的两条描述变更（有意对外变更）：ws_list_hosts 描述补「本机段 self 与同机
+ * sameMachine 标注」、ws_list_collabs 描述补「是否静音」——描述同步后按规程整体重冻，md5 由
+ * 5f087a6b36bcbdd2ab37ed5fb0fec9c4（改造前基准）更新为 56533a014d0eafc7be51e92f67d85911
+ * （10871 字符）；其余 17 项与全部 schema 逐字节未动（本次 diff 只有下方两行描述变化）。 */
 const FROZEN_LIST_JSON = `[
   {
     "name": "ws_status",
@@ -138,7 +142,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_list_hosts",
-    "description": "扫描局域网中在线的驿站（广播段扫 + 单播兜底）：列出身份名、地址:端口与当前参与协作数",
+    "description": "扫描局域网中在线的驿站（广播段扫 + 单播兜底）：列出身份名、地址:端口与当前参与协作数；载荷另含本机段 self（本机身份、端口与活跃终端会话），同机其他数据根的实例在 hosts 里带 sameMachine 标注",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -204,7 +208,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_list_collabs",
-    "description": "列出本机参与的全部协作（角色、状态、待回应邀请与是否过期）——新建协作与同意门处置的入口",
+    "description": "列出本机参与的全部协作（角色、状态、待回应邀请与是否过期、是否静音）——新建协作与同意门处置的入口",
     "inputSchema": {
       "type": "object",
       "properties": {}

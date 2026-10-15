@@ -267,7 +267,20 @@ async function scanUntilHost(client, instanceId) {
     found = scanned.payload.hosts.find((host) => host.instanceId === instanceId) ?? null;
   }
   assert.ok(found !== null, `扫描应经已知主机兜底发现目标：${JSON.stringify(scanned.payload.hosts)}`);
-  return found;
+  return { found, payload: scanned.payload };
+}
+
+/* 扫描载荷的两点断言（命令第 2 步的呈现数据源）：同机标注（临时根双站点＝同一物理机、不同数据根，
+ * 经已知主机接触后应带 sameMachine）；本机段（实例标识经 ws_status 独立取回比对、端口如实、
+ * 活跃终端含调用会话、计数与集合一致）。 */
+async function assertScanAnnotations(client, { found, scanned }, { port, sessionId }) {
+  assert.equal(found.sameMachine, true, '同机双站点（同一物理机、不同数据根）：列举条目带同机标注');
+  const status = await callTool(client, 'ws_status');
+  assert.equal(status.isError, false);
+  assert.equal(scanned.self.instanceId, status.payload.instanceId);
+  assert.equal(scanned.self.port, port);
+  assert.ok(scanned.self.sessions.some((entry) => entry.sessionId === sessionId), '调用会话即本机活跃终端');
+  assert.equal(scanned.self.sessionCount, scanned.self.sessions.length, '计数与集合一致');
 }
 
 test('验收预演：邀请→同意→对话→看台账（双真实实例全流程）', { timeout: 120000 }, async (t) => {
@@ -569,9 +582,9 @@ test('验收预演：/ws-discuss 驱动链——命令文件经安装落地、�
   assert.ok(referenced.includes('ws_invite') && referenced.includes('ws_end_collab'), '回执承诺的邀请与结束动作在引用面内');
 
   /* 第 2 步：扫描在线驿站——被邀方端点取自扫描结果（命令的 take-a-targets 面）；重扫语义见 scanUntilHost。 */
-  const found = await scanUntilHost(a, statusB.instanceId);
-  /* 第 3 步身份提示面与第 5 步发起：按扫描端点原样透传。 */
-  assert.equal((await callTool(a, 'ws_status')).isError, false);
+  const { found, payload: scanned } = await scanUntilHost(a, statusB.instanceId);
+  await assertScanAnnotations(a, { found, scanned }, { port: portA, sessionId: sessionIdFor(homeA) });
+  /* 第 3 步身份提示面与第 5 步发起：按扫描端点原样透传（身份面在上一行断言内已取回）。 */
   const created = await callTool(a, 'ws_create_collab', {
     name: '驱动讨论',
     topic: '命令驱动主题',

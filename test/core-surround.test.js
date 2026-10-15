@@ -307,7 +307,7 @@ async function startCoreOnTempRoot(t, home) {
   const started = await startCore({ env: { ...process.env, WAYSTATION_HOME: home } });
   assert.equal(started.ok, true, started.message ?? '核心启动');
   t.after(() => started.core.stop());
-  return JSON.parse(readFileSync(coreJsonPath(home), 'utf8'));
+  return { record: JSON.parse(readFileSync(coreJsonPath(home), 'utf8')), core: started.core };
 }
 
 function bridgeClientFor(home, record, { bridgeId, sessionId }) {
@@ -343,7 +343,7 @@ function triggerJudgedCount(home) {
 
 test('整链·真核＋真 IPC：注册即写＋顶替存活（旧连接断开空转）＋断开删除', { timeout: 60000 }, async (t) => {
   const home = makeTempDir(t);
-  const record = await startCoreOnTempRoot(t, home);
+  const { record } = await startCoreOnTempRoot(t, home);
   const live = [];
   t.after(async () => {
     for (const entry of live) {
@@ -374,7 +374,7 @@ test('整链·真核＋真 IPC：注册即写＋顶替存活（旧连接断开�
 
 test('整链·观察窗触发记账（真核）：建协触发 A 达出口；新会话注册触发 B 判一次；同 sessionId 顶替不重判', { timeout: 60000 }, async (t) => {
   const home = makeTempDir(t);
-  const record = await startCoreOnTempRoot(t, home);
+  const { record } = await startCoreOnTempRoot(t, home);
   const peerPort = await pickFreePort();
   const live = [];
   t.after(async () => {
@@ -407,7 +407,7 @@ test('整链·观察窗触发记账（真核）：建协触发 A 达出口；新
 
 test('整链·per-session 过滤（真核＋真工具调用）：绑定随会话、异会话不含、断开删除、夺席后转移', { timeout: 90000 }, async (t) => {
   const home = makeTempDir(t);
-  const record = await startCoreOnTempRoot(t, home);
+  const { record } = await startCoreOnTempRoot(t, home);
   const peerPort = await pickFreePort();
   const a = bridgeClientFor(home, record, { bridgeId: 'bridge-a', sessionId: 'session-a' });
   const b = bridgeClientFor(home, record, { bridgeId: 'bridge-b', sessionId: 'session-b' });
@@ -434,4 +434,29 @@ test('整链·per-session 过滤（真核＋真工具调用）：绑定随会话
   const muted = await callAndWait(b, 'ws_set_mute', { collabId: created.collabId, muted: true });
   assert.equal(muted.ok, true, muted.message);
   await waitFor(() => (collabsOf(fileB).some((entry) => entry.collabId === created.collabId) ? true : null), { timeoutMs: 12000 });
+  assert.equal(collabsOf(fileB).find((entry) => entry.collabId === created.collabId).muted, true, '静音切换即刷新会话文件（状态栏 🔇 的数据源）');
+});
+
+/* —— 整链·ws_list_hosts 本机段（真核＋真 IPC） —— */
+
+test('整链·本机段会话数据源：上下文取值器随桥注册/退场实时变化（零桥边界如实为空集合）', { timeout: 60000 }, async (t) => {
+  const home = makeTempDir(t);
+  const { record, core } = await startCoreOnTempRoot(t, home);
+  const a = bridgeClientFor(home, record, { bridgeId: 'bridge-seg-a', sessionId: 'session-seg-a' });
+  const b = bridgeClientFor(home, record, { bridgeId: 'bridge-seg-b', sessionId: 'session-seg-b' });
+  t.after(async () => {
+    await a.client.close().catch(() => {});
+    await b.client.close().catch(() => {});
+  });
+  assert.deepEqual(core.context.activeSessions(), [], '零桥边界：核心已起、尚无桥');
+  await a.client.connect();
+  await waitFor(() => (core.context.activeSessions().length === 1 ? true : null), { timeoutMs: 10000 });
+  assert.equal(core.context.activeSessions()[0].sessionId, 'session-seg-a');
+  assert.equal(core.context.activeSessions()[0].app, core.context.version, '客户端字段取自注册记录（桥 hello 的应用版本）');
+  await b.client.connect();
+  await waitFor(() => (core.context.activeSessions().length === 2 ? true : null), { timeoutMs: 10000 });
+  a.client.send({ type: 'bye', reason: 'session-end' });
+  await a.client.close();
+  await waitFor(() => (core.context.activeSessions().length === 1 ? true : null), { timeoutMs: 10000 });
+  assert.deepEqual(core.context.activeSessions().map((entry) => entry.sessionId), ['session-seg-b'], '退场后只留在线桥');
 });

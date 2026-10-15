@@ -388,6 +388,7 @@ function listEntryOf(state, local, now) {
     state: stateName,
     version: local.role === 'manager' ? local.ledger.version : (local.snapshot === null ? null : local.snapshot.version),
     memberCount: memberCountOf(local),
+    muted: local.mute.isMuted(),
     archived: isArchived(stateName),
     managerOffline: local.role === 'manager' ? false : (probeState?.offline === true),
     frozenUnresolved: local.freezeDeadlineNotified === true,
@@ -464,7 +465,8 @@ async function syncNow(state, input = {}) {
  * 校验：muted 须布尔（工具层同校验，此处仍是权威面——直调 API 的路径同样要挡）、collabId 须本机存在。
  * 取消时（真翻转）经 notifyLocal 投一行错过内容摘要——N = 当前累计 − 基线（基线随静音状态文件持久，
  * 跨重启不丢）；累计面：讨论 = 帖子列表 size（含回填帖）、协作 = 内容消息计数（与状态栏读数同一取数面）。
- * 基线缺失（设静音时为旧数据 / 累计面不可用）时摘要降级为不带 N 的表述——宁可不给数、不给错数。 */
+ * 基线缺失（设静音时为旧数据 / 累计面不可用）时摘要降级为不带 N 的表述——宁可不给数、不给错数。
+ * 静音态同属指示面（清单行与状态栏 🔇 标记都读它）：切换后即时触发观察面刷新，不等心跳。 */
 function setMuteNow(state, input) {
   const collabId = input?.collabId;
   const muted = input?.muted;
@@ -477,6 +479,7 @@ function setMuteNow(state, input) {
   }
   const countNow = contentCountOf(local);
   const before = local.mute.setMuted(muted, countNow);
+  notifyIndicatorChange(state);
   if (muted === false && before.wasMuted) {
     notifyLocal(state, local, resumeNoticeText(local, countNow, before.baseline));
   }

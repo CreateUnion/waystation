@@ -695,6 +695,9 @@ function buildContext(state) {
     startedAt: state.record.startedAt,
     /* 核心的 IPC 端点：ws_status 的 core 字段在场条件（仅核心应答时出现——桥的差错载荷由桥合成）。 */
     coreEndpoint: state.record.endpoint,
+    /* 本机活跃终端（ws_list_hosts 本机段的会话数据源）：注册表在 IPC 监听步构造、网络组件重建
+     * 不重建它——取值器现取，未装配相位如实为空集合。 */
+    activeSessions: () => state.bridges?.sessions() ?? [],
   };
 }
 

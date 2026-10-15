@@ -31,7 +31,7 @@ export const WS_STATUS_SPEC = {
 
 export const WS_LIST_HOSTS_SPEC = {
   name: 'ws_list_hosts',
-  description: '扫描局域网中在线的驿站（广播段扫 + 单播兜底）：列出身份名、地址:端口与当前参与协作数',
+  description: '扫描局域网中在线的驿站（广播段扫 + 单播兜底）：列出身份名、地址:端口与当前参与协作数；载荷另含本机段 self（本机身份、端口与活跃终端会话），同机其他数据根的实例在 hosts 里带 sameMachine 标注',
   inputSchema: { type: 'object', properties: {} },
 };
 
@@ -75,7 +75,7 @@ export const WS_CHECK_INBOX_SPEC = {
 
 export const WS_LIST_COLLABS_SPEC = {
   name: 'ws_list_collabs',
-  description: '列出本机参与的全部协作（角色、状态、待回应邀请与是否过期）——新建协作与同意门处置的入口',
+  description: '列出本机参与的全部协作（角色、状态、待回应邀请与是否过期、是否静音）——新建协作与同意门处置的入口',
   inputSchema: { type: 'object', properties: {} },
 };
 

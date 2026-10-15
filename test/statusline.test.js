@@ -186,6 +186,25 @@ test('消息数不可得：字段缺失（旧状态文件）或形态不符一�
   assert.equal(run.stdout, '协作中：旧协作（驿丞，3 人） ｜ 负计数（驿丞，3 人） ｜ 文本计数（驿丞，3 人） ｜ 讨论中：旧讨论（2 人）');
 });
 
+test('静音标记：muted: true 的条目名称前带 🔇（协作与讨论同规）；缺字段 / false 均不标', async (t) => {
+  const home = makeStationDir(t);
+  writeSessionFile(home, 'session-abc-1', sessionFileOf({
+    collabs: [
+      { collabId: 'collab-1', name: '静音项目', state: 'active', role: 'manager', memberCount: 3, muted: true, msgCount: 2 },
+      { collabId: 'collab-2', name: '照常项目', state: 'active', role: 'member', memberCount: 2, muted: false },
+      { collabId: 'collab-3', name: '旧文件项目', state: 'active', role: 'member', memberCount: 2 },
+      { collabId: 'collab-f1', name: '静音讨论', state: 'active', role: 'member', mode: 'forum', memberCount: 4, muted: true },
+    ],
+  }));
+  const run = await runStatusline(t, { input: JSON.stringify({ session_id: 'session-abc-1' }), home });
+  assert.equal(run.code, 0);
+  assert.equal(run.stderr, '');
+  assert.equal(
+    run.stdout,
+    '协作中：🔇 静音项目（驿丞，3 人，2 条） ｜ 照常项目（协作者，2 人） ｜ 旧文件项目（协作者，2 人） ｜ 讨论中：🔇 静音讨论（4 人）',
+  );
+});
+
 test('人数未知：既有行为不动；计数可得时仍位次在后', async (t) => {
   const home = makeStationDir(t);
   writeSessionFile(home, 'session-abc-1', sessionFileOf({

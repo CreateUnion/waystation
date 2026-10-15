@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createDispatch } from '../src/net/dispatch.js';
-import { createNetStack } from '../src/net/stack.js';
+import { createNetStack, isLocalAddress } from '../src/net/stack.js';
 import { makeTempDir } from './helpers.js';
 
 const SELF = { instanceId: 'inst-self', identityName: '本机', port: 17321 };
@@ -21,7 +21,7 @@ function createFakeDiscovery(overrides = {}) {
     },
     scan: async ({ windowMs }) => {
       calls.push(`scan:${windowMs}`);
-      return [{ instanceId: 'inst-b', identityName: '主机乙', addresses: ['127.0.0.2'], collabCount: 0, lastSeenAt: new Date().toISOString() }];
+      return [{ instanceId: 'inst-b', identityName: '主机乙', endpoints: [{ address: '127.0.0.2', port: 17321 }], collabCount: 0, lastSeenAt: new Date().toISOString() }];
     },
     stats: () => ({ discovery: true }),
     ...overrides,
@@ -364,6 +364,36 @@ test('listHosts：透传扫描窗口与结果', { timeout: 15000 }, async (t) =>
   assert.equal(listed.ok, true);
   assert.equal(listed.hosts[0].identityName, '主机乙');
   assert.ok(discovery.calls.includes('scan:250'), '扫描窗口来自装配参数');
+});
+
+test('isLocalAddress：接口表（注入）与回环段的判据', () => {
+  const interfaces = {
+    eth0: [{ address: '192.168.9.9', family: 'IPv4', internal: false }],
+    lo: [{ address: '127.0.0.1', family: 'IPv4', internal: true }],
+  };
+  assert.equal(isLocalAddress('192.168.9.9', interfaces), true, '接口地址集合命中');
+  assert.equal(isLocalAddress('127.0.0.2', interfaces), true, '回环段整段按同机处理（非本机不可达）');
+  assert.equal(isLocalAddress('203.0.113.7', interfaces), false, '文档保留测试网段：任何本机都不会命中');
+  assert.equal(isLocalAddress('', interfaces), false);
+  assert.equal(isLocalAddress(undefined, interfaces), false);
+});
+
+test('listHosts：同机地址标注 sameMachine（回环命中为真、异机地址为假）', { timeout: 15000 }, async (t) => {
+  const seenAt = new Date().toISOString();
+  const discovery = createFakeDiscovery({
+    scan: async () => [
+      { instanceId: 'inst-local', identityName: '同机邻居', endpoints: [{ address: '127.0.0.2', port: 17321 }], collabCount: 0, lastSeenAt: seenAt },
+      { instanceId: 'inst-remote', identityName: '异机驿站', endpoints: [{ address: '203.0.113.7', port: 17321 }], collabCount: 0, lastSeenAt: seenAt },
+    ],
+  });
+  const { stack } = makeStack(t, { discovery });
+  await stack.start();
+  t.after(() => stack.close());
+  const listed = await stack.listHosts();
+  assert.equal(listed.ok, true);
+  assert.equal(listed.hosts[0].sameMachine, true);
+  assert.equal(listed.hosts[1].sameMachine, false);
+  assert.equal(listed.hosts[0].endpoints[0].address, '127.0.0.2', '标注为加性字段，扫描结果原样保留');
 });
 
 test('status：聚合四个组件计数与降级字段', { timeout: 15000 }, async (t) => {
