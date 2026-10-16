@@ -13,7 +13,8 @@ function readJson(name) {
 test('package.json：npm 包骨架字段齐备', () => {
   const pkg = readJson('package.json');
   assert.equal(pkg.name, 'waystation');
-  assert.equal(pkg.version, '0.1.0');
+  // 版本随发布递增：此处只验 semver 形态；与 package-lock 的一致性由下一条用例把关
+  assert.match(pkg.version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/);
   assert.equal(pkg.type, 'module');
   assert.equal(pkg.engines.node, '>=20');
   assert.equal(pkg.bin.waystation, 'bin/waystation.js');

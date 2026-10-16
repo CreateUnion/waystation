@@ -10,7 +10,7 @@ test('客户端脚本：new Function 包装只解析不执行（语法自检）'
 });
 
 /* 锚点＝客户端与服务端契约的字符串级证据：端点、游标参数、路由前缀、持久化键、滚动协议、
- * 方向标、浮标文案。任一处被重命名（服务端换端点、客户端换键），这里先红。 */
+ * 分栏类、浮标文案。任一处被重命名（服务端换端点、客户端换键），这里先红。 */
 test('客户端脚本：服务端契约锚点齐备', () => {
   const anchors = [
     '/api/collabs',
@@ -22,8 +22,8 @@ test('客户端脚本：服务端契约锚点齐备', () => {
     'textContent',
     'innerHTML',
     'hashchange',
-    '→',
-    '←',
+    'feed-out',
+    'feed-in',
     '条新消息 ↓',
     '暂停',
     '恢复',
@@ -32,6 +32,7 @@ test('客户端脚本：服务端契约锚点齐备', () => {
   for (const anchor of anchors) {
     assert.ok(APP_JS.includes(anchor), '缺少锚点：' + anchor);
   }
+  assert.ok(!APP_JS.includes('feed-direction'), '方向标（位置已表达方向，冗余）应已移除');
 });
 
 test('页面壳：三处挂载点与字号三键齐备', () => {
@@ -56,6 +57,24 @@ test('样式：主题变量、色签 8 色、长串兜底齐备', () => {
     assert.ok(STYLE_CSS.includes('.chip-' + index), '缺少色签类：.chip-' + index);
   }
   assert.ok(STYLE_CSS.includes('overflow-wrap'), '缺少超长串兜底 overflow-wrap');
+});
+
+/* 聊天分栏的机器可查部分：左右对齐、气泡限宽、宽内容不破版（表格/代码滚动）、
+ * 系统行居中；DOM 侧（viewer-assets-dom.test.js）盖结构与类，观感仍入人验收单。 */
+test('样式：聊天式分栏与气泡溢出兜底齐备（窄窗/长内容不破版）', () => {
+  assert.ok(/\.feed-out\s*\{[^}]*justify-content:\s*flex-end/.test(STYLE_CSS), 'out 行靠右');
+  assert.ok(/\.feed-in\s*\{[^}]*justify-content:\s*flex-start/.test(STYLE_CSS), 'in 行靠左');
+  assert.ok(/\.feed-bubble\s*\{[^}]*max-width:\s*76%/.test(STYLE_CSS), '气泡限宽 ~76%');
+  assert.ok(/\.feed-bubble\s*\{[^}]*overflow-wrap:\s*anywhere/.test(STYLE_CSS), '气泡内长串可断');
+  assert.ok(/\.md-table\s*\{[^}]*overflow-x:\s*auto/.test(STYLE_CSS), '宽表格在气泡内横向滚动');
+  /* 用色断言钉到选择器规则体内：只查变量是否定义拦不住「变量在、规则没接线」的漂移。 */
+  assert.ok(/\.feed-out\s+\.feed-bubble\s*\{[^}]*background:\s*var\(--bg-accent\)/.test(STYLE_CSS), '本机气泡用主色淡底');
+  assert.ok(/\.feed-in\s+\.feed-bubble\s*\{[^}]*border-left[^}]*var\(--chip-color/.test(STYLE_CSS), '对方气泡边缘取作者色变量');
+  assert.ok(/\.chip-name\s*\{[^}]*color:\s*var\(--chip-color/.test(STYLE_CSS), '色签名字色取作者色变量');
+  assert.ok(/\.day-row\s*\{[^}]*text-align:\s*center/.test(STYLE_CSS), '日期分隔行居中');
+  assert.ok(/\.event-row\s*\{[^}]*justify-content:\s*center/.test(STYLE_CSS), '系统事件行居中');
+  assert.ok(/\.event-skipped\s*\{[^}]*text-align:\s*center/.test(STYLE_CSS), '跳过提示行居中');
+  assert.ok(!STYLE_CSS.includes('feed-direction'), '方向标样式随冗余箭头一并移除');
 });
 
 test('嵌入纪律：客户端脚本无反引号与模板插值序列（防宿主层自咬）', () => {

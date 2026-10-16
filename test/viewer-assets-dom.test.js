@@ -5,7 +5,7 @@ import { APP_JS } from '../src/viewer/assets.js';
 /* 客户端行为的可复跑固化：自包含最小 DOM 桩（零依赖，不引 jsdom——项目零新增依赖），把 APP_JS
  * 当被测对象执行真实逻辑。桩只实现客户端实际用到的面：节点树、textContent、innerHTML 存储、
  * hidden、属性（title/href）、事件监听、滚动量、localStorage、fetch 编排队列。
- * 覆盖：列表与详情首屏、跨日分隔、方向标与（N 人）、锚点携带与 reset 清屏、上滚浮标、
+ * 覆盖：列表与详情首屏、跨日分隔、聊天分栏与气泡、作者色与（N 人）、锚点携带与 reset 清屏、上滚浮标、
  * 暂停冻结与在途丢弃、恢复补拉、字号持久与钳制、404 停轮询、非法 hash 归一、两行坏行计数。
  * 桩不模拟布局与 HTML 解析（innerHTML 只存字符串）——浏览器侧观感仍由人验收逐项过。 */
 
@@ -83,6 +83,10 @@ function findAll(node, token, found = []) {
     findAll(child, token, found);
   }
   return found;
+}
+
+function classesOf(node) {
+  return String(node.className).split(' ');
 }
 
 function textLines(node, token) {
@@ -295,18 +299,66 @@ test('窗口标题：名称未就绪（name=null）保持默认标题', async ()
   assert.equal(env.document.title, 'waystation 观察窗');
 });
 
-test('协作行：方向标与（N 人）标记，count 缺省不显示', async () => {
+test('分栏：out 靠右、in 靠左、无 direction 的讨论帖行归左（不按作者名判）', async () => {
   const env = createEnv();
+  const forumRow = { id: 'a3', ts: TS_MORNING, fromName: '乙', kind: 'progress', html: '<p>a3</p>' };   // 讨论帖行：数据层无 direction 字段
   await bootDetail(env, {
-    rows: [feedRow('a1', { direction: 'out', count: 3 }), feedRow('a2', { direction: 'in' })],
+    rows: [feedRow('a1', { direction: 'out' }), feedRow('a2', { direction: 'in' }), forumRow],
     reset: true,
     skipped: 0,
   }, metaBody());
-  const heads = findAll(env.byId['stream'], 'feed-head');
-  assert.equal(findAll(heads[0], 'feed-direction')[0].textContent, '→');
-  assert.equal(findAll(heads[1], 'feed-direction')[0].textContent, '←');
-  assert.ok(textOf(heads[0]).includes('（3 人）'), textOf(heads[0]));
-  assert.ok(!textOf(heads[1]).includes('人）'), 'count 缺省不显示人数标记');
+  const rows = streamRows(env);
+  assert.ok(classesOf(rows[0]).includes('feed-out') && !classesOf(rows[0]).includes('feed-in'), 'out 行靠右：' + rows[0].className);
+  assert.ok(classesOf(rows[1]).includes('feed-in') && !classesOf(rows[1]).includes('feed-out'), 'in 行靠左：' + rows[1].className);
+  assert.ok(classesOf(rows[2]).includes('feed-in') && !classesOf(rows[2]).includes('feed-out'), '无 direction 的内容行归左：' + rows[2].className);
+});
+
+test('气泡：内容行裹气泡（时间/作者/正文都在内）与（N 人）标记，日期行与系统行无气泡', async () => {
+  const env = createEnv();
+  await bootDetail(env, {
+    rows: [feedRow('a1'), feedRow('a2', { ts: TS_NEXT_DAY, direction: 'out', count: 3 })],
+    reset: true,
+    skipped: 2,
+  }, metaBody({ skipped: 1 }));
+  const bubbles = findAll(env.byId['stream'], 'feed-bubble');
+  assert.equal(bubbles.length, 2, '每条内容行恰一个气泡');
+  for (const row of streamRows(env)) {
+    const bubble = findAll(row, 'feed-bubble');
+    assert.equal(bubble.length, 1, '一行一气泡：' + row.className);
+    assert.equal(findAll(bubble[0], 'feed-head').length, 1);
+    assert.equal(findAll(bubble[0], 'feed-time').length, 1, '时间在气泡内');
+    assert.equal(findAll(bubble[0], 'chip').length, 1, '作者色签在气泡内');
+    assert.equal(findAll(bubble[0], 'msg-body').length, 1, '正文在气泡内');
+  }
+  assert.ok(textOf(bubbles[1]).includes('（3 人）'), textOf(bubbles[1]));
+  assert.ok(!textOf(bubbles[0]).includes('人）'), 'count 缺省不显示人数标记');
+  assert.equal(findAll(env.byId['stream'], 'day-row').length, 2, '两日各一日期分隔行');
+  for (const day of findAll(env.byId['stream'], 'day-row')) {
+    assert.equal(findAll(day, 'feed-bubble').length, 0, '日期分隔行无气泡');
+  }
+  assert.equal(findAll(env.byId['event-track'], 'feed-bubble').length, 0, '系统事件行（事件轨/跳过行）无气泡');
+});
+
+test('作者色：气泡边缘与色签同取名字色类（8 色板按名 hash，同作者恒同色）', async () => {
+  const env = createEnv();
+  await bootDetail(env, {
+    rows: [
+      feedRow('a1', { direction: 'in', fromName: '甲机' }),
+      feedRow('a2', { direction: 'in', fromName: '乙机' }),
+    ],
+    reset: true,
+    skipped: 0,
+  }, metaBody());
+  const rows = streamRows(env);
+  const bubbleA = findAll(rows[0], 'feed-bubble')[0];
+  const bubbleB = findAll(rows[1], 'feed-bubble')[0];
+  // 色类值＝客户端哈希结果（甲机→chip-0、乙机→chip-1）：换成别的实现色板映射即红
+  assert.ok(classesOf(bubbleA).includes('chip-0'), '甲机气泡边缘取 chip-0：' + bubbleA.className);
+  assert.ok(classesOf(bubbleB).includes('chip-1'), '乙机气泡边缘取 chip-1：' + bubbleB.className);
+  const chipA = findAll(rows[0], 'chip')[0];
+  assert.ok(classesOf(chipA).includes('chip-0'), '色签容器与气泡边缘同色类：' + chipA.className);
+  assert.equal(findAll(chipA, 'chip-badge').length, 1);
+  assert.equal(findAll(chipA, 'chip-name')[0].textContent, '甲机');
 });
 
 test('增量轮询：两拍请求各带上次末行/末事件 id 的锚点，只追加不清屏', async () => {
@@ -495,6 +547,7 @@ test('渲染安全：innerHTML 只接服务端 html 字段，其余字段按文�
   const bodies = findAll(env.byId['stream'], 'msg-body');
   assert.equal(bodies.length, 1);
   assert.equal(bodies[0].innerHTML, '<p>安全</p>');
+  assert.equal(findAll(env.byId['stream'], 'feed-bubble')[0].innerHTML, null, '气泡容器非注入面：html 只落 msg-body');
   const head = findAll(env.byId['stream'], 'feed-head')[0];
   assert.ok(textOf(head).includes(hostileName), '作者名按文本呈现');
   assert.ok(textOf(head).includes('<b>粗</b>'), 'kind 按文本呈现');

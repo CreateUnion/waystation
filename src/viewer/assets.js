@@ -175,11 +175,19 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     return hash % PALETTE_SIZE;
   }
 
-  /* 作者色签：色块＝名字首字，同作者恒同色；徽标与名字都走 textContent。 */
+  /* 作者色类：按名字 hash 取 8 色板之一，同作者恒同色；空名回退「？」（未知作者也有稳定色，
+   * 与色签的显示回退同规）。色签与气泡边缘共读同一色类。 */
+  function colorClassOf(name) {
+    const text = (name === null || name === undefined || name === '') ? '？' : String(name);
+    return 'chip-' + colorIndex(text);
+  }
+
+  /* 作者色签：色块＝名字首字；色类挂在容器上，徽标/名字/气泡边缘经 --chip-color 同取一色；
+   * 字段都走 textContent（作者名是对端可控注入面）。 */
   function chipOf(name) {
     const text = (name === null || name === undefined || name === '') ? '？' : String(name);
-    const chip = el('span', 'chip');
-    chip.appendChild(el('span', 'chip-badge chip-' + colorIndex(text), Array.from(text)[0]));
+    const chip = el('span', 'chip ' + colorClassOf(text));
+    chip.appendChild(el('span', 'chip-badge', Array.from(text)[0]));
     chip.appendChild(el('span', 'chip-name', text));
     return chip;
   }
@@ -383,26 +391,27 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     document.title = named ? DEFAULT_TITLE + ' · ' + name : DEFAULT_TITLE;
   }
 
-  /* 一行流：时间（悬停完整 ISO）＋方向（协作行）＋作者色签＋kind 徽标＋正文。
+  /* 一行流（聊天式分栏）：时间（悬停完整 ISO）＋作者色签＋kind 徽标＋正文，内容行裹气泡。
+   * 行型只认 row.direction（'out' 靠右 / 其余靠左）——讨论帖行不带 direction（数据层只给
+   * 协作会话流标方向），按中性侧落左；不按作者名猜方向（名字不是可靠判据，本机名可改）。
    * 正文是服务端渲染好的 html 片段（唯一允许的 innerHTML 入口）；其余字段全部 textContent。 */
   function feedRowNode(row) {
-    const wrap = el('div', 'feed-row');
+    const wrap = el('div', 'feed-row ' + (row.direction === 'out' ? 'feed-out' : 'feed-in'));
+    const bubble = el('div', 'feed-bubble ' + colorClassOf(row.fromName));
     const head = el('div', 'feed-head');
     const time = el('span', 'feed-time', timeOf(row.ts));
     time.title = row.ts;
     head.appendChild(time);
-    if (row.direction === 'out' || row.direction === 'in') {
-      head.appendChild(el('span', 'feed-direction', row.direction === 'out' ? '→' : '←'));
-    }
     head.appendChild(chipOf(row.fromName));
     head.appendChild(el('span', 'feed-kind', row.kind));
     if (typeof row.count === 'number' && row.count > 1) {
       head.appendChild(el('span', 'feed-count', '（' + row.count + ' 人）'));
     }
-    wrap.appendChild(head);
+    bubble.appendChild(head);
     const body = el('div', 'msg-body');
     body.innerHTML = typeof row.html === 'string' ? row.html : '';
-    wrap.appendChild(body);
+    bubble.appendChild(body);
+    wrap.appendChild(bubble);
     return wrap;
   }
 
@@ -756,6 +765,7 @@ export const STYLE_CSS = String.raw`/* 深色单主题（设计裁定）：主�
   --fg: #dde3ee;
   --fg-dim: #939db1;
   --accent: #6ea8ff;
+  --bg-accent: #2a384e;   /* 本机气泡淡底：主色约两成混入 --bg-raised，深色面上仍与中性底可辨 */
   --warn: #ffb454;
   --chip-0: #e57373;
   --chip-1: #f0a35e;
@@ -892,9 +902,32 @@ button:hover { border-color: var(--accent); }
   #event-pane { border-left: none; border-top: 1px solid var(--line); max-height: 32vh; }
 }
 
-/* —— 主栏流 —— */
+/* —— 主栏流（聊天式分栏：本机靠右、成员靠左，系统行居中无气泡）—— */
 
-.feed-row { padding: 0.35rem 0.15rem 0.5rem; border-bottom: 1px dashed var(--line); }
+.feed-row { display: flex; padding: 0.25rem 0.15rem; }
+
+.feed-out { justify-content: flex-end; }
+
+.feed-in { justify-content: flex-start; }
+
+/* 气泡限宽给对侧留白：贴满整行就分辨不出分栏方向 */
+.feed-bubble {
+  max-width: 76%;
+  min-width: 0;
+  padding: 0.3rem 0.6rem 0.4rem;
+  border: 1px solid var(--line);
+  border-radius: 0.35rem;
+  background: var(--bg-raised);   /* 对方：中性灰底 */
+  overflow-wrap: anywhere;
+}
+
+/* 边缘色标作者：色类（chip-N）挂在气泡上，--chip-color 由此下发；本机气泡统一走主色 */
+.feed-in .feed-bubble { border-left: 3px solid var(--chip-color, var(--line)); }
+
+.feed-out .feed-bubble {
+  background: var(--bg-accent);
+  border-right: 3px solid var(--accent);
+}
 
 .feed-head {
   display: flex;
@@ -906,8 +939,6 @@ button:hover { border-color: var(--accent); }
 }
 
 .feed-time { font-variant-numeric: tabular-nums; }
-
-.feed-direction { color: var(--accent); font-weight: 700; }
 
 .feed-kind { padding: 0 0.3rem; border: 1px solid var(--line); border-radius: 0.25rem; }
 
@@ -924,22 +955,23 @@ button:hover { border-color: var(--accent); }
   width: 1.35em;
   height: 1.35em;
   border-radius: 0.3rem;
-  background: var(--fg-dim);
+  background: var(--chip-color, var(--fg-dim));
   color: #12151b;
   font-weight: 700;
 }
 
-.chip-name { color: var(--fg-dim); }
+/* 名字与气泡边缘同取作者色：色类容器下发 --chip-color，无色类时回退中性色 */
+.chip-name { color: var(--chip-color, var(--fg-dim)); overflow-wrap: anywhere; }
 
-/* 色签 8 色：放在 .chip-badge 之后，同特异性下后写者胜 */
-.chip-0 { background: var(--chip-0); }
-.chip-1 { background: var(--chip-1); }
-.chip-2 { background: var(--chip-2); }
-.chip-3 { background: var(--chip-3); }
-.chip-4 { background: var(--chip-4); }
-.chip-5 { background: var(--chip-5); }
-.chip-6 { background: var(--chip-6); }
-.chip-7 { background: var(--chip-7); }
+/* 色签 8 色：以自定义属性下发（徽标底/名字色/气泡边缘同源一色，同作者恒同色） */
+.chip-0 { --chip-color: var(--chip-0); }
+.chip-1 { --chip-color: var(--chip-1); }
+.chip-2 { --chip-color: var(--chip-2); }
+.chip-3 { --chip-color: var(--chip-3); }
+.chip-4 { --chip-color: var(--chip-4); }
+.chip-5 { --chip-color: var(--chip-5); }
+.chip-6 { --chip-color: var(--chip-6); }
+.chip-7 { --chip-color: var(--chip-7); }
 
 /* —— 消息正文（Markdown 渲染产物）—— */
 
@@ -1003,7 +1035,15 @@ button:hover { border-color: var(--accent); }
   font-size: 0.72rem;
 }
 
-.msg-body .md-table { width: 100%; margin: 0.5rem 0; border-collapse: collapse; }
+/* 表格成为可滚动块：列多的宽表在气泡内横向滚动，不把气泡撑破分栏 */
+.msg-body .md-table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  margin: 0.5rem 0;
+  border-collapse: collapse;
+  overflow-x: auto;
+}
 
 .msg-body .md-table th, .msg-body .md-table td {
   padding: 0.25rem 0.5rem;
@@ -1017,15 +1057,15 @@ button:hover { border-color: var(--accent); }
 
 .msg-body hr { margin: 0.7rem 0; border: none; border-top: 1px solid var(--line); }
 
-/* —— 事件轨 —— */
+/* —— 事件轨（系统事件行：居中、无气泡——不属分栏任何一侧）—— */
 
-.event-row { display: flex; gap: 0.4rem; padding: 0.15rem 0; color: var(--fg-dim); font-size: 0.82rem; }
+.event-row { display: flex; gap: 0.4rem; justify-content: center; padding: 0.15rem 0; color: var(--fg-dim); font-size: 0.82rem; }
 
 .event-time { flex: none; font-variant-numeric: tabular-nums; }
 
 .event-text { overflow-wrap: anywhere; }
 
-.event-skipped { margin-top: 0.4rem; color: var(--warn); font-size: 0.82rem; }
+.event-skipped { margin-top: 0.4rem; color: var(--warn); font-size: 0.82rem; text-align: center; }
 
 /* —— 新消息浮标 —— */
 

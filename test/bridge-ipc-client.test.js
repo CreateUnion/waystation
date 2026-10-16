@@ -15,6 +15,11 @@ import { createCoreLink } from '../src/bridge/ipc-client.js';
 
 const TOKEN = 'bridge-test-token-0123456789abcdef';
 
+/* 假核 app 版本桩：桩核 welcome.app（运行核心版本读数）与桥的换代判定读数（targetAppVersion）同源。
+ * 换代判定比「安装树目标版本 vs 运行核心版本」——缺省安装树读数随 package.json 版本迁移，会误判
+ * target-newer 进换代窗口；判定前提「目标≤运行」须在测试内自洽，换代用例另行显式注入目标版本。 */
+const STUB_APP_VERSION = '0.1.0';
+
 function quietLog() {
   return { info: () => {}, warn: () => {}, error: () => {} };
 }
@@ -24,7 +29,7 @@ function recordFixture(dataDir, overrides = {}) {
   return {
     v: 1,
     ipcV: IPC_VERSION,
-    appVersion: '0.1.0',
+    appVersion: STUB_APP_VERSION,
     pid: process.pid,
     endpoint: endpointFor(dataDir),
     token: TOKEN,
@@ -48,7 +53,7 @@ function welcomeFixture(dataDir) {
     type: 'welcome',
     ok: true,
     v: IPC_VERSION,
-    app: '0.1.0',
+    app: STUB_APP_VERSION,
     corePid: process.pid,
     dataDir,
     identity: { instanceId: 'inst-boot', identityName: 'lfxue' },
@@ -96,7 +101,9 @@ function linkFor(home, spawnFn, overrides = {}) {
   return createCoreLink({
     dataDir: home,
     env: { WAYSTATION_HOME: home, CLAUDE_CODE_SESSION_ID: 'session-bridge-1', CLAUDE_CODE_MESSAGING_TOKEN: 'tok-secret' },
-    app: '0.1.0',
+    app: STUB_APP_VERSION,
+    // 换代判定读数桩：与桩核 welcome.app 同源（缺省现读安装树会随 package.json 版本迁移误判）
+    targetAppVersion: STUB_APP_VERSION,
     bridgeId: 'bridge-under-test',
     sessionId: 'session-bridge-1',
     log: quietLog(),
@@ -755,7 +762,7 @@ test('换代·安装树根按模块位置派生：缺省目标读数＝仓库 pa
   const repoVersion = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')).version;
   const harness = changeoverHarness(t, home, { appVersion: '0.0.1' });
   await harness.start();
-  const link = linkFor(home, harness.spawnFn, { waitMs: 3000 }); // 不注入 targetAppVersion/appRoot
+  const link = linkFor(home, harness.spawnFn, { waitMs: 3000, targetAppVersion: null }); // 目标读数显式置空＝走缺省安装树路径；appRoot 不注入
   t.after(() => link.close());
   assert.equal(resolve(link.changeoverState().appRoot), resolve(repoRoot), '安装树根＝模块位置派生的仓库根');
   assert.equal((await link.ensureCore()).ok, true);
@@ -784,7 +791,7 @@ test('换代·目标读数不可得：降级上报、不换代（不以桥内存
   writeRecord(home, { status: 'ready' });
   const harness = changeoverHarness(t, home);
   await harness.start();
-  const link = linkFor(home, harness.spawnFn, { appRoot: bare, waitMs: 3000 });
+  const link = linkFor(home, harness.spawnFn, { appRoot: bare, targetAppVersion: null, waitMs: 3000 });
   t.after(() => link.close());
   assert.equal((await link.ensureCore()).ok, true);
   await waitFor(() => (link.changeoverState().notice ?? '').includes('换代判定不可得'), { timeoutMs: 3000 });
