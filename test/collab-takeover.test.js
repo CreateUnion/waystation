@@ -275,7 +275,7 @@ test('握手：无在册端点时不置保守态（无从对表即无对表义�
 
 /* —— 抢接规程 —— */
 
-test('抢接发起守卫：管理器 / 未判失联 / 无快照 / 未接线探测均拒绝', async (t) => {
+test('抢接发起守卫：站长 / 未判失联 / 无快照 / 未接线探测均拒绝', async (t) => {
   const managerSide = makeHarness(t);
   const managed = await managerActive(managerSide);
   const asManager = await managerSide.service.takeOver({ collabId: managed });

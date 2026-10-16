@@ -250,7 +250,7 @@ export async function stopViewer({ candidatePorts, digest, probe = probeViewer, 
 
 /* —— 自动开窗：触发 A/B 的构造与出口 —— */
 
-/* 触发 B「进行中」状态集，按角色写死（设计 §3.2）：管理侧 = 尚未归档的全部状态——自己创建的
+/* 触发 B「进行中」状态集，按角色写死（设计 §3.2）：站长侧 = 尚未归档的全部状态——自己创建的
  * 协作在等对方同意（proposed）期间开新会话照样拉起；成员侧 = 已入席——受邀未同意不弹，防与
  * 「防每会话被弹」的意图相抵。 */
 const MANAGER_IN_PROGRESS_STATES = ['proposed', 'active', 'frozen'];

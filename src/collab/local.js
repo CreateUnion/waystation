@@ -200,7 +200,7 @@ export function memberStateFor(status) {
 }
 
 /* 冻结前状态的兜底推测（旧数据缺 frozenFrom 标记时）：成员侧已回应过邀请即视为 active，
- * 未回应视为 proposed；管理侧存在非邀请态成员即视为 active，否则 proposed。 */
+ * 未回应视为 proposed；站长侧存在非邀请态成员即视为 active，否则 proposed。 */
 export function inferredFrozenFrom(local) {
   if (local.role === 'manager') {
     const settled = local.ledger.members.some((entry) => entry.role !== 'manager' && entry.state !== 'invited' && entry.state !== 'left');

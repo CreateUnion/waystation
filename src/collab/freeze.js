@@ -9,7 +9,7 @@ import { endpointFor, governanceTargets, invitePayloadOf, mutateLedger, notifyLo
  * 匹配一律用同名 + 成员交集（与冻结检出同一判据）；系统不自动仲裁——本地已处置者以本地为准，
  * 收到相抵的远端裁定不改本地状态（冲突计数留痕，由人继续谈）。 */
 
-/* 48 小时无裁定提示：管理侧取台账 frozenAt、成员侧取记录 frozenAt；旧数据缺标记时进程内自见到起算
+/* 48 小时无裁定提示：站长侧取台账 frozenAt、成员侧取记录 frozenAt；旧数据缺标记时进程内自见到起算
  * （重启重计——提示至多延后，不会误报）。提示一次即停，解除冻结后复位。 */
 export function checkFrozenDeadlines(state, now) {
   for (const local of state.collabs.values()) {

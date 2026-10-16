@@ -659,7 +659,7 @@ test('null 语义：目录不存在／id 形态非法／root 非法 → null 不
 
 test('listCollabs：主目录＋sites 双根（同名 id 两目录）、非 ID_PATTERN 目录忽略、updatedAt 最大者倒序', (t) => {
   const dataDir = makeTempDir(t);
-  // main 根：c-1 讨论（两帖两事件）；c-2 协作（管理员席位）；非法名目录与散文件应被忽略
+  // main 根：c-1 讨论（两帖两事件）；c-2 协作（站长席位）；非法名目录与散文件应被忽略
   writeFiles(collabDirIn(dataDir, 'main', 'c-1'), {
     [POSTS_FILE_NAME]: jsonl(postEntry(), postEntry({ entryId: 'post-2', seq: 2, ts: tsPlus(500) })),
     [MEMBERS_FILE_NAME]: jsonl(

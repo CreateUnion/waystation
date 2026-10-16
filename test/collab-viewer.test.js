@@ -348,7 +348,7 @@ test('成员流坏行：回放与增量均印跳过提示（与帖流同一提�
   assert.equal(viewer.countOf('跳过一条无法解析的记录行'), 2, '增量期坏行再留痕一次');
 });
 
-test('元状态：名称/状态变化各印一行系统行（管理席读台账）', async (t) => {
+test('元状态：名称/状态变化各印一行系统行（站长席读台账）', async (t) => {
   const home = makeStationDir(t);
   seedCollab(home, { posts: 1, seat: 'manager' });
   const viewer = startViewer(t, { home });

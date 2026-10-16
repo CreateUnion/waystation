@@ -727,7 +727,7 @@ async function approveInto(node, collabId) {
   assert.equal((await node.command({ cmd: 'approve_invite', collabId, approve: true })).ok, true);
 }
 
-/* 三节点编排（并发抢接用）：节点已由组守卫启动，这里先建乙丙协作接上彼此端点，再建甲管理的三人主协作。 */
+/* 三节点编排（并发抢接用）：节点已由组守卫启动，这里先建乙丙协作接上彼此端点，再建甲任站长的三人主协作。 */
 async function buildGovernedTriad(t, { a, b, c, port }) {
   const y = await c.command({ cmd: 'create_collab', name: '接线项目', topic: '主题', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
   await approveInto(b, y.collabId);
@@ -754,7 +754,7 @@ function spawnEstablishPairNodes(t, port, config, options = {}) {
   ]);
 }
 
-/* 双成员达成（甲管理、乙同意、建立并推过快照）。 */
+/* 双成员达成（甲任站长、乙同意、建立并推过快照）。 */
 async function establishPairWith(t, { a, b, port, name }) {
   const created = await a.command({ cmd: 'create_collab', name, topic: '主题', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
   assert.equal(created.ok, true);

@@ -14,7 +14,7 @@ function quietLog() {
   return { info: () => {}, warn: () => {}, error: () => {} };
 }
 
-test('冻结前状态兜底：管理侧看成员落定、成员侧看同决结果（旧数据缺 frozenFrom 标记）', () => {
+test('冻结前状态兜底：站长侧看成员落定、成员侧看同决结果（旧数据缺 frozenFrom 标记）', () => {
   const manager = (members) => inferredFrozenFrom({ role: 'manager', ledger: { members } });
   assert.equal(manager([{ role: 'member', state: 'invited' }]), 'proposed', '全部仍在邀请态 → 未成立');
   assert.equal(manager([{ role: 'member', state: 'member' }]), 'active', '存在落定成员 → 已成立');

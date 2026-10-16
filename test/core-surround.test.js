@@ -385,7 +385,7 @@ test('整链·观察窗触发记账（真核）：建协触发 A 达出口；新
   const seed = bridgeClientFor(home, record, { bridgeId: 'bridge-seed', sessionId: 'session-seed' });
   live.push(seed);
   await seed.client.connect();
-  /* 建协（进行中：管理侧 proposed）→ 触发 A 以单核根拉起该协作页（测试上下文闸拦下开窗，出口留痕）。 */
+  /* 建协（进行中：站长侧 proposed）→ 触发 A 以单核根拉起该协作页（测试上下文闸拦下开窗，出口留痕）。 */
   const created = await callAndWait(seed, 'ws_create_collab', {
     name: '记账项目', topic: '主题', targets: [{ instanceId: 'inst-peer', identityName: '对端', address: '127.0.0.1', port: peerPort }],
   });

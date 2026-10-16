@@ -391,7 +391,7 @@ test('已注入标记：正常注入记真（跨重启保留）；重复副本�
   await waitFor(() => (reportFor(reloaded, joinCopy.msgId) ? true : null));
 });
 
-test('清理挂点：成员退出（讨论）与管理结束 / 整条撤回（协作）清理静音状态', async (t) => {
+test('清理挂点：成员退出（讨论）与站长结束 / 整条撤回（协作）清理静音状态', async (t) => {
   const made = makeService(t);
   const forumId = await makeMemberForum(made, { collabId: 'collab-clear-leave' });
   made.service.setMute({ collabId: forumId, muted: true });

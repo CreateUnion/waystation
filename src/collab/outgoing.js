@@ -1289,7 +1289,7 @@ export function countLiveCollabs(state) {
   return count;
 }
 
-/* 席位转移原语（接管生效 / 移交受让共用）：以给定台账担任站长席位——本地记录转管理、
+/* 席位转移原语（接管生效 / 移交受让共用）：以给定台账担任站长席位——本地记录转站长、
  * 台账落盘（本机成为单一写者）、自身留存并推送当前视图（成员由此学习新站长端点）。 */
 export function promoteToManager(state, local, ledger) {
   syncRosterRoles(ledger);
