@@ -435,10 +435,16 @@ function createCoreChangeoverSeat(state) {
 }
 
 /* 桥注册（设计 §3.1-6 末位）：注册表记账 + 会话状态文件写面；该会话首次出现才按规则判一次
- * 观察窗触发 B——每 sessionId 一次记账（重连/顶替/重生重注册不重判，设计 §7）。 */
+ * 观察窗触发 B——每 sessionId 一次记账（重连/顶替/重生重注册不重判，设计 §7）。
+ * 记账后补投挂起的指名邀请（离线目标挂起、重开即活）：让出一拍再发起——注册回执（welcome）
+ * 在本同步回合内才写出发送，先投的 push 会被桥侧按「握手期收到 push」拒帧（IPC 客户端契约）；
+ * 让出后 welcome 已在途（同连接写序保持），投递异步进行、注册路径只发起不等候，失败只留痕。 */
 function registerBridgeEntry(state, record) {
   state.bridges.register(record);
   const noticed = state.sessionStatus.noteRegister(record);
+  queueMicrotask(() => {
+    void state.routing?.flushPendingInvites?.(record.sessionId);
+  });
   if (noticed.firstSeen) {
     triggerViewerOnStart(state, record.sessionId);
   }
@@ -733,6 +739,9 @@ function buildComponents(state) {
     dataDir: state.dataDir,
     log: state.log,
     describeCollab: (collabId) => state.collab?.describe(collabId) ?? null,
+    /* 本机获准台账判据（adopt 收紧：未获准不夺席）：闭包运行期取协作服务——判据面缺席（未作答）
+     * 时按无判据继续，写类调用不因附属面受阻。 */
+    isGranted: (collabId, sessionId) => state.collab?.join?.isGranted?.(collabId, sessionId) ?? null,
   });
   state.collab = createCollabService({
     dataDir: state.dataDir,

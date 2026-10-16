@@ -1,8 +1,8 @@
 import { isIP } from 'node:net';
-import { ID_PATTERN, MAX_REASON_CHARS, isIdentityName, isPresentationText } from '../net/protocol.js';
+import { ID_PATTERN, MAX_REASON_CHARS, PROTOCOL_VERSION, isIdentityName, isPresentationText, newMsgId } from '../net/protocol.js';
 import { createJoinApplicationsStore, createJoinsStore } from './joins.js';
 import { currentManagerIdOf, isLocalArchivedState, localModeOf, localNameOf, selfJoinedOf } from './local.js';
-import { endpointFor, notifyLocal } from './outgoing.js';
+import { endpointFor } from './outgoing.js';
 import { shortSessionId } from '../util/short-id.js';
 
 /* 加入域服务（会话级加入 §2/§4）：会话申请 / 站长批准 / 接线 / 拒绝呈现 ＋ 讨论直连。
@@ -455,14 +455,45 @@ function writeApproval(joinState, approval) {
   return written;
 }
 
-/* 拒绝呈现：一行本机提示（协作名 ＋ 本会话短码 ＋ 原因）。提示经本机注入面按该协作的绑定路由——
- * 未接线（申请被拒的常态）时路由面按「无活跃绑定会话」丢弃留痕：不静默消失，也不把拒绝误投给
+/* 拒绝呈现：一行本机提示（协作名 ＋ 本会话短码 ＋ 原因），按**申请会话**寻址投递——被拒会话
+ * 尚未接线（申请被拒的常态），按绑定路由投不到它；帧携 targetSessionId，核心路由据其投该会话
+ * 的桥。该会话不在场即由路由面按「指名会话不在场」丢弃留痕：不静默消失，也不把拒绝误投给
  * 持有该协作席位的他会话。 */
 function presentDenial(joinState, { collabId, sessionId, reason }) {
   const local = joinState.state.collabs.get(collabId);
   const name = local === undefined ? collabId : localNameOf(local);
   const head = `加入申请被拒绝：协作「${name}」的站长拒绝了本会话（${shortSessionId(sessionId)}）的加入申请`;
-  notifyLocal(joinState.state, local ?? { collabId }, reason === undefined ? head : `${head}——原因：${reason}`);
+  notifySession(joinState, local ?? { collabId }, sessionId, reason === undefined ? head : `${head}——原因：${reason}`);
+}
+
+/* 按会话寻址的本机提示（拒绝呈现的定向形态）：帧构造与投递口径沿既有本机提示先例（notifyLocal），
+ * 只多一个指名面（payload.targetSessionId——与邀请面的目标同字段同语义）。提示是附属面：注入面
+ * 缺位 / 抛错一律如实返回（申请记录已删的事实不受影响）。 */
+function notifySession(joinState, local, sessionId, text) {
+  const state = joinState.state;
+  if (typeof state.notify !== 'function') {
+    return undefined;
+  }
+  try {
+    const routed = state.notify({
+      v: PROTOCOL_VERSION,
+      type: 'notice',
+      msgId: newMsgId(),
+      from: state.self,
+      collabId: local.collabId,
+      ts: new Date().toISOString(),
+      payload: { event: 'local-alert', text, targetSessionId: sessionId },
+    });
+    if (routed === false) {
+      return false;
+    }
+    state.counters.notificationsSent++;
+    return true;
+  } catch (error) {
+    state.counters.notificationsDropped++;
+    state.log.warn('本机提示投递失败（已忽略）', { collabId: local.collabId, reason: error.message });
+    return false;
+  }
 }
 
 /* 拒绝原因的服务层预校验（与协议层 decline / stop 的原因同一判据；空串归一为未给出）。 */

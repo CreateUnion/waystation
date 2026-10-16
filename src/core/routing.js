@@ -6,21 +6,26 @@ import { MAX_TAKEOVER_WINDOW_MS } from '../config.js';
 import { bindingsFilePath } from '../paths.js';
 import { writeJsonAtomic } from '../storage.js';
 import { renderSessionMessage } from '../adapters/claude-code.js';
+import { listLocalCollabIds, loadMember, saveMember } from '../collab/store.js';
 import { ensureRunDir } from './ipc.js';
 
 /* 注入路由（设计 §4 全要素）：绑定表（run/bindings.json）与两条注入决策链。
  * 链一（入站帧）：绑定查询 → 桥在线则 push（文本在核心渲染，桥不渲染不解析）→ 等待 delivered
  * 回执（期限 2s，超时按未注入处置）；绑定休眠到此为止、其余无绑定帧不投（数据已落盘、
  * 发送侧维持第二档）。无绑定邀请例外（首邀到达时绑定表尚无该条目，而其是本机待办——
- * 受邀请方据此走同意门）：投当前全部活跃桥，仍不写绑定。
+ * 受邀请方据此走同意门）：指名（payload.targetSessionId）只投目标会话的桥、不在场即登记挂起
+ * 于 member.json（该会话下次注册时补投）；未指名照旧投当前全部活跃桥。两者都不写绑定。
  * 链二（本机提示）：调用者相关（工具调用触发）投调用者桥——调用身份经 AsyncLocalStorage 随
- * 调用链外置，无需把 context 逐层穿过协作服务；定时器/入站类按绑定路由，休眠/无绑定丢弃＋留痕。
+ * 调用链外置，无需把 context 逐层穿过协作服务；携 targetSessionId 者按该会话寻址投桥
+ * （被拒会话常未接线，绑定路由投不到它）；定时器/入站类按绑定路由，休眠/无绑定丢弃＋留痕。
  * 判定口径（写死）：活跃 = 绑定的 sessionId 在当前注册桥集合内；休眠是派生状态（不落盘）——
  * 桥退场即休眠、原会话重连即活跃；绑定里的 bridgeId 只作入席出处记录。
- * adopt：写类调用来自活跃会话而绑定休眠/空 → 夺席（判定先于工具 handler）；绑定活跃且异会话
- * → 不夺席＋响应附 notice 指引；纯读类与敲门（ws_request_join）一律不改绑定。
+ * adopt：写类调用来自活跃会话而绑定休眠/空 → 夺席（判定先于工具 handler）；夺席前先过本机获准
+ * 台账判据（managed 且未获准 → 不夺席＋响应附「先 ws_join 申请」指引；讨论豁免）；绑定活跃且
+ * 异会话 → 不夺席＋席位持有指引；纯读类与敲门（ws_request_join）一律不改绑定。
  * 本模块不 import 桥组件与网络收发面（注册表与 IPC 发送面由组合根 attach 注入），
- * 渲染复用适配器的 renderSessionMessage（核心渲染面单一权威）。 */
+ * 渲染复用适配器的 renderSessionMessage（核心渲染面单一权威）；collab/store 只取成员记录
+ * 读写面（指名邀请的挂起登记与补投——过 loadMember 形态校验，不另造一份记录形态）。 */
 
 export const PUSH_RECEIPT_TIMEOUT_MS = 2000;
 
@@ -52,16 +57,21 @@ export function classifyTool(name) {
   return READ_CLASS_TOOLS.has(name) ? 'read' : 'none';
 }
 
-/* 绑定活跃时的跨会话写类调用指引（设计 §4.1 文案）——可达路径＝关掉/退出原会话后由休眠态夺席。 */
-export const ADOPT_GUIDANCE_NOTICE = '该协作的注入绑定于另一会话；如需本会话接收，请让该会话退出协作或关闭';
+/* 未获准（managed）时的写类调用指引（设计「会话级加入」写死文案）——夺席前先过本机获准台账：
+ * 未获准的会话即使绑定休眠/空也不夺席，可达路径＝先 ws_join 申请（或由站长批准）。 */
+export const ADOPT_GUIDANCE_NOTICE = '本会话未获准跟进该协作——先 ws_join 申请（或由站长批准）';
+/* 绑定活跃且异会话时的指引（设计 §4.1 文案）——与「未获准」是两种拒绝理由：席位被另一活跃
+ * 会话持有；可达路径＝关掉/退出原会话后由休眠态夺席（获准者）。 */
+export const ADOPT_HELD_NOTICE = '该协作的注入绑定于另一会话；如需本会话接收，请让该会话退出协作或关闭';
 /* 调用者相关提示的归属说明（链二①）：摘要投本会话，但该协作的持续注入归另一会话。 */
 export const ATTRIBUTION_NOTICE = '本协作的实时注入绑定于另一会话——本次调用触发的提示仅投本会话';
 /* 无会话标识的桥（env 缺 CLAUDE_CODE_SESSION_ID）：绑定/注入/夺席语义全部不可用——在写类与
  * 入席类调用（create/approve）的成功响应里如实说明（同一 notice 机制），不静默降级。 */
 export const SESSIONLESS_NOTICE = '本会话无会话标识（CLAUDE_CODE_SESSION_ID 缺失）——无法登记注入绑定，本会话收不到该协作的实时注入；请重开会话或检查客户端环境';
 
-/* 绑定条目的入席出处（写点枚举）。 */
-const BINDING_ORIGINS = ['create', 'join', 'adopt'];
+/* 绑定条目的入席出处（写点枚举）。grant＝加入域「批准接线」（离线会话写持久映射——加载面收了
+ * 才谈得上重开即活）。 */
+const BINDING_ORIGINS = ['create', 'join', 'adopt', 'grant'];
 /* 丢弃留痕的首行摘要截断（日志可读性；完整文案在帧里，日志只作定位）。 */
 const DROP_HEAD_MAX = 120;
 
@@ -332,13 +342,15 @@ function noteUnhealthy(state, bridgeId) {
 
 /**
  * @param {{ dataDir: string, log: any, describeCollab?: ((collabId: string) => any) | null,
+ *   isGranted?: ((collabId: string, sessionId: string) => boolean | null | undefined) | null,
  *   receiptTimeoutMs?: number, callTimeoutMs?: number, now?: () => number }} options
  */
-export function createInjectionRouter({ dataDir, log, describeCollab = null, receiptTimeoutMs = PUSH_RECEIPT_TIMEOUT_MS, callTimeoutMs = CALL_SAFETY_DEADLINE_MS, now = Date.now }) {
+export function createInjectionRouter({ dataDir, log, describeCollab = null, isGranted = null, receiptTimeoutMs = PUSH_RECEIPT_TIMEOUT_MS, callTimeoutMs = CALL_SAFETY_DEADLINE_MS, now = Date.now }) {
   const state = {
     dataDir,
     log,
     describeCollab,
+    isGranted,
     timeoutMs: receiptTimeoutMs,
     callTimeoutMs,
     clock: now,
@@ -350,11 +362,12 @@ export function createInjectionRouter({ dataDir, log, describeCollab = null, rec
     callContext: new AsyncLocalStorage(),
     droppedNotices: 0,
     counters: {
-      adoptions: 0, inboundPushed: 0, inboundUnrouted: 0, inboundFailed: 0,
-      notifyCaller: 0, notifyBound: 0, notifyDropped: 0, renderFailures: 0,
+      adoptions: 0, adoptGrantRefusals: 0, inboundPushed: 0, inboundUnrouted: 0, inboundFailed: 0,
+      notifyCaller: 0, notifyBound: 0, notifySession: 0, notifyDropped: 0, renderFailures: 0,
       callFailures: 0, callTimeouts: 0, callLateResults: 0,
       pushesSent: 0, pushSendFailures: 0, receiptTimeouts: 0,
       receiptsOk: 0, receiptsFailed: 0, receiptsUnmatched: 0,
+      inviteTargetPending: 0, pendingInvitesFlushed: 0,
     },
   };
   const pusher = createPusher(state);
@@ -375,6 +388,7 @@ function routerApiOf(state, pusher) {
     handleCall: (frame, record, options) => handleCallOf(state, frame, record, options),
     deliverToSession: (frame) => deliverOf(state, frame, pusher),
     notify: (frame) => notifyOf(state, frame, pusher),
+    flushPendingInvites: (sessionId) => flushPendingInvitesOf(state, sessionId, pusher),
     settleDelivered: (frame) => pusher.settle(frame),
     stats: () => ({
       ...state.counters,
@@ -386,8 +400,9 @@ function routerApiOf(state, pusher) {
   };
 }
 
-/* adopt 判定（设计 §4.1，先于工具 handler 调用）：写类 + collabId + 绑定休眠/空 → 夺席；
- * 绑定活跃且异会话 → 不夺席＋notice 指引；同会话/无 collabId/非写类 → 原样。
+/* adopt 判定（设计 §4.1 ＋「会话级加入」收紧，先于工具 handler 调用）：写类 + collabId + 绑定
+ * 休眠/空 → 先过获准判据（managed 且未获准 → 不夺席＋指引），获准才夺席；绑定活跃且异会话
+ * → 不夺席＋席位持有指引；同会话/无 collabId/非写类 → 原样。
  * 无会话标识的调用者不入席（绑定以 sessionId 为身份，无从记录）。 */
 function applyAdoptOf(state, { tool, args, caller, now = null }) {
   if (classifyTool(tool) !== 'write') {
@@ -398,18 +413,52 @@ function applyAdoptOf(state, { tool, args, caller, now = null }) {
     return noAdopt();
   }
   const sessionId = caller?.sessionId ?? null;
-  const held = state.bindings.get(collabId);
   if (!bindableCaller(sessionId, caller)) {
     return noAdopt();   // 无会话标识的桥本就不入席：指引文案对它不成立（另经 SESSIONLESS_NOTICE 说明）
   }
+  const held = state.bindings.get(collabId);
   if (bindingIsActive(held, state.registry)) {
-    return held.sessionId === sessionId ? noAdopt() : { adopted: false, notice: ADOPT_GUIDANCE_NOTICE };
+    return held.sessionId === sessionId ? noAdopt() : { adopted: false, notice: ADOPT_HELD_NOTICE };
+  }
+  return adoptFor(state, { collabId, sessionId, caller, now });
+}
+
+/* 休眠/空绑定下的夺席（先过获准判据）：本机获准台账无该会话 → 不夺席＋「先 ws_join 申请」指引；
+ * 获准（或无判据）→ 写绑定（origin adopt，set 即含落盘）。 */
+function adoptFor(state, { collabId, sessionId, caller, now = null }) {
+  if (isGrantBarred(state, collabId, sessionId)) {
+    state.counters.adoptGrantRefusals++;
+    state.log.info('写类调用未夺席（本机获准台账无该会话）', { collabId, sessionId });
+    return { adopted: false, notice: ADOPT_GUIDANCE_NOTICE };
   }
   const boundAt = new Date(now ?? state.clock()).toISOString();
   state.bindings.set(collabId, { sessionId, bridgeId: caller.bridgeId, boundAt, origin: 'adopt' });
   state.counters.adoptions++;
   state.log.info('写类调用夺席（绑定休眠或空）', { collabId, sessionId, bridgeId: caller.bridgeId });
   return { adopted: true, notice: null };
+}
+
+/* 获准判据（夺席前的最新一道）：只有明确答「未获准」才拦（false）；判据面未注入 / 非布尔作答 /
+ * 异常一律不拦——沿旧行为，不因附属面弄坏写类调用。讨论（forum）豁免——讨论无批准门；
+ * 未知模式按 managed 解释（与成员记录形态的缺省口径同源）。 */
+function isGrantBarred(state, collabId, sessionId) {
+  if (typeof state.isGranted !== 'function' || isForumInstance(state, collabId)) {
+    return false;
+  }
+  try {
+    return state.isGranted(collabId, sessionId) === false;
+  } catch (error) {
+    state.log.warn('获准判据面异常（按无判据继续——不收紧）', { collabId, reason: error?.message });
+    return false;
+  }
+}
+
+function isForumInstance(state, collabId) {
+  try {
+    return state.describeCollab?.(collabId)?.mode === 'forum';
+  } catch {
+    return false;   // 描述器异常按 managed 解释（最严的一侧）
+  }
 }
 
 /* 可入席的调用者（绑定以 sessionId 为身份、bridgeId 作出处）：无会话标识的桥不入席。 */
@@ -599,11 +648,16 @@ function isUnboundInvite(state, frame) {
 }
 
 /* 无绑定邀请的机器级兜底：邀请是本机待办（受邀请方据此走同意门），首邀到达时绑定表却尚无该
- * 条目（写点只有 create/join/adopt）——投给当前全部活跃注册桥。同机多窗口＝同一参与者，该由
- * 哪个窗口处理由人决定，故不猜接收者、全部投；各桥并发推送、独立回执期限，单桥失败不阻断
- * 其余。不写绑定：席位仍只由 create/join/adopt 写点建立（邀请到达不是入席）。
+ * 条目（写点只有 create/join/adopt/grant）——指名者只投目标会话的桥（不在场即登记挂起、等其
+ * 注册补投），未指名者投给当前全部活跃注册桥（同机多窗口＝同一参与者，该由哪个窗口处理由人
+ * 决定，故不猜接收者、全部投）；各桥并发推送、独立回执期限，单桥失败不阻断其余。
+ * 不写绑定：席位仍只由 create/join/adopt/grant 写点建立（邀请到达不是入席）。
  * 零活跃桥＝挂起照旧（不投、计未投）——数据已落盘，工具与观察窗照常可拉。 */
 async function deliverInviteBroadcastOf(state, frame, pusher) {
+  const target = inviteTargetOf(frame);
+  if (target !== undefined) {
+    return deliverNamedInviteOf(state, frame, target, pusher);
+  }
   const targets = state.registry.list();
   if (targets.length === 0) {
     state.counters.inboundUnrouted++;
@@ -622,6 +676,184 @@ async function deliverInviteBroadcastOf(state, frame, pusher) {
     state.counters.inboundFailed++;
   }
   return ok;
+}
+
+/* 指名邀请的投递（设计「会话级加入」点名落点一）：只投目标会话的桥——在册会话上做唯一前缀
+ * 匹配（短码＝会话标识前 8 字符是对外表示）；无匹配 / 歧义一律按「指定会话不在场」处置：
+ * 登记挂起于 member.json（该会话下次注册时补投），本帧按未投计数（不猜接收者、不落回广播）。
+ * 目标指名随记录定格（member.json 的 targetSessionId——点头判据：只有该会话能点头）。 */
+async function deliverNamedInviteOf(state, frame, target, pusher) {
+  const text = renderTextOf(state, frame);
+  if (text === null) {
+    state.counters.inboundUnrouted++;
+    return false;   // 渲染失败只丢该条（不登记——坏帧重开也投不出，渲染面已留痕）
+  }
+  const entry = target === null ? null : liveSessionEntryOf(state, target);
+  if (entry === null) {
+    return giveUpNamedInvite(state, frame, target);
+  }
+  rememberNamedInvite(state, frame, entry.sessionId, false);
+  const ok = await pusher.push(entry.record, { text, collabId: frame.collabId, frameType: frame.type });
+  if (ok) {
+    state.counters.inboundPushed++;
+  } else {
+    state.counters.inboundFailed++;
+  }
+  return ok;
+}
+
+/* 指名邀请投不出去（目标形态坏 / 不在场）：形态坏不登记（重开也投不出坏帧）；不在场登记挂起
+ * （成员记录读写失败即未登记）。两种结局都按未投计数——三态互斥（有桥而全败才是失败）。 */
+function giveUpNamedInvite(state, frame, target) {
+  state.counters.inboundUnrouted++;
+  if (target !== null && rememberNamedInvite(state, frame, target, true)) {
+    state.counters.inviteTargetPending++;
+    state.log.info('指名邀请的目标会话不在场（登记挂起——该会话注册时补投）', { collabId: frame.collabId, targetSessionId: target });
+    return false;
+  }
+  state.log.warn('指名邀请未投出（目标形态坏 / 不在场而成员记录不可用）', { collabId: frame.collabId, targetSessionId: frame?.payload?.targetSessionId });
+  return false;
+}
+
+/* 指名目标的读出：undefined＝未指名（字段缺失 / 空串——照旧广播，旧版对端与未指名同规）；
+ * null＝指名面形态坏（见了字段但不是标识形态——按「指定会话不在场」处置，不落回广播）；
+ * 字符串＝目标会话（短码或全标识，接收侧做唯一前缀匹配）。 */
+function inviteTargetOf(frame) {
+  const token = frame?.payload?.targetSessionId;
+  if (token === undefined || token === null || token === '') {
+    return undefined;
+  }
+  return isCollabId(token) ? token : null;
+}
+
+/* 活跃会话的唯一前缀命中（无匹配 / 多义 → null：不猜接收者）。 */
+function liveSessionEntryOf(state, token) {
+  if (state.registry === null || state.ipc === null) {
+    return null;
+  }
+  const matched = state.registry.list().filter((entry) => typeof entry.sessionId === 'string' && sessionMatchesToken(entry.sessionId, token));
+  return matched.length === 1 ? matched[0] : null;
+}
+
+function sessionMatchesToken(sessionId, token) {
+  return sessionId === token || sessionId.startsWith(token);
+}
+
+/* —— 指名邀请的登记面（member.json 的 targetSessionId ＋ pendingInvites）与补投 —— */
+
+/* 指名随成员记录定格（点头判据：只有该会话能点头）＋按需登记挂起帧（原帧随登记留存——补投
+ * 经同一渲染面）。整条记录读改写：读面过 loadMember 形态校验（形态不符即不落，不另造一份
+ * 记录形态）；写面失败只留痕（在场投出不受影响）。返回登记面是否已落地。 */
+function rememberNamedInvite(state, frame, targetSessionId, pending) {
+  const record = loadMember(state.dataDir, frame.collabId);
+  if (record === null) {
+    state.log.warn('指名邀请未定格（成员记录缺失或形态不符）', { collabId: frame.collabId });
+    return false;
+  }
+  const patched = { ...record, targetSessionId };
+  if (pending) {
+    patched.pendingInvites = upsertPendingInvite(record.pendingInvites, { sessionId: targetSessionId, frame });
+  }
+  try {
+    saveMember(state.dataDir, patched);
+    return true;
+  } catch (error) {
+    state.log.warn('指名邀请登记写盘失败（登记面未落）', { collabId: frame.collabId, reason: error.message });
+    return false;
+  }
+}
+
+/* 同名目标就地刷新（重发邀请带来新帧标识——补投投的是最新那一份）。 */
+function upsertPendingInvite(list, entry) {
+  const kept = Array.isArray(list) ? list.filter((item) => item?.sessionId !== entry.sessionId) : [];
+  return [...kept, entry];
+}
+
+/* 挂起补投（桥注册挂点的核心出口，组合根在会话状态记账后调用）：逐本机协作把登记给该会话的
+ * 指名邀请投出——投出成功即摘除登记、投不出去保留（下次补投再试）；邀请已处置 / 过有效期的
+ * 登记就地摘除。全程不抛（注册路径不得因补投失败受阻）。 */
+async function flushPendingInvitesOf(state, sessionId, pusher) {
+  try {
+    return await flushPendingInvitesInner(state, sessionId, pusher);
+  } catch (error) {
+    state.log.warn('挂起邀请补投异常（已隔离——注册不受影响）', { sessionId, reason: error?.message });
+    return 0;
+  }
+}
+
+async function flushPendingInvitesInner(state, sessionId, pusher) {
+  const entry = isCollabId(sessionId) ? (state.registry?.find?.(sessionId) ?? null) : null;
+  if (entry === null || state.ipc === null) {
+    return 0;
+  }
+  let flushed = 0;
+  for (const collabId of listLocalCollabIds(state.dataDir)) {
+    flushed += await flushCollabInvitesOf(state, collabId, { sessionId, entry, pusher });
+  }
+  return flushed;
+}
+
+/* 单协作一轮补投：登记面读改写一次（未投出与未摘除的条目原样保留）。 */
+async function flushCollabInvitesOf(state, collabId, ctx) {
+  const record = loadMember(state.dataDir, collabId);
+  const pending = Array.isArray(record?.pendingInvites) ? record.pendingInvites : null;
+  if (record === null || pending === null || pending.length === 0) {
+    return 0;
+  }
+  const kept = [];
+  let flushed = 0;
+  for (const item of pending) {
+    const outcome = await flushPendingInviteOf(state, item, { ...ctx, collabId, record });
+    if (outcome === 'pushed') {
+      flushed++;
+    }
+    if (outcome === 'kept') {
+      kept.push(item);
+    }
+  }
+  if (kept.length !== pending.length) {
+    writePendingInvites(state, collabId, record, kept);
+  }
+  return flushed;
+}
+
+/* 单条补投判定：非本次注册的会话（含前缀歧义）不动它；已处置 / 过期的摘除；渲染不出的保留
+ * （下一轮再试，不因渲染失败丢登记）；投出成功计数并摘除，投不出去保留。 */
+async function flushPendingInviteOf(state, item, ctx) {
+  const targetEntry = typeof item?.sessionId === 'string' ? liveSessionEntryOf(state, item.sessionId) : null;
+  if (targetEntry === null || targetEntry.sessionId !== ctx.sessionId) {
+    return 'kept';
+  }
+  if (isInviteSettledOrExpired(state, ctx.record)) {
+    state.log.info('挂起邀请不再补投（已处置或过有效期）——摘除登记', { collabId: ctx.collabId, targetSessionId: item.sessionId });
+    return 'dropped';
+  }
+  const frame = item?.frame;
+  const text = frame === undefined ? null : renderTextOf(state, frame);
+  const ok = text !== null && await ctx.pusher.push(targetEntry.record, { text, collabId: ctx.collabId, frameType: frame.type });
+  if (ok !== true) {
+    return 'kept';
+  }
+  state.counters.pendingInvitesFlushed++;
+  state.log.info('挂起邀请已补投（目标会话注册）', { collabId: ctx.collabId, targetSessionId: targetEntry.sessionId });
+  return 'pushed';
+}
+
+/* 邀请是否已处置（已回应 / 已退出等非提议态）或过有效期（成员记录 expiresAt）——两者都不再补投。 */
+function isInviteSettledOrExpired(state, record) {
+  if (record.state !== 'proposed' || (record.decision ?? null) !== null) {
+    return true;
+  }
+  const expiresAtMs = typeof record.expiresAt === 'string' ? Date.parse(record.expiresAt) : Number.NaN;
+  return Number.isFinite(expiresAtMs) && state.clock() >= expiresAtMs;
+}
+
+function writePendingInvites(state, collabId, record, kept) {
+  try {
+    saveMember(state.dataDir, { ...record, pendingInvites: kept });
+  } catch (error) {
+    state.log.warn('挂起邀请登记写回失败（保留原登记——下轮再试）', { collabId, reason: error.message });
+  }
 }
 
 async function deliverOf(state, frame, pusher) {
@@ -646,11 +878,17 @@ async function deliverOf(state, frame, pusher) {
 /* —— 链二：本机提示 —— */
 
 /* 返回 false = 该提示无接收者（join-ack 判据的落点：调用方据此「不回 ack」）；
- * 返回 true = 已投出（或已交给等待面）。异常不抛出以外的返回值契约见 outgoing.notifyLocal。 */
+ * 返回 true = 已投出（或已交给等待面）。异常不抛出以外的返回值契约见 outgoing.notifyLocal。
+ * 携 targetSessionId 者先走按会话寻址（显式指名优先于调用者/绑定归属——被拒会话常未接线，
+ * 绑定路由投不到它）；该会话不在场即丢弃留痕，不误投持席会话。 */
 function notifyOf(state, frame, pusher) {
   const text = renderTextOf(state, frame);
   if (text === null || !isCollabId(frame?.collabId)) {
     return dropNoticeOf(state, frame, text, '帧形态不全');
+  }
+  const target = noticeTargetOf(frame);
+  if (target !== undefined) {
+    return notifySessionOf(state, frame, text, target, pusher);
   }
   const caller = state.callContext.getStore();
   if (caller?.active === true) {
@@ -663,6 +901,28 @@ function notifyOf(state, frame, pusher) {
   void pusher.push(entry.record, { text, collabId: frame.collabId, frameType: frame.type });
   state.counters.notifyBound++;
   return true;
+}
+
+/* 链二③：按会话寻址（提示帧携 payload.targetSessionId）：投该会话的桥——短码做唯一前缀
+ * 匹配；不在场 / 歧义即按无接收者丢弃留痕。 */
+function notifySessionOf(state, frame, text, target, pusher) {
+  const entry = target === null ? null : liveSessionEntryOf(state, target);
+  if (entry === null) {
+    return dropNoticeOf(state, frame, text, target === null ? '指名会话形态坏' : '指名会话不在场');
+  }
+  void pusher.push(entry.record, { text, collabId: frame.collabId, frameType: frame.type });
+  state.counters.notifySession++;
+  return true;
+}
+
+/* 提示帧的指名会话（payload.targetSessionId）：undefined＝未指名（照旧按调用者/绑定路由）；
+ * null＝形态坏（不猜接收者）。与邀请面的目标同字段同语义——都是「投给这个会话」。 */
+function noticeTargetOf(frame) {
+  const token = frame?.payload?.targetSessionId;
+  if (token === undefined || token === null || token === '') {
+    return undefined;
+  }
+  return isCollabId(token) ? token : null;
 }
 
 /* 链二①：投调用者桥；调用者非该协作绑定会话时把归属说明记进本次调用回报（附 C 同口径：

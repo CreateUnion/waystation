@@ -598,8 +598,13 @@ function statsOf(state) {
 
 /* 邀请回应的驱动面（讨论）：同意即加入后立即起一轮回填对表（复用周期对表的同一入口）——
  * 新人不必等下一个周期节拍（默认 60s）才看到历史。让出到微任务边界再起：本机这一回合的外发
- * 次序为 join 自播先、对表请求后（应答方准入按「请求方在成员表内」把关——请求先到会被拒）。 */
+ * 次序为 join 自播先、对表请求后（应答方准入按「请求方在成员表内」把关——请求先到会被拒）。
+ * 点头前先过指名判定（指名邀请只有该会话能点头）。 */
 function approveNow(state, input) {
+  const refusal = namedInviteRefusalOf(state, input);
+  if (refusal !== null) {
+    return refusal;
+  }
   const result = approveInvite(state, input);
   if (result.ok === true && result.joined === true) {
     const local = state.collabs.get(input?.collabId);
@@ -610,6 +615,63 @@ function approveNow(state, input) {
     }
   }
   return result;
+}
+
+/* 指名邀请的点头判定（「会话级加入」点名落点三）：member.json 的 targetSessionId 定格「只有该
+ * 会话能点头」——其余会话（含无会话标识的调用）即使拿到邀请也拒，指引走 ws_join。判据读取成
+ * 员记录文件（指名标记的写入方是核心路由面，内存记录可能尚未载入该字段），读不出退回内存记录；
+ * 目标按短码定格时用唯一前缀匹配（与接收侧同一口径）。null＝无指名 / 未指名：交既有路径。
+ * 调用者会话标识取自输入（工具面穿 context.sessionId；caller.sessionId 形态一并接受）。 */
+function namedInviteRefusalOf(state, input) {
+  const collabId = input?.collabId;
+  const local = state.collabs.get(collabId);
+  if (local === undefined) {
+    return null;   // 未知协作：交既有路径如实拒（不在此另立文案）
+  }
+  const target = namedInviteTargetOf(state, collabId, local);
+  if (target === null) {
+    return null;
+  }
+  if (targetSessionMatches(target, callerSessionIdOf(input))) {
+    learnInviteTarget(local, target);   // 点名已核对：补学进内存记录（后续整写不抹掉它）
+    return null;
+  }
+  return {
+    ok: false,
+    message: `该邀请指定给了别的会话（${shortSessionId(target)}）——只有该会话能点头；本会话要跟进请走 ws_join 申请`,
+  };
+}
+
+/* 指名标记的取数：成员记录文件优先（标记的写入方是核心路由面，内存记录可能尚未载入），
+ * 读不出退回内存记录；两者都无（或空串）返 null＝未指名。 */
+function namedInviteTargetOf(state, collabId, local) {
+  const record = loadMember(state.dataDir, collabId);
+  const target = typeof record?.targetSessionId === 'string' ? record.targetSessionId : local.member?.targetSessionId;
+  return typeof target === 'string' && target !== '' ? target : null;
+}
+
+/* 点头会话与指名的比对：全标识精确命中，短码（对外表示）唯一前缀命中。 */
+function targetSessionMatches(target, sessionId) {
+  return sessionId !== null && (sessionId === target || sessionId.startsWith(target));
+}
+
+/* 内存成员记录补学（记录文件有而内存态无的指名标记）：成员记录随后会被整写（回应落地等），
+ * 不补学就会在第一次整写时被抹掉——点名随即失效。 */
+function learnInviteTarget(local, target) {
+  if (local.member !== null && typeof local.member === 'object' && local.member.targetSessionId === undefined) {
+    local.member.targetSessionId = target;
+  }
+}
+
+/* 调用者会话标识（点头判据的比对面）：工具面穿 context.sessionId（平铺形态，与 ws_list_collabs
+ * 同款）；路由面调用者可给 caller.sessionId。均缺＝无会话标识（无从核对指名）。 */
+function callerSessionIdOf(input) {
+  const flat = typeof input?.sessionId === 'string' && input.sessionId !== '' ? input.sessionId : null;
+  if (flat !== null) {
+    return flat;
+  }
+  const nested = input?.caller?.sessionId;
+  return typeof nested === 'string' && nested !== '' ? nested : null;
 }
 
 /* 对表驱动入口（显式触发面；周期 tick 走 startSyncEngine 的定时器）：省略 collabId = 全量扫一轮
