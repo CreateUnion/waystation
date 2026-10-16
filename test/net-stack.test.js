@@ -355,6 +355,90 @@ test('requestJoin：发现层 rejection → 收敛为错误形态（不直穿）
   assert.ok(result.message.includes('套接字未运行'));
 });
 
+test('requestJoinResolve：降级（站点不可用）→ 明确错误文案（不触达发现层）', { timeout: 15000 }, async (t) => {
+  const discovery = createFakeDiscovery();
+  const { stack } = makeStack(t, { discovery, degraded: { reason: 'segment-exhausted', message: '端口段全满——本地功能可用' } });
+  await stack.start();
+  const result = await stack.requestJoinResolve({ name: '联调讨论', address: '127.0.0.2', port: 17321 });
+  assert.equal(result.ok, false);
+  assert.equal(result.message, '端口段全满——本地功能可用');
+  assert.deepEqual(discovery.calls, [], '降级态不触达组件（预降级直通）');
+});
+
+test('requestJoinResolve：讨论名 / 目标地址 / 端口形态非法 → 明确错误（不发畸形载荷、不做无谓收答等待）', { timeout: 15000 }, async (t) => {
+  const calls = [];
+  const discovery = createFakeDiscovery({
+    requestJoinResolve: async (args) => {
+      calls.push(args);
+      return null;
+    },
+  });
+  const { stack } = makeStack(t, { discovery });
+  await stack.start();
+  t.after(() => stack.close());
+  const cases = [
+    [{}, '讨论名非法'],
+    [{ name: '甲\n乙', address: '127.0.0.2', port: 17321 }, '讨论名非法'],
+    [{ name: '联调讨论', address: 'localhost', port: 17321 }, '目标地址非法'],
+    [{ name: '联调讨论', address: '127.0.0.2', port: 0 }, '目标端口非法'],
+  ];
+  for (const [args, expected] of cases) {
+    const result = await stack.requestJoinResolve(args);
+    assert.equal(result.ok, false, JSON.stringify(args));
+    assert.ok(result.message.includes(expected), result.message);
+  }
+  assert.equal(calls.length, 0, '非法参数在启程前把关（单播不承载畸形载荷）');
+});
+
+test('requestJoinResolve：合法 → 透传 trim 名与目标端点（含窗口）、回传解析结果', { timeout: 15000 }, async (t) => {
+  const calls = [];
+  const reply = {
+    found: true,
+    collabId: 'collab-1',
+    name: '联调讨论',
+    responder: { instanceId: 'inst-a', identityName: '主机甲', address: '127.0.0.2', port: 17321 },
+    replies: 1,
+  };
+  const discovery = createFakeDiscovery({
+    requestJoinResolve: async (args) => {
+      calls.push(args);
+      return reply;
+    },
+  });
+  const { stack } = makeStack(t, { discovery });
+  await stack.start();
+  t.after(() => stack.close());
+  const result = await stack.requestJoinResolve({ name: ' 联调讨论 ', address: '127.0.0.2', port: 17322, timeoutMs: 800 });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, '联调讨论', '名字 trim 后下传');
+  assert.equal(calls[0].address, '127.0.0.2');
+  assert.equal(calls[0].port, 17322, '目标端口是发现层参数而非站点端口');
+  assert.equal(calls[0].timeoutMs, 800, '收答窗口原样转交（缺省由发现层兜底）');
+  assert.deepEqual(result, { ok: true, reply });
+});
+
+test('requestJoinResolve：窗口内无应答 → reply 为 null；发现层 rejection 收敛为错误形态（不直穿）', { timeout: 15000 }, async (t) => {
+  const silent = createFakeDiscovery({ requestJoinResolve: async () => null });
+  const first = makeStack(t, { discovery: silent });
+  await first.stack.start();
+  t.after(() => first.stack.close());
+  const result = await first.stack.requestJoinResolve({ name: '联调讨论', address: '127.0.0.2', port: 17321 });
+  assert.deepEqual(result, { ok: true, reply: null }, '无应答＝问过了没人答（与「答了未命中」两回事），不算错误');
+
+  const broken = createFakeDiscovery({
+    requestJoinResolve: async () => {
+      throw new Error('套接字未运行');
+    },
+  });
+  const second = makeStack(t, { discovery: broken });
+  await second.stack.start();
+  t.after(() => second.stack.close());
+  const failed = await second.stack.requestJoinResolve({ name: '联调讨论', address: '127.0.0.2', port: 17321 });
+  assert.equal(failed.ok, false);
+  assert.ok(failed.message.includes('按名解析失败'));
+  assert.ok(failed.message.includes('套接字未运行'));
+});
+
 test('listHosts：透传扫描窗口与结果', { timeout: 15000 }, async (t) => {
   const discovery = createFakeDiscovery();
   const { stack } = makeStack(t, { discovery });
