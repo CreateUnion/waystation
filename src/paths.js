@@ -64,6 +64,14 @@ export function collabFilePath(dataDir, collabId, fileName) {
   return join(collabDir(dataDir, collabId), fileName);
 }
 
+export const JOINS_FILE_NAME = 'joins.json';
+
+/** 每协作加入台账（设计 §7）：本机待批准名单＋本机获准名单同住一个文件——两侧（站长 / 会话所在机）
+ * 同形态、各持本机相关条目，故随协作走。文件名经 collabFilePath 过段形态守卫（与 collabId 同一硬边界）。 */
+export function joinsFilePath(dataDir, collabId) {
+  return collabFilePath(dataDir, collabId, JOINS_FILE_NAME);
+}
+
 /** 槽位 k≥2 的站点数据目录（设计 §13：槽位 1 = 主数据目录本身，k≥2 = <主数据目录>/sites/<k>/，各自含独立 config.json）。
  * 槽位上限由 site.js 的 SLOT_COUNT 约束（本函数只做路径层底线：≥2 的整数）——
  * 与 collabId 同一硬边界：非法值一律抛错，不做清洗或拼接。 */
@@ -86,8 +94,8 @@ export function sessionFilePath(mainDataDir, sessionId) {
   return join(mainDataDir, SESSIONS_DIR_NAME, `${sessionId}.json`);
 }
 
-/* 运行态目录（设计 §2.3/§6.1）：核心锁＋运行描述符＋凭据（core.json）、IPC 端点与绑定表（bindings.json）
- * 的宿主。与业务数据分离——核心的等待接管态「数据面零写」只豁免 run/ 自身。 */
+/* 运行态目录（设计 §2.3/§6.1）：核心锁＋运行描述符＋凭据（core.json）、IPC 端点与绑定表（bindings.json）、
+ * 加入申请台账（join-applications.json）的宿主。与业务数据分离——核心的等待接管态「数据面零写」只豁免 run/ 自身。 */
 export const RUN_DIR_NAME = 'run';
 export const CORE_JSON_FILE_NAME = 'core.json';
 export const BINDINGS_FILE_NAME = 'bindings.json';
@@ -102,4 +110,13 @@ export function coreJsonPath(root) {
 
 export function bindingsFilePath(root) {
   return join(root, RUN_DIR_NAME, BINDINGS_FILE_NAME);
+}
+
+export const JOIN_APPLICATIONS_FILE_NAME = 'join-applications.json';
+
+/** 本机会话的加入申请台账（设计 §7）：用会话身份申请入席后、等站长回执期间的申请记录。
+ * 跨协作（条目自带 collabId）且先于本机认识该协作存在（未在席者敲门解析后才得 collabId），
+ * 故不落单协作目录，与绑定表同住 run/——两者都描述本机与会话的接线，属运行态而非协作内容。 */
+export function joinApplicationsFilePath(root) {
+  return join(root, RUN_DIR_NAME, JOIN_APPLICATIONS_FILE_NAME);
 }
