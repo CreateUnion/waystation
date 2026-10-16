@@ -813,6 +813,7 @@ function ensureApplicantSeated(joinState, plan) {
   const payload = { ...invitePayloadOf(local.ledger), targetSessionId: plan.pending.sessionId };
   const sent = sendFrameOf(joinState, { collabId: plan.collabId, target, type: 'invite', payload });
   if (sent.ok !== true) {
+    rollbackInvitedMember(joinState, local, plan.pending);
     return { ok: false, message: `入席邀请发送失败：${sent.reason}——未落处置，可稍后重试` };
   }
   joinState.state.counters.invitesSent++;
@@ -837,6 +838,25 @@ function registerInvitedMember(joinState, local, pending) {
   });
   if (registered === null) {
     joinState.log.warn('受邀登记未落地（台账写被挂起）', { collabId: local.collabId, instanceId: pending.instanceId });
+    return false;
+  }
+  return true;
+}
+
+/* 受邀登记回滚（邀请投递失败的收口）：摘除刚写入的 invited 行——登记先于投递，若留着这条孤儿行，
+ * 「已在册」判据会让**重试**直接跳过邀请、只发出授权回执（申请人拿不到邀请却收到一发即落的回执
+ * ＝悬空端态，正是该判据要防的那条路）。只摘 invited 行：回滚只面对自己刚写的那一条，已回应 /
+ * 已入席的终局行不得翻转。摘除失败如实告警（不静默——孤儿行会让后续重试全部跳过邀请）。 */
+function rollbackInvitedMember(joinState, local, pending) {
+  const held = local.ledger.members.find((entry) => entry.instanceId === pending.instanceId);
+  if (held === undefined || held.state !== 'invited') {
+    return true;
+  }
+  const rolled = mutateLedger(joinState.state, local, (ledger) => {
+    ledger.members = ledger.members.filter((entry) => entry.instanceId !== pending.instanceId);
+  });
+  if (rolled === null) {
+    joinState.log.warn('受邀登记回滚失败（台账写被挂起）——重试可能跳过邀请，请核对名册', { collabId: local.collabId, instanceId: pending.instanceId });
     return false;
   }
   return true;

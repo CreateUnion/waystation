@@ -1296,7 +1296,7 @@ test('申请（target 两形态）：{instanceId} 经已知主机清单解析端
   });
   const ok = await made.service.join.request({ name: '远端项目', target: { instanceId: 'inst-known' }, sessionId: 'newcomer-1' });
   assert.equal(ok.ok, true, ok.message);
-  assert.deepEqual(resolved, [{ address: '127.0.0.7', port: 17700 }], '实例标识经已知主机清单解析（设计 §6 评审 M4）');
+  assert.deepEqual(resolved, [{ address: '127.0.0.7', port: 17700 }], '实例标识经已知主机清单解析（设计 §6）');
   const requests = sentOf(made.direct, 'join-request');
   assert.equal(requests.length, 1);
   assert.deepEqual(requests[0].to, { instanceId: 'inst-known', address: '127.0.0.7', port: 17700 });
@@ -1309,4 +1309,42 @@ test('申请（target 两形态）：{instanceId} 经已知主机清单解析端
   const badTarget = await made.service.join.request({ name: '远端项目', target: { address: 'not-an-ip', port: 1 }, sessionId: 'newcomer-1' });
   assert.equal(badTarget.ok, false);
   assert.match(badTarget.message, /target 非法/);
+});
+
+test('未在席的批准（站长侧）：入席邀请发送失败＝登记回滚（无孤儿行）；重试补发成功、点头后台账收录、计数不虚增', async (t) => {
+  const direct = [];
+  let refuse = true;
+  const owner = makeService(t, {
+    sendDirect: (message) => {
+      direct.push(message);
+      return refuse ? { ok: false, reason: '对方端点不可达' } : { ok: true, msgId: `d-${direct.length}` };
+    },
+  });
+  const created = owner.service.create({ name: '远端项目', topic: '主题', targets: [endpoint('inst-b', '主机乙')] });
+  await receive(owner.service, joinRequestFrame(created.collabId, 'newcomer-1', peer('inst-c', '主机丙', 17600)), '127.0.0.3');
+  const failed = owner.service.join.approve({ collabId: created.collabId, sessionId: 'newcomer-1', approve: true, approvedBy: 'session-a' });
+  assert.equal(failed.ok, false, '投递失败＝未落处置');
+  assert.match(failed.message, /入席邀请发送失败/);
+  assert.equal(ledgerOf(owner.dir, created.collabId).members.some((row) => row.instanceId === 'inst-c'), false, '登记回滚：台账不留孤儿行');
+  assert.equal(owner.service.list().collabs[0].memberCount, 2, '名册回到登记前（manager ＋ 创建目标）');
+  assert.equal(owner.service.join.pendingJoinsOf(created.collabId).length, 1, '待批准面保留（可重试）');
+  assert.deepEqual(approvalsOf(owner.dir, created.collabId), []);
+  assert.equal(owner.service.stats().invitesSent, 1, '失败那次不计数（创建期目标一）');
+  /* 重试：判据落空（回滚过）→ 重走「登记 → 投邀请」，全链闭环。 */
+  refuse = false;
+  const retried = owner.service.join.approve({ collabId: created.collabId, sessionId: 'newcomer-1', approve: true, approvedBy: 'session-a' });
+  assert.equal(retried.ok, true, retried.message);
+  const invites = sentOf(direct, 'invite');
+  assert.equal(invites.length, 2, '首投被拒一 ＋ 重试补发一（重试不是只发授权回执）');
+  assert.equal(invites[1].payload.targetSessionId, 'newcomer-1');
+  assert.equal(invites[1].payload.members.some((row) => row.instanceId === 'inst-c'), true);
+  assert.equal(sentOf(direct, 'join-grant').length, 1, '回执照发');
+  assert.equal(ledgerOf(owner.dir, created.collabId).members.find((row) => row.instanceId === 'inst-c').state, 'invited', '重试后登记在位（受邀行）');
+  assert.equal(owner.service.stats().invitesSent, 2, '创建目标一 ＋ 本次入席一（不虚增）');
+  /* 邀请确实落成：申请人点头 → 站长台账收录（无 eventMismatch）。 */
+  const admitted = await receive(owner.service, approveResponseFrame(created.collabId, peer('inst-c', '主机丙', 17600)), '127.0.0.3');
+  assert.equal(admitted.ok, true, admitted.reason);
+  assert.equal(owner.service.stats().eventMismatch, 0, '补发的邀请在链路上成立（回应被正常收录）');
+  assert.equal(ledgerOf(owner.dir, created.collabId).members.find((row) => row.instanceId === 'inst-c').state, 'approved');
+  assert.equal(owner.service.list().collabs[0].memberCount, 3);
 });
