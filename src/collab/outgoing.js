@@ -6,6 +6,7 @@ import { createMembersStore } from './members.js';
 import { createCounterStore, notifyIndicatorChange } from './counter.js';
 import { createMuteStore } from './mute.js';
 import { createInjectedStore } from './injected.js';
+import { createJoinsStore } from './joins.js';
 import { ledgerDigest, removeLedgerFile } from './store.js';
 import { currentManagerIdOf, emitOwnMemberEvent, foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, localTopicOf, memberStateFor, persistLedger, persistMember, persistSnapshot, relayDepartedOf, relayPeerOf, rememberKnownHost, selfJoinedOf } from './local.js';
 import { matchConflictCollabs } from './gate.js';
@@ -42,7 +43,40 @@ function applyDefaultMute(local) {
   return before.wasMuted !== true;
 }
 
-export function createCollab(state, { name, topic, targets, mode }) {
+/* 获准写点（设计 §5:58 明文三处：create＝发起会话 / invite＝点头会话 / grant＝获批会话〔加入域〕）：
+ * 写本机获准台账（collabs/<id>/joins.json 的 approvals）——adopt 收紧的唯一判据。只记协作
+ * （讨论无批准门、不产获准段，如实不写）；会话标识缺省 / 形态坏＝没有会话可授予，不写。
+ * 台账是权限记录、不是主链事实：写不进只留痕，创建 / 入席照旧成立（未获准的会话仍可 ws_join 申请）。
+ * approvedBy 记点头者会话（工具面穿参的自然结果——创建即发起会话、同意即点头会话）。 */
+function writeGrantApproval(state, local, sessionId, origin) {
+  if (localModeOf(local) !== 'managed' || typeof sessionId !== 'string' || !ID_PATTERN.test(sessionId)) {
+    return false;
+  }
+  try {
+    const store = createJoinsStore({ dataDir: state.dataDir, collabId: local.collabId, log: state.log });
+    if (store.addApproval({
+      instanceId: state.self.instanceId,
+      sessionId,
+      origin,
+      grantedAt: nowMsOf(state),
+      approvedBy: sessionId,
+    }) !== true) {
+      state.log.warn('获准条目形态不符，未入账（该会话未获准）', { collabId: local.collabId, sessionId, origin });
+      return false;
+    }
+    return true;
+  } catch (error) {
+    state.log.warn('获准台账写入失败（已忽略——未获准会话仍可 ws_join 申请）', { collabId: local.collabId, sessionId, origin, reason: error?.message });
+    return false;
+  }
+}
+
+/* 时刻（毫秒）：与加入域同一时钟基准（服务注入的 now；直调免注入时退回系统时钟）。 */
+function nowMsOf(state) {
+  return typeof state.clock === 'function' ? state.clock() : Date.now();
+}
+
+export function createCollab(state, { name, topic, targets, mode, sessionId }) {
   const collabMode = mode ?? DEFAULT_COLLAB_MODE;
   const rejected = createRejection(state, name, topic, targets, collabMode);
   if (rejected !== null) {
@@ -64,11 +98,7 @@ export function createCollab(state, { name, topic, targets, mode }) {
     suspended: null,
     staleManagerId: null,
   };
-  for (const target of targets) {
-    local.endpoints.set(target.instanceId, { address: target.address, port: target.port });
-    rememberKnownHost(state, { address: target.address, port: target.port, instanceId: target.instanceId, identityName: target.identityName });
-  }
-  local.member.endpoints = Object.fromEntries(local.endpoints);
+  registerCreateTargets(state, local, targets);
   state.collabs.set(ledger.collabId, local);
   if (collabMode === 'forum') {
     /* 发起人实例标识 = 中继归属（设计 §5.1/§5.3）：本机即中继，随记录持久化
@@ -81,9 +111,19 @@ export function createCollab(state, { name, topic, targets, mode }) {
   const invited = inviteInitialTargets(state, ledger, targets, collabMode, local);
   state.counters.collabsCreated++;
   applyDefaultMute(local);   // 写点一：创建成功（邀请发送结果不影响入席事实）
+  writeGrantApproval(state, local, sessionId, 'create');   // 获准写点一：发起会话（设计 §5）
   state.openViewer?.({ root: state.viewerRoot, id: ledger.collabId });   // 触发 A：建立即开该协作页（开关在出口内现读）
   /* 新建实例的静音状态必为空（新 collabId 无旧文件），写点一的默认静音必然落笔——提醒同发。 */
   return { ok: true, collabId: ledger.collabId, invited, notice: DEFAULT_MUTE_NOTICE };
+}
+
+/* 建协目标登记（端点表 ＋ 已知主机学习；台账名单由 freshLedgerOf 定格）。 */
+function registerCreateTargets(state, local, targets) {
+  for (const target of targets) {
+    local.endpoints.set(target.instanceId, { address: target.address, port: target.port });
+    rememberKnownHost(state, { address: target.address, port: target.port, instanceId: target.instanceId, identityName: target.identityName });
+  }
+  local.member.endpoints = Object.fromEntries(local.endpoints);
 }
 
 /* 创建邀请的发送面：逐目标发 invite（单条入队失败只如实标注，不回滚已建协作）；
@@ -91,7 +131,7 @@ export function createCollab(state, { name, topic, targets, mode }) {
 function inviteInitialTargets(state, ledger, targets, collabMode, local) {
   const invited = [];
   for (const target of targets) {
-    const payload = invitePayloadOf(ledger, [], forumEndpointsOf(collabMode, local));
+    const payload = applyInviteNaming(invitePayloadOf(ledger, [], forumEndpointsOf(collabMode, local)), target);
     if (collabMode === 'forum') {
       payload.originator = { instanceId: state.self.instanceId, identityName: state.self.identityName };
     }
@@ -100,6 +140,17 @@ function inviteInitialTargets(state, ledger, targets, collabMode, local) {
     state.counters.invitesSent++;
   }
   return invited;
+}
+
+/* 指名会话随邀请帧（会话级加入 §3 发送面）：targets 项带 targetSessionId 即写入载荷顶层
+ * payload.targetSessionId——接收侧据此只投该会话（不在场＝登记挂起、该会话注册时补投），
+ * 且只有它能点头；省略＝不指名（照旧投目标机全部活跃会话，谁点头谁承接）。
+ * 旧版对端忽略该加法字段，按未指名处理（等同不指名，如实）。 */
+function applyInviteNaming(payload, target) {
+  if (typeof target?.targetSessionId === 'string') {
+    payload.targetSessionId = target.targetSessionId;
+  }
+  return payload;
 }
 
 /* 讨论邀请随带的端点表（设计 §5.1：现成员表与端点表——被邀者据此取得寻址信息）；managed 不带。 */
@@ -163,7 +214,7 @@ export function inviteMembers(state, { collabId, targets }) {
   }
   const invited = [];
   for (const target of targets) {
-    const payload = forumInvitePayloadOf(state, local, topic, targets);
+    const payload = applyInviteNaming(forumInvitePayloadOf(state, local, topic, targets), target);
     const result = sendTo(state, collabId, target.instanceId, { address: target.address, port: target.port }, 'invite', payload);
     invited.push({ instanceId: target.instanceId, ok: result.ok === true, msgId: result.msgId, reason: result.reason });
     state.counters.invitesSent++;
@@ -266,7 +317,7 @@ function joinKnockNoticeText(knock, name) {
   return `收到加入申请：「${knock.identityName}」（实例 ${knock.instanceId}，端点 ${knock.address}:${knock.port}）想加入讨论「${name}」——放行 = 本机用 ws_invite 邀请它（targets 用该身份与端点），随后由对方的同意门定夺`;
 }
 
-export function approveInvite(state, { collabId, approve, reason }) {
+export function approveInvite(state, { collabId, approve, reason, sessionId }) {
   const local = state.collabs.get(collabId);
   if (local === undefined) {
     return { ok: false, message: '本机没有该协作（collabId 不存在）——先看 ws_list_collabs' };
@@ -282,14 +333,16 @@ export function approveInvite(state, { collabId, approve, reason }) {
   if (decided !== null) {
     return { ok: false, message: `已回应过（${decided}）——不能改口` };
   }
-  return applyInviteDecision(state, local, approve, wanted, reason);
+  return applyInviteDecision(state, local, approve, wanted, reason, sessionId);
 }
 
 /* 表态的落地与入席副作用（设计 §3.1/§3.3）：分派到讨论 / 协作各自的实现；同意且实现成功时
  * 写默认静音、给一行提醒。入席、写静音、提醒三者同谓词——判据取**决策结果**（wanted）而非
  * 原始入参的真值：服务 API 直调传非布尔真值时入席照旧生效，静音与提醒必须跟着生效，
- * 不得只剩半套（拒绝、参数非法、端点未知等分支则一律不写，不留残留）。 */
-function applyInviteDecision(state, local, approve, wanted, reason) {
+ * 不得只剩半套（拒绝、参数非法、端点未知等分支则一律不写，不留残留）。
+ * 获准写点二（设计 §5:58）：同意邀请成功的**点头会话**入本机获准台账（origin:invite）——
+ * 会话标识由工具面穿参（缺省＝无会话标识，如实不写；见 writeGrantApproval）。 */
+function applyInviteDecision(state, local, approve, wanted, reason, sessionId) {
   const result = localModeOf(local) === 'forum'
     ? decideForumInvite(state, local, wanted, reason)
     : sendDecision(state, local, approve, wanted, reason);
@@ -297,6 +350,7 @@ function applyInviteDecision(state, local, approve, wanted, reason) {
     return result;
   }
   const wrote = applyDefaultMute(local);   // 写点二：同意加入成功
+  writeGrantApproval(state, local, sessionId, 'invite');
   state.openViewer?.({ root: state.viewerRoot, id: local.collabId });   // 触发 A：同意入席即开该协作页（开关在出口内现读）
   /* 提醒只在本次真的写了静音时给：幂等重入的早返回根本到不了这里（本次什么都没写），
    * 说「已默认静音」会与事实相反。 */
@@ -1725,11 +1779,26 @@ function targetRejection(target, seen) {
   if (!isEndpointValue(target)) {
     return '目标端点非法（地址需 IP 字面量、端口 1–65535）';
   }
+  const naming = namingRejectionOf(target);
+  if (naming !== null) {
+    return naming;
+  }
   if (seen.has(target.instanceId)) {
     return '目标重复（或包含本机）';
   }
   seen.add(target.instanceId);
   return null;
+}
+
+/* 可选指名会话（targetSessionId）的形态把关：未给＝不指名（null）；给了须为标识形态（短码是
+ * 标识前缀，同一判据）——给了坏形态即拒（不得静默丢字段，丢字段＝把指名邀请变回广播）。 */
+function namingRejectionOf(target) {
+  if (target.targetSessionId === undefined) {
+    return null;
+  }
+  return typeof target.targetSessionId === 'string' && ID_PATTERN.test(target.targetSessionId)
+    ? null
+    : '目标指名会话非法（1–64 位字母数字与连字符的会话标识 / 短码）';
 }
 
 function isEndpointValue(target) {

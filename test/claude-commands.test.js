@@ -56,14 +56,23 @@ function makeCommandsDir(home, files) {
   return commandsDir;
 }
 
-test('仓库命令源：六个文件存在且带受管标记（防源集合与标记漂移）', () => {
-  for (const name of ['ws-collab.md', 'ws-discuss.md', 'ws-list.md', 'ws-mute.md', 'ws-purge.md', 'ws-view.md']) {
+test('仓库命令源：七个文件存在且带受管标记（防源集合与标记漂移）', () => {
+  for (const name of ['ws-collab.md', 'ws-discuss.md', 'ws-list.md', 'ws-mute.md', 'ws-purge.md', 'ws-view.md', 'ws-join.md']) {
     const filePath = join(repoRoot, 'scripts', 'claude-commands', name);
     assert.equal(existsSync(filePath), true, `缺少命令源文件：${name}`);
     const text = readFileSync(filePath, 'utf8');
     assert.ok(text.startsWith('---'), `${name} 应以 frontmatter 开头`);
     assert.ok(text.includes(MANAGED_MARKER), `${name} 应带受管标记`);
   }
+});
+
+test('ws-join 命令文：申请 / 批准 / 敲门三路径齐备（防正文漂移）', () => {
+  const text = readFileSync(join(repoRoot, 'scripts', 'claude-commands', 'ws-join.md'), 'utf8');
+  assert.ok(text.includes('ws_join'), '必须写明申请入口工具');
+  assert.ok(text.includes('ws_approve_join'), '必须写明站长批准入口');
+  assert.ok(text.includes('pendingJoins'), '必须写明待批准清单的取数面');
+  assert.ok(text.includes('批准是活人点头') || text.includes('活人点头'), '必须写明批准是活人门（不得替用户决定）');
+  assert.ok(text.includes('敲门'), '必须写明讨论未在席的敲门路径');
 });
 
 test('ws-view 命令文：后台启动/启动验证/停止方法三要素齐备（防正文漂移）', () => {

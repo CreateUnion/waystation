@@ -253,7 +253,7 @@ test('stdio 骨架：进程可起、ws_status 可调、网络层就绪、数据�
   const port = await pickFreePort();
   const client = await connectClient(t, INDEX_ENTRY, home, { port });
   const { tools } = await client.listTools();
-  assert.deepEqual(tools.map((tool) => tool.name), ['ws_status', 'ws_list_hosts', 'ws_ping', 'ws_delivery_status', 'ws_check_inbox', 'ws_list_collabs', 'ws_create_collab', 'ws_approve_invite', 'ws_withdraw_invite', 'ws_view_ledger', 'ws_send_message', 'ws_set_mute', 'ws_leave_collab', 'ws_end_collab', 'ws_invite', 'ws_request_join', 'ws_decide', 'ws_handover', 'ws_take_over']);
+  assert.deepEqual(tools.map((tool) => tool.name), ['ws_status', 'ws_list_hosts', 'ws_ping', 'ws_delivery_status', 'ws_check_inbox', 'ws_list_collabs', 'ws_create_collab', 'ws_approve_invite', 'ws_withdraw_invite', 'ws_view_ledger', 'ws_send_message', 'ws_set_mute', 'ws_leave_collab', 'ws_end_collab', 'ws_invite', 'ws_request_join', 'ws_join', 'ws_approve_join', 'ws_decide', 'ws_handover', 'ws_take_over']);
   const status = await fetchStatus(client);
   assert.equal(status.name, 'waystation');
   assert.equal(status.version, JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')).version, 'ws_status 版本与包版本一致');

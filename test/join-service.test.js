@@ -405,6 +405,115 @@ test('申请（短节律重试至时限）：未决期内按节律重发（沿�
   assert.equal(sentOf(made.direct, 'join-request').length, stopped, '时限到即停轮（不再重发）');
 });
 
+test('申请超时（TTL 到期）：本机提示携逐字版本提示「对端可能版本不支持加入申请（需 0.1.2+）」（混合版本两例之一）', async (t) => {
+  let clockMs = Date.now();
+  const made = makeService(t, {
+    now: () => clockMs,
+    config: { joinRequestTtlMs: 60000 },
+    joinRequestRetryMs: 15,
+    joinRequestRetryMaxMs: 15,
+  });
+  await activeMemberCollab(t, made, 'collab-remote');
+  made.notices.length = 0;   // 同意入席的本机提示已记账：本用例只判超时那一条
+  await made.service.join.request({ collabId: 'collab-remote', sessionId: 'newcomer-1' });
+  clockMs += 120000;   // 越过申请时限
+  await waitFor(() => (made.notices.length > 0 ? true : null), { timeoutMs: 4000 });
+  assert.equal(made.notices.length, 1);
+  const notice = made.notices[0];
+  assert.equal(notice.collabId, 'collab-remote');
+  assert.equal(notice.payload.event, 'local-alert', '沿既有本机提示先例（notice + local-alert）');
+  assert.equal(notice.payload.targetSessionId, 'newcomer-1', '按申请会话寻址（未接线的会话按绑定路由投不到）');
+  assert.match(notice.payload.text, /超时/);
+  assert.ok(
+    notice.payload.text.includes('对端可能版本不支持加入申请（需 0.1.2+）'),
+    `版本提示须逐字（设计 §2）：${notice.payload.text}`,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(made.notices.length, 1, '提示恰一次（剪除后重发轮已停：迟到副本不重复呈现）');
+  assert.deepEqual(applicationsOf(made.dir), [], '超时提示与剪除同一步落地（申请记录已清）');
+});
+
+/* —— 获准写点（设计 §5:58 三处之 create / invite；grant 的写点在回执落地节）与指名邀请发送面 —— */
+
+test('获准写点（创建）：发起会话即获准（origin:create、approvedBy ＝发起会话）；无标识 / 讨论不写', async (t) => {
+  const made = makeService(t);
+  const created = made.service.create({ name: '自建项目', topic: '主题', targets: [endpoint('inst-b', '主机乙')], sessionId: 'creator-a-0123456789' });
+  assert.equal(created.ok, true, created.message);
+  const approvals = approvalsOf(made.dir, created.collabId);
+  assert.equal(approvals.length, 1);
+  assert.deepEqual(
+    { instanceId: approvals[0].instanceId, sessionId: approvals[0].sessionId, origin: approvals[0].origin, approvedBy: approvals[0].approvedBy },
+    { instanceId: 'inst-self', sessionId: 'creator-a-0123456789', origin: 'create', approvedBy: 'creator-a-0123456789' },
+    '获准台账三要素：本机实例 ＋ 发起会话 ＋ 来路 create（批准人＝点头会话）',
+  );
+  assert.equal(typeof approvals[0].grantedAt, 'number');
+  assert.equal(made.service.join.isGranted(created.collabId, 'creator-a-0123456789'), true, '获准判据（adopt 收紧单点）即见');
+
+  const bare = makeService(t);
+  const plain = bare.service.create({ name: '自建项目', topic: '主题', targets: [endpoint('inst-b', '主机乙')] });
+  assert.deepEqual(approvalsOf(bare.dir, plain.collabId), [], '无会话标识＝没有会话可授予（如实不写）');
+
+  const forum = makeService(t);
+  const talk = forum.service.create({ name: '讨论甲', topic: '主题', targets: [endpoint('inst-b', '主机乙')], mode: 'forum', sessionId: 'creator-a-0123456789' });
+  assert.deepEqual(approvalsOf(forum.dir, talk.collabId), [], '讨论无批准门：不产获准段（如实不写）');
+});
+
+test('获准写点（同意邀请）：点头会话入本机获准台账（origin:invite）；无标识点头 / 拒绝一律不写', async (t) => {
+  const made = makeService(t);
+  await receive(made.service, inviteFrame({ collabId: 'collab-invite' }));
+  const approved = await made.service.approve({ collabId: 'collab-invite', approve: true, sessionId: 'nodder-a-0123456789' });
+  assert.equal(approved.ok, true, approved.message);
+  const approvals = approvalsOf(made.dir, 'collab-invite');
+  assert.equal(approvals.length, 1);
+  assert.deepEqual(
+    { instanceId: approvals[0].instanceId, sessionId: approvals[0].sessionId, origin: approvals[0].origin, approvedBy: approvals[0].approvedBy },
+    { instanceId: 'inst-self', sessionId: 'nodder-a-0123456789', origin: 'invite', approvedBy: 'nodder-a-0123456789' },
+  );
+  assert.equal(made.service.join.isGranted('collab-invite', 'nodder-a-0123456789'), true);
+
+  const bare = makeService(t);
+  await receive(bare.service, inviteFrame({ collabId: 'collab-plain' }));
+  await bare.service.approve({ collabId: 'collab-plain', approve: true });
+  assert.deepEqual(approvalsOf(bare.dir, 'collab-plain'), [], '无会话标识（工具面未穿参的旧直调）：不写');
+
+  const refused = makeService(t);
+  await receive(refused.service, inviteFrame({ collabId: 'collab-decline' }));
+  await refused.service.approve({ collabId: 'collab-decline', approve: false, reason: '不参与', sessionId: 'nodder-a-0123456789' });
+  assert.deepEqual(approvalsOf(refused.dir, 'collab-decline'), [], '拒绝不产获准条目');
+});
+
+test('指名邀请（发送面）：targets 项带 targetSessionId 即写入邀请帧载荷顶层；省略＝字段不在场（未指名）', async (t) => {
+  const made = makeService(t);
+  const created = made.service.create({
+    name: '自建项目',
+    topic: '主题',
+    targets: [endpoint('inst-b', '主机乙'), { ...endpoint('inst-c', '主机丙'), targetSessionId: 'a1b2c3d4' }],
+  });
+  assert.equal(created.ok, true, created.message);
+  const invites = sentOf(made.sent, 'invite');
+  assert.equal(invites.length, 2);
+  assert.equal(invites[0].payload.targetSessionId, undefined, '未指名：字段不在场（投目标机全部活跃会话）');
+  assert.equal(invites[1].payload.targetSessionId, 'a1b2c3d4', '指名：随邀请帧载荷定格（接收侧按它只投目标会话）');
+
+  const bad = await made.service.create({
+    name: '自建项目二',
+    topic: '主题',
+    targets: [{ ...endpoint('inst-b', '主机乙'), targetSessionId: '坏 形态' }],
+  });
+  assert.equal(bad.ok, false, '指名会话形态坏＝服务侧拒绝（不得静默丢字段变成广播）');
+  assert.match(bad.message, /指名会话/);
+
+  const forum = makeService(t);
+  const talk = forum.service.create({ name: '讨论甲', topic: '主题', mode: 'forum', targets: [endpoint('inst-b', '主机乙')] });
+  assert.equal(talk.ok, true, talk.message);
+  forum.sent.length = 0;
+  const invited = forum.service.invite({ collabId: talk.collabId, targets: [{ ...endpoint('inst-z', '主机子'), targetSessionId: '9f8e7d6c' }] });
+  assert.equal(invited.ok, true, invited.message);
+  const named = sentOf(forum.sent, 'invite');
+  assert.equal(named.length, 1);
+  assert.equal(named[0].payload.targetSessionId, '9f8e7d6c', '增邀（ws_invite）同规：指名随帧载荷');
+});
+
 /* —— 回执落地：grant / deny 的比对与收尾 —— */
 
 test('join-grant 到达：写本机获准台账＋接线（离线会话写持久映射、重开即活）＋删申请记录＋开该协作页', async (t) => {

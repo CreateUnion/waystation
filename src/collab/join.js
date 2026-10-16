@@ -22,6 +22,10 @@ export const JOIN_REQUEST_RETRY_MAX_MS = 300000;
 const JOIN_APPLICATION_LABEL = '加入申请';
 const MAIN_VIEWER_ROOT = 'main';
 
+/* 申请超时的如实提示（设计 §2 逐字）：时限内没等到任何回执——旧版对端不识 join 三帧时最可能的
+ * 解释；「可能」不省（可达性 / 无人值守等同样成立，不指控、不定论）。 */
+const JOIN_TIMEOUT_VERSION_HINT = '对端可能版本不支持加入申请（需 0.1.2+）';
+
 /**
  * @param {{ state: any, send?: ((message: object) => any) | null, openViewer?: ((ref: object) => unknown) | null,
  *   log?: any, now?: () => number }} deps
@@ -309,9 +313,16 @@ function armRetry(joinState, plan) {
 
 function runRetry(joinState, key, entry) {
   entry.timer = null;
+  /* 停轮前先判「是不是超时」：记录消失有两个来路——已落地（批准 / 拒绝，收尾时已停轮）与
+   * 过时限剪除；只有后者留一行超时提示（已处置的申请不提示，避免「批准了还说超时」）。 */
+  const held = findApplication(joinState, entry.plan.collabId, entry.plan.sessionId);
+  const expired = held !== null && joinState.now() - held.sentAt >= ttlOf(joinState);
   pruneApplications(joinState);
   const record = findApplication(joinState, entry.plan.collabId, entry.plan.sessionId);
   if (record === null) {
+    if (expired) {
+      presentExpiry(joinState, held);
+    }
     joinState.retries.delete(key);   // 已落地（批准 / 拒绝）或过时限剪除：停轮
     return;
   }
@@ -515,6 +526,18 @@ function presentDenial(joinState, { collabId, sessionId, reason }) {
   const name = local === undefined ? collabId : localNameOf(local);
   const head = `加入申请被拒绝：协作「${name}」的站长拒绝了本会话（${shortSessionId(sessionId)}）的加入申请`;
   notifySession(joinState, local ?? { collabId }, sessionId, reason === undefined ? head : `${head}——原因：${reason}`);
+}
+
+/* 超时呈现（设计 §2：TTL 到期提示）：一行本机提示投**申请会话**（与拒绝呈现同一寻址形态——
+ * 未接线的会话按绑定路由投不到，帧携 targetSessionId 由核心路由定向投桥）。协作名可查时带上，
+ * 查不到（未在席路径）退回协作标识；短码与拒绝呈现同款（对外表示一律短码）。 */
+function presentExpiry(joinState, record) {
+  joinState.log.info('加入申请超时（时限到即剪除并停发）', { collabId: record.collabId, sessionId: record.sessionId });
+  const local = joinState.state.collabs.get(record.collabId);
+  const name = local === undefined ? record.collabId : localNameOf(local);
+  const head = `加入申请超时：协作「${name}」在申请时限内未获批准（本会话 ${shortSessionId(record.sessionId)} 的申请已停止重发）`;
+  notifySession(joinState, local ?? { collabId: record.collabId }, record.sessionId,
+    `${head}——${JOIN_TIMEOUT_VERSION_HINT}；稍后可重新申请，或直接联系对方站长`);
 }
 
 /* 按会话寻址的本机提示（拒绝呈现的定向形态）：帧构造与投递口径沿既有本机提示先例（notifyLocal），

@@ -1,4 +1,4 @@
-/* 工具规格单一权威：19 个工具的 name / description / inputSchema——形态即 registry.list() 的输出三元组
+/* 工具规格单一权威：21 个工具的 name / description / inputSchema——形态即 registry.list() 的输出三元组
  * （src/tools/registry.js）。核心用它注册 handler，桥用它应答 MCP tools/list——核心不在时桥也必须答得上，
  * 故本模块是纯数据：零 import、无运行时依赖，桥侧导入它不认识网络、不认识数据层。
  *
@@ -10,7 +10,9 @@
  *
  * 字段本身是对外契约（工具面与 schema 不变）：逐字节冻结在同名测试里，改动任一字符都会让它变红。 */
 
-/* 被邀请目标的条目 schema（创建邀请与增邀两工具共用同一形状，单一权威保持在本模块）。 */
+/* 被邀请目标的条目 schema（创建邀请与增邀两工具共用同一形状，单一权威保持在本模块）。
+ * targetSessionId＝对目标实例的**会话短码**指名（可选）：该目标的邀请只投这一会话、只有它能点头；
+ * 省略 = 不指名（投目标机全部活跃会话，谁点头谁承接）——旧版对端忽略该字段，等同不指名（如实）。 */
 
 const TARGET_ITEM_SCHEMA = {
   type: 'object',
@@ -19,6 +21,7 @@ const TARGET_ITEM_SCHEMA = {
     identityName: { type: 'string', description: '目标身份名（取自 ws_list_hosts；进邀请名单与同意门）' },
     address: { type: 'string', description: '目标地址（IP 字面量）' },
     port: { type: 'integer', description: '目标端口（取自 ws_list_hosts 的端点）' },
+    targetSessionId: { type: 'string', description: '指名会话短码（可选）：只投该目标实例上的这一会话、只有它能点头；省略 = 不指名（投全部活跃会话）' },
   },
   required: ['instanceId', 'identityName', 'address', 'port'],
 };
@@ -210,6 +213,42 @@ export const WS_REQUEST_JOIN_SPEC = {
   },
 };
 
+export const WS_JOIN_SPEC = {
+  name: 'ws_join',
+  description: '申请加入协作或讨论（本会话尚未在席时发起）：协作＝申请——给 collabId 直接申请，只给 name＋target 时先对该目标单播按名解析出 collabId 再申请（名称不广播）；申请直投站长、站长批准后接线本会话。讨论＝本机在席时本会话直接接线生效（无批准门），未在席时封装敲门全流程（等待放行，接线在同意门）。会话标识取本会话上下文——无会话标识的会话无法申请加入（明确拒）。',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      collabId: { type: 'string', description: '协作 / 讨论标识（可选；与 name 二选一——给了就跳过按名解析）' },
+      name: { type: 'string', description: '协作 / 讨论名（可选；与 collabId 二选一——本机同名在册者直取，否则需 target 按名单播解析）' },
+      target: {
+        type: 'object',
+        description: '按名解析的目标（可选，仅 name 且本机未在册时用）：{ address, port } 或 { instanceId }（后者经已知主机清单解析出端点）',
+        properties: {
+          address: { type: 'string', description: '目标地址（IP 字面量）' },
+          port: { type: 'integer', description: '目标端口' },
+          instanceId: { type: 'string', description: '目标实例标识（须在已知主机清单内——先 ws_list_hosts）' },
+        },
+      },
+    },
+  },
+};
+
+export const WS_APPROVE_JOIN_SPEC = {
+  name: 'ws_approve_join',
+  description: '批准或拒绝一条待回应的加入申请（站长侧）：批准＝授权申请人会话（写获准台账＋回执接线本会话）；拒绝＝回执携原因并出待批准面。待批准清单见 ws_list_collabs 条目的 pendingJoins；批准是活人门（无人点头＝新窗口加不进协作，如实）。',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      collabId: { type: 'string', description: '协作标识（取自 ws_list_collabs 的 pendingJoins 条目所在协作）' },
+      sessionId: { type: 'string', description: '申请人会话标识（短码即可——取 pendingJoins 的 sessionId；接收侧做唯一前缀匹配）' },
+      approve: { type: 'boolean', description: 'true = 批准加入；false = 拒绝' },
+      reason: { type: 'string', description: '拒绝原因（可选，仅拒绝时使用，≤200 字符）' },
+    },
+    required: ['collabId', 'sessionId', 'approve'],
+  },
+};
+
 export const WS_DECIDE_SPEC = {
   name: 'ws_decide',
   description: '裁定（站长席位）：冻结中三选一——merge（合并；建议发起更早者任站长，名单并集、新增成员走同意门）/ keep（保持两条，需明示）/ terminate（终止本方一条）；合流递交裁定用 mergeOffer=accept|reject',
@@ -268,6 +307,8 @@ export const TOOL_SPECS = [
   WS_END_COLLAB_SPEC,
   WS_INVITE_SPEC,
   WS_REQUEST_JOIN_SPEC,
+  WS_JOIN_SPEC,
+  WS_APPROVE_JOIN_SPEC,
   WS_DECIDE_SPEC,
   WS_HANDOVER_SPEC,
   WS_TAKE_OVER_SPEC,

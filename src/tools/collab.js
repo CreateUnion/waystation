@@ -43,7 +43,9 @@ export function createCollabTool() {
       if (targets === null) {
         return errorResult(targetsErrorMessage());
       }
-      return resultOf(await context.collab.create({ name, topic, targets, mode }));
+      /* 本会话标识随创建穿参：发起会话即获准（写本机获准台账 origin:create——会话级加入 §5
+       * 获准写点一）；无标识会话如实传空（未获准者可走 ws_join 申请）。 */
+      return resultOf(await context.collab.create({ name, topic, targets, mode, sessionId: context.sessionId }));
     },
   };
 }
@@ -107,7 +109,9 @@ export function approveInviteTool() {
       /* reason 按描述语义归一：approve=true 时在工具层丢弃（服务层该分支本就不消费）——宁可少传，
        * 不让「同意 + 理由」这种无定义组合穿到线上。 */
       const reason = args.approve === false ? optionalTextArg(args, 'reason') : undefined;
-      return resultOf(await context.collab.approve({ collabId, approve: args.approve, reason }));
+      /* 本会话标识平铺穿参（服务侧 caller.sessionId 备选形态亦收）：指名邀请的「只有该会话能点头」
+       * 判定要拿点头会话做比对面；无标识会话如实传空（指名邀请被拒、未指名零变）。 */
+      return resultOf(await context.collab.approve({ collabId, approve: args.approve, reason, sessionId: context.sessionId }));
     },
   };
 }
@@ -209,7 +213,7 @@ export function endCollabTool() {
   };
 }
 
-/* 工具返回口径（19 工具单一权威）：成功 = 顶层含 ok:true 的 JSON 对象（列表载荷用命名字段承载：
+/* 工具返回口径（21 工具单一权威）：成功 = 顶层含 ok:true 的 JSON 对象（列表载荷用命名字段承载：
  * hosts / rows / collabs）；失败 = errorResult 纯文案 + isError。新增工具一律照此。 */
 export function okResult(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
@@ -233,7 +237,7 @@ export function trimmedString(args, name) {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-function optionalTextArg(args, name) {
+export function optionalTextArg(args, name) {
   if (args[name] === undefined) {
     return undefined;
   }
@@ -271,14 +275,36 @@ function targetArg(entry) {
 
 /* 四字段归一：instanceId / identityName / address 各自 trim 后按判据校验（与配置面、协议层同权威）；address 取 IP 字面量、port 取 protocol.isPort——与 ws_ping 同深度（服务侧兜底保留，纵深防御）。 */
 function trimmedTargetFields(entry) {
-  const instanceId = typeof entry.instanceId === 'string' ? entry.instanceId.trim() : '';
-  const identityName = typeof entry.identityName === 'string' ? entry.identityName.trim() : '';
-  const address = typeof entry.address === 'string' ? entry.address.trim() : '';
+  const instanceId = trimmedString(entry, 'instanceId');
+  const identityName = trimmedString(entry, 'identityName');
+  const address = trimmedString(entry, 'address');
   if (instanceId === '' || !ID_PATTERN.test(instanceId) || !isIdentityName(identityName)) {
     return null;
   }
-  if (address === '' || isIP(address) === 0 || !isPort(entry.port)) {
+  if (!isTargetEndpoint(address, entry.port)) {
     return null;
   }
-  return { instanceId, identityName, address, port: entry.port };
+  const named = targetSessionFieldOf(entry);
+  if (named === null) {
+    return null;
+  }
+  return { instanceId, identityName, address, port: entry.port, ...named };
+}
+
+function isTargetEndpoint(address, port) {
+  return address !== '' && isIP(address) !== 0 && isPort(port);
+}
+
+/* 可选指名会话（邀请的 targetSessionId）：未给＝不指名（字段不出现在归一结果里）；给了须为
+ * 标识形态（短码是标识前缀，同一判据）——「给了但形态坏」与「没给」必须分开，不得静默丢字段
+ * （丢字段＝把指名邀请变成广播，与用户意图相反）。 */
+function targetSessionFieldOf(entry) {
+  if (entry.targetSessionId === undefined || entry.targetSessionId === null) {
+    return {};
+  }
+  const targetSessionId = typeof entry.targetSessionId === 'string' ? entry.targetSessionId.trim() : '';
+  if (targetSessionId === '' || !ID_PATTERN.test(targetSessionId)) {
+    return null;
+  }
+  return { targetSessionId };
 }

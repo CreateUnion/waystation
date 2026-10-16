@@ -12,6 +12,7 @@ import { pingTool } from '../src/tools/ping.js';
 import { deliveryStatusTool } from '../src/tools/delivery-status.js';
 import { checkInboxTool } from '../src/tools/check-inbox.js';
 import { listCollabsTool, createCollabTool, approveInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, setMuteTool, leaveCollabTool, endCollabTool, inviteTool, requestJoinTool, SEND_MESSAGE_TYPES } from '../src/tools/collab.js';
+import { joinTool, approveJoinTool } from '../src/tools/join.js';
 import { decideTool, handoverTool, takeOverTool } from '../src/tools/governance.js';
 import { COLLAB_MODES, DEFAULT_COLLAB_MODE, MAX_COLLAB_MEMBERS, MAX_IDENTITY_NAME_CHARS, MAX_MESSAGE_TEXT_CHARS, MAX_REASON_CHARS, MAX_TOPIC_CHARS } from '../src/net/protocol.js';
 import { MAX_FORUM_MEMBERS } from '../src/collab/model.js';
@@ -44,6 +45,8 @@ const TOOL_FACTORIES = [
   endCollabTool,
   inviteTool,
   requestJoinTool,
+  joinTool,
+  approveJoinTool,
   decideTool,
   handoverTool,
   takeOverTool,
@@ -57,9 +60,9 @@ function coreToolList() {
   return registry.list();
 }
 
-test('工具面冻结快照：19 项逐字节不变', () => {
+test('工具面冻结快照：21 项逐字节不变', () => {
   const listed = coreToolList();
-  assert.equal(listed.length, 19, '工具数为 19——增删工具属须人批准的对外变更');
+  assert.equal(listed.length, 21, '工具数为 21——增删工具属须人批准的对外变更');
   assert.equal(
     JSON.stringify(listed, null, 2),
     FROZEN_LIST_JSON,
@@ -67,8 +70,8 @@ test('工具面冻结快照：19 项逐字节不变', () => {
   );
 });
 
-test('规格模块：19 项无遗漏，按名索引与注册序一致', () => {
-  assert.equal(TOOL_SPECS.length, 19, '规格模块须与工具数一一对应');
+test('规格模块：21 项无遗漏，按名索引与注册序一致', () => {
+  assert.equal(TOOL_SPECS.length, 21, '规格模块须与工具数一一对应');
   assert.deepEqual(Object.keys(SPECS_BY_NAME), TOOL_SPECS.map((spec) => spec.name));
   assert.deepEqual(coreToolList().map((tool) => tool.name), TOOL_SPECS.map((spec) => spec.name));
 });
@@ -125,7 +128,7 @@ async function sendMessageDefaultType() {
   return sent.type;
 }
 
-/* 冻结基准：19 工具注册后 JSON.stringify(registry.list(), null, 2) 的全量输出（改造前从当前树生成）。
+/* 冻结基准：21 工具注册后 JSON.stringify(registry.list(), null, 2) 的全量输出（本批从当前树生成）。
  * 文本级固化——缩进与换行也是比对范围，故整段贴在此处、不手工编辑。
  * 新增本机段带来的两条描述变更（有意对外变更）：ws_list_hosts 描述补「本机段 self 与同机
  * sameMachine 标注」、ws_list_collabs 描述补「是否静音」——描述同步后按规程整体重冻，md5 由
@@ -135,7 +138,13 @@ async function sendMessageDefaultType() {
  * 五处再作模式精确化（ws_end_collab / ws_withdraw_invite / ws_approve_invite / ws_send_message·to
  * / ws_leave_collab——补「讨论为发起人」「邀请方」等两模式口径）——按规程重冻，md5 由
  * 56533a014d0eafc7be51e92f67d85911 更新为 05adcc78fd1add8e83b902b536bd18ae（10893 字符）；
- * 全部 schema 与结构逐字节未动。 */
+ * 全部 schema 与结构逐字节未动。
+ * 会话级加入批（工具面 19→21，本次重冻的批准流程即本批）：新增 ws_join / ws_approve_join 两件
+ * （注册序插在 ws_request_join 之后、ws_decide 之前）；ws_create_collab 与 ws_invite 的 targets
+ * 条目 schema 增可选 targetSessionId（指名会话短码——创建时与后续邀请同规）——按「须人批准的
+ * 对外变更」规程整体重冻，md5 由 05adcc78fd1add8e83b902b536bd18ae 更新为
+ * e93ce1f55ba032743a4723f803b97031（13247 字符）；其余 19 项 name / description 与全部必须
+ * 字段逐字节未动（diff 只有两条新增项与 targets 的一处加法字段）。 */
 const FROZEN_LIST_JSON = `[
   {
     "name": "ws_status",
@@ -258,6 +267,10 @@ const FROZEN_LIST_JSON = `[
               "port": {
                 "type": "integer",
                 "description": "目标端口（取自 ws_list_hosts 的端点）"
+              },
+              "targetSessionId": {
+                "type": "string",
+                "description": "指名会话短码（可选）：只投该目标实例上的这一会话、只有它能点头；省略 = 不指名（投全部活跃会话）"
               }
             },
             "required": [
@@ -450,6 +463,10 @@ const FROZEN_LIST_JSON = `[
               "port": {
                 "type": "integer",
                 "description": "目标端口（取自 ws_list_hosts 的端点）"
+              },
+              "targetSessionId": {
+                "type": "string",
+                "description": "指名会话短码（可选）：只投该目标实例上的这一会话、只有它能点头；省略 = 不指名（投全部活跃会话）"
               }
             },
             "required": [
@@ -480,6 +497,71 @@ const FROZEN_LIST_JSON = `[
       },
       "required": [
         "name"
+      ]
+    }
+  },
+  {
+    "name": "ws_join",
+    "description": "申请加入协作或讨论（本会话尚未在席时发起）：协作＝申请——给 collabId 直接申请，只给 name＋target 时先对该目标单播按名解析出 collabId 再申请（名称不广播）；申请直投站长、站长批准后接线本会话。讨论＝本机在席时本会话直接接线生效（无批准门），未在席时封装敲门全流程（等待放行，接线在同意门）。会话标识取本会话上下文——无会话标识的会话无法申请加入（明确拒）。",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "collabId": {
+          "type": "string",
+          "description": "协作 / 讨论标识（可选；与 name 二选一——给了就跳过按名解析）"
+        },
+        "name": {
+          "type": "string",
+          "description": "协作 / 讨论名（可选；与 collabId 二选一——本机同名在册者直取，否则需 target 按名单播解析）"
+        },
+        "target": {
+          "type": "object",
+          "description": "按名解析的目标（可选，仅 name 且本机未在册时用）：{ address, port } 或 { instanceId }（后者经已知主机清单解析出端点）",
+          "properties": {
+            "address": {
+              "type": "string",
+              "description": "目标地址（IP 字面量）"
+            },
+            "port": {
+              "type": "integer",
+              "description": "目标端口"
+            },
+            "instanceId": {
+              "type": "string",
+              "description": "目标实例标识（须在已知主机清单内——先 ws_list_hosts）"
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "ws_approve_join",
+    "description": "批准或拒绝一条待回应的加入申请（站长侧）：批准＝授权申请人会话（写获准台账＋回执接线本会话）；拒绝＝回执携原因并出待批准面。待批准清单见 ws_list_collabs 条目的 pendingJoins；批准是活人门（无人点头＝新窗口加不进协作，如实）。",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "collabId": {
+          "type": "string",
+          "description": "协作标识（取自 ws_list_collabs 的 pendingJoins 条目所在协作）"
+        },
+        "sessionId": {
+          "type": "string",
+          "description": "申请人会话标识（短码即可——取 pendingJoins 的 sessionId；接收侧做唯一前缀匹配）"
+        },
+        "approve": {
+          "type": "boolean",
+          "description": "true = 批准加入；false = 拒绝"
+        },
+        "reason": {
+          "type": "string",
+          "description": "拒绝原因（可选，仅拒绝时使用，≤200 字符）"
+        }
+      },
+      "required": [
+        "collabId",
+        "sessionId",
+        "approve"
       ]
     }
   },
