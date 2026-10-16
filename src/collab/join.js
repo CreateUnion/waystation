@@ -2,7 +2,7 @@ import { isIP } from 'node:net';
 import { ID_PATTERN, MAX_REASON_CHARS, PROTOCOL_VERSION, isIdentityName, isPresentationText, newMsgId } from '../net/protocol.js';
 import { createJoinApplicationsStore, createJoinsStore } from './joins.js';
 import { currentManagerIdOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, selfJoinedOf } from './local.js';
-import { endpointFor, invitePayloadOf } from './outgoing.js';
+import { endpointFor, invitePayloadOf, mutateLedger } from './outgoing.js';
 import { shortSessionId } from '../util/short-id.js';
 
 /* 加入域服务（会话级加入 §2/§4）：会话申请 / 站长批准 / 接线 / 拒绝呈现 ＋ 讨论直连。
@@ -79,15 +79,50 @@ async function requestJoin(joinState, input) {
   if (matched.length === 1) {
     return requestForCollab(joinState, matched[0], sessionId, null);
   }
-  const target = targetOf(input.target);
-  if (target === null) {
+  const wanted = requestTargetOf(joinState, input.target);
+  if (wanted.ok !== true) {
+    return wanted;
+  }
+  if (wanted.target === null) {
     return knockByName(joinState, name, sessionId);
   }
-  const resolved = await resolveCollabId(joinState, name, target);
+  const resolved = await resolveCollabId(joinState, name, wanted.target);
   if (resolved.ok !== true) {
     return resolved;
   }
   return requestForCollab(joinState, resolved.collabId, sessionId, resolved.responder);
+}
+
+/* 目标形态归一（设计 §6）：未给＝null（走敲门）；{address, port} 直取（IP 字面量 ＋ 端口）；
+ * {instanceId} 经站点级已知主机清单解析端点（「实例标识 → 地址:端口」的既有学习面）。
+ * 给了但解析不出＝如实报错——不静默改走敲门（打算解析 A 机却广播给全网是静默错向）。 */
+function requestTargetOf(joinState, raw) {
+  if (raw === undefined || raw === null) {
+    return { ok: true, target: null };
+  }
+  const instanceId = idOf(raw.instanceId);
+  if (instanceId !== null) {
+    const known = lookupHostOf(joinState, instanceId);
+    if (known === null) {
+      return { ok: false, message: `目标实例的端点未知（${instanceId}）——先 ws_list_hosts 确认对方在线，或直接给 { address, port }` };
+    }
+    return { ok: true, target: known };
+  }
+  const address = typeof raw.address === 'string' ? raw.address.trim() : '';
+  const port = raw.port;
+  return isIP(address) !== 0 && Number.isInteger(port) && port >= 1 && port <= 65535
+    ? { ok: true, target: { address, port } }
+    : { ok: false, message: '参数 target 非法：需要 { address, port }（IP 字面量 ＋ 1–65535 端口）或 { instanceId }（已知主机清单里的实例标识）' };
+}
+
+/* 已知主机清单的端点查取（形态不符 / 查不到一律 null）。 */
+function lookupHostOf(joinState, instanceId) {
+  const lookup = joinState.state.knownHosts?.lookup;
+  const known = typeof lookup === 'function' ? lookup.call(joinState.state.knownHosts, instanceId) : null;
+  if (known === null || known === undefined || typeof known.address !== 'string' || !Number.isInteger(known.port)) {
+    return null;
+  }
+  return { address: known.address, port: known.port };
 }
 
 function matchLocalByName(joinState, name) {
@@ -559,7 +594,8 @@ function rememberKnock(joinState, name, sessionId) {
 
 /* 同意门落地后的收口（服务在讨论邀请被批准时调用）：该讨论名登记在册的请求会话接线——放行者
  * 若恰是请求会话，同意门的写点已接线（此处幂等重写）；登记不存在 / 已过期 / 服务面缺位一律不动
- * （既有行为不变）。返回接线到的会话标识，未接线返回 null。 */
+ * （既有行为不变）。登记在**接线成功之后**才清除：瞬态不可用（绑定表缺位 / 写盘失败）不丢登记，
+ * 待下次落地重试。返回接线到的会话标识，未接线返回 null。 */
 function bindKnockedSession(joinState, local) {
   if (local === undefined || localModeOf(local) !== 'forum') {
     return null;
@@ -569,13 +605,15 @@ function bindKnockedSession(joinState, local) {
   if (registered === undefined) {
     return null;
   }
-  joinState.knocks.delete(name);   // 一次性登记：席位已交回，不重复接线
   if (joinState.now() - registered.at >= ttlOf(joinState) || !isIdentityName(registered.sessionId)) {
-    return null;   // 登记过期（放行来得太晚）或形态坏：按未登记处置
+    joinState.knocks.delete(name);   // 过期（放行来得太晚）或形态坏：登记作废
+    return null;
   }
-  return bindSession(joinState, { collabId: local.collabId, sessionId: registered.sessionId, origin: 'join' }) === true
-    ? registered.sessionId
-    : null;
+  if (bindSession(joinState, { collabId: local.collabId, sessionId: registered.sessionId, origin: 'join' }) !== true) {
+    return null;   // 接线未落地：登记保留（本会话待下次落地接线）
+  }
+  joinState.knocks.delete(name);   // 一次性登记：席位已交回，不重复接线
+  return registered.sessionId;
 }
 
 /* 敲门原语调用（网络面缺位 / 降级 / 异常同归一处如实报错；无应答＝空清单，不是失败）。 */
@@ -731,10 +769,12 @@ function completeRemoteGrant(joinState, plan) {
   return { ok: true, collabId: plan.collabId, sessionId: plan.pending.sessionId, sent: true, seated: seated.seated };
 }
 
-/* 批准一并完成入席（设计 §2）：申请人机器尚未在册（不在台账名单内）＝经既有邀请通道把该机器
- * 请进来——受邀准入路径（handleInvite）负责本机协作注册与成员记录，载荷用既有构造（名单须含
- * 被邀者），并指名申请会话（点头权归它；离线时按既有的指名挂起补投）。机器已在册＝无需入席
- * （新窗口跟进照旧只由批准回执接线）。 */
+/* 批准一并完成入席（设计 §2）：申请人机器尚未在册（不在台账名单内）＝先把它登进台账名单为
+ * invited、再经既有邀请通道把该机器请进来——受邀准入路径（handleInvite）负责对方本机协作注册
+ * 与成员记录，载荷用既有构造（名单取自台账，含被邀者），并指名申请会话（点头权归它；离线时按
+ * 既有的指名挂起补投）。机器已在册＝无需入席（新窗口跟进照旧只由批准回执接线）。
+ * 登记在先使受邀请链路闭环：申请人点头时站长侧按「名单内且 invited」定位回应方（否则按
+ * eventMismatch 丢弃、名册永不收录该机器），且「已在册」判据对同机器的新窗口立即成立（不重发）。 */
 function ensureApplicantSeated(joinState, plan) {
   const local = joinState.state.collabs.get(plan.collabId);
   if (localRosterOf(local).some((entry) => entry.instanceId === plan.pending.instanceId)) {
@@ -744,14 +784,39 @@ function ensureApplicantSeated(joinState, plan) {
   if (target === null) {
     return { ok: false, message: `申请人端点未知（${plan.pending.instanceId}）——先 ws_list_hosts 确认对方在线，或让申请人重新申请（入站帧会带来端点）` };
   }
-  const applicant = { instanceId: plan.pending.instanceId, identityName: applicantNameOf(plan.pending) };
-  const payload = { ...invitePayloadOf(local.ledger, [applicant]), targetSessionId: plan.pending.sessionId };
+  if (!registerInvitedMember(joinState, local, plan.pending)) {
+    return { ok: false, message: '受邀登记未落地（台账写入被暂停或失败）——未落处置，可稍后重试' };
+  }
+  const payload = { ...invitePayloadOf(local.ledger), targetSessionId: plan.pending.sessionId };
   const sent = sendFrameOf(joinState, { collabId: plan.collabId, target, type: 'invite', payload });
   if (sent.ok !== true) {
     return { ok: false, message: `入席邀请发送失败：${sent.reason}——未落处置，可稍后重试` };
   }
   joinState.state.counters.invitesSent++;
   return { ok: true, seated: false };
+}
+
+/* 受邀登记（创建流同形：role:'member' ＋ state:'invited' ＋ joinedAt，经台账写面落地并推快照）。
+ * 已在名单（任何状态）不重写——既有行的终局（approved / member / left / declined）不得被翻转。
+ * 返回是否已登记（写面被挂起 / 失败返回 false：调用方据此不投邀请，免得对方点头被拒）。 */
+function registerInvitedMember(joinState, local, pending) {
+  if (localRosterOf(local).some((entry) => entry.instanceId === pending.instanceId)) {
+    return true;
+  }
+  const registered = mutateLedger(joinState.state, local, (ledger) => {
+    ledger.members.push({
+      instanceId: pending.instanceId,
+      identityName: applicantNameOf(pending),
+      role: 'member',
+      state: 'invited',
+      joinedAt: new Date(joinState.now()).toISOString(),
+    });
+  });
+  if (registered === null) {
+    joinState.log.warn('受邀登记未落地（台账写被挂起）', { collabId: local.collabId, instanceId: pending.instanceId });
+    return false;
+  }
+  return true;
 }
 
 /* 被邀者身份名（邀请名单的形态判据要求可呈现）：受邀帧的 from 已过协议校验，缺名时退回实例标识。 */
@@ -898,12 +963,6 @@ function nameOf(value) {
 }
 
 /* 目标端点形态（按名解析的目标：IP 字面量与端口）——与网络层入口判据同一口径，形态不符即不发程。 */
-function targetOf(target) {
-  const address = typeof target?.address === 'string' ? target.address.trim() : '';
-  const port = target?.port;
-  return isIP(address) !== 0 && Number.isInteger(port) && port >= 1 && port <= 65535 ? { address, port } : null;
-}
-
 /* 申请时限（毫秒）：准入门判据、台账剪除与站长侧待批准存活面共用同一注入值；非法 / 缺失回落缺省。 */
 function ttlOf(joinState) {
   const ttlMs = joinState.state.joinRequestTtlMs;

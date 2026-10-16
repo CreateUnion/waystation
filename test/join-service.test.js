@@ -9,6 +9,7 @@ import { CONFIG_FILE_NAME, bindingsFilePath, coreJsonPath, joinApplicationsFileP
 import { createCollabService } from '../src/collab/service.js';
 import { resolveJoinTarget } from '../src/collab/join.js';
 import { bindingIsActive, createBindingStore } from '../src/core/routing.js';
+import { loadLedger } from '../src/collab/store.js';
 import { createIpcClient } from '../src/core/ipc.js';
 import { startCore } from '../src/core/main.js';
 import { makeTempDir, pickFreePort, waitFor } from './helpers.js';
@@ -65,7 +66,7 @@ function makeService(t, overrides = {}) {
   const notices = [];
   const opened = [];
   const deliveries = captureDeliveries();
-  const bindings = createBindingStore({ dataDir: dir, log: quietLog() });
+  const bindings = optionalOf(overrides, 'bindings', createBindingStore({ dataDir: dir, log: quietLog() }));
   const self = overrides.self ?? peer('inst-self', '本机');
   const config = { inviteTtlMs: DAY, ...(overrides.config ?? {}) };
   const service = createCollabService({
@@ -74,13 +75,13 @@ function makeService(t, overrides = {}) {
     self,
     send: overrides.send ?? deliveries.send,
     sendDirect: optionalOf(overrides, 'sendDirect', deliveries.sendDirect),
-    knownHosts: { remember: () => {}, lookup: () => undefined },
+    knownHosts: optionalOf(overrides, 'knownHosts', { remember: () => {}, lookup: () => undefined }),
     notify: (frame) => {
       notices.push(frame);
       return true;
     },
     log: quietLog(),
-    bindings: optionalOf(overrides, 'bindings', bindings),
+    bindings,
     bridgeIdOf: overrides.bridgeIdOf ?? null,
     openViewer: (ref) => {
       opened.push(ref);
@@ -1095,4 +1096,108 @@ test('讨论敲门登记：放行来得太晚（越过申请时限）＝不再�
   assert.equal(approved.ok, true, approved.message);
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(made.bindings.entries().length, 0, '登记过期＝不接线（陈旧放行不改席位）');
+});
+
+/* —— 修复轮二：受邀登记（台账闭环）与敲门登记的清除时序 —— */
+
+/* 台账读面（受邀登记 / 收录的判据面）。 */
+function ledgerOf(dir, collabId) {
+  return loadLedger(dir, collabId).ledger;
+}
+
+function approveResponseFrame(collabId, from) {
+  seq++;
+  return { v: 1, type: 'approve', msgId: `msg-nod-${seq}`, from: { ...from }, collabId, ts: new Date().toISOString(), payload: {} };
+}
+
+test('未在席的批准（站长侧）：批准把申请人登进台账名单为 invited（创建流同形）——点头后正常收录、无 eventMismatch', async (t) => {
+  const owner = makeService(t);
+  const created = owner.service.create({ name: '远端项目', topic: '主题', targets: [endpoint('inst-b', '主机乙')] });
+  await receive(owner.service, joinRequestFrame(created.collabId, 'newcomer-1', peer('inst-c', '主机丙', 17600)), '127.0.0.3');
+  const approved = owner.service.join.approve({ collabId: created.collabId, sessionId: 'newcomer-1', approve: true, approvedBy: 'session-a' });
+  assert.equal(approved.ok, true, approved.message);
+  const invited = ledgerOf(owner.dir, created.collabId).members.find((row) => row.instanceId === 'inst-c');
+  assert.equal(invited.state, 'invited', '受邀登记（创建流同形：role member ＋ state invited）');
+  assert.equal(invited.role, 'member');
+  assert.equal(invited.identityName, '主机丙');
+  assert.equal(typeof invited.joinedAt, 'string');
+  assert.equal(owner.service.list().collabs[0].memberCount, 3, '名册含被邀机器（manager ＋ 创建目标 ＋ 申请人）');
+  /* 申请人点头：站长侧按「名单内且 invited」收录（登记在先＝回应被正常定位，不落 eventMismatch 丢弃面）。 */
+  const admitted = await receive(owner.service, approveResponseFrame(created.collabId, peer('inst-c', '主机丙', 17600)), '127.0.0.3');
+  assert.equal(admitted.ok, true, admitted.reason);
+  assert.equal(owner.service.stats().eventMismatch, 0, '受邀登记在先＝回应被正常收录');
+  assert.equal(owner.service.stats().approvalsIn, 1);
+  assert.equal(ledgerOf(owner.dir, created.collabId).members.find((row) => row.instanceId === 'inst-c').state, 'approved', '点头后台账收录');
+});
+
+test('未在席的批准（站长侧）：同机器新窗口再获批＝不补发邀请、计数不虚增、名单行不重写', async (t) => {
+  const owner = makeService(t);
+  const created = owner.service.create({ name: '远端项目', topic: '主题', targets: [endpoint('inst-b', '主机乙')] });
+  await receive(owner.service, joinRequestFrame(created.collabId, 'newcomer-1', peer('inst-c', '主机丙', 17600)), '127.0.0.3');
+  owner.service.join.approve({ collabId: created.collabId, sessionId: 'newcomer-1', approve: true, approvedBy: 'session-a' });
+  const invitesSent = owner.service.stats().invitesSent;
+  const version = ledgerOf(owner.dir, created.collabId).version;
+  assert.equal(sentOf(owner.direct, 'invite').length, 1);
+  /* 同机器的第二个窗口申请：该机器已在册（受邀行）＝不再补发、不重写名单行。 */
+  await receive(owner.service, joinRequestFrame(created.collabId, 'newcomer-2', peer('inst-c', '主机丙', 17600)), '127.0.0.3');
+  const second = owner.service.join.approve({ collabId: created.collabId, sessionId: 'newcomer-2', approve: true, approvedBy: 'session-a' });
+  assert.equal(second.ok, true, second.message);
+  assert.equal(sentOf(owner.direct, 'invite').length, 1, '已在册＝不补发邀请');
+  assert.equal(owner.service.stats().invitesSent, invitesSent, '计数不虚增');
+  assert.equal(ledgerOf(owner.dir, created.collabId).version, version, '名单行不重写（台账零变更）');
+  assert.equal(ledgerOf(owner.dir, created.collabId).members.filter((row) => row.instanceId === 'inst-c').length, 1);
+});
+
+test('讨论敲门登记：接线未落地（绑定表瞬态不可用）＝登记保留，下次落地仍接线（清除在成功之后）', async (t) => {
+  const dir = makeTempDir(t);
+  const store = createBindingStore({ dataDir: dir, log: quietLog() });
+  const made = makeService(t, {
+    bindings: store,
+    requestJoin: async ({ name }) => ({ ok: true, replies: [{ collabId: 'collab-f', name, memberCount: 2, originator: peer('inst-a', '主机甲') }] }),
+  });
+  const knocked = await made.service.join.request({ name: '联调讨论', sessionId: 'forumses-1' });
+  assert.equal(knocked.ok, true, knocked.message);
+  const realSet = store.set;
+  delete store.set;   // 瞬态：绑定表不可用（接线未落地）
+  await receive(made.service, inviteFrame({ collabId: 'collab-f', name: '联调讨论', mode: 'forum' }), '127.0.0.1');
+  const first = await made.service.approve({ collabId: 'collab-f', approve: true });
+  assert.equal(first.ok, true, first.message);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(made.bindings.get('collab-f'), null, '绑定表不可用＝接线未落地');
+  store.set = realSet;   // 面恢复
+  /* 同名讨论的再次落地：登记未被首次失败吃掉，请求会话照常持席。 */
+  await receive(made.service, inviteFrame({ collabId: 'collab-f2', name: '联调讨论', mode: 'forum' }), '127.0.0.1');
+  const second = await made.service.approve({ collabId: 'collab-f2', approve: true });
+  assert.equal(second.ok, true, second.message);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(made.bindings.get('collab-f2')?.sessionId, 'forumses-1', '登记保留＝下次落地仍接线');
+});
+
+test('申请（target 两形态）：{instanceId} 经已知主机清单解析端点；解析不出如实报错、不静默改走敲门', async (t) => {
+  const resolved = [];
+  const made = makeService(t, {
+    knownHosts: {
+      remember: () => {},
+      lookup: (instanceId) => (instanceId === 'inst-known' ? { address: '127.0.0.7', port: 17700 } : undefined),
+    },
+    requestJoinResolve: async ({ address, port }) => {
+      resolved.push({ address, port });
+      return { ok: true, reply: { found: true, collabId: 'collab-far', responder: { instanceId: 'inst-known', identityName: '主机己', address, port } } };
+    },
+  });
+  const ok = await made.service.join.request({ name: '远端项目', target: { instanceId: 'inst-known' }, sessionId: 'newcomer-1' });
+  assert.equal(ok.ok, true, ok.message);
+  assert.deepEqual(resolved, [{ address: '127.0.0.7', port: 17700 }], '实例标识经已知主机清单解析（设计 §6 评审 M4）');
+  const requests = sentOf(made.direct, 'join-request');
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0].to, { instanceId: 'inst-known', address: '127.0.0.7', port: 17700 });
+  /* 实例标识解析不出：如实报错（不静默改走敲门——广播给全网是错向）。 */
+  const unknown = await made.service.join.request({ name: '远端项目', target: { instanceId: 'inst-ghost' }, sessionId: 'newcomer-1' });
+  assert.equal(unknown.ok, false);
+  assert.match(unknown.message, /端点未知/);
+  assert.equal(sentOf(made.direct, 'join-request').length, 1, '零新增帧（更未改走敲门）');
+  /* 形态坏的目标同样如实拒（不静默按未给处理）。 */
+  const badTarget = await made.service.join.request({ name: '远端项目', target: { address: 'not-an-ip', port: 1 }, sessionId: 'newcomer-1' });
+  assert.equal(badTarget.ok, false);
+  assert.match(badTarget.message, /target 非法/);
 });
