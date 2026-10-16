@@ -609,12 +609,35 @@ function approveNow(state, input) {
   if (result.ok === true && result.joined === true) {
     const local = state.collabs.get(input?.collabId);
     if (local !== undefined) {
+      settleKnockedSession(state, local);
       queueMicrotask(() => {
         triggerSync(state, local, { reason: 'join-decided' });
       });
     }
   }
   return result;
+}
+
+/* 敲门登记的本会话接线（讨论「加入后本会话接线」的收口）：同意门的写点（放行者席位）在 handler
+ * 之后才落，故本步以宏任务让位——登记在册的请求会话最终持席（放行者即请求会话时＝幂等重写）。
+ * 无登记 / 非讨论 / 计时器不可用一律空转（既有行为不变）；计时器不阻止进程退出。 */
+function settleKnockedSession(state, local) {
+  const bind = () => {
+    try {
+      state.join.bindKnockedSession(local);
+    } catch (error) {
+      state.counters.eventFailures++;
+      state.log.warn('敲门会话接线异常（已隔离）', { collabId: local.collabId, reason: error?.message });
+    }
+  };
+  if (typeof setTimeout !== 'function') {
+    bind();
+    return;
+  }
+  const timer = setTimeout(bind, 0);
+  if (typeof timer.unref === 'function') {
+    timer.unref();
+  }
 }
 
 /* 指名邀请的点头判定（「会话级加入」点名落点三）：member.json 的 targetSessionId 定格「只有该

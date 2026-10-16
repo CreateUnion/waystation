@@ -1,8 +1,8 @@
 import { isIP } from 'node:net';
 import { ID_PATTERN, MAX_REASON_CHARS, PROTOCOL_VERSION, isIdentityName, isPresentationText, newMsgId } from '../net/protocol.js';
 import { createJoinApplicationsStore, createJoinsStore } from './joins.js';
-import { currentManagerIdOf, isLocalArchivedState, localModeOf, localNameOf, selfJoinedOf } from './local.js';
-import { endpointFor } from './outgoing.js';
+import { currentManagerIdOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, selfJoinedOf } from './local.js';
+import { endpointFor, invitePayloadOf } from './outgoing.js';
 import { shortSessionId } from '../util/short-id.js';
 
 /* 加入域服务（会话级加入 §2/§4）：会话申请 / 站长批准 / 接线 / 拒绝呈现 ＋ 讨论直连。
@@ -27,7 +27,7 @@ const MAIN_VIEWER_ROOT = 'main';
  *   log?: any, now?: () => number }} deps
  */
 export function createJoinDomain({ state, send = null, openViewer = null, log = null, now = Date.now }) {
-  /** @type {{ state: any, send: any, openViewer: any, log: any, now: () => number, stores: Map<string, any>, retries: Map<string, any> }} */
+  /** @type {{ state: any, send: any, openViewer: any, log: any, now: () => number, stores: Map<string, any>, retries: Map<string, any>, knocks: Map<string, any> }} */
   const joinState = {
     state,
     send: typeof send === 'function' ? send : null,
@@ -36,6 +36,7 @@ export function createJoinDomain({ state, send = null, openViewer = null, log = 
     now: typeof now === 'function' ? now : Date.now,
     stores: new Map(),      // collabId → 加入台账（惰性构造；写前 load 刷新，并入他域写入的获准）
     retries: new Map(),     // 申请重发轮（键＝协作 ＋ 会话）
+    knocks: new Map(),      // 讨论名 → 敲门登记（请求会话 ＋ 时刻：同意门落地时把席位交回请求会话）
   };
   state.joinApplications = state.joinApplications ?? createJoinApplicationsStore({ dataDir: state.dataDir, log: joinState.log });
   const domain = {
@@ -46,6 +47,8 @@ export function createJoinDomain({ state, send = null, openViewer = null, log = 
     handleJoinDeny: (frame) => handleJoinDeny(joinState, frame),
     pendingJoinsOf: (collabId) => pendingJoinsOf(joinState, collabId),
     isGranted: (collabId, sessionId) => isGranted(joinState, collabId, sessionId),
+    /* 讨论同意门落地后的收口（服务在邀请被批准时调用）：把敲门登记在册的请求会话接线。 */
+    bindKnockedSession: (local) => bindKnockedSession(joinState, local),
   };
   /* 准入门的上限判定注入面（待批准存活面）：门只调 list() 取数、不筛不删，过期待批准由本提供方剪除。 */
   state.pendingJoinsOf = domain.pendingJoinsOf;
@@ -364,28 +367,41 @@ function matchApplication(joinState, frame) {
 
 /* 批准回执（设计 §2）：写本机获准台账 → 写绑定（origin:grant——离线会话＝持久映射、重开即活）
  * → 删申请记录 → 开该协作页（「进入即见」）。授权对象＝回执携的会话，须与命中记录一致
- * （准入门不比对会话标识，这一步在本域补：不一致的回执不得改他会话的绑定）。 */
+ * （准入门不比对会话标识，这一步在本域补：不一致的回执不得改他会话的绑定）。
+ * 获准入账被拒即整条回执不落地（不接线、不删申请记录：杜绝「已接线未获准」）。 */
 function handleJoinGrant(joinState, frame) {
+  const record = matchGrantedApplication(joinState, frame);
+  if (record === null) {
+    return null;
+  }
+  const written = writeApproval(joinState, {
+    collabId: record.collabId,
+    instanceId: joinState.state.self.instanceId,
+    sessionId: record.sessionId,
+    origin: 'grant',
+    grantedAt: joinState.now(),
+    approvedBy: approverOf(frame?.from),
+  });
+  if (written !== true) {
+    joinState.log.warn('获准条目形态不符，回执未落地（不接线、申请记录保留）', { collabId: record.collabId, sessionId: record.sessionId });
+    return null;
+  }
+  finishGranted(joinState, { collabId: record.collabId, sessionId: record.sessionId });
+  return { ok: true, action: 'granted', collabId: record.collabId, sessionId: record.sessionId };
+}
+
+/* 回执与本机申请台账的比对（含授权会话一致性）：命中且一致才返回记录，否则留痕返回 null。 */
+function matchGrantedApplication(joinState, frame) {
   const record = matchApplication(joinState, frame);
   if (record === null) {
     joinState.log.warn('加入批准回执与本机申请台账不匹配（未申请或已过期），忽略', { collabId: frame?.collabId, msgId: frame?.msgId });
     return null;
   }
-  const sessionId = idOf(frame?.payload?.sessionId);
-  if (sessionId !== record.sessionId) {
-    joinState.log.warn('加入批准回执的授权会话与命中记录不一致，忽略', { collabId: record.collabId, authorized: frame?.payload?.sessionId });
+  if (idOf(frame.payload?.sessionId) !== record.sessionId) {
+    joinState.log.warn('加入批准回执的授权会话与命中记录不一致，忽略', { collabId: record.collabId, authorized: frame.payload?.sessionId });
     return null;
   }
-  writeApproval(joinState, {
-    collabId: record.collabId,
-    instanceId: joinState.state.self.instanceId,
-    sessionId,
-    origin: 'grant',
-    grantedAt: joinState.now(),
-    approvedBy: approverOf(frame?.from),
-  });
-  finishGranted(joinState, { collabId: record.collabId, sessionId });
-  return { ok: true, action: 'granted', collabId: record.collabId, sessionId };
+  return record;
 }
 
 /* 拒绝回执（设计 §2）：删申请记录 ＋ 本机提示呈现拒绝与原因（沿既有本机提示先例）。 */
@@ -517,7 +533,9 @@ function validateReason(reason) {
  * 本域只到「等待放行」为止——接线在同意门，谁点头谁承接）。 */
 async function requestForum(joinState, local, sessionId) {
   if (selfJoinedOf(local, joinState.state.self.instanceId)) {
-    bindSession(joinState, { collabId: local.collabId, sessionId, origin: 'join' });
+    if (bindSession(joinState, { collabId: local.collabId, sessionId, origin: 'join' }) !== true) {
+      return { ok: false, message: '接线未落地（绑定表不可用）——本会话收不到该讨论的注入' };
+    }
     return { ok: true, collabId: local.collabId, sessionId, mode: 'forum', bound: true, note: '讨论在席＝本机接线立即（无批准门）——本会话开始接收该讨论的注入' };
   }
   return knockByName(joinState, localNameOf(local), sessionId);
@@ -528,7 +546,36 @@ async function knockByName(joinState, name, sessionId) {
   if (knocked.ok !== true) {
     return knocked;
   }
+  rememberKnock(joinState, name, sessionId);
   return { ok: true, mode: 'forum', sessionId, knocked: true, replies: knocked.replies, note: knockNoteOf(knocked.replies) };
+}
+
+/* 敲门登记（设计 §4 的「加入后本会话接线」）：请求会话 ↔ 讨论名——放行者与请求会话未必同一个
+ * （敲门不指名，放行后的邀请广播给全部活跃会话），登记让同意门落地时把席位交回请求会话。
+ * 同名后敲者覆盖先敲者（一个讨论只留最新的请求会话），登记按申请时限过期（放行来晚了不再接线）。 */
+function rememberKnock(joinState, name, sessionId) {
+  joinState.knocks.set(name, { sessionId, at: joinState.now() });
+}
+
+/* 同意门落地后的收口（服务在讨论邀请被批准时调用）：该讨论名登记在册的请求会话接线——放行者
+ * 若恰是请求会话，同意门的写点已接线（此处幂等重写）；登记不存在 / 已过期 / 服务面缺位一律不动
+ * （既有行为不变）。返回接线到的会话标识，未接线返回 null。 */
+function bindKnockedSession(joinState, local) {
+  if (local === undefined || localModeOf(local) !== 'forum') {
+    return null;
+  }
+  const name = localNameOf(local);
+  const registered = joinState.knocks.get(name);
+  if (registered === undefined) {
+    return null;
+  }
+  joinState.knocks.delete(name);   // 一次性登记：席位已交回，不重复接线
+  if (joinState.now() - registered.at >= ttlOf(joinState) || !isIdentityName(registered.sessionId)) {
+    return null;   // 登记过期（放行来得太晚）或形态坏：按未登记处置
+  }
+  return bindSession(joinState, { collabId: local.collabId, sessionId: registered.sessionId, origin: 'join' }) === true
+    ? registered.sessionId
+    : null;
 }
 
 /* 敲门原语调用（网络面缺位 / 降级 / 异常同归一处如实报错；无应答＝空清单，不是失败）。 */
@@ -649,22 +696,67 @@ function matchPending(joinState, records, wanted) {
   return matched.length === 1 ? matched[0] : null;
 }
 
-/* 批准落地：本机自批（申请人会话在本机）＝批准记录 ＋ 接线 ＋ 开页（回执无从经网络回到自己）；
- * 远端申请人＝先投回执再落记录（回执发不出去＝没批准，待批准面保留以便重试）。 */
+/* 批准落地：申请人会话在本机（本机自批）＝本机直接接线（回执无从经网络回到自己）；
+ * 远端申请人＝补入席（未在册时）＋投回执＋落批准记录。获准入账被拒一律不接线。 */
 function grantPending(joinState, plan) {
-  if (plan.pending.instanceId === joinState.state.self.instanceId) {
-    writeApproval(joinState, approvalOf(plan, plan.pending.instanceId));
-    plan.store.removePendingJoin(plan.pending.sessionId);
-    finishGranted(joinState, { collabId: plan.collabId, sessionId: plan.pending.sessionId });
-    return { ok: true, collabId: plan.collabId, sessionId: plan.pending.sessionId, local: true, bound: true };
+  return plan.pending.instanceId === joinState.state.self.instanceId
+    ? completeLocalGrant(joinState, plan)
+    : completeRemoteGrant(joinState, plan);
+}
+
+function completeLocalGrant(joinState, plan) {
+  if (writeApproval(joinState, approvalOf(plan, plan.pending.instanceId)) !== true) {
+    return { ok: false, message: '获准条目形态不符，未入账（未接线）——待批准面保留，可重试' };
+  }
+  plan.store.removePendingJoin(plan.pending.sessionId);
+  finishGranted(joinState, { collabId: plan.collabId, sessionId: plan.pending.sessionId });
+  return { ok: true, collabId: plan.collabId, sessionId: plan.pending.sessionId, local: true, bound: true };
+}
+
+/* 远端申请人：先补入席（申请人机器尚未在册时）、再投授权回执、最后落批准记录——回执 / 邀请发不
+ * 出去都按「未处置」收口（待批准面保留，可重试），获准入账失败同样不接线。 */
+function completeRemoteGrant(joinState, plan) {
+  const seated = ensureApplicantSeated(joinState, plan);
+  if (seated.ok !== true) {
+    return seated;
   }
   const sent = sendPendingDecision(joinState, plan, 'join-grant', { sessionId: plan.pending.sessionId });
   if (sent.ok !== true) {
     return sent;
   }
-  writeApproval(joinState, approvalOf(plan, plan.pending.instanceId));
+  if (writeApproval(joinState, approvalOf(plan, plan.pending.instanceId)) !== true) {
+    return { ok: false, message: '获准条目形态不符，未入账（未接线）——待批准面保留，可重试' };
+  }
   plan.store.removePendingJoin(plan.pending.sessionId);
-  return { ok: true, collabId: plan.collabId, sessionId: plan.pending.sessionId, sent: true };
+  return { ok: true, collabId: plan.collabId, sessionId: plan.pending.sessionId, sent: true, seated: seated.seated };
+}
+
+/* 批准一并完成入席（设计 §2）：申请人机器尚未在册（不在台账名单内）＝经既有邀请通道把该机器
+ * 请进来——受邀准入路径（handleInvite）负责本机协作注册与成员记录，载荷用既有构造（名单须含
+ * 被邀者），并指名申请会话（点头权归它；离线时按既有的指名挂起补投）。机器已在册＝无需入席
+ * （新窗口跟进照旧只由批准回执接线）。 */
+function ensureApplicantSeated(joinState, plan) {
+  const local = joinState.state.collabs.get(plan.collabId);
+  if (localRosterOf(local).some((entry) => entry.instanceId === plan.pending.instanceId)) {
+    return { ok: true, seated: true };
+  }
+  const target = decisionTargetOf(joinState, plan.collabId, plan.pending.instanceId);
+  if (target === null) {
+    return { ok: false, message: `申请人端点未知（${plan.pending.instanceId}）——先 ws_list_hosts 确认对方在线，或让申请人重新申请（入站帧会带来端点）` };
+  }
+  const applicant = { instanceId: plan.pending.instanceId, identityName: applicantNameOf(plan.pending) };
+  const payload = { ...invitePayloadOf(local.ledger, [applicant]), targetSessionId: plan.pending.sessionId };
+  const sent = sendFrameOf(joinState, { collabId: plan.collabId, target, type: 'invite', payload });
+  if (sent.ok !== true) {
+    return { ok: false, message: `入席邀请发送失败：${sent.reason}——未落处置，可稍后重试` };
+  }
+  joinState.state.counters.invitesSent++;
+  return { ok: true, seated: false };
+}
+
+/* 被邀者身份名（邀请名单的形态判据要求可呈现）：受邀帧的 from 已过协议校验，缺名时退回实例标识。 */
+function applicantNameOf(pending) {
+  return isIdentityName(pending.identityName) ? pending.identityName : pending.instanceId;
 }
 
 /* 拒绝落地：本机自批＝本机提示呈现原因；远端申请人＝回 join-deny（含原因），发不出去即不落处置。 */
@@ -708,14 +800,20 @@ function sendPendingDecision(joinState, plan, type, payload) {
   if (target === null) {
     return { ok: false, message: `申请人端点未知（${plan.pending.instanceId}）——先 ws_list_hosts 确认对方在线，或让申请人重新申请（入站帧会带来端点）` };
   }
+  const sent = sendFrameOf(joinState, { collabId: plan.collabId, target, type, payload: { reqMsgId: plan.pending.reqMsgId, ...payload } });
+  return sent.ok === true ? { ok: true } : { ok: false, message: `回执发送失败：${sent.reason}——未落处置，可稍后重试` };
+}
+
+/* 直投出口（批准回合的两个动作——入席邀请与授权回执——同走直投面：同通道同命运；发送面缺位 /
+ * 拒绝都如实返回原因）。 */
+function sendFrameOf(joinState, { collabId, target, type, payload }) {
   if (joinState.send === null) {
-    return { ok: false, message: '回执发送失败：直投面不可用（发送注入缺失）——未落处置，可稍后重试' };
+    return { ok: false, reason: '直投面不可用（发送注入缺失）' };
   }
-  const result = joinState.send({ collabId: plan.collabId, to: target, type, payload: { reqMsgId: plan.pending.reqMsgId, ...payload } });
-  if (result?.ok !== true) {
-    return { ok: false, message: `回执发送失败：${result?.reason ?? '发送面未返回结果'}——未落处置，可稍后重试` };
-  }
-  return { ok: true };
+  const result = joinState.send({ collabId, to: target, type, payload });
+  return result?.ok === true
+    ? { ok: true, msgId: result.msgId }
+    : { ok: false, reason: result?.reason ?? '发送面未返回结果' };
 }
 
 function decisionTargetOf(joinState, collabId, instanceId) {
