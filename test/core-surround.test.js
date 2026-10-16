@@ -436,6 +436,17 @@ test('整链·观察窗触发记账（真核）：建协触发 A 达出口；未
   assert.equal(triggerJudgedCount(home), judgedOnce, '同 sessionId 顶替不重判（不重复开窗判定）');
 });
 
+/* 会话获准台账（joins.json）直落：夺席收紧后，休眠/空绑定下的写类夺席以本机获准台账为判据
+ * （本会话未获准不夺席）；登记工具面归会话级加入链的后续批，本用例以台账面就位构造
+ * 「已获准、绑定休眠」前态——核心判据读的就是这份文件（获准全量会话标识精确匹配）。 */
+function grantSessionInLedger(home, instanceId, collabId, sessionId) {
+  writeFileSync(join(home, 'collabs', collabId, 'joins.json'), JSON.stringify({
+    v: 1,
+    pendingJoins: [],
+    approvals: [{ instanceId, sessionId, origin: 'grant', grantedAt: Date.now(), approvedBy: 'session-a' }],
+  }, null, 2), 'utf8');
+}
+
 test('整链·per-session 过滤（真核＋真工具调用）：绑定随会话、异会话不含、断开删除、夺席后转移', { timeout: 90000 }, async (t) => {
   const home = makeTempDir(t);
   const { record } = await startCoreOnTempRoot(t, home);
@@ -462,6 +473,8 @@ test('整链·per-session 过滤（真核＋真工具调用）：绑定随会话
   a.client.send({ type: 'bye', reason: 'session-end' });
   await a.client.close();
   await waitFor(() => (existsSync(fileA) ? null : true), { timeoutMs: 10000 });
+  /* 会话 B 获准台账就位（已获准、绑定休眠 → 写类调用夺席；未经收紧的旧行为里 B 不获准也夺）。 */
+  grantSessionInLedger(home, record.identity.instanceId, created.collabId, 'session-b');
   const muted = await callAndWait(b, 'ws_set_mute', { collabId: created.collabId, muted: true });
   assert.equal(muted.ok, true, muted.message);
   await waitFor(() => (collabsOf(fileB).some((entry) => entry.collabId === created.collabId) ? true : null), { timeoutMs: 12000 });
