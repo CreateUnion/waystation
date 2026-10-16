@@ -1,5 +1,5 @@
 import { DEFAULT_COLLAB_MODE } from '../net/protocol.js';
-import { appendLedger, ensureCollabDir, saveMember, saveSnapshot } from './store.js';
+import { appendLedger, ensureCollabDir, loadMember, saveMember, saveSnapshot } from './store.js';
 import { isArchived } from './model.js';
 import { newMemberEventId } from './members.js';
 
@@ -143,13 +143,32 @@ export function currentManagerIdOf(local) {
   return local.member.manager.instanceId;
 }
 
+/* 成员记录整写（服务侧唯一咽喉）：写前把**路由面字段**从盘上合并回来——指名邀请的
+ * targetSessionId 与挂起登记 pendingInvites 由核心路由面直写 member.json（判据与补投都读它），
+ * 内存记录不含这两项，整写会静默抹掉（挂起邀请永不再补投）。合并口径＝文件显式给了就以文件
+ * 为准（路由面是这两个字段的唯一写者：登记、刷新与摘除都由它做），同时补学回内存记录——
+ * 此后本会话的整写不再丢；文件没有该字段（旧记录）则保留内存值。 */
 export function persistMember(state, local) {
   try {
     ensureCollabDir(state.dataDir, local.collabId);
+    mergeRoutingMarks(state, local);
     saveMember(state.dataDir, local.member);
   } catch (error) {
     state.counters.persistFailures++;
     state.log.warn('成员记录写入失败（内存态继续）', { collabId: local.collabId, reason: error.message });
+  }
+}
+
+/* 路由面字段的合并（见 persistMember）：读不出 / 形态不符一律原样（不拿坏数据覆盖内存态）。 */
+function mergeRoutingMarks(state, local) {
+  const onDisk = loadMember(state.dataDir, local.collabId);
+  if (onDisk === null || local.member === null || typeof local.member !== 'object') {
+    return;
+  }
+  for (const field of ['targetSessionId', 'pendingInvites']) {
+    if (onDisk[field] !== undefined) {
+      local.member[field] = onDisk[field];
+    }
   }
 }
 

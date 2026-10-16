@@ -1259,8 +1259,8 @@ async function e2eCreateCollab(scene) {
   return created.collabId;
 }
 
-/* 获准台账（joins.json）直落：本批的批准工具面归 T14，e2e 以台账面就位模拟「此前已获批准」——
- * 核心判据读的就是这份文件（获准台账判据全量会话标识精确匹配）。 */
+/* 获准台账（joins.json）直落：批准工具面由工具面收口批次补，e2e 以台账面就位模拟「此前已获
+ * 批准」——核心判据读的就是这份文件（获准台账判据全量会话标识精确匹配）。 */
 function grantInLedger(root, collabId, instanceId, sessionId) {
   const file = join(root, 'collabs', collabId, 'joins.json');
   writeFileSync(file, JSON.stringify({

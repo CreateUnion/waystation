@@ -782,39 +782,44 @@ async function flushPendingInvitesOf(state, sessionId, pusher) {
 }
 
 async function flushPendingInvitesInner(state, sessionId, pusher) {
-  const entry = isCollabId(sessionId) ? (state.registry?.find?.(sessionId) ?? null) : null;
-  if (entry === null || state.ipc === null) {
+  const registered = isCollabId(sessionId) && (state.registry?.find?.(sessionId) ?? null) !== null;
+  if (!registered || state.ipc === null) {
     return 0;
   }
   let flushed = 0;
   for (const collabId of listLocalCollabIds(state.dataDir)) {
-    flushed += await flushCollabInvitesOf(state, collabId, { sessionId, entry, pusher });
+    flushed += await flushCollabInvitesOf(state, collabId, { sessionId, pusher });
   }
   return flushed;
 }
 
-/* 单协作一轮补投：登记面读改写一次（未投出与未摘除的条目原样保留）。 */
+/* 单协作一轮补投：逐条判定（跨 await 等回执），收尾按「本轮已结清的会话」摘除登记。 */
 async function flushCollabInvitesOf(state, collabId, ctx) {
   const record = loadMember(state.dataDir, collabId);
   const pending = Array.isArray(record?.pendingInvites) ? record.pendingInvites : null;
   if (record === null || pending === null || pending.length === 0) {
     return 0;
   }
-  const kept = [];
+  const round = await runFlushRound(state, pending, { ...ctx, collabId, record });
+  if (round.cleared.size > 0) {
+    settlePendingInvites(state, collabId, record, round.cleared);
+  }
+  return round.flushed;
+}
+
+/* 一轮逐条判定：返回本轮投出数与「已结清」（投出或摘除）的会话集合——未结清的原样保留。 */
+async function runFlushRound(state, pending, ctx) {
+  const cleared = new Set();
   let flushed = 0;
   for (const item of pending) {
-    const outcome = await flushPendingInviteOf(state, item, { ...ctx, collabId, record });
-    if (outcome === 'pushed') {
-      flushed++;
-    }
+    const outcome = await flushPendingInviteOf(state, item, ctx);
     if (outcome === 'kept') {
-      kept.push(item);
+      continue;
     }
+    cleared.add(item?.sessionId);
+    flushed += outcome === 'pushed' ? 1 : 0;
   }
-  if (kept.length !== pending.length) {
-    writePendingInvites(state, collabId, record, kept);
-  }
-  return flushed;
+  return { cleared, flushed };
 }
 
 /* 单条补投判定：非本次注册的会话（含前缀歧义）不动它；已处置 / 过期的摘除；渲染不出的保留
@@ -848,9 +853,14 @@ function isInviteSettledOrExpired(state, record) {
   return Number.isFinite(expiresAtMs) && state.clock() >= expiresAtMs;
 }
 
-function writePendingInvites(state, collabId, record, kept) {
+/* 摘除写回（本轮已结清的条目）：判定跨 await（push 最长等一个回执期限），期间登记面可能被
+ * 别的写入方改过（重发邀请刷新 / 服务侧整写）——写前重读盘上最新记录，只摘本轮结清的会话
+ * （新到登记与在途条目原样保留）；读不出退回本轮快照。 */
+function settlePendingInvites(state, collabId, snapshot, cleared) {
   try {
-    saveMember(state.dataDir, { ...record, pendingInvites: kept });
+    const record = loadMember(state.dataDir, collabId) ?? snapshot;
+    const pending = Array.isArray(record.pendingInvites) ? record.pendingInvites : [];
+    saveMember(state.dataDir, { ...record, pendingInvites: pending.filter((item) => !cleared.has(item?.sessionId)) });
   } catch (error) {
     state.log.warn('挂起邀请登记写回失败（保留原登记——下轮再试）', { collabId, reason: error.message });
   }

@@ -75,6 +75,7 @@ function makeHarness(t, overrides = {}) {
     send: (record, frame) => {
       h.out.push({ record, frame });
       if (frame.type === 'push') {
+        overrides.onPush?.(h, frame);   // 并发写入注入点（补投在途时的第三个写入方）
         queueMicrotask(() => h.router.settleDelivered({ type: 'delivered', pushId: frame.pushId, ok: overrides.pushOk !== false }));
       }
       return true;
@@ -232,6 +233,53 @@ test('挂起补投：投出失败保留登记（下轮再投）；非目标会�
   const failedPush = await receive(h, inviteFrameOf('collab-named', 'session-t'));
   assert.equal(failedPush.delivered, false, '目标在场但回执未成：按未注入处置');
   assert.equal(h.router.stats().inboundFailed, 1, '单桥失败计数（三态互斥：失败 ≠ 未投）');
+});
+
+test('挂起登记·服务侧整写不抹掉路由面字段：挂起登记与指名标记仍在，补投仍可命中', async (t) => {
+  const h = makeHarness(t);
+  h.registry.register(bridgeRecord('bridge-a', 'session-alpha'));
+  await receive(h, inviteFrameOf('collab-named', 'session-t'));
+  assert.equal(memberOf(h, 'collab-named').pendingInvites.length, 1, '挂起登记就位');
+
+  /* 服务侧整写（成员记录整写的唯一咽喉＝persistMember）：端点变化即整写——用一条旁路帧把
+   * 站长的来源端口换掉，框架走「准入 → 消费 → 端点学习 → 整写」，投递面不参与（非邀请帧）。 */
+  const touched = { ...inviteFrameOf('collab-named', 'session-t'), type: 'reply', msgId: `msg-touch-${randomUUID()}`, payload: { text: '你好' } };
+  touched.from = { ...PEER, port: PEER.port + 1 };
+  const learned = await receive(h, touched);
+  assert.equal(learned.ok, true, '旁路帧过准入（端点学习触发整写）');
+  assert.equal(memberOf(h, 'collab-named').endpoints['inst-peer'].port, PEER.port + 1, '端点已学得（整写确实发生）');
+  assert.equal(memberOf(h, 'collab-named').pendingInvites.length, 1, '整写后挂起登记仍在');
+  assert.equal(memberOf(h, 'collab-named').targetSessionId, 'session-t', '整写后指名标记仍在');
+
+  h.registry.register(bridgeRecord('bridge-t', 'session-target-abc'));
+  assert.equal(await h.router.flushPendingInvites('session-target-abc'), 1, '补投仍可命中（登记未被整写抹掉）');
+  await waitFor(() => pushFramesOf(h.out, 'bridge-t').length >= 1);
+  assert.ok(pushFramesOf(h.out, 'bridge-t')[0].frame.text.includes('指名项目'), '补投文本照常');
+});
+
+test('挂起补投·写回不覆盖并发登记：跨 await 期间新到的登记保留（写回前重读合并）', async (t) => {
+  let h = null;
+  h = makeHarness(t, {
+    onPush: (harness) => {
+      /* 并发登记：模拟补投在途（等回执）时另一条指名邀请落到 member.json（登记面是读改写）。 */
+      const record = JSON.parse(readFileSync(memberFileOf(harness, 'collab-named'), 'utf8'));
+      const frame = inviteFrameOf('collab-named', 'session-late', { payload: { name: '后到项目' } });
+      writeFileSync(memberFileOf(harness, 'collab-named'), JSON.stringify({
+        ...record,
+        pendingInvites: [...record.pendingInvites, { sessionId: 'session-late', frame }],
+      }, null, 2), 'utf8');
+    },
+  });
+  h.registry.register(bridgeRecord('bridge-a', 'session-alpha'));
+  await receive(h, inviteFrameOf('collab-named', 'session-t'));
+  h.registry.register(bridgeRecord('bridge-t', 'session-target-abc'));
+  assert.equal(await h.router.flushPendingInvites('session-target-abc'), 1, '本轮补投一条（在途期新登记入库）');
+  assert.deepEqual(memberOf(h, 'collab-named').pendingInvites.map((item) => item.sessionId), ['session-late'], '在途新登记保留、本轮已结清的摘除');
+
+  h.registry.register(bridgeRecord('bridge-l', 'session-late-9'));
+  assert.equal(await h.router.flushPendingInvites('session-late-9'), 1, '后到登记照常补投（未被旧快照覆盖）');
+  await waitFor(() => pushFramesOf(h.out, 'bridge-l').length >= 1);
+  assert.ok(pushFramesOf(h.out, 'bridge-l')[0].frame.text.includes('后到项目'), '后到邀请文本照常');
 });
 
 /* —— 落点三：点头判定（member.json 的指名 ≠ 点头会话即拒） —— */
