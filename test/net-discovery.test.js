@@ -818,6 +818,23 @@ test('旧版对端（应答无会话字段）：扫描结果与清单都保持�
   assert.equal(Object.hasOwn(a.knownHosts.list().find((entry) => entry.address === '127.0.0.2'), 'sessions'), false, '清单同样记「未知」');
 });
 
+test('清单会话段不被探测路径抹掉：应答存下的短码在随后收到对方探测（该字段缺席）后仍在场', { timeout: 15000 }, async (t) => {
+  const port = await pickFreePort();
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port });
+  const b = await startNode(t, { self: SELF_B, bindAddress: '127.0.0.2', port, activeSessions: () => SESSIONS_B });
+  a.knownHosts.remember({ address: '127.0.0.2', port });
+  await a.node.scan({ windowMs: 250 });
+  assert.deepEqual(a.knownHosts.list().find((entry) => entry.address === '127.0.0.2').sessions, ['9f8e7d6c', 'ab12cd34'], '先经扫描应答存入短码');
+  b.knownHosts.remember({ address: '127.0.0.1', port });
+  const rememberedBefore = a.knownHosts.stats().remembered;
+  for (let attempt = 0; attempt < 5 && a.knownHosts.stats().remembered === rememberedBefore; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, DISCOVERY_REPLY_MIN_INTERVAL_MS + 50));   // 越过清单写节流窗
+    b.node.announce();   // 启动自介＝探测（线上不带 sessions）
+  }
+  await waitFor(() => a.knownHosts.stats().remembered > rememberedBefore, { timeoutMs: 3000 });
+  assert.deepEqual(a.knownHosts.list().find((entry) => entry.address === '127.0.0.2').sessions, ['9f8e7d6c', 'ab12cd34'], '探测只刷新时间：已知短码不得被抹掉（否则对端每扫一次 / 重启一次就消失一次）');
+});
+
 /* 伪解析对端：按收到序数取应答形态（数组取到末尾即沿用最后一项；null = 这一发不答）。 */
 function startResolvePeer(t, { port, address, replies }) {
   const socket = dgram.createSocket({ type: 'udp4', reuseAddr: false });

@@ -288,6 +288,31 @@ test('清单载入：旧条目（无会话字段）兼容为未知；带字段�
   assert.equal(hosts.stats().invalidEntries, 0, '会话段形态宽容：条目本身仍有效（存储级底线只管条目骨架）');
 });
 
+test('先应答后探测：探测态 remember（无会话字段）继承既有短码，不抹掉已存会话', (t) => {
+  const dir = makeTempDir(t);
+  /* 立即落盘（窗口注入 0）：本用例要断言「继承值也进磁盘」，默认 5s 节流会让磁盘停在首版 */
+  const hosts = createKnownHosts({ dataDir: dir, log: { info: () => {}, error: () => {}, warn: () => {} }, persistMinIntervalMs: 0 });
+  hosts.remember({ address: '10.0.0.9', port: 7321, instanceId: 'inst-a', identityName: '甲', sessions: ['9f8e7d6c5b4a3210', 'ab12cd34ef56'] });
+  hosts.remember({ address: '10.0.0.9', port: 7321, instanceId: 'inst-a', identityName: '甲' });   // 探测 / 启动自介路径：不带该字段
+  assert.deepEqual(hosts.list()[0].sessions, ['9f8e7d6c', 'ab12cd34'], '缺字段＝这份没报（不是「零会话」），继承既有短码');
+  assert.equal(hosts.stats().remembered, 2, '继承同样是一次真实写入（身份与 lastSeenAt 照常刷新）');
+  hosts.remember({ address: '10.0.0.9', port: 7321, instanceId: 'inst-a', identityName: '甲', sessions: [] });
+  assert.deepEqual(hosts.list()[0].sessions, [], '明确申报零会话（空数组）＝覆盖');
+  hosts.remember({ address: '10.0.0.9', port: 7321, instanceId: 'inst-a', identityName: '甲', sessions: ['9f8e7d6c5b4a3210'] });
+  assert.deepEqual(hosts.list()[0].sessions, ['9f8e7d6c'], '重新申报（短码变了）＝覆盖');
+  hosts.remember({ address: '10.0.0.9', port: 7321, instanceId: 'inst-a', identityName: '甲', sessions: 'not-an-array' });
+  assert.deepEqual(hosts.list()[0].sessions, ['9f8e7d6c'], '无法整形＝这份没有可用情报，保留已知（与「未报」同一处置——取舍见报告）');
+  const onDisk = JSON.parse(readFileSync(join(dir, KNOWN_HOSTS_FILE_NAME), 'utf8'));
+  assert.deepEqual(onDisk.hosts[0].sessions, ['9f8e7d6c'], '继承值落盘（重载不丢）');
+});
+
+test('无既有会话段的条目：探测态 remember 不臆造空数组（继承不越界为「零会话」）', (t) => {
+  const { hosts } = makeHosts(t);
+  hosts.remember({ address: '10.0.0.9', port: 7321, instanceId: 'inst-a', identityName: '甲' });
+  hosts.remember({ address: '10.0.0.9', port: 7321, instanceId: 'inst-a', identityName: '甲改名' });
+  assert.equal(Object.hasOwn(hosts.list()[0], 'sessions'), false, '从没报过＝未知，连续探测也不改写成空数组');
+});
+
 test('会话段与全量标识混入：只采字符串短码，非字符串项剔除', (t) => {
   const { hosts } = makeHosts(t);
   hosts.remember({ address: '10.0.0.1', port: 7321, sessions: ['9f8e7d6c5b4a3210', 42, null, '', 'ab12cd34ef56'] });

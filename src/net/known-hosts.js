@@ -139,12 +139,19 @@ function remember(state, entry) {
     identityName: boundedText(identityName),
     lastSeenAt: new Date().toISOString(),
   };
+  /* 会话段的合并口径（与扫描结果面同一纪律）：明确申报（数组——空数组＝「零会话」也是申报）即覆盖；
+   * 未报或这份无法整形＝这份没有可用的会话情报 → 继承同键既有值。探测与启动自介都不带该字段，
+   * 且远比 250ms 写节流稀疏——不继承就会「对端每扫一次 / 重启自介一次，本机清单里它的会话短码
+   * 就消失一次」。探测只证明「这台机器在此」，不是「它没有会话」（与「没报 ≠ 零会话」同一判据）。 */
+  const key = keyOf(stored);
+  const held = state.hosts.get(key);
   const sessions = boundedSessions(sessionInput);
   if (sessions !== null) {
-    stored.sessions = sessions;   // 未知（null）则字段缺席：重载后仍是未知（不臆断成零会话）
+    stored.sessions = sessions;
+  } else if (held !== undefined && held.sessions !== undefined) {
+    stored.sessions = held.sessions;
   }
-  const key = keyOf(stored);
-  const isNewKey = !state.hosts.has(key);
+  const isNewKey = held === undefined;
   state.hosts.delete(key);
   state.hosts.set(key, stored);
   evictOverflow(state);
