@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { bindingsFilePath } from '../paths.js';
 import { listLocalCollabIds, loadLedger, loadMember, loadSnapshot, quarantineLedger } from './store.js';
 import { isArchived, withDefaultMode } from './model.js';
 import { createPostsStore } from './posts.js';
@@ -5,6 +7,7 @@ import { createMembersStore } from './members.js';
 import { createCounterStore, notifyIndicatorChange } from './counter.js';
 import { createMuteStore, muteSuppresses } from './mute.js';
 import { createInjectedStore } from './injected.js';
+import { createJoinsStore } from './joins.js';
 import { POST_KINDS } from '../net/protocol.js';
 import { decideAdmission, SYNC_REQUEST_MAX, SYNC_REQUEST_WINDOW_MS } from './gate.js';
 import { handleEvent } from './events.js';
@@ -142,7 +145,7 @@ function apiOf(state) {
     decide: (input) => forumGovernanceRejection(state, input?.collabId) ?? decide(state, input),
     decideMerge: (input) => forumGovernanceRejection(state, input?.collabId) ?? decideMergeOffer(state, input),
     handover: (input) => forumGovernanceRejection(state, input?.collabId) ?? handover(state, input),
-    list: () => listCollabs(state),
+    list: (input) => listCollabs(state, input),
     indicators: () => indicators(state),
     create: (input) => createCollab(state, input),
     invite: (input) => inviteMembers(state, input),
@@ -344,14 +347,46 @@ function ledgerFromSource(local, collabId) {
 /* 本机参与清单（ws_list_collabs 的数据面）：状态取本地权威；expired = 提议中且未回应且已过
  * 有效期（仅标注，不改状态——设计 §6 的「过期不算拒绝」）。
  * 治理面读数：managerOffline（成员侧失联判定）、frozenUnresolved（冻结超时已提示一次）、
- * suspended（收敛等待中的写暂停）、handshakeUnresolved（成员侧握手未能对表——只读保守运行）。 */
-function listCollabs(state) {
+ * suspended（收敛等待中的写暂停）、handshakeUnresolved（成员侧握手未能对表——只读保守运行）。
+ * 会话视角（可选调用者 sessionId）：sessionGranted / sessionBound 按调用会话逐条判定——两本
+ * 记录各司其职（获准＝权限台账、绑定＝路由绑定表），本层只取数不判决。 */
+function listCollabs(state, input) {
   const now = Date.now();
+  const caller = callerSessionOf(state, input);
   const collabs = [];
   for (const local of state.collabs.values()) {
-    collabs.push(listEntryOf(state, local, now));
+    collabs.push(listEntryOf(state, local, now, caller));
   }
   return { collabs };
+}
+
+/* 调用会话视角：无会话标识（桥缺会话环境变量）＝没有视角，两字段如实判否——该调用者确实不在
+ * 任何获准名单里、绑定表也不指向它。绑定集一次现读、全体条目共用（一次列表一次真相）。 */
+function callerSessionOf(state, input) {
+  const sessionId = typeof input?.sessionId === 'string' && input.sessionId !== '' ? input.sessionId : null;
+  return sessionId === null ? null : { sessionId, boundIds: boundCollabIdsOf(state, sessionId) };
+}
+
+/* 本会话绑定集（绑定表逐条解构按会话标识筛——只取数、不判决，与核心触发 B 的取数口径同源）。
+ * 绑定表住核心运行态（run/bindings.json，核心单写者、原子替换）：此处只读不写；读不出即按空集，
+ * 与核心加载面同一宽容口径——绑定是路由态，丢它只是不再注入，清单不该因它读不到而失败。 */
+function boundCollabIdsOf(state, sessionId) {
+  const bindings = readBindings(state);
+  return new Set(
+    Object.entries(bindings)
+      .filter(([, binding]) => binding?.sessionId === sessionId)
+      .map(([collabId]) => collabId),
+  );
+}
+
+/* 绑定表读取：文件不存在（尚未接线）/ 读不出 / 解析不出 / 顶层非对象一律按空表。 */
+function readBindings(state) {
+  try {
+    const parsed = JSON.parse(readFileSync(bindingsFilePath(state.dataDir), 'utf8'));
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
 }
 
 /* 观察面读数（状态栏消息数）：讨论 = 本机全量副本帖数（含回填帖）、协作 = 累计收到的内容消息数。
@@ -377,7 +412,7 @@ function memberCountOf(local) {
   return localRosterOf(local).length;
 }
 
-function listEntryOf(state, local, now) {
+function listEntryOf(state, local, now, caller) {
   const stateName = localStateOf(local);
   const probeState = state.probes.get(local.collabId);
   return {
@@ -395,7 +430,19 @@ function listEntryOf(state, local, now) {
     suspended: local.suspended !== null,
     handshakeUnresolved: local.handshakeUnresolved === true,
     ...inviteViewOf(local, now),
+    ...sessionViewOf(state, local, caller),
   };
+}
+
+/* 本会话字段（设计 §6）：获准＝本会话在本机获准台账（joins.json 的 approvals）里，绑定＝绑定表
+ * 当前指向本会话。获准台账现建现读（只消费判据、不写）：批准后下一次列表即见，缓存会陈旧。
+ * 判据要全量会话标识——短码是展示面的表示，不做前缀匹配。 */
+function sessionViewOf(state, local, caller) {
+  if (caller === null) {
+    return { sessionGranted: false, sessionBound: false };
+  }
+  const joins = createJoinsStore({ dataDir: state.dataDir, collabId: local.collabId, log: state.log });
+  return { sessionGranted: joins.isGranted(caller.sessionId), sessionBound: caller.boundIds.has(local.collabId) };
 }
 
 /* 邀请视图（成员侧）：决策 / 有效期与过期标注（仅标注、不改状态——设计 §6 的「过期不算拒绝」）；

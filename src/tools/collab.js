@@ -17,10 +17,12 @@ export const SEND_MESSAGE_TYPES = POST_KINDS;
 
 const MAX_TARGETS = MAX_COLLAB_MEMBERS - 1;   // 目标上限 = 名单上限减发起者本人（单一权威：protocol.MAX_COLLAB_MEMBERS）
 
+/* 清单的会话视角（本会话是否获准 / 是否绑定）要判在调用者身上：调用上下文已注入本会话标识，
+ * 工具层只把它原样转交（判定归协作服务——无标识会话如实传空，由服务判否）。 */
 export function listCollabsTool() {
   return {
     ...WS_LIST_COLLABS_SPEC,
-    handler: async (_args, context) => okResult({ ok: true, ...context.collab.list() }),
+    handler: async (_args, context) => okResult({ ok: true, ...context.collab.list({ sessionId: context.sessionId }) }),
   };
 }
 

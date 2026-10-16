@@ -1,11 +1,14 @@
+import { shortSessionId } from '../util/short-id.js';
 import { WS_LIST_HOSTS_SPEC } from './specs.js';
 
 /* ws_list_hosts：扫描局域网在线驿站（广播段扫 + 已知主机单播兜底，窗口收应答）。
  * 清单按实例标识去重合并：身份名 + 端点（「地址:端口」）。端点而非裸地址是回信寻址的依据——
  * 多站点下端口按站点独立，只报地址无法定位到对端驿站。
  * 载荷分两段：hosts＝其他驿站（本机实例由发现层按实例标识排除；同机的其他数据根实例照常列出、
- * 由网络层标注 sameMachine）；self＝本机自身（核心身份＋端口＋活跃终端会话，经上下文取值器现取——
- * 注册桥即活跃终端）。本机地址无现成数据源，self 只报端口，不硬凑地址。
+ * 由网络层标注 sameMachine；另携对端上报的活跃会话短码 sessions——旧版对端无该字段＝省略，
+ * 「零会话」与「没报」是两回事，不得混为一谈）；self＝本机自身（核心身份＋端口＋活跃终端会话，
+ * 经上下文取值器现取——注册桥即活跃终端；此处维持全量会话记录不变）。
+ * 本机地址无现成数据源，self 只报端口，不硬凑地址。
  * 返回口径：成功载荷顶层恒含 ok:true（19 工具统一约定，见 tools/collab.js）。 */
 export function hostsTool() {
   return {
@@ -24,6 +27,7 @@ export function hostsTool() {
         collabCount: host.collabCount,
         lastSeenAt: host.lastSeenAt,
         sameMachine: host.sameMachine === true,
+        ...sessionsFieldOf(host),
       }));
       const sessions = context.activeSessions();
       const self = {
@@ -36,4 +40,11 @@ export function hostsTool() {
       return { content: [{ type: 'text', text: JSON.stringify({ ok: true, self, hosts }, null, 2) }] };
     },
   };
+}
+
+/* 远端条目的会话段（设计 §1）：对端没报该字段（旧版对端）＝整段省略——「对端没有活跃会话」
+ * 与「对端没报」必须可区分，不拿空数组冒充满足；有值一律经短码唯一权威产出对外表示
+ * （会话标识原样外泄无益，短码即指名的够用粒度）。 */
+function sessionsFieldOf(host) {
+  return Array.isArray(host.sessions) ? { sessions: host.sessions.map(shortSessionId) } : {};
 }

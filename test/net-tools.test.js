@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { hostsTool } from '../src/tools/hosts.js';
 import { pingTool } from '../src/tools/ping.js';
@@ -11,6 +11,9 @@ import { listCollabsTool, createCollabTool, inviteTool, requestJoinTool, approve
 import { decideTool, handoverTool, takeOverTool } from '../src/tools/governance.js';
 import { MAX_COLLAB_MEMBERS } from '../src/net/protocol.js';
 import { CONFIG_FILE_NAME, loadConfig } from '../src/config.js';
+import { createCollabService } from '../src/collab/service.js';
+import { createJoinsStore } from '../src/collab/joins.js';
+import { bindingsFilePath, runDir } from '../src/paths.js';
 import { makeTempDir } from './helpers.js';
 
 function contextWith(net) {
@@ -54,7 +57,7 @@ const SERVICE_DEFAULTS = {
 };
 
 function fakeService(responses = {}) {
-  const calls = { list: 0, create: [], invite: [], approve: [], withdraw: [], view: [], send: [], setMute: [], end: [], leave: [] };
+  const calls = { list: 0, listInputs: [], create: [], invite: [], approve: [], withdraw: [], view: [], send: [], setMute: [], end: [], leave: [] };
   /* 调用记录 + 响应注入（未注入口径取默认值）：工具层一律 await 结果，同步返回等价。 */
   const record = (name, input) => {
     calls[name].push(input);
@@ -62,8 +65,9 @@ function fakeService(responses = {}) {
   };
   return {
     calls,
-    list() {
+    list(input) {
       calls.list++;
+      calls.listInputs.push(input);
       return responses.list ?? SERVICE_DEFAULTS.list;
     },
     create: (input) => record('create', input),
@@ -291,6 +295,23 @@ test('ws_list_hosts：同机另一数据根条目带 sameMachine 标注（异机
   assert.equal(hosts[1].sameMachine, false);
 });
 
+test('ws_list_hosts：远端条目的 sessions 为会话短码；旧版对端无该字段则省略、零会话如实为空数组', async () => {
+  const net = {
+    listHosts: async () => ({
+      ok: true,
+      hosts: [
+        { instanceId: 'inst-b', identityName: '主机乙', endpoints: [{ address: '127.0.0.2', port: 17321 }], collabCount: 1, lastSeenAt: '2026-10-12T00:00:00.000Z', sessions: ['9f8e7d6c5b4a3210', 'ab12cd34ef56'] },
+        { instanceId: 'inst-old', identityName: '旧版对端', endpoints: [{ address: '127.0.0.3', port: 17321 }], collabCount: 0, lastSeenAt: '2026-10-12T00:00:00.000Z' },
+        { instanceId: 'inst-quiet', identityName: '零会话机', endpoints: [{ address: '127.0.0.4', port: 17321 }], collabCount: 0, lastSeenAt: '2026-10-12T00:00:00.000Z', sessions: [] },
+      ],
+    }),
+  };
+  const hosts = JSON.parse((await callTool(hostsTool(), {}, net)).content[0].text).hosts;
+  assert.deepEqual(hosts[0].sessions, ['9f8e7d6c', 'ab12cd34'], '远端会话以短码呈现（前 8 字符）');
+  assert.equal(Object.hasOwn(hosts[1], 'sessions'), false, '旧版对端无该字段：省略而非伪造空数组');
+  assert.deepEqual(hosts[2].sessions, [], '对端如实报零会话：空数组在场（与「没报」区分）');
+});
+
 test('ws_status：输出含 site 站点块', async () => {
   const net = { status: () => ({ available: true, reason: null, message: '', port: 17321, counters: { discovery: {}, transport: {}, dispatch: {}, inbound: {} } }) };
   const context = contextWith(net);
@@ -332,6 +353,78 @@ test('ws_list_collabs：透传服务清单（含角色/状态/邀请过期标注
   assert.equal(listed.collabs[0].collabId, 'collab-1');
   assert.equal(listed.collabs[0].expired, false);
   assert.equal(collab.calls.list, 1);
+});
+
+/* 真服务夹具（会话字段判定的集成面）：只装配判定所需的最小依赖——获准台账与绑定表都是磁盘真相，
+ * 每次列表调用现读；投递面用假发送（本用例不出网）。 */
+function quietLog() {
+  return { info: () => {}, warn: () => {}, error: () => {} };
+}
+
+function realCollabServiceOf(dir) {
+  return createCollabService({
+    dataDir: dir,
+    config: { inviteTtlMs: 24 * 60 * 60 * 1000 },
+    self: { instanceId: 'inst-self', identityName: '本机', port: 17321 },
+    send: () => ({ ok: true, msgId: 'q-1' }),
+    knownHosts: { remember: () => {} },
+    log: quietLog(),
+    syncPeerPicker: () => [],
+  });
+}
+
+async function listEntryFor(collab, collabId, sessionId) {
+  const context = { ...collabContextOf(collab), sessionId };
+  const payload = JSON.parse((await listCollabsTool().handler({}, context)).content[0].text);
+  return payload.collabs.find((entry) => entry.collabId === collabId);
+}
+
+test('ws_list_collabs：按调用会话穿参（context 既有注入；无标识会话传 undefined）', async () => {
+  const collab = fakeService();
+  await listCollabsTool().handler({}, { ...collabContextOf(collab), sessionId: 'session-a-0123456789' });
+  await listCollabsTool().handler({}, collabContextOf(collab));
+  assert.deepEqual(collab.calls.listInputs.map((input) => input.sessionId), ['session-a-0123456789', undefined], '逐次携本会话标识；无标识会话如实为空');
+});
+
+test('ws_list_collabs：sessionGranted / sessionBound 按调用会话判定（获准要全量标识精确命中、绑定看绑定表指向本会话）', async (t) => {
+  const dir = makeTempDir(t);
+  const service = realCollabServiceOf(dir);
+  const created = service.create({ name: '联调项目', topic: '发布联调', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }] });
+  assert.equal(created.ok, true);
+  const grantedSession = 'session-a-0123456789';
+  const joins = createJoinsStore({ dataDir: dir, collabId: created.collabId, log: quietLog() });
+  assert.equal(joins.addApproval({ instanceId: 'inst-self', sessionId: grantedSession, origin: 'grant', grantedAt: 1, approvedBy: '主机甲' }), true);
+  mkdirSync(runDir(dir), { recursive: true });
+  writeFileSync(bindingsFilePath(dir), JSON.stringify({ [created.collabId]: { sessionId: grantedSession, bridgeId: 'bridge-1', boundAt: '2026-10-16T00:00:00.000Z', origin: 'create' } }));
+
+  const own = await listEntryFor(service, created.collabId, grantedSession);
+  assert.equal(own.sessionGranted, true, '本会话在获准台账');
+  assert.equal(own.sessionBound, true, '绑定表指向本会话');
+
+  const other = await listEntryFor(service, created.collabId, 'session-b-9999999999');
+  assert.equal(other.sessionGranted, false, '异会话不在获准台账');
+  assert.equal(other.sessionBound, false, '绑定表未指向异会话');
+
+  const shortCode = await listEntryFor(service, created.collabId, grantedSession.slice(0, 8));
+  assert.equal(shortCode.sessionGranted, false, '短码不是台账键：获准须全量标识精确命中');
+  assert.equal(shortCode.sessionBound, false, '短码不等于绑定表里的全量标识');
+
+  const sessionless = await listEntryFor(service, created.collabId, undefined);
+  assert.equal(sessionless.sessionGranted, false, '无标识会话：两字段如实判否（字段恒在场）');
+  assert.equal(sessionless.sessionBound, false);
+});
+
+test('ws_list_collabs：台账未落盘 / 绑定表损坏按空态判否——列表不因读不到台账而失败', async (t) => {
+  const dir = makeTempDir(t);
+  const service = realCollabServiceOf(dir);
+  const created = service.create({ name: '联调项目', topic: '发布联调', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }] });
+  const missing = await listEntryFor(service, created.collabId, 'session-a-0123456789');
+  assert.equal(missing.sessionGranted, false, '无获准台账＝未获准');
+  assert.equal(missing.sessionBound, false, '无绑定表＝未绑定');
+  mkdirSync(runDir(dir), { recursive: true });
+  writeFileSync(bindingsFilePath(dir), '{ 坏的 JSON', 'utf8');
+  const corrupt = await listEntryFor(service, created.collabId, 'session-a-0123456789');
+  assert.equal(corrupt.sessionBound, false, '绑定表读不出＝按空表（只影响注入判定，列表照常出）');
 });
 
 test('ws_create_collab：name / topic 缺失或空白 → isError，不调服务', async () => {
