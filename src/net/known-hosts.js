@@ -2,16 +2,20 @@ import { readFileSync, renameSync } from 'node:fs';
 import { isIP } from 'node:net';
 import { join } from 'node:path';
 import { isPort } from './protocol.js';
+import { shortSessionId } from '../util/short-id.js';
 import { ANCHOR_PORT } from '../site.js';
 import { writeJsonAtomic } from '../storage.js';
 
 export const KNOWN_HOSTS_FILE_NAME = 'known-hosts.json';
 export const MAX_KNOWN_HOSTS = 64;
+/* 每个条目的会话短码上限：会话段是「顺带可见性」（清单不承载权威列表），
+ * 超限截断保证条目与整文件体积皆有界。 */
+export const MAX_KNOWN_SESSIONS = 32;
 
 /* 本文件的字符串字段只做「本地文件不荒唐」的存储级底线校验；
  * 线上协议的严格校验在 protocol.js——两层目的不同，边界可以不同。 */
 const MAX_TEXT_CHARS = 128;
-const STORAGE_VERSION = 2;
+const STORAGE_VERSION = 3;
 
 /* 落盘节流窗口（模块私有）：协作域逐帧的端点学习会走到 remember——同键的 lastSeenAt 刷新
  * 按窗口合并写盘（内存态仍逐帧新鲜、择新排序不受影响）；新键（新站点）立即落盘，
@@ -21,8 +25,9 @@ const PERSIST_MIN_INTERVAL_MS = 5000;
 /* 已知主机清单（设计 §5，模型 A）：单播兜底扫描的目标来源 = 历史见过的「地址:端口」。
  * 探测来源与扫描应答都会写入它——广播单向盲区（实测：桥接 VM→宿主广播未达、单播可达）靠它反向补偿；
  * 同机多站点各占「地址:端口」一条，键即该组合。
- * 存储 1→2 版：旧条目（键=地址、无 port）按锚点端口解释——旧版站点全部取默认端口，默认配置下语义等价；
- * 不引入文件级迁移（下一次写入即 v2 形态）。
+ * 存储 1→2 版：旧条目（键=地址、无 port）按锚点端口解释——旧版站点全部取默认端口，默认配置下语义等价。
+ * 存储 2→3 版：条目增可选 `sessions`（对端活跃会话短码，见会话级管理设计 §1）——旧条目缺字段＝未知，
+ * 与「对端报了零会话」（空数组）是两个语义，不混同；不引入文件级迁移（下一次写入即 v3 形态）。
  * 写入失败只告警不抛出：清单是发现辅助，丢失不得影响主流程（健壮性硬性要求）。 */
 export function createKnownHosts({ dataDir, log, persistMinIntervalMs = PERSIST_MIN_INTERVAL_MS }) {
   const state = {
@@ -119,13 +124,14 @@ function quarantine(state) {
 }
 
 function remember(state, entry) {
-  const { address, port, instanceId, identityName } = entry;
+  const { address, port, instanceId, identityName, sessions: sessionInput } = entry;
   if (typeof address !== 'string' || isIP(address) === 0 || !isPort(port)) {
     state.counters.invalidEntries++;
     state.log.warn('忽略非法来源地址或端口（不入清单）', { address: String(address), port: String(port) });
     return;
   }
   state.counters.remembered++;
+  /** @type {{ address: string, port: number, instanceId: string, identityName: string, lastSeenAt: string, sessions?: string[] }} */
   const stored = {
     address,
     port,
@@ -133,6 +139,10 @@ function remember(state, entry) {
     identityName: boundedText(identityName),
     lastSeenAt: new Date().toISOString(),
   };
+  const sessions = boundedSessions(sessionInput);
+  if (sessions !== null) {
+    stored.sessions = sessions;   // 未知（null）则字段缺席：重载后仍是未知（不臆断成零会话）
+  }
   const key = keyOf(stored);
   const isNewKey = !state.hosts.has(key);
   state.hosts.delete(key);
@@ -180,16 +190,43 @@ function validateEntry(entry) {
   if (!isPort(port)) {
     return null;
   }
-  const lastSeenAt = typeof entry.lastSeenAt === 'string' && !Number.isNaN(Date.parse(entry.lastSeenAt))
-    ? entry.lastSeenAt
-    : new Date(0).toISOString();
-  return {
+  /** @type {{ address: string, port: number, instanceId: string, identityName: string, lastSeenAt: string, sessions?: string[] }} */
+  const checked = {
     address: entry.address,
     port,
     instanceId: boundedText(entry.instanceId),
     identityName: boundedText(entry.identityName),
-    lastSeenAt,
+    lastSeenAt: storedLastSeenAt(entry.lastSeenAt),
   };
+  const sessions = boundedSessions(entry.sessions);
+  if (sessions !== null) {
+    checked.sessions = sessions;
+  }
+  return checked;
+}
+
+/* 时间戳读取：认不出即归零时刻（条目仍有效——时间只影响排序与淘汰，不值得为一枚坏时间戳丢掉整条地址） */
+function storedLastSeenAt(value) {
+  return typeof value === 'string' && !Number.isNaN(Date.parse(value)) ? value : new Date(0).toISOString();
+}
+
+/* 会话段的形态底线：数组即短码化并截断（对外一律短码——短码化是唯一权威的呈现加工）；
+ * 非数组＝未知（返回 null，调用方整段不落），未知与「零会话」（空数组）是两个语义，不混同。 */
+function boundedSessions(value) {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const codes = [];
+  for (const item of value) {
+    if (typeof item !== 'string' || item === '') {
+      continue;   // 非字符串与空串不入清单：对端整形的良心不由本层假设
+    }
+    codes.push(shortSessionId(item));
+    if (codes.length >= MAX_KNOWN_SESSIONS) {
+      break;
+    }
+  }
+  return codes;
 }
 
 function boundedText(value) {

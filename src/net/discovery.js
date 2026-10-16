@@ -1,7 +1,9 @@
 import dgram from 'node:dgram';
+import { isIP } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { ANCHOR_PORT, SLOT_COUNT } from '../site.js';
-import { MAX_COLLAB_COUNT, MAX_DATAGRAM_BYTES, PROTOCOL_VERSION, isIdentityName, newMsgId, validateJoinAck, validateJoinKnock, validateProbe, validateProbeAck } from './protocol.js';
+import { shortSessionId } from '../util/short-id.js';
+import { MAX_COLLAB_COUNT, MAX_DATAGRAM_BYTES, PROTOCOL_VERSION, fitJoinResolveAck, isIdentityName, isPort, newMsgId, validateJoinAck, validateJoinKnock, validateJoinResolve, validateJoinResolveAck, validateProbe, validateProbeAck } from './protocol.js';
 
 export const DISCOVERY_REPLY_MIN_INTERVAL_MS = 250;
 const MAX_THROTTLED_SOURCES = 64;
@@ -15,6 +17,10 @@ export const JOIN_KNOCK_RETRY_COUNT = 2;
 export const JOIN_KNOCK_RETRY_INTERVAL_MS = 1000;
 export const JOIN_KNOCK_WINDOW_MS = 3500;
 export const JOIN_KNOCK_REPLY_MIN_INTERVAL_MS = 2500;
+
+/* 按名解析（单播问答，会话级管理设计 §2）的缺省收答窗口：单播直达而非广播扫描，一次问答即足；
+ * 窗口内少量重发覆盖单包丢失，发程落在窗口内。 */
+export const JOIN_RESOLVE_TIMEOUT_MS = 1500;
 
 /* 定向广播地址计算：按接口逐卡收发，不依赖全局广播路由（设计 §5）。
  * 取 ip | ~netmask；无广播意义的场合（/32、缺掩码、IPv6、内网接口）跳过；同网段多网卡自动去重。 */
@@ -40,9 +46,11 @@ export function broadcastTargets(interfaces) {
  * segmentBase 为测试注入缝（生产一律缺省 = 内置锚点，不构成配置面）：段内端口即 [segmentBase, segmentBase+7]。
  * 主动加入另有一组注入缝：onJoinKnock = 命中处理回调（协作层注入——发现层不 import 协作层，
  * 分层纪律经注入解除）；joinKnock* 四个时程参数为测试注入缝（生产一律缺省 = 内置值）。
- * 生命周期一次性（start → scan / announce / requestJoin → close），调用时序由装配层保证：close 后套接字
- * 已关闭，再次 start/scan/announce/requestJoin 会以套接字错误失败（吵闹而非挂起）——失败即安全网，
- * 不属可依赖的语义。 */
+ * 会话级可见性同款注入：activeSessions = 本机活跃终端取值器（注册桥的会话视图——探测应答的
+ * `sessions` 短码由此产出）；onJoinResolve = 按名解析的命中处理回调（缺省 = 本机无讨论面，不应答）。
+ * 生命周期一次性（start → scan / announce / requestJoin / requestJoinResolve → close），调用时序由装配层保证：
+ * close 后套接字已关闭，再次 start/scan/announce/requestJoin* 会以套接字错误失败（吵闹而非挂起）——
+ * 失败即安全网，不属可依赖的语义。 */
 export function createDiscovery(options) {
   const state = discoveryStateOf(options);
   state.socket.on('message', (buffer, rinfo) => {
@@ -57,14 +65,43 @@ export function createDiscovery(options) {
     scan: (options) => scan(state, options),
     announce: () => announce(state),
     requestJoin: (options) => requestJoin(state, options),
+    requestJoinResolve: (options) => requestJoinResolve(state, options),
     stats: () => statsOf(state),
+  };
+}
+
+/* 计数器初值（与状态构造分离：状态面只管装配，计量面单独成表便于逐路核对）。 */
+function initialCounters() {
+  return {
+    datagramsIn: 0,
+    probesAnswered: 0,
+    probeResponses: 0,
+    probeSessionsDropped: 0,
+    probeRepliesSkipped: 0,
+    selfObserved: 0,
+    rateLimited: 0,
+    sendFailures: 0,
+    selfIntroductions: 0,
+    joinKnocksSent: 0,
+    joinRepliesIn: 0,
+    joinRepliesAnswered: 0,
+    joinRepliesSkipped: 0,
+    joinKnocksThrottled: 0,
+    joinResolveRequestsSent: 0,
+    joinResolveRequestsIn: 0,
+    joinResolveRepliesAnswered: 0,
+    joinResolveRepliesSkipped: 0,
+    joinResolveRequestsThrottled: 0,
+    joinResolveRepliesIn: 0,
+    rejected: { oversize: 0, malformed: 0, invalid: 0 },
   };
 }
 
 /* 发现层状态构造：注入缝、套接字、限流表与计数器一次性定格，与行为函数分离。 */
 function discoveryStateOf({
   port, bindAddress = '0.0.0.0', instanceId, identityName, getCollabCount, knownHosts, log, segmentBase = ANCHOR_PORT,
-  onJoinKnock = null,
+  onJoinKnock = null, onJoinResolve = null,
+  activeSessions = () => [],
   joinKnockWindowMs = JOIN_KNOCK_WINDOW_MS,
   joinKnockRetryCount = JOIN_KNOCK_RETRY_COUNT,
   joinKnockRetryIntervalMs = JOIN_KNOCK_RETRY_INTERVAL_MS,
@@ -72,31 +109,20 @@ function discoveryStateOf({
 }) {
   return {
     port, bindAddress, instanceId, identityName, getCollabCount, knownHosts, log, segmentBase,
-    onJoinKnock, joinKnockWindowMs, joinKnockRetryCount, joinKnockRetryIntervalMs, joinKnockReplyMinIntervalMs,
+    onJoinKnock, onJoinResolve, activeSessions,
+    joinKnockWindowMs, joinKnockRetryCount, joinKnockRetryIntervalMs, joinKnockReplyMinIntervalMs,
     socket: dgram.createSocket({ type: 'udp4', reuseAddr: false }),
-    counters: {
-      datagramsIn: 0,
-      probesAnswered: 0,
-      probeResponses: 0,
-      selfObserved: 0,
-      rateLimited: 0,
-      sendFailures: 0,
-      selfIntroductions: 0,
-      joinKnocksSent: 0,
-      joinRepliesIn: 0,
-      joinRepliesAnswered: 0,
-      joinRepliesSkipped: 0,
-      joinKnocksThrottled: 0,
-      rejected: { oversize: 0, malformed: 0, invalid: 0 },
-    },
+    counters: initialCounters(),
     collectors: new Set(),
     joinCollectors: new Set(),
-    /* 三张限流表（各管一路的风暴，键 = 来源「地址:端口」）：
+    resolveCollectors: new Set(),
+    /* 四张限流表（各管一路的风暴，键 = 来源「地址:端口」）：
      * probeReplyAt 只管「探测应答的风暴」——仅由收到的探测记账，收 ack 不得抑制本应发出的探测应答；
      * joinReplyAt 只管「敲门应答的风暴」——仅由收到的敲门记账；伪造敲门不放大为应答与本机会话提示；
+     * resolveReplyAt 只管「解析应答的风暴」——仅由收到的解析请求记账（单播定向问答，沿探测应答的最小间隔口径）；
      * writeThrottleAt 管「清单整文件原子写的风暴」——探测器与应答两路入站共用同一张表，
      * 伪造探测与伪造应答交替同样不放大写频。 */
-    probeReplyAt: new Map(), joinReplyAt: new Map(), writeThrottleAt: new Map(),
+    probeReplyAt: new Map(), joinReplyAt: new Map(), resolveReplyAt: new Map(), writeThrottleAt: new Map(),
     bound: false,
     closed: false,
   };
@@ -203,6 +229,14 @@ function onDatagram(state, buffer, rinfo) {
     handleJoinAck(state, parsed, rinfo);
     return;
   }
+  if (parsed.type === 'join-resolve') {
+    handleJoinResolve(state, parsed, rinfo);
+    return;
+  }
+  if (parsed.type === 'join-resolve-ack') {
+    handleJoinResolveAck(state, parsed, rinfo);
+    return;
+  }
   state.counters.rejected.invalid++;
   state.log.warn('未知发现报文类型，拒绝', { from: rinfo.address, type: String(parsed.type) });
 }
@@ -227,11 +261,28 @@ function handleProbe(state, datagram, rinfo) {
   // 探测来源也是「历史见过地址」：广播单向盲区里对方能广播过来、我们回不去——记下它，下次扫描单播补上。
   // 端口取数据报来源端口（站点数据报恒出自其监听套接字——探测报文本身不带端口字段）。
   rememberThrottled(state, datagram, rinfo, { address: rinfo.address, port: rinfo.port });
-  sendDatagram(state, buildProbeAck(state), rinfo.port, rinfo.address, 'probe-ack');
+  answerProbe(state, rinfo);
+}
+
+/* 探测应答回发：应答体先过体积整形（设计 §5.6 硬规则）——超限弃会话段保整包（可见性是顺带面，
+ * 探测的可达性才是本面契约）；整形到无可截则弃整份并计数留痕（绝不发超限数据报）。 */
+function answerProbe(state, rinfo) {
+  const ack = buildProbeAck(state);
+  const fitted = fitProbeAckDatagram(ack);
+  if (fitted === null) {
+    state.counters.probeRepliesSkipped++;
+    state.log.warn('扫描应答超体积预算且不可再截，放弃该份', { instanceId: state.instanceId });
+    return;
+  }
+  if (!Object.hasOwn(fitted, 'sessions')) {
+    state.counters.probeSessionsDropped++;
+    state.log.warn('扫描应答超体积预算：弃会话字段保整包（宁缺勿超）', { instanceId: state.instanceId });
+  }
+  sendDatagram(state, Buffer.from(JSON.stringify(fitted)), rinfo.port, rinfo.address, 'probe-ack');
   state.counters.probesAnswered++;
 }
 
-/* 同源最小间隔记账（三张表共用同一实现；间隔按路传参）：键 = 来源「地址:端口」——同机多站点互为合法
+/* 同源最小间隔记账（四张表共用同一实现；间隔按路传参）：键 = 来源「地址:端口」——同机多站点互为合法
  * 不同源，不被互相的窗口吞掉。
  * 代价如实记录：同一 IP 每张表各可占 MAX_THROTTLED_SOURCES 个表项（防护评估见计量用例）。
  * 窗口内返回 false，窗口外刷新时间戳并放行；刷新的键移到 Map 尾部、淘汰取首键——表按「最近刷新」维护且容量有界；
@@ -257,7 +308,15 @@ function rememberThrottled(state, datagram, rinfo, endpoint) {
     state.counters.rateLimited++;
     return;
   }
-  state.knownHosts.remember({ address: endpoint.address, port: endpoint.port, instanceId: datagram.instanceId, identityName: datagram.identityName });
+  state.knownHosts.remember({
+    address: endpoint.address,
+    port: endpoint.port,
+    instanceId: datagram.instanceId,
+    identityName: datagram.identityName,
+    /* 会话段是探测应答的加法字段：探测自身不带该字段（否则 undefined）＝清单记「未知」——
+     * 探测请求与探测应答的会话真相不混同（探测来源只证明「这台机器在此」）。 */
+    sessions: datagram.sessions,
+  });
 }
 
 function handleResponse(state, datagram, rinfo) {
@@ -296,7 +355,20 @@ function mergeResponse(collector, datagram, endpoint) {
   entry.identityName = datagram.identityName;
   entry.collabCount = datagram.collabCount;
   entry.lastSeenAt = new Date().toISOString();
+  mergeSessions(entry, datagram);
   collector.set(datagram.instanceId, entry);
+}
+
+/* 会话段合并（扫描结果面，会话级管理设计 §1）：只采字符串短码——协议校验不覆盖该加法字段，
+ * 本地形态底线在此把关（非字符串项剔除、一律短码化），列表不长于一份数据报的携带量。
+ * 对端这份没报（旧版实现 / 超限弃字段）不改写已知值：丢一份 ≠ 对方没有会话。 */
+function mergeSessions(entry, datagram) {
+  if (!Array.isArray(datagram.sessions)) {
+    return;
+  }
+  entry.sessions = datagram.sessions
+    .filter((code) => typeof code === 'string' && code !== '')
+    .map((code) => shortSessionId(code));
 }
 
 /* —— 主动加入（设计 §5.6）：成员侧敲门处理与申请人侧应答收集 —— */
@@ -466,15 +538,219 @@ function mergeJoinAck(collector, datagram, rinfo) {
   });
 }
 
+/* —— 按名解析（会话级管理设计 §2）：单播问答「谁在 <讨论名> 讨论」 —— */
+
+/* 解析请求处理（被问者侧）：校验 → 应答限流（同源最小间隔；伪造请求不放大为应答风暴，
+ * 与探测应答同口径——单播定向问答无重发时程顾虑，无需敲门那张长窗表）→ 命中解析经注入回调
+ * （缺省 = 本机无讨论面，不应答）→ 按解析结果回发单播应答。
+ * 不排除自答：请求不自报身份（单播问答按来源地址回发），被问者无从判别来源是不是本机——
+ * 自答由申请侧的应答处理按 instanceId 滤除（一次回发的浪费是「问答无需先互认」的代价）。 */
+function handleJoinResolve(state, datagram, rinfo) {
+  const checked = validateJoinResolve(datagram);
+  if (!checked.ok) {
+    state.counters.rejected.invalid++;
+    state.log.warn('解析请求校验失败，拒绝', { from: rinfo.address, reason: checked.reason });
+    return;
+  }
+  state.counters.joinResolveRequestsIn++;
+  if (!withinMinInterval(state.resolveReplyAt, rinfo)) {
+    state.counters.joinResolveRequestsThrottled++;
+    return;
+  }
+  const reply = resolveLocally(state, datagram, rinfo);
+  if (reply === null) {
+    return;   // 无讨论面：不应答（沿敲门先例——「本机没有解析面」不是「没有这个讨论」）
+  }
+  sendJoinResolveAck(state, datagram, rinfo, reply);
+}
+
+/* 命中解析（协作层经注入承担：按名匹配本机在册协作、「同名多义」判否等语义都在那一侧）；
+ * 返回值只取对象形态，其余一律按「无应答」——注入面不信任上游形态（命中回调抛错同样隔离）。 */
+function resolveLocally(state, datagram, rinfo) {
+  if (typeof state.onJoinResolve !== 'function') {
+    return null;
+  }
+  try {
+    const reply = state.onJoinResolve({ name: datagram.name, address: rinfo.address, port: rinfo.port, resolveId: datagram.resolveId });
+    return reply !== null && typeof reply === 'object' && !Array.isArray(reply) ? reply : null;
+  } catch (error) {
+    state.log.warn('解析命中处理异常（已隔离）', { from: rinfo.address, reason: error.message });
+    return null;
+  }
+}
+
+/* 解析应答回发：命中与未命中各有形态（未命中极简——不得携讨论面字段，带即被对端按自相矛盾拒收）；
+ * 应答体先过协议层的整形（先弃名称、仍超弃整份），再自校验一遍才发：
+ * 注入面给出的非法形态（如坏 collabId）不得变成一份自家就会拒收的数据报。 */
+function sendJoinResolveAck(state, request, rinfo, reply) {
+  const fitted = fitJoinResolveAck(buildJoinResolveAck(state, request, reply));
+  if (fitted === null || !validateJoinResolveAck(fitted).ok) {
+    state.counters.joinResolveRepliesSkipped++;
+    state.log.warn('解析应答不可发（超体积预算或注入面形态非法），放弃该份', { from: rinfo.address });
+    return;
+  }
+  sendDatagram(state, Buffer.from(JSON.stringify(fitted)), rinfo.port, rinfo.address, 'join-resolve-ack');
+  state.counters.joinResolveRepliesAnswered++;
+}
+
+function buildJoinResolveAck(state, request, reply) {
+  const ack = {
+    v: PROTOCOL_VERSION,
+    type: 'join-resolve-ack',
+    instanceId: state.instanceId,
+    identityName: state.identityName,
+    port: state.port,
+    resolveId: request.resolveId,
+    found: reply.found === true,
+  };
+  if (!ack.found) {
+    return ack;   // 未命中极简：不带讨论面字段（未命中却点名是自相矛盾的断言）
+  }
+  ack.collabId = reply.collabId;
+  if (isIdentityName(reply.name)) {
+    ack.name = reply.name;   // 名称可省（整形可弃）：完整讨论名由申请人加入后经正式通道对表补齐
+  }
+  return ack;
+}
+
+/* 解析应答处理（申请人侧）：校验 → 计数 → 排除自答 → 并入在途收集面（只认 resolveId 相符的收集面：
+ * 迟到的旧应答不进新解析的结果）。 */
+function handleJoinResolveAck(state, datagram, rinfo) {
+  const checked = validateJoinResolveAck(datagram);
+  if (!checked.ok) {
+    state.counters.rejected.invalid++;
+    state.log.warn('解析应答校验失败，拒绝', { from: rinfo.address, reason: checked.reason });
+    return;
+  }
+  state.counters.joinResolveRepliesIn++;
+  if (datagram.instanceId === state.instanceId) {
+    state.counters.selfObserved++;
+    return;
+  }
+  for (const collector of state.resolveCollectors) {
+    mergeJoinResolveAck(collector, datagram, rinfo);
+  }
+}
+
+/* 应答并入：命中优先于未命中——重发之间对端的在册面可能变化，后到的命中比先前的未命中更接近真相；
+ * 已记命中则后续份不再改写（首个命中即结果），重发造成的重复份只计数留痕。 */
+function mergeJoinResolveAck(collector, datagram, rinfo) {
+  if (collector.resolveId !== datagram.resolveId) {
+    return;
+  }
+  collector.replies++;
+  const reply = {
+    found: datagram.found === true,
+    responder: { instanceId: datagram.instanceId, identityName: datagram.identityName, address: rinfo.address, port: datagram.port ?? rinfo.port },
+  };
+  if (reply.found) {
+    reply.collabId = datagram.collabId;
+    if (datagram.name !== undefined) {
+      reply.name = datagram.name;   // 对端整形可弃名：缺席即「未携名」，不臆造
+    }
+  }
+  if (collector.reply === null || (reply.found && !collector.reply.found)) {
+    collector.reply = reply;
+  }
+}
+
+/* 按名解析（申请人侧；加入面与工具调用的落点）：向指定驿站单播询问「谁在 <讨论名> 讨论」、
+ * 窗口内收应答（resolveId 相符才采信）；窗口关闭后返回结果对象或 null。
+ * null = 「对方没答」（不可达 / 丢包），与 found:false（「对方答了：没有这个讨论」）是两回事——
+ * 调用方按各自语义处置（无应答如实报错、未命中另寻他路）。
+ * 目标地址与端口是寻址信息（来自扫描结果 / 清单），形态在启程前把关：不发畸形载荷、不做无谓的收答等待。 */
+async function requestJoinResolve(state, input = {}) {
+  const target = resolveTargetOf(input);
+  const timeoutMs = resolveTimeoutOf(input);
+  /** @type {{ resolveId: string, reply: Record<string, unknown> | null, replies: number }} */
+  const collector = { resolveId: newMsgId(), reply: null, replies: 0 };
+  state.resolveCollectors.add(collector);
+  try {
+    await sendResolveRequests(state, collector.resolveId, target, timeoutMs);
+  } finally {
+    state.resolveCollectors.delete(collector);
+  }
+  return collector.reply === null ? null : { ...collector.reply, replies: collector.replies };
+}
+
+/* 询问面参数把关（讨论名 / 目标地址 / 目标端口）：非法即抛 TypeError（编程错误快速暴露）。 */
+function resolveTargetOf(input) {
+  const name = typeof input?.name === 'string' ? input.name.trim() : '';
+  if (!isIdentityName(name)) {
+    throw new TypeError(`requestJoinResolve 需要合法的讨论名（≤64 字符、不含不可见字符的呈现文本），实际：${JSON.stringify(input?.name)}`);
+  }
+  if (typeof input.address !== 'string' || isIP(input.address) === 0) {
+    throw new TypeError(`requestJoinResolve 需要 IP 字面量目标地址（不做域名解析），实际：${JSON.stringify(input.address)}`);
+  }
+  if (!isPort(input.port)) {
+    throw new TypeError(`requestJoinResolve 需要 1–65535 的整数目标端口，实际：${JSON.stringify(input.port)}`);
+  }
+  return { name, address: input.address, port: input.port };
+}
+
+function resolveTimeoutOf(input) {
+  const timeoutMs = input.timeoutMs === undefined ? JOIN_RESOLVE_TIMEOUT_MS : input.timeoutMs;
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60000) {
+    throw new TypeError(`requestJoinResolve 需要合法的 timeoutMs（1–60000 毫秒），实际：${JSON.stringify(input.timeoutMs)}`);
+  }
+  return timeoutMs;
+}
+
+/* 请求发程：单播直达（不广播——名字只给被问的那一台），窗口对半分成两段、每段各发一发
+ * （少量重发覆盖单包丢失；重发时程大于应答限流窗，首答丢失时重发仍能唤起应答）。 */
+async function sendResolveRequests(state, resolveId, target, timeoutMs) {
+  const request = Buffer.from(JSON.stringify({ v: PROTOCOL_VERSION, type: 'join-resolve', resolveId, name: target.name }));
+  const firstLeg = Math.floor(timeoutMs / 2);
+  const legs = [firstLeg, timeoutMs - firstLeg];
+  for (const legMs of legs) {
+    sendDatagram(state, request, target.port, target.address, 'join-resolve');
+    state.counters.joinResolveRequestsSent++;
+    await sleep(legMs);
+  }
+}
+
+/* 扫描应答体（会话级可见性，设计 §1）：恒携 `sessions`（本机活跃终端短码列表——零会话如实报空数组，
+ * 「报了零」与「没报」对接收侧是两回事）；其余字段与旧实现逐字一致（旧对端按加法字段忽略）。
+ * 体积整形交 answerProbe（超限弃该字段保整包）。 */
 function buildProbeAck(state) {
-  return Buffer.from(JSON.stringify({
+  return {
     v: PROTOCOL_VERSION,
     type: 'probe-ack',
     instanceId: state.instanceId,
     identityName: state.identityName,
     collabCount: currentCollabCount(state),
     port: state.port,
-  }));
+    sessions: currentSessions(state),
+  };
+}
+
+/* 本机活跃终端短码（注册桥经注入的取值器现取——发现层不 import 注册表）。
+ * 取值失败按零会话应答：会话段是顺带可见性，取值异常不得让探测面停摆。 */
+function currentSessions(state) {
+  try {
+    const sessions = state.activeSessions();
+    if (!Array.isArray(sessions)) {
+      return [];
+    }
+    return sessions
+      .map((entry) => shortSessionId(entry?.sessionId))
+      .filter((code) => code !== '');
+  } catch (error) {
+    state.log.warn('活跃会话取值失败，按零会话应答', { reason: error.message });
+    return [];
+  }
+}
+
+/* 扫描应答的体积整形（设计 §5.6 硬规则：序列化后 ≤ MAX_DATAGRAM_BYTES 含信封）：
+ * 预算内原样；超限先弃 `sessions` 整字段（可见性让步于整包可达——宁缺勿超，由调用方计一数留痕）；
+ * 弃到信封本身仍超（身份与端口横向撑爆，合规输入不可达）返回 null，由调用方弃发。 */
+export function fitProbeAckDatagram(datagram) {
+  if (fitsDatagramBudget(datagram)) {
+    return datagram;
+  }
+  const withoutSessions = { ...datagram };
+  delete withoutSessions.sessions;
+  return fitsDatagramBudget(withoutSessions) ? withoutSessions : null;
 }
 
 /* 报数值域与对端入站校验（protocol.js）对称：超上限钳制、非整数/负数归 0——

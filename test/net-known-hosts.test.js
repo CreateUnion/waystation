@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { KNOWN_HOSTS_FILE_NAME, MAX_KNOWN_HOSTS, createKnownHosts } from '../src/net/known-hosts.js';
+import { KNOWN_HOSTS_FILE_NAME, MAX_KNOWN_HOSTS, MAX_KNOWN_SESSIONS, createKnownHosts } from '../src/net/known-hosts.js';
 import { makeTempDir } from './helpers.js';
 
 function makeHosts(t, { dataDir } = {}) {
@@ -25,7 +25,7 @@ test('remember：落盘为 version+hosts 形态，targets 可读', (t) => {
   hosts.remember({ address: '192.168.0.140', port: 7321, instanceId: 'inst-b', identityName: '主机乙' });
   assert.deepEqual(hosts.targets().map((entry) => entry.address), ['192.168.0.140']);
   const onDisk = JSON.parse(readFileSync(join(dir, KNOWN_HOSTS_FILE_NAME), 'utf8'));
-  assert.equal(onDisk.version, 2);
+  assert.equal(onDisk.version, 3);
   assert.equal(onDisk.hosts.length, 1);
   assert.equal(onDisk.hosts[0].address, '192.168.0.140');
   assert.equal(onDisk.hosts[0].identityName, '主机乙');
@@ -152,7 +152,7 @@ test('键「地址:端口」：同地址不同端口是两条独立条目', (t) 
   hosts.remember({ address: '10.0.0.9', port: 7322, instanceId: 'inst-b', identityName: '乙' });
   assert.equal(hosts.stats().entries, 2);
   const onDisk = JSON.parse(readFileSync(join(dir, KNOWN_HOSTS_FILE_NAME), 'utf8'));
-  assert.equal(onDisk.version, 2);
+  assert.equal(onDisk.version, 3);
   assert.deepEqual(onDisk.hosts.map((entry) => entry.port).sort(), [7321, 7322]);
 });
 
@@ -164,10 +164,11 @@ test('v1 旧文件迁移：无 port 条目按锚点端口解释、载入即服�
   }));
   const { hosts } = makeHosts(t, { dataDir: dir });
   assert.deepEqual(hosts.targets(), [{ address: '10.0.0.1', port: 7321 }]);
-  // 下一次写入即 v2 形态
+  assert.equal(Object.hasOwn(hosts.list()[0], 'sessions'), false, 'v1 条目无会话字段＝未知');
+  // 下一次写入即 v3 形态
   hosts.remember({ address: '10.0.0.2', port: 7322, instanceId: 'inst-b', identityName: '乙' });
   const onDisk = JSON.parse(readFileSync(join(dir, KNOWN_HOSTS_FILE_NAME), 'utf8'));
-  assert.equal(onDisk.version, 2);
+  assert.equal(onDisk.version, 3);
   assert.ok(onDisk.hosts.every((entry) => Number.isInteger(entry.port)));
 });
 
@@ -247,4 +248,48 @@ test('落盘节流：同键刷新按窗口合并（内存即时、磁盘滞后�
   immediate.remember({ address: '10.0.0.9', port: 7321, instanceId: 'inst-a', identityName: '甲' });
   immediate.remember({ address: '10.0.0.9', port: 7321, instanceId: 'inst-a', identityName: '甲改名' });
   assert.equal(JSON.parse(readFileSync(join(immediateDir, KNOWN_HOSTS_FILE_NAME), 'utf8')).hosts[0].identityName, '甲改名', '窗口注入 0 = 每次都落盘（既有直测口径）');
+});
+
+test('remember 存会话短码：短码化（前 8 字符）＋有界截断；缺字段＝未知、空数组如实在场', (t) => {
+  const { dir, hosts } = makeHosts(t);
+  hosts.remember({ address: '10.0.0.1', port: 7321, sessions: ['9f8e7d6c5b4a3210', 'ab12cd34ef56'] });
+  assert.deepEqual(hosts.list()[0].sessions, ['9f8e7d6c', 'ab12cd34'], '对外一律短码（全量标识不落清单）');
+  hosts.remember({ address: '10.0.0.2', port: 7321, sessions: [] });
+  assert.deepEqual(hosts.list().find((entry) => entry.address === '10.0.0.2').sessions, [], '对端报了零会话＝空数组在场（与「没报」区分）');
+  hosts.remember({ address: '10.0.0.3', port: 7321 });
+  assert.equal(Object.hasOwn(hosts.list().find((entry) => entry.address === '10.0.0.3'), 'sessions'), false, '没报会话＝未知：不改写成空数组');
+  const many = Array.from({ length: MAX_KNOWN_SESSIONS + 8 }, (_, index) => `s${String(index).padStart(7, '0')}-full`);
+  hosts.remember({ address: '10.0.0.4', port: 7321, sessions: many });
+  const bounded = hosts.list().find((entry) => entry.address === '10.0.0.4').sessions;
+  assert.equal(bounded.length, MAX_KNOWN_SESSIONS, '超限截断（会话段是顺带可见性，不承载无界列表）');
+  assert.deepEqual(bounded, many.slice(0, MAX_KNOWN_SESSIONS).map((id) => id.slice(0, 8)));
+  const onDisk = JSON.parse(readFileSync(join(dir, KNOWN_HOSTS_FILE_NAME), 'utf8'));
+  assert.deepEqual(onDisk.hosts.find((entry) => entry.address === '10.0.0.1').sessions, ['9f8e7d6c', 'ab12cd34'], '短码原样落盘');
+  assert.equal(Object.hasOwn(onDisk.hosts.find((entry) => entry.address === '10.0.0.3'), 'sessions'), false, '未知不落字段（重载后仍是未知）');
+});
+
+test('清单载入：旧条目（无会话字段）兼容为未知；带字段条目短码化并截断；非法形态按未知', (t) => {
+  const dir = makeTempDir(t);
+  writeFileSync(join(dir, KNOWN_HOSTS_FILE_NAME), JSON.stringify({
+    version: 2,
+    hosts: [
+      { address: '10.0.0.1', port: 7321, lastSeenAt: '2026-01-01T00:00:00.000Z' },
+      { address: '10.0.0.2', port: 7321, lastSeenAt: '2026-01-01T00:00:00.000Z', sessions: ['9f8e7d6c5b4a3210', 'ab12cd34ef56'] },
+      { address: '10.0.0.3', port: 7321, lastSeenAt: '2026-01-01T00:00:00.000Z', sessions: 'not-an-array' },
+      { address: '10.0.0.4', port: 7321, lastSeenAt: '2026-01-01T00:00:00.000Z', sessions: Array.from({ length: MAX_KNOWN_SESSIONS + 5 }, (_, index) => `t${String(index).padStart(7, '0')}`) },
+    ],
+  }));
+  const { hosts } = makeHosts(t, { dataDir: dir });
+  const byAddress = new Map(hosts.list().map((entry) => [entry.address, entry]));
+  assert.equal(Object.hasOwn(byAddress.get('10.0.0.1'), 'sessions'), false, '旧版本条目缺字段＝未知（兼容读取，不臆断零会话）');
+  assert.deepEqual(byAddress.get('10.0.0.2').sessions, ['9f8e7d6c', 'ab12cd34'], '载入同样短码化');
+  assert.equal(Object.hasOwn(byAddress.get('10.0.0.3'), 'sessions'), false, '非法形态按未知（不臆断）');
+  assert.equal(byAddress.get('10.0.0.4').sessions.length, MAX_KNOWN_SESSIONS, '载入亦服从上限（手改 / 旧版残留同口径）');
+  assert.equal(hosts.stats().invalidEntries, 0, '会话段形态宽容：条目本身仍有效（存储级底线只管条目骨架）');
+});
+
+test('会话段与全量标识混入：只采字符串短码，非字符串项剔除', (t) => {
+  const { hosts } = makeHosts(t);
+  hosts.remember({ address: '10.0.0.1', port: 7321, sessions: ['9f8e7d6c5b4a3210', 42, null, '', 'ab12cd34ef56'] });
+  assert.deepEqual(hosts.list()[0].sessions, ['9f8e7d6c', 'ab12cd34'], '非字符串与空串不入清单（对端整形的良心不由本层假设）');
 });

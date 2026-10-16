@@ -770,6 +770,9 @@ function buildNetStack(state, { knownHosts, transport, dispatch }) {
       knownHosts,
       log: state.log,
       onJoinKnock: (knock) => state.collab.joinKnock(knock),
+      /* 会话级可见性：扫描应答的 sessions 短码取自注册桥（与 ws_list_hosts 的本机段同一来源，
+       * 运行期现取——注册表在 IPC 监听步才构造，未装配相位如实为空集合）。 */
+      activeSessions: () => state.bridges?.sessions() ?? [],
     }),
     transport,
     dispatch,

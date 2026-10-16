@@ -48,6 +48,7 @@ export function createNetStack({ discovery, transport, dispatch, inbound, port, 
     listHosts: () => listHosts(state),
     pingHost: (options) => pingHost(state, options),
     requestJoin: (options) => requestJoin(state, options ?? {}),
+    requestJoinResolve: (options) => requestJoinResolve(state, options ?? {}),
     send: (message) => state.dispatch.send(message),
     deliveryStatus: (query) => state.dispatch.deliveryStatus(query ?? {}),
     checkInbox: (query) => state.inbound.checkInbox(query),
@@ -215,6 +216,31 @@ async function requestJoin(state, { name }) {
     return { ok: true, replies: await state.discovery.requestJoin({ name: wanted }) };
   } catch (error) {
     return { ok: false, message: `主动加入敲门失败：${error.message}` };
+  }
+}
+
+/* 按名解析（会话级管理设计 §2；加入域与工具面的落点）：向指定驿站单播问「谁在 <讨论名> 讨论」。
+ * 讨论名与目标端点（来自扫描列表 / 已知主机清单）在启程前把关——不发畸形载荷、也不做无谓的收答等待；
+ * reply 为 null = 窗口内没有应答（不可达 / 丢包），与「答了未命中」（found:false）是两回事，
+ * 由调用方按各自语义处置（统一文案由工具层承载）。 */
+async function requestJoinResolve(state, { name, address, port, timeoutMs }) {
+  if (!state.available) {
+    return { ok: false, message: state.message };
+  }
+  const wanted = typeof name === 'string' ? name.trim() : '';
+  if (!isIdentityName(wanted)) {
+    return { ok: false, message: '讨论名非法：需要 ≤64 字符、不含换行 / 不可见字符的呈现文本（同身份名判据）' };
+  }
+  if (typeof address !== 'string' || isIP(address) === 0) {
+    return { ok: false, message: '目标地址非法：需要 IPv4/IPv6 字面量（不做域名解析）' };
+  }
+  if (!isPort(port)) {
+    return { ok: false, message: '目标端口非法：需要 1–65535 的整数（端口来源以扫描列表为准）' };
+  }
+  try {
+    return { ok: true, reply: await state.discovery.requestJoinResolve({ name: wanted, address, port, timeoutMs }) };
+  } catch (error) {
+    return { ok: false, message: `按名解析失败：${error.message}` };
   }
 }
 
