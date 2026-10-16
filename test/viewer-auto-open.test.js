@@ -144,8 +144,8 @@ test('openViewerWindow：spawn error／非零 exit → log.warn 留痕；exit 0 
 
 /* —— openViewerOnStart：触发 B 规则 —— */
 
-function startCall({ home, collabs, probe, spawnFn, log, root = 'main', siteMode = 'explicit', slot = null }) {
-  return openViewerOnStart({ collabs, root, digest: DIGEST, dataDir: home, siteMode, slot, scriptPath: 'S', log, probe, spawnFn, env: {} });
+function startCall({ home, collabs, boundCollabIds, probe, spawnFn, log, root = 'main', siteMode = 'explicit', slot = null }) {
+  return openViewerOnStart({ collabs, boundCollabIds, root, digest: DIGEST, dataDir: home, siteMode, slot, scriptPath: 'S', log, probe, spawnFn, env: {} });
 }
 
 test('触发 B：恰 1 个进行中 → 其详情页（--focus <root>/<id>）', async (t) => {
@@ -153,7 +153,7 @@ test('触发 B：恰 1 个进行中 → 其详情页（--focus <root>/<id>）', 
   writeConfig(home, { viewerAutoOpen: true });
   const { calls, spawnFn } = fakeSpawn();
   const result = await startCall({
-    home, collabs: [entryOf('c-solo')], probe: async () => null, spawnFn, log: captureLog(),
+    home, collabs: [entryOf('c-solo')], boundCollabIds: ['c-solo'], probe: async () => null, spawnFn, log: captureLog(),
     root: 's3', siteMode: 'slot', slot: 3,
   });
   assert.deepEqual(result, { opened: true });
@@ -164,7 +164,7 @@ test('触发 B：≥2 个进行中 → 列表页（不带 --focus）', async (t)
   const home = makeTempDir(t);
   writeConfig(home, { viewerAutoOpen: true });
   const { calls, spawnFn } = fakeSpawn();
-  const result = await startCall({ home, collabs: [entryOf('c-1'), entryOf('c-2')], probe: async () => null, spawnFn, log: captureLog() });
+  const result = await startCall({ home, collabs: [entryOf('c-1'), entryOf('c-2')], boundCollabIds: ['c-1', 'c-2'], probe: async () => null, spawnFn, log: captureLog() });
   assert.deepEqual(result, { opened: true });
   assert.deepEqual(calls[0].args, ['S'], '列表页＝不带 focus 的默认启动');
 });
@@ -178,7 +178,7 @@ test('触发 B：同根已在跑 → 不重复弹（默认端口段探针＋根�
     return healthOf();
   };
   const { calls, spawnFn } = fakeSpawn();
-  const result = await startCall({ home, collabs: [entryOf('c-1')], probe, spawnFn, log: captureLog() });
+  const result = await startCall({ home, collabs: [entryOf('c-1')], boundCollabIds: ['c-1'], probe, spawnFn, log: captureLog() });
   assert.deepEqual(result, { opened: false, reason: 'running' });
   assert.equal(calls.length, 0, '已跑不再拉起，也不重复弹窗');
   assert.equal(ports[0], DEFAULT_VIEWER_PORT, '「在跑」判定走默认端口段');
@@ -189,7 +189,7 @@ test('触发 B：别根实例存在 → 视为未在跑，照常拉起', async (
   writeConfig(home, { viewerAutoOpen: true });
   const { calls, spawnFn } = fakeSpawn();
   const result = await startCall({
-    home, collabs: [entryOf('c-1')], probe: async () => healthOf({ root: 'ffffffff' }), spawnFn, log: captureLog(),
+    home, collabs: [entryOf('c-1')], boundCollabIds: ['c-1'], probe: async () => healthOf({ root: 'ffffffff' }), spawnFn, log: captureLog(),
   });
   assert.deepEqual(result, { opened: true });
   assert.equal(calls.length, 1);
@@ -204,9 +204,9 @@ test('触发 B：0 个 / 仅受邀未同意（member proposed）→ 不做，且
     return null;
   };
   const { calls, spawnFn } = fakeSpawn();
-  assert.deepEqual(await startCall({ home, collabs: [], probe, spawnFn, log: captureLog() }), { opened: false, reason: 'none' });
+  assert.deepEqual(await startCall({ home, collabs: [], boundCollabIds: [], probe, spawnFn, log: captureLog() }), { opened: false, reason: 'none' });
   assert.deepEqual(
-    await startCall({ home, collabs: [entryOf('j-proposed', 'member', 'proposed')], probe, spawnFn, log: captureLog() }),
+    await startCall({ home, collabs: [entryOf('j-proposed', 'member', 'proposed')], boundCollabIds: ['j-proposed'], probe, spawnFn, log: captureLog() }),
     { opened: false, reason: 'none' },
   );
   assert.equal(probes, 0, '无进行中协作不做任何探测');
@@ -217,13 +217,13 @@ test('触发 B：自建者 proposed 仍弹、member active 弹、归档态不弹
   const home = makeTempDir(t);
   writeConfig(home, { viewerAutoOpen: true });
   const { calls, spawnFn } = fakeSpawn();
-  const managerProposed = await startCall({ home, collabs: [entryOf('m-proposed', 'manager', 'proposed')], probe: async () => null, spawnFn, log: captureLog() });
+  const managerProposed = await startCall({ home, collabs: [entryOf('m-proposed', 'manager', 'proposed')], boundCollabIds: ['m-proposed'], probe: async () => null, spawnFn, log: captureLog() });
   assert.deepEqual(managerProposed, { opened: true });
   assert.deepEqual(calls[0].args, ['S', '--focus', 'main/m-proposed']);
-  const memberActive = await startCall({ home, collabs: [entryOf('j-active', 'member', 'active')], probe: async () => null, spawnFn, log: captureLog() });
+  const memberActive = await startCall({ home, collabs: [entryOf('j-active', 'member', 'active')], boundCollabIds: ['j-active'], probe: async () => null, spawnFn, log: captureLog() });
   assert.deepEqual(memberActive, { opened: true });
   const archived = await startCall({
-    home, collabs: [entryOf('m-done', 'manager', 'completed'), entryOf('j-done', 'member', 'terminated')], probe: async () => null, spawnFn, log: captureLog(),
+    home, collabs: [entryOf('m-done', 'manager', 'completed'), entryOf('j-done', 'member', 'terminated')], boundCollabIds: ['m-done', 'j-done'], probe: async () => null, spawnFn, log: captureLog(),
   });
   assert.deepEqual(archived, { opened: false, reason: 'none' });
   assert.equal(calls.length, 2, '归档协作不作为拉起的依据');
@@ -233,7 +233,7 @@ test('触发 B：开关 false → 全关（不 spawn，reason 透传）', async 
   const home = makeTempDir(t);
   writeConfig(home, { viewerAutoOpen: false });
   const { calls, spawnFn } = fakeSpawn();
-  const result = await startCall({ home, collabs: [entryOf('c-1')], probe: async () => null, spawnFn, log: captureLog() });
+  const result = await startCall({ home, collabs: [entryOf('c-1')], boundCollabIds: ['c-1'], probe: async () => null, spawnFn, log: captureLog() });
   assert.deepEqual(result, { opened: false, reason: 'auto-open-off' });
   assert.equal(calls.length, 0);
 });
@@ -246,10 +246,43 @@ test('触发 B：探针异常 → 静默降级＋log.warn（绝不抛出）', as
     throw new Error('探测故障');
   };
   const { calls, spawnFn } = fakeSpawn();
-  assert.deepEqual(await startCall({ home, collabs: [entryOf('c-1')], probe, spawnFn, log }), { opened: false, reason: 'error' });
+  assert.deepEqual(await startCall({ home, collabs: [entryOf('c-1')], boundCollabIds: ['c-1'], probe, spawnFn, log }), { opened: false, reason: 'error' });
   assert.equal(calls.length, 0);
   assert.equal(log.warns.length, 1);
   assert.match(String(log.warns[0]), /静默降级/);
+});
+
+test('触发 B：绑定集空 → 不做（连端口都不探）', async (t) => {
+  const home = makeTempDir(t);
+  writeConfig(home, { viewerAutoOpen: true });
+  let probes = 0;
+  const probe = async () => { probes++; return null; };
+  const { calls, spawnFn } = fakeSpawn();
+  const result = await startCall({ home, collabs: [entryOf('c-1')], boundCollabIds: [], probe, spawnFn, log: captureLog() });
+  assert.deepEqual(result, { opened: false, reason: 'none' });
+  assert.equal(probes, 0, '绑定空集不做任何探测');
+  assert.equal(calls.length, 0);
+});
+
+test('触发 B：绑定只含部分枚举 → 只按绑定集判（详情页取绑定者）', async (t) => {
+  const home = makeTempDir(t);
+  writeConfig(home, { viewerAutoOpen: true });
+  const { calls, spawnFn } = fakeSpawn();
+  const result = await startCall({ home, collabs: [entryOf('c-1'), entryOf('c-2')], boundCollabIds: ['c-1'], probe: async () => null, spawnFn, log: captureLog() });
+  assert.deepEqual(result, { opened: true });
+  assert.deepEqual(calls[0].args, ['S', '--focus', 'main/c-1'], '未绑定的 c-2 不参与判定');
+});
+
+test('触发 B：绑定集参数缺失/非数组 → 按空集＋warn 一次，不弹', async (t) => {
+  const home = makeTempDir(t);
+  writeConfig(home, { viewerAutoOpen: true });
+  const log = captureLog();
+  const { calls, spawnFn } = fakeSpawn();
+  assert.deepEqual(await startCall({ home, collabs: [entryOf('c-1')], probe: async () => null, spawnFn, log }), { opened: false, reason: 'none' });
+  assert.deepEqual(await startCall({ home, collabs: [entryOf('c-1')], boundCollabIds: 'c-1', probe: async () => null, spawnFn, log }), { opened: false, reason: 'none' });
+  assert.equal(calls.length, 0);
+  assert.equal(log.warns.length, 2);
+  assert.match(String(log.warns[0]), /绑定集/);
 });
 
 /* —— 触发 A：创建/同意成功点经 openViewer(ref) 落到真实出口 —— */
