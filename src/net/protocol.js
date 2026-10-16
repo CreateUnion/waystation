@@ -34,6 +34,7 @@ export function isCollabMode(value) {
  * post = 讨论模式的帖通道（设计 §5.2：帧 type = 通道类别、kind = 语义徽标）——
  * 本表是 managed 与讨论两模式的并集（帖载荷只校并集形态，模式语义归协作层）。
  * join = 讨论模式的成员加入事件（成立/加入双义通告，设计 §5.1/§5.4）；
+ * join-request / join-grant / join-deny = 会话主动加入三帧（申请 / 批准 / 拒绝，会话级管理设计 §2）；
  * history-request / history-bundle = 拉取两件套（回填与真对账同一机制，设计 §5.3）。 */
 export const MESSAGE_TYPES = [
   'invite', 'approve', 'decline', 'withdraw',
@@ -42,7 +43,7 @@ export const MESSAGE_TYPES = [
   'ping', 'pong', 'delivery-status',
   'snapshot',
   'post',
-  'join', 'history-request', 'history-bundle',
+  'join', 'join-request', 'join-grant', 'join-deny', 'history-request', 'history-bundle',
   'ack',
 ];
 
@@ -131,6 +132,44 @@ export function validateJoinAck(datagram) {
   return validateDiscovery(datagram, 'join-ack');
 }
 
+/* 按名解析的请求与应答（会话级管理设计 §2）：单播数据报「谁在 <讨论名> 讨论」——请求方不自报身份
+ * （应答按数据报来源地址单播回发，问答双方无需先互认），故请求不套发现类的身份必填口径；
+ * 与敲门同族，同样不进 MESSAGE_TYPES（它们不是协作域帧，与入站帧白名单无交互）。 */
+export function validateJoinResolve(datagram) {
+  return validateDiscovery(datagram, 'join-resolve');
+}
+
+export function validateJoinResolveAck(datagram) {
+  return validateDiscovery(datagram, 'join-resolve-ack');
+}
+
+/* 解析应答的体积整形（沿加入应答同族：序列化后 ≤ MAX_DATAGRAM_BYTES，含信封）：
+ * 未命中先归极简形态（讨论面字段在未命中时无意义）；命中先弃 name（整字段——不做前缀截断）、
+ * 仍超则弃整份（返回 null，由发送方计数留痕）——绝不发超限数据报，也绝不截不可截字段（collabId 完整保留）。
+ * 讨论名与完整讨论面由申请人加入后经正式通道对表补齐：这里的裁剪只是可达性妥协，不承载权威数据。 */
+export function fitJoinResolveAck(datagram) {
+  const shaped = datagram.found === true ? datagram : minimalResolveAck(datagram);
+  if (fitsDatagramBudget(shaped)) {
+    return shaped;
+  }
+  const withoutName = { ...shaped };
+  delete withoutName.name;
+  return fitsDatagramBudget(withoutName) ? withoutName : null;
+}
+
+/* 未命中应答的极简形态：弃讨论面字段（collabId / name）——其余字段原样保留（未知加法字段不弃，前向兼容）。 */
+function minimalResolveAck(datagram) {
+  const minimal = { ...datagram };
+  delete minimal.collabId;
+  delete minimal.name;
+  return minimal;
+}
+
+/* 数据报体积量法：与发现层整形同一常量、同一量法（序列化后的 UTF-8 字节数）。 */
+function fitsDatagramBudget(datagram) {
+  return Buffer.byteLength(JSON.stringify(datagram)) <= MAX_DATAGRAM_BYTES;
+}
+
 /** 帧解码：JSON 解析 + 信封校验；成功时回带 frame 供调用方使用。 */
 export function parseFrame(text) {
   if (typeof text !== 'string') {
@@ -155,7 +194,8 @@ export function parseFrame(text) {
 /* 类型专属字段：pong 的 replyTo、ack 的 ackFor、delivery-status 的载荷结构、
  * 协作域（建协类 / 协作类 / 治理类）的载荷形态。
  * 本层只做形态校验（字段完整性 / 类型 / 长度边界 / 数值范围），不测量体积；
- * 体积上限（MAX_FRAME_BYTES / MAX_DATAGRAM_BYTES）由消费方按 Buffer 字节数测量并执行。 */
+ * 体积上限（MAX_FRAME_BYTES / MAX_DATAGRAM_BYTES）由消费方按 Buffer 字节数测量并执行
+ * （例外：解析应答的整形 fitJoinResolveAck——可弃字段的次序是协议契约，随数据报校验定义于此）。 */
 function validateTypeSpecific(frame) {
   if (frame.type === 'pong' && !isId(frame.replyTo)) {
     return refuse('pong 缺少合法的 replyTo');
@@ -203,12 +243,20 @@ function validateDiscovery(datagram, expectedType) {
   if (datagram.type !== expectedType) {
     return refuse(`发现报文类型非法（期望 ${expectedType}）`);
   }
+  if (expectedType === 'join-resolve') {
+    return joinResolveFieldsRejection(datagram);   // 请求方不自报身份：先于身份字段分支
+  }
   if (!isId(datagram.instanceId)) {
     return refuse('发现报文 instanceId 非法');
   }
   if (!isIdentityName(datagram.identityName)) {
     return refuse('发现报文 identityName 非法');
   }
+  return discoveryPayloadRejection(datagram, expectedType);
+}
+
+/* 各类型的专属字段（身份字段之后）：probe 无专属字段（公共头即全部）。 */
+function discoveryPayloadRejection(datagram, expectedType) {
   if (expectedType === 'probe-ack') {
     return probeAckFieldsRejection(datagram);
   }
@@ -217,6 +265,9 @@ function validateDiscovery(datagram, expectedType) {
   }
   if (expectedType === 'join-ack') {
     return joinAckFieldsRejection(datagram);
+  }
+  if (expectedType === 'join-resolve-ack') {
+    return joinResolveAckFieldsRejection(datagram);
   }
   return { ok: true };
 }
@@ -303,6 +354,53 @@ function joinAckTextRejection(value, maxChars, truncatedFlag, label) {
   return isPresentationText(value, maxChars) ? null : refuse(`加入应答 ${label}非法（≤${maxChars} 字符的呈现文本）`);
 }
 
+/* 解析请求：讨论名（同敲门口径——名字会播给被问者）+ 报送标识（应答据此回指本次解析，
+ * 旧答不进新申请的结果面）。请求方不自报身份：单播问答按数据报来源地址回发。 */
+function joinResolveFieldsRejection(datagram) {
+  if (!isId(datagram.resolveId)) {
+    return refuse('解析报文 resolveId 非法');
+  }
+  if (!isIdentityName(datagram.name)) {
+    return refuse(`解析报文 name 非法（讨论名：≤${MAX_IDENTITY_NAME_CHARS} 字符、不含不可见字符的呈现文本）`);
+  }
+  return { ok: true };
+}
+
+/* 解析应答（单播回执）：报送标识 + 命中断言「谁在 <讨论名> 讨论」；port 宽容缺省（同扫描应答 /
+ * 加入应答口径——缺 port 回退数据报来源端口）。命中与未命中各有自己的形态（见下方两个分支）。 */
+function joinResolveAckFieldsRejection(datagram) {
+  if (!isId(datagram.resolveId)) {
+    return refuse('解析应答 resolveId 非法');
+  }
+  if (datagram.found !== true && datagram.found !== false) {
+    return refuse('解析应答 found 非法（布尔）');
+  }
+  if (datagram.port !== undefined && !isPort(datagram.port)) {
+    return refuse('解析应答 port 非法（1–65535 的整数）');
+  }
+  return datagram.found ? joinResolveHitRejection(datagram) : joinResolveMissRejection(datagram);
+}
+
+/* 命中形态：协作标识必携且不可截（沿加入应答不可截先例——申请人据此拨入加入）；
+ * 讨论名可省（整形可弃，完整名加入后对表补齐），存在则须为合法讨论名（呈现面判据）。 */
+function joinResolveHitRejection(datagram) {
+  if (!isId(datagram.collabId)) {
+    return refuse('解析应答 collabId 非法（命中必携；不可截不可弃）');
+  }
+  if (datagram.name !== undefined && !isIdentityName(datagram.name)) {
+    return refuse(`解析应答 name 非法（讨论名：≤${MAX_IDENTITY_NAME_CHARS} 字符、不含不可见字符的呈现文本）`);
+  }
+  return { ok: true };
+}
+
+/* 未命中形态：极简——不带讨论面字段（带即拒：未命中却点名是自相矛盾的断言）。 */
+function joinResolveMissRejection(datagram) {
+  if (datagram.collabId !== undefined || datagram.name !== undefined) {
+    return refuse('解析应答未命中不得携带讨论面字段（collabId / name）');
+  }
+  return { ok: true };
+}
+
 function isPlainObject(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -386,6 +484,9 @@ const COLLAB_PAYLOAD_RULES = {
   snapshot: validateSnapshotPayload,
   post: validatePostPayload,
   join: validateMemberEventPayload,
+  'join-request': validateJoinRequestPayload,
+  'join-grant': validateJoinGrantPayload,
+  'join-deny': validateJoinDenyPayload,
   'history-request': validateHistoryRequestPayload,
   'history-bundle': validateHistoryBundlePayload,
   end: validateOptionalObjectPayload,
@@ -575,6 +676,35 @@ function validateLeavePayload(payload) {
     if (!isId(payload.eventId) || !isTimestamp(payload.ts)) {
       return refuse('leave 的成员事件字段非法（eventId 与 ts 须成对且形态合法）');
     }
+  }
+  return validateReasonPayload(payload);
+}
+
+/* —— 会话主动加入三帧（会话级管理设计 §2）：申请 / 批准 / 拒绝 —— */
+
+/* 申请：只携目标会话标识（会话短码在协议面之外——短码只是对外表示，帧内一律全标识）。
+ * 批准：回带目标会话标识（确认授予对象）+ 申请帧的 msgId（决定与申请对上，拒收无主决定）；
+ * 拒绝：只回带申请帧 msgId + 可选原因（形态同 decline / stop 的原因判据）。 */
+function validateJoinRequestPayload(payload) {
+  if (!isPlainObject(payload) || !isId(payload.sessionId)) {
+    return refuse('join-request.sessionId 非法（1–64 位字母数字与连字符）');
+  }
+  return { ok: true };
+}
+
+function validateJoinGrantPayload(payload) {
+  if (!isPlainObject(payload) || !isId(payload.sessionId)) {
+    return refuse('join-grant.sessionId 非法（1–64 位字母数字与连字符）');
+  }
+  if (!isId(payload.reqMsgId)) {
+    return refuse('join-grant.reqMsgId 非法（申请帧的 msgId）');
+  }
+  return { ok: true };
+}
+
+function validateJoinDenyPayload(payload) {
+  if (!isPlainObject(payload) || !isId(payload.reqMsgId)) {
+    return refuse('join-deny.reqMsgId 非法（申请帧的 msgId）');
   }
   return validateReasonPayload(payload);
 }

@@ -15,12 +15,15 @@ import {
   POST_KINDS,
   PROTOCOL_VERSION,
   TRANSPORT_TYPES,
+  fitJoinResolveAck,
   isIdentityName,
   isPresentationText,
   newMsgId,
   parseFrame,
   validateJoinAck,
   validateJoinKnock,
+  validateJoinResolve,
+  validateJoinResolveAck,
   validateMessage,
   validateProbe,
   validateProbeAck,
@@ -169,8 +172,8 @@ test('发现报文类型不匹配（探测/应答互收）：拒绝', () => {
 
 test('常量：版本、类型集、治理集、传输集与体积上限', () => {
   assert.equal(PROTOCOL_VERSION, 1);
-  assert.equal(MESSAGE_TYPES.length, 28);
-  for (const type of ['invite', 'approve', 'decline', 'withdraw', 'topic', 'task', 'progress', 'issue', 'stop', 'reply', 'freeze', 'unfreeze', 'decision', 'handover', 'takeover-init', 'takeover', 'notice', 'leave', 'end', 'ping', 'pong', 'delivery-status', 'snapshot', 'post', 'join', 'history-request', 'history-bundle', 'ack']) {
+  assert.equal(MESSAGE_TYPES.length, 31);
+  for (const type of ['invite', 'approve', 'decline', 'withdraw', 'topic', 'task', 'progress', 'issue', 'stop', 'reply', 'freeze', 'unfreeze', 'decision', 'handover', 'takeover-init', 'takeover', 'notice', 'leave', 'end', 'ping', 'pong', 'delivery-status', 'snapshot', 'post', 'join', 'join-request', 'join-grant', 'join-deny', 'history-request', 'history-bundle', 'ack']) {
     assert.ok(MESSAGE_TYPES.includes(type), type);
   }
   assert.deepEqual(GOVERNANCE_TYPES, ['freeze', 'unfreeze', 'decision', 'takeover-init', 'takeover']);
@@ -386,6 +389,58 @@ test('协作域 join / leave（讨论成员事件）：事件 id 与事件时刻
   assert.equal(validateMessage(collabFrame('leave', { ...stamp, reason: '退出' })).ok, true);
 });
 
+/* 会话主动加入三帧（会话级管理设计 §2）：申请 / 批准 / 拒绝——协作域帧，sessionId 与 reqMsgId 过标识判据。 */
+
+test('协作域 join-request：sessionId 必携且合法（缺 payload / 非对象 / 非标识逐项拒）', () => {
+  assert.equal(validateMessage(collabFrame('join-request', { sessionId: 'sess-1' })).ok, true);
+  for (const sessionId of [undefined, '../x', 'a/b', 'a.b', '', 'x'.repeat(65), 42, null]) {
+    const checked = validateMessage(collabFrame('join-request', { sessionId }));
+    assert.equal(checked.ok, false, String(sessionId));
+    assert.ok(checked.reason.includes('join-request.sessionId'), checked.reason);
+  }
+  assert.equal(validateMessage(collabFrame('join-request', undefined)).ok, false, '缺 payload');
+  assert.equal(validateMessage(collabFrame('join-request', [])).ok, false, 'payload 须为 JSON 对象');
+});
+
+test('协作域 join-grant：sessionId 与 reqMsgId 双必携（各逐项拒）', () => {
+  assert.equal(validateMessage(collabFrame('join-grant', { sessionId: 'sess-1', reqMsgId: 'msg-1' })).ok, true);
+  for (const sessionId of [undefined, 'bad id!', 42]) {
+    const checked = validateMessage(collabFrame('join-grant', { sessionId, reqMsgId: 'msg-1' }));
+    assert.equal(checked.ok, false, String(sessionId));
+    assert.ok(checked.reason.includes('join-grant.sessionId'), checked.reason);
+  }
+  for (const reqMsgId of [undefined, '../x', 42]) {
+    const checked = validateMessage(collabFrame('join-grant', { sessionId: 'sess-1', reqMsgId }));
+    assert.equal(checked.ok, false, String(reqMsgId));
+    assert.ok(checked.reason.includes('join-grant.reqMsgId'), checked.reason);
+  }
+  assert.equal(validateMessage(collabFrame('join-grant', {})).ok, false);
+});
+
+test('协作域 join-deny：reqMsgId 必携、reason 可选（沿原因判据：超长与控制字符拒）', () => {
+  assert.equal(validateMessage(collabFrame('join-deny', { reqMsgId: 'msg-1' })).ok, true);
+  assert.equal(validateMessage(collabFrame('join-deny', { reqMsgId: 'msg-1', reason: '该会话不在席' })).ok, true);
+  assert.equal(validateMessage(collabFrame('join-deny', {})).ok, false);
+  assert.equal(validateMessage(collabFrame('join-deny', { reqMsgId: 'bad id!' })).ok, false);
+  assert.equal(validateMessage(collabFrame('join-deny', { reqMsgId: 'msg-1', reason: 'x'.repeat(201) })).ok, false);
+  assert.equal(validateMessage(collabFrame('join-deny', { reqMsgId: 'msg-1', reason: '带\u0007控制符' })).ok, false);
+});
+
+test('协作域 join 三帧：属协作域必须携 collabId（缺 collabId 拒）', () => {
+  const cases = [
+    ['join-request', { sessionId: 'sess-1' }],
+    ['join-grant', { sessionId: 'sess-1', reqMsgId: 'msg-1' }],
+    ['join-deny', { reqMsgId: 'msg-1' }],
+  ];
+  for (const [type, payload] of cases) {
+    assert.equal(validateMessage(collabFrame(type, payload)).ok, true, type);
+    const checked = validateMessage(frameWith({ type, collabId: undefined, payload }));
+    assert.equal(checked.ok, false, type);
+    assert.ok(checked.reason.includes('collabId'), checked.reason);
+    assert.equal(TRANSPORT_TYPES.includes(type), false, type);
+  }
+});
+
 test('协作域 history-request：after 与 summary 均为可选加法字段（空载荷 = 全量拉取）', () => {
   const cursor = { ts: new Date().toISOString(), postId: 'post-1' };
   const summary = { authors: [{ instanceId: 'inst-a', count: 3, seqs: [[1, 2], [4, 4]] }] };
@@ -466,7 +521,7 @@ test('协作域 freeze / snapshot：freeze 名单形态；snapshot request 通�
 });
 
 test('协作域全类型覆盖：对每个协作域类型给非法 payload 必拒（防漏挂表）', () => {
-  const collabTypes = ['invite', 'approve', 'decline', 'withdraw', 'topic', 'task', 'progress', 'issue', 'stop', 'reply', 'notice', 'freeze', 'snapshot', 'post', 'join', 'history-request', 'history-bundle', 'end', 'leave'];
+  const collabTypes = ['invite', 'approve', 'decline', 'withdraw', 'topic', 'task', 'progress', 'issue', 'stop', 'reply', 'notice', 'freeze', 'snapshot', 'post', 'join', 'join-request', 'join-grant', 'join-deny', 'history-request', 'history-bundle', 'end', 'leave'];
   const invalidPayload = {
     invite: { name: '项目' },
     approve: 'x',
@@ -483,6 +538,9 @@ test('协作域全类型覆盖：对每个协作域类型给非法 payload 必�
     snapshot: {},
     post: { post: { postId: 'post-1' } },
     join: {},
+    'join-request': {},
+    'join-grant': { sessionId: 'sess-1' },
+    'join-deny': { reqMsgId: 'bad id!' },
     'history-request': 'x',
     'history-bundle': {},
     end: 'x',
@@ -753,15 +811,149 @@ test('join-ack：主题与名称沿用呈现面判据（超长 / 控制字符 / 
   assert.equal(validateJoinAck(ackDatagram({ name: 42 })).ok, false);
 });
 
-test('敲门与应答不入协作域类型表：validateMessage 按未知类型拒绝', () => {
-  assert.equal(MESSAGE_TYPES.includes('join-knock'), false);
-  assert.equal(MESSAGE_TYPES.includes('join-ack'), false);
-  assert.equal(validateMessage(frameWith({ type: 'join-knock' })).ok, false);
-  assert.equal(validateMessage(frameWith({ type: 'join-ack' })).ok, false);
-  assert.ok(validateMessage(frameWith({ type: 'join-knock' })).reason.includes('未知'));
+/* —— 按名解析（会话级管理设计 §2）：单播请求与应答数据报（发现类，不入 MESSAGE_TYPES） —— */
+
+const RESOLVE = { v: PROTOCOL_VERSION, type: 'join-resolve', name: '联调讨论', resolveId: 'resolve-1' };
+
+/* 解析应答骨架（未命中为极简形态——讨论面字段由用例按需覆盖）。 */
+function resolveAck(overrides = {}) {
+  return {
+    v: PROTOCOL_VERSION,
+    type: 'join-resolve-ack',
+    instanceId: 'inst-b',
+    identityName: '主机乙',
+    port: 7321,
+    resolveId: 'resolve-1',
+    found: true,
+    collabId: 'collab-1',
+    name: '联调讨论',
+    ...overrides,
+  };
+}
+
+/* 未命中骨架（极简形态：不带讨论面字段）。 */
+function resolveMiss(overrides = {}) {
+  return {
+    v: PROTOCOL_VERSION,
+    type: 'join-resolve-ack',
+    instanceId: 'inst-b',
+    identityName: '主机乙',
+    port: 7321,
+    resolveId: 'resolve-1',
+    found: false,
+    ...overrides,
+  };
+}
+
+test('join-resolve：合法通过（请求方不自报身份——单播问答按来源回发）；resolveId 与 name 逐项拒', () => {
+  assert.equal(validateJoinResolve(RESOLVE).ok, true);
+  assert.equal(validateJoinResolve({ ...RESOLVE, instanceId: 'inst-a', identityName: '主机甲' }).ok, true, '自报身份只是冗余字段（不拒）');
+  for (const resolveId of ['../x', 'a b', '', 'x'.repeat(65), 42, undefined]) {
+    const checked = validateJoinResolve({ ...RESOLVE, resolveId });
+    assert.equal(checked.ok, false, String(resolveId));
+    assert.ok(checked.reason.includes('resolveId'), checked.reason);
+  }
+  for (const name of ['甲\n乙', 'x'.repeat(65), '', '   ', undefined, 42]) {
+    const checked = validateJoinResolve({ ...RESOLVE, name });
+    assert.equal(checked.ok, false, String(name));
+    assert.ok(checked.reason.includes('name'), checked.reason);
+  }
 });
 
-test('发现类校验器互不认账：probe / probe-ack / join-knock / join-ack 交叉拒绝', () => {
+test('join-resolve-ack：命中形态（found=true 必携 collabId、name 可省）；resolveId 与身份字段必携', () => {
+  assert.equal(validateJoinResolveAck(resolveAck()).ok, true);
+  assert.equal(validateJoinResolveAck(resolveAck({ name: undefined })).ok, true, '整形弃名后仍合法（完整名加入后对表补齐）');
+  assert.equal(validateJoinResolveAck(resolveAck({ name: 'x'.repeat(64) })).ok, true);
+  for (const collabId of [undefined, 'a/b', 42]) {
+    const checked = validateJoinResolveAck(resolveAck({ collabId }));
+    assert.equal(checked.ok, false, String(collabId));
+    assert.ok(checked.reason.includes('collabId'), checked.reason);
+  }
+  for (const name of ['甲\n乙', 'x'.repeat(65), '', 42]) {
+    assert.equal(validateJoinResolveAck(resolveAck({ name })).ok, false, String(name));
+  }
+  for (const resolveId of [undefined, '../x', 42]) {
+    const checked = validateJoinResolveAck(resolveAck({ resolveId }));
+    assert.equal(checked.ok, false, String(resolveId));
+    assert.ok(checked.reason.includes('resolveId'), checked.reason);
+  }
+  for (const instanceId of [undefined, '../x', 42]) {
+    assert.equal(validateJoinResolveAck(resolveAck({ instanceId })).ok, false, String(instanceId));
+  }
+  for (const identityName of [undefined, '', '甲\n乙', 42]) {
+    assert.equal(validateJoinResolveAck(resolveAck({ identityName })).ok, false, String(identityName));
+  }
+});
+
+test('join-resolve-ack：未命中为极简形态（不带讨论面字段，带了即拒）', () => {
+  assert.equal(validateJoinResolveAck(resolveMiss()).ok, true);
+  assert.equal(validateJoinResolveAck(resolveMiss({ collabId: 'collab-1' })).ok, false, '未命中却给出协作标识（矛盾断言）');
+  assert.equal(validateJoinResolveAck(resolveMiss({ name: '联调讨论' })).ok, false, '未命中不带讨论名');
+});
+
+test('join-resolve-ack：found 必携且为布尔；port 宽容缺省、存在则须合法', () => {
+  for (const found of [undefined, 'yes', 'true', 1, null]) {
+    const checked = validateJoinResolveAck(resolveAck({ found }));
+    assert.equal(checked.ok, false, String(found));
+    assert.ok(checked.reason.includes('found'), checked.reason);
+  }
+  assert.equal(validateJoinResolveAck(resolveAck({ port: undefined })).ok, true, '缺 port 回退数据报来源端口（同扫描应答 / 加入应答口径）');
+  for (const port of [0, 65536, '7321', 1.5]) {
+    const checked = validateJoinResolveAck(resolveAck({ port }));
+    assert.equal(checked.ok, false, String(port));
+    assert.ok(checked.reason.includes('port'), checked.reason);
+  }
+});
+
+test('解析数据报对的体积整形：预算内原样返回（未命中极简形态照原样）', () => {
+  const hit = resolveAck();
+  assert.deepEqual(fitJoinResolveAck(hit), hit);
+  const miss = resolveMiss();
+  assert.deepEqual(fitJoinResolveAck(miss), miss);
+});
+
+test('fitJoinResolveAck：命中超限先弃 name（整字段弃、不截前缀）、collabId 不可截', () => {
+  const heavy = resolveAck({ instanceId: 'e'.repeat(64), identityName: '乙'.repeat(64), collabId: 'c'.repeat(64), resolveId: 'r'.repeat(64), name: '名'.repeat(64) });
+  assert.ok(Buffer.byteLength(JSON.stringify(heavy)) > MAX_DATAGRAM_BYTES, '构造面须确实超限');
+  const fitted = fitJoinResolveAck(heavy);
+  assert.ok(Buffer.byteLength(JSON.stringify(fitted)) <= MAX_DATAGRAM_BYTES);
+  assert.equal(Object.hasOwn(fitted, 'name'), false, '超限弃 name 整字段（不做前缀截断）');
+  assert.equal(fitted.collabId, heavy.collabId, '不可截字段保持完整');
+  assert.equal(fitted.resolveId, heavy.resolveId);
+  assert.equal(fitted.instanceId, heavy.instanceId);
+  assert.equal(validateJoinResolveAck(fitted).ok, true, '整形结果必过校验（同一权威自洽）');
+});
+
+test('fitJoinResolveAck：未命中先归极简形态（弃讨论面字段）；仍超预算一律弃整份（返回 null）', () => {
+  const miss = resolveMiss({ collabId: 'collab-1', name: '联调讨论' });
+  const fitted = fitJoinResolveAck(miss);
+  assert.ok(Buffer.byteLength(JSON.stringify(fitted)) <= MAX_DATAGRAM_BYTES);
+  assert.equal(Object.hasOwn(fitted, 'collabId'), false, '未命中不带讨论面字段');
+  assert.equal(Object.hasOwn(fitted, 'name'), false);
+  assert.equal(fitted.found, false);
+  assert.equal(fitted.resolveId, 'resolve-1');
+  assert.equal(validateJoinResolveAck(fitted).ok, true);
+  /* 弃尽可弃字段仍超（信封本身撑爆）→ 弃整份：绝不发超限数据报、绝不截不可截字段。 */
+  const hopeless = resolveMiss({ instanceId: 'e'.repeat(64), identityName: '乙'.repeat(64), futureField: 'x'.repeat(200) });
+  assert.equal(fitJoinResolveAck(hopeless), null);
+  const hopelessHit = resolveAck({ instanceId: 'e'.repeat(64), identityName: '乙'.repeat(64), collabId: 'c'.repeat(64), resolveId: 'r'.repeat(64), name: '名'.repeat(64), futureField: 'x'.repeat(200) });
+  assert.equal(fitJoinResolveAck(hopelessHit), null, '整形只弃 name：其余字段（含未来加法字段）不截不弃，据此仍超即弃发');
+});
+
+test('敲门与应答、解析对不入协作域类型表：validateMessage 按未知类型拒绝', () => {
+  assert.equal(MESSAGE_TYPES.includes('join-knock'), false);
+  assert.equal(MESSAGE_TYPES.includes('join-ack'), false);
+  assert.equal(MESSAGE_TYPES.includes('join-resolve'), false);
+  assert.equal(MESSAGE_TYPES.includes('join-resolve-ack'), false);
+  assert.equal(validateMessage(frameWith({ type: 'join-knock' })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'join-ack' })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'join-resolve' })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'join-resolve-ack' })).ok, false);
+  assert.ok(validateMessage(frameWith({ type: 'join-knock' })).reason.includes('未知'));
+  assert.ok(validateMessage(frameWith({ type: 'join-resolve' })).reason.includes('未知'));
+});
+
+test('发现类校验器互不认账：probe / probe-ack / join-knock / join-ack / join-resolve / join-resolve-ack 交叉拒绝', () => {
   const probe = { v: PROTOCOL_VERSION, type: 'probe', instanceId: 'inst-a', identityName: '主机甲' };
   const probeAck = { ...probe, type: 'probe-ack', collabCount: 0 };
   assert.equal(validateProbe(KNOCK).ok, false);
@@ -776,4 +968,22 @@ test('发现类校验器互不认账：probe / probe-ack / join-knock / join-ack
   assert.equal(validateJoinKnock({ ...KNOCK, instanceId: '../x' }).ok, false);
   assert.equal(validateJoinAck(null).ok, false);
   assert.equal(validateJoinKnock('text').ok, false);
+  /* 解析对与敲门族互不认账（单播请求 / 应答各归各的校验器）。 */
+  assert.equal(validateJoinResolve(KNOCK).ok, false);
+  assert.equal(validateJoinResolve(ackDatagram()).ok, false);
+  assert.equal(validateJoinResolve(resolveAck()).ok, false);
+  assert.equal(validateJoinKnock(RESOLVE).ok, false);
+  assert.equal(validateJoinKnock(resolveAck()).ok, false);
+  assert.equal(validateJoinAck(RESOLVE).ok, false);
+  assert.equal(validateJoinAck(resolveAck()).ok, false, '解析应答不得被当作加入应答吸收');
+  assert.equal(validateJoinResolveAck(RESOLVE).ok, false);
+  assert.equal(validateJoinResolveAck(KNOCK).ok, false);
+  assert.equal(validateJoinResolveAck(ackDatagram()).ok, false);
+  assert.equal(validateJoinResolveAck(probeAck).ok, false);
+  assert.equal(validateJoinResolve(null).ok, false);
+  assert.equal(validateJoinResolve('text').ok, false);
+  assert.equal(validateJoinResolveAck(null).ok, false);
+  assert.equal(validateJoinResolveAck('text').ok, false);
+  assert.equal(validateJoinResolve({ ...RESOLVE, v: 2 }).ok, false);
+  assert.equal(validateJoinResolveAck({ ...resolveAck(), v: 2 }).ok, false);
 });
