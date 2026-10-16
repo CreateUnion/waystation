@@ -16,7 +16,8 @@ import { makeTempDir, pickFreePort, waitFor } from './helpers.js';
 
 /* 核心周边面的综合判别面（设计 §2.5/§8/§12：ws_status 载荷；§7：观察窗触发 A/B 宿主改核心）：
  * ① ws_status 成功应答的单核形态与降级服务态、core 字段的在场条件；
- * ② 观察窗触发 B 的每 sessionId 记账——判定复用的出口是 launch.js 真实函数，spawn/探针全桩，
+ * ② 观察窗触发 B 的每 sessionId 记账——判定面＝本会话绑定面（绑定集按注册会话取数、判定在出口内
+ *    单点）；判定复用的出口是 launch.js 真实函数，spawn/探针全桩，
  *    绝不真开窗（env 传 {} 走真实 spawn 路径、spawnFn 为桩，与 viewer-auto-open.test.js 同法）；
  * ③ 整链：注册表顶替真实事件序、触发 A 核心宿主（真服务→真出口→桩 spawn）；
  * ④ 接线后真件整链：真核心进程内起站＋真 IPC 客户端——桥生命周期与会话文件、per-session 过滤。
@@ -136,8 +137,10 @@ test('触发 A（核心宿主）：单核 siteMode 的根映射恒 main；viewer
 });
 
 /* 核心宿主接线同形（main.js 接线时的实际形态）：桥注册 → 写会话状态文件 + 首见才判触发 B；
- * 判定复用 launch.js 的真实出口（判定口径逐字不变），根的映射走单核（恒 main）。 */
-function makeCoreHostTrigger({ home, collabs, probe, spawnFn, log }) {
+ * 判定复用 launch.js 的真实出口（判定在出口内单点），根的映射走单核（恒 main）。判定面＝本会话
+ * 绑定面（会话级暴露语义）：bindings 以 { [collabId]: sessionId } 模拟绑定表的会话归属，register
+ * 按注册会话取绑定集——与 main.js 的 boundCollabIdsOf 同口径（只取数、不判决）。 */
+function makeCoreHostTrigger({ home, collabs, bindings = {}, probe, spawnFn, log }) {
   const status = createCoreSessionStatus({
     dataDir: home,
     collect: () => ({ instanceId: 'core-inst', identityName: '本机', site: { mode: 'single', slot: null, port: 17321, takeover: false }, port: 17321, collabs: collabs() }),
@@ -150,8 +153,9 @@ function makeCoreHostTrigger({ home, collabs, probe, spawnFn, log }) {
     if (!noticed.firstSeen) {
       return Promise.resolve(null);
     }
+    const boundCollabIds = Object.entries(bindings).filter(([, sid]) => sid === bridge.sessionId).map(([id]) => id);
     return openViewerOnStart({
-      collabs: collabs(), root: 'main', digest: DIGEST, dataDir: home, siteMode: 'single', slot: null,
+      collabs: collabs(), boundCollabIds, root: 'main', digest: DIGEST, dataDir: home, siteMode: 'single', slot: null,
       scriptPath: 'S', log, probe, spawnFn, env: {},
     });
   };
@@ -168,7 +172,7 @@ test('触发 B 记账：新 sessionId 首次注册判一次；同 sessionId 顶�
     probes++;
     return null;
   };
-  const trigger = makeCoreHostTrigger({ home, collabs: () => [entryOf('c-1')], probe, spawnFn, log });
+  const trigger = makeCoreHostTrigger({ home, collabs: () => [entryOf('c-1')], bindings: { 'c-1': 'session-a' }, probe, spawnFn, log });
   await trigger.register({ bridgeId: 'b1', sessionId: 'session-a', connId: 1 });
   assert.deepEqual(calls[0].args, ['S', '--focus', 'main/c-1'], '单核根恒 main，恰 1 个进行中 → 详情页');
   const probesAfterFirst = probes;
@@ -188,7 +192,9 @@ test('触发 B 记账：新 sessionId 按规则重判；同根已在跑 → 判�
     probes++;
     return healthOf();
   };
-  const trigger = makeCoreHostTrigger({ home, collabs: () => [entryOf('c-1')], probe, spawnFn, log: captureLog() });
+  const trigger = makeCoreHostTrigger({
+    home, collabs: () => [entryOf('c-1'), entryOf('c-2')], bindings: { 'c-1': 'session-a', 'c-2': 'session-b' }, probe, spawnFn, log: captureLog(),
+  });
   const first = await trigger.register({ bridgeId: 'b1', sessionId: 'session-a', connId: 1 });
   assert.deepEqual(first, { opened: false, reason: 'running' });
   const probesAfterFirst = probes;
@@ -202,7 +208,7 @@ test('触发 B 开关三支（核心宿主）：缺省 true 静默拉起、显�
   const homeDefault = makeTempDir(t);
   const logDefault = captureLog();
   const defaultFake = fakeSpawn();
-  const triggerDefault = makeCoreHostTrigger({ home: homeDefault, collabs: () => [entryOf('c-1')], probe: async () => null, spawnFn: defaultFake.spawnFn, log: logDefault });
+  const triggerDefault = makeCoreHostTrigger({ home: homeDefault, collabs: () => [entryOf('c-1')], bindings: { 'c-1': 's-default' }, probe: async () => null, spawnFn: defaultFake.spawnFn, log: logDefault });
   const opened = await triggerDefault.register({ bridgeId: 'b1', sessionId: 's-default', connId: 1 });
   assert.deepEqual(opened, { opened: true });
   assert.equal(defaultFake.calls.length, 1);
@@ -211,7 +217,7 @@ test('触发 B 开关三支（核心宿主）：缺省 true 静默拉起、显�
   const homeOff = makeTempDir(t);
   writeConfig(homeOff, { viewerAutoOpen: false });
   const offFake = fakeSpawn();
-  const triggerOff = makeCoreHostTrigger({ home: homeOff, collabs: () => [entryOf('c-1')], probe: async () => null, spawnFn: offFake.spawnFn, log: captureLog() });
+  const triggerOff = makeCoreHostTrigger({ home: homeOff, collabs: () => [entryOf('c-1')], bindings: { 'c-1': 's-off' }, probe: async () => null, spawnFn: offFake.spawnFn, log: captureLog() });
   assert.deepEqual(await triggerOff.register({ bridgeId: 'b1', sessionId: 's-off', connId: 1 }), { opened: false, reason: 'auto-open-off' });
   assert.equal(offFake.calls.length, 0);
   /* 非法值：回落 true 拉起 + warn 留痕一次。 */
@@ -219,10 +225,22 @@ test('触发 B 开关三支（核心宿主）：缺省 true 静默拉起、显�
   writeConfig(homeBad, { viewerAutoOpen: 'yes' });
   const badLog = captureLog();
   const badFake = fakeSpawn();
-  const triggerBad = makeCoreHostTrigger({ home: homeBad, collabs: () => [entryOf('c-1')], probe: async () => null, spawnFn: badFake.spawnFn, log: badLog });
+  const triggerBad = makeCoreHostTrigger({ home: homeBad, collabs: () => [entryOf('c-1')], bindings: { 'c-1': 's-bad' }, probe: async () => null, spawnFn: badFake.spawnFn, log: badLog });
   assert.deepEqual(await triggerBad.register({ bridgeId: 'b1', sessionId: 's-bad', connId: 1 }), { opened: true });
   assert.equal(badFake.calls.length, 1);
   assert.equal(badLog.warns.length, 1, '非法值经出口 warn 留痕');
+});
+
+test('触发 B：未绑定新会话注册 → 不判不弹（连探测都不做）', async (t) => {
+  const home = makeTempDir(t);
+  writeConfig(home, { viewerAutoOpen: true });
+  let probes = 0;
+  const probe = async () => { probes++; return null; };
+  const { calls, spawnFn } = fakeSpawn();
+  const trigger = makeCoreHostTrigger({ home, collabs: () => [entryOf('c-1')], bindings: { 'c-1': 'session-other' }, probe, spawnFn, log: captureLog() });
+  await trigger.register({ bridgeId: 'b1', sessionId: 'session-fresh', connId: 1 });
+  assert.equal(probes, 0);
+  assert.equal(calls.length, 0, '未绑定会话不弹窗');
 });
 
 /* —— 整链：注册表顶替真实事件序（接线形态与 main.js 接线一致） —— */
@@ -341,6 +359,13 @@ function triggerJudgedCount(home) {
   return logTextOf(home).split('跳过观察窗自动打开').length - 1;
 }
 
+/* 出口 fail-safe 告警（缺绑定集参数按空集处理）的出现次数：它恒为 0 才是接线到位的判别面——
+ * 旧接线（不传 boundCollabIds）会把每次触发 B 都打成该告警（真核侧对 main.js 新接线的拦截点，
+ * 负断言侧的「不留痕」以它为准）。 */
+function failSafeWarnCount(home) {
+  return logTextOf(home).split('触发 B 缺绑定集参数').length - 1;
+}
+
 test('整链·真核＋真 IPC：注册即写＋顶替存活（旧连接断开空转）＋断开删除', { timeout: 60000 }, async (t) => {
   const home = makeTempDir(t);
   const { record } = await startCoreOnTempRoot(t, home);
@@ -372,7 +397,7 @@ test('整链·真核＋真 IPC：注册即写＋顶替存活（旧连接断开�
   await waitFor(() => (existsSync(file) ? null : true), { timeoutMs: 10000 });
 });
 
-test('整链·观察窗触发记账（真核）：建协触发 A 达出口；新会话注册触发 B 判一次；同 sessionId 顶替不重判', { timeout: 60000 }, async (t) => {
+test('整链·观察窗触发记账（真核）：建协触发 A 达出口；未绑定新会话注册全静默；同 sessionId 顶替不重判', { timeout: 60000 }, async (t) => {
   const home = makeTempDir(t);
   const { record } = await startCoreOnTempRoot(t, home);
   const peerPort = await pickFreePort();
@@ -392,11 +417,17 @@ test('整链·观察窗触发记账（真核）：建协触发 A 达出口；新
   assert.equal(created.ok, true, created.message);
   await waitFor(() => (triggerJudgedCount(home) >= 1 ? true : null), { timeoutMs: 10000 });
   const judgedAfterCreate = triggerJudgedCount(home);
-  /* 新会话注册 → 触发 B 判一次（存在进行中协作才达出口）；同 sessionId 顶替不重判。 */
+  /* 未绑定新会话注册 → 触发 B 只取本会话绑定集（会话级暴露语义）：guest 无绑定，出口在绑定过滤处
+   * 返回 none——不判、不探、不留痕。负断言：等核心受理注册（会话文件落盘）后短等待，判定计数不增；
+   * 随后同 sessionId 顶替不重判（未绑定新会话＝全静默）。 */
   const guest = bridgeClientFor(home, record, { bridgeId: 'bridge-guest-1', sessionId: 'session-guest' });
   live.push(guest);
   await guest.client.connect();
-  await waitFor(() => (triggerJudgedCount(home) > judgedAfterCreate ? true : null), { timeoutMs: 10000 });
+  const guestFile = sessionFilePath(home, 'session-guest');
+  await waitFor(() => (existsSync(guestFile) ? true : null), { timeoutMs: 10000 });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(triggerJudgedCount(home), judgedAfterCreate, '未绑定新会话＝全静默（会话级暴露语义：不判不弹）');
+  assert.equal(failSafeWarnCount(home), 0, '绑定集参数恒在场（main.js 接线）：不落「缺参数」fail-safe 告警');
   const judgedOnce = triggerJudgedCount(home);
   const superseder = bridgeClientFor(home, record, { bridgeId: 'bridge-guest-2', sessionId: 'session-guest' });
   live.push(superseder);

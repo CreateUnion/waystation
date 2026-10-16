@@ -440,16 +440,16 @@ function registerBridgeEntry(state, record) {
   state.bridges.register(record);
   const noticed = state.sessionStatus.noteRegister(record);
   if (noticed.firstSeen) {
-    triggerViewerOnStart(state);
+    triggerViewerOnStart(state, record.sessionId);
   }
 }
 
-/* 触发 B（新会话首次注册；判定口径与旧宿主逐字不变——进行中状态集/同根在跑/不重复弹窗全在
- * 出口内，触发时现读主根 config 的 viewerAutoOpen）：根映射单核恒 main；后台异步、绝不抛出
- * （出口内部消化异常），不阻塞帧处理。 */
-function triggerViewerOnStart(state) {
+/* 触发 B（新会话首次注册；判定面＝本会话绑定面——源＝2026-10-16 会话级暴露设计）：根映射单核
+ * 恒 main；绑定集只取数不判决（判定在出口内单点）；后台异步、绝不抛出，不阻塞帧处理。 */
+function triggerViewerOnStart(state, sessionId) {
   void openViewerOnStart({
     collabs: state.collab.list().collabs,
+    boundCollabIds: boundCollabIdsOf(state, sessionId),
     root: 'main',
     digest: rootDigest(state.dataDir),
     dataDir: state.dataDir,
@@ -458,6 +458,13 @@ function triggerViewerOnStart(state) {
     scriptPath: VIEWER_SCRIPT_PATH,
     log: state.log,
   });
+}
+
+/* 本会话绑定集（绑定表逐条 [collabId, binding] 解构按 sessionId 筛——只取数、不判决）。 */
+function boundCollabIdsOf(state, sessionId) {
+  return (state.routing?.bindings?.entries() ?? [])
+    .filter(([, binding]) => binding.sessionId === sessionId)
+    .map(([collabId]) => collabId);
 }
 
 /* 会话状态文件的快照面（核心身份与站点形态）：site 恒 single——null/旧形态会被下一核的数据面
