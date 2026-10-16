@@ -513,7 +513,7 @@ test('ws_view_ledger：合法 → 输出 source / version / ledger；服务拒�
   assert.equal(payload.source, 'local');
   assert.equal(payload.ledger.version, 2);
   assert.deepEqual(collab.calls.view, [{ collabId: 'collab-1' }]);
-  const denied = fakeService({ view: { ok: false, message: '管理者离线且本机无快照——没有可读台账' } });
+  const denied = fakeService({ view: { ok: false, message: '站长离线且本机无快照——没有可读台账' } });
   const deniedResult = await callCollabTool(viewLedgerTool(), { collabId: 'collab-1' }, denied);
   assert.equal(deniedResult.isError, true);
   assert.ok(deniedResult.content[0].text.includes('没有可读台账'));
@@ -589,7 +589,7 @@ test('ws_end_collab / ws_leave_collab：合法透传、拒绝路径 isError、�
   assert.deepEqual(collab.calls.end, [{ collabId: 'collab-1' }]);
   assert.deepEqual(collab.calls.leave, [{ collabId: 'collab-1' }]);
   assert.equal((await callCollabTool(endCollabTool(), {}, collab)).isError, true);
-  const denied = fakeService({ leave: { ok: false, message: '管理席位不可退出——请先结束协作或显式交接' } });
+  const denied = fakeService({ leave: { ok: false, message: '站长席位不可退出——请先结束协作或显式交接' } });
   assert.equal((await callCollabTool(leaveCollabTool(), { collabId: 'collab-1' }, denied)).isError, true);
   assert.equal(collab.calls.end.length, 1);
 });
@@ -685,7 +685,7 @@ test('ws_take_over：confirm 非布尔拒；缺省发起 / true / false 三态�
   await callCollabTool(takeOverTool(), { collabId: 'collab-1', confirm: true }, collab);
   await callCollabTool(takeOverTool(), { collabId: 'collab-1', confirm: false }, collab);
   assert.deepEqual(collab.calls.takeOver.slice(1), [{ collabId: 'collab-1', confirm: true }, { collabId: 'collab-1', confirm: false }]);
-  const denied = fakeGovernanceService({ takeOver: { ok: false, message: '现任驿丞未被判定失联' } });
+  const denied = fakeGovernanceService({ takeOver: { ok: false, message: '现任站长未被判定失联' } });
   const refused = await callCollabTool(takeOverTool(), { collabId: 'collab-1' }, denied);
   assert.equal(refused.isError, true);
   assert.ok(refused.content[0].text.includes('失联'));

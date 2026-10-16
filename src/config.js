@@ -97,7 +97,7 @@ export function buildDefaults(hostName, options = {}) {
     probeTimeoutMs: 1000,
     inviteTtlMs: DAY_MS,
     // 失联判定与抢接规程默认值（设计 §9 明文默认）：
-    // 对管理者周期探测 30s；连续失败累计 2 分钟判失联；抢接收集窗口 30s（自广播起算）；
+    // 对站长周期探测 30s；连续失败累计 2 分钟判失联；抢接收集窗口 30s（自广播起算）；
     // 冻结无裁定 48 小时提示双方（单方处置时限）。
     managerProbeIntervalMs: 30000,
     managerOfflineMs: 120000,

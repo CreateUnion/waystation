@@ -7,16 +7,16 @@ import {
 import { ledgerDigest } from './store.js';
 
 /* 失联判定、握手与抢接规程（设计 §9）：
- * - 失联判定：成员侧对现任驿丞周期探测（TCP 拨入 + ping/pong），连续失败累计达标判失联；
+ * - 失联判定：成员侧对现任站长周期探测（TCP 拨入 + ping/pong），连续失败累计达标判失联；
  *   判定只吃探测结果、与投递队列解耦（排队不作为可达性证据）；
  * - 握手（常驻机制）：启动 / 网络恢复 / 治理通告后对表——角色、版本、在途或生效抢接；
  * - 抢接：收集窗口 + 并发让位 + 人确认 + 生效广播 + 收敛兜底（与合流衔接）。
  * 定时器与等待面随服务 close 收口；一切异常隔离为计数与告警，绝不穿出。 */
 
 /* 窗口内探测节律（模块默认值；服务注入缝可覆盖）：收集窗口 30s 内需多轮探测以及时识别假失联
- * （原驿丞复活）。 */
+ * （原站长复活）。 */
 export const TAKEOVER_PROBE_INTERVAL_MS = 2000;
-/* 握手回帧等待上限（模块默认值；服务注入缝可覆盖）：超过即判「无法对表」——管理席位转只读保守运行。 */
+/* 握手回帧等待上限（模块默认值；服务注入缝可覆盖）：超过即判「无法对表」——站长席位转只读保守运行。 */
 export const HANDSHAKE_REPLY_TIMEOUT_MS = 5000;
 
 function probeStateOf(state, collabId) {
@@ -62,8 +62,8 @@ export function runProbeTick(state) {
   }
 }
 
-/* 成员侧对现任驿丞的周期探测：只在存活协作、端点已知、无在途探测时发起。
- * 讨论实例不参与（无驿丞 / 无失联判定 / 无抢接——设计 §4；讨论的收敛由对表引擎承担）。 */
+/* 成员侧对现任站长的周期探测：只在存活协作、端点已知、无在途探测时发起。
+ * 讨论实例不参与（无站长 / 无失联判定 / 无抢接——设计 §4；讨论的收敛由对表引擎承担）。 */
 function maybeProbeManager(state, local) {
   if (typeof state.probe !== 'function' || local.role === 'manager' || localModeOf(local) === 'forum') {
     return;
@@ -78,7 +78,7 @@ function maybeProbeManager(state, local) {
   }
   const endpoint = local.endpoints.get(local.member.manager.instanceId);
   if (endpoint === undefined) {
-    state.counters.probeSkippedNoEndpoint++;   // 运维面可见：驿丞端点未知时探测不可达（不静默跳过）
+    state.counters.probeSkippedNoEndpoint++;   // 运维面可见：站长端点未知时探测不可达（不静默跳过）
     return;
   }
   probeState.inFlight = true;
@@ -112,7 +112,7 @@ function applyProbeResult(state, local, probeState, result) {
     probeState.offline = false;
     if (wasOffline) {
       state.counters.managerRecovered++;
-      state.log.info('管理者恢复应答（判定解除）', { collabId: local.collabId });
+      state.log.info('站长恢复应答（判定解除）', { collabId: local.collabId });
       runHandshake(state, { collabId: local.collabId });   // 网络恢复即对表
     }
     return;
@@ -125,8 +125,8 @@ function applyProbeResult(state, local, probeState, result) {
   if (!probeState.offline && now - probeState.failSince >= state.config.managerOfflineMs) {
     probeState.offline = true;
     state.counters.managerOffline++;
-    state.log.warn('连续探测失败达判定时限——管理者失联', { collabId: local.collabId, reason: result.reason });
-    notifyLocal(state, local, `对协作「${localNameOf(local)}」的管理者连续探测失败——如确认对方失联，可用 ws_take_over 发起抢接。`);
+    state.log.warn('连续探测失败达判定时限——站长失联', { collabId: local.collabId, reason: result.reason });
+    notifyLocal(state, local, `对协作「${localNameOf(local)}」的站长连续探测失败——如确认对方失联，可用 ws_take_over 发起抢接。`);
   }
 }
 
@@ -290,7 +290,7 @@ function evaluateRemoteHandshake(state, local, frame) {
   const takeover = remote.takeover ?? null;
   if (local.role === 'manager') {
     /* 只对他方记录动作：成员回帧会把「生效抢接者就是本机」写进视图——自身记录是对表确认，
-     * 视为继续（否则新驿丞会被自己的记录降级、删掉台账）。 */
+     * 视为继续（否则新站长会被自己的记录降级、删掉台账）。 */
     if (takeover !== null && takeover.candidate.instanceId !== state.self.instanceId) {
       if (takeover.phase === 'effective') {
         handleCarriedEffective(state, local, takeover);
@@ -299,7 +299,7 @@ function evaluateRemoteHandshake(state, local, frame) {
       suspendLocal(state, local, 'takeover-inflight', Date.now() + state.config.takeoverWindowMs);
       return;
     }
-    return;   // 情形①：仍是驿丞且无在途或已生效的他方抢接（含自身记录）——继续
+    return;   // 情形①：仍是站长且无在途或已生效的他方抢接（含自身记录）——继续
   }
   evaluateRemoteAsMember(state, local, frame, remote, takeover);
 }
@@ -312,13 +312,13 @@ function evaluateRemoteAsMember(state, local, frame, remote, takeover) {
     return;
   }
   if (remote.role === 'manager') {
-    /* 陈旧主张守卫（对照本机已知）：发送方非本机现任驿丞时，须主张版本严格高于本机最近一次
-     * 席位变更的基准版本才可学习——被替换驿丞重启 / 其管理器时代排队帧续投携带的是等于或
+    /* 陈旧主张守卫（对照本机已知）：发送方非本机现任站长时，须主张版本严格高于本机最近一次
+     * 席位变更的基准版本才可学习——被替换站长重启 / 其管理器时代排队帧续投携带的是等于或
      * 更旧的主张（内部版本号），采纳会让本机引用回翻（出站改道、视图被快照来源守卫冻结、
-     * 无自动纠正路径）；更新的主张（真正的新驿丞）照常学习（不得过度收窄）。本机照常回帧
+     * 无自动纠正路径）；更新的主张（真正的新站长）照常学习（不得过度收窄）。本机照常回帧
      * 把本机生效记录带给对方，由对方收敛——握手对表的对称面。 */
     if (!managerClaimAcceptable(state, local, frame, remote)) {
-      state.log.warn('收到陈旧驿丞主张（版本未越过本机已知的席位变更基准）——不采纳', { collabId: local.collabId, claimed: frame.from.instanceId, claimedVersion: remote.version });
+      state.log.warn('收到陈旧站长主张（版本未越过本机已知的席位变更基准）——不采纳', { collabId: local.collabId, claimed: frame.from.instanceId, claimedVersion: remote.version });
       return;
     }
     adoptNewManager(state, local, { instanceId: frame.from.instanceId, identityName: frame.from.identityName }, remote.version);
@@ -329,9 +329,9 @@ function evaluateRemoteAsMember(state, local, frame, remote, takeover) {
   }
 }
 
-/* 管理席位对「他方携带的生效记录」的处置：候选资格校验（席位时钟判据）——记录基准早于或
- * 等于本机席位时钟（本机已知的那次或更早的席位状态）即不收敛，否则新驿丞会被已翻页的记录
- * 拉下席位、删掉台账；无席位变更知识（原始驿丞、未收敛的被替换者）或不陈旧（更高基准——
+/* 站长席位对「他方携带的生效记录」的处置：候选资格校验（席位时钟判据）——记录基准早于或
+ * 等于本机席位时钟（本机已知的那次或更早的席位状态）即不收敛，否则新站长会被已翻页的记录
+ * 拉下席位、删掉台账；无席位变更知识（原始站长、未收敛的被替换者）或不陈旧（更高基准——
  * 本地版本更高的合流腿）照常收敛：合流递交 + 让位降级（设计 §9 步骤 4 / 握手③）。 */
 function handleCarriedEffective(state, local, takeover) {
   if (carriedRecordStale(local, takeover.baseVersion)) {
@@ -341,7 +341,7 @@ function handleCarriedEffective(state, local, takeover) {
   convergeOnReplaced(state, local, takeover.candidate, takeover.baseVersion);
 }
 
-/* 管理者主张的可学习性：本机现任驿丞本人的主张照常采纳（幂等对表）；他方主张须版本严格高于
+/* 站长主张的可学习性：本机现任站长本人的主张照常采纳（幂等对表）；他方主张须版本严格高于
  * 本机席位时钟（缺省 0 = 无席位变更知识，均可学习）。版本未知（null / 非整数）的他方主张
  * 不可判新——按陈旧处理（保守不采纳）。 */
 function managerClaimAcceptable(state, local, frame, remote) {
@@ -351,15 +351,15 @@ function managerClaimAcceptable(state, local, frame, remote) {
   return Number.isInteger(remote.version) && remote.version > (managerSinceVersionOf(local) ?? 0);
 }
 
-/* 本机席位时钟 = 最近一次席位变更（受让 / 接管 / 让位 / 采纳新驿丞）的台账基准版本；
- * 无变更知识返回 null（原始驿丞未收敛 / 从未变更过驿丞引用的成员——不判陈旧）。 */
+/* 本机席位时钟 = 最近一次席位变更（受让 / 接管 / 让位 / 采纳新站长）的台账基准版本；
+ * 无变更知识返回 null（原始站长未收敛 / 从未变更过站长引用的成员——不判陈旧）。 */
 function managerSinceVersionOf(local) {
   return typeof local.member?.managerSinceVersion === 'number' ? local.member.managerSinceVersion : null;
 }
 
 /* 携带的生效抢接记录是否已陈旧（席位时钟判据）：记录基准 ≤ 本机席位时钟即陈旧——移交不推
  * 台账版本（「抢占于 v、移交于 v」是常态），按裸版本比对的严格大于会放过等版本遗留记录，
- * 使新驿丞被拉下席位；时钟只在席位变更时推进，故等版本与更低基准一并判陈旧，而更高基准
+ * 使新站长被拉下席位；时钟只在席位变更时推进，故等版本与更低基准一并判陈旧，而更高基准
  * （本地版本更高的合流腿）不受影响。 */
 function carriedRecordStale(local, baseVersion) {
   const clock = managerSinceVersionOf(local);
@@ -424,13 +424,13 @@ function beginTakeover(state, local) {
 
 function takeoverRejection(state, local) {
   if (local.role === 'manager') {
-    return '本机就是该协作的管理者——无需抢接';
+    return '本机就是该协作的站长——无需抢接';
   }
   if (isArchived(localStateOf(local))) {
     return '协作已结束（或已退出）——不可抢接';
   }
   if (local.snapshot === null) {
-    return '本机无快照——无从恢复台账，抢接不可行（先与现任驿丞完成一次对表）';
+    return '本机无快照——无从恢复台账，抢接不可行（先与现任站长完成一次对表）';
   }
   if (typeof state.probe !== 'function') {
     return '本机未接线探测能力——抢接不可行';
@@ -439,11 +439,11 @@ function takeoverRejection(state, local) {
     return '本机已有在途抢接——先等待其结论';
   }
   if (state.effectiveTakeovers.has(local.collabId)) {
-    return '该协作已有生效抢接（驿丞已为他人）——先对表收敛';
+    return '该协作已有生效抢接（站长已为他人）——先对表收敛';
   }
   const probeState = probeStateOf(state, local.collabId);
   if (probeState.offline !== true) {
-    return '现任驿丞未被判定失联——请等待探测判定（连续失败累计达标）后再试';
+    return '现任站长未被判定失联——请等待探测判定（连续失败累计达标）后再试';
   }
   return null;
 }
@@ -453,7 +453,7 @@ function broadcastAnnounce(state, local, record, managerPeer) {
   sendToRoster(state, local, 'takeover-init', { kind: 'announce', manager: managerPeer, baseVersion: record.baseVersion, windowEndsAt });
 }
 
-/* 收集窗口：自广播起算（窗口时长已在窗口结束时点固化）——窗口内持续探测原驿丞，
+/* 收集窗口：自广播起算（窗口时长已在窗口结束时点固化）——窗口内持续探测原站长，
  * 应答即中止（假失联）；窗口止后按优先序判定。 */
 function startTakeoverWindow(state, local, record) {
   const tick = async () => {
@@ -462,7 +462,7 @@ function startTakeoverWindow(state, local, record) {
     }
     const endpoint = local.endpoints.get(local.member.manager.instanceId);
     if (endpoint === undefined) {
-      abortTakeover(state, local, record, '管理者端点未知——抢接中止');
+      abortTakeover(state, local, record, '站长端点未知——抢接中止');
       return;
     }
     const result = await probePeer(state, endpoint);
@@ -470,7 +470,7 @@ function startTakeoverWindow(state, local, record) {
       return;
     }
     if (result.reachable === true) {
-      abortTakeover(state, local, record, '原驿丞恢复应答——抢接中止（假失联）');
+      abortTakeover(state, local, record, '原站长恢复应答——抢接中止（假失联）');
       return;
     }
     if (Date.now() >= record.windowEndsAt) {
@@ -578,9 +578,9 @@ async function finalizeTakeover(state, local, baseVersion) {
   if (probeResult.reachable === true) {
     state.takeovers.delete(local.collabId);
     state.rearmedTakeovers.delete(local.collabId);
-    sendToRoster(state, local, 'takeover-init', { kind: 'cancel', reason: '原驿丞恢复应答——抢接中止（生效前最后探测）' });
+    sendToRoster(state, local, 'takeover-init', { kind: 'cancel', reason: '原站长恢复应答——抢接中止（生效前最后探测）' });
     state.counters.takeoversAborted++;
-    return { ok: false, message: '生效前最后探测：原驿丞恢复应答——抢接中止' };
+    return { ok: false, message: '生效前最后探测：原站长恢复应答——抢接中止' };
   }
   /* 生效取生效时台账真值：收集窗口内可能收到更新的快照（版本漂移）——生效帧、优先序比较与
    * 恢复台账同源，不沿用发起时宣布的旧基准（错值会污染对立抢接判定与合流递交的基准面）。 */
@@ -602,11 +602,11 @@ async function finalizeTakeover(state, local, baseVersion) {
   state.rearmedTakeovers.delete(local.collabId);
   state.awaitingTakeovers.delete(local.collabId);
   applyTakeover(state, local, appliedVersion);
-  return { ok: true, message: `抢接已生效：本机成为驿丞（基准版本 ${appliedVersion}）` };
+  return { ok: true, message: `抢接已生效：本机成为站长（基准版本 ${appliedVersion}）` };
 }
 
 /* 生效：从本机快照恢复（manager 换为本机、updatedAt 刷新、版本保持基准值——版本号跨抢接延续不重置），
- * 承担管理席位，向全体广播 takeover（治理类豁免过期与上限，重试直至送达——离线者恢复后让位）。 */
+ * 担任站长席位，向全体广播 takeover（治理类豁免过期与上限，重试直至送达——离线者恢复后让位）。 */
 function applyTakeover(state, local, baseVersion) {
   const ledger = structuredClone(local.snapshot.ledger);
   ledger.manager = { instanceId: state.self.instanceId, identityName: state.self.identityName };
@@ -617,11 +617,11 @@ function applyTakeover(state, local, baseVersion) {
   state.effectiveTakeovers.set(local.collabId, { candidate, baseVersion, digest });
   sendToRoster(state, local, 'takeover', { baseVersion, digest });
   state.counters.takeoversEffective++;
-  state.log.warn('抢接生效——本机承担驿丞席位', { collabId: local.collabId, baseVersion });
-  notifyLocal(state, local, `抢接已生效：本机已成为协作「${localNameOf(local)}」的驿丞（基准版本 ${baseVersion}）。`);
+  state.log.warn('抢接生效——本机担任站长席位', { collabId: local.collabId, baseVersion });
+  notifyLocal(state, local, `抢接已生效：本机已成为协作「${localNameOf(local)}」的站长（基准版本 ${baseVersion}）。`);
 }
 
-/* 生效通告补发（端点学习点消费）：本机即记录中的新驿丞时，向新学得端点的名册成员补发一次
+/* 生效通告补发（端点学习点消费）：本机即记录中的新站长时，向新学得端点的名册成员补发一次
  * takeover——「未入队即无重试」的盲区由此收窄；帧幂等（接收侧按版本收敛）。 */
 export function resendEffectiveTakeover(state, local, instanceId) {
   const effective = state.effectiveTakeovers.get(local.collabId);
@@ -666,7 +666,7 @@ export async function handleTakeoverInit(state, frame) {
 function handleAnnounce(state, local, frame, payload) {
   const currentManagerId = currentManagerIdOf(local);
   if (payload.manager.instanceId !== currentManagerId) {
-    state.log.warn('抢接意图针对的驿丞与本地记录不符（过期通告，忽略）', { collabId: local.collabId, claimed: payload.manager.instanceId });
+    state.log.warn('抢接意图针对的站长与本地记录不符（过期通告，忽略）', { collabId: local.collabId, claimed: payload.manager.instanceId });
     return;
   }
   state.counters.takeoversIn++;
@@ -679,7 +679,7 @@ function handleAnnounce(state, local, frame, payload) {
       yieldNow(state, local, record, rival);
     }
   } else if (state.effectiveTakeovers.has(local.collabId)) {
-    // 已有生效抢接：在途意图按过期处理（新驿丞在位，无需再抢）
+    // 已有生效抢接：在途意图按过期处理（新站长在位，无需再抢）
   } else if (local.role === 'manager') {
     suspendLocal(state, local, 'takeover-inflight', Date.now() + state.config.takeoverWindowMs + state.takeoverProbeIntervalMs);
   }
@@ -714,7 +714,7 @@ function handleReport(state, local, frame, payload) {
   }
 }
 
-/* 取消（假失联恢复 / 让位 / 放弃）：管理席位侧解除在途挂起；被让位者获得顺位机会。 */
+/* 取消（假失联恢复 / 让位 / 放弃）：站长席位侧解除在途挂起；被让位者获得顺位机会。 */
 function handleGovernanceCancel(state, local, frame) {
   state.counters.takeoversCancelsIn++;
   if (local.role === 'manager' && local.suspended !== null && local.suspended.reason === 'takeover-inflight') {
@@ -768,7 +768,7 @@ function applyTakeoverNews(state, local, incoming) {
 }
 
 /* 被替换 / 让位的收敛内核（步骤 4；握手情形③与抢接接收共用）：本地版本高于基准 → 先合流递交，
- * 再降级为协作者并提示本机人（分区期间的超出部分交由现任驿丞的人裁定）。 */
+ * 再降级为协作者并提示本机人（分区期间的超出部分交由现任站长的人裁定）。 */
 export function convergeOnReplaced(state, local, candidate, baseVersion) {
   const localVersion = localVersionOf(local);
   if (localVersion !== null && localVersion > baseVersion) {
@@ -780,10 +780,10 @@ export function convergeOnReplaced(state, local, candidate, baseVersion) {
   downgradeToMember(state, local, candidate, baseVersion);
   state.counters.takeoverDowngrades++;
   state.log.warn('本机让位——已降级为协作者', { collabId: local.collabId, newManager: candidate.instanceId, baseVersion });
-  notifyLocal(state, local, `本机已被替换：协作「${name}」的驿丞现为「${candidate.identityName}」；本机已降为协作者。`);
+  notifyLocal(state, local, `本机已被替换：协作「${name}」的站长现为「${candidate.identityName}」；本机已降为协作者。`);
 }
 
-/* 成员侧收到生效抢接 / 驿丞变更：同步成员记录（内部已含陈旧队列重定向与视图拉取）。 */
+/* 成员侧收到生效抢接 / 站长变更：同步成员记录（内部已含陈旧队列重定向与视图拉取）。 */
 function convergeMemberOnEffective(state, local, candidate, baseVersion) {
   adoptNewManager(state, local, candidate, baseVersion);
   const mine = localVersionOf(local);

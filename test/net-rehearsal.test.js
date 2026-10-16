@@ -662,7 +662,7 @@ test('协作预演：结束后迟到消息丢弃并计数 + 服务层门控拒�
   }, { timeoutMs: 15000 });
 });
 
-test('协作预演：管理者离线 → view_ledger 回退快照并标注可能非最新', { timeout: 90000 }, async (t) => {
+test('协作预演：站长离线 → view_ledger 回退快照并标注可能非最新', { timeout: 90000 }, async (t) => {
   const { port, nodes: [a, b] } = await startNodesGuarded(t, 2, (startPort) => spawnAdjacentPairNodes(t, startPort));
   const created = await a.command({ cmd: 'create_collab', name: '回退项目', topic: '主题', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
   await waitFor(async () => {
@@ -768,7 +768,7 @@ async function establishPairWith(t, { a, b, port, name }) {
   return created.collabId;
 }
 
-test('治理预演：显式交接全链（先确认后删除；受让方承担席位）', { timeout: 120000 }, async (t) => {
+test('治理预演：显式交接全链（先确认后删除；受让方担任席位）', { timeout: 120000 }, async (t) => {
   const dirA = makeNodeDir(t);
   const { port, nodes: [a, b] } = await startNodesGuarded(t, 2, (startPort) => spawnEstablishPairNodes(t, startPort, GOVERNANCE_CONFIG, { dataDirA: dirA }));
   const collabId = await establishPairWith(t, { a, b, port, name: '交接项目' });
@@ -786,7 +786,7 @@ test('治理预演：显式交接全链（先确认后删除；受让方承担�
   assert.equal(existsSync(join(dirA, 'collabs', collabId, 'snapshot.json')), true, '成员备份保留');
 });
 
-test('治理预演：失联抢接全链 + 原驿丞重启握手降级', { timeout: 180000 }, async (t) => {
+test('治理预演：失联抢接全链 + 原站长重启握手降级', { timeout: 180000 }, async (t) => {
   const dirA = makeNodeDir(t);
   const { port, nodes: [a, b] } = await startNodesGuarded(t, 2, (startPort) => spawnEstablishPairNodes(t, startPort, GOVERNANCE_CONFIG, { dataDirA: dirA }));
   const collabId = await establishPairWith(t, { a, b, port, name: '抢接项目' });
@@ -803,7 +803,7 @@ test('治理预演：失联抢接全链 + 原驿丞重启握手降级', { timeou
   const bView = await b.command({ cmd: 'view_ledger', collabId });
   assert.equal(bView.ledger.manager.instanceId, b.ready.instanceId);
   assert.equal(bView.ledger.version, verdict.baseVersion, '基准版本延续（不重置）');
-  /* 原驿丞重启：启动握手 / 补投的通告识出已被替换 → 降级为协作者并清理台账 */
+  /* 原站长重启：启动握手 / 补投的通告识出已被替换 → 降级为协作者并清理台账 */
   const a2 = await startNode(t, { identityName: '主机甲', bindAddress: '127.0.0.1', port, dataDir: dirA, knownPeers: [{ address: '127.0.0.1', port: port + 1 }], config: GOVERNANCE_CONFIG });
   const aEntry = await waitFor(async () => {
     const listed = await a2.command({ cmd: 'list_collabs' });
@@ -816,7 +816,7 @@ test('治理预演：失联抢接全链 + 原驿丞重启握手降级', { timeou
   assert.equal(existsSync(join(dirA, 'collabs', collabId, 'ledger.jsonl')), false, '降级即清理本地台账');
 });
 
-test('治理预演：假失联中止（窗口内原驿丞复活 → 抢接中止）', { timeout: 120000 }, async (t) => {
+test('治理预演：假失联中止（窗口内原站长复活 → 抢接中止）', { timeout: 120000 }, async (t) => {
   const config = { ...GOVERNANCE_CONFIG, takeoverWindowMs: 4000 };
   const { port, nodes: [a, b] } = await startNodesGuarded(t, 2, (startPort) => spawnEstablishPairNodes(t, startPort, config));
   const collabId = await establishPairWith(t, { a, b, port, name: '假失联项目' });
@@ -834,7 +834,7 @@ test('治理预演：假失联中止（窗口内原驿丞复活 → 抢接中止
   const bStats = await b.command({ cmd: 'collab_stats' });
   const aStats = await a2.command({ cmd: 'collab_stats' });
   assert.equal(bStats.stats.takeoversAborted >= 1, true);
-  assert.equal(aStats.stats.takeoverDowngrades, 0, '原驿丞未被替换');
+  assert.equal(aStats.stats.takeoverDowngrades, 0, '原站长未被替换');
 });
 
 test('治理预演：并发抢接（互见让位、确定性单一胜者、败方收敛）', { timeout: 180000 }, async (t) => {
@@ -865,7 +865,7 @@ test('治理预演：并发抢接（互见让位、确定性单一胜者、败�
     const viewed = await loserNode.command({ cmd: 'view_ledger', collabId });
     return viewed.ok === true && viewed.ledger.manager.instanceId === winnerNode.ready.instanceId ? viewed : null;
   }, { timeoutMs: 20000 });
-  assert.equal(loserView.ledger.manager.instanceId, winnerNode.ready.instanceId, '败方收敛到新驿丞视图');
+  assert.equal(loserView.ledger.manager.instanceId, winnerNode.ready.instanceId, '败方收敛到新站长视图');
 });
 
 test('治理预演：离线错过通告 → 恢复后送达即让位（治理豁免过期）', { timeout: 180000 }, async (t) => {

@@ -236,7 +236,7 @@ test('治理验收：显式交接（ws_handover 全链，先确认后删除）',
   assert.equal(bLedger.payload.ledger.manager.instanceId, statusB.instanceId);
 });
 
-test('治理验收：失联抢接（ws_take_over 全链）+ 原驿丞重启握手降级', { timeout: 180000 }, async (t) => {
+test('治理验收：失联抢接（ws_take_over 全链）+ 原站长重启握手降级', { timeout: 180000 }, async (t) => {
   const studio = await startStudio(t);
   const { a, b, homeA, portA, inboxA, collabId } = studio;
   const statusA = (await callTool(a, 'ws_status')).payload;
@@ -257,7 +257,7 @@ test('治理验收：失联抢接（ws_take_over 全链）+ 原驿丞重启握�
   const bLedger = await callTool(b, 'ws_view_ledger', { collabId });
   assert.equal(bLedger.payload.ledger.manager.instanceId, (await callTool(b, 'ws_status')).payload.instanceId);
   assert.equal(bLedger.payload.ledger.version, verdict.payload.baseVersion, '版本跨抢接延续');
-  /* 原驿丞重启：握手 / 通告送达识出已被替换 → 降级 */
+  /* 原站长重启：握手 / 通告送达识出已被替换 → 降级 */
   const a2 = await startStation(t, { home: homeA, port: portA, inbox: inboxA });
   await waitFor(async () => {
     const listed = (await callTool(a2, 'ws_list_collabs')).payload.collabs;

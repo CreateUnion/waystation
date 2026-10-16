@@ -97,7 +97,7 @@ export function terminateLocalCopy(state, local, reason) {
   return true;
 }
 
-/* —— 裁定工具（管理席位）—— */
+/* —— 裁定工具（站长席位）—— */
 
 export function decide(state, { collabId, choice }) {
   const local = state.collabs.get(collabId);
@@ -105,7 +105,7 @@ export function decide(state, { collabId, choice }) {
     return { ok: false, message: '本机没有该协作（先 ws_list_collabs）' };
   }
   if (local.role !== 'manager') {
-    return { ok: false, message: '裁定由管理席位执行（成员的路径是退出该协作）' };
+    return { ok: false, message: '裁定由站长席位执行（成员的路径是退出该协作）' };
   }
   if (localStateOf(local) !== 'frozen') {
     return { ok: false, message: '只有冻结中的协作需要裁定（当前未冻结）' };
@@ -147,7 +147,7 @@ function executeTerminate(state, local) {
 
 /* 合并（保留方执行）：保留条解除冻结；名单取并集——新增参与者以 invited 入账并发 invite 走同意门；
  * 本机持有的被并入条转终止；广播执行帧（对端：winner 条解冻、其余匹配条终止）。
- * 保留方判定（设计默认建议「发起更早者任管理者」的最佳努力面）：对端数据齐备时先算后执行，
+ * 保留方判定（设计默认建议「发起更早者任站长」的最佳努力面）：对端数据齐备时先算后执行，
  * 本机非保留方改发意向帧；数据缺省（成员侧检出）以先执行方为准——建议规则由工具文案提示。 */
 function executeMerge(state, local) {
   if (mergeWinnerOf(state, local) === 'rival') {
@@ -173,10 +173,10 @@ function executeMerge(state, local) {
   state.counters.freezeDecisionsOut++;
   local.mergeIntent = null;
   local.conflictRival = null;
-  return { ok: true, choice: 'merge', message: `合并已执行：本机为保留条驿丞；新增 ${additions.length} 名成员走同意门` };
+  return { ok: true, choice: 'merge', message: `合并已执行：本机为保留条站长；新增 ${additions.length} 名成员走同意门` };
 }
 
-/* 保留方判定：对端数据（发起时间 + 管理者）齐备才判定；同时间按管理者实例标识码位序小者优先
+/* 保留方判定：对端数据（发起时间 + 站长）齐备才判定；同时间按站长实例标识码位序小者优先
  * （与抢接优先序同向）。数据缺省返回 'self'（以先执行方为准——「建议」的如实边界）。 */
 function mergeWinnerOf(state, local) {
   const rival = local.conflictRival;
@@ -331,7 +331,7 @@ function applyDecisionTo(state, local, frame, payload) {
   }
 }
 
-/* 接收侧顺序校验（仅管理席位侧可判——成员侧无「本条发起时间」数据、不做校验）：
+/* 接收侧顺序校验（仅站长席位侧可判——成员侧无「本条发起时间」数据、不做校验）：
  * 执行方条并不比本机更早 → 本机按建议应为保留方，拒绝被并入（保持冻结、冲突留痕，
  * 由人继续谈——「两边裁定矛盾时保持冻结」的机器化面）。 */
 function mergeOrderRefuses(state, local, frame, payload) {
@@ -397,7 +397,7 @@ export async function handleMergeRequest(state, frame) {
   }
   state.counters.mergeRequestsIn++;
   if (local.role !== 'manager') {
-    state.log.warn('收到合流递交但本机不是管理席位（忽略）', { collabId: frame.collabId, from: frame.from.instanceId });
+    state.log.warn('收到合流递交但本机不是站长席位（忽略）', { collabId: frame.collabId, from: frame.from.instanceId });
     return;
   }
   const payload = frame.payload;
@@ -426,7 +426,7 @@ export function decideMergeOffer(state, { collabId, mergeOffer }) {
     return { ok: false, message: '本机没有该协作（先 ws_list_collabs）' };
   }
   if (local.role !== 'manager') {
-    return { ok: false, message: '合流裁定由管理席位执行' };
+    return { ok: false, message: '合流裁定由站长席位执行' };
   }
   const pending = local.pendingMerge;
   if (pending === null || pending === undefined) {

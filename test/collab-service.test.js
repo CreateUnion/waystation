@@ -250,7 +250,7 @@ test('create：本机参与协作数达上限（64）→ 拒绝', (t) => {
 
 /* —— 邀请到达与同意门 —— */
 
-test('invite 到达：成员记录建立（proposed / decision null / 有效期）、管理者端点与清单学习、过期标注随之', async (t) => {
+test('invite 到达：成员记录建立（proposed / decision null / 有效期）、站长端点与清单学习、过期标注随之', async (t) => {
   const { service, remembered } = makeService(t);
   const framed = inviteFrame({ collabId: 'collab-9' });
   const admitted = await receive(service, framed);
@@ -345,7 +345,7 @@ test('decline：拒绝帧携带 reason；decision 定格 declined', async (t) =>
   assert.deepEqual(frames[0].payload, { reason: '人手不足' });
 });
 
-/* —— 管理者侧：回应收集与建立 —— */
+/* —— 站长侧：回应收集与建立 —— */
 
 function managerWithTwoInvites(t) {
   const made = makeService(t);
@@ -360,7 +360,7 @@ function managerWithTwoInvites(t) {
   return { ...made, collabId: created.collabId };
 }
 
-test('approve 到达管理席位：入账 + 快照推进 + 未全票不建立', async (t) => {
+test('approve 到达站长席位：入账 + 快照推进 + 未全票不建立', async (t) => {
   const { service, sent, collabId } = managerWithTwoInvites(t);
   await receive(service, collabFrame('approve', collabId, peer('inst-b', '主机乙'), {}));
   assert.equal(sentOf(sent, 'snapshot', collabId).length >= 1, true);
@@ -604,7 +604,7 @@ test('end 到达成员 / 迟到消息：归档 + 协作类拒绝并计数 + snap
   assert.equal(admitted.ok, true, '归档态放行快照接收');
 });
 
-test('leave：成员退出发帧并归档；管理者拒绝自身退出；管理者收 leave 入账 + roster 通告', async (t) => {
+test('leave：成员退出发帧并归档；站长拒绝自身退出；站长收 leave 入账 + roster 通告', async (t) => {
   const { service, sent } = makeService(t);
   const held = await activeTwoMemberCollab(t, service);
   const left = await service.leave({ collabId: held });
@@ -625,7 +625,7 @@ test('leave：成员退出发帧并归档；管理者拒绝自身退出；管理
 
 /* —— 台账联动与快照 —— */
 
-test('topic 到达管理席位：主题更新 + version 推进 + 快照；topic 外发时本机台账先行更新', async (t) => {
+test('topic 到达站长席位：主题更新 + version 推进 + 快照；topic 外发时本机台账先行更新', async (t) => {
   const { service, sent, collabId } = managerWithTwoInvites(t);
   await receive(service, collabFrame('topic', collabId, peer('inst-b', '主机乙'), { text: '主题更新为发布冲刺' }));
   assert.equal(service.list().collabs[0].version, 2);
@@ -635,7 +635,7 @@ test('topic 到达管理席位：主题更新 + version 推进 + 快照；topic 
   assert.equal(sentOf(sent, 'topic', collabId).length, 2, '发给两名成员');
 });
 
-test('progress 到达管理席位：board 追加；超 200 条剪除最旧并计数', async (t) => {
+test('progress 到达站长席位：board 追加；超 200 条剪除最旧并计数', async (t) => {
   const { service, collabId } = managerWithTwoInvites(t);
   for (let index = 0; index < 205; index++) {
     await receive(service, collabFrame('progress', collabId, peer('inst-b', '主机乙'), { text: `进度-${index}` }));
@@ -728,7 +728,7 @@ test('文本预校验：越界 topic 拒绝且本地台账零变更；stop / 拒
   assert.equal(listed.state, 'proposed');
 });
 
-test('快照请求：管理席位应答当前台账；成员侧忽略', async (t) => {
+test('快照请求：站长席位应答当前台账；成员侧忽略', async (t) => {
   const { service, sent, collabId } = managerWithTwoInvites(t);
   await receive(service, collabFrame('snapshot', collabId, peer('inst-b', '主机乙'), { kind: 'request' }));
   const replies = sentOf(sent, 'snapshot', collabId).filter((frame) => frame.payload.kind === 'data');
@@ -743,7 +743,7 @@ test('快照请求：管理席位应答当前台账；成员侧忽略', async (t
 
 /* —— 读路径与离线/终止语义 —— */
 
-test('view：管理席位本机直读；成员在线拉取（注入回应）为 live', async (t) => {
+test('view：站长席位本机直读；成员在线拉取（注入回应）为 live', async (t) => {
   const { service, collabId } = managerWithTwoInvites(t);
   const localView = await service.view({ collabId });
   assert.equal(localView.source, 'local');
@@ -779,7 +779,7 @@ test('view：超时回退快照并标注可能非最新；无快照 → ok:false
   assert.ok(missing.message.includes('没有可读台账'));
 });
 
-test('send 路由与状态门控：成员只发管理者、管理者可发指定/全体、未知与归档拒绝', async (t) => {
+test('send 路由与状态门控：成员只发站长、站长可发指定/全体、未知与归档拒绝', async (t) => {
   const { service, sent } = makeService(t);
   const held = await activeTwoMemberCollab(t, service);
   const okSend = await service.send({ collabId: held, text: '收到', type: 'reply' });
@@ -873,7 +873,7 @@ test('并发 view：先到者超时只摘自己（等待面部分摘除），后
   const second = service.view({ collabId: held });
   const firstView = await first;
   assert.equal(firstView.ok, false, '先到者超时回退：本机无快照、如实拒绝');
-  assert.equal(firstView.message, '管理者离线且本机无快照——没有可读台账');
+  assert.equal(firstView.message, '站长离线且本机无快照——没有可读台账');
   await receive(service, snapshotFrame(held, peer('inst-a', '主机甲'), 5));
   const secondView = await second;
   assert.equal(secondView.source, 'live', '回应仍能解挂后到者（先到者的超时未摘掉整条等待面）');
@@ -887,7 +887,7 @@ test('close：在途 view 等待面被统一解挂（按无快照回退、不悬
   service.close();
   const view = await pending;
   assert.equal(view.ok, false, 'close 解挂等待面：本机无快照、如实拒绝');
-  assert.equal(view.message, '管理者离线且本机无快照——没有可读台账');
+  assert.equal(view.message, '站长离线且本机无快照——没有可读台账');
 });
 
 test('观测计数：未知协作拒绝 / 快照回执 / 未匹配冻结（运营观测面断言）', async (t) => {
@@ -924,7 +924,7 @@ function createForum(service, { name = '讨论甲', targets = [targetOf('b')] } 
 }
 
 /* 「已加入」态夹具（服务 / 协议级口径）：真实加入通路归后续任务——此处以追加合法台账行的方式
- * 装配「进行中」，走正常加载路径（成员记录不动，管理席位状态以台账为权威）。 */
+ * 装配「进行中」，走正常加载路径（成员记录不动，站长席位状态以台账为权威）。 */
 function advanceForumToActive(made, collabId) {
   const loaded = loadLedger(made.dir, collabId);
   appendLedger(made.dir, { ...loaded.ledger, status: 'active', version: loaded.ledger.version + 1 });

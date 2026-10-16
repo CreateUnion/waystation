@@ -373,7 +373,7 @@ test('台账流坏行：回放与增量均印跳过提示（原恒静默面）',
   assert.equal(viewer.countOf('跳过一条无法解析的记录行'), 2, '增量期坏行再留痕一次');
 });
 
-test('管理席位已退出：名取台账（对齐 localNameOf）、态取 left（对齐 localStateOf）', async (t) => {
+test('站长席位已退出：名取台账（对齐 localNameOf）、态取 left（对齐 localStateOf）', async (t) => {
   const home = makeStationDir(t);
   seedCollab(home, { posts: 1, seat: 'manager' });
   writeFileSync(collabPath(home, 'member.json'), JSON.stringify(memberRecordOf({ role: 'manager', state: 'left', name: '记录名甲' })));

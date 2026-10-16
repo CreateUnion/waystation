@@ -393,7 +393,7 @@ test('验收预演：结束与终态门控（通告投递、双侧拒绝、归�
   assert.equal(archivedView.payload.ledger.status, 'completed');
 });
 
-test('验收预演：管理者离线 → 读快照回退并标注可能非最新', { timeout: 120000 }, async (t) => {
+test('验收预演：站长离线 → 读快照回退并标注可能非最新', { timeout: 120000 }, async (t) => {
   const made = await startTemporaryStudio(t, { name: '回退项目', topic: '主题' });
   const { homeB, portA, a, b, collabId } = made;
   assert.equal((await callTool(b, 'ws_approve_invite', { collabId, approve: true })).isError, false);

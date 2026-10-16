@@ -175,7 +175,7 @@ function makeWire() {
   };
 }
 
-/* 双节点对表场景：A=发起人（管理席位）、B=成员（受邀并已加入）。
+/* 双节点对表场景：A=发起人（站长席位）、B=成员（受邀并已加入）。
  * B 的自播 join 经手工一跳送达 A；B 再对表一轮拉回 A 的事件集（双方成员表装配完成）。
  * overrides.a / overrides.b 覆盖各端构造面（软阈、预算、重播间隔等）。 */
 async function makeForumPair(t, overrides = {}) {
@@ -656,7 +656,7 @@ test('注入栅栏（限帖通道）：(作者, postId) 去重命中抑制重复
 
 test('会话注入分流：拉取两件套帧从不注入（含回填帖）；managed 的「受理帧仍注入」不泛化', async (t) => {
   const made = makePipedService(t);
-  /* 管理席位侧讨论实例：B 已加入——拉取请求/应答经真管线到达。 */
+  /* 站长席位侧讨论实例：B 已加入——拉取请求/应答经真管线到达。 */
   const collabId = made.service.create({ name: '讨论甲', topic: '议题', mode: 'forum', targets: [{ instanceId: SELF_B.instanceId, identityName: SELF_B.identityName, address: '127.0.0.2', port: SELF_B.port }] }).collabId;
   await receive(made.service, joinFrameOf(collabId, peer(SELF_B.instanceId, SELF_B.identityName, SELF_B.port)));
   const connection = fakeConnection();

@@ -278,7 +278,7 @@ function writeForumFixture(home, collabId, { posts = 3, tailWithoutNewline = fal
   });
 }
 
-/* 协作夹具（管理席位）：台账两行（一条迁移）＋累计收到＋收/发各一条内容消息。 */
+/* 协作夹具（站长席位）：台账两行（一条迁移）＋累计收到＋收/发各一条内容消息。 */
 function writeManagedFixture(home, collabId) {
   writeFiles(collabDirIn(home, collabId), {
     [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ mode: 'managed', collabId, name: '协作甲' })),

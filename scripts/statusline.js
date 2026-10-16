@@ -11,7 +11,7 @@ import { ID_PATTERN } from '../src/net/protocol.js';
  * 集成属客户端配置（两条路径都不改本脚本）：独立 statusLine 直接指定本脚本；claude-hud 等
  * 组合式状态栏经其扩展能力对接（组合形态由客户端能力决定，端到端未实测——README 如实标注）。 */
 
-const ROLE_LABELS = { manager: '驿丞', member: '协作者' };
+const ROLE_LABELS = { manager: '站长', member: '协作者' };
 const STATE_LABELS = { proposed: '待同意', frozen: '冻结' };
 const MODE_LABELS = { managed: '协作中', forum: '讨论中' };
 const FORUM_MODE = 'forum';
@@ -57,7 +57,7 @@ function modeOf(entry) {
   return entry?.mode === FORUM_MODE ? FORUM_MODE : 'managed';
 }
 
-/* 条目前缀：协作条目带角色（驿丞 / 协作者）；讨论条目平权、不带角色。非进行中状态带标注。 */
+/* 条目前缀：协作条目带角色（站长 / 协作者）；讨论条目平权、不带角色。非进行中状态带标注。 */
 function itemPartsOf(entry) {
   const parts = [];
   if (modeOf(entry) !== FORUM_MODE) {

@@ -3,12 +3,12 @@ import { appendLedger, ensureCollabDir, saveMember, saveSnapshot } from './store
 import { isArchived } from './model.js';
 import { newMemberEventId } from './members.js';
 
-/* 本地协作态与持久化的共享原语（服务内多模块共用）：状态读法（管理席位以台账为权威、
+/* 本地协作态与持久化的共享原语（服务内多模块共用）：状态读法（站长席位以台账为权威、
  * 成员以本地记录为权威）与「只计数告警、绝不抛出」的写盘包装（健壮性硬性要求——
  * 写盘失败不得让协作事件处理或消息主链中断）。写包装统一先确保协作目录存在（写路径自足）。 */
 
-/* 状态读法：管理席位以台账为权威；「已退出」是成员记录的本地终态，对**讨论的发起人**同样可达
- * （发起人可退出——退出即放弃结束权，设计 §6），故管理席位以 member.state 的 left 标记优先。 */
+/* 状态读法：站长席位以台账为权威；「已退出」是成员记录的本地终态，对**讨论的发起人**同样可达
+ * （发起人可退出——退出即放弃结束权，设计 §6），故站长席位以 member.state 的 left 标记优先。 */
 export function localStateOf(local) {
   if (local.role === 'manager' && local.member.state !== 'left') {
     return local.ledger.status;
@@ -16,7 +16,7 @@ export function localStateOf(local) {
   return local.member.state;
 }
 
-/* 模式读法（两侧视角统一）：管理席位取台账、成员取本地记录；缺省 managed（旧数据兼容，
+/* 模式读法（两侧视角统一）：站长席位取台账、成员取本地记录；缺省 managed（旧数据兼容，
  * 创建时定死不可变——本函数是全部模式判定的单一入口）。 */
 export function localModeOf(local) {
   const raw = local.role === 'manager' ? local.ledger.mode : local.member.mode;
@@ -93,7 +93,7 @@ export function relayDepartedOf(local, relayId) {
   return latest !== null && latest.kind === 'leave';
 }
 
-/* 主题读法（两侧视角统一）：管理席位取台账、成员取本地记录（邀请载荷/对表元状态写入）。 */
+/* 主题读法（两侧视角统一）：站长席位取台账、成员取本地记录（邀请载荷/对表元状态写入）。 */
 export function localTopicOf(local) {
   const raw = local.role === 'manager' ? local.ledger.topic : local.member.topic;
   return typeof raw === 'string' ? raw : null;
@@ -125,7 +125,7 @@ function allocateOwnEventStamp(state, local) {
   return new Date(stampMs).toISOString();
 }
 
-/* 本机持有的当前汇报版本：管理席位取台账版本；成员取最近一次校验通过的快照版本（无快照为 null）。
+/* 本机持有的当前汇报版本：站长席位取台账版本；成员取最近一次校验通过的快照版本（无快照为 null）。
  * 抢接优先序与合流判定都以它为「本机版本」口径。 */
 export function localVersionOf(local) {
   if (local.role === 'manager') {
@@ -134,7 +134,7 @@ export function localVersionOf(local) {
   return local.snapshot === null ? null : local.snapshot.version;
 }
 
-/* 现任驿丞标识（两侧视角统一读法）。 */
+/* 现任站长标识（两侧视角统一读法）。 */
 export function currentManagerIdOf(local) {
   if (local.role === 'manager') {
     return local.ledger.manager.instanceId;

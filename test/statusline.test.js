@@ -113,7 +113,7 @@ test('新鲜文件：单协作渲染为一行指示（角色与人数）', async
   const run = await runStatusline(t, { input: JSON.stringify({ hook_event_name: 'Status', session_id: 'session-abc-1' }), home });
   assert.equal(run.code, 0);
   assert.equal(run.stderr, '');
-  assert.equal(run.stdout, '协作中：联调项目（驿丞，3 人）');
+  assert.equal(run.stdout, '协作中：联调项目（站长，3 人）');
 });
 
 test('多协作：以 ｜ 连接、非进行中状态带标注（冻结 / 待同意）', async (t) => {
@@ -154,7 +154,7 @@ test('混合条目：协作与讨论并列（各自前缀分组）、缺 mode �
     ],
   }));
   const run = await runStatusline(t, { input: JSON.stringify({ session_id: 'session-abc-1' }), home });
-  assert.equal(run.stdout, '协作中：项目甲（驿丞，3 人） ｜ 项目丙（协作者，2 人） ｜ 讨论中：讨论乙（4 人）');
+  assert.equal(run.stdout, '协作中：项目甲（站长，3 人） ｜ 项目丙（协作者，2 人） ｜ 讨论中：讨论乙（4 人）');
 });
 
 test('消息数：讨论条目「（人数，N 帖）」、协作条目「（角色，人数，N 条）」——计数位次在人数之后', async (t) => {
@@ -183,7 +183,7 @@ test('消息数不可得：字段缺失（旧状态文件）或形态不符一�
   }));
   const run = await runStatusline(t, { input: JSON.stringify({ session_id: 'session-abc-1' }), home });
   assert.equal(run.code, 0);
-  assert.equal(run.stdout, '协作中：旧协作（驿丞，3 人） ｜ 负计数（驿丞，3 人） ｜ 文本计数（驿丞，3 人） ｜ 讨论中：旧讨论（2 人）');
+  assert.equal(run.stdout, '协作中：旧协作（站长，3 人） ｜ 负计数（站长，3 人） ｜ 文本计数（站长，3 人） ｜ 讨论中：旧讨论（2 人）');
 });
 
 test('静音标记：muted: true 的条目名称前带 🔇（协作与讨论同规）；缺字段 / false 均不标', async (t) => {
@@ -201,7 +201,7 @@ test('静音标记：muted: true 的条目名称前带 🔇（协作与讨论同
   assert.equal(run.stderr, '');
   assert.equal(
     run.stdout,
-    '协作中：🔇 静音项目（驿丞，3 人，2 条） ｜ 照常项目（协作者，2 人） ｜ 旧文件项目（协作者，2 人） ｜ 讨论中：🔇 静音讨论（4 人）',
+    '协作中：🔇 静音项目（站长，3 人，2 条） ｜ 照常项目（协作者，2 人） ｜ 旧文件项目（协作者，2 人） ｜ 讨论中：🔇 静音讨论（4 人）',
   );
 });
 

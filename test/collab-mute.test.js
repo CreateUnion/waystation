@@ -172,14 +172,14 @@ async function makeMemberForum(made, { collabId, name = '联调项目' } = {}) {
   return collabId;
 }
 
-/* 管理席位侧协作（managed）：本机发起、单目标（同上前置：显式取消入席默认静音）。 */
+/* 站长席位侧协作（managed）：本机发起、单目标（同上前置：显式取消入席默认静音）。 */
 function makeManaged(made, { name = '协作甲', target = SELF_B } = {}) {
   const collabId = made.service.create({ name, topic: '主题', targets: [targetOf(target)] }).collabId;
   made.service.setMute({ collabId, muted: false });
   return collabId;
 }
 
-/* 管理席位侧讨论：本机发起（讨论创建跳过同名冲突检查）、成员 join（同上前置：显式取消入席默认静音）。 */
+/* 站长席位侧讨论：本机发起（讨论创建跳过同名冲突检查）、成员 join（同上前置：显式取消入席默认静音）。 */
 async function makeManagerForum(made, { name = '联调项目', member = SELF_B } = {}) {
   const collabId = made.service.create({ name, topic: '议题', mode: 'forum', targets: [targetOf(member)] }).collabId;
   made.service.setMute({ collabId, muted: false });

@@ -16,7 +16,7 @@ import { handleHandover, handleManagerChanged } from './handover.js';
 
 /* 接收事件处理（consume 的落点）：端点学习、邀请建记录与冲突检测、回应与建立、撤回 / 退出 / 结束、
  * 主题与进度联动、冻结接收与转达、快照接收 / 回执 / 请求应答、治理与韧性五型（抢接 / 裁定 / 解冻 / 移交 /
- * 握手与驿丞变更通告）。异常由服务外层统一隔离（绝不穿出）。
+ * 握手与站长变更通告）。异常由服务外层统一隔离（绝不穿出）。
  * 事件处理发生在接收管线的「落盘 + ack 之后」——此处失败不回滚消息的受理承诺。 */
 
 const EVENT_HANDLERS = {
@@ -63,7 +63,7 @@ export async function handleEvent(state, frame, meta) {
 
 /* 端点学习（设计 §5「清单随协作参与关系更新」的接入面）：已受理帧的来源地址与端口记入
  * 对应协作的端点表（仅当本机在协作中——注册表命中），并同步 known-hosts（单播兜底目标）。
- * 仅在端点变化时写 member.json（避免每条消息一次写盘）；学习到现任驿丞端点时补做队列重定向、
+ * 仅在端点变化时写 member.json（避免每条消息一次写盘）；学习到现任站长端点时补做队列重定向、
  * 学到生效抢接记录的成员端点时补发通告（「未入队即无重试」的盲区收窄）。
  * known-hosts 清单的 lastSeenAt 逐帧刷新（供单播兜底择新），其落盘由清单自身的节流窗口
  * 合并（见 net/known-hosts.js）——「避免每条消息一次写盘」在此按两处口径各自成立。
@@ -276,7 +276,7 @@ function handleDeclineResponse(state, frame) {
   applyInviteResponse(state, frame, 'declined');
 }
 
-/* 管理席位侧：把回应入账（幂等——同向重试帧不再推进）。提议中协作走建立判定点；
+/* 站长席位侧：把回应入账（幂等——同向重试帧不再推进）。提议中协作走建立判定点；
  * 进行中协作的邀请回应（合并新增成员）直接定格：approved → member（同意效力范围：已过同意门）、
  * declined → declined。冻结 / 归档态忽略（冻结期写被门控拦住，此处兜底语义一致）。 */
 function applyInviteResponse(state, frame, wanted) {
@@ -344,7 +344,7 @@ function countResponse(state, wanted) {
 }
 
 /* 建立判定点（定案 7）：全部应邀者有终局决策且同意 ≥1 → 建立前冲突复检（第二检测点）→
- * 冻结（检出）或转 active；部分未决等待；全部拒绝保持提议中（管理者可整条撤回）。
+ * 冻结（检出）或转 active；部分未决等待；全部拒绝保持提议中（站长可整条撤回）。
  * 讨论模式不走本路径：建立 = 加入事件（个别加入制、不设 established 帧——设计 §5.1），
  * 由加入链路推进；此处拦截以免讨论被 managed 的「收齐全票」判定提前转正。 */
 function maybeEstablish(state, local) {
@@ -452,7 +452,7 @@ function handleEstablished(state, frame) {
   state.counters.establishedIn++;
 }
 
-/* 主题到达（管理席位）：主题下发与更新入账（快照随台账变更统一推送）。 */
+/* 主题到达（站长席位）：主题下发与更新入账（快照随台账变更统一推送）。 */
 function handleTopic(state, frame) {
   const local = state.collabs.get(frame.collabId);
   if (local === undefined || local.role !== 'manager') {
@@ -464,7 +464,7 @@ function handleTopic(state, frame) {
   state.counters.topicsIn++;
 }
 
-/* 进度到达（管理席位）：任务板追加；超上限剪除最旧并计数（有界增长）。 */
+/* 进度到达（站长席位）：任务板追加；超上限剪除最旧并计数（有界增长）。 */
 function handleProgress(state, frame) {
   const local = state.collabs.get(frame.collabId);
   if (local === undefined || local.role !== 'manager') {
@@ -587,7 +587,7 @@ function handleSnapshot(state, frame) {
   storeSnapshot(state, frame);
 }
 
-/* 快照接收（定案 4 + 治理收紧）：来源必须为现任驿丞（换席后陈旧副本不得经快照通道覆盖——
+/* 快照接收（定案 4 + 治理收紧）：来源必须为现任站长（换席后陈旧副本不得经快照通道覆盖——
  * 版本号只保证单调，不保证来源正当）→ 形态 → 自洽（version ↔ 内嵌台账、collabId ↔ 帧 collabId）
  * → digest 重算 → 版本不倒退 → 落盘 + 回执 + 唤醒等待中的 view。 */
 function storeSnapshot(state, frame) {
@@ -599,7 +599,7 @@ function storeSnapshot(state, frame) {
   const currentManagerId = local.role === 'manager' ? state.self.instanceId : local.member.manager.instanceId;
   if (frame.from.instanceId !== currentManagerId) {
     state.counters.snapshotFromNonManager++;
-    state.log.warn('快照来源不是现任驿丞（拒绝：防陈旧副本经快照通道覆盖）', { collabId: frame.collabId, from: frame.from.instanceId });
+    state.log.warn('快照来源不是现任站长（拒绝：防陈旧副本经快照通道覆盖）', { collabId: frame.collabId, from: frame.from.instanceId });
     return;
   }
   const record = snapshotRecordOf(frame, frame.payload);
@@ -659,7 +659,7 @@ function resolvePendingView(state, collabId, snapshot) {
   }
 }
 
-/* 快照请求应答：管理席位把当前台账整份回给请求方（端点取请求帧来源；成员侧忽略；
+/* 快照请求应答：站长席位把当前台账整份回给请求方（端点取请求帧来源；成员侧忽略；
  * 写暂停期间不服务——收敛等待中避免以未定身份对外供数）。
  * 载荷冻结：入队的是台账副本——活引用在「应答入队与上线序列化」的间隙会被后续变更改写，
  * 帧将以「摘要不符」被对端丢弃（与快照推送同一纪律）。 */
@@ -682,7 +682,7 @@ function answerSnapshotRequest(state, frame) {
   state.counters.snapshotSent++;
 }
 
-/* 结束到达（成员侧）：归档；重复通告幂等；管理席位收到结束通告忽略（结束只能由本机发起）。
+/* 结束到达（成员侧）：归档；重复通告幂等；站长席位收到结束通告忽略（结束只能由本机发起）。
  * 讨论实例的发起人同样收不到合法的 end（仅发起人可 end——发送侧守卫在 outgoing.js 的 endCollab）；
  * 成员侧归档即停 join 重播与对表（end 双通道之一：在线广播；离线者经 bundle 元状态学到）。 */
 function handleEnd(state, frame) {
@@ -692,7 +692,7 @@ function handleEnd(state, frame) {
   }
   if (local.role === 'manager') {
     state.counters.eventMismatch++;
-    state.log.warn('管理席位收到结束通告（忽略——结束只能由本机发起）', { collabId: local.collabId });
+    state.log.warn('站长席位收到结束通告（忽略——结束只能由本机发起）', { collabId: local.collabId });
     return;
   }
   local.member.state = 'completed';
@@ -704,7 +704,7 @@ function handleEnd(state, frame) {
 }
 
 /* 退出到达：讨论 = 成员事件并入（折叠出表）+ 触发对表（设计 §5.4——leave 是广播事件，
- * 由接收方按事件集并集吸收）；managed = 管理席位记成员状态 + 名单变更通告（设计 §6）。 */
+ * 由接收方按事件集并集吸收）；managed = 站长席位记成员状态 + 名单变更通告（设计 §6）。 */
 function handleLeave(state, frame) {
   const local = state.collabs.get(frame.collabId);
   if (local === undefined) {

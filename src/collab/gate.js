@@ -21,7 +21,7 @@ const FORUM_CHANNEL_TYPES = new Set(['join', 'history-request', 'history-bundle'
  * notice 按事件再分（见 forumTypeAllowed）。 */
 const FORUM_ALLOWED_TYPES = new Set(['post', 'approve', 'decline', 'withdraw', 'leave', 'end']);
 
-/* notice 的讨论侧受理面：仅名单通告（roster）。它是讨论加入链在用的事件——管理席位收齐
+/* notice 的讨论侧受理面：仅名单通告（roster）。它是讨论加入链在用的事件——站长席位收齐
  * 新成员回应后广播名单变更（afterInviteResponse 的 active 分支对讨论同样生效），既有链路按
  * 「受理 + ack」走；拒收会让对端的重试队列停摆（join 重播的投递回报被钉死在这一帧之后）。
  * 其余事件（established / snapshot-stored / handshake / manager-changed / merge 系）是
@@ -227,7 +227,7 @@ function admitInvite(state, frame, meta) {
   }
   if (!members.some((member) => member.instanceId === frame.from.instanceId)) {
     state.counters.invitesRejected++;
-    return { ok: false, reason: '邀请来源不在名单中（管理者身份不一致）' };
+    return { ok: false, reason: '邀请来源不在名单中（站长身份不一致）' };
   }
   const source = typeof meta?.remoteAddress === 'string' && meta.remoteAddress !== '' ? meta.remoteAddress : '';
   const now = Date.now();
@@ -260,7 +260,7 @@ function admitConflictFrame(state, frame) {
   return { ok: false, reason: '冻结 / 裁定通告与本机协作无匹配（与己无关，忽略）' };
 }
 
-/* 待回应邀请数：成员侧 proposed 且未回应的本地记录（管理席位自己发起的提议中协作不算挂起）。 */
+/* 待回应邀请数：成员侧 proposed 且未回应的本地记录（站长席位自己发起的提议中协作不算挂起）。 */
 function countPendingInvites(state) {
   let count = 0;
   for (const local of state.collabs.values()) {

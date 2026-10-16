@@ -135,7 +135,7 @@ async function memberActive(harness, { collabId = 'collab-x', manager = peer('in
   return collabId;
 }
 
-/* 管理席位侧协作（含一名已同意成员 inst-b；台账 v2 定格）。 */
+/* 站长席位侧协作（含一名已同意成员 inst-b；台账 v2 定格）。 */
 function managerWithMember(harness, { names = null } = {}) {
   const created = harness.service.create({
     name: names ?? '联调项目',
@@ -171,7 +171,7 @@ test('失联判定与投递队列解耦：排队条目不改变探测结论', as
   const harness = makeHarness(t);
   const collabId = await memberActive(harness);
   const queued = await harness.service.send({ collabId, text: '离线期间的消息' });
-  assert.equal(queued.ok, true, '消息对离线驿丞仍受理入队');
+  assert.equal(queued.ok, true, '消息对离线站长仍受理入队');
   harness.service.start();
   await waitFor(() => (harness.service.list().collabs[0].managerOffline === true ? true : null), { timeoutMs: 3000 });
   harness.script.push({ reachable: true, rttMs: 1 });
@@ -179,7 +179,7 @@ test('失联判定与投递队列解耦：排队条目不改变探测结论', as
   harness.service.close();
 });
 
-test('探测方向：管理席位不发起探测（计数零增长）', async (t) => {
+test('探测方向：站长席位不发起探测（计数零增长）', async (t) => {
   const harness = makeHarness(t);
   await managerActive(harness);
   harness.service.start();
@@ -190,7 +190,7 @@ test('探测方向：管理席位不发起探测（计数零增长）', async (t
 
 /* —— 握手 —— */
 
-test('握手：管理席位向名册广播（role=manager、reply=false、版本取台账）', async (t) => {
+test('握手：站长席位向名册广播（role=manager、reply=false、版本取台账）', async (t) => {
   const harness = makeHarness(t);
   const collabId = await managerActive(harness);
   harness.sent.length = 0;
@@ -217,7 +217,7 @@ test('握手：收到非回帧必回一帧（reply=true），回帧不再被回�
   assert.equal(sentOf(harness.sent, 'notice', collabId).filter((frame) => frame.payload.event === 'handshake').length, 0);
 });
 
-test('握手：成员对表——现任驿丞版本更高时拉取当前视图', async (t) => {
+test('握手：成员对表——现任站长版本更高时拉取当前视图', async (t) => {
   const harness = makeHarness(t);
   const collabId = await memberActive(harness);
   harness.sent.length = 0;
@@ -225,7 +225,7 @@ test('握手：成员对表——现任驿丞版本更高时拉取当前视图',
   assert.equal(sentOf(harness.sent, 'snapshot', collabId).some((frame) => frame.payload.kind === 'request'), true);
 });
 
-test('握手：发现驿丞已换（对表）——引用更新 + 陈旧队列重定向', async (t) => {
+test('握手：发现站长已换（对表）——引用更新 + 陈旧队列重定向', async (t) => {
   const harness = makeHarness(t);
   const collabId = await memberActive(harness);
   await harness.service.send({ collabId, text: '在途消息' });
@@ -233,13 +233,13 @@ test('握手：发现驿丞已换（对表）——引用更新 + 陈旧队列�
   await receive(harness.service, collabFrame('notice', collabId, peer('inst-b', '主机乙'), { event: 'handshake', role: 'manager', version: 5, takeover: null, reply: false }));
   const member = JSON.parse(readFileSync(join(harness.dir, 'collabs', collabId, 'member.json'), 'utf8'));
   assert.equal(member.manager.instanceId, 'inst-b');
-  assert.equal(harness.reassigns.length, 1, '发往旧驿丞的未确认条目已重定向');
+  assert.equal(harness.reassigns.length, 1, '发往旧站长的未确认条目已重定向');
   assert.equal(harness.reassigns[0].fromInstanceId, 'inst-a');
   assert.equal(harness.reassigns[0].to.instanceId, 'inst-b');
   assert.equal(harness.service.stats().managerChangedIn >= 1, true);
 });
 
-test('握手：无法对表（在册端点无回帧）——管理席位转只读保守运行，接触后恢复', async (t) => {
+test('握手：无法对表（在册端点无回帧）——站长席位转只读保守运行，接触后恢复', async (t) => {
   const harness = makeHarness(t);
   const collabId = await managerActive(harness);
   harness.service.start();
@@ -254,7 +254,7 @@ test('握手：无法对表（在册端点无回帧）——管理席位转只�
   harness.service.close();
 });
 
-/* 磁盘点：清空管理席位记录的端点表（模拟邀请目标从未联系过的状态）后重建服务。 */
+/* 磁盘点：清空站长席位记录的端点表（模拟邀请目标从未联系过的状态）后重建服务。 */
 function clearEndpointsOnDisk(harness, collabId) {
   const memberPath = join(harness.dir, 'collabs', collabId, 'member.json');
   const member = JSON.parse(readFileSync(memberPath, 'utf8'));
@@ -280,7 +280,7 @@ test('抢接发起守卫：管理器 / 未判失联 / 无快照 / 未接线探�
   const managed = await managerActive(managerSide);
   const asManager = await managerSide.service.takeOver({ collabId: managed });
   assert.equal(asManager.ok, false);
-  assert.ok(asManager.message.includes('管理者'));
+  assert.ok(asManager.message.includes('站长'));
 
   const harness = makeHarness(t);
   const collabId = await memberActive(harness);
@@ -299,7 +299,7 @@ test('抢接发起守卫：管理器 / 未判失联 / 无快照 / 未接线探�
   assert.ok(noProbe.message.includes('探测') || noProbe.message.includes('快照'));
 });
 
-test('抢接窗口：原驿丞恢复应答 → 中止并广播取消（假失联）', async (t) => {
+test('抢接窗口：原站长恢复应答 → 中止并广播取消（假失联）', async (t) => {
   const harness = makeHarness(t);
   const collabId = await memberActive(harness);
   harness.service.start();
@@ -349,12 +349,12 @@ test('抢接生效：从快照恢复（manager 换本机、版本保持基准）
   assert.equal(broadcasts.length, 1);
   assert.equal(broadcasts[0].payload.baseVersion, 2);
   assert.equal(ledgerDigest(viewed.ledger), broadcasts[0].payload.digest, '通告摘要 = 恢复台账摘要');
-  assert.equal(sentOf(harness.sent, 'snapshot', collabId).filter((frame) => frame.payload.kind === 'data').length >= 1, true, '承担席位即推当前视图');
+  assert.equal(sentOf(harness.sent, 'snapshot', collabId).filter((frame) => frame.payload.kind === 'data').length >= 1, true, '担任席位即推当前视图');
   assert.equal(harness.service.stats().takeoversEffective >= 1, true);
   harness.service.close();
 });
 
-test('抢接生效前最后探测：原驿丞复活 → 中止不生效', async (t) => {
+test('抢接生效前最后探测：原站长复活 → 中止不生效', async (t) => {
   const harness = makeHarness(t);
   const collabId = await memberActive(harness);
   harness.service.start();
@@ -392,7 +392,7 @@ test('并发让位与顺位：更高优先意图到达即让位；让位对象�
   harness.service.close();
 });
 
-test('收到意图（管理席位）：挂起在途（写暂停）；取消到达即恢复', async (t) => {
+test('收到意图（站长席位）：挂起在途（写暂停）；取消到达即恢复', async (t) => {
   const harness = makeHarness(t);
   const collabId = await managerActive(harness);
   await receive(harness.service, collabFrame('takeover-init', collabId, peer('inst-b', '主机乙'), {
@@ -404,7 +404,7 @@ test('收到意图（管理席位）：挂起在途（写暂停）；取消到�
   const reports = sentOf(harness.sent, 'takeover-init', collabId).filter((frame) => frame.payload.kind === 'report');
   assert.equal(reports.length, 1, '向候选定向回汇总');
   assert.equal(reports[0].payload.version, 3, '版本 = 台账当前版本');
-  await receive(harness.service, collabFrame('takeover-init', collabId, peer('inst-b', '主机乙'), { kind: 'cancel', reason: '原驿丞恢复应答' }));
+  await receive(harness.service, collabFrame('takeover-init', collabId, peer('inst-b', '主机乙'), { kind: 'cancel', reason: '原站长恢复应答' }));
   assert.equal(harness.service.list().collabs[0].suspended, false);
   const resumed = await harness.service.send({ collabId, text: '恢复后消息', type: 'issue' });
   assert.equal(resumed.ok, true);
@@ -419,7 +419,7 @@ test('收到意图（旁观成员）：转达并回汇总；同原帧重复副�
   });
   await receive(harness.service, announce);
   const relays = () => harness.sent.filter((frame) => frame.type === 'takeover-init' && frame.to.instanceId === 'inst-a').length;
-  assert.equal(relays(), 1, '向其他在线参与者转达（此处为驿丞端点）');
+  assert.equal(relays(), 1, '向其他在线参与者转达（此处为站长端点）');
   assert.equal(sentOf(harness.sent, 'takeover-init', collabId).filter((frame) => frame.payload.kind === 'report').length, 1, '向候选定向回汇总');
   harness.sent.length = 0;
   await receive(harness.service, { ...announce, msgId: 'msg-copy-1', payload: { ...announce.payload, originMsgId: announce.msgId } });
@@ -442,7 +442,7 @@ test('收到生效通告（成员侧）：引用更新 + 合流递交（本地�
   assert.equal(harness.service.stats().mergeOffersSent >= 1, true);
 });
 
-test('收到生效通告（原驿丞侧）：停写 → 降级为成员、删除本地台账、保留快照备份、提示本机人', async (t) => {
+test('收到生效通告（原站长侧）：停写 → 降级为成员、删除本地台账、保留快照备份、提示本机人', async (t) => {
   const harness = makeHarness(t);
   const collabId = await managerActive(harness);
   const ledgerPath = collabFilePath(harness.dir, collabId, LEDGER_FILE_NAME);
@@ -457,7 +457,7 @@ test('收到生效通告（原驿丞侧）：停写 → 降级为成员、删除
   assert.equal(harness.service.stats().takeoverDowngrades >= 1, true);
 });
 
-test('收到生效通告（原驿丞本地版本更高）：合流递交后照常降级', async (t) => {
+test('收到生效通告（原站长本地版本更高）：合流递交后照常降级', async (t) => {
   const harness = makeHarness(t);
   const collabId = await managerActive(harness);
   await receive(harness.service, collabFrame('topic', collabId, peer('inst-b', '主机乙'), { text: '分区期间的主题变更' }));
@@ -508,9 +508,9 @@ function reloadServiceOn(t, made) {
   });
 }
 
-test('握手：管理席位收「记录指向本机」的对表回帧——零动作（不自我降级）', async (t) => {
-  /* 判别性用例（源自对抗评审行为探针）：新驿丞重启后与持记录的成员回帧对表，
-   * 成员的视图里「生效抢接者就是本机」——管理者分支必须识别自我引用并视为继续。 */
+test('握手：站长席位收「记录指向本机」的对表回帧——零动作（不自我降级）', async (t) => {
+  /* 判别性用例（源自对抗评审行为探针）：新站长重启后与持记录的成员回帧对表，
+   * 成员的视图里「生效抢接者就是本机」——站长分支必须识别自我引用并视为继续。 */
   const harness = makeHarness(t);
   const collabId = await managerActive(harness);
   const ledgerPath = collabFilePath(harness.dir, collabId, LEDGER_FILE_NAME);
@@ -530,7 +530,7 @@ test('握手：管理席位收「记录指向本机」的对表回帧——零�
   assert.equal(writable.ok, true);
 });
 
-test('握手：管理席位收「他方生效记录」——照常降级与合流路径不变（回归守卫）', async (t) => {
+test('握手：站长席位收「他方生效记录」——照常降级与合流路径不变（回归守卫）', async (t) => {
   const harness = makeHarness(t);
   const collabId = await managerActive(harness);
   await receive(harness.service, collabFrame('notice', collabId, peer('inst-b', '主机乙'), {
@@ -602,7 +602,7 @@ test('未知协作的普通帧：门控拒绝并计数（unknownCollab）', asyn
 
 test('转达保原发身份：经转达的生效通告认候选不认转达者', async (t) => {
   /* 判别性用例（源自对抗评审行为探针）：转达出口原样携带原发 from——身份语义定义在 from 上，
-   * 改写为转达者会让接收方把转达者当作新驿丞（归因错位、写路径随之外错）。 */
+   * 改写为转达者会让接收方把转达者当作新站长（归因错位、写路径随之外错）。 */
   const relayNode = makeHarness(t, { self: { instanceId: 'inst-b', identityName: '主机乙', port: 17321 } });
   const collabId = await memberActive(relayNode, { collabId: 'collab-relay' });
   const digest = ledgerDigest(ledgerStub(collabId, 5, { instanceId: 'inst-c', identityName: '主机丙' }));
@@ -616,13 +616,13 @@ test('转达保原发身份：经转达的生效通告认候选不认转达者',
   await memberActive(target, { collabId });
   await receive(target.service, collabFrame('takeover', collabId, relay.from, relay.payload), '127.0.0.9');
   const member = JSON.parse(readFileSync(join(target.dir, 'collabs', collabId, 'member.json'), 'utf8'));
-  assert.equal(member.manager.instanceId, 'inst-c', '接收方采纳候选（转达者 inst-b 不得被当作新驿丞）');
+  assert.equal(member.manager.instanceId, 'inst-c', '接收方采纳候选（转达者 inst-b 不得被当作新站长）');
   assert.equal(member.endpoints['inst-c'], undefined, '转达帧不作端点学习：from 是原发者、链路地址是转达者的');
 });
 
-test('转达保原发身份：同版本下转达者字典序更小不压过真实新驿丞', async (t) => {
+test('转达保原发身份：同版本下转达者字典序更小不压过真实新站长', async (t) => {
   /* 判别性用例（源自对抗评审行为探针两态）：若转达把 from 改写为转达者（inst-b < inst-c），
-   * 接收方在同基准版本下按实例标识序会把转达者当更高优先——真实新驿丞被转达噪声压过。 */
+   * 接收方在同基准版本下按实例标识序会把转达者当更高优先——真实新站长被转达噪声压过。 */
   const relayNode = makeHarness(t, { self: { instanceId: 'inst-b', identityName: '主机乙', port: 17321 } });
   const collabId = await memberActive(relayNode, { collabId: 'collab-relay-rank' });
   const digest = ledgerDigest(ledgerStub(collabId, 5, { instanceId: 'inst-c', identityName: '主机丙' }));
@@ -635,12 +635,12 @@ test('转达保原发身份：同版本下转达者字典序更小不压过真�
   await receive(target.service, collabFrame('takeover', collabId, peer('inst-c', '主机丙'), { baseVersion: 5, digest }));
   await receive(target.service, collabFrame('takeover', collabId, relay.from, relay.payload));
   const member = JSON.parse(readFileSync(join(target.dir, 'collabs', collabId, 'member.json'), 'utf8'));
-  assert.equal(member.manager.instanceId, 'inst-c', '同版本转达不改变现任（转达者不压过真实新驿丞）');
+  assert.equal(member.manager.instanceId, 'inst-c', '同版本转达不改变现任（转达者不压过真实新站长）');
   assert.equal(target.service.stats().takeoverSuperseded, 0, '同候选重复通告不走「弱优先取代」路径');
 });
 
 test('抢接生效：窗口内快照漂移——生效帧 baseVersion 取生效时台账真值', async (t) => {
-  /* 判别性用例（源自对抗评审行为探针）：收集窗口内到达更新的原驿丞快照（版本漂移）——
+  /* 判别性用例（源自对抗评审行为探针）：收集窗口内到达更新的原站长快照（版本漂移）——
    * 生效帧与恢复台账同源取真值，不沿用发起时宣布的旧基准（优先序与合流判定不被错值污染）。 */
   const harness = makeHarness(t);
   const collabId = await memberActive(harness);
@@ -690,7 +690,7 @@ test('计数断言：无端点成员被治理广播跳过（rosterSkipped）；�
   assert.equal(applied.ok, true, String(applied.message));
   const resendsBefore = harness.service.stats().takeoverResends;
   harness.sent.length = 0;
-  await receive(harness.service, collabFrame('reply', collabId, peer('inst-a', '主机甲', 17322), { text: '原驿丞换端口联系' }));
+  await receive(harness.service, collabFrame('reply', collabId, peer('inst-a', '主机甲', 17322), { text: '原站长换端口联系' }));
   assert.equal(harness.service.stats().takeoverResends, resendsBefore + 1, '端点学得后补发生效通告');
   const resent = sentOf(harness.sent, 'takeover', collabId);
   assert.equal(resent.length, 1);
@@ -699,11 +699,11 @@ test('计数断言：无端点成员被治理广播跳过（rosterSkipped）；�
   harness.service.close();
 });
 
-/* —— 成员侧陈旧驿丞主张守卫与治理面读数（期终审查裁定 I-1 / M-3）—— */
+/* —— 成员侧陈旧站长主张守卫与治理面读数（期终审查裁定 I-1 / M-3）—— */
 
-test('握手陈旧主张：成员已收敛到新驿丞后，被替换驿丞的主张不回翻引用', async (t) => {
-  /* 判别性用例（期终审查行为探针实录）：被替换驿丞停机排队的握手帧 / 重启后的启动握手携带
-   * role=manager、takeover=null（其本地视角）——成员若采纳则引用回翻：出站静默改道旧驿丞、
+test('握手陈旧主张：成员已收敛到新站长后，被替换站长的主张不回翻引用', async (t) => {
+  /* 判别性用例（期终审查行为探针实录）：被替换站长停机排队的握手帧 / 重启后的启动握手携带
+   * role=manager、takeover=null（其本地视角）——成员若采纳则引用回翻：出站静默改道旧站长、
    * 快照被来源守卫拒收（视图冻结），且无自动纠正路径。 */
   const harness = makeHarness(t);
   const collabId = await memberActive(harness);
@@ -712,14 +712,14 @@ test('握手陈旧主张：成员已收敛到新驿丞后，被替换驿丞的�
     digest: ledgerDigest(ledgerStub(collabId, 2, { instanceId: 'inst-b', identityName: '主机乙' })),
   }));
   let member = JSON.parse(readFileSync(join(harness.dir, 'collabs', collabId, 'member.json'), 'utf8'));
-  assert.equal(member.manager.instanceId, 'inst-b', '先收敛到新驿丞');
+  assert.equal(member.manager.instanceId, 'inst-b', '先收敛到新站长');
   await receive(harness.service, collabFrame('notice', collabId, peer('inst-a', '主机甲'), { event: 'handshake', role: 'manager', version: 2, takeover: null, reply: true }));
   member = JSON.parse(readFileSync(join(harness.dir, 'collabs', collabId, 'member.json'), 'utf8'));
-  assert.equal(member.manager.instanceId, 'inst-b', '陈旧驿丞主张不得回翻已收敛引用');
+  assert.equal(member.manager.instanceId, 'inst-b', '陈旧站长主张不得回翻已收敛引用');
 });
 
-test('握手陈旧主张：回升帧把本机生效记录带给旧驿丞（对称收敛面）', async (t) => {
-  /* 启动握手（reply=false 的发起帧）必回一帧：回帧携带本机生效抢接视图——旧驿丞据此收敛
+test('握手陈旧主张：回升帧把本机生效记录带给旧站长（对称收敛面）', async (t) => {
+  /* 启动握手（reply=false 的发起帧）必回一帧：回帧携带本机生效抢接视图——旧站长据此收敛
    * 降级（握手对表的对称面）；本机同时不采纳其 manager 主张。 */
   const harness = makeHarness(t);
   const collabId = await memberActive(harness);
@@ -750,7 +750,7 @@ test('治理面读数：成员握手无果在清单可见（handshakeUnresolved�
 
 /* —— 席位变更作废语义与陈旧席位主张（期终复检裁定 R-1 / R-2 / G-1 / G-2）—— */
 
-/* 建协（A 为原驿丞）：邀请 / 同意 / 建立通告 / 快照逐帧投递；成员间互学端点。 */
+/* 建协（A 为原站长）：邀请 / 同意 / 建立通告 / 快照逐帧投递；成员间互学端点。 */
 async function establishMembers(a, members, collabId) {
   const peerA = peer('inst-a', '主机甲');
   for (const node of members) {
@@ -775,7 +775,7 @@ async function establishMembers(a, members, collabId) {
   }
 }
 
-/* B 判 A 失联 → 抢接生效 → 生效广播逐帧投给 receivers（旧驿丞让位、其余采纳新驿丞）。 */
+/* B 判 A 失联 → 抢接生效 → 生效广播逐帧投给 receivers（旧站长让位、其余采纳新站长）。 */
 async function bTakesOverSeat(b, receivers, collabId) {
   b.service.start();
   await waitFor(() => (b.service.list().collabs[0].managerOffline === true ? true : null), { timeoutMs: 3000 });
@@ -792,7 +792,7 @@ async function bTakesOverSeat(b, receivers, collabId) {
   }
 }
 
-/* B → C 显式移交（offer / accept 收口）→ 返回「驿丞已变更」通告（由调用方决定投给谁）。 */
+/* B → C 显式移交（offer / accept 收口）→ 返回「站长已变更」通告（由调用方决定投给谁）。 */
 async function bHandsOverToC(b, c, collabId) {
   b.script.push({ reachable: true, rttMs: 1 });
   b.sent.length = 0;
@@ -823,7 +823,7 @@ async function regularHandshakeFromA(a, c, collabId) {
   await receive(a.service, collabFrame('notice', collabId, peer('inst-c', '主机丙'), replyOut.payload));
 }
 
-/* C（现任驿丞）向 D 发起常规握手并收回帧（D 持有的过期记录由此回传到 C）。 */
+/* C（现任站长）向 D 发起常规握手并收回帧（D 持有的过期记录由此回传到 C）。 */
 async function handshakeRoundCtoD(c, d, collabId) {
   c.sent.length = 0;
   d.sent.length = 0;
@@ -836,15 +836,15 @@ async function handshakeRoundCtoD(c, d, collabId) {
   await receive(c.service, collabFrame('notice', collabId, peer('inst-d', '主机丁'), reply.payload));
 }
 
-/* 成员记录的现任驿丞引用。 */
+/* 成员记录的现任站长引用。 */
 function managerRefOf(harness, collabId) {
   return JSON.parse(readFileSync(join(harness.dir, 'collabs', collabId, 'member.json'), 'utf8')).manager.instanceId;
 }
 
-test('三节点组合链：抢占 → 显式移交 → 常规握手——席位收敛一致、新驿丞不被旧记录拉下席位', async (t) => {
+test('三节点组合链：抢占 → 显式移交 → 常规握手——席位收敛一致、新站长不被旧记录拉下席位', async (t) => {
   /* 判别性用例（期终复检三节点探针链转正）：抢占 × 移交互作的记录传播面——修复前：
-   * 新驿丞 C 收到携带旧生效记录的握手即自我降级并删台账，A 引用回翻，终态三节点互指成员、
-   * 无管理者。修复后：席位变更作废记录 + 接收侧候选资格校验 → 链条收敛一致。 */
+   * 新站长 C 收到携带旧生效记录的握手即自我降级并删台账，A 引用回翻，终态三节点互指成员、
+   * 无站长。修复后：席位变更作废记录 + 接收侧候选资格校验 → 链条收敛一致。 */
   const a = makeHarness(t, { self: { instanceId: 'inst-a', identityName: '主机甲', port: 17321 } });
   const b = makeHarness(t, { self: { instanceId: 'inst-b', identityName: '主机乙', port: 17321 } });
   const c = makeHarness(t, { self: { instanceId: 'inst-c', identityName: '主机丙', port: 17321 } });
@@ -873,13 +873,13 @@ test('三节点组合链：抢占 → 显式移交 → 常规握手——席位�
     reply: true,
   }));
 
-  /* 终态不变式：C 仍为驿丞（台账在、无降级），A / B 引用一致指向 C——有且仅有一个可收敛管理者。 */
-  assert.equal(c.service.list().collabs[0].role, 'manager', '新驿丞未被已翻页的记录拉下席位');
+  /* 终态不变式：C 仍为站长（台账在、无降级），A / B 引用一致指向 C——有且仅有一个可收敛站长。 */
+  assert.equal(c.service.list().collabs[0].role, 'manager', '新站长未被已翻页的记录拉下席位');
   assert.equal(c.service.stats().takeoverDowngrades, 0);
-  assert.equal(existsSync(collabFilePath(c.dir, collabId, LEDGER_FILE_NAME)), true, '新驿丞台账未被删除');
+  assert.equal(existsSync(collabFilePath(c.dir, collabId, LEDGER_FILE_NAME)), true, '新站长台账未被删除');
   assert.equal(b.service.list().collabs[0].role, 'member');
   const memberA = JSON.parse(readFileSync(join(a.dir, 'collabs', collabId, 'member.json'), 'utf8'));
-  assert.equal(memberA.manager.instanceId, 'inst-c', 'A 引用指向现任驿丞（未回翻）');
+  assert.equal(memberA.manager.instanceId, 'inst-c', 'A 引用指向现任站长（未回翻）');
   const memberB = JSON.parse(readFileSync(join(b.dir, 'collabs', collabId, 'member.json'), 'utf8'));
   assert.equal(memberB.manager.instanceId, 'inst-c');
   a.service.close();
@@ -887,14 +887,14 @@ test('三节点组合链：抢占 → 显式移交 → 常规握手——席位�
   c.service.close();
 });
 
-test('陈旧席位主张（移交面）：陈旧 manager 主张拒绝、正当新驿丞主张照常学习（R-2 两向）', async (t) => {
+test('陈旧席位主张（移交面）：陈旧 manager 主张拒绝、正当新站长主张照常学习（R-2 两向）', async (t) => {
   /* 判别性用例（期终复检探针②）：纯移交面不产生生效抢接记录——守卫须对照本机已知的
    * 席位变更基准版本：等于 / 更旧的主张不采纳（防回翻），更新的主张照常学习（不过度收窄）。 */
   const harness = makeHarness(t);
   const collabId = await memberActive(harness);
   await receive(harness.service, collabFrame('notice', collabId, peer('inst-a', '主机甲'), { event: 'manager-changed', version: 3, manager: { instanceId: 'inst-b', identityName: '主机乙' } }));
   let member = JSON.parse(readFileSync(join(harness.dir, 'collabs', collabId, 'member.json'), 'utf8'));
-  assert.equal(member.manager.instanceId, 'inst-b', '先经驿丞变更采纳新驿丞（变更基准版本 3）');
+  assert.equal(member.manager.instanceId, 'inst-b', '先经站长变更采纳新站长（变更基准版本 3）');
   await receive(harness.service, collabFrame('notice', collabId, peer('inst-a', '主机甲'), { event: 'handshake', role: 'manager', version: 3, takeover: null, reply: true }));
   member = JSON.parse(readFileSync(join(harness.dir, 'collabs', collabId, 'member.json'), 'utf8'));
   assert.equal(member.manager.instanceId, 'inst-b', '陈旧主张（版本未越过席位变更基准）不采纳');
@@ -909,19 +909,19 @@ test('陈旧席位主张（移交面）：陈旧 manager 主张拒绝、正当�
   assert.equal(member.manager.instanceId, 'inst-b', '携带旧记录的握手同样不回翻');
   assert.equal(harness.service.stats().takeoverDowngrades, 0);
 
-  /* 方向二：正当的新驿丞主张照常学习（未变更过席位的成员）。 */
+  /* 方向二：正当的新站长主张照常学习（未变更过席位的成员）。 */
   const fresh = makeHarness(t);
   const freshId = await memberActive(fresh);
   await receive(fresh.service, collabFrame('notice', freshId, peer('inst-b', '主机乙'), { event: 'handshake', role: 'manager', version: 3, takeover: null, reply: true }));
   const freshMember = JSON.parse(readFileSync(join(fresh.dir, 'collabs', freshId, 'member.json'), 'utf8'));
-  assert.equal(freshMember.manager.instanceId, 'inst-b', '更新的管理者主张照常学习（不得过度收窄）');
+  assert.equal(freshMember.manager.instanceId, 'inst-b', '更新的站长主张照常学习（不得过度收窄）');
 });
 
-test('四节点组合链（等版本窗口）：移交不推版本时陈旧记录不再拉下新驿丞（G-1）', async (t) => {
+test('四节点组合链（等版本窗口）：移交不推版本时陈旧记录不再拉下新站长（G-1）', async (t) => {
   /* 判别性用例（期终复评四节点探针链转正）：抢占于 v、移交于 v（移交不推台账版本）——D 离线
-   * 错过「驿丞已变更」通告、仍携记录 {inst-b, v}；裸版本严格大于对现任 C（台账 v）恰判未过时，
-   * 修复前 C 自我降级 + 删台账 + 四节点无管理者；席位时钟判据（记录基准 ≤ 时钟即陈旧）下
-   * C 保持驿丞，D 待迟到通告送达后收敛。 */
+   * 错过「站长已变更」通告、仍携记录 {inst-b, v}；裸版本严格大于对现任 C（台账 v）恰判未过时，
+   * 修复前 C 自我降级 + 删台账 + 四节点无站长；席位时钟判据（记录基准 ≤ 时钟即陈旧）下
+   * C 保持站长，D 待迟到通告送达后收敛。 */
   const a = makeHarness(t, { self: { instanceId: 'inst-a', identityName: '主机甲', port: 17321 } });
   const b = makeHarness(t, { self: { instanceId: 'inst-b', identityName: '主机乙', port: 17321 } });
   const c = makeHarness(t, { self: { instanceId: 'inst-c', identityName: '主机丙', port: 17321 } });
@@ -940,18 +940,18 @@ test('四节点组合链（等版本窗口）：移交不推版本时陈旧记�
   assert.equal(d.service.list().collabs[0].role, 'member');
   const changed = await bHandsOverToC(b, c, collabId);
   await receive(a.service, collabFrame('notice', collabId, peer('inst-b', '主机乙'), changed.payload));
-  /* D 错过来自 B 的「驿丞已变更」通告（模拟离线未达）：引用仍为 inst-b、持有记录 {inst-b, 5}。
+  /* D 错过来自 B 的「站长已变更」通告（模拟离线未达）：引用仍为 inst-b、持有记录 {inst-b, 5}。
    * C 的常规握手经 D 回帧把该记录带回 C——等版本窗口成立。 */
   await handshakeRoundCtoD(c, d, collabId);
 
-  assert.equal(c.service.list().collabs[0].role, 'manager', '新驿丞未被等版本旧记录拉下席位');
+  assert.equal(c.service.list().collabs[0].role, 'manager', '新站长未被等版本旧记录拉下席位');
   assert.equal(c.service.stats().takeoverDowngrades, 0);
-  assert.equal(existsSync(collabFilePath(c.dir, collabId, LEDGER_FILE_NAME)), true, '新驿丞台账未被删除');
+  assert.equal(existsSync(collabFilePath(c.dir, collabId, LEDGER_FILE_NAME)), true, '新站长台账未被删除');
   assert.equal(managerRefOf(a, collabId), 'inst-c');
   assert.equal(managerRefOf(b, collabId), 'inst-c');
   assert.equal(managerRefOf(d, collabId), 'inst-b', 'D 错过通告：等版本主张不可经握手学习（登记边界）');
 
-  /* 迟到的「驿丞已变更」通告送达 → D 收敛，四引用一致指向 C。 */
+  /* 迟到的「站长已变更」通告送达 → D 收敛，四引用一致指向 C。 */
   await receive(d.service, collabFrame('notice', collabId, peer('inst-b', '主机乙'), changed.payload));
   assert.equal(managerRefOf(d, collabId), 'inst-c', '迟到通告送达后四引用一致收敛');
   a.service.close();
@@ -960,8 +960,8 @@ test('四节点组合链（等版本窗口）：移交不推版本时陈旧记�
   d.service.close();
 });
 
-test('资格校验不拦高版本合流腿：被替换驿丞携带更高台账版本重联 → 合流递交 + 让位降级（G-2）', async (t) => {
-  /* 判别性用例（期终复评双版本对照探针转正）：被替换驿丞（本地台账版本高于记录基准、
+test('资格校验不拦高版本合流腿：被替换站长携带更高台账版本重联 → 合流递交 + 让位降级（G-2）', async (t) => {
+  /* 判别性用例（期终复评双版本对照探针转正）：被替换站长（本地台账版本高于记录基准、
    * 无席位变更知识）接收握手携带的正当生效记录——按设计 §9 步骤 4 / 握手③走合流递交
    * 加让位降级；席位时钟判据不得把该腿一并拦下。 */
   const harness = makeHarness(t);
@@ -986,7 +986,7 @@ test('资格校验不拦高版本合流腿：被替换驿丞携带更高台账�
   assert.equal(managerRefOf(harness, collabId), 'inst-b');
 });
 
-test('探测可观测性：驿丞端点未知时探测跳过并计数（probeSkippedNoEndpoint）', async (t) => {
+test('探测可观测性：站长端点未知时探测跳过并计数（probeSkippedNoEndpoint）', async (t) => {
   /* M7-F1 可观测性小项：旧载荷形态的 manager-changed（无端点字段）——成员采纳后端点仍未知，
    * 探测跳过必须留痕（运维面可见「互盲」状态，不再静默）。 */
   const harness = makeHarness(t);
@@ -996,7 +996,7 @@ test('探测可观测性：驿丞端点未知时探测跳过并计数（probeSki
     version: 3,
     manager: { instanceId: 'inst-b', identityName: '主机乙' },
   }));
-  assert.equal(managerRefOf(harness, collabId), 'inst-b', '采纳新驿丞（旧载荷形态、无端点字段）');
+  assert.equal(managerRefOf(harness, collabId), 'inst-b', '采纳新站长（旧载荷形态、无端点字段）');
   harness.service.start();
   await waitFor(() => (harness.service.stats().probeSkippedNoEndpoint >= 1 ? true : null), { timeoutMs: 3000 });
   harness.service.close();

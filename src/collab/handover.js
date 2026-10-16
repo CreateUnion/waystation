@@ -6,8 +6,8 @@ import { ledgerDigest } from './store.js';
 import { adoptNewManager, applyEndpoint, downgradeToMember, endpointFor, notifyLocal, promoteToManager, sendTo, sendToRoster } from './outgoing.js';
 import { probePeer, resumeLocal, suspendLocal } from './takeover.js';
 
-/* 显式移交（设计 §9 + §8「先确认后删除」）：管理席位携带整份台账发起 → 目标校验并回执 →
- * 旧席位收到确认后才清理本地台账并转成员 → 全体通告「驿丞已变更」。
+/* 显式移交（设计 §9 + §8「先确认后删除」）：站长席位携带整份台账发起 → 目标校验并回执 →
+ * 旧席位收到确认后才清理本地台账并转成员 → 全体通告「站长已变更」。
  * 目标离线当场拒绝（应急走抢接）；无回执不删除（台账保持）；双方消息流水与日志留痕——
  * 移交方记「已移交并清理（版本号、去向机器、摘要值）」，接收方记「已接收（同上）」。 */
 
@@ -20,7 +20,7 @@ export async function handover(state, { collabId, target }) {
     return { ok: false, message: '本机没有该协作（先 ws_list_collabs）' };
   }
   if (local.role !== 'manager') {
-    return { ok: false, message: '只有管理席位可以移交' };
+    return { ok: false, message: '只有站长席位可以移交' };
   }
   const preflight = await handoverPreflight(state, local, target);
   if (preflight.error !== undefined) {
@@ -92,7 +92,7 @@ async function settleHandover(state, local, targetId, member) {
   if (!done) {
     return { ok: false, message: '确认与当前台账版本不符（期间已有变更）——本次移交作废，可重试' };
   }
-  return { ok: true, message: `移交完成：驿丞已变更为「${member.identityName}」——本机台账已清理并转协作者` };
+  return { ok: true, message: `移交完成：站长已变更为「${member.identityName}」——本机台账已清理并转协作者` };
 }
 
 function handoverRejection(state, local, targetId) {
@@ -131,7 +131,7 @@ function waitForHandoverAnswer(state, collabId, targetId) {
   });
 }
 
-/* 完成移交（确认到手之后）：先确认后删除——删除本地台账文件、转成员记录、广播「驿丞已变更」。 */
+/* 完成移交（确认到手之后）：先确认后删除——删除本地台账文件、转成员记录、广播「站长已变更」。 */
 export function completeHandover(state, local, accept) {
   if (local.role !== 'manager' || local.ledger === null) {
     return false;
@@ -141,8 +141,8 @@ export function completeHandover(state, local, accept) {
     return false;
   }
   const name = localNameOf(local);
-  /* 端点互盲修复（主修）：新驿丞端点随「驿丞已变更」通告下发——旧驿丞与新驿丞刚直连过、
-   * 端点已知；只与旧驿丞通信过的成员据此学到新驿丞端点，否则双方互盲且无自愈路径。
+  /* 端点互盲修复（主修）：新站长端点随「站长已变更」通告下发——旧站长与新站长刚直连过、
+   * 端点已知；只与旧站长通信过的成员据此学到新站长端点，否则双方互盲且无自愈路径。
    * 端点未知时省略该字段（旧载荷形态不变，接收侧按可选处理）。 */
   const managerEndpoint = local.endpoints.get(accept.managerPeer.instanceId);
   state.counters.handoverCompleted++;
@@ -162,7 +162,7 @@ export function completeHandover(state, local, accept) {
     changedPayload.endpoint = { address: managerEndpoint.address, port: managerEndpoint.port };
   }
   sendToRoster(state, local, 'notice', changedPayload);
-  notifyLocal(state, local, `移交完成：协作「${name}」的驿丞已变为「${accept.managerPeer.identityName}」；本机已转协作者。`);
+  notifyLocal(state, local, `移交完成：协作「${name}」的站长已变为「${accept.managerPeer.identityName}」；本机已转协作者。`);
   return true;
 }
 
@@ -186,11 +186,11 @@ export async function handleHandover(state, frame) {
   }
 }
 
-/* 受理（目标侧）：来源必须为现任驿丞；校验形态 / 摘要 / 版本自洽；通过即承担管理席位并回执。 */
+/* 受理（目标侧）：来源必须为现任站长；校验形态 / 摘要 / 版本自洽；通过即担任站长席位并回执。 */
 function handleOffer(state, local, frame) {
   if (frame.from.instanceId !== currentManagerIdOf(local)) {
     state.counters.handoverRejected++;
-    state.log.warn('移交提议来源不是现任驿丞（忽略）', { collabId: local.collabId, from: frame.from.instanceId });
+    state.log.warn('移交提议来源不是现任站长（忽略）', { collabId: local.collabId, from: frame.from.instanceId });
     return;
   }
   const guard = offerLocalGuard(state, local);
@@ -208,7 +208,7 @@ function handleOffer(state, local, frame) {
 
 function offerLocalGuard(state, local) {
   if (local.role === 'manager') {
-    return '本机已是驿丞';
+    return '本机已是站长';
   }
   if (isLocalArchivedState(local)) {
     return '本机该协作已归档';
@@ -240,7 +240,7 @@ function offerValidation(record, collabId) {
   return null;
 }
 
-/* 受理成立：承担管理席位（台账换本机为管理者 + 落盘 + 推送当前视图）并回执「已接收（版本 / 来源 / 摘要）」。 */
+/* 受理成立：担任站长席位（台账换本机为站长 + 落盘 + 推送当前视图）并回执「已接收（版本 / 来源 / 摘要）」。 */
 function acceptOffer(state, local, frame) {
   const payload = frame.payload;
   const ledger = structuredClone(payload.ledger);
@@ -249,7 +249,7 @@ function acceptOffer(state, local, frame) {
   promoteToManager(state, local, ledger);
   learnOfferedEndpoints(state, local, payload);
   state.counters.handoverAccepted++;
-  state.log.info('已接收移交并承担驿丞席位（版本 / 来源 / 摘要）', {
+  state.log.info('已接收移交并担任站长席位（版本 / 来源 / 摘要）', {
     collabId: local.collabId,
     version: payload.version,
     from: frame.from.instanceId,
@@ -259,11 +259,11 @@ function acceptOffer(state, local, frame) {
   if (endpoint !== undefined) {
     sendTo(state, local.collabId, frame.from.instanceId, endpoint, 'handover', { kind: 'accept', version: payload.version, digest: payload.digest });
   }
-  notifyLocal(state, local, `已接手驿丞席位（来自「${frame.from.identityName}」，版本 ${payload.version}）。`);
+  notifyLocal(state, local, `已接手站长席位（来自「${frame.from.identityName}」，版本 ${payload.version}）。`);
 }
 
-/* 端点互盲修复（辅修）：逐项学习旧驿丞随 offer 下发的端点全表（均为其已学得的可信项）——
- * 新驿丞立即具备直投全部老成员的寻址，不等广播往返；名单缺身份名或地址 / 端口非法项
+/* 端点互盲修复（辅修）：逐项学习旧站长随 offer 下发的端点全表（均为其已学得的可信项）——
+ * 新站长立即具备直投全部老成员的寻址，不等广播往返；名单缺身份名或地址 / 端口非法项
  * 跳过并计数（留痕，不污染端点表）。 */
 function learnOfferedEndpoints(state, local, payload) {
   if (payload.endpoints === undefined) {
@@ -340,7 +340,7 @@ function isHandoverAnswerFrom(state, held, frame) {
   return false;
 }
 
-/* 「驿丞已变更」通告（成员侧）：来源须为本地记录的现任驿丞（旧席位广播），随后更新引用。 */
+/* 「站长已变更」通告（成员侧）：来源须为本地记录的现任站长（旧席位广播），随后更新引用。 */
 export async function handleManagerChanged(state, frame) {
   const local = state.collabs.get(frame.collabId);
   if (local === undefined) {
@@ -348,17 +348,17 @@ export async function handleManagerChanged(state, frame) {
   }
   if (local.role === 'manager') {
     state.counters.eventMismatch++;
-    state.log.warn('管理席位收到驿丞变更通告（忽略）', { collabId: local.collabId });
+    state.log.warn('站长席位收到站长变更通告（忽略）', { collabId: local.collabId });
     return;
   }
   if (frame.from.instanceId !== currentManagerIdOf(local)) {
     state.counters.eventMismatch++;
-    state.log.warn('驿丞变更通告来源与本地记录不符（忽略）', { collabId: local.collabId, from: frame.from.instanceId });
+    state.log.warn('站长变更通告来源与本地记录不符（忽略）', { collabId: local.collabId, from: frame.from.instanceId });
     return;
   }
   adoptNewManager(state, local, frame.payload.manager, frame.payload.version);
-  /* 端点互盲修复（主修接收侧）：通告携带的新驿丞端点（可选字段）在采纳后立即学习——
-   * 成员由此不再与现任驿丞互盲（端点学得即触发陈旧队列重定向，探测 / 握手 / 消息路径同时可达）。 */
+  /* 端点互盲修复（主修接收侧）：通告携带的新站长端点（可选字段）在采纳后立即学习——
+   * 成员由此不再与现任站长互盲（端点学得即触发陈旧队列重定向，探测 / 握手 / 消息路径同时可达）。 */
   if (frame.payload.endpoint !== undefined) {
     learnPayloadEndpoint(state, local, frame.payload.manager.instanceId, frame.payload.manager.identityName, frame.payload.endpoint);
   }

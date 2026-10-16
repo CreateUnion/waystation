@@ -449,7 +449,7 @@ test('managed：会话流锚点（中间锚增量、找不到 reset 全量）', 
 
 /* —— 元状态与事件轨 —— */
 
-test('managed：管理席位——台账末条为名/态权威，人数取名单长度，计数取累计收到，迁移行 id/文本/序正确', (t) => {
+test('managed：站长席位——台账末条为名/态权威，人数取名单长度，计数取累计收到，迁移行 id/文本/序正确', (t) => {
   const dataDir = makeTempDir(t);
   writeFiles(collabDirIn(dataDir, 'main', 'c-1'), {
     [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ collabId: 'c-1' })),

@@ -593,13 +593,13 @@ test('治理域 takeover-init report：version 与 takeover 可空、记录形�
 
 test('治理域 takeover-init cancel：reason 可选', () => {
   assert.equal(validateMessage(frameWith({ type: 'takeover-init', payload: { kind: 'cancel' } })).ok, true);
-  assert.equal(validateMessage(frameWith({ type: 'takeover-init', payload: { kind: 'cancel', reason: '原驿丞恢复应答' } })).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'takeover-init', payload: { kind: 'cancel', reason: '原站长恢复应答' } })).ok, true);
   assert.equal(validateMessage(frameWith({ type: 'takeover-init', payload: { kind: 'cancel', reason: 'x'.repeat(201) } })).ok, false);
 });
 
 test('治理域 takeover：baseVersion 与 digest 必填、reason 可选', () => {
   assert.equal(validateMessage(frameWith({ type: 'takeover', payload: { baseVersion: 3, digest: digestOf } })).ok, true);
-  assert.equal(validateMessage(frameWith({ type: 'takeover', payload: { baseVersion: 3, digest: digestOf, reason: '管理者失联' } })).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'takeover', payload: { baseVersion: 3, digest: digestOf, reason: '站长失联' } })).ok, true);
   assert.equal(validateMessage(frameWith({ type: 'takeover', payload: { baseVersion: 1.5, digest: digestOf } })).ok, false);
   assert.equal(validateMessage(frameWith({ type: 'takeover', payload: { baseVersion: 3 } })).ok, false);
 });
@@ -623,7 +623,7 @@ test('notice manager-changed：manager 与 version 必填；endpoint 可选且�
   assert.equal(validateMessage(frameWith({ type: 'notice', payload: { event: 'manager-changed', version: 3, manager } })).ok, true);
   assert.equal(validateMessage(frameWith({ type: 'notice', payload: { event: 'manager-changed', version: 3 } })).ok, false);
   assert.equal(validateMessage(frameWith({ type: 'notice', payload: { event: 'manager-changed', version: 0, manager } })).ok, false);
-  /* 端点互盲修复的加法字段：新驿丞端点随通告下发（旧帧无此字段行为不变；自家新帧不被自家拒收）。 */
+  /* 端点互盲修复的加法字段：新站长端点随通告下发（旧帧无此字段行为不变；自家新帧不被自家拒收）。 */
   const withEndpoint = { event: 'manager-changed', version: 3, manager, endpoint: { address: '127.0.0.2', port: 7321 } };
   assert.equal(validateMessage(frameWith({ type: 'notice', payload: withEndpoint })).ok, true, 'endpoint 放行');
   for (const endpoint of [{ address: '127.0.0.2', port: 0 }, { address: 7, port: 7321 }, 'x', { port: 7321 }, { address: '', port: 7321 }]) {

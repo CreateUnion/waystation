@@ -131,7 +131,7 @@ async function memberActive(harness, { collabId = 'collab-x', manager = peer('in
   return collabId;
 }
 
-/* 管理席位侧协作（含一名已同意成员 inst-b；台账 v2 定格）。 */
+/* 站长席位侧协作（含一名已同意成员 inst-b；台账 v2 定格）。 */
 async function managerActive(harness, { name = '联调项目' } = {}) {
   const created = harness.service.create({
     name,
@@ -173,7 +173,7 @@ test('握手覆盖面：论坛实例不参与 managed 握手（协作实例照�
   assert.equal(handshakes.some((frame) => frame.collabId === managed), true, '协作实例照常发起握手');
 });
 
-test('管理席位收到在途抢接握手视图：暂停对外写（takeover-inflight）', async (t) => {
+test('站长席位收到在途抢接握手视图：暂停对外写（takeover-inflight）', async (t) => {
   const harness = makeHarness(t);
   const collabId = await managerActive(harness);
   await receive(harness.service, collabFrame('notice', collabId, peer('inst-b', '主机乙'), {
@@ -183,12 +183,12 @@ test('管理席位收到在途抢接握手视图：暂停对外写（takeover-in
     takeover: { phase: 'collecting', candidate: { instanceId: 'inst-b', identityName: '主机乙' }, baseVersion: 2 },
     reply: true,
   }));
-  assert.equal(harness.service.list().collabs[0].suspended, true, '在途抢接视图到达 → 管理席位暂停对外写');
+  assert.equal(harness.service.list().collabs[0].suspended, true, '在途抢接视图到达 → 站长席位暂停对外写');
   await receive(harness.service, collabFrame('takeover-init', collabId, peer('inst-b', '主机乙'), { kind: 'cancel', reason: '候选放弃' }));
   assert.equal(harness.service.list().collabs[0].suspended, false, '取消到达即恢复');
 });
 
-test('成员收到生效抢接握手视图：收敛到新驿丞（成员记录改指）', async (t) => {
+test('成员收到生效抢接握手视图：收敛到新站长（成员记录改指）', async (t) => {
   const harness = makeHarness(t);
   const collabId = await memberActive(harness);
   const before = JSON.parse(readFileSync(collabFilePath(harness.dir, collabId, 'member.json'), 'utf8'));
@@ -201,7 +201,7 @@ test('成员收到生效抢接握手视图：收敛到新驿丞（成员记录�
     reply: true,
   }));
   const after = JSON.parse(readFileSync(collabFilePath(harness.dir, collabId, 'member.json'), 'utf8'));
-  assert.equal(after.manager.instanceId, 'inst-e', '生效抢接的握手视图使成员收敛到新驿丞');
+  assert.equal(after.manager.instanceId, 'inst-e', '生效抢接的握手视图使成员收敛到新站长');
   assert.equal(harness.service.list().collabs[0].role, 'member', '收敛不改变本机角色');
 });
 

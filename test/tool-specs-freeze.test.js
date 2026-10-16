@@ -273,7 +273,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_approve_invite",
-    "description": "对一条待回应邀请表态（同意 = 加入协作；拒绝 = 本条不参与，管理者决定继续或取消）",
+    "description": "对一条待回应邀请表态（同意 = 加入协作；拒绝 = 本条不参与，站长决定继续或取消）",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -298,7 +298,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_withdraw_invite",
-    "description": "撤回邀请（管理者，仅提议中）：指定 target 撤回该条；省略 target 整条取消（协作终止）",
+    "description": "撤回邀请（站长，仅提议中）：指定 target 撤回该条；省略 target 整条取消（协作终止）",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -318,7 +318,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_view_ledger",
-    "description": "查看协作台账：管理者本机直读；成员在线时向管理者拉取（source=live），管理者离线回退本地快照并标注可能非最新；讨论模式=本地合并视图（帖子列表＋成员表＋端点，标注「本地视图，未与全员核对」）",
+    "description": "查看协作台账：站长本机直读；成员在线时向站长拉取（source=live），站长离线回退本地快照并标注可能非最新；讨论模式=本地合并视图（帖子列表＋成员表＋端点，标注「本地视图，未与全员核对」）",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -334,7 +334,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_send_message",
-    "description": "发送协作域消息（星型路由：成员发给管理者；管理者省略 to 即发全体成员）——离线时消息排队、对方重开后送达；讨论模式为发帖（人人可见、to 参数一律拒绝）：默认经中继（发起人）投递（成员投稿至中继、由其转达全员），中继不可达时自动降级直投——返回的 route 字段如实标注本机走的路（relay/degraded/fanout）、results 为投稿或直投的受理态，成员级结果经中继聚合捎回、未达者由对方周期对表收敛",
+    "description": "发送协作域消息（星型路由：成员发给站长；站长省略 to 即发全体成员）——离线时消息排队、对方重开后送达；讨论模式为发帖（人人可见、to 参数一律拒绝）：默认经中继（发起人）投递（成员投稿至中继、由其转达全员），中继不可达时自动降级直投——返回的 route 字段如实标注本机走的路（relay/degraded/fanout）、results 为投稿或直投的受理态，成员级结果经中继聚合捎回、未达者由对方周期对表收敛",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -352,7 +352,7 @@ const FROZEN_LIST_JSON = `[
         },
         "to": {
           "type": "string",
-          "description": "目标成员实例标识（管理者可选；成员省略即发给管理者）"
+          "description": "目标成员实例标识（站长可选；成员省略即发给站长）"
         }
       },
       "required": [
@@ -384,7 +384,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_leave_collab",
-    "description": "退出某条协作（本机不再参与；管理者收通知并更新台账）——终态数据本地保留",
+    "description": "退出某条协作（本机不再参与；站长收通知并更新台账）——终态数据本地保留",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -400,7 +400,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_end_collab",
-    "description": "结束协作（管理者）：全员收到结束通告、各机把终态台账转归档——结束后不再接受任何协作域消息",
+    "description": "结束协作（站长）：全员收到结束通告、各机把终态台账转归档——结束后不再接受任何协作域消息",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -480,7 +480,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_decide",
-    "description": "裁定（管理席位）：冻结中三选一——merge（合并；建议发起更早者任管理者，名单并集、新增成员走同意门）/ keep（保持两条，需明示）/ terminate（终止本方一条）；合流递交裁定用 mergeOffer=accept|reject",
+    "description": "裁定（站长席位）：冻结中三选一——merge（合并；建议发起更早者任站长，名单并集、新增成员走同意门）/ keep（保持两条，需明示）/ terminate（终止本方一条）；合流递交裁定用 mergeOffer=accept|reject",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -513,7 +513,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_handover",
-    "description": "显式交接（管理席位）：把驿丞席位移交给在线成员（先确认后删除——对方校验并回执后本机才清理台账）；目标离线会被拒绝（应急走 ws_take_over 抢接）",
+    "description": "显式交接（站长席位）：把站长席位移交给在线成员（先确认后删除——对方校验并回执后本机才清理台账）；目标离线会被拒绝（应急走 ws_take_over 抢接）",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -534,7 +534,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_take_over",
-    "description": "抢接（成员侧，管理者被判失联后）：缺省发起——广播收集窗口（默认 30s）并持续探测原驿丞；窗口结束若本机为最高优先候选，经本机人确认后用 confirm: true 生效（含生效前最后探测）、false 放弃（顺位候选会收到重排提示）",
+    "description": "抢接（成员侧，站长被判失联后）：缺省发起——广播收集窗口（默认 30s）并持续探测原站长；窗口结束若本机为最高优先候选，经本机人确认后用 confirm: true 生效（含生效前最后探测）、false 放弃（顺位候选会收到重排提示）",
     "inputSchema": {
       "type": "object",
       "properties": {

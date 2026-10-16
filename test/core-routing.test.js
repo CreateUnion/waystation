@@ -546,14 +546,14 @@ test('链二②：定时器/入站类提示按绑定路由；休眠/无绑定 �
   assert.equal(pushFramesOf(out, 'bridge-b').length, 0);
 
   router.bindings.set('collab-sleep', { sessionId: 'session-ghost', bridgeId: 'bridge-ghost', boundAt: 'x', origin: 'adopt' });
-  assert.equal(router.notify(noticeFrameOf('collab-sleep', '失联提示：管理者离线\n第二行不摘要')), false, '休眠绑定丢弃');
+  assert.equal(router.notify(noticeFrameOf('collab-sleep', '失联提示：站长离线\n第二行不摘要')), false, '休眠绑定丢弃');
   assert.equal(router.notify(noticeFrameOf('collab-none', '顺位轮到本机')), false, '无绑定丢弃');
   assert.equal(pushFramesOf(out).length, 1, '休眠/无绑定不产生 push（即使另有活跃桥）');
   const drops = lines.filter((line) => line.level === 'warn' && line.message.includes('丢弃'));
   assert.equal(drops.length, 2, '每条丢弃留痕');
   assert.equal(drops[0].meta.dropped, 1);
   assert.equal(drops[1].meta.dropped, 2, '留痕带累计条数');
-  assert.equal(drops[0].meta.head, '失联提示：管理者离线', '留痕带首行摘要');
+  assert.equal(drops[0].meta.head, '失联提示：站长离线', '留痕带首行摘要');
   assert.equal(router.stats().notifyDropped, 2);
 });
 

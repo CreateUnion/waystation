@@ -144,7 +144,7 @@ function writeForumFixture(dataDir, collabId = 'c-forum') {
   });
 }
 
-/* 协作夹具：管理席位（台账两行＝一条迁移）＋扇出合并对（错峰 ≤50ms 链式）＋收到一条＋
+/* 协作夹具：站长席位（台账两行＝一条迁移）＋扇出合并对（错峰 ≤50ms 链式）＋收到一条＋
  * counter 累计收到＋根 config 本机身份名。 */
 function writeManagedFixture(dataDir, collabId = 'c-managed') {
   writeFiles(collabDirIn(dataDir, 'main', collabId), {

@@ -159,7 +159,7 @@ async function awaitSync(pending) {
   }
 }
 
-/* 双节点对表场景：A=发起人（管理席位）、B=成员（受邀并已加入，join 经手工一跳送达 A）。 */
+/* 双节点对表场景：A=发起人（站长席位）、B=成员（受邀并已加入，join 经手工一跳送达 A）。 */
 async function makeForumPair(t, overrides = {}) {
   const wire = makeWire();
   const selfA = overrides.selfA ?? SELF_A;
@@ -244,7 +244,7 @@ test('收尾：停止对表引擎时未决的拉取等待面即时了结（不�
   assert.equal(Date.now() - startedAt < 4000, true, '收尾不等待应答期限（8000ms 未到）');
 });
 
-/* 轮换场景：A=管理席位（真应答），B=已加入成员（不注入对端序→走轮换），C 仅端点已知（不应答）。 */
+/* 轮换场景：A=站长席位（真应答），B=已加入成员（不注入对端序→走轮换），C 仅端点已知（不应答）。 */
 async function makeRotationScene(t, wire) {
   const madeA = makeService(t, { self: SELF_A, sendDirect: wire.sendDirectFor(SELF_A) });
   wire.register(SELF_A, madeA.service);
@@ -338,7 +338,7 @@ test('成立时刻兜底：台账缺 establishedAt（旧数据）时按最早他
   const firstReq = await receive(reloaded.service, collabFrame('history-request', collabId, SELF_B, { after: null }));
   assert.equal(firstReq.ok, true, JSON.stringify(firstReq));
   const bundles = reloaded.direct.filter((message) => message.type === 'history-bundle' && message.collabId === collabId);
-  assert.equal(bundles.length, 1, '管理席位应答一帧回填');
+  assert.equal(bundles.length, 1, '站长席位应答一帧回填');
   assert.equal(bundles[0].payload.meta.establishedAt, joinTs, '成立时刻按最早他方 join 事件推导（兜底不臆造新值）');
 });
 

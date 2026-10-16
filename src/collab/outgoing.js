@@ -108,7 +108,7 @@ function forumEndpointsOf(mode, local) {
 }
 
 /* 新建台账（v1 proposed；名单 = 本机〔manager〕+ 各目标〔invited〕；模式创建时定死）。
- * 讨论模式的角色名沿用既有结构（发起人 = 本机管理席位）——平权语义与角色重命名归各模式链路
+ * 讨论模式的角色名沿用既有结构（发起人 = 本机站长席位）——平权语义与角色重命名归各模式链路
  * 落地阶段，本表只保证 mode 字段随实例走。 */
 function freshLedgerOf(state, name, topic, targets, mode) {
   const now = new Date().toISOString();
@@ -351,7 +351,7 @@ function sendInviteBookkeeping(state, local, wanted, reason) {
   return { delivered: sent.ok === true, msgId: sent.msgId, reason: sent.reason };
 }
 
-/* 决策发帧：先定格 decision（本地状态即真相），再入队；管理者端点未知给出明确指引。
+/* 决策发帧：先定格 decision（本地状态即真相），再入队；站长端点未知给出明确指引。
  * 拒绝原因按协议呈现判据先行校验（超限 / 换行在入队侧会被拒——不得先定格、后静默失败）。 */
 function sendDecision(state, local, approve, wanted, reason) {
   const validated = validateDeclineReason(approve ? undefined : reason);
@@ -360,7 +360,7 @@ function sendDecision(state, local, approve, wanted, reason) {
   }
   const endpoint = local.endpoints.get(local.member.manager.instanceId);
   if (endpoint === undefined) {
-    return { ok: false, message: '管理者端点未知（邀请可能不完整）——请重新扫描后请对方重发邀请' };
+    return { ok: false, message: '站长端点未知（邀请可能不完整）——请重新扫描后请对方重发邀请' };
   }
   local.member.decision = wanted;
   persistMember(state, local);
@@ -373,7 +373,7 @@ function sendDecision(state, local, approve, wanted, reason) {
 export function withdrawInvite(state, { collabId, target }) {
   const local = state.collabs.get(collabId);
   if (local === undefined || local.role !== 'manager') {
-    return { ok: false, message: '只有管理席位可以撤回邀请' };
+    return { ok: false, message: '只有站长席位可以撤回邀请' };
   }
   /* 挂起期明确拒绝（与 sendMessage 同一口径）：撤回含台账写 + 通告面，收敛等待中会被
    * 暂停守卫截成半执行（撤回帧已发、台账未变）——待收敛后再试。 */
@@ -791,11 +791,11 @@ function deliverPostTo(state, local, instanceId, post) {
 export function endCollab(state, { collabId }) {
   const local = state.collabs.get(collabId);
   if (local === undefined || local.role !== 'manager') {
-    /* 讨论的发起人 = 本机管理席位（role 创建时定死）；非发起人（成员记录）一律拒绝并给
+    /* 讨论的发起人 = 本机站长席位（role 创建时定死）；非发起人（成员记录）一律拒绝并给
      * 替代动作——成员想离开讨论走 ws_leave_collab（设计 §6「结束权归发起人」）。 */
     const message = local !== undefined && localModeOf(local) === 'forum'
       ? '只有发起人可以结束讨论（结束权归发起人）——成员退出请用 ws_leave_collab'
-      : '只有管理席位可以结束协作';
+      : '只有站长席位可以结束协作';
     return { ok: false, message };
   }
   /* 讨论的发起人退出即放弃结束权（设计 §6）：本机已退出该讨论 → end 不再受理（状态面）。 */
@@ -803,7 +803,7 @@ export function endCollab(state, { collabId }) {
     return { ok: false, message: '本机已退出该讨论——发起人退出即放弃结束权（讨论存续，结束不再受理）' };
   }
   /* 挂起期明确拒绝（与 sendMessage 同一口径）：收敛等待中的结束会半执行——台账写被暂停守卫
-   * 拦下，成员记录与通告却照发，产出「成员已归档、驿丞仍活跃」的僵尸协作。 */
+   * 拦下，成员记录与通告却照发，产出「成员已归档、站长仍活跃」的僵尸协作。 */
   if (local.suspended !== null) {
     return { ok: false, message: '协作对外写已暂停（在途抢接或未能对表）——收敛后恢复' };
   }
@@ -852,7 +852,7 @@ export function leaveCollab(state, { collabId }) {
     return leaveForum(state, local);
   }
   if (local.role === 'manager') {
-    return { ok: false, message: '管理席位不可退出——请先结束协作（显式交接属治理事项）' };
+    return { ok: false, message: '站长席位不可退出——请先结束协作（显式交接属治理事项）' };
   }
   if (isLocalArchivedState(local)) {
     return { ok: false, message: '协作已结束（或已退出）' };
@@ -916,7 +916,7 @@ export async function viewLedger(state, { collabId }) {
   if (stored !== null) {
     return { ok: true, source: 'snapshot', version: stored.version, note: `快照，版本 ${stored.version}，可能非最新`, archived, ledger: stored.ledger };
   }
-  return { ok: false, message: archived ? '协作已归档且本机无可用快照' : '管理者离线且本机无快照——没有可读台账' };
+  return { ok: false, message: archived ? '协作已归档且本机无可用快照' : '站长离线且本机无快照——没有可读台账' };
 }
 
 /* 讨论的本地合并视图（设计 §7 工具面）：本地帖子列表（显示序）+ 折叠成员表 + 端点 + 主题——
@@ -995,7 +995,7 @@ export function mutateLedger(state, local, apply, options = {}) {
 }
 
 /* 快照推送（设计 §8）：每次台账变更推全体成员（除本机）——端点已知者入可靠队列；
- * 端点未知者计数跳过（成员从未联系过管理席位的窗口）。管理席位同步留存自身最近快照。
+ * 端点未知者计数跳过（成员从未联系过站长席位的窗口）。站长席位同步留存自身最近快照。
  * 载荷冻结：帧在调度侧才序列化（入队落盘与上线各一次），活引用会让「摘要 ↔ 内容」分叉——
  * 台账被后续变更改写后，先入队的帧会以「摘要不符」被接收侧丢弃（本函数先深拷贝再入队）。 */
 export function pushSnapshot(state, local) {
@@ -1189,8 +1189,8 @@ export function relayGovernance(state, frame, targets) {
     return 0;
   }
   rememberRelayedOrigin(state, origin);
-  /* 转达原样携带原发身份（设计 §9）：帧的 from 是候选人 / 驿丞的权威身份——改写为转达者会让
-   * 接收方把转达者当作新驿丞（身份归因错位）；只取协议定义的三字段，不夹带来源帧其它字段。 */
+  /* 转达原样携带原发身份（设计 §9）：帧的 from 是候选人 / 站长的权威身份——改写为转达者会让
+   * 接收方把转达者当作新站长（身份归因错位）；只取协议定义的三字段，不夹带来源帧其它字段。 */
   const originFrom = { instanceId: frame.from.instanceId, identityName: frame.from.identityName, port: frame.from.port };
   let relayed = 0;
   for (const [instanceId, target] of targets) {
@@ -1217,7 +1217,7 @@ export function rememberRelayedOrigin(state, origin) {
 
 /* 冻结广播（设计 §6）：发给涉及两条协作的全部已知端点（除本机）——被冻那条的成员端点 ∪
  * 同名交集协作的成员端点；端点未知者跳过（转达与快照机制兜底可见性）。
- * 管理席位侧检出时随带被冻条的发起时间与管理者（合流并集与保留方判定的参考数据；
+ * 站长席位侧检出时随带被冻条的发起时间与站长（合流并集与保留方判定的参考数据；
  * 成员侧检出无从提供——接收侧按数据缺省保守处理）。 */
 export function broadcastFreeze(state, frozenLocal, reason) {
   const payload = {
@@ -1239,7 +1239,7 @@ export function broadcastFreeze(state, frozenLocal, reason) {
   return sent;
 }
 
-/* 本地冻结：管理席位冻台账（version 推进 + 快照）、成员冻本地记录；已冻结或迁移不允许时幂等返回 false。
+/* 本地冻结：站长席位冻台账（version 推进 + 快照）、成员冻本地记录；已冻结或迁移不允许时幂等返回 false。
  * 冻结标记（frozenAt / frozenFrom）随冻结写入——48 小时无裁定提示与「回冻结前状态」的依据。 */
 export function applyFreezeLocally(state, local, reason) {
   if (localStateOf(local) === 'frozen') {
@@ -1267,7 +1267,7 @@ export function applyFreezeLocally(state, local, reason) {
   return true;
 }
 
-/* 管理席位视角的可投递成员标识（除本机；终态成员——被拒 / 被撤回 / 已退出——不投消息）：
+/* 站长席位视角的可投递成员标识（除本机；终态成员——被拒 / 被撤回 / 已退出——不投消息）：
  * 消息广播与通告的收件人集合；提议中协作的「未回应」成员也在集内（提议中亦可沟通）。 */
 export function memberIdsOf(state, local) {
   if (local.role !== 'manager') {
@@ -1289,8 +1289,8 @@ export function countLiveCollabs(state) {
   return count;
 }
 
-/* 席位转移原语（接管生效 / 移交受让共用）：以给定台账承担管理席位——本地记录转管理、
- * 台账落盘（本机成为单一写者）、自身留存并推送当前视图（成员由此学习新驿丞端点）。 */
+/* 席位转移原语（接管生效 / 移交受让共用）：以给定台账担任站长席位——本地记录转管理、
+ * 台账落盘（本机成为单一写者）、自身留存并推送当前视图（成员由此学习新站长端点）。 */
 export function promoteToManager(state, local, ledger) {
   syncRosterRoles(ledger);
   /* 席位变更（受让 / 接管）作废本机关于他方候选的生效抢接记录（指向本机自身的新记录
@@ -1308,8 +1308,8 @@ export function promoteToManager(state, local, ledger) {
   pushSnapshot(state, local);
 }
 
-/* 席位变更后的名册角色同步：台账 manager 与 members[].role 恒一致——新任驿丞置 manager、
- * 其余旧 manager 位回落 member（否则旧驿丞被移交前置按 role 误拒，交回路径永久不可达）。 */
+/* 席位变更后的名册角色同步：台账 manager 与 members[].role 恒一致——新任站长置 manager、
+ * 其余旧 manager 位回落 member（否则旧站长被移交前置按 role 误拒，交回路径永久不可达）。 */
 function syncRosterRoles(ledger) {
   for (const member of ledger.members) {
     if (member.instanceId === ledger.manager.instanceId) {
@@ -1321,8 +1321,8 @@ function syncRosterRoles(ledger) {
 }
 
 /* 生效抢接记录的席位翻页作废：keepCandidateId 指保留「关于该候选」的记录（传 null 清空全部）。
- * 生效记录是进程内的席位主张面——任何本机席位变更（受让 / 让位 / 采纳新驿丞）即告翻页；
- * 不清理会让组合链（抢占 × 移交）里已翻页的记录继续经握手传播，把新驿丞按旧记录拉下席位。 */
+ * 生效记录是进程内的席位主张面——任何本机席位变更（受让 / 让位 / 采纳新站长）即告翻页；
+ * 不清理会让组合链（抢占 × 移交）里已翻页的记录继续经握手传播，把新站长按旧记录拉下席位。 */
 function invalidateEffectiveTakeovers(state, local, keepCandidateId) {
   const held = state.effectiveTakeovers.get(local.collabId);
   if (held === undefined) {
@@ -1333,9 +1333,9 @@ function invalidateEffectiveTakeovers(state, local, keepCandidateId) {
   }
 }
 
-/* 降级为成员（被替换 / 合流让位的落点）：管理席位——以台账定格名单转成员记录、删除本地台账
- * （单副本纪律：台账随后任驿丞走；本机快照保留为成员备份）；成员——仅更新驿丞引用。
- * 随后重定向陈旧出站队列（发往旧驿丞的未确认消息改投新驿丞——不静默丢弃）并拉取现任视图。
+/* 降级为成员（被替换 / 合流让位的落点）：站长席位——以台账定格名单转成员记录、删除本地台账
+ * （单副本纪律：台账随后任站长走；本机快照保留为成员备份）；成员——仅更新站长引用。
+ * 随后重定向陈旧出站队列（发往旧站长的未确认消息改投新站长——不静默丢弃）并拉取现任视图。
  * 席位变更（让位）作废本机生效抢接记录并推进席位时钟（陈旧判据的本机已知面）。 */
 export function downgradeToMember(state, local, managerPeer, version) {
   invalidateEffectiveTakeovers(state, local, null);
@@ -1360,8 +1360,8 @@ export function downgradeToMember(state, local, managerPeer, version) {
   state.counters.downgrades++;
 }
 
-/* 陈旧出站队列重定向：发往旧驿丞的未确认条目改投新驿丞（同 msgId 保持——进行中消息在新席位
- * 上等价有效且不产生重复投递）；新驿丞端点未知先暂存 staleManagerId、待端点学习后补投。 */
+/* 陈旧出站队列重定向：发往旧站长的未确认条目改投新站长（同 msgId 保持——进行中消息在新席位
+ * 上等价有效且不产生重复投递）；新站长端点未知先暂存 staleManagerId、待端点学习后补投。 */
 export function retargetStaleQueue(state, local, fromInstanceId, toInstanceId) {
   if (fromInstanceId === toInstanceId) {
     return;
@@ -1386,7 +1386,7 @@ export function retargetStaleQueue(state, local, fromInstanceId, toInstanceId) {
   }
 }
 
-/* 端点学习后的补投（applyEndpoint 的挂点）：暂存的旧驿丞队列等到新驿丞端点即可重定向。 */
+/* 端点学习后的补投（applyEndpoint 的挂点）：暂存的旧站长队列等到新站长端点即可重定向。 */
 export function resumeStaleRetarget(state, local) {
   if (local.staleManagerId === null || local.staleManagerId === undefined) {
     return;
@@ -1395,7 +1395,7 @@ export function resumeStaleRetarget(state, local) {
 }
 
 /* 端点学习（协作端点表入口——直连帧学习与治理载荷学习共用）：记录「实例标识 → 地址:端口」，
- * 仅在变化时写 member.json；学到现任驿丞端点时补做陈旧队列重定向（互盲解除后改投立即发生）。
+ * 仅在变化时写 member.json；学到现任站长端点时补做陈旧队列重定向（互盲解除后改投立即发生）。
  * 返回是否发生更新（调用方据此决定补发生效通告等后续动作）。 */
 export function applyEndpoint(state, local, peer, address, port) {
   const held = local.endpoints.get(peer.instanceId);
@@ -1412,7 +1412,7 @@ export function applyEndpoint(state, local, peer, address, port) {
   return changed;
 }
 
-/* 向现任驿丞拉取当前视图（快照请求；端点未知静默跳过——对方主动联系时端点自然学习）。 */
+/* 向现任站长拉取当前视图（快照请求；端点未知静默跳过——对方主动联系时端点自然学习）。 */
 export function requestCurrentView(state, local) {
   const managerId = local.member.manager.instanceId;
   const endpoint = endpointFor(state, local, managerId);
@@ -1422,7 +1422,7 @@ export function requestCurrentView(state, local) {
   sendTo(state, local.collabId, managerId, endpoint, 'snapshot', { kind: 'request' });
 }
 
-/* 驿丞引用更新（成员侧；移交 / 抢接 / 握手共用）：更新记录、重定向陈旧队列并留痕；
+/* 站长引用更新（成员侧；移交 / 抢接 / 握手共用）：更新记录、重定向陈旧队列并留痕；
  * 是否拉取当前视图由调用方决定（对表路径按版本差决定）。 */
 export function adoptNewManager(state, local, managerPeer, remoteVersion) {
   if (local.role !== 'member') {
@@ -1432,7 +1432,7 @@ export function adoptNewManager(state, local, managerPeer, remoteVersion) {
   if (oldId === managerPeer.instanceId) {
     return false;
   }
-  /* 席位变更（采纳新驿丞）作废关于其它候选的生效记录（关于新驿丞本人的记录保留——它是
+  /* 席位变更（采纳新站长）作废关于其它候选的生效记录（关于新站长本人的记录保留——它是
    * 本机对「发生过抢接」的如实知识，继续随握手外传供他方收敛）；并推进席位时钟
    * （陈旧判据的本机已知面：早于或等于该次变更的席位主张与记录不再回翻本机引用）。 */
   invalidateEffectiveTakeovers(state, local, managerPeer.instanceId);
@@ -1443,11 +1443,11 @@ export function adoptNewManager(state, local, managerPeer, remoteVersion) {
   persistMember(state, local);
   retargetStaleQueue(state, local, oldId, managerPeer.instanceId);
   state.counters.managerChangedIn++;
-  state.log.info('驿丞引用已更新', { collabId: local.collabId, from: oldId, to: managerPeer.instanceId, version: remoteVersion });
+  state.log.info('站长引用已更新', { collabId: local.collabId, from: oldId, to: managerPeer.instanceId, version: remoteVersion });
   return true;
 }
 
-/* 合流递交（设计 §9 步骤 4）：把本地 diverged 台账整份发给现任驿丞、由其本机人裁定采纳 / 丢弃。
+/* 合流递交（设计 §9 步骤 4）：把本地 diverged 台账整份发给现任站长、由其本机人裁定采纳 / 丢弃。
  * 不走快照通道——快照通道的「版本不倒退即收」会让 diverged 内容静默覆盖（禁止静默覆盖）。 */
 export function sendMergeOffer(state, local, managerPeer, baseVersion) {
   const source = local.role === 'manager' ? local.ledger : (local.snapshot === null ? null : local.snapshot.ledger);
@@ -1499,14 +1499,14 @@ export function notifyLocal(state, local, text) {
   }
 }
 
-/* 星型路由（设计 §10）：成员只发给管理者（省略 to 或显式 = 管理者）；管理者发给任一人、
+/* 星型路由（设计 §10）：成员只发给站长（省略 to 或显式 = 站长）；站长发给任一人、
  * 省略 to = 全体已建立成员（不含本机）。 */
 function recipientsOf(state, local, to) {
   const managerId = local.member.manager.instanceId;
   const explicit = typeof to === 'string' && to.trim() !== '' ? to.trim() : null;
   if (local.role === 'member') {
     if (explicit !== null && explicit !== managerId) {
-      return { error: '成员只能发给管理者（星型路由）' };
+      return { error: '成员只能发给站长（星型路由）' };
     }
     return { targets: [managerId] };
   }
@@ -1531,7 +1531,7 @@ function payloadOf(type, text) {
   return { text };
 }
 
-/* 管理席位记录（含移交受让与接管恢复的构造面）：roster = 台账定格名单，endpoints 由调用方补。
+/* 站长席位记录（含移交受让与接管恢复的构造面）：roster = 台账定格名单，endpoints 由调用方补。
  * topic 随记录定格（讨论成员侧发起邀请的取数面；managed 记录同样携带——形态无差别）。 */
 export function managerRecordOf(ledger) {
   return {

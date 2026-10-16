@@ -102,7 +102,7 @@ function ledgerStub(collabId, version, { manager = { instanceId: 'inst-a', ident
   };
 }
 
-/* 管理席位侧已建立的协作（v3：创建 v1 + 回应 v2 + 建立 v3；成员 inst-b 端点已知）。 */
+/* 站长席位侧已建立的协作（v3：创建 v1 + 回应 v2 + 建立 v3；成员 inst-b 端点已知）。 */
 async function managerActive(harness, { name = '联调项目' } = {}) {
   const created = harness.service.create({
     name,
@@ -417,7 +417,7 @@ async function memberActiveAt(harness, collabId, manager = peer('inst-a', '主�
   await receive(harness.service, collabFrame('snapshot', collabId, manager, { kind: 'data', version, digest: ledgerDigest(ledger), ledger }));
 }
 
-test('移交全链：确认后旧席位清理台账并转成员，受让方承担席位并广播「驿丞已变更」', async (t) => {
+test('移交全链：确认后旧席位清理台账并转成员，受让方担任席位并广播「站长已变更」', async (t) => {
   const a = makeHarness(t, { probeResults: [{ reachable: true, rttMs: 1 }] });
   const collabId = await managerActive(a);
   const b = memberHarness(t);
@@ -426,7 +426,7 @@ test('移交全链：确认后旧席位清理台账并转成员，受让方承�
   const pending = a.service.handover({ collabId, target: 'inst-b' });
   const offer = await waitFor(() => a.sent.find((frame) => frame.type === 'handover' && frame.payload.kind === 'offer'), { timeoutMs: 2000 });
   await receive(b.service, collabFrame('handover', collabId, peer('inst-a', '主机甲'), offer.payload));
-  assert.equal(b.service.list().collabs[0].role, 'manager', '受让方承担管理席位');
+  assert.equal(b.service.list().collabs[0].role, 'manager', '受让方担任站长席位');
   const accept = await waitFor(() => b.sent.find((frame) => frame.type === 'handover' && frame.payload.kind === 'accept'), { timeoutMs: 2000 });
   await receive(a.service, collabFrame('handover', collabId, peer('inst-b', '主机乙'), accept.payload));
   const result = await pending;
@@ -478,7 +478,7 @@ test('移交守卫与失败路径：目标离线拒绝、超时不删、对方�
   assert.equal(existsSync(collabFilePath(mismatch.dir, mismatchId, LEDGER_FILE_NAME)), true);
 });
 
-test('移交受理（目标侧）：来源非现任驿丞忽略；冻结中由门控拒绝（不处理不经手）', async (t) => {
+test('移交受理（目标侧）：来源非现任站长忽略；冻结中由门控拒绝（不处理不经手）', async (t) => {
   const b = memberHarness(t);
   const collabId = 'collab-h';
   await memberActiveAt(b, collabId);
@@ -500,7 +500,7 @@ test('移交受理（目标侧）：来源非现任驿丞忽略；冻结中由�
   assert.equal(frozenB.service.list().collabs[0].state, 'frozen');
 });
 
-test('驿丞变更通告接收：来源为现任驿丞时更新引用；来源不符忽略并计数', async (t) => {
+test('站长变更通告接收：来源为现任站长时更新引用；来源不符忽略并计数', async (t) => {
   const b = memberHarness(t);
   const collabId = 'collab-mc';
   await memberActiveAt(b, collabId);
@@ -516,7 +516,7 @@ test('驿丞变更通告接收：来源为现任驿丞时更新引用；来源�
 
 test('移交等待期：常规写被拒（负例，offer 后即挂起）；accept 到达后照常完成并解挂', async (t) => {
   /* 判别性用例（源自对抗评审行为探针）：等待窗内的任意常规写会让回执版本错配、旧席位
-   * 保守不删而受让方已承担席位——单边孤儿。修复 = offer 后即挂起（等待期禁常规写）。 */
+   * 保守不删而受让方已担任席位——单边孤儿。修复 = offer 后即挂起（等待期禁常规写）。 */
   const a = makeHarness(t, { probeResults: [{ reachable: true, rttMs: 1 }], handoverConfirmTimeoutMs: 500 });
   const collabId = await managerActive(a);
   const b = memberHarness(t);
@@ -578,7 +578,7 @@ test('移交回执来源校验：非本次目标的 accept / reject 被忽略并
 
 test('席位交回：A→B 移交后 role 位同步，B 可把席位交回 A', async (t) => {
   /* 判别性用例（源自对抗评审行为探针）：席位变更须同步 members[].role（台账 manager 与 role 位
-   * 恒一致）——否则旧驿丞 role 仍为 manager，交回被移交前置（「需为已建立成员」）误拒。 */
+   * 恒一致）——否则旧站长 role 仍为 manager，交回被移交前置（「需为已建立成员」）误拒。 */
   const a = makeHarness(t, { probeResults: [{ reachable: true, rttMs: 1 }] });
   const collabId = await managerActive(a);
   const b = makeHarness(t, { self: { instanceId: 'inst-b', identityName: '主机乙', port: 17321 }, probeResults: [{ reachable: true, rttMs: 1 }] });
@@ -592,10 +592,10 @@ test('席位交回：A→B 移交后 role 位同步，B 可把席位交回 A', a
   assert.equal(first.ok, true, String(first.message));
   const ledgerB = (await b.service.view({ collabId })).ledger;
   assert.equal(ledgerB.manager.instanceId, 'inst-b');
-  assert.equal(ledgerB.members.find((member) => member.instanceId === 'inst-b').role, 'manager', '新驿丞 role=manager');
-  assert.equal(ledgerB.members.find((member) => member.instanceId === 'inst-self').role, 'member', '原驿丞 role=member');
+  assert.equal(ledgerB.members.find((member) => member.instanceId === 'inst-b').role, 'manager', '新站长 role=manager');
+  assert.equal(ledgerB.members.find((member) => member.instanceId === 'inst-self').role, 'member', '原站长 role=member');
 
-  /* B（现驿丞）把席位交回 A（原驿丞）：端点由「在册联系」学习，回执以 A 真实实例标识送达。 */
+  /* B（现站长）把席位交回 A（原站长）：端点由「在册联系」学习，回执以 A 真实实例标识送达。 */
   await receive(b.service, collabFrame('reply', collabId, peer('inst-self', '本机'), { text: '在册联系' }));
   const pendingBack = b.service.handover({ collabId, target: 'inst-self' });
   const offerBack = await waitFor(() => b.sent.find((frame) => frame.type === 'handover' && frame.payload.kind === 'offer'), { timeoutMs: 2000 });
@@ -605,12 +605,12 @@ test('席位交回：A→B 移交后 role 位同步，B 可把席位交回 A', a
   const back = await pendingBack;
   assert.equal(back.ok, true, String(back.message));
   assert.equal(b.service.list().collabs[0].role, 'member');
-  assert.equal(a.service.list().collabs[0].role, 'manager', '席位交回原驿丞');
+  assert.equal(a.service.list().collabs[0].role, 'manager', '席位交回原站长');
 });
 
 test('挂起期明确拒绝：end / withdraw 不半执行（台账与记录均不动）', async (t) => {
   /* 判别性用例（源自对抗评审行为探针）：收敛等待中的完成 / 撤回会与在途席位变更相互践踏
-   * （成员已归档、驿丞仍活跃的僵尸协作）——入口明确拒绝（与 sendMessage 同一口径）。 */
+   * （成员已归档、站长仍活跃的僵尸协作）——入口明确拒绝（与 sendMessage 同一口径）。 */
   const harness = makeHarness(t);
   const collabId = await managerActive(harness);
   await receive(harness.service, collabFrame('takeover-init', collabId, peer('inst-b', '主机乙'), {
@@ -671,7 +671,7 @@ test('挂起期入站回应：拒绝且不虚增计数、不发名单通告（�
 
 /* —— 交接端点互盲修复（M7-F1）—— */
 
-/* 三节点交接前置：A 为驿丞，B / C 均只与 A 直连过（各自的端点表只有 A）。 */
+/* 三节点交接前置：A 为站长，B / C 均只与 A 直连过（各自的端点表只有 A）。 */
 async function handoverTriadReady(a, b, c, collabId) {
   const peerA = peer('inst-a', '主机甲');
   for (const node of [b, c]) {
@@ -682,10 +682,10 @@ async function handoverTriadReady(a, b, c, collabId) {
   }
 }
 
-test('交接端点互盲修复：manager-changed 携带新驿丞端点、offer 携带端点全表（成员即时可达）', async (t) => {
-  /* 判别性用例（M7-F1 真机缺陷）：成员只与旧驿丞直连过（端点表只有旧驿丞）——交接后若新
-   * 驿丞端点不随通告下发即互盲死结（探测跳过、握手 / 消息发不出）；载荷携带端点 + 接收侧
-   * 学习后，成员立即学到新驿丞端点（互盲解除、出站可达）。 */
+test('交接端点互盲修复：manager-changed 携带新站长端点、offer 携带端点全表（成员即时可达）', async (t) => {
+  /* 判别性用例（M7-F1 真机缺陷）：成员只与旧站长直连过（端点表只有旧站长）——交接后若新
+   * 站长端点不随通告下发即互盲死结（探测跳过、握手 / 消息发不出）；载荷携带端点 + 接收侧
+   * 学习后，成员立即学到新站长端点（互盲解除、出站可达）。 */
   const a = makeHarness(t, { probeResults: [{ reachable: true, rttMs: 1 }] });
   const b = makeHarness(t, { self: { instanceId: 'inst-b', identityName: '主机乙', port: 17321 } });
   const c = makeHarness(t, { self: { instanceId: 'inst-c', identityName: '主机丙', port: 17321 } });
@@ -702,7 +702,7 @@ test('交接端点互盲修复：manager-changed 携带新驿丞端点、offer �
 
   const pending = a.service.handover({ collabId, target: 'inst-b' });
   const offer = await waitFor(() => a.sent.find((message) => message.type === 'handover' && message.payload.kind === 'offer'), { timeoutMs: 2000 });
-  assert.deepEqual(offer.payload.endpoints['inst-c'], { address: '127.0.0.3', port: 17321 }, '辅修：offer 携带端点全表（旧驿丞视角）');
+  assert.deepEqual(offer.payload.endpoints['inst-c'], { address: '127.0.0.3', port: 17321 }, '辅修：offer 携带端点全表（旧站长视角）');
   await receive(b.service, collabFrame('handover', collabId, peerA, offer.payload));
   const memberB = JSON.parse(readFileSync(join(b.dir, 'collabs', collabId, 'member.json'), 'utf8'));
   assert.deepEqual(memberB.endpoints['inst-c'], { address: '127.0.0.3', port: 17321 }, '辅修：受让方逐项学习（可直投老成员）');
@@ -711,20 +711,20 @@ test('交接端点互盲修复：manager-changed 携带新驿丞端点、offer �
   assert.equal((await pending).ok, true);
 
   const changed = a.sent.find((message) => message.type === 'notice' && message.payload.event === 'manager-changed');
-  assert.ok(changed, '旧驿丞广播驿丞变更');
-  assert.deepEqual(changed.payload.endpoint, { address: '127.0.0.2', port: 17321 }, '主修：载荷携带新驿丞端点');
+  assert.ok(changed, '旧站长广播站长变更');
+  assert.deepEqual(changed.payload.endpoint, { address: '127.0.0.2', port: 17321 }, '主修：载荷携带新站长端点');
   await receive(c.service, collabFrame('notice', collabId, peerA, changed.payload));
   const memberC = JSON.parse(readFileSync(join(c.dir, 'collabs', collabId, 'member.json'), 'utf8'));
   assert.equal(memberC.manager.instanceId, 'inst-b');
-  assert.deepEqual(memberC.endpoints['inst-b'], { address: '127.0.0.2', port: 17321 }, '成员学到新驿丞端点（互盲解除）');
+  assert.deepEqual(memberC.endpoints['inst-b'], { address: '127.0.0.2', port: 17321 }, '成员学到新站长端点（互盲解除）');
   const sent = await c.service.send({ collabId, text: '交接后第一条', type: 'reply' });
-  assert.equal(sent.ok, true, '消息直达新驿丞（不再「端点未知」）');
+  assert.equal(sent.ok, true, '消息直达新站长（不再「端点未知」）');
   assert.equal(sent.to[0], 'inst-b');
   c.service.close();
 });
 
 test('端点留痕：治理载荷携带非法端点项（地址 / 端口两分支）→ 忽略并计数、不入表', async (t) => {
-  /* M7-F1 审查 Minor-1①：载荷端点的留痕忽略行为直覆盖——驿丞变更本身照常生效（端点属
+  /* M7-F1 审查 Minor-1①：载荷端点的留痕忽略行为直覆盖——站长变更本身照常生效（端点属
    * 辅助面），非法项不污染端点表。 */
   const harness = makeHarness(t);
   const collabId = 'collab-endpoint';
@@ -738,7 +738,7 @@ test('端点留痕：治理载荷携带非法端点项（地址 / 端口两分�
   }));
   assert.equal(harness.service.stats().endpointRejected, rejectedBefore + 1, '地址非法 → 忽略并计数');
   let member = JSON.parse(readFileSync(join(harness.dir, 'collabs', collabId, 'member.json'), 'utf8'));
-  assert.equal(member.manager.instanceId, 'inst-b', '驿丞变更本身照常生效（端点属辅助面）');
+  assert.equal(member.manager.instanceId, 'inst-b', '站长变更本身照常生效（端点属辅助面）');
   assert.equal(member.endpoints['inst-b'], undefined, '非法端点不入表');
 
   await receive(harness.service, collabFrame('notice', collabId, peer('inst-b', '主机乙'), {
@@ -753,16 +753,16 @@ test('端点留痕：治理载荷携带非法端点项（地址 / 端口两分�
   assert.equal(member.endpoints['inst-c'], undefined, '非法端口不入表');
 });
 
-test('载荷学习触发陈旧队列重投：manager-changed 学到新驿丞端点后原队列条目自动改投', async (t) => {
-  /* M7-F1 审查 Minor-1②（真机复验第③步的机制）：指向旧驿丞的未确认条目在换驿丞瞬间因新端点
+test('载荷学习触发陈旧队列重投：manager-changed 学到新站长端点后原队列条目自动改投', async (t) => {
+  /* M7-F1 审查 Minor-1②（真机复验第③步的机制）：指向旧站长的未确认条目在换站长瞬间因新端点
    * 未知而暂存（staleManagerId）；载荷携带端点学得后必须自动重定向补投——否则排队样本永不
    * 投递（互盲死结的投递侧）。判别方式：观测注入的 reassign 改投原语——旧实现（载荷端点不
    * 学习）下 resumeStaleRetarget 无触发，reassign 永不被调用（必红）。 */
   const harness = makeHarness(t, { moved: 2 });
   const collabId = 'collab-retarget';
   await memberActiveAt(harness, collabId);
-  const queued = await harness.service.send({ collabId, text: '发往旧驿丞的排队样本' });
-  assert.equal(queued.ok, true, '换驿丞前条目已入队（指向旧驿丞）');
+  const queued = await harness.service.send({ collabId, text: '发往旧站长的排队样本' });
+  assert.equal(queued.ok, true, '换站长前条目已入队（指向旧站长）');
   harness.reassigns.length = 0;
   await receive(harness.service, collabFrame('notice', collabId, peer('inst-a', '主机甲'), {
     event: 'manager-changed',
@@ -770,9 +770,9 @@ test('载荷学习触发陈旧队列重投：manager-changed 学到新驿丞端�
     manager: { instanceId: 'inst-b', identityName: '主机乙' },
     endpoint: { address: '127.0.0.9', port: 17321 },
   }));
-  assert.equal(harness.service.stats().queueStaleKept >= 1, true, '换驿丞瞬间新端点未知 → 条目先暂存');
+  assert.equal(harness.service.stats().queueStaleKept >= 1, true, '换站长瞬间新端点未知 → 条目先暂存');
   assert.equal(harness.reassigns.length, 1, '载荷学得端点即触发陈旧队列重定向（resumeStaleRetarget）');
   assert.equal(harness.reassigns[0].fromInstanceId, 'inst-a');
-  assert.deepEqual(harness.reassigns[0].to, { instanceId: 'inst-b', address: '127.0.0.9', port: 17321 }, '改投目标 = 学得的新驿丞端点');
+  assert.deepEqual(harness.reassigns[0].to, { instanceId: 'inst-b', address: '127.0.0.9', port: 17321 }, '改投目标 = 学得的新站长端点');
   assert.equal(harness.service.stats().queueRetargeted, 2, '改投条目数入账（补投生效面）');
 });

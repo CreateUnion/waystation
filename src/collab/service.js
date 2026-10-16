@@ -297,7 +297,7 @@ function loadOne(state, collabId) {
   return local;
 }
 
-/* 管理席位台账的加载与损坏重建（设计 §13：保留损坏副本、从最近快照重建并提示差异）：
+/* 站长席位台账的加载与损坏重建（设计 §13：保留损坏副本、从最近快照重建并提示差异）：
  * 快照优先（版本明确）、成员记录骨架兜底；重建结果立即回写（台账流落新首行），来源计数留痕。 */
 function recoverLedger(state, collabId, local) {
   const loaded = loadLedger(state.dataDir, collabId);
@@ -399,7 +399,7 @@ function listEntryOf(state, local, now) {
 }
 
 /* 邀请视图（成员侧）：决策 / 有效期与过期标注（仅标注、不改状态——设计 §6 的「过期不算拒绝」）；
- * 管理席位给空面。 */
+ * 站长席位给空面。 */
 function inviteViewOf(local, now) {
   if (local.role !== 'member') {
     return { decision: null, invitedAt: null, expiresAt: null, expired: false };

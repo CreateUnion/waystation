@@ -341,7 +341,7 @@ function isCollabCount(value) {
 }
 
 /* —— 协作域载荷形态（协作核心 + 治理与韧性）：本层只判形态（字段完整性 / 类型 / 长度边界 / 数值范围）；
- * 语义裁定（名单含本机、状态是否允许、来源是否现任驿丞）在协作层。上限值服务呈现链与会话注入链的稳健性。 */
+ * 语义裁定（名单含本机、状态是否允许、来源是否现任站长）在协作层。上限值服务呈现链与会话注入链的稳健性。 */
 export const MAX_COLLAB_MEMBERS = 32;
 export const MAX_TOPIC_CHARS = 200;
 export const MAX_MESSAGE_TEXT_CHARS = 4000;
@@ -848,8 +848,8 @@ function validateVersionedNotice(payload) {
   return { ok: true };
 }
 
-/* 驿丞已变更（移交完成后旧席位广播）：新驿丞身份与交接版本均必填；endpoint（新驿丞端点）
- * 为可选加法字段——随通告下发以解除「只与旧驿丞通信过的成员」与新驿丞的端点互盲。 */
+/* 站长已变更（移交完成后旧席位广播）：新站长身份与交接版本均必填；endpoint（新站长端点）
+ * 为可选加法字段——随通告下发以解除「只与旧站长通信过的成员」与新站长的端点互盲。 */
 function validateManagerChangedNotice(payload) {
   if (!Number.isInteger(payload.version) || payload.version < 1) {
     return refuse('manager-changed.version 非法（≥1 的整数）');
@@ -945,7 +945,7 @@ function validateFreezePayload(payload) {
   if (!members.ok) {
     return members;
   }
-  /* 合流并集的参考数据（管理席位检出时提供、成员侧检出缺省）：被冻条的发起时间与管理者。 */
+  /* 合流并集的参考数据（站长席位检出时提供、成员侧检出缺省）：被冻条的发起时间与站长。 */
   if (payload.createdAt !== undefined && !isTimestamp(payload.createdAt)) {
     return refuse('freeze.createdAt 非法（时间戳）');
   }
@@ -1026,7 +1026,7 @@ function validateHandoverPayload(payload) {
   return refuse('handover.kind 非法（offer / accept / reject）');
 }
 
-/* offer：版本 + 摘要 + 台账整份；endpoints（可选加法字段）= 旧驿丞视角的端点全表
+/* offer：版本 + 摘要 + 台账整份；endpoints（可选加法字段）= 旧站长视角的端点全表
  * （instanceId → {address, port}）——受让方逐项学习后立即可直投老成员（端点互盲修复）。 */
 function validateHandoverOffer(payload) {
   if (!isVersionedDigestPayload(payload)) {
@@ -1107,7 +1107,7 @@ function validateTakeoverReport(payload) {
   return { ok: true };
 }
 
-/* 抢接生效通告：基准版本 + 恢复台账摘要（新驿丞身份以帧 from 为准）。 */
+/* 抢接生效通告：基准版本 + 恢复台账摘要（新站长身份以帧 from 为准）。 */
 function validateTakeoverPayload(payload) {
   if (!isPlainObject(payload)) {
     return refuse('takeover 缺少 payload');
