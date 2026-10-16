@@ -4,11 +4,15 @@
  * 只读零写盘是硬契约：数据目录里的文件只读不改。存储层的 loadLines 会对半写尾行做截断修复
  * （ftruncate），因此一律自行 readFileSync，绝不经过它；loadConfig/saveConfig 的损坏分支会
  * 改名写盘、counter 模块的 import 面含写能力，同样禁用。
- * import 白名单（设计 §5.2）：store.js 只许 loadMember（纯读＋形态校验）；model/members/posts
- * 只许形态判据与折叠纯函数；protocol.js/paths.js 取常量与判据函数；台账「最后一条合法行」按
- * isLedgerShape 纯读复现（沿 scripts/collab-viewer.js 的先例）；member/snapshot/counter/config
- * 四个小 JSON 自行 JSON.parse＋形态守卫。文件名常量因此在本文件就地定义（不 import 协作模块的
- * 常量符号）——单一权威由测试兜底：夹具以各模块导出的规范常量为准，与这里不同步即红。
+ * import 白名单（设计 §5.2）：store.js 只许 loadMember（纯读＋形态校验）；model/members/posts/joins
+ * 只许形态判据与折叠纯函数；protocol.js/paths.js 取常量与判据函数；util/short-id.js 取会话短码的
+ * 唯一权威；台账「最后一条合法行」按 isLedgerShape 纯读复现（沿 scripts/collab-viewer.js 的先例）；
+ * member/snapshot/counter/config 四个小 JSON 自行 JSON.parse＋形态守卫。文件名常量因此在本文件就地
+ * 定义（不 import 协作模块的常量符号）——单一权威由测试兜底：夹具以各模块导出的规范常量为准，
+ * 与这里不同步即红。
+ *
+ * 会话可见面（设计 §1 观察窗）另纯读三源：run/bindings.json（本机绑定）、协作目录 joins.json
+ * （获准名单）、站点根 known-hosts.json（远端发布）——三源一律宽容读取，缺源则整段省略。
  *
  * 微缓存只覆盖追加型 JSONL（posts/members/ledger/inbox/outbox）的解析结果，键 = (绝对路径,
  * size, mtimeMs)：append 必改 size；压实重写会改 size 或 mtime，键失配即重析。缺失态不入缓存
@@ -18,13 +22,15 @@
 
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { COLLABS_DIR_NAME, CONFIG_FILE_NAME, SITES_DIR_NAME, collabDir, collabFilePath } from '../paths.js';
+import { COLLABS_DIR_NAME, CONFIG_FILE_NAME, SITES_DIR_NAME, bindingsFilePath, collabDir, collabFilePath, joinsFilePath } from '../paths.js';
 import { ID_PATTERN, MAX_MESSAGE_TEXT_CHARS, POST_KINDS, isIdentityName } from '../net/protocol.js';
 import { isPostEntryShape } from '../collab/posts.js';
 import { foldMemberEvents, isMemberEventShape } from '../collab/members.js';
 import { isLedgerShape, isTimestamp } from '../collab/model.js';
 import { loadMember } from '../collab/store.js';
 import { isMuteShape } from '../collab/mute.js';
+import { isApprovalShape, isJoinsShape } from '../collab/joins.js';
+import { shortSessionId } from '../util/short-id.js';
 import { displayText } from './text.js';
 import { metaViewOf } from './meta.js';
 
@@ -45,6 +51,9 @@ const COUNTER_FILE_NAME = 'counter.json';
 const MUTE_FILE_NAME = 'mute.json';
 const INBOX_FILE_NAME = 'inbox.jsonl';
 const OUTBOX_FILE_NAME = 'outbox.jsonl';
+/* known-hosts.json 同规就地定义：known-hosts.js 的 import 面含写能力（createKnownHosts），只读层
+ * 不引其符号；漂移由测试兜底（夹具以该模块导出的 KNOWN_HOSTS_FILE_NAME 规范常量建立）。 */
+const KNOWN_HOSTS_FILE_NAME = 'known-hosts.json';
 
 /* 本机身份名回退（config.json 缺失/损坏时，发出行作者无从得知——如实标「本机」）。 */
 const FALLBACK_IDENTITY_NAME = '本机';
@@ -449,6 +458,140 @@ function mutedOf(state, base, collabId) {
   return isMuteShape(parsed) ? parsed.muted : false;
 }
 
+/* —— 会话可见面（设计 §1 观察窗：本机获准 / 本机绑定 / 站长获准名单 / 远端发布）—— */
+
+/* 非空文本字段（展示用名）：缺失/空串＝无值（省略字段，呈现端回退别的标识）。 */
+function textFieldOf(value) {
+  return typeof value === 'string' && value !== '' ? value : null;
+}
+
+/* 本机绑定（run/bindings.json，核心单写者原子替换、读到的永远是已提交态）：整档读不出/解析不出/
+ * 顶层非对象＝无源（undefined，呈现端省略该段）；表在场而本协作无条目/条目形态不符＝如实 null
+ * （无接线）。会话标识经短码唯一权威（util/short-id.js）产出对外表示——不就地切片。 */
+function localBoundOf(state, base, collabId) {
+  const parsed = readJsonOrNull(state, bindingsFilePath(base));
+  if (!isPlainObject(parsed)) {
+    return undefined;
+  }
+  const binding = parsed[collabId];
+  if (!isPlainObject(binding) || textFieldOf(binding.sessionId) === null) {
+    return null;
+  }
+  return shortSessionId(binding.sessionId);
+}
+
+/* 加入台账的获准名单（协作目录 joins.json）：整档形态不符＝无源（null，含缺失/损坏——「未就绪」
+ * 是合法呈现态，不告警）；合规档案逐条过 isApprovalShape（坏条丢弃、其余照常——与台账模块的加载
+ * 纪律同源）。只引判据符号；写面 createJoinsStore 一律不引（白名单硬闸）。 */
+function approvalsOf(state, base, collabId) {
+  const parsed = readJsonOrNull(state, joinsFilePath(base, collabId));
+  if (!isJoinsShape(parsed)) {
+    return null;
+  }
+  return parsed.approvals.filter((entry) => isApprovalShape(entry));
+}
+
+/* 远端发布（站点根 known-hosts.json，发现层的学习清单）：逐条取「有合规实例标识且如实携 sessions
+ * 数组」者——字段缺省＝对端未报（整条跳过，不伪造空列表），空数组＝如实报零（保留在场）；同实例
+ * 多条择「最近见过」一条（与单点兜底清单的择新口径同源）。无任何可呈现条目＝无源（null）。 */
+function publishedOf(state, base) {
+  const parsed = readJsonOrNull(state, join(base, KNOWN_HOSTS_FILE_NAME));
+  if (!isPlainObject(parsed) || !Array.isArray(parsed.hosts)) {
+    return null;
+  }
+  const newest = new Map();
+  for (const entry of parsed.hosts) {
+    if (isPublishableEntry(entry)) {
+      keepNewestPerInstance(newest, entry);
+    }
+  }
+  if (newest.size === 0) {
+    return null;
+  }
+  return [...newest.values()].map((held) => publishedEntryOf(held.entry));
+}
+
+/* 可呈现条目：有合规实例标识、且如实携 sessions 数组（缺字段＝对端未报，整条跳过）。 */
+function isPublishableEntry(entry) {
+  return isPlainObject(entry) && Array.isArray(entry.sessions) && hasInstanceId(entry);
+}
+
+/* 同实例择「最近见过」一条（时间戳读不出按最旧参与竞位；同刻先见者留）。 */
+function keepNewestPerInstance(newest, entry) {
+  const seen = typeof entry.lastSeenAt === 'string' ? Date.parse(entry.lastSeenAt) : Number.NaN;
+  const held = newest.get(entry.instanceId);
+  if (held === undefined || seen > held.seen) {
+    newest.set(entry.instanceId, { seen, entry });
+  }
+}
+
+/* 先判 typeof 再 test：ID_PATTERN.test(undefined) 会把字面量 'undefined' 当合法标识。 */
+function hasInstanceId(entry) {
+  return typeof entry.instanceId === 'string' && ID_PATTERN.test(entry.instanceId);
+}
+
+function publishedEntryOf(entry) {
+  const view = {
+    instanceId: entry.instanceId,
+    sessions: entry.sessions.filter((code) => textFieldOf(code) !== null).map(shortSessionId),
+  };
+  const name = textFieldOf(entry.identityName);
+  if (name !== null) {
+    view.identityName = name;
+  }
+  return view;
+}
+
+/* 获准名单条目（站长席位视角）：实例标识＋会话短码；机器名从台账名单补齐（本机已认识该机器时，
+ * 台账即台账/快照的 members 名单），名单查无则省略该字段（呈现端回退实例标识）。 */
+function grantedEntryOf(approval, ledger) {
+  const view = { instanceId: approval.instanceId, sessionId: shortSessionId(approval.sessionId) };
+  const name = rosterNameOf(ledger, approval.instanceId);
+  if (name !== null) {
+    view.identityName = name;
+  }
+  return view;
+}
+
+function rosterNameOf(ledger, instanceId) {
+  if (ledger === null || ledger === undefined || !Array.isArray(ledger.members)) {
+    return null;
+  }
+  for (const member of ledger.members) {
+    if (isPlainObject(member) && member.instanceId === instanceId) {
+      return textFieldOf(member.identityName);
+    }
+  }
+  return null;
+}
+
+/* 会话可见面（设计 §1）：四视图＝本机获准 / 本机绑定 / 站长获准名单 / 远端发布。
+ * 获准名单按席位分派——站长席位（role=manager）的台账即「站长获准名单」（全体批准记录，逐条携
+ * 实例标识）；成员会话机（及参与记录缺失的残骸）的台账即「本机获准名单」（本机哪些会话获准该协作）。
+ * 讨论无批准门（无台账）——不产获准段（不是「未获准」，模式分支在呈现端同样按它走）；绑定与远端
+ * 发布与模式无关。缺数据源则省略该字段（在场而空/null＝如实零/无）；四视图全缺＝整段省略（返回
+ * null，条目与 meta 据此不带该字段——既有夹具无三源，载荷逐字节不变）。 */
+function sessionsOf(state, base, collabId, member, mode, ledger) {
+  const sessions = {};
+  const bound = localBoundOf(state, base, collabId);
+  if (bound !== undefined) {
+    sessions.localBound = bound;
+  }
+  if (mode !== 'forum') {
+    const approvals = approvalsOf(state, base, collabId);
+    if (approvals !== null && member !== null && member.role === 'manager') {
+      sessions.grantedRemote = approvals.map((approval) => grantedEntryOf(approval, ledger));
+    } else if (approvals !== null) {
+      sessions.localGranted = approvals.map((approval) => shortSessionId(approval.sessionId));
+    }
+  }
+  const published = publishedOf(state, base);
+  if (published !== null) {
+    sessions.published = published;
+  }
+  return Object.keys(sessions).length === 0 ? null : sessions;
+}
+
 /* 本机身份名（发出行作者）：读对应根的 config.json，仅 JSON.parse＋字符串守卫——严禁 loadConfig
  * （其损坏分支会改名写盘）；缺失/损坏/空值回退「本机」。 */
 function identityNameOf(state, base) {
@@ -583,12 +726,17 @@ function readMeta(state, root, collabId, after) {
   const { base } = resolved;
   const member = loadMember(base, collabId);
   const posts = readParsedFile(state, collabFilePath(base, collabId, POSTS_FILE_NAME), classifyPostLine);
-  const meta = modeOf(member, posts !== null) === 'forum'
+  const mode = modeOf(member, posts !== null);
+  /* 台账来源在分支前取好一并下发（会话可见面的获准名单同取这份，不再重读）。 */
+  const source = mode === 'forum' ? { ledgerRows: [], skipped: 0 } : ledgerSourceOf(state, base, collabId, member);
+  const meta = mode === 'forum'
     ? forumMetaOf(state, base, collabId, member, posts, after)
-    : managedMetaOf(state, base, collabId, member, after);
-  /* 静音态与模式无关（讨论/协作同面），统一在 meta 组装末尾附加——两个模式分支各自增字段
-   * 会把同一条取数纪律复制两份。 */
-  return { ...meta, muted: mutedOf(state, base, collabId) };
+    : managedMetaOf(state, base, collabId, member, source, after);
+  /* 静音态与会话可见面都与模式无关（讨论/协作同面），统一在 meta 组装末尾附加——两个模式分支各自增
+   * 字段会把同一条取数纪律复制两份。缺源则整段省略（与列表条目同一口径）。 */
+  const muted = mutedOf(state, base, collabId);
+  const sessions = sessionsOf(state, base, collabId, member, mode, lastOf(source.ledgerRows));
+  return sessions === null ? { ...meta, muted } : { ...meta, muted, sessions };
 }
 
 /* 讨论元状态：席面名/态取参与记录（讨论无台账）；成员数＝事件折叠；计数＝合法完整帖行数
@@ -611,9 +759,8 @@ function forumMetaOf(state, base, collabId, member, posts, after) {
 
 /* 协作元状态：席面名/态取 metaViewOf 口径；人数＝台账/快照 members 名单长度（成员席位下是
  * 邀请定格名单，非实时人数——如实呈现）；计数＝累计收到（与会话流不同源：不含发出、且随
- * 文件现行内容走）。 */
-function managedMetaOf(state, base, collabId, member, after) {
-  const source = ledgerSourceOf(state, base, collabId, member);
+ * 文件现行内容走）。台账来源由调用方取好传入（会话可见面同取一份，台账文件不重读）。 */
+function managedMetaOf(state, base, collabId, member, source, after) {
   const ledger = lastOf(source.ledgerRows);
   const view = metaViewOf(ledger, member);
   return {
@@ -692,7 +839,7 @@ function summarizeCollab(state, site, collabId) {
     ? forumSummaryOf(state, site.base, collabId, posts)
     : managedSummaryOf(state, site.base, collabId, member);
   const view = metaViewOf(summary.ledger, member);
-  return {
+  const entry = {
     root: site.root,
     id: collabId,
     name: view === null ? null : view.name,
@@ -703,6 +850,12 @@ function summarizeCollab(state, site, collabId) {
     count: summary.count,
     updatedAt: updatedAtMsOf(state, site.base, collabId),
   };
+  /* 会话可见面：缺数据源则省略整段（列表行与详情成员区都据此不渲染空段）。 */
+  const sessions = sessionsOf(state, site.base, collabId, member, mode, summary.ledger);
+  if (sessions !== null) {
+    entry.sessions = sessions;
+  }
+  return entry;
 }
 
 /* 排序：updatedAt 倒序；同值以 id、再以 root 稳定序（同名 id 出现在两根时顺序仍确定）。 */

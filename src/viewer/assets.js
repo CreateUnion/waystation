@@ -292,6 +292,88 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     loadList();
   }
 
+  /* —— 会话可见面（本机获准/本机绑定、站长获准名单、远端发布）—— */
+
+  /* 机器标识：身份名（台账名单/发现清单可查时）优先，缺失回退实例标识；两者都缺＝空串
+   * （呈现端只在条目有短码时才会拼它）。字段一律 textContent 注入（对端可控）。 */
+  function machineLabelOf(entry) {
+    if (entry === null || entry === undefined) {
+      return '';
+    }
+    if (typeof entry.identityName === 'string' && entry.identityName !== '') {
+      return entry.identityName;
+    }
+    return typeof entry.instanceId === 'string' ? entry.instanceId : '';
+  }
+
+  /* 获准名单条目文本：机器＋会话短码。 */
+  function grantedTextOf(entry) {
+    const label = machineLabelOf(entry);
+    const code = typeof entry.sessionId === 'string' ? entry.sessionId : '';
+    return label === '' ? code : label + ' ' + code;
+  }
+
+  /* 发布条目文本：机器＋会话短码组；空数组＝如实报零（对端报了零会话，与「未报」不同）。 */
+  function publishedTextOf(entry) {
+    const label = machineLabelOf(entry);
+    const codes = Array.isArray(entry.sessions) ? entry.sessions : [];
+    const body = codes.length === 0 ? '0 个会话' : codes.join(' ');
+    return label === '' ? body : label + ' ' + body;
+  }
+
+  /* 列表行会话摘要：本机绑定/获准短码＋站长获准名单（机器＋短码）＋远端发布台数。
+   * 数据面缺源＝该字段不在场（该段不出）；在场而空/null＝如实零/无。全无内容＝整段不出。 */
+  function sessionSummaryOf(sessions) {
+    if (sessions === null || sessions === undefined) {
+      return null;
+    }
+    const parts = [];
+    if (typeof sessions.localBound === 'string' && sessions.localBound !== '') {
+      parts.push('本机绑定 ' + sessions.localBound);
+    }
+    if (Array.isArray(sessions.localGranted)) {
+      parts.push(sessions.localGranted.length === 0 ? '本机获准 0 个会话' : '本机获准 ' + sessions.localGranted.join(' '));
+    }
+    if (Array.isArray(sessions.grantedRemote)) {
+      parts.push(sessions.grantedRemote.length === 0
+        ? '站长获准名单 0 个会话'
+        : '站长获准名单 ' + sessions.grantedRemote.map(grantedTextOf).join('、'));
+    }
+    if (Array.isArray(sessions.published) && sessions.published.length > 0) {
+      parts.push('远端发布 ' + sessions.published.length + ' 台');
+    }
+    return parts.length === 0 ? null : '会话：' + parts.join('｜');
+  }
+
+  /* 详情页会话区（成员机器×会话）：逐段一行——本机绑定/获准、站长获准名单、远端发布。
+   * 缺源（数据面缺字段）＝该行不出；全无内容＝整区不出（与列表行摘要同一省略口径）。 */
+  function sessionsBlockNode(sessions) {
+    if (sessions === null || sessions === undefined) {
+      return null;
+    }
+    const lines = [];
+    if (typeof sessions.localBound === 'string' && sessions.localBound !== '') {
+      lines.push('本机绑定：' + sessions.localBound);
+    }
+    if (Array.isArray(sessions.localGranted)) {
+      lines.push('本机获准：' + (sessions.localGranted.length === 0 ? '0 个会话' : sessions.localGranted.join(' ')));
+    }
+    if (Array.isArray(sessions.grantedRemote)) {
+      lines.push('站长获准名单：' + (sessions.grantedRemote.length === 0 ? '0 个会话' : sessions.grantedRemote.map(grantedTextOf).join('、')));
+    }
+    if (Array.isArray(sessions.published) && sessions.published.length > 0) {
+      lines.push('远端发布：' + sessions.published.map(publishedTextOf).join('、'));
+    }
+    if (lines.length === 0) {
+      return null;
+    }
+    const block = el('div', 'banner-sessions');
+    for (const text of lines) {
+      block.appendChild(el('div', 'session-line', text));
+    }
+    return block;
+  }
+
   /* —— 列表视图 —— */
 
   function countSegmentOf(item) {
@@ -322,6 +404,11 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     row.appendChild(el('span', 'collab-count', countSegmentOf(item)));
     appendText(row, ' — ');
     row.appendChild(el('span', 'collab-updated', stampOf(item.updatedAt)));
+    const sessionText = sessionSummaryOf(item.sessions);
+    if (sessionText !== null) {
+      appendText(row, ' — ');
+      row.appendChild(el('span', 'collab-sessions', sessionText));
+    }
     return row;
   }
 
@@ -381,6 +468,11 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     /* 静音横幅随 meta 每拍重渲：false 时不渲染即天然移除（无需另写撤销路径）。 */
     if (meta.muted === true) {
       dom.banner.appendChild(el('div', 'banner-muted', MUTE_BANNER_TEXT));
+    }
+    /* 会话区同规随 meta 每拍重渲：数据面缺字段/无内容时整区不出。 */
+    const sessions = sessionsBlockNode(meta.sessions);
+    if (sessions !== null) {
+      dom.banner.appendChild(sessions);
     }
   }
 
@@ -858,6 +950,9 @@ button:hover { border-color: var(--accent); }
 /* 静音标记：行内小间距即可，颜色从简（emoji 自带字形色） */
 .collab-muted { margin-left: 0.35rem; font-weight: 400; }
 
+/* 列表行的会话摘要：与既有灰字段同调（机器名/会话短码可长，随行换行） */
+.collab-sessions { color: var(--fg-dim); }
+
 .empty-note { padding: 1.2rem; color: var(--fg-dim); text-align: center; }
 
 /* —— 详情视图 —— */
@@ -880,6 +975,11 @@ button:hover { border-color: var(--accent); }
 
 /* 静音提醒行：与顶栏状态提示同用 --warn（同为「需要注意的运行态」语义） */
 .banner-muted { margin-top: 0.15rem; color: var(--warn); font-size: 0.85rem; font-weight: 400; }
+
+/* 详情页会话区（成员机器×会话）：与主题行同级的弱化补充，一行一段 */
+.banner-sessions { margin-top: 0.15rem; color: var(--fg-dim); font-size: 0.85rem; font-weight: 400; }
+
+.session-line { overflow-wrap: anywhere; }
 
 #detail-body {
   flex: 1;

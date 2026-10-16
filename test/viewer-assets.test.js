@@ -35,6 +35,29 @@ test('客户端脚本：服务端契约锚点齐备', () => {
   assert.ok(!APP_JS.includes('feed-direction'), '方向标（位置已表达方向，冗余）应已移除');
 });
 
+/* 会话可见面的字符串级契约：数据面字段名（sessions 四视图）与四段呈现标签、如实零措辞、
+ * 类锚点——任一侧改名（服务端换字段、客户端换措辞）这里先红。 */
+test('客户端脚本：会话可见面锚点齐备（四视图字段、四段标签与零措辞）', () => {
+  for (const anchor of [
+    'sessions',
+    'localBound',
+    'localGranted',
+    'grantedRemote',
+    'published',
+    '本机绑定',
+    '本机获准',
+    '站长获准名单',
+    '远端发布',
+    '0 个会话',
+    'collab-sessions',
+    'banner-sessions',
+  ]) {
+    assert.ok(APP_JS.includes(anchor), '缺少锚点：' + anchor);
+  }
+  assert.ok(STYLE_CSS.includes('.collab-sessions'), '缺少列表行会话摘要样式');
+  assert.ok(STYLE_CSS.includes('.banner-sessions'), '缺少详情页会话区样式');
+});
+
 test('页面壳：三处挂载点与字号三键齐备', () => {
   for (const id of ['list-view', 'detail-view', 'event-track']) {
     assert.ok(INDEX_HTML.includes('id="' + id + '"'), '缺少挂载点：' + id);

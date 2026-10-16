@@ -235,6 +235,75 @@ test('列表视图：muted 行加 🔇 标记，非静音行无标记', async ()
   assert.ok(!textOf(rows[1]).includes('🔇'), textOf(rows[1]));
 });
 
+test('列表视图：会话摘要段（本机绑定/获准短码、站长获准名单、远端发布台数）；缺段不渲染', async () => {
+  const env = createEnv();
+  await bootList(env, [
+    {
+      root: 'main', id: 'demo', name: '演示', mode: 'managed', state: 'active', memberCount: 2, count: 5, updatedAt: 1760000000000,
+      sessions: {
+        localBound: 'aaaa1111',
+        localGranted: ['bbbb2222'],
+        grantedRemote: [{ instanceId: 'inst-b', identityName: '乙机', sessionId: 'cccc3333' }],
+        published: [{ instanceId: 'inst-c', identityName: '丙机', sessions: ['dddd4444'] }],
+      },
+    },
+    { root: 'main', id: 'plain', name: '素面', mode: 'managed', state: 'active', memberCount: 1, count: 1, updatedAt: 1760000001000 },
+    { root: 'main', id: 'zero', name: '零获准', mode: 'managed', state: 'active', memberCount: 1, count: 1, updatedAt: 1760000002000, sessions: { localBound: null, localGranted: [] } },
+    { root: 'main', id: 'forum', name: '讨论一号', mode: 'forum', state: 'active', memberCount: 1, count: 2, updatedAt: 1760000003000, sessions: { localBound: 'eeee5555' } },
+  ]);
+  const rows = findAll(env.byId['list-view'], 'collab-row');
+  const full = textOf(rows[0]);
+  assert.ok(full.includes('会话：本机绑定 aaaa1111｜本机获准 bbbb2222｜站长获准名单 乙机 cccc3333｜远端发布 1 台'), full);
+  assert.equal(findAll(rows[1], 'collab-sessions').length, 0, '无 sessions 字段＝无摘要段');
+  assert.ok(!textOf(rows[1]).includes('会话：'), textOf(rows[1]));
+  assert.ok(textOf(rows[2]).includes('会话：本机获准 0 个会话'), textOf(rows[2]));
+  assert.ok(!textOf(rows[2]).includes('本机绑定'), '绑定 null＝该段不出：' + textOf(rows[2]));
+  const forum = textOf(rows[3]);
+  assert.ok(forum.includes('会话：本机绑定 eeee5555'), forum);
+  assert.ok(!forum.includes('本机获准') && !forum.includes('站长获准名单'), '讨论无批准门＝不产获准段：' + forum);
+});
+
+test('详情成员区：sessions 四段一行一段（机器标签＋短码、零会话如实零）；缺段不出行、无内容不出区', async () => {
+  const env = createEnv();
+  await bootDetail(env, { rows: [], reset: true, skipped: 0 }, metaBody({
+    sessions: {
+      localBound: 'aaaa1111',
+      grantedRemote: [
+        { instanceId: 'inst-b', identityName: '乙机', sessionId: 'cccc3333' },
+        { instanceId: 'inst-x', sessionId: 'dddd4444' },
+      ],
+      published: [
+        { instanceId: 'inst-c', identityName: '丙机', sessions: ['eeee5555', 'ffff6666'] },
+        { instanceId: 'inst-y', identityName: '丁机', sessions: [] },
+      ],
+    },
+  }));
+  assert.deepEqual(textLines(env.byId['banner'], 'session-line'), [
+    '本机绑定：aaaa1111',
+    '站长获准名单：乙机 cccc3333、inst-x dddd4444',
+    '远端发布：丙机 eeee5555 ffff6666、丁机 0 个会话',
+  ]);
+  const bare = createEnv();
+  await bootDetail(bare, { rows: [], reset: true, skipped: 0 }, metaBody());   // 数据面无该字段
+  assert.equal(findAll(bare.byId['banner'], 'banner-sessions').length, 0, '无 sessions 字段＝整区不出');
+  const empty = createEnv();
+  await bootDetail(empty, { rows: [], reset: true, skipped: 0 }, metaBody({ sessions: { localBound: null } }));
+  assert.equal(findAll(empty.byId['banner'], 'banner-sessions').length, 0, '无内容＝整区不出');
+});
+
+test('详情成员区：机器名与短码按文本注入（不触 innerHTML）', async () => {
+  const env = createEnv();
+  const hostile = '<img src=x onerror=1>';
+  await bootDetail(env, { rows: [], reset: true, skipped: 0 }, metaBody({
+    sessions: { grantedRemote: [{ instanceId: 'inst-b', identityName: hostile, sessionId: 'cccc3333' }] },
+  }));
+  const block = findAll(env.byId['banner'], 'banner-sessions')[0];
+  assert.notEqual(block, undefined);
+  assert.equal(block.innerHTML, null, '会话区非注入面');
+  assert.ok(textOf(block).includes(hostile), '机器名按文本呈现');
+  assert.ok(textOf(block).includes('cccc3333'), '短码按文本呈现');
+});
+
 test('详情首屏：并发发起、横幅、跨日分隔、注入面分界', async () => {
   const env = createEnv();
   await bootDetail(env, {

@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { makeTempDir } from './helpers.js';
 import { createViewerData } from '../src/viewer/data.js';
-import { COLLABS_DIR_NAME, CONFIG_FILE_NAME, SITES_DIR_NAME } from '../src/paths.js';
+import { BINDINGS_FILE_NAME, COLLABS_DIR_NAME, CONFIG_FILE_NAME, JOINS_FILE_NAME, RUN_DIR_NAME, SITES_DIR_NAME } from '../src/paths.js';
+import { KNOWN_HOSTS_FILE_NAME } from '../src/net/known-hosts.js';
 import { POSTS_FILE_NAME } from '../src/collab/posts.js';
 import { MEMBERS_FILE_NAME } from '../src/collab/members.js';
 import { LEDGER_FILE_NAME, MEMBER_FILE_NAME, SNAPSHOT_FILE_NAME } from '../src/collab/store.js';
@@ -903,22 +904,148 @@ test('大文件夹具：1500 行台账与 500 帖的正确性（线性量级，�
   assert.equal(data.readFeed('main', 'big-posts', 'post-249@inst-a').rows.length, 250);
 });
 
+/* —— 会话可见面（sessions 四视图） —— */
+
+/* 会话短码＝会话标识前 8 字符（util/short-id.js 唯一权威）：期望值逐字写死，切片口径漂移即红。
+ * 获准条目的形态以 joins 模块的 isApprovalShape 为契约（instanceId/sessionId 过 ID_PATTERN）。 */
+
+test('sessions：站长席位——本机绑定取绑定表；获准名单取台账（逐条携实例标识，名单名可查时补齐）', (t) => {
+  const dataDir = makeTempDir(t);
+  writeFiles(collabDirIn(dataDir, 'main', 'c-1'), {
+    [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ collabId: 'c-1' })),
+    [LEDGER_FILE_NAME]: jsonl(ledgerOf({ collabId: 'c-1' })),
+    [JOINS_FILE_NAME]: JSON.stringify({
+      v: 1,
+      pendingJoins: [],
+      approvals: [
+        { instanceId: 'inst-b', sessionId: 'abcdef0123456789', origin: 'grant', grantedAt: 1, approvedBy: '甲机' },
+        { instanceId: 'inst-unknown', sessionId: '00112233445566aa', origin: 'grant', grantedAt: 2, approvedBy: '甲机' },
+      ],
+    }),
+  });
+  writeFiles(join(dataDir, RUN_DIR_NAME), {
+    [BINDINGS_FILE_NAME]: JSON.stringify({
+      'c-1': { sessionId: 'deadbeefcafe1234', bridgeId: 'b1', boundAt: 1, origin: 'create' },
+    }),
+  });
+  const entry = createData(dataDir).listCollabs().collabs[0];
+  assert.deepEqual(entry.sessions, {
+    localBound: 'deadbeef',
+    grantedRemote: [
+      { instanceId: 'inst-b', identityName: '乙机', sessionId: 'abcdef01' },   // 名单名从台账名单补齐
+      { instanceId: 'inst-unknown', sessionId: '00112233' },                   // 名单查无＝省略名（呈现端回退实例标识）
+    ],
+  });
+});
+
+test('sessions：成员席位——台账即本机获准（短码列表）；详情 meta 同视图在场', (t) => {
+  const dataDir = makeTempDir(t);
+  writeFiles(collabDirIn(dataDir, 's2', 'c-1'), {
+    [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ collabId: 'c-1', role: 'member', name: '成员乙' })),
+    [SNAPSHOT_FILE_NAME]: JSON.stringify(snapshotOf({ ledger: ledgerOf({ name: '协作乙' }) })),
+    [JOINS_FILE_NAME]: JSON.stringify({
+      v: 1,
+      pendingJoins: [{ instanceId: 'inst-x', sessionId: 'ffffeeee00001111', requestedAt: 3 }],
+      approvals: [{ instanceId: 'inst-me', sessionId: 'aabbcc0011223344', origin: 'grant', grantedAt: 4, approvedBy: '甲机' }],
+    }),
+  });
+  writeFiles(join(dataDir, SITES_DIR_NAME, '2', RUN_DIR_NAME), {
+    [BINDINGS_FILE_NAME]: JSON.stringify({
+      'c-1': { sessionId: '0011aabbccdd2233', bridgeId: 'b2', boundAt: 2, origin: 'grant' },
+    }),
+  });
+  const data = createData(dataDir);
+  const expected = { localBound: '0011aabb', localGranted: ['aabbcc00'] };
+  assert.deepEqual(data.listCollabs().collabs[0].sessions, expected);
+  assert.deepEqual(data.readMeta('s2', 'c-1', null).sessions, expected);   // 详情面同源同形
+  assert.equal(data.readMeta('s2', 'c-2', null), null);                    // 目录缺失不受影响
+});
+
+test('sessions：讨论无批准门——台账在手也不产获准段（不是「未获准」）；绑定照常在场', (t) => {
+  const dataDir = makeTempDir(t);
+  writeFiles(collabDirIn(dataDir, 'main', 'c-forum'), {
+    [POSTS_FILE_NAME]: jsonl(postEntry()),
+    [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ mode: 'forum', collabId: 'c-forum' })),
+    [JOINS_FILE_NAME]: JSON.stringify({
+      v: 1,
+      pendingJoins: [],
+      approvals: [{ instanceId: 'inst-b', sessionId: 'abcdef0123456789', origin: 'grant', grantedAt: 1, approvedBy: '甲机' }],
+    }),
+  });
+  writeFiles(join(dataDir, RUN_DIR_NAME), {
+    [BINDINGS_FILE_NAME]: JSON.stringify({
+      'c-forum': { sessionId: '1234567890abcdef', bridgeId: 'b1', boundAt: 1, origin: 'join' },
+    }),
+  });
+  const entry = createData(dataDir).listCollabs().collabs[0];
+  assert.deepEqual(entry.sessions, { localBound: '12345678' });
+  assert.equal('localGranted' in entry.sessions, false);
+  assert.equal('grantedRemote' in entry.sessions, false);
+});
+
+test('sessions：远端发布——known-hosts 会话短码（同实例择最近见过）；缺字段＝未报整条不出、空数组＝如实零；站点根各读各的', (t) => {
+  const dataDir = makeTempDir(t);
+  writeFiles(collabDirIn(dataDir, 'main', 'c-1'), { [LEDGER_FILE_NAME]: jsonl(ledgerOf({ collabId: 'c-1' })) });
+  writeFiles(collabDirIn(dataDir, 's2', 'c-1'), { [LEDGER_FILE_NAME]: jsonl(ledgerOf({ collabId: 'c-1' })) });
+  writeFileSync(join(dataDir, KNOWN_HOSTS_FILE_NAME), JSON.stringify({
+    version: 2,
+    hosts: [
+      { address: '10.0.0.9', port: 7323, instanceId: 'inst-r1', identityName: '远端甲', lastSeenAt: T0, sessions: ['1111aaaa'] },
+      { address: '10.0.0.9', port: 7333, instanceId: 'inst-r1', identityName: '远端甲', lastSeenAt: tsPlus(5000), sessions: ['1111aaaa', '2222bbbb'] },
+      { address: '10.0.0.10', port: 7323, instanceId: 'inst-r2', identityName: '远端乙', lastSeenAt: T0, sessions: [] },
+      { address: '10.0.0.11', port: 7323, instanceId: 'inst-r3', identityName: '远端丙', lastSeenAt: T0 },
+      { address: '10.0.0.12', port: 7323, instanceId: '', identityName: '无名', lastSeenAt: T0, sessions: ['3333cccc'] },
+    ],
+  }));
+  const byRoot = new Map(createData(dataDir).listCollabs().collabs.map((entry) => [entry.root, entry]));
+  assert.deepEqual(byRoot.get('main').sessions.published, [
+    { instanceId: 'inst-r1', identityName: '远端甲', sessions: ['1111aaaa', '2222bbbb'] },
+    { instanceId: 'inst-r2', identityName: '远端乙', sessions: [] },
+  ]);
+  assert.equal('sessions' in byRoot.get('s2'), false);   // 站点根读自己的 known-hosts.json（无源＝整段省略）
+});
+
+test('sessions：缺数据源则省略（无表/无台账/无清单＝无段）；损坏档案按无源降级；表在场无条目＝null 如实', (t) => {
+  const dataDir = makeTempDir(t);
+  writeFiles(collabDirIn(dataDir, 'main', 'c-bare'), { [LEDGER_FILE_NAME]: jsonl(ledgerOf({ collabId: 'c-bare' })) });
+  writeFiles(collabDirIn(dataDir, 'main', 'c-broken'), {
+    [LEDGER_FILE_NAME]: jsonl(ledgerOf({ collabId: 'c-broken' })),
+    [JOINS_FILE_NAME]: '{不是 JSON',
+  });
+  const bare = new Map(createData(dataDir).listCollabs().collabs.map((entry) => [entry.id, entry]));
+  assert.equal('sessions' in bare.get('c-bare'), false);          // 三源全缺＝整段省略
+  assert.equal('sessions' in bare.get('c-broken'), false);
+  writeFiles(join(dataDir, RUN_DIR_NAME), {
+    [BINDINGS_FILE_NAME]: JSON.stringify({ 'c-else': { sessionId: 'abcdef0123456789' } }),
+  });
+  const partial = new Map(createData(dataDir).listCollabs().collabs.map((entry) => [entry.id, entry]));
+  assert.deepEqual(partial.get('c-bare').sessions, { localBound: null });     // 表在场而本协作无条目＝如实 null
+  assert.deepEqual(partial.get('c-broken').sessions, { localBound: null });   // 损坏台账＝无源（不产空名单）
+  writeFiles(join(dataDir, RUN_DIR_NAME), { [BINDINGS_FILE_NAME]: '{不是 JSON' });
+  const corrupt = new Map(createData(dataDir).listCollabs().collabs.map((entry) => [entry.id, entry]));
+  assert.equal('sessions' in corrupt.get('c-bare'), false);       // 表损坏＝无源
+});
+
 /* —— 只读白名单（静态自证） —— */
 
 test('只读白名单：data.js 的 import 只含白名单符号（防未来漂移）', () => {
   const source = readFileSync(fileURLToPath(new URL('../src/viewer/data.js', import.meta.url)), 'utf8');
-  /* 白名单（设计 §5.2）：store.js 只许 loadMember；model/members/posts 只许判据与折叠纯函数；
-   * protocol.js/paths.js 常量与判据函数；node: 内置只取读取面；两个查看器共享模块只读引用。 */
+  /* 白名单（设计 §5.2）：store.js 只许 loadMember；model/members/posts/joins 只许判据与折叠纯函数；
+   * protocol.js/paths.js 常量与判据函数；util/short-id.js 短码唯一权威；node: 内置只取读取面；
+   * 两个查看器共享模块只读引用。known-hosts.json 的名字在 data.js 就地定义（该模块 import 面含写
+   * 能力 createKnownHosts），夹具以 KNOWN_HOSTS_FILE_NAME 规范常量建立兜底漂移。 */
   const expected = new Map([
     ['node:fs', ['readFileSync', 'readdirSync', 'statSync']],
     ['node:path', ['join']],
-    ['../paths.js', ['COLLABS_DIR_NAME', 'CONFIG_FILE_NAME', 'SITES_DIR_NAME', 'collabDir', 'collabFilePath']],
+    ['../paths.js', ['COLLABS_DIR_NAME', 'CONFIG_FILE_NAME', 'SITES_DIR_NAME', 'bindingsFilePath', 'collabDir', 'collabFilePath', 'joinsFilePath']],
     ['../net/protocol.js', ['ID_PATTERN', 'MAX_MESSAGE_TEXT_CHARS', 'POST_KINDS', 'isIdentityName']],
     ['../collab/posts.js', ['isPostEntryShape']],
     ['../collab/members.js', ['foldMemberEvents', 'isMemberEventShape']],
     ['../collab/model.js', ['isLedgerShape', 'isTimestamp']],
     ['../collab/store.js', ['loadMember']],
     ['../collab/mute.js', ['isMuteShape']],   // 纯判据符号；写面 createMuteStore 不在此列
+    ['../collab/joins.js', ['isApprovalShape', 'isJoinsShape']],   // 同上：纯判据符号；写面 createJoinsStore 不在此列
+    ['../util/short-id.js', ['shortSessionId']],
     ['./text.js', ['displayText']],
     ['./meta.js', ['metaViewOf']],
   ]);
