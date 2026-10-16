@@ -108,7 +108,7 @@ function forumEndpointsOf(mode, local) {
 }
 
 /* 新建台账（v1 proposed；名单 = 本机〔manager〕+ 各目标〔invited〕；模式创建时定死）。
- * 讨论模式的角色名沿用既有结构（发起人 = 本机站长席位）——平权语义与角色重命名归各模式链路
+ * 讨论模式的角色名沿用既有结构（发起人 = 本机 manager 记录）——平权语义与角色重命名归各模式链路
  * 落地阶段，本表只保证 mode 字段随实例走。 */
 function freshLedgerOf(state, name, topic, targets, mode) {
   const now = new Date().toISOString();
@@ -351,7 +351,7 @@ function sendInviteBookkeeping(state, local, wanted, reason) {
   return { delivered: sent.ok === true, msgId: sent.msgId, reason: sent.reason };
 }
 
-/* 决策发帧：先定格 decision（本地状态即真相），再入队；站长端点未知给出明确指引。
+/* 决策发帧：先定格 decision（本地状态即真相），再入队；邀请者端点未知给出明确指引。
  * 拒绝原因按协议呈现判据先行校验（超限 / 换行在入队侧会被拒——不得先定格、后静默失败）。 */
 function sendDecision(state, local, approve, wanted, reason) {
   const validated = validateDeclineReason(approve ? undefined : reason);
@@ -360,7 +360,7 @@ function sendDecision(state, local, approve, wanted, reason) {
   }
   const endpoint = local.endpoints.get(local.member.manager.instanceId);
   if (endpoint === undefined) {
-    return { ok: false, message: '站长端点未知（邀请可能不完整）——请重新扫描后请对方重发邀请' };
+    return { ok: false, message: '邀请者端点未知（邀请可能不完整）——请重新扫描后请对方重发邀请' };
   }
   local.member.decision = wanted;
   persistMember(state, local);
@@ -373,7 +373,7 @@ function sendDecision(state, local, approve, wanted, reason) {
 export function withdrawInvite(state, { collabId, target }) {
   const local = state.collabs.get(collabId);
   if (local === undefined || local.role !== 'manager') {
-    return { ok: false, message: '只有站长席位可以撤回邀请' };
+    return { ok: false, message: '只有站长（讨论为发起人）可以撤回邀请' };
   }
   /* 挂起期明确拒绝（与 sendMessage 同一口径）：撤回含台账写 + 通告面，收敛等待中会被
    * 暂停守卫截成半执行（撤回帧已发、台账未变）——待收敛后再试。 */
@@ -791,7 +791,7 @@ function deliverPostTo(state, local, instanceId, post) {
 export function endCollab(state, { collabId }) {
   const local = state.collabs.get(collabId);
   if (local === undefined || local.role !== 'manager') {
-    /* 讨论的发起人 = 本机站长席位（role 创建时定死）；非发起人（成员记录）一律拒绝并给
+    /* 讨论的发起人 = 本机 manager 记录（role 创建时定死）；非发起人（成员记录）一律拒绝并给
      * 替代动作——成员想离开讨论走 ws_leave_collab（设计 §6「结束权归发起人」）。 */
     const message = local !== undefined && localModeOf(local) === 'forum'
       ? '只有发起人可以结束讨论（结束权归发起人）——成员退出请用 ws_leave_collab'
@@ -1267,7 +1267,7 @@ export function applyFreezeLocally(state, local, reason) {
   return true;
 }
 
-/* 站长席位视角的可投递成员标识（除本机；终态成员——被拒 / 被撤回 / 已退出——不投消息）：
+/* manager 记录视角的可投递成员标识（除本机；终态成员——被拒 / 被撤回 / 已退出——不投消息）：
  * 消息广播与通告的收件人集合；提议中协作的「未回应」成员也在集内（提议中亦可沟通）。 */
 export function memberIdsOf(state, local) {
   if (local.role !== 'manager') {
@@ -1531,7 +1531,7 @@ function payloadOf(type, text) {
   return { text };
 }
 
-/* 站长席位记录（含移交受让与接管恢复的构造面）：roster = 台账定格名单，endpoints 由调用方补。
+/* manager 记录（含移交受让与接管恢复的构造面）：roster = 台账定格名单，endpoints 由调用方补。
  * topic 随记录定格（讨论成员侧发起邀请的取数面；managed 记录同样携带——形态无差别）。 */
 export function managerRecordOf(ledger) {
   return {

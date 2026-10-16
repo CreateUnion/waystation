@@ -96,7 +96,7 @@ export const WS_CREATE_COLLAB_SPEC = {
 
 export const WS_APPROVE_INVITE_SPEC = {
   name: 'ws_approve_invite',
-  description: '对一条待回应邀请表态（同意 = 加入协作；拒绝 = 本条不参与，站长决定继续或取消）',
+  description: '对一条待回应邀请表态（同意 = 加入协作；拒绝 = 本条不参与，邀请方决定继续或取消）',
   inputSchema: {
     type: 'object',
     properties: {
@@ -110,7 +110,7 @@ export const WS_APPROVE_INVITE_SPEC = {
 
 export const WS_WITHDRAW_INVITE_SPEC = {
   name: 'ws_withdraw_invite',
-  description: '撤回邀请（站长，仅提议中）：指定 target 撤回该条；省略 target 整条取消（协作终止）',
+  description: '撤回邀请（站长；讨论为发起人，仅提议中）：指定 target 撤回该条；省略 target 整条取消（协作终止）',
   inputSchema: {
     type: 'object',
     properties: {
@@ -142,7 +142,7 @@ export const WS_SEND_MESSAGE_SPEC = {
       collabId: { type: 'string', description: '协作标识' },
       text: { type: 'string', description: '消息正文（必填，≤4000 字符）' },
       type: { type: 'string', description: '消息类型（可选，缺省 reply；可选值：topic / task / progress / issue / stop / reply）' },
-      to: { type: 'string', description: '目标成员实例标识（站长可选；成员省略即发给站长）' },
+      to: { type: 'string', description: '目标成员实例标识（协作：站长可选；成员省略即发给站长；讨论一律拒绝）' },
     },
     required: ['collabId', 'text'],
   },
@@ -163,7 +163,7 @@ export const WS_SET_MUTE_SPEC = {
 
 export const WS_LEAVE_COLLAB_SPEC = {
   name: 'ws_leave_collab',
-  description: '退出某条协作（本机不再参与；站长收通知并更新台账）——终态数据本地保留',
+  description: '退出某条协作（本机不再参与；协作由站长、讨论由发起人收通知并更新台账）——终态数据本地保留',
   inputSchema: {
     type: 'object',
     properties: {
@@ -175,7 +175,7 @@ export const WS_LEAVE_COLLAB_SPEC = {
 
 export const WS_END_COLLAB_SPEC = {
   name: 'ws_end_collab',
-  description: '结束协作（站长）：全员收到结束通告、各机把终态台账转归档——结束后不再接受任何协作域消息',
+  description: '结束协作（站长；讨论为发起人）：全员收到结束通告、各机把终态台账转归档——结束后不再接受任何协作域消息',
   inputSchema: {
     type: 'object',
     properties: {

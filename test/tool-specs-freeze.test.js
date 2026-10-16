@@ -130,7 +130,12 @@ async function sendMessageDefaultType() {
  * 新增本机段带来的两条描述变更（有意对外变更）：ws_list_hosts 描述补「本机段 self 与同机
  * sameMachine 标注」、ws_list_collabs 描述补「是否静音」——描述同步后按规程整体重冻，md5 由
  * 5f087a6b36bcbdd2ab37ed5fb0fec9c4（改造前基准）更新为 56533a014d0eafc7be51e92f67d85911
- * （10871 字符）；其余 17 项与全部 schema 逐字节未动（本次 diff 只有下方两行描述变化）。 */
+ * （10871 字符）；其余 17 项与全部 schema 逐字节未动（本次 diff 只有下方两行描述变化）。
+ * 站长更名批与讨论侧措辞修的描述变更（有意对外变更）：工具描述统一改称「站长」（10 行），
+ * 五处再作模式精确化（ws_end_collab / ws_withdraw_invite / ws_approve_invite / ws_send_message·to
+ * / ws_leave_collab——补「讨论为发起人」「邀请方」等两模式口径）——按规程重冻，md5 由
+ * 56533a014d0eafc7be51e92f67d85911 更新为 05adcc78fd1add8e83b902b536bd18ae（10893 字符）；
+ * 全部 schema 与结构逐字节未动。 */
 const FROZEN_LIST_JSON = `[
   {
     "name": "ws_status",
@@ -273,7 +278,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_approve_invite",
-    "description": "对一条待回应邀请表态（同意 = 加入协作；拒绝 = 本条不参与，站长决定继续或取消）",
+    "description": "对一条待回应邀请表态（同意 = 加入协作；拒绝 = 本条不参与，邀请方决定继续或取消）",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -298,7 +303,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_withdraw_invite",
-    "description": "撤回邀请（站长，仅提议中）：指定 target 撤回该条；省略 target 整条取消（协作终止）",
+    "description": "撤回邀请（站长；讨论为发起人，仅提议中）：指定 target 撤回该条；省略 target 整条取消（协作终止）",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -352,7 +357,7 @@ const FROZEN_LIST_JSON = `[
         },
         "to": {
           "type": "string",
-          "description": "目标成员实例标识（站长可选；成员省略即发给站长）"
+          "description": "目标成员实例标识（协作：站长可选；成员省略即发给站长；讨论一律拒绝）"
         }
       },
       "required": [
@@ -384,7 +389,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_leave_collab",
-    "description": "退出某条协作（本机不再参与；站长收通知并更新台账）——终态数据本地保留",
+    "description": "退出某条协作（本机不再参与；协作由站长、讨论由发起人收通知并更新台账）——终态数据本地保留",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -400,7 +405,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_end_collab",
-    "description": "结束协作（站长）：全员收到结束通告、各机把终态台账转归档——结束后不再接受任何协作域消息",
+    "description": "结束协作（站长；讨论为发起人）：全员收到结束通告、各机把终态台账转归档——结束后不再接受任何协作域消息",
     "inputSchema": {
       "type": "object",
       "properties": {
