@@ -8,7 +8,9 @@ import { createCounterStore, notifyIndicatorChange } from './counter.js';
 import { createMuteStore, muteSuppresses } from './mute.js';
 import { createInjectedStore } from './injected.js';
 import { createJoinsStore } from './joins.js';
+import { JOIN_REQUEST_RETRY_MAX_MS, JOIN_REQUEST_RETRY_MS, JOIN_REQUEST_TTL_MS, createJoinDomain, resolveJoinTarget } from './join.js';
 import { POST_KINDS } from '../net/protocol.js';
+import { shortSessionId } from '../util/short-id.js';
 import { decideAdmission, SYNC_REQUEST_MAX, SYNC_REQUEST_WINDOW_MS } from './gate.js';
 import { handleEvent } from './events.js';
 import { localModeOf, localNameOf, localRosterOf, localStateOf, persistLedger } from './local.js';
@@ -42,19 +44,40 @@ const INVITE_MIN_INTERVAL_MS = 1000;
  *   pullReplyTimeoutMs?: number, syncMaxRequestsPerCycle?: number, syncMaxSourcesPerCycle?: number,
  *   syncSoftBundleBytes?: number, syncTailPosts?: number, syncTailWindowMs?: number,
  *   syncPeerPicker?: ((context: { collabId: string, candidates: string[] }) => string[] | null) | null,
- *   syncRequestWindowMs?: number, syncRequestMax?: number, joinReplayIntervalsMs?: number[] }} options
+ *   syncRequestWindowMs?: number, syncRequestMax?: number, joinReplayIntervalsMs?: number[],
+ *   bindings?: { set: (collabId: string, binding: object) => unknown, get: (collabId: string) => any,
+ *     entries: () => Array<[string, any]> } | null,
+ *   bridgeIdOf?: ((sessionId: string) => string | null) | null,
+ *   requestJoin?: ((options: object) => Promise<any>) | null,
+ *   requestJoinResolve?: ((options: object) => Promise<any>) | null,
+ *   joinRequestRetryMs?: number, joinRequestRetryMaxMs?: number, now?: () => number }} options
  */
 export function createCollabService(options) {
   const state = buildState(options);
+  state.join = createJoinDomain({
+    state,
+    send: joinSenderOf(state),
+    openViewer: state.openViewer,
+    log: state.log,
+    now: state.clock,
+  });
   loadRegistry(state);
   return apiOf(state);
+}
+
+/* 加入域的发送面（设计 §2）：直投优先——申请与回执不进 outbox 长队列（申请时限短于队列保留期，
+ * 且重发轮由加入域按短节律自理）。直投面未注入＝发送面缺失（加入域如实报错，不静默改走长队列）。 */
+function joinSenderOf(state) {
+  return typeof state.sendDirect === 'function' ? state.sendDirect : null;
 }
 
 function buildState(options) {
   return {
     ...coreStateOf(options),
     ...syncStateOf(options),
+    ...joinStateOf(options),
     ...runtimeMaps(),
+    join: /** @type {any} */ (null),   // 加入域实例（构造步挂上；形态由加入域自定）
     onIndicatorChange: options.onIndicatorChange ?? null,
     probeTimer: null,
     syncTimer: null,
@@ -108,6 +131,22 @@ function pickOption(options, key, fallback) {
   return options[key] ?? fallback;
 }
 
+/* 加入域（会话级加入）的构造选项：申请时限（配置权威在 config，缺省同邀请时限）、重发节律、
+ * 网络注入面（按名解析 / 敲门原语——组合根以闭包接入，运行期才触达）、核心绑定表与桥查取面、
+ * 时钟（时限与记录时刻共用同一基准）。 */
+function joinStateOf(options) {
+  return {
+    joinRequestTtlMs: options.config?.joinRequestTtlMs ?? JOIN_REQUEST_TTL_MS,
+    joinRequestRetryMs: pickOption(options, 'joinRequestRetryMs', JOIN_REQUEST_RETRY_MS),
+    joinRequestRetryMaxMs: pickOption(options, 'joinRequestRetryMaxMs', JOIN_REQUEST_RETRY_MAX_MS),
+    bindings: pickOption(options, 'bindings', null),
+    bridgeIdOf: pickOption(options, 'bridgeIdOf', null),
+    requestJoin: pickOption(options, 'requestJoin', null),
+    requestJoinResolve: pickOption(options, 'requestJoinResolve', null),
+    clock: pickOption(options, 'now', Date.now),
+  };
+}
+
 /* 运行期容器（注册表 / 限频 / 转达集 / 等待面 / 抢接与握手 / 对表与 join 重播状态）。 */
 function runtimeMaps() {
   return {
@@ -127,6 +166,7 @@ function runtimeMaps() {
     syncRotations: new Map(),  // collabId → 对端轮换游标
     joinReplays: new Map(),    // collabId → { timer, attempts }（join 未收敛重播）
     syncRequestWindow: new Map(),   // 来源地址 → 窗口内请求时刻（请求类入站限流）
+    joinRequestWindow: new Map(),   // 来源地址 → 上次受理时刻（加入申请的入站限频，与邀请限频相互独立）
     relayDown: new Set(),      // 中继降级态的 collabId 集（探测不可达置位；恢复检测清除）
   };
 }
@@ -150,6 +190,8 @@ function apiOf(state) {
     create: (input) => createCollab(state, input),
     invite: (input) => inviteMembers(state, input),
     joinKnock: (knock) => handleJoinKnock(state, knock),   // 发现层注入面（UDP 敲门命中 → 成员侧应答与本机放行提示）
+    joinResolve: (input) => resolveJoinTarget(state, input ?? {}),   // 发现层注入面（按名解析的命中回调，组合根接入）
+    join: joinApiOf(state),   // 会话级加入的处置面（工具层落点）
     approve: (input) => approveNow(state, input),
     relayReport: (input) => applyRelayedReport(state, input),   // 网层回报注入面（转达副本达第三档 → 译回原作者）
     withdraw: (input) => withdrawInvite(state, input),
@@ -163,6 +205,17 @@ function apiOf(state) {
     sync: (input) => syncNow(state, input),
     stats: () => statsOf(state),
     close: () => closeService(state),
+  };
+}
+
+/* 会话级加入的处置面（工具层落点）：request＝发起加入（协作申请 / 讨论直连或敲门）、approve＝
+ * 站长批准 / 拒绝、pendingJoinsOf 与 isGranted＝数据面与判据面（后者供核心 adopt 收紧注入）。 */
+function joinApiOf(state) {
+  return {
+    request: (input) => state.join.request(input),
+    approve: (input) => state.join.approve(input),
+    pendingJoinsOf: (collabId) => state.join.pendingJoinsOf(collabId),
+    isGranted: (collabId, sessionId) => state.join.isGranted(collabId, sessionId),
   };
 }
 
@@ -193,12 +246,29 @@ async function consumeFrame(state, frame, meta) {
   try {
     state.counters.eventsHandled++;
     noteContentMessage(state, frame);
-    return await handleEvent(state, frame, meta);
+    const consumed = await handleEvent(state, frame, meta);
+    return consumed === undefined ? joinFrameResult(state, frame) : consumed;
   } catch (error) {
     state.counters.eventFailures++;
     state.log.error('协作事件处理异常（已隔离）', { type: frame?.type, collabId: frame?.collabId, reason: error?.message });
     return undefined;
   }
+}
+
+/* 会话级加入的三帧分派（设计 §2）：事件面先行——端点学习（入站帧的来源地址与端口记入协作端点表）
+ * 是站长侧回执寻址的取数来源，故先走既有事件面再落本域。三帧都只写本地态 / 直投回执，
+ * 异常由消费面统一隔离（同事件面口径）。 */
+function joinFrameResult(state, frame) {
+  if (frame.type === 'join-request') {
+    return state.join.handleJoinRequest(frame);
+  }
+  if (frame.type === 'join-grant') {
+    return state.join.handleJoinGrant(frame);
+  }
+  if (frame.type === 'join-deny') {
+    return state.join.handleJoinDeny(frame);
+  }
+  return undefined;
 }
 
 /* 静音栅栏的判定面（sessionGate 钩子）：判定归服务域（本层掌握模式与静音态），
@@ -454,7 +524,33 @@ function listEntryOf(state, local, now, caller) {
     handshakeUnresolved: local.handshakeUnresolved === true,
     ...inviteViewOf(local, now),
     ...sessionViewOf(state, local, caller),
+    ...pendingJoinsViewOf(state, local),
   };
+}
+
+/* 待批准面（设计 §2/§6，站长侧）：条目 = {instanceId, identityName?, sessionId 短码, requestedAt}。
+ * 会话标识对外只给短码（对外表示一律短码）；身份名缺省即省略（未携名者按短码呈现）。
+ * 取数走加入域的存活面（过期待批准按申请时限剪除）；成员机恒空——待批准面只属站长。
+ * 取数面异常按空面处置（清单不因附属机制失败而失败）。 */
+function pendingJoinsViewOf(state, local) {
+  if (local.role !== 'manager' || typeof state.pendingJoinsOf !== 'function') {
+    return { pendingJoins: [] };
+  }
+  try {
+    return { pendingJoins: state.pendingJoinsOf(local.collabId).map(pendingJoinView) };
+  } catch (error) {
+    state.counters.loadFailures++;
+    state.log.warn('待批准面取数失败（按空面继续）', { collabId: local.collabId, reason: error.message });
+    return { pendingJoins: [] };
+  }
+}
+
+function pendingJoinView(record) {
+  const view = { instanceId: record.instanceId, sessionId: shortSessionId(record.sessionId), requestedAt: record.requestedAt };
+  if (typeof record.identityName === 'string') {
+    view.identityName = record.identityName;
+  }
+  return view;
 }
 
 /* 本会话字段（设计 §6）：获准＝本会话在本机获准台账（joins.json 的 approvals）里，绑定＝绑定表
@@ -649,6 +745,8 @@ function emptyFlowCounters() {
     invitesSent: 0,
     invitesReceived: 0,
     invitesRejected: 0,
+    joinRequestsRejected: 0,  // 加入申请三查的拒绝数（自邀 / 同源限频 / 待批准上限）
+    joinDecisionsRejected: 0, // 加入回执与本机申请台账不匹配（含已过期）的拒绝数
     decisionsSent: 0,
     approvalsIn: 0,
     declinesIn: 0,

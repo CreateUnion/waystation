@@ -699,6 +699,8 @@ function buildContext(state) {
     site: { mode: 'single', slot: null, port: state.port, takeover: false },
     net: state.net,
     collab: state.collab,
+    /* 会话级加入的处置面（ws_join / ws_approve_join 的工具落点）：加入域服务面的直通引用。 */
+    join: state.collab.join,
     startedAt: state.record.startedAt,
     /* 核心的 IPC 端点：ws_status 的 core 字段在场条件（仅核心应答时出现——桥的差错载荷由桥合成）。 */
     coreEndpoint: state.record.endpoint,
@@ -743,19 +745,37 @@ function buildComponents(state) {
     notify: (frame) => state.routing.notify(frame),
     knownHosts,
     log: state.log,
-    /* 观察窗触发 A（建立协作即开该协作页）：单核根恒 main、站点形态 single——判定与出口零改，
-     * 宿主由旧组合根移到核心。 */
+    /* 观察窗触发 A（建立协作即开该协作页）：单核根恒 main、站点形态 single。 */
     viewerRoot: 'main',
-    openViewer: (ref) => openViewerWindow({
-      ref, dataDir: state.dataDir, siteMode: 'single', slot: null, scriptPath: VIEWER_SCRIPT_PATH, log: state.log,
-    }),
+    openViewer: openCollabViewerOf(state),
     /* 指示面变化（内容计数 / 帖 / 成员事件）→ 会话状态文件即时刷新；写面在 IPC 监听步构造，
      * 本回调运行期才触达（LAN 起表到写面构造之间可达——空转护栏）。 */
     onIndicatorChange: () => state.sessionStatus?.refresh(),
+    ...joinWiringOf(state),
   });
   state.net = buildNetStack(state, { knownHosts, transport, dispatch });
   state.registry = registerTools();
   state.context = buildContext(state);
+}
+
+/* 观察窗触发 A 的拉起出口（判定与出口零改，宿主由旧组合根移到核心）：ref 由服务侧给
+ * （{ root, id }——单核根恒 main）。 */
+function openCollabViewerOf(state) {
+  return (ref) => openViewerWindow({
+    ref, dataDir: state.dataDir, siteMode: 'single', slot: null, scriptPath: VIEWER_SCRIPT_PATH, log: state.log,
+  });
+}
+
+/* 会话级加入（设计 §2/§4）的接线面：绑定表直写面（接线＝写绑定，set 即含落盘）、会话桥查取
+ * （绑定的出处记录；会话离线时加入域以会话标识兜底）、按名解析与敲门原语（网络组件在协作服务
+ * 之后构造——闭包运行期才触达，与 notify 注入面同一接法）。 */
+function joinWiringOf(state) {
+  return {
+    bindings: state.routing.bindings,
+    bridgeIdOf: (sessionId) => state.bridges?.find(sessionId)?.bridgeId ?? null,
+    requestJoinResolve: (options) => state.net.requestJoinResolve(options),
+    requestJoin: (options) => state.net.requestJoin(options),
+  };
 }
 
 // 网络装配：把构造好的四组件与钩子接线（注入面经闭包取协作服务——运行期才触达）
@@ -773,6 +793,10 @@ function buildNetStack(state, { knownHosts, transport, dispatch }) {
       /* 会话级可见性：扫描应答的 sessions 短码取自注册桥（与 ws_list_hosts 的本机段同一来源，
        * 运行期现取——注册表在 IPC 监听步才构造，未装配相位如实为空集合）。 */
       activeSessions: () => state.bridges?.sessions() ?? [],
+      /* 按名解析的被问者侧（加入域提供）：按名匹配本机 managed 在册协作——唯一命中给
+       * {found:true, collabId, name}，无匹配 / 同名多义给 {found:false}；本机无解析面（服务未建）
+       * 返回 null ＝ 不应答（发现层缺省语义）。 */
+      onJoinResolve: (request) => state.collab?.joinResolve({ name: request?.name }) ?? null,
     }),
     transport,
     dispatch,
