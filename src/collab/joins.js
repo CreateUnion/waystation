@@ -301,7 +301,10 @@ function clearJoins(state) {
   }
 }
 
-/* 入账申请（同 msgId 幂等）：重试重发沿用同一 msgId，只刷新原记录而不堆行——回执比对按 msgId 命中唯一一条。 */
+/* 入账申请（同 msgId 幂等）：按 msgId 唯一入账（同一份记录重复入账只刷新而不堆行）。
+ * 注：会话级加入的**重发轮换用新 msgId**（发送面每帧生成新标识）——换记录键而不堆行由调用方
+ * 先删旧后入账完成；因此「旧 msgId 的回执」在换键之后不再命中（两端认识分叉窗口：站长按旧帧
+ * 批准时回执会被拒，由申请人按展示重新申请自愈）。 */
 function addApplication(state, record) {
   if (!isJoinApplicationShape(record)) {
     state.counters.corruptRecords++;

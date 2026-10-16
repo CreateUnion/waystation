@@ -164,7 +164,7 @@ function resolvedReplyOf(reply, name, target) {
     return { ok: false, message: `「${name}」的按名解析无应答（目标驿站不可达或未在运行）——稍后重试` };
   }
   if (reply.found !== true) {
-    return { ok: false, message: `目标驿站没有名为「${name}」的协作（名称不符或该协作不在其册内）` };
+    return { ok: false, message: `目标驿站没有名为「${name}」的协作（名称不符或该协作不在其册内）——若要找的是讨论，请不带 target 重试（讨论的加入走敲门广播）` };
   }
   const collabId = idOf(reply.collabId);
   const responder = responderOf(reply.responder, target);
@@ -665,14 +665,14 @@ function knockNoteOf(replies) {
 /* —— 站长侧：申请入站与处置 —— */
 
 /* 申请入站（设计 §2）：写待批准面（含申请帧标识——回执的回带凭据；展示面只取其中四项）。
- * 非站长机器不落（批准权不随数据副本走）；同会话重发＝就地刷新（台账按会话幂等），
+ * 非站长机器不落（批准权不随数据副本走）——但回一支拒绝回执，静默丢弃会让申请人空等至申请时限、
+ * 还把沉默误读成「对端版本不支持」；同会话重发＝就地刷新（台账按会话幂等），
  * 重发带来的新帧标识即最新回执比对键。 */
 function handleJoinRequest(joinState, frame) {
   const collabId = frame.collabId;
   const local = joinState.state.collabs.get(collabId);
   if (!isJoinManager(local)) {
-    joinState.log.warn('加入申请未落待批准面（本机不是该协作的站长）', { collabId, from: frame.from?.instanceId });
-    return null;
+    return refuseForeignJoin(joinState, frame, collabId);
   }
   const ids = joinIdsOf(frame);
   if (ids === null) {
@@ -690,6 +690,26 @@ function handleJoinRequest(joinState, frame) {
 
 function isJoinManager(local) {
   return local !== undefined && local.role === 'manager';
+}
+
+/* 非站长机器收到申请：回一支拒收回执（reason 指路赶站长）——申请人台账里的 managerInstanceId
+ * 恰是应答者实例、reqMsgId 即本帧，回执比对天然命中，24 小时静默空等换成即时可行动拒绝；
+ * 申请人在本机侧经既有拒绝呈现看到原因并清掉申请记录。回不了（来源实例 / 帧标识形态坏、端点
+ * 未知、发送面拒绝）只留痕：申请人仍由申请时限收敛，不因本机补答失败而更糟。 */
+function refuseForeignJoin(joinState, frame, collabId) {
+  const instanceId = idOf(frame.from?.instanceId);
+  joinState.log.warn('加入申请未落待批准面（本机不是该协作的站长）', { collabId, from: instanceId });
+  const reqMsgId = idOf(frame.msgId);
+  const target = instanceId === null ? null : decisionTargetOf(joinState, collabId, instanceId);
+  if (reqMsgId === null || target === null) {
+    return null;
+  }
+  const validated = validateReason('本机不是该协作的站长——请向站长所在实例申请');
+  if (validated.ok !== true) {
+    return null;
+  }
+  const sent = sendFrameOf(joinState, { collabId, target, type: 'join-deny', payload: { reqMsgId, reason: validated.reason } });
+  return sent.ok === true ? { ok: true, action: 'join-refused', collabId } : null;
 }
 
 /* 申请帧的两个标识（形态已由协议层把关，此处只兜注入面与直调的坏形态）。 */
@@ -976,9 +996,11 @@ function storeOf(joinState, collabId) {
 
 /* —— 按名解析（被问者侧：发现层的命中回调注入面） —— */
 
-/* 按名匹配本机 managed 在册协作：唯一命中给 {found:true, collabId, name}；无匹配 / 同名多义给
- * {found:false}（名字对不上唯一一条时，申请人无从判定该进哪一个）；已结束的实例不作命中
- * （不该把人引向必然失败的路）。讨论不在此面：讨论的加入走敲门广播（应答随带 collabId）。
+/* 按名匹配**本机为该协作站长的** managed 在册协作：唯一命中给 {found:true, collabId, name}；
+ * 无匹配 / 同名多义给 {found:false}（名字对不上唯一一条时，申请人无从判定该进哪一个）；已结束的
+ * 实例不作命中（不该把人引向必然失败的路）。**只答站长机**：批准权在站长手（设计 §2「申请经
+ * 网络直投站长」），成员机应答只会把申请人引向一条无人能批的路（申请被丢、重发至时限）。
+ * 讨论不在此面：讨论的加入走敲门广播（应答随带 collabId）。
  * 名字形态非法返回 null＝不应答（缺省面语义；请求形态已由发现层校验，此处只兜底）。 */
 export function resolveJoinTarget(state, input) {
   const name = nameOf(input?.name);
@@ -987,7 +1009,7 @@ export function resolveJoinTarget(state, input) {
   }
   const matched = [];
   for (const local of state.collabs.values()) {
-    if (localModeOf(local) === 'managed' && localNameOf(local) === name && !isLocalArchivedState(local)) {
+    if (local.role === 'manager' && localModeOf(local) === 'managed' && localNameOf(local) === name && !isLocalArchivedState(local)) {
       matched.push(local.collabId);
     }
   }

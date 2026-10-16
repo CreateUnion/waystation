@@ -148,7 +148,9 @@ function remember(state, entry) {
   const sessions = boundedSessions(sessionInput);
   if (sessions !== null) {
     stored.sessions = sessions;
-  } else if (held !== undefined && held.sessions !== undefined) {
+  } else if (held !== undefined && held.sessions !== undefined && held.instanceId === stored.instanceId) {
+    /* 继承限同实例：同键（地址:端口）换主（DHCP 续租 / 重启换实例）时，上一台的会话短码不是
+     * 这一台的情报——键碰撞下不继承（宁缺勿错认）。 */
     stored.sessions = held.sessions;
   }
   const isNewKey = held === undefined;

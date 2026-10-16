@@ -46,5 +46,7 @@ export function hostsTool() {
  * 与「对端没报」必须可区分，不拿空数组冒充满足；有值一律经短码唯一权威产出对外表示
  * （会话标识原样外泄无益，短码即指名的够用粒度）。 */
 function sessionsFieldOf(host) {
-  return Array.isArray(host.sessions) ? { sessions: host.sessions.map(shortSessionId) } : {};
+  return Array.isArray(host.sessions)
+    ? { sessions: host.sessions.map(shortSessionId).filter(Boolean) }
+    : {};
 }

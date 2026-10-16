@@ -114,9 +114,9 @@ function invitePayloadOf(name, topic, roster, mode) {
   return payload;
 }
 
-function inviteFrame({ collabId, manager = peer('inst-a', '主机甲'), name = '联调项目', topic = '发布联调', mode } = {}) {
+function inviteFrame({ collabId, manager = peer('inst-a', '主机甲'), self = peer('inst-self', '本机'), name = '联调项目', topic = '发布联调', mode } = {}) {
   seq++;
-  const roster = [manager, peer('inst-self', '本机')];
+  const roster = [manager, self];
   return {
     v: 1,
     type: 'invite',
@@ -1347,4 +1347,79 @@ test('未在席的批准（站长侧）：入席邀请发送失败＝登记回�
   assert.equal(owner.service.stats().eventMismatch, 0, '补发的邀请在链路上成立（回应被正常收录）');
   assert.equal(ledgerOf(owner.dir, created.collabId).members.find((row) => row.instanceId === 'inst-c').state, 'approved');
   assert.equal(owner.service.list().collabs[0].memberCount, 3);
+});
+/* —— 终审修复轮：按名解析与批准权面匹配 ＋ 非站长机器的可行动拒绝 —— */
+
+test('按名解析只答站长机：仅持成员记录的机器不命中（同名多义 / 无匹配语义不变）', async (t) => {
+  const collabs = new Map([
+    ['collab-m1', memberLocalOf('远端项目')],
+    ['collab-m2', memberLocalOf('重名项目')],
+    ['collab-m3', managerLocalOf('collab-m3', '重名项目')],
+  ]);
+  assert.deepEqual(resolveJoinTarget({ collabs }, { name: '远端项目' }), { found: false }, '成员机不答解析（批准权不在此）');
+  assert.deepEqual(resolveJoinTarget({ collabs }, { name: '重名项目' }), { found: true, collabId: 'collab-m3', name: '重名项目' },
+    '成员行被滤除＝只剩站长机那一条（未滤除时同名两行会判歧义 found:false——本断言即判别面）');
+  const solo = new Map([['collab-m2', memberLocalOf('重名项目')]]);
+  assert.deepEqual(resolveJoinTarget({ collabs: solo }, { name: '重名项目' }), { found: false });
+  const made = makeService(t);
+  const created = made.service.create({ name: '独占项目', topic: '主题', targets: [endpoint('inst-b', '主机乙')] });
+  assert.deepEqual(made.service.joinResolve({ name: '独占项目' }), { found: true, collabId: created.collabId, name: '独占项目' }, '站长机照常命中');
+});
+
+function memberLocalOf(name) {
+  return { role: 'member', member: { name, mode: 'managed', state: 'active' } };
+}
+
+test('非站长机器收到申请：回 join-deny（指路站长）——申请人立即收到拒绝与原因、申请记录清除', async (t) => {
+  /* 成员机：持成员记录（受邀 → 同意入席）。 */
+  const memberMaker = makeService(t, { self: peer('inst-b', '主机乙', 17400) });
+  await receive(memberMaker.service, inviteFrame({ collabId: 'collab-x', manager: peer('inst-a', '主机甲'), self: peer('inst-b', '主机乙', 17400) }), '127.0.0.1');
+  assert.equal((await memberMaker.service.approve({ collabId: 'collab-x', approve: true })).ok, true);
+  /* 申请人：按名解析指向该成员机（运行态里解析面已不答，这里模拟「被引到这里」的历史路径）→ 直投申请。 */
+  const applicant = makeService(t, {
+    self: peer('inst-c', '主机丙', 17600),
+    requestJoinResolve: async () => ({ ok: true, reply: { found: true, collabId: 'collab-x', responder: { instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.1', port: 17400 } } }),
+  });
+  const asked = await applicant.service.join.request({ name: '远端项目', target: { address: '127.0.0.1', port: 17400 }, sessionId: 'newcomer-1' });
+  assert.equal(asked.ok, true, asked.message);
+  const reqMsgId = applicationsOf(applicant.dir)[0].msgId;
+  assert.equal(applicationsOf(applicant.dir)[0].managerInstanceId, 'inst-b', '申请投向应答者实例（成员机）');
+  /* 把同一帧搬给成员机（测试里手工搬送；真实链路上就是这一份）。 */
+  const request = joinRequestFrame('collab-x', 'newcomer-1', peer('inst-c', '主机丙', 17600));
+  request.msgId = reqMsgId;
+  const admitted = await receive(memberMaker.service, request, '127.0.0.3');
+  assert.equal(admitted.ok, true, admitted.reason);
+  const denies = sentOf(memberMaker.direct, 'join-deny');
+  assert.equal(denies.length, 1, '非站长分支回一支拒绝回执（不再静默丢弃）');
+  assert.equal(denies[0].payload.reqMsgId, reqMsgId, '回执携申请帧标识（与申请人台账天然对上）');
+  assert.match(denies[0].payload.reason, /不是该协作的站长/, '原因指路赶站长');
+  assert.deepEqual(denies[0].to, { instanceId: 'inst-c', address: '127.0.0.3', port: 17600 });
+  assert.deepEqual(memberMaker.service.join.pendingJoinsOf('collab-x'), [], '成员机不落待批准面（批准权不随数据副本走）');
+  await applicant.service.hooks.consume(denyFrame('collab-x', reqMsgId, denies[0].payload.reason, peer('inst-b', '主机乙', 17400)), { remoteAddress: '127.0.0.1' });
+  assert.deepEqual(applicationsOf(applicant.dir), [], '拒绝落地即清申请记录（不再空等至时限）');
+  assert.equal(applicant.notices.length, 1);
+  assert.match(applicant.notices[0].payload.text, /不是该协作的站长/, '拒绝原因随本机提示呈现');
+});
+
+test('非站长机器回不了拒绝（来源实例形态坏 / 端点未知）＝只留痕，不抛出', async (t) => {
+  const memberMaker = makeService(t, { self: peer('inst-b', '主机乙', 17400) });
+  await receive(memberMaker.service, inviteFrame({ collabId: 'collab-x', manager: peer('inst-a', '主机甲'), self: peer('inst-b', '主机乙', 17400) }), '127.0.0.1');
+  await memberMaker.service.approve({ collabId: 'collab-x', approve: true });
+  const request = joinRequestFrame('collab-x', 'newcomer-1', peer('inst-c', '主机丙', 17600));
+  await memberMaker.service.hooks.consume(request, { remoteAddress: '' });   // 来源地址缺失＝端点学不到
+  assert.deepEqual(sentOf(memberMaker.direct, 'join-deny'), [], '端点未知＝留在时限收敛面（不抛出）');
+  const broken = joinRequestFrame('collab-x', 'newcomer-1', peer('inst-c', '主机丙', 17600));
+  broken.from = { instanceId: 'bad id!', identityName: '主机丙', port: 17600 };
+  await memberMaker.service.hooks.consume(broken, { remoteAddress: '127.0.0.3' });
+  assert.deepEqual(sentOf(memberMaker.direct, 'join-deny'), [], '来源形态坏＝同样只留痕');
+});
+
+test('解析未命中文案带讨论出路（M4）：指向敲门路径', async (t) => {
+  const made = makeService(t, {
+    requestJoinResolve: async () => ({ ok: true, reply: { found: false } }),
+  });
+  const missed = await made.service.join.request({ name: '某个讨论', target: { address: '127.0.0.2', port: 17500 }, sessionId: 'newcomer-1' });
+  assert.equal(missed.ok, false);
+  assert.match(missed.message, /没有名/);
+  assert.match(missed.message, /讨论的加入走敲门广播/, '补一句讨论出路（落点＝未命中分支——唯一能据以判断「可能找的是讨论」的失败面）');
 });

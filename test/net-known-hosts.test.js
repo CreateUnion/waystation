@@ -306,6 +306,17 @@ test('先应答后探测：探测态 remember（无会话字段）继承既有�
   assert.deepEqual(onDisk.hosts[0].sessions, ['9f8e7d6c'], '继承值落盘（重载不丢）');
 });
 
+test('会话段继承限同实例：同键（地址:端口）换主时不继承上一台的短码', (t) => {
+  const dir = makeTempDir(t);
+  const hosts = createKnownHosts({ dataDir: dir, log: { info: () => {}, error: () => {}, warn: () => {} }, persistMinIntervalMs: 0 });
+  hosts.remember({ address: '10.0.0.9', port: 7321, instanceId: 'inst-a', identityName: '甲', sessions: ['9f8e7d6c5b4a3210'] });
+  hosts.remember({ address: '10.0.0.9', port: 7321, instanceId: 'inst-b', identityName: '乙' });   // 同键换主：探测态（不带会话字段）
+  assert.equal(Object.hasOwn(hosts.list()[0], 'sessions'), false, '键碰撞下不继承（上一台的短码不是这一台的情报）');
+  hosts.remember({ address: '10.0.0.10', port: 7321, instanceId: 'inst-a', identityName: '甲', sessions: ['9f8e7d6c5b4a3210'] });
+  hosts.remember({ address: '10.0.0.10', port: 7321, instanceId: 'inst-a', identityName: '甲' });   // 同键同实例：探测态照旧继承
+  assert.deepEqual(hosts.list().find((entry) => entry.address === '10.0.0.10').sessions, ['9f8e7d6c'], '同实例的探测态仍继承既有短码（回归：守卫不误伤）');
+});
+
 test('无既有会话段的条目：探测态 remember 不臆造空数组（继承不越界为「零会话」）', (t) => {
   const { hosts } = makeHosts(t);
   hosts.remember({ address: '10.0.0.9', port: 7321, instanceId: 'inst-a', identityName: '甲' });

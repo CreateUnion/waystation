@@ -317,6 +317,19 @@ test('ws_list_hosts：远端条目的 sessions 为会话短码；旧版对端无
   assert.deepEqual(hosts[2].sessions, [], '对端如实报零会话：空数组在场（与「没报」区分）');
 });
 
+test('ws_list_hosts：远端会话段的坏元素（非字符串 / 空串）逐项剔除，不留空串占位', async () => {
+  const net = {
+    listHosts: async () => ({
+      ok: true,
+      hosts: [
+        { instanceId: 'inst-mixed', identityName: '混合机', endpoints: [{ address: '127.0.0.5', port: 17321 }], collabCount: 1, lastSeenAt: '2026-10-12T00:00:00.000Z', sessions: ['9f8e7d6c5b4a3210', '', null, 42, 'ab12cd34ef56'] },
+      ],
+    }),
+  };
+  const hosts = JSON.parse((await callTool(hostsTool(), {}, net)).content[0].text).hosts;
+  assert.deepEqual(hosts[0].sessions, ['9f8e7d6c', 'ab12cd34'], '坏元素剔除（短码化产出空串的不留占位）');
+});
+
 test('ws_status：输出含 site 站点块', async () => {
   const net = { status: () => ({ available: true, reason: null, message: '', port: 17321, counters: { discovery: {}, transport: {}, dispatch: {}, inbound: {} } }) };
   const context = contextWith(net);
