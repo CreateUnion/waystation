@@ -379,14 +379,37 @@ function boundCollabIdsOf(state, sessionId) {
   );
 }
 
-/* 绑定表读取：文件不存在（尚未接线）/ 读不出 / 解析不出 / 顶层非对象一律按空表。 */
+/* 绑定表读取：文件不存在（尚未接线）静默按空表；读不出 / 解析不出 / 顶层非对象一律按空表并留痕——
+ * 宽容口径与核心加载面一致（丢它只是不再注入），但核心那次加载之后再被写坏只剩此处现读能察觉，
+ * 不指认就会把全体会话静默误报成未绑定，故按 store 先例计数＋告警。 */
 function readBindings(state) {
+  let text;
   try {
-    const parsed = JSON.parse(readFileSync(bindingsFilePath(state.dataDir), 'utf8'));
-    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? parsed : {};
-  } catch {
+    text = readFileSync(bindingsFilePath(state.dataDir), 'utf8');
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      traceCorruptBindings(state, error.message);
+    }
     return {};
   }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    traceCorruptBindings(state, '无法解析');
+    return {};
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    traceCorruptBindings(state, '形态不符');
+    return {};
+  }
+  return parsed;
+}
+
+/* 损坏留痕：计数＋告警（与核心绑定表加载同一口径——只观测，宽容行为不变）。 */
+function traceCorruptBindings(state, reason) {
+  state.counters.bindingsCorrupt++;
+  state.log.warn('绑定表不可用（按空表继续——会话绑定判定按未绑定）', { reason });
 }
 
 /* 观察面读数（状态栏消息数）：讨论 = 本机全量副本帖数（含回填帖）、协作 = 累计收到的内容消息数。
@@ -708,6 +731,7 @@ function emptyGuardCounters() {
     sessionGateFailures: 0,
     indicatorChangeFailures: 0,
     loadFailures: 0,
+    bindingsCorrupt: 0,       // 读取绑定表遇损坏的留痕（列表会话视角现读——核心加载之后的再次指认面）
     persistFailures: 0,
   };
 }

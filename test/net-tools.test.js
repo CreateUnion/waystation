@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { hostsTool } from '../src/tools/hosts.js';
 import { pingTool } from '../src/tools/ping.js';
@@ -361,14 +361,27 @@ function quietLog() {
   return { info: () => {}, warn: () => {}, error: () => {} };
 }
 
-function realCollabServiceOf(dir) {
+/* 留痕收集器（warn 面断言用；与加入台账用例同款的注入夹具）。 */
+function collectingLog() {
+  const logs = [];
+  return {
+    logs,
+    log: {
+      info: () => {},
+      warn: (message, fields) => logs.push({ message, fields }),
+      error: () => {},
+    },
+  };
+}
+
+function realCollabServiceOf(dir, log = quietLog()) {
   return createCollabService({
     dataDir: dir,
     config: { inviteTtlMs: 24 * 60 * 60 * 1000 },
     self: { instanceId: 'inst-self', identityName: '本机', port: 17321 },
     send: () => ({ ok: true, msgId: 'q-1' }),
     knownHosts: { remember: () => {} },
-    log: quietLog(),
+    log,
     syncPeerPicker: () => [],
   });
 }
@@ -414,17 +427,33 @@ test('ws_list_collabs：sessionGranted / sessionBound 按调用会话判定（�
   assert.equal(sessionless.sessionBound, false);
 });
 
-test('ws_list_collabs：台账未落盘 / 绑定表损坏按空态判否——列表不因读不到台账而失败', async (t) => {
+test('ws_list_collabs：台账未落盘 / 绑定表损坏按空态判否、损坏留痕——列表不因读不到台账而失败', async (t) => {
   const dir = makeTempDir(t);
-  const service = realCollabServiceOf(dir);
+  const collected = collectingLog();
+  const service = realCollabServiceOf(dir, collected.log);
   const created = service.create({ name: '联调项目', topic: '发布联调', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }] });
   const missing = await listEntryFor(service, created.collabId, 'session-a-0123456789');
   assert.equal(missing.sessionGranted, false, '无获准台账＝未获准');
   assert.equal(missing.sessionBound, false, '无绑定表＝未绑定');
+  assert.equal(service.stats().bindingsCorrupt, 0, '无绑定表（尚未接线）：不计损坏');
+  assert.deepEqual(collected.logs.filter((entry) => entry.message.includes('绑定表')), [], '无绑定表：不留损坏痕');
   mkdirSync(runDir(dir), { recursive: true });
   writeFileSync(bindingsFilePath(dir), '{ 坏的 JSON', 'utf8');
   const corrupt = await listEntryFor(service, created.collabId, 'session-a-0123456789');
   assert.equal(corrupt.sessionBound, false, '绑定表读不出＝按空表（只影响注入判定，列表照常出）');
+  assert.equal(service.stats().bindingsCorrupt, 1);
+  assert.ok(collected.logs.some((entry) => entry.message.includes('绑定表不可用') && entry.fields.reason === '无法解析'), '不可解析留痕');
+  writeFileSync(bindingsFilePath(dir), '[1, 2]', 'utf8');
+  const shaped = await listEntryFor(service, created.collabId, 'session-a-0123456789');
+  assert.equal(shaped.sessionBound, false, '顶层非对象＝按空表');
+  assert.equal(service.stats().bindingsCorrupt, 2);
+  assert.ok(collected.logs.some((entry) => entry.fields.reason === '形态不符'), '形态不符留痕');
+  rmSync(bindingsFilePath(dir));
+  mkdirSync(bindingsFilePath(dir), { recursive: true });
+  const unreadable = await listEntryFor(service, created.collabId, 'session-a-0123456789');
+  assert.equal(unreadable.sessionBound, false, '读取失败＝按空表');
+  assert.equal(service.stats().bindingsCorrupt, 3, '非 ENOENT 读故障并入损坏面');
+  assert.ok(collected.logs.some((entry) => typeof entry.fields.reason === 'string' && entry.fields.reason !== ''), '读取失败留痕带上原因');
 });
 
 test('ws_create_collab：name / topic 缺失或空白 → isError，不调服务', async () => {
