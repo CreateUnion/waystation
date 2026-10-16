@@ -41,6 +41,10 @@ const FIELD_RULES = {
   probeTimeoutMs: { check: (value) => Number.isInteger(value) && value >= 100 && value <= 30000, reason: '需为 100–30000 的整数（毫秒）' },
   // 单条邀请的过期标注时限（设计 §6 默认 24 小时；过期仅标注、不改协作状态）
   inviteTtlMs: { check: (value) => Number.isInteger(value) && value >= 1000 && value <= 30 * DAY_MS, reason: '需为 1000–2592000000 的整数（毫秒，上限 30 天）' },
+  // 加入申请的过期时限（设计 §8：缺省同邀请时限 24 小时）——站长侧待批准与发起侧等待回执都按
+  // 申请时刻的年龄与它比对（两侧时间戳同为毫秒整数，做差即比）；申请不经 outbox 长队列（否则先被
+  // messageTtlMs 过期），故本值不参与队列过期判定
+  joinRequestTtlMs: { check: (value) => Number.isInteger(value) && value >= 1000 && value <= 30 * DAY_MS, reason: '需为 1000–2592000000 的整数（毫秒，上限 30 天）' },
   // 失联判定与抢接规程参数（设计 §9「默认 30s」「默认 2 分钟」「默认 30s，可配」的落点；
   // 下界取「实用快节律」——测试与极小网络可用，防的是误配打爆探测定时器）
   managerProbeIntervalMs: { check: (value) => Number.isInteger(value) && value >= 100 && value <= 600000, reason: '需为 100–600000 的整数（毫秒）' },
@@ -96,6 +100,8 @@ export function buildDefaults(hostName, options = {}) {
     dialTimeoutMs: 5000,
     probeTimeoutMs: 1000,
     inviteTtlMs: DAY_MS,
+    // 加入申请的过期时限：缺省同邀请的 24 小时（申请不经 outbox 长队列，不参与队列过期）
+    joinRequestTtlMs: DAY_MS,
     // 失联判定与抢接规程默认值（设计 §9 明文默认）：
     // 对站长周期探测 30s；连续失败累计 2 分钟判失联；抢接收集窗口 30s（自广播起算）；
     // 冻结无裁定 48 小时提示双方（单方处置时限）。

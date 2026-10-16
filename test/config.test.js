@@ -37,6 +37,7 @@ test('buildDefaults：标识名取传入主机名，形状完整', () => {
     'freezeUnresolvedMs',
     'identityName',
     'inviteTtlMs',
+    'joinRequestTtlMs',
     'logDir',
     'logMaxBytes',
     'logMaxFiles',
@@ -293,6 +294,34 @@ test('inviteTtlMs：默认 24 小时、越界回落默认并告警', (t) => {
   assert.equal(config.inviteTtlMs, 24 * 60 * 60 * 1000);
   assert.equal(warnings.length, 1);
   assert.ok(warnings[0].includes('inviteTtlMs'));
+});
+
+test('joinRequestTtlMs：缺省与邀请时限对齐（24 小时）、非法回落默认并告警', (t) => {
+  const defaults = buildDefaults('主机甲');
+  assert.equal(defaults.joinRequestTtlMs, 24 * 60 * 60 * 1000);
+  assert.equal(defaults.joinRequestTtlMs, defaults.inviteTtlMs, '缺省同邀请时限');
+  assert.equal(loadConfig(makeTempDir(t)).config.joinRequestTtlMs, 86400000, '缺文件走默认值');
+  for (const invalid of ['86400000', 999]) {
+    const dir = makeTempDir(t);
+    writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({ joinRequestTtlMs: invalid }));
+    const warnings = [];
+    const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+    assert.equal(config.joinRequestTtlMs, 86400000, JSON.stringify(invalid));
+    assert.equal(warnings.length, 1, JSON.stringify(invalid));
+    assert.ok(warnings[0].includes('joinRequestTtlMs'), JSON.stringify(invalid));
+  }
+});
+
+test('joinRequestTtlMs：边界值 1000 与 2592000000（30 天）取用、超界一格回落', (t) => {
+  // 入账时间戳（requestedAt / sentAt）与它同为毫秒整数、做差即比——取值原样，无单位换算
+  for (const [value, accepted] of [[1000, true], [2592000000, true], [2592000001, false]]) {
+    const dir = makeTempDir(t);
+    writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({ joinRequestTtlMs: value }));
+    const warnings = [];
+    const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+    assert.equal(config.joinRequestTtlMs, accepted ? value : 86400000, String(value));
+    assert.equal(warnings.length, accepted ? 0 : 1, String(value));
+  }
 });
 
 test('managerProbeIntervalMs：默认 30 秒、越界回落默认并告警', (t) => {
