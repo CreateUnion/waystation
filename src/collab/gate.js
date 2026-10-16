@@ -5,7 +5,9 @@ import { forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localR
 /* 入站门控（admit 决策）：invite 与「冲突裁定族」（freeze / unfreeze / decision）不按 collabId
  * 已知性判定（首个接触点 / 跨协作匹配——裁定帧的 collabId 是执行方那条，须按名匹配）；
  * 已知协作按本地状态查白名单；未知 collabId 一律拒绝（沿用接收管线的安全默认语义）。
- * 白名单是「冻结期允许的操作」与「归档后幂等 / 只读类」的机器化（设计 §6/§10）。 */
+ * 白名单是「冻结期允许的操作」与「归档后幂等 / 只读类」的机器化（设计 §6/§10）。
+ * 会话级加入的 join 家族（设计 §2）同在第一梯队，见 admitJoinFamily——回执帧的发起机尚无
+ * 该协作（申请先于入席），未知 collabId 判定不得先吞。 */
 
 const FROZEN_ALLOWED = new Set(['freeze', 'unfreeze', 'decision', 'takeover-init', 'takeover', 'notice', 'snapshot', 'end', 'leave']);
 const ARCHIVED_ALLOWED = new Set(['snapshot', 'notice', 'end', 'leave', 'history-request', 'history-bundle']);
@@ -43,6 +45,10 @@ const SYNC_THROTTLE_TABLE_MAX = 64;
 export function decideAdmission(state, frame, meta) {
   if (frame.type === 'invite') {
     return admitInvite(state, frame, meta);
+  }
+  const joinDecision = admitJoinFamily(state, frame, meta);
+  if (joinDecision !== null) {
+    return joinDecision;
   }
   if (CONFLICT_FRAME_TYPES.has(frame.type)) {
     return admitConflictFrame(state, frame);
@@ -278,5 +284,79 @@ function rememberInviteSource(state, source, now) {
   while (state.inviteWindow.size > INVITE_THROTTLE_TABLE_MAX) {
     const oldest = state.inviteWindow.keys().next().value;
     state.inviteWindow.delete(oldest);
+  }
+}
+
+/* 会话级加入的入站三帧（设计 §2「准入门 join 家族专支」）：join-request 是会话向站长发起的
+ * 加入申请，join-grant / join-deny 是站长对某条申请的回执。回执的凭据是本机申请台账
+ * （run/join-applications.json，「本机确实申请过」只有它说了算——伪造回执无从凭空造获准）；
+ * 且发起机此刻尚无该协作的本地记录（申请先于入席、回执先于入席），故回执帧必须先于未知
+ * collabId 判定，不得被既有链路吞掉。申请帧在本层只做三查（自邀 / 限频 / 上限），受理与否
+ * 仍落既有链路定论（未知 collabId / 冻结 / 讨论实例类型语义不符自然拒）。
+ * 返回 null = 非本族帧，或申请已过三查（交后续链路）。 */
+function admitJoinFamily(state, frame, meta) {
+  if (frame.type === 'join-request') {
+    return admitJoinRequest(state, frame, meta);
+  }
+  if (frame.type === 'join-grant' || frame.type === 'join-deny') {
+    return admitJoinDecision(state, frame);
+  }
+  return null;
+}
+
+/* 申请帧三查（设计 §2）：自邀拒（不得向自己所在实例发申请——本机对本站长协作的申请走本机
+ * 待批准面，不经网络帧）；同源限频（沿邀请限频先例，窗口表独立——邀请与申请互不挤占额度，
+ * 间隔沿用 inviteMinIntervalMs 这一注入旋钮）；待批准上限（沿待回应邀请上限先例，读该协作的
+ * 待批准数——pendingJoinsOf(collabId) 即站长侧接入台账的注入面）。形态（sessionId 过标识
+ * 白名单）已由协议层把关，此处不重验。三查的拒绝计 joinRequestsRejected；三查通过后落既有
+ * 链路的拒绝（未知 collab / 冻结 / 讨论）计各自的既有计数。全过返回 null。 */
+function admitJoinRequest(state, frame, meta) {
+  if (frame.from.instanceId === state.self.instanceId) {
+    state.counters.joinRequestsRejected++;
+    return { ok: false, reason: '加入申请来源为本机（拒绝自邀 / 冒名 from）' };
+  }
+  const source = typeof meta?.remoteAddress === 'string' && meta.remoteAddress !== '' ? meta.remoteAddress : '';
+  const now = Date.now();
+  const lastAt = state.joinRequestWindow.get(source);
+  if (lastAt !== undefined && now - lastAt < state.inviteMinIntervalMs) {
+    state.counters.joinRequestsRejected++;
+    return { ok: false, reason: '加入申请过于频繁（同一来源限频）' };
+  }
+  if (state.pendingJoinsOf(frame.collabId).length >= MAX_PENDING_INVITES) {
+    state.counters.joinRequestsRejected++;
+    return { ok: false, reason: `待批准加入申请已达上限（${MAX_PENDING_INVITES}）——先处置既有申请或等待过期` };
+  }
+  rememberJoinRequestSource(state, source, now);
+  return null;
+}
+
+/* 回执帧的比对（设计 §2）：仅当本机申请台账存在三项逐条相符的记录才受理——collabId 相符、
+ * from.instanceId 即受理该申请的站长实例（managerInstanceId）、payload.reqMsgId 即申请帧的
+ * msgId（台账按它唯一）；且未过期——时效与台账过期剪除同一基准（now - sentAt < 申请时限，
+ * 见加入台账的剪除判据）。时限取 state.joinRequestTtlMs（配置项的注入值——本门全部数值都走
+ * 平铺注入，与邀请限频 / 请求限流同一样式）。无匹配 / 已过期一律拒并计数。
+ * 申请记录不在此移除：回执后的收尾（删记录、接线）归加入域。 */
+function admitJoinDecision(state, frame) {
+  const record = state.joinApplications.list().find((application) =>
+    application.collabId === frame.collabId
+    && application.managerInstanceId === frame.from.instanceId
+    && application.msgId === frame.payload?.reqMsgId);
+  if (record !== undefined && Date.now() - record.sentAt < state.joinRequestTtlMs) {
+    return { ok: true };
+  }
+  state.counters.joinDecisionsRejected++;
+  if (record !== undefined) {
+    return { ok: false, reason: '加入申请已过期——回执不再受理（时限内未收到回执的申请按失效处置）' };
+  }
+  return { ok: false, reason: '与本机加入申请台账不匹配（collabId / 站长实例 / 申请帧标识须逐项相符）——拒绝' };
+}
+
+/* 申请限频记录（键 = 来源地址，与邀请限频同一表容量先例）：插入序淘汰——表满丢最旧。 */
+function rememberJoinRequestSource(state, source, now) {
+  state.joinRequestWindow.delete(source);
+  state.joinRequestWindow.set(source, now);
+  while (state.joinRequestWindow.size > INVITE_THROTTLE_TABLE_MAX) {
+    const oldest = state.joinRequestWindow.keys().next().value;
+    state.joinRequestWindow.delete(oldest);
   }
 }
