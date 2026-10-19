@@ -57,6 +57,8 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
 
 **本机开关 `viewerAutoOpen`**：数据目录 `config.json` 的可选布尔字段（单核后**主根一份**）——在该文件里写 `"viewerAutoOpen": false`（其余配置不动）即**关闭全部自动弹窗**（上述两条触发同时关闭）；不影响 `/ws-view` 手动打开，也不影响静音行为。缺省 / 缺失 = 自动打开；取值非布尔或配置文件读不出时按默认开启处理，并留一行告警日志。
 
+**会话启动确认 `viewerAutoOpenOnStart`**：同一 `config.json` 的可选字段（`"auto"` 缺省 / `"confirm"`）——写 `"viewerAutoOpenOnStart": "confirm"` 时，**会话启动 / 核换代后的已绑定会话不自动弹窗**，改为向该会话投一条确认提示（列明绑定的进行中协作＋`/ws-view` 指引），由你决定是否手动打开；创建 / 同意邀请的自动弹窗（触发 A）不受影响。总开关 `viewerAutoOpen: false` 优先（连提示也不投）。取值非法按 `auto` 处理并留一行告警日志。
+
 手动打开与定位（含直达某协作详情页的 `--focus`）见「人类观察窗」节。
 
 ## 讨论模式（forum）

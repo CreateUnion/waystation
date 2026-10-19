@@ -28,7 +28,7 @@ import { createCoreSessionStatus, indicatedEntriesOf, isIndicatedCollab } from '
 import { ANCHOR_PORT, SLOT_COUNT, tryAcquirePort } from '../site.js';
 import { writeJsonAtomic } from '../storage.js';
 import { rootDigest } from '../util/digest.js';
-import { openViewerOnStart, openViewerWindow } from '../viewer/launch.js';
+import { openViewerOnStart, openViewerWindow, viewerConsentNoticeOf } from '../viewer/launch.js';
 import { IPC_VERSION, createIpcServer, endpointFor, newIpcToken } from './ipc.js';
 import { createInjectionRouter } from './routing.js';
 import {
@@ -464,7 +464,25 @@ function triggerViewerOnStart(state, sessionId) {
     slot: null,
     scriptPath: VIEWER_SCRIPT_PATH,
     log: state.log,
+  }).then((result) => {
+    if (result?.reason === 'confirm') {
+      notifyViewerConsent(state, sessionId, result.collabs);
+    }
   });
+}
+
+/* 触发 B·确认模式（config.viewerAutoOpenOnStart='confirm'）：不自动拉起，向本会话投一条
+ * 确认提示——由用户决定是否运行 /ws-view（或让会话代开）。提示属附属面：投递失败只留痕，
+ * 不影响注册主链（沿 join 域 notifySession 先例）。 */
+function notifyViewerConsent(state, sessionId, collabs) {
+  if (typeof state.routing?.notify !== 'function' || !Array.isArray(collabs) || collabs.length === 0) {
+    return;
+  }
+  try {
+    state.routing.notify(viewerConsentNoticeOf({ collabs, self: state.self, sessionId }));
+  } catch (error) {
+    state.log.warn('观察窗确认提示投递失败（已忽略）', { reason: error?.message });
+  }
 }
 
 /* 本会话绑定集（绑定表逐条 [collabId, binding] 解构按 sessionId 筛——只取数、不判决）。 */

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { makeTempDir } from './helpers.js';
-import { DEFAULT_VIEWER_PORT, openViewerOnStart, openViewerWindow } from '../src/viewer/launch.js';
+import { DEFAULT_VIEWER_PORT, openViewerOnStart, openViewerWindow, viewerConsentNoticeOf } from '../src/viewer/launch.js';
 import { createCollabService } from '../src/collab/service.js';
 import { CONFIG_FILE_NAME } from '../src/paths.js';
 
@@ -283,6 +283,51 @@ test('触发 B：绑定集参数缺失/非数组 → 按空集＋warn 一次，�
   assert.equal(calls.length, 0);
   assert.equal(log.warns.length, 2);
   assert.match(String(log.warns[0]), /绑定集/);
+});
+
+test('触发 B·确认模式（viewerAutoOpenOnStart=confirm）：不拉起，返回进行中清单供核心投确认提示', async (t) => {
+  const home = makeTempDir(t);
+  writeConfig(home, { viewerAutoOpen: true, viewerAutoOpenOnStart: 'confirm' });
+  const { calls, spawnFn } = fakeSpawn();
+  const result = await startCall({ home, collabs: [entryOf('c-1')], boundCollabIds: ['c-1'], probe: async () => null, spawnFn, log: captureLog() });
+  assert.deepEqual(result, { opened: false, reason: 'confirm', collabs: [entryOf('c-1')] });
+  assert.equal(calls.length, 0, '确认模式不拉起观察窗');
+});
+
+test('触发 B·确认模式与总开关：viewerAutoOpen=false 优先（不弹也不投提示）', async (t) => {
+  const home = makeTempDir(t);
+  writeConfig(home, { viewerAutoOpen: false, viewerAutoOpenOnStart: 'confirm' });
+  const { calls, spawnFn } = fakeSpawn();
+  const result = await startCall({ home, collabs: [entryOf('c-1')], boundCollabIds: ['c-1'], probe: async () => null, spawnFn, log: captureLog() });
+  assert.deepEqual(result, { opened: false, reason: 'auto-open-off' });
+  assert.equal(calls.length, 0);
+});
+
+test('触发 B·确认模式非法值：按 auto 回落并留痕（照常拉起）', async (t) => {
+  const home = makeTempDir(t);
+  writeConfig(home, { viewerAutoOpen: true, viewerAutoOpenOnStart: 'ask' });
+  const { calls, spawnFn } = fakeSpawn();
+  const log = captureLog();
+  const result = await startCall({ home, collabs: [entryOf('c-1')], boundCollabIds: ['c-1'], probe: async () => null, spawnFn, log });
+  assert.deepEqual(result, { opened: true });
+  assert.equal(calls.length, 1, '非法值按 auto：照常拉起');
+  assert.equal(log.warns.length, 1, '非法值 warn 一次');
+});
+
+test('确认提示帧：notice/local-alert、定向会话、协作名清单与 /ws-view 指引', () => {
+  const frame = viewerConsentNoticeOf({
+    collabs: [{ collabId: 'c-1', name: '联调项目' }, { collabId: 'c-2', name: '第二协作' }],
+    self: { instanceId: 'inst-self', identityName: '本机', port: 17321 },
+    sessionId: 'session-a',
+  });
+  assert.equal(frame.type, 'notice');
+  assert.equal(frame.collabId, 'c-1');
+  assert.equal(frame.payload.event, 'local-alert');
+  assert.equal(frame.payload.targetSessionId, 'session-a');
+  assert.match(frame.payload.text, /会话已启动/);
+  assert.match(frame.payload.text, /「联调项目」、「第二协作」/);
+  assert.match(frame.payload.text, /观察窗未自动打开/);
+  assert.match(frame.payload.text, /\/ws-view/);
 });
 
 /* —— 触发 A：创建/同意成功点经 openViewer(ref) 落到真实出口 —— */

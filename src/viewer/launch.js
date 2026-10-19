@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join, win32 } from 'node:path';
 import { CONFIG_FILE_NAME } from '../paths.js';
+import { PROTOCOL_VERSION, newMsgId } from '../net/protocol.js';
 
 export { rootDigest } from '../util/digest.js';
 
@@ -259,6 +260,12 @@ const MEMBER_IN_PROGRESS_STATES = ['active', 'frozen'];
 /* viewerAutoOpen 的字段名（config.json，每根一份；缺省/缺失＝true 静默、非法＝true＋warn）。 */
 const AUTO_OPEN_KEY = 'viewerAutoOpen';
 
+/* viewerAutoOpenOnStart 的字段名与取值（config.json，每根一份）：'auto'＝会话启动直接拉起
+ * （缺省）；'confirm'＝不拉起，改为向本会话投一条确认提示，由用户决定是否手动打开。
+ * 总开关 viewerAutoOpen=false 优先（见 openViewerOnStart）。 */
+const AUTO_OPEN_START_KEY = 'viewerAutoOpenOnStart';
+const START_MODES = new Set(['auto', 'confirm']);
+
 /**
  * 站点根在观察窗 URL 里的名字（设计 §3.2 的根映射）：显式数据目录与槽位 1 = 主根 main（槽位 1
  * 即主数据目录本身）；槽位 k≥2 = s<k>；站点解析降级（无站点信息）也记 main——main 是观察窗
@@ -327,6 +334,58 @@ export function readViewerAutoOpen({ dataDir, warn, readFile = readFileSync }) {
 }
 
 /**
+ * viewerAutoOpenOnStart 现读（与 viewerAutoOpen 同一读法：纯 JSON.parse＋取值判定，不写盘）：
+ * 'auto'（缺省/缺失）＝会话启动直接拉起；'confirm'＝先征得用户同意（出口不拉起，核心向本会话
+ * 投一条确认提示）。非法值按缺省 auto 处理并 warn 一次；文件缺失静默按 auto。
+ * @param {{ dataDir: string, warn: (message: string) => void, readFile?: (path: string, encoding: 'utf8') => string }} options
+ * @returns {'auto' | 'confirm'}
+ */
+export function readViewerStartMode({ dataDir, warn, readFile = readFileSync }) {
+  try {
+    const parsed = JSON.parse(readFile(join(dataDir, CONFIG_FILE_NAME), 'utf8'));
+    const value = parsed?.[AUTO_OPEN_START_KEY];
+    if (value === undefined) {
+      return 'auto';
+    }
+    if (START_MODES.has(value)) {
+      return value;
+    }
+    warn('viewerAutoOpenOnStart 值非法（仅 auto/confirm），按默认 auto 处理');
+    return 'auto';
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return 'auto';
+    }
+    warn(`viewerAutoOpenOnStart 不可读（${error.message}），按默认 auto 处理`);
+    return 'auto';
+  }
+}
+
+/**
+ * 触发 B 的「确认模式」提示帧（不拉起观察窗时投给本会话）：列出本会话绑定的进行中协作，
+ * 由用户决定是否手动打开（/ws-view）。帧形态与 join 域的 notifySession 同源（local-alert 本机
+ * 提示＋targetSessionId 定向）——提示是附属面，投递失败不影响注册主链。
+ * @param {{ collabs: Array<{ collabId: string, name?: string }>, self: object, sessionId: string }} options
+ * @returns {object}
+ */
+export function viewerConsentNoticeOf({ collabs, self, sessionId }) {
+  const names = collabs.map((entry) => `「${entry?.name ?? entry?.collabId ?? '?'}」`).join('、');
+  return {
+    v: PROTOCOL_VERSION,
+    type: 'notice',
+    msgId: newMsgId(),
+    from: self,
+    collabId: collabs[0]?.collabId,
+    ts: new Date().toISOString(),
+    payload: {
+      event: 'local-alert',
+      text: `会话已启动：本会话绑定到进行中的协作 ${names}——观察窗未自动打开；需要时运行 /ws-view 打开（或告诉我打开观察窗）。`,
+      targetSessionId: sessionId,
+    },
+  };
+}
+
+/**
  * 触发 B 的「进行中」筛选：遍历注册表条目按角色/状态判定（localStateOf 读出的状态）。
  * 不用 countLiveCollabs——它只给计数、口径含成员侧 proposed，与按角色写死的判定相反。
  * @param {Array<{ collabId: string, role: string, state: string }> | null | undefined} entries
@@ -389,29 +448,57 @@ function boundSetOf(boundCollabIds, log) {
   return new Set(boundCollabIds);
 }
 
+/* 本会话的进行中绑定协作（绑定过滤与进行中过滤一处合成——判定单点）。 */
+function inProgressOf(collabs, boundCollabIds, log) {
+  const bound = boundSetOf(boundCollabIds, log);
+  return inProgressCollabsOf((collabs ?? []).filter((entry) => bound.has(entry.collabId)));
+}
+
+/* 同根观察窗是否已在跑（默认端口段探测＋根摘要比对；别根/他人一律视为未在跑）。 */
+async function viewerRunningOnPorts({ digest, probe }) {
+  const candidatePorts = Array.from({ length: PORT_TRIES }, (_, offset) => DEFAULT_VIEWER_PORT + offset);
+  return (await findSameRootViewer({ candidatePorts, digest, probe })) !== null;
+}
+
+/* 启动动作判定（前置已成立：有进行中绑定协作、同根观察窗未在跑）：确认模式＝不拉起、交回
+ * 进行中清单（核心据此投确认提示）；总开关显式 false＝全关（连提示也不投）；返回 null＝照常拉起。 */
+function startActionOf({ dataDir, inProgress, log }) {
+  const warn = (message) => log.warn(message);
+  if (readViewerStartMode({ dataDir, warn }) !== 'confirm') {
+    return null;
+  }
+  if (readViewerAutoOpen({ dataDir, warn }) === false) {
+    return { opened: false, reason: 'auto-open-off' };
+  }
+  return { opened: false, reason: 'confirm', collabs: inProgress };
+}
+
 /**
  * 新会话启动时的观察窗拉起（触发 B）：判定面＝**本会话绑定面**（源＝2026-10-16 会话级暴露设计）——
  * 本会话绑定的协作 ∩ 进行中（进行中按角色写死，见 inProgressCollabsOf）——0 个不做（新会话无绑定
  * 即此支）；同根观察窗已在跑（默认端口段探测＋根摘要比对；别根/他人一律视为未在跑）不重复弹；未在
- * 跑则恰 1 个开其详情页、≥2 开列表页。绑定过滤与进行中过滤在本出口内一处合成，调用点只取数、不
+ * 跑则按启动动作（startActionOf）：确认模式（viewerAutoOpenOnStart='confirm'）不拉起、交回清单；
+ * 否则恰 1 个开其详情页、≥2 开列表页。绑定过滤与进行中过滤在本出口内一处合成，调用点只取数、不
  * 判决（判据分叉即缺陷）。
  * 判定时点＝桥注册即时、每 sessionId 每核一次：同核内重连/顶替/重生重注册不重判，核换代/重启后
  * 重注册即重判；判定不区分绑定活跃/休眠（那是注入路由的派生状态，与判定面无关）。
  * 绑定集非法（缺失/非数组）按空集处理＋warn 一次：宁不弹——安静是安全侧。绝不抛出，失败静默降级
  * （探测异常同走告警出口）。
  * @param {{ collabs: Array<{ collabId: string, role: string, state: string }> | null | undefined, boundCollabIds: string[], root: string, digest: string, dataDir: string, siteMode?: string | null, slot?: number | null, scriptPath: string, log: { warn: (...args: any[]) => void }, probe?: (options: { port: number }) => Promise<{ root?: string, pid?: number } | null>, spawnFn?: typeof spawn, env?: Record<string, string | undefined> }} options
- * @returns {Promise<{ opened: boolean, reason?: string }>}
+ * @returns {Promise<{ opened: boolean, reason?: string, collabs?: Array<{ collabId: string, role: string, state: string }> }>}
  */
 export async function openViewerOnStart({ collabs, boundCollabIds, root, digest, dataDir, siteMode, slot, scriptPath, log, probe = probeViewer, spawnFn = spawn, env = process.env }) {
   try {
-    const bound = boundSetOf(boundCollabIds, log);
-    const inProgress = inProgressCollabsOf((collabs ?? []).filter((entry) => bound.has(entry.collabId)));
+    const inProgress = inProgressOf(collabs, boundCollabIds, log);
     if (inProgress.length === 0) {
       return { opened: false, reason: 'none' };
     }
-    const candidatePorts = Array.from({ length: PORT_TRIES }, (_, offset) => DEFAULT_VIEWER_PORT + offset);
-    if (await findSameRootViewer({ candidatePorts, digest, probe }) !== null) {
+    if (await viewerRunningOnPorts({ digest, probe })) {
       return { opened: false, reason: 'running' };
+    }
+    const action = startActionOf({ dataDir, inProgress, log });
+    if (action !== null) {
+      return action;
     }
     const ref = inProgress.length === 1 ? { root, id: inProgress[0].collabId } : null;
     return openViewerWindow({ ref, dataDir, siteMode, slot, scriptPath, log, spawnFn, env });

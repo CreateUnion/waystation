@@ -320,11 +320,20 @@ test('整链·触发 A（核心宿主）：建立协作 → 真出口以 single 
 
 /* —— 整链（接线后真件）：真核心进程内起站 + 真 IPC 客户端 —— */
 
-async function startCoreOnTempRoot(t, home) {
-  writeFileSync(join(home, CONFIG_FILE_NAME), JSON.stringify({ port: await pickFreePort(), identityName: '本机', viewerAutoOpen: false }, null, 2));
+async function startCoreOnTempRoot(t, home, configOverrides = {}) {
+  writeFileSync(join(home, CONFIG_FILE_NAME), JSON.stringify({ port: await pickFreePort(), identityName: '本机', viewerAutoOpen: false, ...configOverrides }, null, 2));
   const started = await startCore({ env: { ...process.env, WAYSTATION_HOME: home } });
   assert.equal(started.ok, true, started.message ?? '核心启动');
-  t.after(() => started.core.stop());
+  t.after(() => {
+    try {
+      const stopped = started.core.stop();
+      if (stopped && typeof stopped.catch === 'function') {
+        stopped.catch(() => {});
+      }
+    } catch {
+      // 用例内已显式停核：收尾不重复报错
+    }
+  });
   return { record: JSON.parse(readFileSync(coreJsonPath(home), 'utf8')), core: started.core };
 }
 
@@ -434,6 +443,42 @@ test('整链·观察窗触发记账（真核）：建协触发 A 达出口；未
   await superseder.client.connect();
   await waitFor(() => (guest.closed.length === 1 ? true : null), { timeoutMs: 10000 });
   assert.equal(triggerJudgedCount(home), judgedOnce, '同 sessionId 顶替不重判（不重复开窗判定）');
+});
+
+test('整链·触发 B 确认模式（真核）：已绑定会话注册 → 不拉起、收确认提示帧', { timeout: 90000 }, async (t) => {
+  const home = makeTempDir(t);
+  const confirmConfig = { viewerAutoOpen: true, viewerAutoOpenOnStart: 'confirm' };
+  const live = [];
+  t.after(async () => {
+    for (const entry of live) {
+      await entry.client.close().catch(() => {});
+    }
+  });
+  /* 第一核：建协把 seed 会话写进绑定表（触发 A 照常走出口；测试上下文闸拦下开窗）。 */
+  const first = await startCoreOnTempRoot(t, home, confirmConfig);
+  const peerPort = await pickFreePort();
+  const seed = bridgeClientFor(home, first.record, { bridgeId: 'bridge-confirm-seed', sessionId: 'session-confirm' });
+  live.push(seed);
+  await seed.client.connect();
+  const created = await callAndWait(seed, 'ws_create_collab', {
+    name: '确认模式项目', topic: '主题', targets: [{ instanceId: 'inst-peer', identityName: '对端', address: '127.0.0.1', port: peerPort }],
+  });
+  assert.equal(created.ok, true, created.message);
+  await waitFor(() => (triggerJudgedCount(home) >= 1 ? true : null), { timeoutMs: 10000 });
+  const judgedAfterCreate = triggerJudgedCount(home);
+  await seed.client.close();
+  await first.core.stop();
+  /* 第二核：同 sessionId 重新注册＝已绑定会话首次注册 → 确认模式：不拉起，投确认提示。 */
+  const second = await startCoreOnTempRoot(t, home, confirmConfig);
+  const bound = bridgeClientFor(home, second.record, { bridgeId: 'bridge-confirm-bound', sessionId: 'session-confirm' });
+  live.push(bound);
+  await bound.client.connect();
+  await waitFor(() => (bound.frames.some((frame) => frame.type === 'push' && String(frame.text).includes('观察窗未自动打开')) ? true : null), { timeoutMs: 10000 });
+  const notice = bound.frames.find((frame) => frame.type === 'push' && String(frame.text).includes('观察窗未自动打开'));
+  assert.equal(notice.frameType, 'notice', '确认提示为本机提示帧');
+  assert.match(notice.text, /「确认模式项目」/, '提示携协作名');
+  assert.match(notice.text, /\/ws-view/, '指引手动打开');
+  assert.equal(triggerJudgedCount(home), judgedAfterCreate, '确认模式不拉起（无新出口留痕）');
 });
 
 /* 会话获准台账（joins.json）直落：夺席收紧后，休眠/空绑定下的写类夺席以本机获准台账为判据
