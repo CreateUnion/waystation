@@ -1317,6 +1317,55 @@ test('ws_invite：向既有讨论发邀请帧（模式随载荷、折叠成员�
   assert.equal(entry.mode, 'forum', '模式创建时定死、不可变');
 });
 
+test('ws_invite（managed）：站长可邀请新机器加入既有协作——登记受邀行＋发帧（载荷含目标、可指名）', async (t) => {
+  const { service, sent, dir } = makeService(t);
+  const created = service.create({ name: '协作甲', topic: '主题', targets: [targetOf('b')] });
+  assert.equal(created.ok, true, created.message);
+  sent.length = 0;
+  const target = { ...targetOf('c'), targetSessionId: 'c0ffee12' };
+  const result = await service.invite({ collabId: created.collabId, targets: [target] });
+  assert.equal(result.ok, true, result.message);
+  const invites = sentOf(sent, 'invite', created.collabId);
+  assert.equal(invites.length, 1);
+  assert.equal(invites[0].to.instanceId, 'inst-c');
+  assert.equal(invites[0].payload.mode, 'managed');
+  assert.equal(invites[0].payload.targetSessionId, 'c0ffee12', '指名会话随载荷下发');
+  assert.ok(invites[0].payload.members.some((entry) => entry.instanceId === 'inst-c'), '载荷名单含被邀者（准入判据）');
+  const row = loadLedger(dir, created.collabId).ledger.members.find((entry) => entry.instanceId === 'inst-c');
+  assert.equal(row.state, 'invited', '受邀行先登记（回应守卫要求 invited）');
+  assert.equal(row.role, 'member');
+});
+
+test('ws_invite（managed）：非站长拒绝——成员会话请让目标走 ws_join', async (t) => {
+  const { service } = makeService(t);
+  await receive(service, inviteFrame({ collabId: 'collab-member' }));
+  await service.approve({ collabId: 'collab-member', approve: true });
+  const result = await service.invite({ collabId: 'collab-member', targets: [targetOf('c')] });
+  assert.equal(result.ok, false);
+  assert.match(result.message, /只有站长/);
+});
+
+test('ws_invite（managed）：目标已在有效名单内 → 拒绝（新会话走 ws_join）', async (t) => {
+  const { service } = makeService(t);
+  const created = service.create({ name: '协作乙', topic: '主题', targets: [targetOf('c')] });
+  const result = await service.invite({ collabId: created.collabId, targets: [targetOf('c')] });
+  assert.equal(result.ok, false);
+  assert.match(result.message, /已在协作名单内/);
+  assert.match(result.message, /ws_join/);
+});
+
+test('ws_invite（managed）：终局行重邀翻回 invited（declined → invited）', async (t) => {
+  const { service, dir } = makeService(t);
+  const created = service.create({ name: '协作丙', topic: '主题', targets: [targetOf('c')] });
+  await receive(service, collabFrame('decline', created.collabId, peer('inst-c', '主机c'), {}), '127.0.0.3');
+  const declined = loadLedger(dir, created.collabId).ledger.members.find((entry) => entry.instanceId === 'inst-c');
+  assert.equal(declined.state, 'declined', '先落终局行');
+  const result = await service.invite({ collabId: created.collabId, targets: [targetOf('c')] });
+  assert.equal(result.ok, true, result.message);
+  const revived = loadLedger(dir, created.collabId).ledger.members.find((entry) => entry.instanceId === 'inst-c');
+  assert.equal(revived.state, 'invited', '终局行重邀翻回 invited');
+});
+
 test('ws_invite：16 软约束（邀请侧，数据源=折叠成员表）——16 人拒新邀请；被拒者不占名额', async (t) => {
   /* 数据源勘正（T1 Info4 / T2 审查 Info-6）：名额 = 按事件折叠的成员表（join 者才占位），
    * 创建名单/受邀未加入者/被拒者都不占（旧名单口径下被拒者永久占名额——本用例旧口径必红）。 */
@@ -1354,15 +1403,14 @@ test('ws_invite：16 软约束（邀请侧，数据源=折叠成员表）——1
   assert.equal(capped.service.list().collabs[0].memberCount, 17, '并发补位暂 17 允许（设计 §9 已披露边界）');
 });
 
-test('ws_invite：managed / 未知 / 归档 / 未加入 / 目标形态一律明确拒绝并指引', async (t) => {
+test('ws_invite：未知 / 归档 / 未加入 / 目标形态一律明确拒绝并指引；managed 走站长增员', async (t) => {
   const { service } = makeService(t);
   const managed = service.create({ name: '协作甲', topic: '主题', targets: [targetOf('b')] });
   const onManaged = await service.invite({ collabId: managed.collabId, targets: [targetOf('c')] });
-  assert.equal(onManaged.ok, false);
-  assert.ok(onManaged.message.includes('managed'), onManaged.message);
+  assert.equal(onManaged.ok, true, 'managed 既有协作：站长可邀请新机器（2026-10-19 开放增员）');
   const unknown = await service.invite({ collabId: 'collab-none', targets: [targetOf('c')] });
   assert.equal(unknown.ok, false);
-  assert.ok(unknown.message.includes('没有该讨论'));
+  assert.ok(unknown.message.includes('没有该协作或讨论'), unknown.message);
 
   const collabId = createForum(service);
   const badTargets = await service.invite({ collabId, targets: [] });

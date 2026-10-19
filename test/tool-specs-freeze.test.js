@@ -434,13 +434,13 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_invite",
-    "description": "邀请成员加入既有讨论（对既有讨论发出，重复邀请幂等）——协作（managed）的增员补齐另立任务中，本工具当前仅用于讨论",
+    "description": "邀请成员加入既有讨论（任何成员可发起、重复邀请幂等）或既有协作（仅站长；目标机器不得已在有效名单内——已入席机器的新会话请走 ws_join 申请；终局行可重邀）",
     "inputSchema": {
       "type": "object",
       "properties": {
         "collabId": {
           "type": "string",
-          "description": "讨论标识（取自 ws_list_collabs 的 mode=forum 条目）"
+          "description": "协作 / 讨论标识（取自 ws_list_collabs）"
         },
         "targets": {
           "type": "array",

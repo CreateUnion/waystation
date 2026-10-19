@@ -181,27 +181,32 @@ function freshLedgerOf(state, name, topic, targets, mode) {
   };
 }
 
-/* 邀请成员加入既有的讨论（邀请入口的发送侧）：**任何成员可发起**（平权，设计 §5.1）——
- * 邀请帧复用既有构造、对既有 collabId 发出、重复邀请幂等（本地成员表不由邀请动作改写——
- * 成员关系由加入事件推进）。名单与名额以**折叠成员表**为准（被拒/被撤回者不占名额）；
- * 成员侧的主题等元数据取本地记录（邀请载荷/对表元状态写入的落点——成员侧无主题可取的缺口由此闭合）。 */
+/* 邀请成员加入既有讨论 / 既有协作（邀请入口的发送侧）。两模式权限与名单语义不同：
+ * 讨论＝**任何成员可发起**（平权，设计 §5.1），名单以折叠成员表为准、邀请不改本地成员表；
+ * 协作＝**仅站长可发起**（治理模式），目标机器须不在有效名单内（已入席机器的新会话走 ws_join
+ * 申请、站长批准），受邀行先登记为 invited 再发帧（载荷名单须含目标——被邀者准入判据），
+ * 终局行（declined/withdrawn/left）可重邀翻回 invited。 */
 export function inviteMembers(state, { collabId, targets }) {
   const local = state.collabs.get(collabId);
   if (local === undefined) {
-    return { ok: false, message: '本机没有该讨论（collabId 不存在）——先看 ws_list_collabs' };
-  }
-  if (localModeOf(local) !== 'forum') {
-    return { ok: false, message: `协作模式（${DEFAULT_COLLAB_MODE}）的增员补齐另立任务中——ws_invite 当前仅用于讨论模式` };
+    return { ok: false, message: '本机没有该协作或讨论（collabId 不存在）——先看 ws_list_collabs' };
   }
   if (isLocalArchivedState(local)) {
-    return { ok: false, message: '讨论已结束（或已终止 / 已退出）——不再受理邀请动作' };
-  }
-  if (!selfJoinedOf(local, state.self.instanceId)) {
-    return { ok: false, message: '本机尚未加入该讨论（等待邀请或先回应邀请）——加入为成员后才能邀请他人' };
+    return { ok: false, message: '该协作或讨论已结束（或已终止 / 已退出）——不再受理邀请动作' };
   }
   const targetsRejection = targetsRejectionOf(targets, state.self.instanceId);
   if (targetsRejection !== null) {
     return { ok: false, message: targetsRejection };
+  }
+  return localModeOf(local) === 'forum'
+    ? inviteForumMembers(state, local, targets)
+    : inviteManagedMembers(state, local, targets);
+}
+
+/* 讨论邀请（既有路径保持不变）：任何成员可发起；名额数据源＝折叠成员表（被拒/被撤回者不占名额）。 */
+function inviteForumMembers(state, local, targets) {
+  if (!selfJoinedOf(local, state.self.instanceId)) {
+    return { ok: false, message: '本机尚未加入该讨论（等待邀请或先回应邀请）——加入为成员后才能邀请他人' };
   }
   /* 上限检查点在放行/邀请步之前（设计 §5.6）；名额数据源 = 折叠成员表（含 invited 的旧名单口径
    * 会让被拒者永久占用名额）。 */
@@ -215,11 +220,60 @@ export function inviteMembers(state, { collabId, targets }) {
   const invited = [];
   for (const target of targets) {
     const payload = applyInviteNaming(forumInvitePayloadOf(state, local, topic, targets), target);
-    const result = sendTo(state, collabId, target.instanceId, { address: target.address, port: target.port }, 'invite', payload);
+    const result = sendTo(state, local.collabId, target.instanceId, { address: target.address, port: target.port }, 'invite', payload);
     invited.push({ instanceId: target.instanceId, ok: result.ok === true, msgId: result.msgId, reason: result.reason });
     state.counters.invitesSent++;
   }
-  return { ok: true, collabId, invited };
+  return { ok: true, collabId: local.collabId, invited };
+}
+
+/* 协作增员（站长制）：目标已在有效名单（invited / approved / member）＝如实拒——该机器的新会话
+ * 应走 ws_join 申请（站长批准走 join-grant，不扰动既有成员行）；终局行重邀翻回 invited。 */
+function inviteManagedMembers(state, local, targets) {
+  if (local.role !== 'manager') {
+    return { ok: false, message: '只有站长可以邀请成员加入协作——成员会话请让目标走 ws_join 申请（由站长批准）' };
+  }
+  const activeStates = new Set(['invited', 'approved', 'member']);
+  for (const target of targets) {
+    const held = local.ledger.members.find((entry) => entry.instanceId === target.instanceId);
+    if (held !== undefined && held.role !== 'manager' && activeStates.has(held.state)) {
+      return { ok: false, message: `目标已在协作名单内（${target.identityName ?? target.instanceId}，${held.state}）——其新会话请走 ws_join 申请（或由站长批准）` };
+    }
+  }
+  const additions = targets.filter((target) => !local.ledger.members.some((entry) => entry.instanceId === target.instanceId));
+  if (local.ledger.members.length + additions.length > MAX_COLLAB_MEMBERS) {
+    return { ok: false, message: `协作成员已达上限（${MAX_COLLAB_MEMBERS}）——不再发起新邀请` };
+  }
+  const registered = registerManagedInvites(state, local, targets, new Date().toISOString());
+  if (registered === null) {
+    return { ok: false, message: '受邀登记未落地（台账写入被挂起或失败）——未发邀请，可稍后重试' };
+  }
+  const base = invitePayloadOf(local.ledger, [], null);
+  const invited = [];
+  for (const target of targets) {
+    const payload = applyInviteNaming({ ...base, members: base.members.map((entry) => ({ ...entry })) }, target);
+    const result = sendTo(state, local.collabId, target.instanceId, { address: target.address, port: target.port }, 'invite', payload);
+    invited.push({ instanceId: target.instanceId, ok: result.ok === true, msgId: result.msgId, reason: result.reason });
+    state.counters.invitesSent++;
+  }
+  return { ok: true, collabId: local.collabId, invited };
+}
+
+/* 协作增员的受邀登记：新目标入表为 invited；终局行重邀翻回 invited（非终局行已在上层拒绝）。 */
+function registerManagedInvites(state, local, targets, now) {
+  return mutateLedger(state, local, (ledger) => {
+    for (const target of targets) {
+      const row = ledger.members.find((entry) => entry.instanceId === target.instanceId);
+      if (row === undefined) {
+        ledger.members.push({ instanceId: target.instanceId, identityName: target.identityName, role: 'member', state: 'invited', joinedAt: now });
+        continue;
+      }
+      /* 终局行重邀（2026-10-19 产品裁定）：翻回 invited；非终局行已在上层拒绝。 */
+      row.state = 'invited';
+      row.identityName = target.identityName;
+      row.joinedAt = now;
+    }
+  });
 }
 
 /* 讨论邀请载荷（发送侧公共构造）：名/主题/模式 + **发起人实例标识（中继归属）** +
