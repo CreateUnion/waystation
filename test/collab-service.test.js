@@ -90,6 +90,10 @@ function collabFrame(type, collabId, from, payload) {
   return { v: 1, type, msgId: `msg-${type}-${seq}`, from: { instanceId: from.instanceId, identityName: from.identityName, port: from.port }, collabId, ts: new Date().toISOString(), payload };
 }
 
+function memberOf(dir, collabId) {
+  return JSON.parse(readFileSync(collabFilePath(dir, collabId, MEMBER_FILE_NAME), 'utf8'));
+}
+
 async function receive(service, frame, remoteAddress = '127.0.0.1') {
   const admitted = await service.hooks.admit(frame, { remoteAddress });
   if (admitted?.ok === true) {
@@ -343,6 +347,52 @@ test('decline：拒绝帧携带 reason；decision 定格 declined', async (t) =>
   const frames = sentOf(sent, 'decline', 'collab-9');
   assert.equal(frames.length, 1);
   assert.deepEqual(frames[0].payload, { reason: '人手不足' });
+});
+
+test('重入（成员侧·已拒绝）：managed 再收邀请 → 重新定格提议面（旧决策清空），同意门可再次入席', async (t) => {
+  const { service, dir } = makeService(t);
+  await receive(service, inviteFrame({ collabId: 'collab-rejoin' }));
+  await service.approve({ collabId: 'collab-rejoin', approve: false, reason: '暂时不参与' });
+  assert.equal(memberOf(dir, 'collab-rejoin').decision, 'declined');
+  const rejectedBefore = service.stats().invitesRejected;
+  const admitted = await receive(service, inviteFrame({ collabId: 'collab-rejoin', topic: '重入主题' }));
+  assert.equal(admitted.ok, true, admitted.reason);
+  const member = memberOf(dir, 'collab-rejoin');
+  assert.equal(member.state, 'proposed', '重新定格提议面');
+  assert.equal(member.decision, null, '旧拒绝决策清空（重走同意门）');
+  assert.equal(member.topic, '重入主题', '主题随最新邀请定格');
+  assert.equal(service.stats().invitesRejected, rejectedBefore, '可重入终局不再计入拒绝');
+  const approved = await service.approve({ collabId: 'collab-rejoin', approve: true });
+  assert.equal(approved.ok, true);
+  assert.equal(approved.decision, 'approved', '重入后同意门照常生效');
+});
+
+test('重入（成员侧·已退出）：left 的协作再收邀请 → 清归档标记、重走同意门', async (t) => {
+  const { service, dir } = makeService(t);
+  await receive(service, inviteFrame({ collabId: 'collab-left-rejoin' }));
+  await service.approve({ collabId: 'collab-left-rejoin', approve: true });
+  const left = await service.leave({ collabId: 'collab-left-rejoin' });
+  assert.equal(left.ok, true, left.message);
+  const leftMember = memberOf(dir, 'collab-left-rejoin');
+  assert.equal(leftMember.state, 'left');
+  assert.equal(typeof leftMember.archivedAt, 'string');
+  const admitted = await receive(service, inviteFrame({ collabId: 'collab-left-rejoin', topic: '重入主题' }));
+  assert.equal(admitted.ok, true, admitted.reason);
+  const member = memberOf(dir, 'collab-left-rejoin');
+  assert.equal(member.state, 'proposed', '退出后重新定格提议面');
+  assert.equal('archivedAt' in member, false, '归档标记清除');
+  assert.equal(member.decision, null);
+});
+
+test('重入边界（成员侧）：已加入（active）的 managed 重复邀请照旧拒绝——成员面零变更', async (t) => {
+  const { service, dir } = makeService(t);
+  await receive(service, inviteFrame({ collabId: 'collab-active-again' }));
+  await service.approve({ collabId: 'collab-active-again', approve: true });
+  const before = memberOf(dir, 'collab-active-again');
+  const rejectedBefore = service.stats().invitesRejected;
+  await receive(service, inviteFrame({ collabId: 'collab-active-again' }));
+  assert.equal(service.stats().invitesRejected, rejectedBefore + 1, '非终局重复邀请维持拒绝语义');
+  assert.deepEqual(memberOf(dir, 'collab-active-again'), before, '成员面零变更');
 });
 
 /* —— 站长侧：回应收集与建立 —— */

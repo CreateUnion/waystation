@@ -1,7 +1,8 @@
 import { isIP } from 'node:net';
 import { ID_PATTERN, MAX_REASON_CHARS, PROTOCOL_VERSION, isIdentityName, isPresentationText, newMsgId } from '../net/protocol.js';
 import { createJoinApplicationsStore, createJoinsStore } from './joins.js';
-import { currentManagerIdOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, selfJoinedOf } from './local.js';
+import { currentManagerIdOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, selfJoinedOf } from './local.js';
+import { LOCAL_LEFT_STATE } from './model.js';
 import { endpointFor, invitePayloadOf, mutateLedger } from './outgoing.js';
 import { shortSessionId } from '../util/short-id.js';
 
@@ -195,7 +196,12 @@ async function requestForCollab(joinState, collabId, sessionId, responder) {
     return requestManaged(joinState, sessionId, { collabId, manager: responder });
   }
   if (isLocalArchivedState(local)) {
-    return { ok: false, message: '该协作已结束（或本机已退出）——不再纳新，不能加入' };
+    /* 已退出（left）的协作成员可重新申请（2026-10-19 产品裁定：终局行可再入席，站长批准制）；
+     * 协作本身已结束 / 已终止，或讨论已退出（论坛重入走邀请路径）照旧如实拒。 */
+    const rejoinable = local.role === 'member' && localModeOf(local) === 'managed' && localStateOf(local) === LOCAL_LEFT_STATE;
+    if (!rejoinable) {
+      return { ok: false, message: '该协作已结束（或本机已退出）——不再纳新，不能加入' };
+    }
   }
   if (localModeOf(local) === 'forum') {
     return requestForum(joinState, local, sessionId);
@@ -815,46 +821,68 @@ function completeRemoteGrant(joinState, plan) {
 /* 批准一并完成入席（设计 §2）：申请人机器尚未在册（不在台账名单内）＝先把它登进台账名单为
  * invited、再经既有邀请通道把该机器请进来——受邀准入路径（handleInvite）负责对方本机协作注册
  * 与成员记录，载荷用既有构造（名单取自台账，含被邀者），并指名申请会话（点头权归它；离线时按
- * 既有的指名挂起补投）。机器已在册＝无需入席（新窗口跟进照旧只由批准回执接线）。
+ * 既有的指名挂起补投）。机器已在册且非终局＝无需入席（新窗口跟进照旧只由批准回执接线）；
+ * 终局行（declined / withdrawn / left）＝重邀把该行翻回 invited 再走邀请通道（2026-10-19
+ * 产品裁定：终局行可再入席，站长批准制）。
  * 登记在先使受邀请链路闭环：申请人点头时站长侧按「名单内且 invited」定位回应方（否则按
- * eventMismatch 丢弃、名册永不收录该机器），且「已在册」判据对同机器的新窗口立即成立（不重发）。 */
+ * eventMismatch 丢弃、名册永不收录该机器），且「已在册（非终局）」判据对同机器的新窗口立即成立（不重发）。 */
 function ensureApplicantSeated(joinState, plan) {
   const local = joinState.state.collabs.get(plan.collabId);
-  if (localRosterOf(local).some((entry) => entry.instanceId === plan.pending.instanceId)) {
+  const held = localRosterOf(local).find((entry) => entry.instanceId === plan.pending.instanceId);
+  if (held !== undefined && !isRejoinableMemberState(held.state)) {
     return { ok: true, seated: true };
   }
   const target = decisionTargetOf(joinState, plan.collabId, plan.pending.instanceId);
   if (target === null) {
     return { ok: false, message: `申请人端点未知（${plan.pending.instanceId}）——先 ws_list_hosts 确认对方在线，或让申请人重新申请（入站帧会带来端点）` };
   }
+  /* 终局行重邀的回滚快照：投递失败时恢复原终局行（不是删行——历史不得因重试丢失）。 */
+  const previous = held === undefined ? null : { ...held };
   if (!registerInvitedMember(joinState, local, plan.pending)) {
     return { ok: false, message: '受邀登记未落地（台账写入被暂停或失败）——未落处置，可稍后重试' };
   }
   const payload = { ...invitePayloadOf(local.ledger), targetSessionId: plan.pending.sessionId };
   const sent = sendFrameOf(joinState, { collabId: plan.collabId, target, type: 'invite', payload });
   if (sent.ok !== true) {
-    rollbackInvitedMember(joinState, local, plan.pending);
+    rollbackInvitedMember(joinState, local, plan.pending, previous);
     return { ok: false, message: `入席邀请发送失败：${sent.reason}——未落处置，可稍后重试` };
   }
   joinState.state.counters.invitesSent++;
   return { ok: true, seated: false };
 }
 
+/* 可重入的终局行（2026-10-19 产品裁定：终止行可再入席，站长批准制）：重邀把该行翻回 invited，
+ * 对方同意后照常经回应守卫入席。非终局行（invited / approved / member）不重写。 */
+const REJOINABLE_MEMBER_STATES = new Set(['declined', 'withdrawn', 'left']);
+
+function isRejoinableMemberState(state) {
+  return REJOINABLE_MEMBER_STATES.has(state);
+}
+
 /* 受邀登记（创建流同形：role:'member' ＋ state:'invited' ＋ joinedAt，经台账写面落地并推快照）。
- * 已在名单（任何状态）不重写——既有行的终局（approved / member / left / declined）不得被翻转。
+ * 已在名单且非终局不重写（approved / member 不得被翻转）；终局行（declined / withdrawn / left）
+ * 重邀时翻回 invited（用户裁定放开的再入席路径）。
  * 返回是否已登记（写面被挂起 / 失败返回 false：调用方据此不投邀请，免得对方点头被拒）。 */
 function registerInvitedMember(joinState, local, pending) {
-  if (localRosterOf(local).some((entry) => entry.instanceId === pending.instanceId)) {
+  const held = localRosterOf(local).find((entry) => entry.instanceId === pending.instanceId);
+  if (held !== undefined && !isRejoinableMemberState(held.state)) {
     return true;
   }
   const registered = mutateLedger(joinState.state, local, (ledger) => {
-    ledger.members.push({
-      instanceId: pending.instanceId,
-      identityName: applicantNameOf(pending),
-      role: 'member',
-      state: 'invited',
-      joinedAt: new Date(joinState.now()).toISOString(),
-    });
+    const row = ledger.members.find((entry) => entry.instanceId === pending.instanceId);
+    if (row === undefined) {
+      ledger.members.push({
+        instanceId: pending.instanceId,
+        identityName: applicantNameOf(pending),
+        role: 'member',
+        state: 'invited',
+        joinedAt: new Date(joinState.now()).toISOString(),
+      });
+      return;
+    }
+    row.state = 'invited';
+    row.identityName = applicantNameOf(pending);
+    row.joinedAt = new Date(joinState.now()).toISOString();
   });
   if (registered === null) {
     joinState.log.warn('受邀登记未落地（台账写被挂起）', { collabId: local.collabId, instanceId: pending.instanceId });
@@ -865,11 +893,31 @@ function registerInvitedMember(joinState, local, pending) {
 
 /* 受邀登记回滚（邀请投递失败的收口）：摘除刚写入的 invited 行——登记先于投递，若留着这条孤儿行，
  * 「已在册」判据会让**重试**直接跳过邀请、只发出授权回执（申请人拿不到邀请却收到一发即落的回执
- * ＝悬空端态，正是该判据要防的那条路）。只摘 invited 行：回滚只面对自己刚写的那一条，已回应 /
- * 已入席的终局行不得翻转。摘除失败如实告警（不静默——孤儿行会让后续重试全部跳过邀请）。 */
-function rollbackInvitedMember(joinState, local, pending) {
+ * ＝悬空端态，正是该判据要防的那条路）。新登记行摘除；终局行重邀（previous 非空）还原原行——
+ * 回滚只面对自己刚写的那一条，历史不得因一次投递失败丢失。回滚失败如实告警（不静默——孤儿行
+ * 会让后续重试全部跳过邀请）。 */
+/**
+ * @param {any} joinState
+ * @param {any} local
+ * @param {any} pending
+ * @param {object | null} [previous]
+ */
+function rollbackInvitedMember(joinState, local, pending, previous = null) {
   const held = local.ledger.members.find((entry) => entry.instanceId === pending.instanceId);
-  if (held === undefined || held.state !== 'invited') {
+  if (held === undefined) {
+    return true;
+  }
+  if (previous !== null) {
+    const restored = mutateLedger(joinState.state, local, (ledger) => {
+      ledger.members = ledger.members.map((entry) => (entry.instanceId === pending.instanceId ? { ...previous } : entry));
+    });
+    if (restored === null) {
+      joinState.log.warn('受邀登记回滚失败（台账写被挂起）——重试可能跳过邀请，请核对名册', { collabId: local.collabId, instanceId: pending.instanceId });
+      return false;
+    }
+    return true;
+  }
+  if (held.state !== 'invited') {
     return true;
   }
   const rolled = mutateLedger(joinState.state, local, (ledger) => {

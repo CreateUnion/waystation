@@ -1,12 +1,12 @@
 import { DEFAULT_COLLAB_MODE, isPort } from '../net/protocol.js';
-import { MAX_BOARD_ENTRIES, isSnapshotShape } from './model.js';
+import { LOCAL_LEFT_STATE, MAX_BOARD_ENTRIES, isSnapshotShape } from './model.js';
 import { createPostsStore } from './posts.js';
 import { createMembersStore } from './members.js';
 import { createCounterStore, notifyIndicatorChange } from './counter.js';
 import { createMuteStore } from './mute.js';
 import { createInjectedStore } from './injected.js';
 import { ledgerDigest } from './store.js';
-import { isLocalArchivedState, localModeOf, persistMember, persistSnapshot, rememberKnownHost, selfJoinedOf } from './local.js';
+import { isLocalArchivedState, localModeOf, localStateOf, persistMember, persistSnapshot, rememberKnownHost, selfJoinedOf } from './local.js';
 import { matchConflictCollabs, noteForumGovernanceIgnored } from './gate.js';
 import { applyEndpoint, applyFreezeLocally, broadcastFreeze, governanceTargets, memberIdsOf, mutateLedger, relayGovernance, relayRedistribute, selfIsRelay, sendTo, stopJoinReplay } from './outgoing.js';
 import { applyIncomingJoin, applyIncomingLeave, handleHistoryBundle, handleHistoryRequest } from './sync.js';
@@ -142,20 +142,47 @@ function handleInvite(state, frame, meta) {
   persistMember(state, local);
 }
 
-/* 同 collabId 再次邀请（讨论）：就地互认——已加入者只学端点（重复 join 由事件日志幂等吸收）；
- * 未加入者（含已拒绝、已过期、已退出重入）重新定格提议面（新有效期、最新名单与主题），
- * 事件日志与帖子原样保留（重入回填按同步游标续拉）。 */
+/* 同 collabId 再次邀请（讨论与可重入的协作共用）：讨论＝就地互认——已加入者只学端点（重复 join
+ * 由事件日志幂等吸收）；未加入者（含已拒绝、已过期、已退出重入）重新定格提议面（新有效期、最新
+ * 名单与主题），事件日志与帖子原样保留（重入回填按同步游标续拉）。协作（managed）仅在本地参与
+ * 处于可重入终局（已退出 / 已拒绝 / 已撤回）时受理重邀，重走同意门；其余重复邀请照旧拒绝。 */
 function receiveRepeatInvite(state, existing, frame, meta) {
-  if (localModeOf(existing) !== 'forum' || (frame.payload.mode ?? DEFAULT_COLLAB_MODE) !== 'forum') {
-    state.counters.invitesRejected++;
-    return;
-  }
+  const localMode = localModeOf(existing);
+  const incomingMode = frame.payload.mode ?? DEFAULT_COLLAB_MODE;
   learnInviteSource(state, existing, frame, meta);
   learnInviteEndpoints(state, existing, frame);
-  state.counters.invitesReceived++;
-  if (selfJoinedOf(existing, state.self.instanceId)) {
-    return;   // 已加入：邀请幂等（并集吸收），不动本地成员面
+  if (localMode === 'forum' && incomingMode === 'forum') {
+    state.counters.invitesReceived++;
+    if (selfJoinedOf(existing, state.self.instanceId)) {
+      return;   // 已加入：邀请幂等（并集吸收），不动本地成员面
+    }
+    resetProposedRecord(state, existing, frame);
+    return;
   }
+  if (localMode === 'managed' && incomingMode === 'managed' && isRejoinableMember(existing)) {
+    /* 终局行可再入席（2026-10-19 产品裁定）：重邀重新定格提议面，是否入席仍由同意门决定。 */
+    state.counters.invitesReceived++;
+    resetProposedRecord(state, existing, frame);
+    return;
+  }
+  state.counters.invitesRejected++;
+}
+
+/* 可重入的本地终局：成员记录已退出（left），或邀请决策已拒绝 / 已撤回——重邀重新定格提议面。
+ * 站长记录不在此列（协作由站长本机持有，重邀无意义）；已加入（approved）不重入。 */
+function isRejoinableMember(existing) {
+  if (existing.role !== 'member') {
+    return false;
+  }
+  if (localStateOf(existing) === LOCAL_LEFT_STATE) {
+    return true;
+  }
+  return existing.member.decision === 'declined' || existing.member.decision === 'withdrawn';
+}
+
+/* 提议面重定格（讨论重入与协作可重入共用）：新有效期、最新名单 / 主题 / 邀请者引用；退出标记
+ * 清除，事件日志 / 帖子 / 输出队列原样保留（重入按同步游标续拉）。 */
+function resetProposedRecord(state, existing, frame) {
   const now = new Date().toISOString();
   existing.member.state = 'proposed';
   existing.member.decision = null;

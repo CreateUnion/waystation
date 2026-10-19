@@ -553,6 +553,13 @@ function grantedEntryOf(approval, ledger) {
   return view;
 }
 
+/* 站长机本机实例标识（member.manager.instanceId）：站长记录即本机持有协作；形态不符＝未知
+ * （省略本机获准段——宁缺勿错判本机归属）。 */
+function managerInstanceIdOf(member) {
+  const manager = member.manager;
+  return isPlainObject(manager) && hasInstanceId(manager) ? manager.instanceId : null;
+}
+
 function rosterNameOf(ledger, instanceId) {
   if (ledger === null || ledger === undefined || !Array.isArray(ledger.members)) {
     return null;
@@ -580,7 +587,15 @@ function sessionsOf(state, base, collabId, member, mode, ledger) {
   if (mode !== 'forum') {
     const approvals = approvalsOf(state, base, collabId);
     if (approvals !== null && member !== null && member.role === 'manager') {
+      /* 站长机：台账即全体批准记录（grantedRemote，逐条携实例标识）；本机实例自己的获准条目
+       * 另按本机视角单列（设计 §2「本机按获准台账……站长侧按全体批准记录」两段同成立）。 */
       sessions.grantedRemote = approvals.map((approval) => grantedEntryOf(approval, ledger));
+      const localInstanceId = managerInstanceIdOf(member);
+      if (localInstanceId !== null) {
+        sessions.localGranted = approvals
+          .filter((approval) => approval.instanceId === localInstanceId)
+          .map((approval) => shortSessionId(approval.sessionId));
+      }
     } else if (approvals !== null) {
       sessions.localGranted = approvals.map((approval) => shortSessionId(approval.sessionId));
     }

@@ -749,15 +749,30 @@ test('讨论分支（未在席）：按名敲门封装（复用敲门原语）�
   assert.match(none.note, /无人|无应答/);
 });
 
-test('申请（已归档）：在册但已退出的协作不再纳新（如实拒，不落待批准面）', async (t) => {
+test('申请（已退出重入）：已退出的协作允许重新申请（终局行可再入席，站长批准制）', async (t) => {
   const made = makeService(t);
   await activeMemberCollab(t, made, 'collab-left');
   const left = await made.service.leave({ collabId: 'collab-left' });
   assert.equal(left.ok, true, left.message);
   const result = await made.service.join.request({ collabId: 'collab-left', sessionId: 'newcomer-1' });
+  assert.equal(result.ok, true, result.message);
+  assert.equal(result.pending, true);
+  assert.equal(sentOf(made.direct, 'join-request').length, 1, '重入申请直投站长（终局不再一刀切拒绝）');
+  assert.equal(applicationsOf(made.dir).length, 1, '重入申请进本机申请台账（等待站长批准）');
+});
+
+test('申请（已结束/已终止）：协作本身终局仍不可加入（如实拒）', async (t) => {
+  const made = makeService(t);
+  const created = made.service.create({ name: '自建项目', topic: '主题', targets: [endpoint('inst-b', '主机乙', '127.0.0.2', 17400)] });
+  assert.equal(created.ok, true, created.message);
+  const admitted = await receive(made.service, approveResponseFrame(created.collabId, peer('inst-b', '主机乙', 17400)), '127.0.0.2');
+  assert.equal(admitted.ok, true, '同意帧过准入');
+  assert.equal(ledgerOf(made.dir, created.collabId).status, 'active', '建立');
+  const ended = await made.service.end({ collabId: created.collabId });
+  assert.equal(ended.ok, true, '结束协作（建立后结束）');
+  const result = await made.service.join.request({ collabId: created.collabId, sessionId: 'newcomer-1' });
   assert.equal(result.ok, false);
   assert.match(result.message, /已结束|已退出/);
-  assert.deepEqual(made.service.join.pendingJoinsOf('collab-left'), [], '不落待批准面');
 });
 
 test('讨论分支（已归档）：在册但已退出 = 不再纳新（如实拒）', async (t) => {
@@ -1219,6 +1234,11 @@ function approveResponseFrame(collabId, from) {
   return { v: 1, type: 'approve', msgId: `msg-nod-${seq}`, from: { ...from }, collabId, ts: new Date().toISOString(), payload: {} };
 }
 
+function declineResponseFrame(collabId, from) {
+  seq++;
+  return { v: 1, type: 'decline', msgId: `msg-dec-${seq}`, from: { ...from }, collabId, ts: new Date().toISOString(), payload: {} };
+}
+
 test('未在席的批准（站长侧）：批准把申请人登进台账名单为 invited（创建流同形）——点头后正常收录、无 eventMismatch', async (t) => {
   const owner = makeService(t);
   const created = owner.service.create({ name: '远端项目', topic: '主题', targets: [endpoint('inst-b', '主机乙')] });
@@ -1255,6 +1275,39 @@ test('未在席的批准（站长侧）：同机器新窗口再获批＝不补�
   assert.equal(owner.service.stats().invitesSent, invitesSent, '计数不虚增');
   assert.equal(ledgerOf(owner.dir, created.collabId).version, version, '名单行不重写（台账零变更）');
   assert.equal(ledgerOf(owner.dir, created.collabId).members.filter((row) => row.instanceId === 'inst-c').length, 1);
+});
+
+test('终局行重邀（站长侧）：declined 行批准加入时翻回 invited 并补发指名邀请——点头后正常收录', async (t) => {
+  const owner = makeService(t);
+  const created = owner.service.create({ name: '重入项目', topic: '主题', targets: [endpoint('inst-c', '主机丙', '127.0.0.3', 17600)] });
+  await receive(owner.service, declineResponseFrame(created.collabId, peer('inst-c', '主机丙', 17600)), '127.0.0.3');
+  assert.equal(ledgerOf(owner.dir, created.collabId).members.find((row) => row.instanceId === 'inst-c').state, 'declined', '先落终局行');
+  await receive(owner.service, joinRequestFrame(created.collabId, 'newcomer-1', peer('inst-c', '主机丙', 17600)), '127.0.0.3');
+  const approved = owner.service.join.approve({ collabId: created.collabId, sessionId: 'newcomer-1', approve: true, approvedBy: 'session-a' });
+  assert.equal(approved.ok, true, approved.message);
+  const invites = sentOf(owner.direct, 'invite');
+  assert.equal(invites.length, 1, '终局行重邀：补发入席邀请（不再当作已在册）');
+  assert.equal(invites[0].payload.targetSessionId, 'newcomer-1', '邀请指名申请会话');
+  assert.equal(ledgerOf(owner.dir, created.collabId).members.find((row) => row.instanceId === 'inst-c').state, 'invited', '终局行翻回 invited');
+  const admitted = await receive(owner.service, approveResponseFrame(created.collabId, peer('inst-c', '主机丙', 17600)), '127.0.0.3');
+  assert.equal(admitted.ok, true, admitted.reason);
+  assert.equal(owner.service.stats().eventMismatch, 0, '重邀后回应被正常收录');
+  assert.equal(ledgerOf(owner.dir, created.collabId).members.find((row) => row.instanceId === 'inst-c').state, 'member', '同意即建立（全部受邀者已定案且≥1 同意），approved 定格为 member');
+});
+
+test('终局行重邀·投递失败：回滚还原原终局行（不删行、不丢历史）', async (t) => {
+  const owner = makeService(t, {
+    sendDirect: (message) => (message.type === 'invite' ? { ok: false, reason: '测试故障' } : { ok: true, msgId: 'd-x' }),
+  });
+  const created = owner.service.create({ name: '重入项目', topic: '主题', targets: [endpoint('inst-c', '主机丙', '127.0.0.3', 17600)] });
+  await receive(owner.service, declineResponseFrame(created.collabId, peer('inst-c', '主机丙', 17600)), '127.0.0.3');
+  await receive(owner.service, joinRequestFrame(created.collabId, 'newcomer-1', peer('inst-c', '主机丙', 17600)), '127.0.0.3');
+  const approved = owner.service.join.approve({ collabId: created.collabId, sessionId: 'newcomer-1', approve: true, approvedBy: 'session-a' });
+  assert.equal(approved.ok, false, '邀请发不出去＝整条未处置');
+  assert.match(approved.message, /邀请发送失败|未落处置/);
+  const row = ledgerOf(owner.dir, created.collabId).members.find((entry) => entry.instanceId === 'inst-c');
+  assert.equal(row.state, 'declined', '回滚还原原终局行（不是删除）');
+  assert.equal(row.role, 'member');
 });
 
 test('讨论敲门登记：接线未落地（绑定表瞬态不可用）＝登记保留，下次落地仍接线（清除在成功之后）', async (t) => {

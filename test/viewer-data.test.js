@@ -909,7 +909,7 @@ test('大文件夹具：1500 行台账与 500 帖的正确性（线性量级，�
 /* 会话短码＝会话标识前 8 字符（util/short-id.js 唯一权威）：期望值逐字写死，切片口径漂移即红。
  * 获准条目的形态以 joins 模块的 isApprovalShape 为契约（instanceId/sessionId 过 ID_PATTERN）。 */
 
-test('sessions：站长席位——本机绑定取绑定表；获准名单取台账（逐条携实例标识，名单名可查时补齐）', (t) => {
+test('sessions：站长席位——本机绑定取绑定表；站长名单＝全体批准记录，本机实例条目另单列本机获准', (t) => {
   const dataDir = makeTempDir(t);
   writeFiles(collabDirIn(dataDir, 'main', 'c-1'), {
     [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ collabId: 'c-1' })),
@@ -920,6 +920,7 @@ test('sessions：站长席位——本机绑定取绑定表；获准名单取台
       approvals: [
         { instanceId: 'inst-b', sessionId: 'abcdef0123456789', origin: 'grant', grantedAt: 1, approvedBy: '甲机' },
         { instanceId: 'inst-unknown', sessionId: '00112233445566aa', origin: 'grant', grantedAt: 2, approvedBy: '甲机' },
+        { instanceId: 'mgr-1', sessionId: 'c0ffee1234567890', origin: 'create', grantedAt: 3, approvedBy: 'mgr-1' },
       ],
     }),
   });
@@ -931,11 +932,28 @@ test('sessions：站长席位——本机绑定取绑定表；获准名单取台
   const entry = createData(dataDir).listCollabs().collabs[0];
   assert.deepEqual(entry.sessions, {
     localBound: 'deadbeef',
+    localGranted: ['c0ffee12'],
     grantedRemote: [
       { instanceId: 'inst-b', identityName: '乙机', sessionId: 'abcdef01' },   // 名单名从台账名单补齐
       { instanceId: 'inst-unknown', sessionId: '00112233' },                   // 名单查无＝省略名（呈现端回退实例标识）
+      { instanceId: 'mgr-1', identityName: '甲机', sessionId: 'c0ffee12' },    // 本机实例条目仍在全体记录内
     ],
   });
+});
+
+test('sessions：参与记录形态不符（站长为 {}）＝按成员残骸处置——台账即本机获准（既有读法不变）', (t) => {
+  const dataDir = makeTempDir(t);
+  writeFiles(collabDirIn(dataDir, 'main', 'c-1'), {
+    [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ collabId: 'c-1', manager: {} })),
+    [LEDGER_FILE_NAME]: jsonl(ledgerOf({ collabId: 'c-1' })),
+    [JOINS_FILE_NAME]: JSON.stringify({
+      v: 1,
+      pendingJoins: [],
+      approvals: [{ instanceId: 'inst-b', sessionId: 'abcdef0123456789', origin: 'grant', grantedAt: 1, approvedBy: '甲机' }],
+    }),
+  });
+  const entry = createData(dataDir).listCollabs().collabs[0];
+  assert.deepEqual(entry.sessions, { localGranted: ['abcdef01'] }, '无效参与记录不被当作站长视角（宁按残骸读本机台账）');
 });
 
 test('sessions：成员席位——台账即本机获准（短码列表）；详情 meta 同视图在场', (t) => {
