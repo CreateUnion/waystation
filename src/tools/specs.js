@@ -99,15 +99,25 @@ export const WS_CREATE_COLLAB_SPEC = {
 
 export const WS_APPROVE_INVITE_SPEC = {
   name: 'ws_approve_invite',
-  description: '对一条待回应邀请表态（同意 = 加入协作；拒绝 = 本条不参与，邀请方决定继续或取消）',
+  description: '对一条待回应邀请表态（同意 = 加入协作；拒绝 = 本条不参与）。首次调用只返回“需要用户确认”与一次性令牌——须先向用户转述邀请、取得明确同意后携 confirmToken 重试；用户明确说“下一次无需确认”时可先用 ws_allow_next_invite 登记一次性豁免',
   inputSchema: {
     type: 'object',
     properties: {
       collabId: { type: 'string', description: '协作标识（取自 ws_list_collabs 的待回应邀请条目）' },
       approve: { type: 'boolean', description: 'true = 同意加入；false = 拒绝' },
       reason: { type: 'string', description: '拒绝原因（可选，仅拒绝时使用，≤200 字符）' },
+      confirmToken: { type: 'string', description: '用户确认挑战令牌（可选）：首次调用会返回 needsUserConfirmation 与令牌；取得用户明确同意后携此令牌重试' },
     },
     required: ['collabId', 'approve'],
+  },
+};
+
+export const WS_ALLOW_NEXT_INVITE_SPEC = {
+  name: 'ws_allow_next_invite',
+  description: '登记一次性邀请确认豁免：仅当用户明确表示「下一次邀请无需确认」时调用；下一次同意 / 拒绝邀请将直接生效并消耗豁免（核心重启后失效）',
+  inputSchema: {
+    type: 'object',
+    properties: {},
   },
 };
 
@@ -299,6 +309,7 @@ export const TOOL_SPECS = [
   WS_LIST_COLLABS_SPEC,
   WS_CREATE_COLLAB_SPEC,
   WS_APPROVE_INVITE_SPEC,
+  WS_ALLOW_NEXT_INVITE_SPEC,
   WS_WITHDRAW_INVITE_SPEC,
   WS_VIEW_LEDGER_SPEC,
   WS_SEND_MESSAGE_SPEC,

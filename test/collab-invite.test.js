@@ -296,8 +296,12 @@ test('点头判定：指名会话照常同意；异会话 / 无会话标识一�
   const sessionless = h.service.approve({ collabId: 'collab-named', approve: true });
   assert.equal(sessionless.ok, false, '无会话标识（无上下文）：无从核对指名，拒');
 
-  const byTarget = h.service.approve({ collabId: 'collab-named', approve: true, sessionId: 'session-target-abc' });
-  assert.equal(byTarget.ok, true, '指名会话（全标识前缀命中）：照常同意');
+  const challenge = h.service.approve({ collabId: 'collab-named', approve: true, sessionId: 'session-target-abc' });
+  assert.equal(challenge.ok, false, '首次同意只签发用户确认挑战');
+  assert.equal(challenge.needsUserConfirmation, true);
+  assert.equal(typeof challenge.confirmToken, 'string');
+  const byTarget = h.service.approve({ collabId: 'collab-named', approve: true, sessionId: 'session-target-abc', confirmToken: challenge.confirmToken });
+  assert.equal(byTarget.ok, true, '指名会话（全标识前缀命中）取得用户确认后照常同意');
   assert.equal(byTarget.decision, 'approved');
 });
 
@@ -306,8 +310,10 @@ test('点头判定·未指名：无 targetSessionId 字段照旧（谁点头谁�
   h.registry.register(bridgeRecord('bridge-a', 'session-alpha'));
   await receive(h, inviteFrameOf('collab-plain', undefined));
   assert.equal(memberOf(h, 'collab-plain').targetSessionId, undefined, '未指名：不写指名标记');
-  const approved = h.service.approve({ collabId: 'collab-plain', approve: true, sessionId: 'session-other' });
-  assert.equal(approved.ok, true, '未指名的邀请：任意在席会话可点头（沿旧行为）');
+  const challenge = h.service.approve({ collabId: 'collab-plain', approve: true, sessionId: 'session-other' });
+  assert.equal(challenge.needsUserConfirmation, true, '同意前须用户确认（与指名无关）');
+  const approved = h.service.approve({ collabId: 'collab-plain', approve: true, sessionId: 'session-other', confirmToken: challenge.confirmToken });
+  assert.equal(approved.ok, true, '未指名的邀请：任意在席会话取得用户确认后可点头');
 });
 
 test('指名邀请·前缀歧义：两个活跃会话都命中 → 按「不在场」处置（不猜接收者）', async (t) => {

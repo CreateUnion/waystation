@@ -11,7 +11,7 @@ import { hostsTool } from '../src/tools/hosts.js';
 import { pingTool } from '../src/tools/ping.js';
 import { deliveryStatusTool } from '../src/tools/delivery-status.js';
 import { checkInboxTool } from '../src/tools/check-inbox.js';
-import { listCollabsTool, createCollabTool, approveInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, setMuteTool, leaveCollabTool, endCollabTool, inviteTool, requestJoinTool, SEND_MESSAGE_TYPES } from '../src/tools/collab.js';
+import { listCollabsTool, createCollabTool, approveInviteTool, allowNextInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, setMuteTool, leaveCollabTool, endCollabTool, inviteTool, requestJoinTool, SEND_MESSAGE_TYPES } from '../src/tools/collab.js';
 import { joinTool, approveJoinTool } from '../src/tools/join.js';
 import { decideTool, handoverTool, takeOverTool } from '../src/tools/governance.js';
 import { COLLAB_MODES, DEFAULT_COLLAB_MODE, MAX_COLLAB_MEMBERS, MAX_IDENTITY_NAME_CHARS, MAX_MESSAGE_TEXT_CHARS, MAX_REASON_CHARS, MAX_TOPIC_CHARS } from '../src/net/protocol.js';
@@ -37,6 +37,7 @@ const TOOL_FACTORIES = [
   listCollabsTool,
   createCollabTool,
   approveInviteTool,
+  allowNextInviteTool,
   withdrawInviteTool,
   viewLedgerTool,
   sendMessageTool,
@@ -60,9 +61,9 @@ function coreToolList() {
   return registry.list();
 }
 
-test('工具面冻结快照：21 项逐字节不变', () => {
+test('工具面冻结快照：22 项逐字节不变', () => {
   const listed = coreToolList();
-  assert.equal(listed.length, 21, '工具数为 21——增删工具属须人批准的对外变更');
+  assert.equal(listed.length, 22, '工具数为 22——增删工具属须人批准的对外变更');
   assert.equal(
     JSON.stringify(listed, null, 2),
     FROZEN_LIST_JSON,
@@ -70,8 +71,8 @@ test('工具面冻结快照：21 项逐字节不变', () => {
   );
 });
 
-test('规格模块：21 项无遗漏，按名索引与注册序一致', () => {
-  assert.equal(TOOL_SPECS.length, 21, '规格模块须与工具数一一对应');
+test('规格模块：22 项无遗漏，按名索引与注册序一致', () => {
+  assert.equal(TOOL_SPECS.length, 22, '规格模块须与工具数一一对应');
   assert.deepEqual(Object.keys(SPECS_BY_NAME), TOOL_SPECS.map((spec) => spec.name));
   assert.deepEqual(coreToolList().map((tool) => tool.name), TOOL_SPECS.map((spec) => spec.name));
 });
@@ -291,7 +292,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_approve_invite",
-    "description": "对一条待回应邀请表态（同意 = 加入协作；拒绝 = 本条不参与，邀请方决定继续或取消）",
+    "description": "对一条待回应邀请表态（同意 = 加入协作；拒绝 = 本条不参与）。首次调用只返回“需要用户确认”与一次性令牌——须先向用户转述邀请、取得明确同意后携 confirmToken 重试；用户明确说“下一次无需确认”时可先用 ws_allow_next_invite 登记一次性豁免",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -306,12 +307,24 @@ const FROZEN_LIST_JSON = `[
         "reason": {
           "type": "string",
           "description": "拒绝原因（可选，仅拒绝时使用，≤200 字符）"
+        },
+        "confirmToken": {
+          "type": "string",
+          "description": "用户确认挑战令牌（可选）：首次调用会返回 needsUserConfirmation 与令牌；取得用户明确同意后携此令牌重试"
         }
       },
       "required": [
         "collabId",
         "approve"
       ]
+    }
+  },
+  {
+    "name": "ws_allow_next_invite",
+    "description": "登记一次性邀请确认豁免：仅当用户明确表示「下一次邀请无需确认」时调用；下一次同意 / 拒绝邀请将直接生效并消耗豁免（核心重启后失效）",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
     }
   },
   {

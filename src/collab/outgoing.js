@@ -7,6 +7,7 @@ import { createCounterStore, notifyIndicatorChange } from './counter.js';
 import { createMuteStore } from './mute.js';
 import { createInjectedStore } from './injected.js';
 import { createJoinsStore } from './joins.js';
+import { consumeInviteChallenge, consumeInviteWaiver, issueInviteChallenge } from './consent.js';
 import { ledgerDigest, removeLedgerFile } from './store.js';
 import { currentManagerIdOf, emitOwnMemberEvent, foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, localTopicOf, memberStateFor, persistLedger, persistMember, persistSnapshot, relayDepartedOf, relayPeerOf, rememberKnownHost, selfJoinedOf } from './local.js';
 import { matchConflictCollabs } from './gate.js';
@@ -371,7 +372,7 @@ function joinKnockNoticeText(knock, name) {
   return `收到加入申请：「${knock.identityName}」（实例 ${knock.instanceId}，端点 ${knock.address}:${knock.port}）想加入讨论「${name}」——放行 = 本机用 ws_invite 邀请它（targets 用该身份与端点），随后由对方的同意门定夺`;
 }
 
-export function approveInvite(state, { collabId, approve, reason, sessionId }) {
+export function approveInvite(state, { collabId, approve, reason, sessionId, confirmToken }) {
   const local = state.collabs.get(collabId);
   if (local === undefined) {
     return { ok: false, message: '本机没有该协作（collabId 不存在）——先看 ws_list_collabs' };
@@ -387,7 +388,49 @@ export function approveInvite(state, { collabId, approve, reason, sessionId }) {
   if (decided !== null) {
     return { ok: false, message: `已回应过（${decided}）——不能改口` };
   }
+  /* 用户确认门（2026-10-19 产品裁定）：带会话标识的决定必须先拿一次性确认挑战或豁免。
+   * 首次调用只签发挑战、不改任何状态——代理须把邀请转述给用户并取得明确同意后携令牌重试。 */
+  const consent = inviteConsentGate(state, local, sessionId, confirmToken);
+  if (consent !== null) {
+    return consent;
+  }
   return applyInviteDecision(state, local, approve, wanted, reason, sessionId);
+}
+
+/* 确认门判定：无会话标识（服务直调/旧路径）不设门；有豁免直接放行；有有效挑战放行；
+ * 否则签发新挑战并返回需要用户确认的结构化结果（邀请摘要供代理转述）。 */
+function inviteConsentGate(state, local, sessionId, confirmToken) {
+  if (typeof sessionId !== 'string' || sessionId === '') {
+    return null;
+  }
+  if (consumeInviteWaiver(state, { sessionId })) {
+    return null;
+  }
+  if (consumeInviteChallenge(state, { sessionId, collabId: local.collabId, token: confirmToken })) {
+    return null;
+  }
+  const token = issueInviteChallenge(state, { sessionId, collabId: local.collabId });
+  return {
+    ok: false,
+    needsUserConfirmation: true,
+    confirmToken: token,
+    invite: inviteSummaryOf(local),
+    message: '同意 / 拒绝邀请需要用户明确确认：请把邀请信息转述给用户，取得明确同意后携带 confirmToken 重试；若用户明确表示下一次无需确认，可先用 ws_allow_next_invite 登记一次性豁免',
+  };
+}
+
+/* 邀请摘要（供代理向用户转述）：名/模式/主题/邀请者与有效期。 */
+function inviteSummaryOf(local) {
+  const manager = local.member?.manager;
+  return {
+    collabId: local.collabId,
+    name: localNameOf(local),
+    mode: localModeOf(local),
+    topic: local.member?.topic ?? null,
+    manager: manager === undefined ? null : { instanceId: manager.instanceId, identityName: manager.identityName },
+    invitedAt: local.member?.invitedAt ?? null,
+    expiresAt: local.member?.expiresAt ?? null,
+  };
 }
 
 /* 表态的落地与入席副作用（设计 §3.1/§3.3）：分派到讨论 / 协作各自的实现；同意且实现成功时

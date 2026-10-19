@@ -349,6 +349,51 @@ test('decline：拒绝帧携带 reason；decision 定格 declined', async (t) =>
   assert.deepEqual(frames[0].payload, { reason: '人手不足' });
 });
 
+test('邀请确认门：首次决定只发挑战（状态不变）；携 confirmToken 重试才生效', async (t) => {
+  const { service, dir } = makeService(t);
+  await receive(service, inviteFrame({ collabId: 'collab-consent' }));
+  const first = await service.approve({ collabId: 'collab-consent', approve: true, sessionId: 'session-c1' });
+  assert.equal(first.ok, false);
+  assert.equal(first.needsUserConfirmation, true);
+  assert.equal(typeof first.confirmToken, 'string');
+  assert.equal(first.invite.name, '联调项目', '邀请摘要供代理向用户转述');
+  assert.equal(memberOf(dir, 'collab-consent').decision ?? null, null, '未取得用户确认＝零状态变更');
+  const approved = await service.approve({ collabId: 'collab-consent', approve: true, sessionId: 'session-c1', confirmToken: first.confirmToken });
+  assert.equal(approved.ok, true);
+  assert.equal(approved.decision, 'approved');
+});
+
+test('邀请确认门：拒绝同样需要确认；一次性豁免让下一次决定直接生效并消耗', async (t) => {
+  const { service, dir } = makeService(t);
+  await receive(service, inviteFrame({ collabId: 'collab-c2' }));
+  assert.equal((await service.allowNextInvite({ sessionId: 'session-c2' })).ok, true);
+  const declined = await service.approve({ collabId: 'collab-c2', approve: false, reason: '不参与', sessionId: 'session-c2' });
+  assert.equal(declined.ok, true, '豁免：决定直接生效');
+  assert.equal(declined.decision, 'declined');
+  assert.equal(memberOf(dir, 'collab-c2').decision, 'declined');
+
+  const second = makeService(t);
+  await receive(second.service, inviteFrame({ collabId: 'collab-c3' }));
+  await second.service.allowNextInvite({ sessionId: 'session-c3' });
+  const direct = await second.service.approve({ collabId: 'collab-c3', approve: true, sessionId: 'session-c3' });
+  assert.equal(direct.ok, true, '豁免消耗于第一次决定');
+  await receive(second.service, inviteFrame({ collabId: 'collab-c4', name: '第二协作' }));
+  const gated = await second.service.approve({ collabId: 'collab-c4', approve: true, sessionId: 'session-c3' });
+  assert.equal(gated.needsUserConfirmation, true, '豁免已消耗：下一次重新需要确认');
+});
+
+test('邀请确认门：挑战绑定协作——他协作的令牌无效', async (t) => {
+  const { service } = makeService(t);
+  await receive(service, inviteFrame({ collabId: 'collab-x' }));
+  await receive(service, inviteFrame({ collabId: 'collab-y', name: '协作乙' }));
+  const a = await service.approve({ collabId: 'collab-x', approve: true, sessionId: 'session-z' });
+  assert.equal(a.needsUserConfirmation, true);
+  const cross = await service.approve({ collabId: 'collab-y', approve: true, sessionId: 'session-z', confirmToken: a.confirmToken });
+  assert.equal(cross.needsUserConfirmation, true, '跨协作令牌无效（重新签发本协作挑战）');
+  const b = await service.approve({ collabId: 'collab-y', approve: true, sessionId: 'session-z', confirmToken: cross.confirmToken });
+  assert.equal(b.ok, true);
+});
+
 test('重入（成员侧·已拒绝）：managed 再收邀请 → 重新定格提议面（旧决策清空），同意门可再次入席', async (t) => {
   const { service, dir } = makeService(t);
   await receive(service, inviteFrame({ collabId: 'collab-rejoin' }));

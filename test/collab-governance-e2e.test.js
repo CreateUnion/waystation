@@ -185,6 +185,24 @@ async function callTool(client, name, args = {}) {
   return { isError: called.isError === true, payload: called.isError === true ? text : JSON.parse(text) };
 }
 
+/* 邀请确认门两步走（2026-10-19）：首次决定拿挑战 → 携 confirmToken 重试（本文件只测治理链）。 */
+async function approveInviteWithConsent(client, args) {
+  const first = await callTool(client, 'ws_approve_invite', args);
+  if (first.isError !== true) {
+    return first;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(first.payload);
+  } catch {
+    return first;
+  }
+  if (parsed?.needsUserConfirmation !== true) {
+    return first;
+  }
+  return callTool(client, 'ws_approve_invite', { ...args, confirmToken: parsed.confirmToken });
+}
+
 async function createAndApprove(t, { a, b, portB }) {
   const statusB = (await callTool(b, 'ws_status')).payload;
   const created = await callTool(a, 'ws_create_collab', { name: '治理项目', topic: '主题', targets: [{ instanceId: statusB.instanceId, identityName: statusB.identityName, address: '127.0.0.1', port: portB }] });
@@ -194,7 +212,7 @@ async function createAndApprove(t, { a, b, portB }) {
     const listed = (await callTool(b, 'ws_list_collabs')).payload.collabs;
     return listed.some((entry) => entry.collabId === collabId) ? true : null;
   }, { timeoutMs: 20000 });
-  assert.equal((await callTool(b, 'ws_approve_invite', { collabId, approve: true })).isError, false);
+  assert.equal((await approveInviteWithConsent(b, { collabId, approve: true })).isError, false);
   for (const client of [a, b]) {
     await waitFor(async () => {
       const listed = (await callTool(client, 'ws_list_collabs')).payload.collabs;

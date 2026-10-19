@@ -1,7 +1,7 @@
 import { isIP } from 'node:net';
 import { COLLAB_MODES, DEFAULT_COLLAB_MODE, ID_PATTERN, MAX_COLLAB_MEMBERS, POST_KINDS, isCollabMode, isIdentityName, isPort } from '../net/protocol.js';
 import {
-  WS_APPROVE_INVITE_SPEC, WS_CREATE_COLLAB_SPEC, WS_END_COLLAB_SPEC, WS_INVITE_SPEC, WS_LEAVE_COLLAB_SPEC,
+  WS_ALLOW_NEXT_INVITE_SPEC, WS_APPROVE_INVITE_SPEC, WS_CREATE_COLLAB_SPEC, WS_END_COLLAB_SPEC, WS_INVITE_SPEC, WS_LEAVE_COLLAB_SPEC,
   WS_LIST_COLLABS_SPEC, WS_REQUEST_JOIN_SPEC, WS_SEND_MESSAGE_SPEC, WS_SET_MUTE_SPEC, WS_VIEW_LEDGER_SPEC,
   WS_WITHDRAW_INVITE_SPEC,
 } from './specs.js';
@@ -110,8 +110,29 @@ export function approveInviteTool() {
        * 不让「同意 + 理由」这种无定义组合穿到线上。 */
       const reason = args.approve === false ? optionalTextArg(args, 'reason') : undefined;
       /* 本会话标识平铺穿参（服务侧 caller.sessionId 备选形态亦收）：指名邀请的「只有该会话能点头」
-       * 判定要拿点头会话做比对面；无标识会话如实传空（指名邀请被拒、未指名零变）。 */
-      return resultOf(await context.collab.approve({ collabId, approve: args.approve, reason, sessionId: context.sessionId }));
+       * 判定要拿点头会话做比对面；无标识会话如实传空（指名邀请被拒、未指名零变）。
+       * confirmToken：用户确认挑战令牌（服务层首次调用签发，取得用户同意后重试时携带）。 */
+      const confirmToken = optionalTextArg(args, 'confirmToken');
+      const result = await context.collab.approve({ collabId, approve: args.approve, reason, sessionId: context.sessionId, confirmToken });
+      /* 用户确认挑战：结构化返回（令牌不能被 resultOf 的纯文案错误面吞掉）——
+       * 代理据此把邀请摘要转述给用户，取得同意后携 confirmToken 重试。 */
+      if (result?.needsUserConfirmation === true) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ ok: false, needsUserConfirmation: true, confirmToken: result.confirmToken, invite: result.invite, message: result.message }) }],
+          isError: true,
+        };
+      }
+      return resultOf(result);
+    },
+  };
+}
+
+/* 一次性邀请确认豁免（用户明确说「下一次无需确认」时调用）：下一次同意 / 拒绝邀请直接生效。 */
+export function allowNextInviteTool() {
+  return {
+    ...WS_ALLOW_NEXT_INVITE_SPEC,
+    handler: async (args, context) => {
+      return resultOf(await context.collab.allowNextInvite({ sessionId: context.sessionId }));
     },
   };
 }

@@ -8,6 +8,7 @@ import { createCounterStore, notifyIndicatorChange } from './counter.js';
 import { createMuteStore, muteSuppresses } from './mute.js';
 import { createInjectedStore } from './injected.js';
 import { createJoinsStore } from './joins.js';
+import { grantInviteWaiver } from './consent.js';
 import { JOIN_REQUEST_RETRY_MAX_MS, JOIN_REQUEST_RETRY_MS, JOIN_REQUEST_TTL_MS, createJoinDomain, resolveJoinTarget } from './join.js';
 import { POST_KINDS } from '../net/protocol.js';
 import { shortSessionId } from '../util/short-id.js';
@@ -168,6 +169,7 @@ function runtimeMaps() {
     syncRequestWindow: new Map(),   // 来源地址 → 窗口内请求时刻（请求类入站限流）
     joinRequestWindow: new Map(),   // 来源地址 → 上次受理时刻（加入申请的入站限频，与邀请限频相互独立）
     relayDown: new Set(),      // 中继降级态的 collabId 集（探测不可达置位；恢复检测清除）
+    inviteConsent: { challenges: new Map(), waivers: new Map() },   // 邀请决定确认门（挑战 / 一次性豁免，纯内存态）
   };
 }
 
@@ -193,6 +195,7 @@ function apiOf(state) {
     joinResolve: (input) => resolveJoinTarget(state, input ?? {}),   // 发现层注入面（按名解析的命中回调，组合根接入）
     join: joinApiOf(state),   // 会话级加入的处置面（工具层落点）
     approve: (input) => approveNow(state, input),
+    allowNextInvite: (input) => allowNextInviteOf(state, input),
     relayReport: (input) => applyRelayedReport(state, input),   // 网层回报注入面（转达副本达第三档 → 译回原作者）
     withdraw: (input) => withdrawInvite(state, input),
     send: (input) => sendMessage(state, input),
@@ -600,6 +603,16 @@ function statsOf(state) {
  * 新人不必等下一个周期节拍（默认 60s）才看到历史。让出到微任务边界再起：本机这一回合的外发
  * 次序为 join 自播先、对表请求后（应答方准入按「请求方在成员表内」把关——请求先到会被拒）。
  * 点头前先过指名判定（指名邀请只有该会话能点头）。 */
+/* 一次性邀请确认豁免（用户明确表示「下一次邀请无需确认」时由工具面登记；核心重启即失效）。 */
+function allowNextInviteOf(state, input) {
+  const sessionId = typeof input?.sessionId === 'string' && input.sessionId !== '' ? input.sessionId : null;
+  if (sessionId === null) {
+    return { ok: false, message: '无会话标识——无法登记邀请确认豁免' };
+  }
+  grantInviteWaiver(state, { sessionId });
+  return { ok: true, note: '已登记一次性豁免：下一次同意 / 拒绝邀请将直接生效（消耗后失效；核心重启亦失效）' };
+}
+
 function approveNow(state, input) {
   const refusal = namedInviteRefusalOf(state, input);
   if (refusal !== null) {
