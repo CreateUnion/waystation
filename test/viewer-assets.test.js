@@ -67,6 +67,13 @@ test('页面壳：三处挂载点与字号三键齐备', () => {
   }
 });
 
+test('页面壳：返回列表键（同源 hash 链接，客户端接线与样式齐备）', () => {
+  assert.ok(/<a id="app-back" href="#\/" hidden>/.test(INDEX_HTML), '缺少返回键挂载点或 href 非 #/');
+  assert.ok(APP_JS.includes("getElementById('app-back')"), '客户端须接线返回键');
+  assert.ok(APP_JS.includes("dom.back.hidden = route.view !== 'detail'"), '返回键须按路由切换显隐');
+  assert.ok(STYLE_CSS.includes('#app-back'), '缺少返回键样式');
+});
+
 /* 任务书「无 <script src=」按「无外部脚本引用」落地：页面必须引同源相对资产 /app.js（服务端直出），
  * 断言收紧为白名单——脚本引用只允许恰为 /app.js 这一条，任何其它来源即红。 */
 test('页面壳：脚本引用恰为同源相对资产 /app.js', () => {
@@ -121,8 +128,9 @@ test('嵌入纪律：三资产零外部资源（协议相对 / data: / 内联资
   assert.ok(!INDEX_HTML.includes('=//'), '页面壳出现无引号形态的协议相对 URL（=//）');
 });
 
-/* 页面壳里的每个 src/href 值都必须是同源相对路径（以 / 开头且非 //）：覆盖单引号属性与
- * 大写 SRC=/HREF= 写法——任何外部来源（http(s)、协议相对、data:）都通不过。
+/* 页面壳里的每个 src/href 值都必须是同源相对路径（以 / 开头且非 //）或页内片段（#…，hash 路由
+ * 不产生网络请求）：覆盖单引号属性与大写 SRC=/HREF= 写法——任何外部来源（http(s)、协议相对、
+ * data:）都通不过。
  * 无引号属性值（如 src= //evil…，HTML5 合法且浏览器会真实外发）不带引号、躲开带引号匹配，
  * 一并按无引号形态扫描——否则未来编辑引入无引号外链不会被任何断言拦下。 */
 test('页面壳：全部 src/href 引用值同源相对（含无引号形态）', () => {
@@ -130,7 +138,8 @@ test('页面壳：全部 src/href 引用值同源相对（含无引号形态）'
   assert.ok(values.length >= 2, '页面壳应至少含样式与脚本两条引用，实际 ' + values.length + ' 条');
   const bare = [...INDEX_HTML.matchAll(/\b(?:src|href)\s*=\s*([^\s"'>]+)/gi)].map((match) => match[1]);
   for (const value of [...values, ...bare]) {
-    assert.ok(value.startsWith('/') && !value.startsWith('//'), '引用值必须是同源相对路径（含无引号形态）：' + value);
+    const sameOrigin = (value.startsWith('/') && !value.startsWith('//')) || value.startsWith('#');
+    assert.ok(sameOrigin, '引用值必须是同源相对路径或页内片段（含无引号形态）：' + value);
   }
 });
 

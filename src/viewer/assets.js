@@ -22,6 +22,7 @@ export const INDEX_HTML = String.raw`<!doctype html>
 </head>
 <body>
 <header id="app-bar">
+  <a id="app-back" href="#/" hidden>← 列表</a>
   <span id="app-title">waystation 观察窗</span>
   <span id="app-status"></span>
   <span id="app-buttons">
@@ -283,6 +284,7 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     state.id = route.id === undefined ? '' : route.id;
     dom.listView.hidden = route.view !== 'list';
     dom.detailView.hidden = route.view !== 'detail';
+    dom.back.hidden = route.view !== 'detail';
     dom.pause.hidden = route.view !== 'detail';
     applyTitle(null);
     if (route.view === 'detail') {
@@ -812,6 +814,7 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     dom.fontDown = document.getElementById('font-down');
     dom.fontReset = document.getElementById('font-reset');
     dom.pause = document.getElementById('pause');
+    dom.back = document.getElementById('app-back');
     dom.listView = document.getElementById('list-view');
     dom.detailView = document.getElementById('detail-view');
     dom.banner = document.getElementById('banner');
@@ -900,6 +903,17 @@ body {
 }
 
 #app-title { font-weight: 600; }
+
+#app-back {
+  color: var(--accent);
+  text-decoration: none;
+  border: 1px solid var(--line);
+  border-radius: 0.35rem;
+  padding: 0.2rem 0.6rem;
+  font-size: 0.9rem;
+}
+
+#app-back:hover { border-color: var(--accent); }
 
 #app-status { flex: 1; color: var(--warn); font-size: 0.85rem; }
 

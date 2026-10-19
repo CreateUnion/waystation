@@ -10,7 +10,7 @@ import { APP_JS } from '../src/viewer/assets.js';
  * 桩不模拟布局与 HTML 解析（innerHTML 只存字符串）——浏览器侧观感仍由人验收逐项过。 */
 
 const MOUNT_IDS = [
-  'app-status', 'font-up', 'font-down', 'font-reset', 'pause',
+  'app-status', 'font-up', 'font-down', 'font-reset', 'pause', 'app-back',
   'list-view', 'detail-view', 'banner', 'stream', 'new-badge', 'event-track',
 ];
 
@@ -360,6 +360,21 @@ test('窗口标题：详情 meta 就位后带协作名；meta 未返回与列表
   env.fireWindow('hashchange');
   await env.flush();
   assert.equal(env.document.title, 'waystation 观察窗', '回列表恢复默认标题');
+});
+
+test('返回键：详情路由显示、列表路由隐藏', async () => {
+  const env = createEnv();
+  await bootList(env, []);
+  assert.equal(env.byId['app-back'].hidden, true, '列表路由不显示返回键');
+  env.plan({ match: '/feed', body: { rows: [], reset: true, skipped: 0 } }, { match: '/meta', body: metaBody() });
+  env.window.location.hash = '#/c/main/demo';
+  env.fireWindow('hashchange');
+  assert.equal(env.byId['app-back'].hidden, false, '详情路由显示返回键');
+  env.plan({ match: '/api/collabs', body: { collabs: [] } });
+  env.window.location.hash = '#/';
+  env.fireWindow('hashchange');
+  await env.flush();
+  assert.equal(env.byId['app-back'].hidden, true, '回列表后隐藏返回键');
 });
 
 test('窗口标题：名称未就绪（name=null）保持默认标题', async () => {
