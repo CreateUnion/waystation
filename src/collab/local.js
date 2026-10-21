@@ -589,9 +589,11 @@ export function persistMember(state, local) {
     ensureCollabDir(state.dataDir, local.collabId);
     mergeRoutingMarks(state, local);
     saveMember(state.dataDir, local.member);
+    return true;
   } catch (error) {
     state.counters.persistFailures++;
     state.log.warn('成员记录写入失败（内存态继续）', { collabId: local.collabId, reason: error.message });
+    return false;
   }
 }
 
@@ -612,9 +614,11 @@ export function persistLedger(state, local) {
   try {
     ensureCollabDir(state.dataDir, local.collabId);
     appendLedger(state.dataDir, local.ledger);
+    return true;
   } catch (error) {
     state.counters.persistFailures++;
     state.log.warn('台账写入失败（内存态继续）', { collabId: local.collabId, reason: error.message });
+    return false;
   }
 }
 

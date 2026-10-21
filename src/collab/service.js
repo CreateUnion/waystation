@@ -35,8 +35,8 @@ import {
 } from './outgoing.js';
 import { JOIN_REPLAY_INTERVALS_MS, SYNC_MAX_REQUESTS_PER_CYCLE, SYNC_MAX_SOURCES_PER_CYCLE, SYNC_REPLY_TIMEOUT_MS, SYNC_SOFT_BUNDLE_BYTES, SYNC_TAIL_POSTS, SYNC_TAIL_WINDOW_MS, runSyncCycle, runSyncSweep, startSyncEngine, stopSyncEngine, triggerSync } from './sync.js';
 import {
-  HANDSHAKE_REPLY_TIMEOUT_MS, TAKEOVER_PROBE_INTERVAL_MS, autoTransfer, clearFreezeReason, freezeOnManagerOffline, m5RuntimeOf,
-  noteSeatClosed, presenceSnapshot, runHandshake, startLiveness, stopLiveness, takeOver,
+  HANDSHAKE_REPLY_TIMEOUT_MS, LEDGER_FROZEN_REASON, TAKEOVER_PROBE_INTERVAL_MS, autoTransfer, clearFreezeReason,
+  freezeOnManagerOffline, m5RuntimeOf, noteSeatClosed, presenceSnapshot, runHandshake, startLiveness, stopLiveness, takeOver,
 } from './takeover.js';
 import { decide, decideMergeOffer } from './freeze.js';
 import { HANDOVER_CONFIRM_TIMEOUT_MS, confirmHandover, handover, rejectHandover } from './handover.js';
@@ -259,6 +259,9 @@ function seatStateOf(options) {
     muteBaselines: new Map(),
     /* 本轮 leave 帧 msgId（进程内，不落盘）：核心退出冲刷时用于留痕与待发判定。 */
     stopLeaveMsgIds: new Set(),
+    /* 邀请落点失败的帧标识（进程内）：sessionGate 据此抑制注入——该邀请已不可接受，
+     * 注入只会让用户看到一条无法回应的待办（M-5 注入面）。 */
+    failedInviteFrames: new Set(),
   };
 }
 
@@ -677,6 +680,9 @@ function sessionGateFrame(state, frame, meta = null) {
  * 静音权威是席位文件的 muted（旧 mute.json 不再读取，无「协作级兜底」）。
  * 归档席位不参与注入，自然也不抑制（其收件面已退出活跃判定）。 */
 function suppressForSeat(state, frame, sessionId) {
+  if (isFailedInviteFrameOf(state, frame)) {
+    return true;
+  }
   if (!isContentFrameOf(frame)) {
     return false;
   }
@@ -687,6 +693,12 @@ function suppressForSeat(state, frame, sessionId) {
   const seatId = typeof sessionId === 'string' ? sessionId : soleSeatSessionId(local);
   const seat = typeof seatId === 'string' ? localSeatOfLocal(local, seatId) : null;
   return seat !== null && seat.muted === true && !isSeatArchived(seat);
+}
+
+/* 落点失败的邀请已不可接受：不投会话（无用户提示好过一条死待办）。成功后清除标记由事件面做。 */
+function isFailedInviteFrameOf(state, frame) {
+  return frame?.type === 'invite' && state.failedInviteFrames instanceof Set
+    && typeof frame.msgId === 'string' && state.failedInviteFrames.has(frame.msgId);
 }
 
 /* 已注入事实的记真面（sessionDelivered 钩子）：只记帖——吸收路径的终态回执以该标记为前件
@@ -878,7 +890,11 @@ function applyCarrierFreezeReason(local, carrier) {
   }
   local.freezeReason = raw;
   if (local.member !== null && typeof local.member === 'object') {
-    local.member.freezeReason = raw;
+    /* 台账传播标记描述成员状态的来源，任期冻结只是叠加的停写原因：重启回填不得覆盖它，
+     * 否则 authoritative active 台账到达后成员无法恢复（设计 §2A.2 C4）。 */
+    if (local.member.freezeReason !== LEDGER_FROZEN_REASON) {
+      local.member.freezeReason = raw;
+    }
   }
 }
 
@@ -890,7 +906,8 @@ function restoreManagerFreezeRuntime(state, collabId) {
   const reason = managerFreezeReasonOf(state, collabId);
   if (reason === null) {
     delete local.freezeReason;
-    if (local.member !== null && typeof local.member === 'object') {
+    if (local.member !== null && typeof local.member === 'object' && local.member.freezeReason !== LEDGER_FROZEN_REASON) {
+      /* 台账传播标记不随无效/缺失的任期原因一起清掉：成员仍须等 authoritative active 台账恢复。 */
       delete local.member.freezeReason;
     }
     return;
@@ -1268,7 +1285,9 @@ function sessionsViewOf(state, local) {
 
 function freezeReasonOfLocal(local) {
   const reason = local.freezeReason ?? local.member?.freezeReason ?? local.ledger?.freezeReason;
-  return typeof reason === 'string' && reason.trim() !== '' ? reason.trim() : null;
+  /* 'ledger' 是成员状态的来源标记，不是任期三态词表里的停写原因：展示面按「无原因」输出
+   * （冻结本身已由状态呈现），避免把内部标记原样透给用户。 */
+  return typeof reason === 'string' && reason.trim() !== '' && reason.trim() !== LEDGER_FROZEN_REASON ? reason.trim() : null;
 }
 
 /* 状态栏席位视图：本机活跃席位的稳定字段集（不暴露暂存/inbox 等运行态）。
@@ -1415,7 +1434,7 @@ function approveLegacyOf(state, input) {
     const local = state.collabs.get(input?.collabId);
     if (local !== undefined) {
       upgradeJoinedCarrierOf(state, local, input?.sessionId);
-      settleKnockedSession(state, local);
+      settleKnockedSession(state, local, input?.sessionId);
       queueMicrotask(() => {
         triggerSync(state, local, { reason: 'join-decided' });
       });
@@ -1470,7 +1489,9 @@ async function acceptSeatInviteNow(state, input) {
  * 但挂起邀请仍在盘上——本地无参与记录时照样走加入域（邀请簿记是唯一权威），
  * 只在挂起记录确实不存在时才退回旧路径的「本机没有该协作」错误面。 */
 async function acceptSeatInviteWithoutLocalOf(state, input) {
-  const pending = pendingInviteRecordOf(state, input);
+  /* 已接受过的记录不再由 pendingInvitesFor 冒泡：重复接受（approve/grant 丢帧或重启后重试）
+   * 必须仍进入加入域，由 alreadyAcceptedInviteOf 决定幂等或重发 approve（C-3 / N-1）。 */
+  const pending = pendingInviteRecordOf(state, input) ?? acceptedInviteRecordOf(state, input);
   if (pending === null) {
     return approveInvite(state, input);
   }
@@ -1527,6 +1548,20 @@ function canLookupPendingInviteOf(state, input) {
     && typeof input?.inviteId === 'string' && typeof input?.sessionId === 'string';
 }
 
+/* 已接受记录的原始取数（不受「已接受」过滤）：给重复接受一条仍能进入加入域的路。 */
+function acceptedInviteRecordOf(state, input) {
+  if (typeof state.join?.acceptedInvite !== 'function' || !canLookupPendingInviteOf(state, input)) {
+    return null;
+  }
+  try {
+    return state.join.acceptedInvite({ collabId: input.collabId, sessionId: input.sessionId, inviteId: input.inviteId });
+  } catch (error) {
+    state.counters.loadFailures++;
+    state.log.warn('已接受邀请取数失败（按无记录处置）', { collabId: input?.collabId, reason: error?.message });
+    return null;
+  }
+}
+
 /* 挂起记录没有展示名，名称/主题取邀请落点载体（邀请到达时已定格）。 */
 function pendingInviteSummaryOf(state, pending) {
   const carrier = readCarrier(collabDir(state.dataDir, pending.collabId)).carrier;
@@ -1581,11 +1616,12 @@ function inviteSummaryOfLocal(local) {
 
 /* 敲门登记的本会话接线（讨论「加入后本会话接线」的收口）：同意门的写点（放行者席位）在 handler
  * 之后才落，故本步以宏任务让位——登记在册的请求会话最终持席（放行者即请求会话时＝幂等重写）。
+ * acceptedSessionId 是本次点头的会话：加入域据此拒绝替「未同意的敲门者」建席（防幽灵席位）。
  * 无登记 / 非讨论 / 计时器不可用一律空转（既有行为不变）；计时器不阻止进程退出。 */
-function settleKnockedSession(state, local) {
+function settleKnockedSession(state, local, acceptedSessionId = null) {
   const bind = () => {
     try {
-      const sessionId = state.join.bindKnockedSession(local);
+      const sessionId = state.join.bindKnockedSession(local, acceptedSessionId);
       if (typeof sessionId === 'string') {
         ensureSeatAfterJoin(state, local.collabId, sessionId, 'member');
       }
@@ -1963,11 +1999,11 @@ function readonlyWriteMessageOf(reason) {
   return '该协作目录处于半写/恢复态（只读）——不能写入；请手工归档或重新创建';
 }
 
-/* 新建的成功收尾：席位登记（本机席位态的唯一写点之一）＋载体文件。
+/* 新建的成功收尾：席位登记（本机席位态的唯一写点之一）＋载体兜底。
  * 无会话标识不得创建（设计 §1.1）：没有站长席位就没有可派生的站长，邀请与注入全部失效。
- * 设计 §8 要求 carrier 先于台账；createCollab 属出站层且内部直接落台账，本层只能在其后补写——
- * 写失败时立即写 recovery 标记（不留「无 carrier、有 member.json」的目录，否则重启会被判 legacy
- * 永久归档），本次创建按失败收口。 */
+ * carrier-first 与成员/台账硬前置归 createCollab（出站层）：carrier 先写，成员/台账写失败即
+ * 中止创建；本层只在出站层成功后补登创建者席位，并兜底检查载体（缺失时写 recovery 标记，
+ * 不留「无 carrier、有 member.json」的目录，否则重启会被判 legacy 永久归档）。 */
 function createNow(state, input) {
   if (typeof state.probeCapability === 'function') {
     return createNowWithCapability(state, input);

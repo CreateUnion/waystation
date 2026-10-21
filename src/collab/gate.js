@@ -381,7 +381,16 @@ function pendingInvitesMaxOf(state) {
   return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_PENDING_INVITES_MAX;
 }
 
+/* 待回应邀请数：按挂起邀请账（pending-invites）的 open 且未过期记录计数——重启后仍准确，
+ * 同一协作的多条邀请也不再只计 1。加入域未接线（独立门控单测）时退回本地 proposed 记录。 */
 function countPendingInvites(state) {
+  if (typeof state.join?.pendingInviteCount === 'function') {
+    try {
+      return state.join.pendingInviteCount();
+    } catch {
+      /* 取数失败按旧口径兜底：容量面仍有 pending store 自身上限兜底，不阻断准入。 */
+    }
+  }
   let count = 0;
   for (const local of state.collabs.values()) {
     if (local.role === 'member' && local.member.state === 'proposed' && (local.member.decision ?? null) === null) {

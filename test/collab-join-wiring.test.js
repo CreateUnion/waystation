@@ -1439,6 +1439,38 @@ test('拒绝帧：发起侧按 inviteId 关闭指名邀请记录（不再只计�
   assert.equal(record.state, 'closed', '指名邀请在拒绝后关闭（open 记录不得残留）');
 });
 
+test('终态拒绝回执（N-3）：已撤回 / 已过期邀请的 approve 回 join-deny（携目标会话）', async (t) => {
+  const made = makeHarness(t);
+  const invite = await made.join.createInvite({
+    collabId: COLLAB, managerSessionId: MANAGER_SESSION, targetInstanceId: 'inst-a', targetSessionId: 'app-session-1',
+  });
+  assert.equal(invite.ok, true, invite.message);
+  assert.equal(made.join.withdrawInvite({ collabId: COLLAB, managerSessionId: MANAGER_SESSION, inviteId: invite.inviteId }).ok, true);
+  made.sent.length = 0;
+  const rejected = await made.join.handleInviteApproval(inviteApprovalFrame(invite.inviteId, 'app-session-1'));
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.reason, 'withdrawn');
+  await waitFor(() => deliveredOf(made.sent, 'join-deny').length > 0 ? true : null, { timeoutMs: 1000 });
+  const deny = deliveredOf(made.sent, 'join-deny').at(-1);
+  assert.equal(deny.payload.sessionId, 'app-session-1', '回执指名到申请会话（目标端据此回滚申请）');
+  assert.equal(deny.payload.joinId, invite.inviteId, '无在途 grant 时以 inviteId 兜底定位');
+  assert.equal(deny.payload.reason, 'aborted');
+  assert.equal(deny.to.instanceId, 'inst-a');
+  assert.deepEqual(deny.toSessions, ['app-session-1']);
+
+  const expiring = makeHarness(t, { config: { inviteTtlMs: 1000 } });
+  const late = await expiring.join.createInvite({
+    collabId: COLLAB, managerSessionId: MANAGER_SESSION, targetInstanceId: 'inst-a', targetSessionId: 'app-session-1',
+  });
+  expiring.clock.value += 2000;
+  expiring.sent.length = 0;
+  const expired = await expiring.join.handleInviteApproval(inviteApprovalFrame(late.inviteId, 'app-session-1'));
+  assert.equal(expired.ok, false);
+  assert.equal(expired.reason, 'expired');
+  await waitFor(() => deliveredOf(expiring.sent, 'join-deny').length > 0 ? true : null, { timeoutMs: 1000 });
+  assert.equal(deliveredOf(expiring.sent, 'join-deny').at(-1).payload.reason, 'expired');
+});
+
 test('目标端撤回：挂起邀请置 withdrawn 并停投', async (t) => {
   const made = makeHarness(t);
   const invite = await made.join.createInvite({

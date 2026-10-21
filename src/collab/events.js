@@ -277,13 +277,35 @@ function handleInvite(state, frame, meta) {
 function inviteLandingFailureOf(state, frame) {
   const recorded = recordPendingInvite(state, frame);
   if (recorded === null || recorded === undefined || recorded.ok === true) {
+    noteInviteLandingOutcome(state, frame, false);
     return null;
   }
   state.counters.inviteLandingAborted = (state.counters.inviteLandingAborted ?? 0) + 1;
   state.log.warn('邀请落点登记失败——中止本次邀请落地（不建本地参与记录）', {
     collabId: frame.collabId, reason: recorded.reason ?? recorded.message ?? 'unknown',
   });
+  /* 标记落点失败的帧：入站管线的会话注入不接受 invite 的 sessionDeliver 声明，改由
+   * sessionGate 读本标记抑制注入（M-5）。 */
+  noteInviteLandingOutcome(state, frame, true);
   return { ok: false, reason: recorded.reason ?? 'invite-landing-failed', sessionDeliver: false };
+}
+
+/* 邀请落点结果标记（按帧标识，进程内有界）：失败 → 记入；成功 → 清除（同一帧重试成功后可注入）。 */
+const FAILED_INVITE_FRAME_MAX = 256;
+
+function noteInviteLandingOutcome(state, frame, failed) {
+  const msgId = typeof frame?.msgId === 'string' ? frame.msgId : null;
+  if (msgId === null || !(state.failedInviteFrames instanceof Set)) {
+    return;
+  }
+  state.failedInviteFrames.delete(msgId);
+  if (!failed) {
+    return;
+  }
+  state.failedInviteFrames.add(msgId);
+  while (state.failedInviteFrames.size > FAILED_INVITE_FRAME_MAX) {
+    state.failedInviteFrames.delete(state.failedInviteFrames.values().next().value);
+  }
 }
 
 /* 目标机挂起邀请登记（邀请/加入域）：未入席会话据此在注册时收到补投；forum 无邀请簿记（D18）。 */

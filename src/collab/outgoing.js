@@ -12,6 +12,7 @@ import { archiveLocalSeatsOfState, currentManagerIdOf, emitOwnMemberEvent, folde
 import { matchConflictCollabs } from './gate.js';
 import { CARRIER_FORMAT_INVITE_STUB, CARRIER_FORMAT_SESSION_SEATS, readCarrier, writeCarrier } from './carrier.js';
 import { collabDir } from '../paths.js';
+import { writeRecovery } from './migration.js';
 import { ledgerTermOf, writeLocalTerminalCopy } from './takeover.js';
 import { createInvitesFileStore } from './joins.js';
 import { matchSessionByToken } from '../util/short-id.js';
@@ -100,14 +101,50 @@ export function createCollab(state, { name, topic, targets, mode, sessionId }) {
     local.member.originator = { instanceId: state.self.instanceId, identityName: state.self.identityName };
     emitOwnMemberEvent(state, local, 'join', sessionId);   // 发起人自创建即在成员表内（"第一个"，设计 §5.1）
   }
-  persistMember(state, local);
-  persistLedger(state, local);
+  /* 成员/台账落盘是创建成功的硬前置：写失败时首邀不得发出（对端可能接受，但本机重启后
+   * 目录会被判半写只读）。载体已落盘，故保留目录并写 recovery 标记，失败可诊断。 */
+  const persistenceFailure = persistCreateRecordsOf(state, local);
+  if (persistenceFailure !== null) {
+    return abortCreatePersistenceOf(state, ledger, persistenceFailure);
+  }
   const invited = initialInvitesOf(state, local, ledger, targets, collabMode, sessionId);
   state.counters.collabsCreated++;
   applyDefaultMute(state, local, sessionId);   // 写点一：创建成功（邀请发送结果不影响入席事实）
   state.openViewer?.({ root: state.viewerRoot, id: ledger.collabId });   // 触发 A：建立即开该协作页（开关在出口内现读）
   /* 新建实例的静音状态必为空（新 collabId 无旧文件），写点一的默认静音必然落笔——提醒同发。 */
   return { ok: true, collabId: ledger.collabId, invited, notice: DEFAULT_MUTE_NOTICE };
+}
+
+/* 创建路径的持久化结果（与运行态路径不同：这里写失败必须中止创建）。返回失败原因或 null。 */
+function persistCreateRecordsOf(state, local) {
+  if (!persistMember(state, local)) {
+    return 'member-persist-failed';
+  }
+  if (!persistLedger(state, local)) {
+    return 'ledger-persist-failed';
+  }
+  return null;
+}
+
+/* 创建中道失败：载体保留，目录显式标记恢复态（只读），内存注册表移除——调用方不得返回成功，
+ * 首邀也尚未发出。恢复标记写不成时仍按只读处理（失败安全）。 */
+function abortCreatePersistenceOf(state, ledger, reason) {
+  const dir = collabDir(state.dataDir, ledger.collabId);
+  const recovery = writeRecovery(dir, { reason });
+  state.readonlyCollabs?.set(ledger.collabId, { reason: 'recovery' });
+  state.collabs.delete(ledger.collabId);
+  if (recovery?.ok !== true) {
+    state.counters.persistFailures++;
+    state.log.warn('创建持久化失败的恢复标记也未能落盘（目录仍按只读处理）', { collabId: ledger.collabId });
+  }
+  return {
+    ok: false,
+    collabId: ledger.collabId,
+    reason,
+    message: reason === 'member-persist-failed'
+      ? '成员记录写入失败——创建中止（未发邀请、不返回成功）；目录已标记为恢复态（只读），请检查磁盘后重新创建'
+      : '共享台账写入失败——创建中止（未发邀请、不返回成功）；目录已标记为恢复态（只读），请检查磁盘后重新创建',
+  };
 }
 
 /* 新建协作的本机运行态容器（与加载路径同形；存储句柄按需构造，不落盘）。 */
@@ -521,9 +558,14 @@ export function handleJoinKnock(state, knock) {
       continue;
     }
     state.counters.joinKnockMatches++;
+    /* 放行指引指名请求会话（设计 §4.5）：同机敲门登记里能拿到 sessionId，放行者据此用
+     * ws_invite 的 targetSessionId 指名回复；远端敲门报文不含会话标识，此时按未指名指引。 */
+    const knockedSessionId = typeof state.join?.knockedSession === 'function'
+      ? state.join.knockedSession(knock.name)
+      : null;
     /* 应答判据＝该协作的绑定会话是否活跃（经提示面的路由结论表达）：无接收者不回 join-ack——
      * 如实表达无人值守，避免对端得到「有人应答但无人放行」的悬置态；休眠期丢弃由路由面留痕。 */
-    if (notifyLocal(state, local, joinKnockNoticeText(knock, localNameOf(local))) === false) {
+    if (notifyLocal(state, local, joinKnockNoticeText(knock, localNameOf(local), knockedSessionId)) === false) {
       state.log.warn('敲门命中但该协作无活跃绑定会话——不回应答（无人值守）', { collabId: local.collabId });
       continue;
     }
@@ -565,10 +607,14 @@ function joinKnockReplyOf(state, local) {
   };
 }
 
-/* 放行指引文案：申请人身份（含实例标识）与来源端点（放行时作 ws_invite 的 targets 项）、讨论名。
+/* 放行指引文案：申请人身份（含实例标识）与来源端点（放行时作 ws_invite 的 targets 项）、讨论名；
+ * 能拿到请求会话时一并指名（targetSessionId），放行只投该会话、不广播给同机其他会话。
  * 同意门仍在申请人一侧——本机放行只是发出正式邀请。 */
-function joinKnockNoticeText(knock, name) {
-  return `收到加入申请：「${knock.identityName}」（实例 ${knock.instanceId}，端点 ${knock.address}:${knock.port}）想加入讨论「${name}」——放行 = 本机用 ws_invite 邀请它（targets 用该身份与端点），随后由对方的同意门定夺`;
+function joinKnockNoticeText(knock, name, knockedSessionId = null) {
+  const target = typeof knockedSessionId === 'string' && knockedSessionId !== ''
+    ? `，targetSessionId 用 ${knockedSessionId}（只投该会话）`
+    : '';
+  return `收到加入申请：「${knock.identityName}」（实例 ${knock.instanceId}，端点 ${knock.address}:${knock.port}）想加入讨论「${name}」——放行 = 本机用 ws_invite 邀请它（targets 用该身份与端点${target}），随后由对方的同意门定夺`;
 }
 
 export function approveInvite(state, { collabId, approve, reason, sessionId, confirmToken }) {

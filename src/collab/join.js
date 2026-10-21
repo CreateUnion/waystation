@@ -87,7 +87,7 @@ export function createJoinDomain({ state, send = null, openViewer = null, log = 
     pendingJoinsOf: (collabId) => pendingJoinsOf(joinState, collabId),
     isGranted: (collabId, sessionId) => isGranted(joinState, collabId, sessionId),
     /* 讨论同意门落地后的收口（服务在邀请被批准时调用）：把敲门登记在册的请求会话接线。 */
-    bindKnockedSession: (local) => bindKnockedSession(joinState, local),
+    bindKnockedSession: (local, acceptedSessionId) => bindKnockedSession(joinState, local, acceptedSessionId),
     /* —— 会话级邀请与两段式入席（邀请簿记、挂起补投、join 两段式；设计 §4） —— */
     ...sessionJoinApiOf(joinState),
   };
@@ -115,6 +115,9 @@ function sessionJoinApiOf(joinState) {
     expireInvites: (at) => expireInvitesOf(joinState, at),
     pruneTerminalPending: (at) => pruneTerminalPendingOf(joinState, at),
     pendingInviteList: (input) => pendingInviteListOf(joinState, input ?? {}),
+    acceptedInvite: (input) => acceptedInviteOf(joinState, input ?? {}),
+    pendingInviteCount: (at) => pendingInviteCountOf(joinState, at),
+    knockedSession: (name) => knockedSessionOf(joinState, name),
     registerPendingInvite: (input) => registerPendingInviteOf(joinState, input ?? {}),
     handleInviteFrame: (frame) => handleInviteFrameOf(joinState, frame),
     handleInviteApproval: (frame) => handleInviteApprovalOf(joinState, frame),
@@ -754,11 +757,14 @@ function rosterJoinSeqOf(local, sessionId) {
 }
 
 async function knockByName(joinState, name, sessionId) {
+  /* 登记先于敲门：发现层若把敲门回送到本机（同机讨论 / 回环），放行指引才能按
+   * (instanceId, sessionId) 指名请求会话；敲门失败时撤掉本次登记（不留没发出去的申请）。 */
+  const registration = rememberKnock(joinState, name, sessionId);
   const knocked = await knockOf(joinState, name);
   if (knocked.ok !== true) {
+    forgetKnock(joinState, name, registration);
     return knocked;
   }
-  rememberKnock(joinState, name, sessionId);
   return { ok: true, mode: 'forum', sessionId, knocked: true, replies: knocked.replies, note: knockNoteOf(knocked.replies) };
 }
 
@@ -766,14 +772,29 @@ async function knockByName(joinState, name, sessionId) {
  * （敲门不指名，放行后的邀请广播给全部活跃会话），登记让同意门落地时把席位交回请求会话。
  * 同名后敲者覆盖先敲者（一个讨论只留最新的请求会话），登记按申请时限过期（放行来晚了不再接线）。 */
 function rememberKnock(joinState, name, sessionId) {
-  joinState.knocks.set(name, { sessionId, at: joinState.now() });
+  const registration = { sessionId, at: joinState.now() };
+  joinState.knocks.set(name, registration);
+  return registration;
+}
+
+/* 只撤本次登记（并发的新敲门已覆盖时不动新登记）。 */
+function forgetKnock(joinState, name, registration) {
+  if (joinState.knocks.get(name) === registration) {
+    joinState.knocks.delete(name);
+  }
+}
+
+/* 登记在册的请求会话（放行指引的指名面）：无登记 / 形态坏一律 null。 */
+function knockedSessionOf(joinState, name) {
+  const registered = typeof name === 'string' ? joinState.knocks.get(name) : undefined;
+  return registered !== undefined && isIdentityName(registered.sessionId) ? registered.sessionId : null;
 }
 
 /* 同意门落地后的收口（服务在讨论邀请被批准时调用）：该讨论名登记在册的请求会话接线——放行者
  * 若恰是请求会话，同意门的写点已接线（此处幂等重写）；登记不存在 / 已过期 / 服务面缺位一律不动
  * （既有行为不变）。登记在**接线成功之后**才清除：瞬态不可用（绑定表缺位 / 写盘失败）不丢登记，
  * 待下次落地重试。返回接线到的会话标识，未接线返回 null。 */
-function bindKnockedSession(joinState, local) {
+function bindKnockedSession(joinState, local, acceptedSessionId = null) {
   if (local === undefined || localModeOf(local) !== 'forum') {
     return null;
   }
@@ -785,6 +806,12 @@ function bindKnockedSession(joinState, local) {
   if (joinState.now() - registered.at >= ttlOf(joinState) || !isIdentityName(registered.sessionId)) {
     joinState.knocks.delete(name);   // 过期（放行来得太晚）或形态坏：登记作废
     return null;
+  }
+  /* 防幽灵席位（设计 §4.5）：只有点头的会话就是敲门会话，或敲门会话已有自己的 join 事件，
+   * 才把席位交回它——其他会话接受未指名邀请时不得替敲门者建席（成员事件由各自会话作者发）。 */
+  const accepted = idOf(acceptedSessionId);
+  if (accepted !== registered.sessionId && !selfJoinedOf(local, joinState.state.self.instanceId, registered.sessionId)) {
+    return null;   // 放行未指名到敲门会话：登记保留，等该会话自己同意
   }
   if (bindSession(joinState, { collabId: local.collabId, sessionId: registered.sessionId, origin: 'join' }) !== true) {
     return null;   // 接线未落地：登记保留（本会话待下次落地接线）
@@ -1981,6 +2008,10 @@ async function sendDeclineFrameOf(joinState, { collabId, inviteId, sessionId, re
   if (manager === undefined) {
     return { ...base, delivery: { ok: false, reason: '挂起记录缺少邀请者信息——decline 帧未发出' } };
   }
+  /* 同机邀请者不投帧（投给会话面不会进入核内处理）：直接交发起侧拒绝处理，关闭邀请记录。 */
+  if (manager.instanceId === joinState.state.self.instanceId) {
+    return localDeclineDeliveryOf(joinState, { base, collabId, inviteId, sessionId, reason, manager });
+  }
   /* inviteId 随拒绝帧回传：发起侧据此关闭对应邀请记录（拒绝不只是计数）。 */
   const sent = await sendSeatFrame(joinState, {
     collabId, instanceId: manager.instanceId, sessionId: manager.sessionId, type: 'decline',
@@ -1989,6 +2020,36 @@ async function sendDeclineFrameOf(joinState, { collabId, inviteId, sessionId, re
   return sent.ok === true
     ? { ...base, delivery: sent }
     : { ...base, delivery: sent, note: `拒绝已本地生效；decline 帧未送达：${sent.reason}` };
+}
+
+/* 同机拒绝的簿记收口（N-2）：先直接调用发起侧拒绝处理（等价于核内收到 decline 帧），
+ * 不依赖「帧注入未入席会话」这条不存在的地面；随后照旧把帧交给本机邀请者会话
+ * （展示与拒绝计数面——同机旁路的既有投递语义不变）。 */
+async function localDeclineDeliveryOf(joinState, { base, collabId, inviteId, sessionId, reason, manager }) {
+  const handled = handleInviteDeclineOf(joinState, {
+    collabId,
+    from: { instanceId: joinState.state.self.instanceId, sessionId },
+    payload: { inviteId, ...(reason === undefined ? {} : { reason }) },
+  });
+  const sent = await sendSeatFrame(joinState, {
+    collabId, instanceId: manager.instanceId, sessionId: manager.sessionId, type: 'decline',
+    payload: { inviteId, ...(reason === undefined ? {} : { reason }) }, fromSessionId: sessionId,
+  });
+  const recordClosed = handled?.ok === true;
+  /* 同机拒绝在核内直接完成：发起侧的「收到拒绝」计数在此记真（远端路径由事件面记账）。
+   * 之后把帧交给本机邀请者会话时，重复处理按幂等返回、不再重复计数。 */
+  if (recordClosed && handled.idempotent !== true) {
+    joinState.state.counters.declinesIn = (joinState.state.counters.declinesIn ?? 0) + 1;
+  }
+  const delivery = { ...sent, local: true, recordClosed };
+  if (recordClosed) {
+    return { ...base, delivery };
+  }
+  return {
+    ...base,
+    delivery: { ...delivery, recordReason: handled?.reason ?? '本机发起侧记录不可关闭（非站长会话或讨论实例）' },
+    note: '拒绝已本地生效；同机发起侧记录未能关闭',
+  };
 }
 
 function acceptInviteIdsOf(input) {
@@ -3329,12 +3390,17 @@ function inviteTargetsJoiningOf(record, joining) {
     && (target.targetSessionId === undefined || target.targetSessionId === joining.sessionId));
 }
 
-/* 撤回帧：目标端据此清挂起记录；同机目标走核内旁路。投递结果只留痕（撤回已在本地生效）。 */
+/* 撤回帧：目标端据此清挂起记录。同机目标不投帧（未入席会话没有可投面，N-2）——直接清本机
+ * 挂起记录并同步本地参与记录的撤回结论。远端投递结果只留痕（撤回已在本地生效）。 */
 function notifyWithdrawnTargetsOf(joinState, collabId, record, managerSessionId) {
   if (record === null) {
     return;
   }
   for (const target of record.targets) {
+    if (target.instanceId === joinState.state.self.instanceId) {
+      applyLocalWithdrawOf(joinState, { collabId, inviteId: record.inviteId });
+      continue;
+    }
     void sendSeatFrame(joinState, {
       collabId, instanceId: target.instanceId, sessionId: target.targetSessionId,
       type: 'withdraw', payload: { scope: 'single', inviteId: record.inviteId }, fromSessionId: managerSessionId,
@@ -3345,6 +3411,19 @@ function notifyWithdrawnTargetsOf(joinState, collabId, record, managerSessionId)
     }).catch((error) => {
       joinState.log.warn('撤回帧发送异常（本地撤回已生效）', { collabId, inviteId: record.inviteId, reason: error?.message });
     });
+  }
+}
+
+/* 同机撤回的本地收口：清挂起记录并同步本地参与记录（与远端 handleWithdrawInbound 同口径）。 */
+function applyLocalWithdrawOf(joinState, { collabId, inviteId }) {
+  const cleared = withdrawPendingInviteOf(joinState, { collabId, inviteId });
+  if (cleared.ok !== true) {
+    joinState.log.warn('同机撤回清理挂起邀请失败', { collabId, inviteId, reason: cleared.reason });
+  }
+  const local = joinState.state.collabs.get(collabId);
+  if (local !== undefined && local.role === 'member' && (local.member?.decision ?? null) === null) {
+    local.member.decision = 'withdrawn';
+    persistMember(joinState.state, local);
   }
 }
 
@@ -3410,7 +3489,11 @@ function registerPendingInviteOf(joinState, input) {
   if (applied.ok !== true) {
     return failureMessage(`挂起邀请登记失败：${applied.reason}`, { reason: applied.reason });
   }
-  books.pending.save();
+  /* 落盘失败不得回报登记成功：调用方（邀请落点）据此中止落地，否则重启后这条邀请无从补投/校验。 */
+  const saved = books.pending.save();
+  if (saved.ok !== true) {
+    return failureMessage(`挂起邀请写入失败：${saved.reason}`, { reason: 'persist-failed' });
+  }
   return { ok: true, inviteId, duplicate: applied.duplicate === true, expiresAt };
 }
 
@@ -3627,6 +3710,52 @@ function pendingInvitesForOf(joinState, input) {
   return books.pending.store.matchPendingForSession({ collabId, sessionId, inviteId: input.inviteId, now: joinState.now() });
 }
 
+/* 已接受邀请的原始记录（不按 matchPending 的「已接受/终态」过滤）：重启后 invite-stub 无本地
+ * 记录时，服务层靠它仍能进入加入域——已成席则幂等，未成席（approve/grant 丢帧）则重发 approve。 */
+function acceptedInviteOf(joinState, input) {
+  const collabId = idOf(input.collabId);
+  const inviteId = idOf(input.inviteId);
+  const sessionId = idOf(input.sessionId);
+  if (collabId === null || inviteId === null || sessionId === null) {
+    return null;
+  }
+  const record = booksOf(joinState, collabId).pending.store.get({ collabId, inviteId });
+  return record !== null && record.acceptedSessions.includes(sessionId) ? record : null;
+}
+
+/* 待回应邀请计数（上限判定面）：按挂起账的 open 且未过期记录计数——重启后由 pending-invites
+ * 文件恢复，不依赖本地参与记录是否加载（invite-stub 不参与注册表加载）。
+ * 无邀请簿记的旧版邀请（无 inviteId）仍按本地 proposed 记录计数，且不与挂起账重复计数。 */
+function pendingInviteCountOf(joinState, at) {
+  const now = Number.isFinite(at) ? at : joinState.now();
+  const booked = bookedPendingInvitesOf(joinState, now);
+  return booked.count + unbookedProposedInvitesOf(joinState, booked.collabIds);
+}
+
+function bookedPendingInvitesOf(joinState, now) {
+  const collabIds = new Set();
+  let count = 0;
+  for (const [collabId, books] of allBooksOf(joinState)) {
+    const open = books.pending.store.list().filter((record) => record.state === 'open' && now < record.expiresAt).length;
+    if (open > 0) {
+      collabIds.add(collabId);
+      count += open;
+    }
+  }
+  return { count, collabIds };
+}
+
+function unbookedProposedInvitesOf(joinState, bookedCollabIds) {
+  let count = 0;
+  for (const local of joinState.state.collabs.values()) {
+    if (local.role === 'member' && local.member?.state === 'proposed' && (local.member.decision ?? null) === null
+      && !bookedCollabIds.has(local.collabId)) {
+      count++;
+    }
+  }
+  return count;
+}
+
 /* 清单面（ws_list_collabs 的待回应邀请）：open 与已过期记录都要露面（设计 §9：含过期），
  * 至少给 inviteId / 目标会话 / 邀请者 / 有效期 / 状态——邀请消息丢失或核心重启后，
  * 这是用户唯一能拿到 inviteId 的入口。 */
@@ -3740,8 +3869,10 @@ function replayInviteFrameOf(joinState, collabId, record) {
   });
 }
 
-/* 站长侧收到受邀会话的 approve（approve 携 inviteId 时由事件面转交本域签发 grant）。 */
-function handleInviteApprovalOf(joinState, frame) {
+/* 站长侧收到受邀会话的 approve（approve 携 inviteId 时由事件面转交本域签发 grant）。
+ * 终态拒绝必须回执（N-3）：目标端已消费挂起邀请并停在「已接受、待授权」，没有 grant 也不会
+ * 自行收敛——不回收据就是用户可见死胡同。 */
+async function handleInviteApprovalOf(joinState, frame) {
   const context = inviteApprovalContextOf(joinState, frame);
   if (context === null) {
     return null;
@@ -3751,10 +3882,34 @@ function handleInviteApprovalOf(joinState, frame) {
   if (managerSessionId === null) {
     return failureMessage('站长席位未知——无法签发 join-grant');
   }
-  return approveInviteForSeat(joinState, {
+  const result = await approveInviteForSeat(joinState, {
     collabId, inviteId, instanceId, sessionId, managerSessionId,
     identityName: isIdentityName(frame.from.identityName) ? frame.from.identityName : instanceId,
   });
+  if (result?.ok !== true) {
+    const reason = /** @type {any} */ (result)?.reason;
+    await sendInviteRejectionReceiptOf(joinState, { collabId, inviteId, instanceId, sessionId, managerSessionId, reason });
+  }
+  return result;
+}
+
+/* 终态拒绝的 join-deny 回执：只对「目标匹配但邀请已不可用」的失败回帧（撤回 / 过期 / 已关闭 /
+ * 已接受未成席）；目标不符或形态类失败不回（坏目标隔离，不给伪造帧回执）。
+ * 目标端 handleJoinDeny 以 payload.sessionId 回滚申请记录并提示；joinId 优先取该会话的在途记录，
+ * 没有则用 inviteId 兜底（目标端本就没有在途 grant 可回滚）。 */
+const INVITE_REJECTION_RECEIPT_REASONS = new Set(['expired', 'withdrawn', 'closed', 'already-accepted', 'already-declined']);
+
+async function sendInviteRejectionReceiptOf(joinState, { collabId, inviteId, instanceId, sessionId, managerSessionId, reason }) {
+  if (!INVITE_REJECTION_RECEIPT_REASONS.has(reason)) {
+    return;
+  }
+  const joining = booksOf(joinState, collabId).joining.registry.find(collabId, sessionId);
+  const joinId = joining !== null && joining.instanceId === instanceId ? joining.joinId : inviteId;
+  await sendSeatFrame(joinState, {
+    collabId, instanceId, sessionId, type: 'join-deny',
+    payload: { joinId, reason: reason === 'expired' ? 'expired' : 'aborted', sessionId },
+    fromSessionId: managerSessionId,
+  }).catch((error) => joinState.log.warn('邀请终态拒绝回执发送失败', { collabId, inviteId, reason: error?.message }));
 }
 
 function inviteApprovalContextOf(joinState, frame) {

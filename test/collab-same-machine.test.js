@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
-import { collabFilePath } from '../src/paths.js';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { collabFilePath, invitesFilePath, pendingInvitesFilePath } from '../src/paths.js';
 import { createCollabService } from '../src/collab/service.js';
 import { MUTE_FILE_NAME } from '../src/collab/mute.js';
 import { loadLedger } from '../src/collab/store.js';
@@ -73,6 +73,18 @@ function mutePathOf(dir, collabId) {
   return collabFilePath(dir, collabId, MUTE_FILE_NAME);
 }
 
+function readJsonOf(file) {
+  return JSON.parse(readFileSync(file, 'utf8'));
+}
+
+function inviteRecordOf(dir, collabId, inviteId) {
+  return readJsonOf(invitesFilePath(dir, collabId)).invites.find((record) => record.inviteId === inviteId);
+}
+
+function pendingRecordOf(dir, collabId, inviteId) {
+  return readJsonOf(pendingInvitesFilePath(dir, collabId)).invites.find((record) => record.inviteId === inviteId);
+}
+
 function twoStageFramesOf(made) {
   return made.sent.filter((message) => TWO_STAGE_TYPES.includes(message.type));
 }
@@ -126,6 +138,31 @@ test('同机待批准申请：超过申请时限即从待批准面剪除，过�
   });
   assert.equal(approved.ok, false, '过期申请不得签发注定空授权的 grant');
   assert.match(approved.message, /没有待批准的加入申请/);
+});
+
+test('同机撤回 / 拒绝（N-2）：目标挂起邀请立即收敛，发起侧记录同步关闭', async (t) => {
+  const made = makeService(t);
+  const collabId = createCollabOf(made, '同机撤回');
+  const invited = await made.service.join.createInvite({ collabId, managerSessionId: MANAGER_SESSION, targetInstanceId: SELF.instanceId, targetSessionId: MEMBER_SESSION });
+  assert.equal(invited.ok, true, invited.message);
+  assert.equal(made.service.join.pendingInvitesFor({ collabId, sessionId: MEMBER_SESSION, inviteId: invited.inviteId }).length, 1, '同机邀请先落挂起记录');
+
+  const withdrawn = made.service.join.withdrawInvite({ collabId, managerSessionId: MANAGER_SESSION, inviteId: invited.inviteId });
+  assert.equal(withdrawn.ok, true, withdrawn.message);
+  assert.deepEqual(made.service.join.pendingInvitesFor({ collabId, sessionId: MEMBER_SESSION, inviteId: invited.inviteId }), [], '同机撤回必须立即清目标挂起邀请（不等 TTL、不依赖帧注入）');
+  assert.equal(pendingRecordOf(made.dir, collabId, invited.inviteId).state, 'withdrawn');
+  assert.equal(inviteRecordOf(made.dir, collabId, invited.inviteId).state, 'withdrawn');
+
+  const second = await made.service.join.createInvite({ collabId, managerSessionId: MANAGER_SESSION, targetInstanceId: SELF.instanceId, targetSessionId: MEMBER_SESSION });
+  assert.equal(second.ok, true, second.message);
+  const challenge = await made.service.approve({ collabId, inviteId: second.inviteId, sessionId: MEMBER_SESSION, approve: false, reason: '暂不参与' });
+  assert.equal(challenge.needsUserConfirmation, true, JSON.stringify(challenge));
+  const declined = await made.service.approve({ collabId, inviteId: second.inviteId, sessionId: MEMBER_SESSION, approve: false, reason: '暂不参与', confirmToken: challenge.confirmToken });
+  assert.equal(declined.ok, true, declined.message);
+  assert.equal(declined.declined, true);
+  assert.equal(declined.delivery?.local, true, '同机拒绝走核内发起侧处理（不投会话帧）');
+  assert.equal(inviteRecordOf(made.dir, collabId, second.inviteId).state, 'closed', '同机拒绝关闭发起侧邀请记录（不止计数）');
+  assert.deepEqual(made.service.join.pendingInvitesFor({ collabId, sessionId: MEMBER_SESSION, inviteId: second.inviteId }), [], '同机拒绝后挂起邀请不再冒泡');
 });
 
 test('同机邀请：投达后登记挂起邀请，接受后两侧同名单、同席位，重启后仍在', async (t) => {
