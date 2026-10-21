@@ -1,6 +1,6 @@
 import { MAX_FRAME_BYTES, MAX_TOPIC_CHARS, isPresentationText } from '../net/protocol.js';
 import { isPostEntryShape, displayOrderOf } from './posts.js';
-import { foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, persistMember, selfJoinedOf } from './local.js';
+import { foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, persistMember, primarySeatOf, selfJoinedOf } from './local.js';
 import { applyEndpoint, checkRelayRecovery, endpointFor, mutateLedger, notifyLocal, startJoinReplay, stopJoinReplay, stopJoinReplays } from './outgoing.js';
 import { foldMemberEvents } from './members.js';
 import { isPeerShape, isTimestamp } from './model.js';
@@ -232,11 +232,18 @@ function sendHistoryRequest(state, local, sourceId, endpoint, after) {
     to: { instanceId: sourceId, address: endpoint.address, port: endpoint.port },
     type: 'history-request',
     payload: { after: after ?? null, summary: summaryOf(local.posts.entries()) },
+    fromSessionId: syncSignerSessionOf(local),
   });
   if (result.ok === true) {
     state.counters.syncRequestsSent++;
   }
   return result;
+}
+
+/* 拉取两件套的发送席位（0.2.0 帧必须携 from.sessionId）：本机在该讨论的活跃席位，
+ * 无席位表的历史夹具返回 undefined（由 dispatch 预检如实拒绝，不伪造身份）。 */
+function syncSignerSessionOf(local) {
+  return primarySeatOf(local)?.sessionId;
 }
 
 function waiterKeyOf(collabId, sourceId) {
@@ -284,6 +291,7 @@ function answerHistoryRequest(state, local, frame) {
     to: { instanceId: frame.from.instanceId, address: endpoint.address, port: endpoint.port },
     type: 'history-bundle',
     payload,
+    fromSessionId: syncSignerSessionOf(local),
   });
   if (sent.ok === true) {
     state.counters.syncBundlesSent++;
