@@ -1,7 +1,7 @@
 import { MAX_BOARD_ENTRIES, canTransition, isLedgerShape } from './model.js';
-import { inferredFrozenFrom, isLocalArchivedState, localNameOf, localRosterOf, localStateOf, persistMember } from './local.js';
+import { inferredFrozenFrom, isLocalArchivedState, localNameOf, localRosterOf, localStateOf, managerSeatOfLocal, persistLedger, persistMember, persistSnapshot } from './local.js';
 import { ledgerDigest } from './store.js';
-import { matchConflictCollabs, noteForumGovernanceIgnored } from './gate.js';
+import { managerFreezeReasonOf, matchConflictCollabs, noteForumGovernanceIgnored } from './gate.js';
 import { endpointFor, governanceTargets, invitePayloadOf, mutateLedger, notifyLocal, relayGovernance, sendTo, sendToRoster } from './outgoing.js';
 
 /* 冻结裁定流（设计 §6 的补全）：合并 / 保持两条 / 终止的执行、unfreeze 处理、48 小时单方处置提示、
@@ -70,24 +70,22 @@ export function unfreezeLocal(state, local, reason) {
   return true;
 }
 
-/* 本地终止一条（冻结单方处置 / 终止裁定 / 被并入条的执行落点）：转终态并归档。 */
-export function terminateLocalCopy(state, local, reason) {
+/* 本地终止一条（冻结单方处置 / 终止裁定 / 被并入条的执行落点）：转终态并归档。
+ * localOnly：任期分叉的用户裁定只归档本机副本——不推快照、不广播（设计 §1.3/§2A.3）。 */
+export function terminateLocalCopy(state, local, reason, { localOnly = false } = {}) {
   if (isLocalArchivedState(local)) {
     return false;
   }
+  clearTerminalFreezeMarks(local);
   if (local.role === 'manager') {
-    mutateLedger(state, local, (ledger) => {
-      ledger.status = 'terminated';
-      delete ledger.frozenAt;
-      delete ledger.frozenFrom;
-      /* 终态形态（设计 §3.4）：站长引用与接管窗口必须清空，名单行降为成员。名单不清空是为了
-       * 终止通告仍投给原参与者；残留站长行会让落盘行过不了形态校验，重启时静默回退到终止前的行。 */
-      ledger.manager = null;
-      delete ledger.managerWindow;
-      for (const member of ledger.members) {
-        member.role = 'member';
-      }
-    }, { governance: true });
+    if (localOnly) {
+      applyTerminalLedgerFields(local.ledger);
+      local.ledger.version++;
+      local.ledger.updatedAt = new Date().toISOString();
+      persistLedger(state, local);
+    } else {
+      mutateLedger(state, local, applyTerminalLedgerFields, { governance: true });
+    }
     local.member.state = 'terminated';
     local.member.archivedAt = new Date().toISOString();
     persistMember(state, local);
@@ -97,10 +95,63 @@ export function terminateLocalCopy(state, local, reason) {
     delete local.member.frozenAt;
     delete local.member.frozenFrom;
     persistMember(state, local);
+    persistLocalTerminalSnapshot(state, local);
   }
   local.mute.clear();
   state.counters.freezeTerminatedLocal++;
   state.log.warn('本机该条协作已终止', { collabId: local.collabId, reason });
+  return true;
+}
+
+/* 终态形态（设计 §3.4）：站长引用与接管窗口必须清空，名单行降为成员。名单不清空是为了
+ * 终止通告仍投给原参与者；残留站长行会让落盘行过不了形态校验，重启时静默回退到终止前的行。 */
+function applyTerminalLedgerFields(ledger) {
+  ledger.status = 'terminated';
+  delete ledger.frozenAt;
+  delete ledger.frozenFrom;
+  ledger.manager = null;
+  delete ledger.managerWindow;
+  for (const member of ledger.members) {
+    member.role = 'member';
+  }
+}
+
+/* 冻结标记随归档清理：终态不再展示冻结原因（载体的历史值由冻结持久化面收尾）。 */
+function clearTerminalFreezeMarks(local) {
+  delete local.freezeReason;
+  if (local.member !== null && typeof local.member === 'object') {
+    delete local.member.freezeReason;
+  }
+}
+
+/* 成员侧本地终态副本（设计 §3.4）：成员核没有权威台账，归档事实写进快照才能跨重启保留
+ * 「已终止」读数。共享名单清空、manager:null、managerTerm 保留、version 递增，附 localTerminal
+ * 标记；其他核不以成员侧副本作权威（快照受理门在接收侧）。 */
+function persistLocalTerminalSnapshot(state, local) {
+  const base = local.snapshot?.ledger;
+  if (base === null || typeof base !== 'object' || Array.isArray(base)) {
+    return false;
+  }
+  const ledger = {
+    ...structuredClone(base),
+    status: 'terminated',
+    manager: null,
+    version: base.version + 1,
+    updatedAt: new Date().toISOString(),
+    members: [],
+    localTerminal: true,
+  };
+  delete ledger.managerWindow;
+  delete ledger.frozenAt;
+  delete ledger.frozenFrom;
+  local.snapshot = {
+    version: ledger.version,
+    digest: ledgerDigest(ledger),
+    receivedAt: new Date().toISOString(),
+    from: { instanceId: state.self.instanceId, identityName: state.self.identityName },
+    ledger,
+  };
+  persistSnapshot(state, local);
   return true;
 }
 
@@ -110,6 +161,17 @@ export function decide(state, { collabId, choice }) {
   const local = state.collabs.get(collabId);
   if (local === undefined) {
     return { ok: false, message: '本机没有该协作（先 ws_list_collabs）' };
+  }
+  if (isLocalArchivedState(local)) {
+    return { ok: false, message: '本机该条协作已归档（结束 / 终止）——无需再裁定' };
+  }
+  /* 任期分叉（设计 §1.3/§2A.3 的工具出口）：terminate 只终止本方分支并在本地归档，不合并、
+   * 不广播；merge/keep 无共同台账基准，不适用。成员侧同样可执行（分叉不是站长权限问题）。 */
+  if (managerFreezeReasonOf(state, local.collabId) === 'manager-fork') {
+    if (choice !== 'terminate') {
+      return { ok: false, message: '任期分叉下只支持 choice:terminate（本地归档本方分支；merge / keep 不适用）' };
+    }
+    return terminateForkBranch(state, local);
   }
   if (local.role !== 'manager') {
     return { ok: false, message: '裁定由站长席位执行（成员的路径是退出该协作）' };
@@ -129,8 +191,21 @@ export function decide(state, { collabId, choice }) {
   return { ok: false, message: 'choice 非法（merge / keep / terminate）' };
 }
 
+function terminateForkBranch(state, local) {
+  const done = terminateLocalCopy(state, local, '裁定：终止任期分叉的本方分支', { localOnly: true });
+  if (!done) {
+    return { ok: false, message: '本机该条已归档——无需再终止' };
+  }
+  state.counters.freezeForkTerminated = (state.counters.freezeForkTerminated ?? 0) + 1;
+  return { ok: true, choice: 'terminate', message: '本方分支已终止并本地归档（不合并、不广播）' };
+}
+
 function rosterRefs(local) {
-  return localRosterOf(local).map((entry) => ({ instanceId: entry.instanceId, identityName: entry.identityName }));
+  return localRosterOf(local).map((entry) => ({
+    instanceId: entry.instanceId,
+    ...(typeof entry.sessionId === 'string' ? { sessionId: entry.sessionId } : {}),
+    identityName: entry.identityName,
+  }));
 }
 
 /* 保持两条：解除冻结并广播 unfreeze（对端同判据解除；两套名字/名单各自保留）。 */
@@ -152,8 +227,9 @@ function executeTerminate(state, local) {
   return { ok: true, choice: 'terminate', message: '本机该条已终止；对端收到裁定后解除冻结' };
 }
 
-/* 合并（保留方执行）：保留条解除冻结；名单取并集——新增参与者以 invited 入账并发 invite 走同意门；
- * 本机持有的被并入条转终止；广播执行帧（对端：winner 条解冻、其余匹配条终止）。
+/* 合并（保留方执行）：保留条解除冻结；名单取并集——新增参与者只发邀请（同意门后由入席路径
+ * 写名单），共享名单不得出现非 member 行（设计 §2.1 D1）；本机持有的被并入条转终止；
+ * 广播执行帧（对端：winner 条解冻、其余匹配条终止）。
  * 保留方判定（设计默认建议「发起更早者任站长」的最佳努力面）：对端数据齐备时先算后执行，
  * 本机非保留方改发意向帧；数据缺省（成员侧检出）以先执行方为准——建议规则由工具文案提示。 */
 function executeMerge(state, local) {
@@ -164,12 +240,6 @@ function executeMerge(state, local) {
   unfreezeLocal(state, local, '裁定：合并（保留方执行）');
   const additions = collectMergeAdditions(state, local);
   if (additions.length > 0) {
-    mutateLedger(state, local, (ledger) => {
-      const now = new Date().toISOString();
-      for (const entry of additions) {
-        ledger.members.push({ instanceId: entry.instanceId, identityName: entry.identityName, role: 'member', state: 'invited', joinedAt: now });
-      }
-    }, { governance: true });
     sendMergeInvites(state, local, additions);
   }
   terminateLocalCopies(state, local);
@@ -180,7 +250,7 @@ function executeMerge(state, local) {
   state.counters.freezeDecisionsOut++;
   local.mergeIntent = null;
   local.conflictRival = null;
-  return { ok: true, choice: 'merge', message: `合并已执行：本机为保留条站长；新增 ${additions.length} 名成员走同意门` };
+  return { ok: true, choice: 'merge', message: `合并已执行：本机为保留条站长；已向 ${additions.length} 名参与者发出邀请（同意后入席）` };
 }
 
 /* 保留方判定：对端数据（发起时间 + 站长）齐备才判定；同时间按站长实例标识码位序小者优先
@@ -209,27 +279,36 @@ function sendMergeIntent(state, local) {
   state.counters.freezeDecisionsOut++;
 }
 
-/* 并集新增项：本方名单 ∪ 冻结检出时记下的对端名单 ∪ 对端意向帧名单（缺身份名者跳过——由人另行邀请）。 */
+/* 并集新增项：本方名单 ∪ 冻结检出时记下的对端名单 ∪ 对端意向帧名单（缺身份名者跳过——由人另行邀请）。
+ * 席位标识随带：对端席位名可指名邀请；旧检出面缺 sessionId 时退回整机不指名。 */
 function collectMergeAdditions(state, local) {
   const union = new Map();
+  const remember = (entry) => {
+    if (!union.has(entry.instanceId) && typeof entry.identityName === 'string') {
+      union.set(entry.instanceId, {
+        instanceId: entry.instanceId,
+        identityName: entry.identityName,
+        ...(typeof entry.sessionId === 'string' ? { sessionId: entry.sessionId } : {}),
+      });
+    }
+  };
   for (const entry of localRosterOf(local)) {
-    union.set(entry.instanceId, { instanceId: entry.instanceId, identityName: entry.identityName });
+    remember(entry);
   }
   for (const source of [local.conflictRival, local.mergeIntent]) {
     if (source === null || source === undefined) {
       continue;
     }
     for (const entry of source.members) {
-      if (!union.has(entry.instanceId)) {
-        union.set(entry.instanceId, { instanceId: entry.instanceId, identityName: entry.identityName });
-      }
+      remember(entry);
     }
   }
   return [...union.values()].filter((entry) => entry.instanceId !== state.self.instanceId
-    && typeof entry.identityName === 'string'
     && !local.ledger.members.some((member) => member.instanceId === entry.instanceId));
 }
 
+/* 合流邀请：目标走同意门（设计 §2.1 D1——受邀未入席者不是成员，不写共享名单）。
+ * payload.targets 是目标机器的准入依据；对端席位名已知时同时指名该会话。 */
 function sendMergeInvites(state, local, additions) {
   for (const entry of additions) {
     const endpoint = endpointFor(state, local, entry.instanceId);
@@ -238,8 +317,29 @@ function sendMergeInvites(state, local, additions) {
       state.log.warn('合并新增成员端点未知（暂缓邀请）', { collabId: local.collabId, member: entry.instanceId });
       continue;
     }
-    sendTo(state, local.collabId, entry.instanceId, endpoint, 'invite', invitePayloadOf(local.ledger));
+    const payload = mergeInvitePayloadOf(local, entry);
+    sendTo(state, local.collabId, entry.instanceId, endpoint, 'invite', payload, { fromSessionId: managerSessionOf(local) });
   }
+}
+
+function mergeInvitePayloadOf(local, entry) {
+  const payload = invitePayloadOf(local.ledger);
+  const target = { instanceId: entry.instanceId };
+  if (typeof entry.sessionId === 'string') {
+    target.targetSessionId = entry.sessionId;
+    payload.targetSessionId = entry.sessionId;
+  }
+  payload.targets = [target];
+  return payload;
+}
+
+/* 邀请签发席位：台账站长引用优先（新形态带 sessionId），旧形态退回本机站长席位。 */
+function managerSessionOf(local) {
+  const fromLedger = local.ledger?.manager?.sessionId;
+  if (typeof fromLedger === 'string') {
+    return fromLedger;
+  }
+  return managerSeatOfLocal(local)?.sessionId;
 }
 
 /* 本机持有的被并入条（同名交集的其他本地协作）转终止。 */
@@ -294,7 +394,11 @@ function armMergeIntent(state, local, frame, payload) {
     local.mergeIntent = {
       createdAt: payload.createdAt,
       managerInstanceId: frame.from.instanceId,
-      members: payload.members.map((entry) => ({ instanceId: entry.instanceId, identityName: entry.identityName })),
+      members: payload.members.map((entry) => ({
+        instanceId: entry.instanceId,
+        ...(typeof entry.sessionId === 'string' ? { sessionId: entry.sessionId } : {}),
+        identityName: entry.identityName,
+      })),
     };
   }
   notifyLocal(state, local, `对端选择了「${choiceTextOf(payload.choice)}」——如本机同意，用 ws_decide 执行；不同意可维持冻结（系统不自动仲裁）。`);

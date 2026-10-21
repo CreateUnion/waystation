@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { makeTempDir, waitFor } from './helpers.js';
 import { makeLedger, seedSessionCollab } from './helpers/session-participants.js';
 import { createCollabService } from '../src/collab/service.js';
-import { ledgerDigest } from '../src/collab/store.js';
+import { ledgerDigest, loadLedger } from '../src/collab/store.js';
 
 /* 治理面（冻结裁定 / 合流递交 / 显式移交 / 站长变更接收 / 挂起期写闸 / 端点学习）。
  *
@@ -13,7 +13,7 @@ import { ledgerDigest } from '../src/collab/store.js';
  * - 「活跃协作的新增成员同意门：approve→member、decline→declined」：共享名单只放活跃席位，
  *   邀请在途态归 invites/pending-invites（设计 §0.2 D1、§2.1、§4.1）；用例不再断言 invited 行。
  * - 「decide merge（保留方）：新增参与者以 invited 入账」：同上（D1）。merge 的意向/执行与
- *   执行帧断言保留；另报 ISSUE：freeze.js 合流仍向共享名单写 state:'invited'（违反 D1/台账形态）。
+ *   执行帧断言保留；新增参与者只发邀请（同意门后由入席路径写名单），共享名单不写非 member 行。
  * - 「移交全链：旧席位台账已清理」：设计 §2A.4③ 要求保留本地只读副本；现实现删 ledger.jsonl、
  *   保留 snapshot.json——按现状断言快照副本并报 ISSUE（不在测试里固化删除行为）。
  * - 「移交守卫：超时不删（阻塞等待确认）」：新移交立即返回 offerId、不阻塞（§2A.4③）；
@@ -354,6 +354,34 @@ test('decide merge（非保留方）：改发意向帧，不本地执行', async
   const intents = harness.sent.filter((frame) => frame.type === 'decision');
   assert.equal(intents.length >= 1, true, '意向帧逐成员机器广播');
   assert.equal(intents[0].payload.executed, false);
+});
+
+test('decide merge（保留方）：新增参与者只发邀请，共享名单不写非 member 行（D1）', async (t) => {
+  const outsider = { instanceId: 'inst-d', sessionId: 'sess-d', identityName: '丁机' };
+  const harness = makeManagerHarness(t, {
+    endpoints: { [MEM.instanceId]: MEM_ENDPOINT, [RIVAL.instanceId]: RIVAL_ENDPOINT, [outsider.instanceId]: { address: '127.0.0.4', port: 17321 } },
+  });
+  await freezeViaBroadcast(harness, {
+    members: rosterRefs([outsider]),
+    extra: { createdAt: '2099-01-01T00:00:00.000Z' },
+  });
+  harness.sent.length = 0;
+  const merged = harness.service.decide({ collabId: COLLAB, choice: 'merge', sessionId: MGR.sessionId });
+  assert.equal(merged.ok, true, merged.message);
+  const ledger = (await harness.service.view({ collabId: COLLAB })).ledger;
+  assert.equal(ledger.members.every((entry) => entry.state === 'member'), true, '共享名单只含活跃席位');
+  assert.equal(ledger.members.some((entry) => entry.instanceId === outsider.instanceId), false, '受邀者同意前不入名单');
+  const invites = harness.sent.filter((frame) => frame.type === 'invite');
+  assert.equal(invites.length, 1, '新增参与者走邀请');
+  assert.equal(invites[0].to.instanceId, outsider.instanceId);
+  assert.deepEqual(invites[0].payload.targets, [{ instanceId: outsider.instanceId }], '目标机器按 targets 准入');
+  assert.equal(typeof invites[0].fromSessionId, 'string', '邀请由站长席位签发');
+  const decisions = harness.sent.filter((frame) => frame.type === 'decision');
+  assert.equal(decisions.length >= 1, true);
+  assert.equal(decisions[0].payload.members.every((entry) => typeof entry.sessionId === 'string'), true, '裁定帧名单携席位标识');
+  const loaded = loadLedger(harness.dir, COLLAB);
+  assert.equal(loaded.corrupt, false, '落盘台账未产生非法行');
+  assert.equal(loaded.ledger.members.every((entry) => entry.state === 'member'), true);
 });
 
 /* —— 合流递交 —— */

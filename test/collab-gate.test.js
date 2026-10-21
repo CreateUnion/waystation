@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { decideAdmission } from '../src/collab/gate.js';
+import { decideAdmission, frozenWriteRefusalOf, managerFreezeReasonOf } from '../src/collab/gate.js';
 import { INVITE_THROTTLE_TABLE_MAX, MAX_PENDING_INVITES } from '../src/collab/model.js';
 
 /* 准入门 join 家族的单元用例：直调 decideAdmission，state 用最小夹具。
@@ -236,4 +236,88 @@ test('join-deny：同款比对——无记录拒、过期拒、匹配受理（�
   const matched = decideAdmission(matchedState, joinDecisionOf('join-deny', { reason: '暂不接纳' }), SOURCE_A);
   assert.equal(matched.ok, true);
   assert.equal(matchedState.counters.joinDecisionsRejected, 0);
+});
+
+/* —— 邀请目标（设计 §2.2 D13）：targets 是目标机器的准入依据 —— */
+
+function inviteFrameOf({ targets, members, from = 'inst-b' }) {
+  return frameOf('invite', {
+    msgId: `msg-invite-${Math.random()}`,
+    collabId: 'collab-inv',
+    from,
+    payload: { name: '联调项目', topic: '发布联调', members, ...(targets === undefined ? {} : { targets }) },
+  });
+}
+
+const SENDER_ONLY = [{ instanceId: 'inst-b', identityName: '主机乙' }];
+const WITH_SELF = [...SENDER_ONLY, { instanceId: SELF_ID, identityName: '本机' }];
+
+test('invite：members 只含发起人时按 targets 准入目标机', () => {
+  const state = makeState();
+  const admitted = decideAdmission(state, inviteFrameOf({ targets: [{ instanceId: SELF_ID }], members: SENDER_ONLY }), SOURCE_A);
+  assert.equal(admitted.ok, true, admitted.reason);
+  assert.equal(state.counters.invitesRejected, 0);
+});
+
+test('invite：无 targets 的旧版邀请退回「名单含本机」兼容判据', () => {
+  const admitted = decideAdmission(makeState(), inviteFrameOf({ members: WITH_SELF }), SOURCE_A);
+  assert.equal(admitted.ok, true, admitted.reason);
+  const absent = decideAdmission(makeState(), inviteFrameOf({ members: SENDER_ONLY }), { remoteAddress: '10.0.0.9' });
+  assert.equal(absent.ok, false, '旧版名单不含本机即拒');
+});
+
+test('invite：targets 不含本机即拒——目标机器是唯一判据，名单含本机也不放行', () => {
+  const state = makeState();
+  const rejected = decideAdmission(state, inviteFrameOf({ targets: [{ instanceId: 'inst-other' }], members: WITH_SELF }), SOURCE_A);
+  assert.equal(rejected.ok, false);
+  assert.ok(rejected.reason.includes('目标'), rejected.reason);
+  assert.equal(state.counters.invitesRejected, 1);
+});
+
+/* —— 冻结写门（设计 §1.3/§6.4）：任期冻结三态与共享态冻结同权 —— */
+
+function contentFrameOf(collabId = 'collab-a') {
+  return frameOf('issue', { msgId: 'msg-issue', collabId, from: 'inst-peer', payload: { text: '进度' } });
+}
+
+function frozenManagerState(reason) {
+  return makeState({
+    collabs: new Map([['collab-a', localManagerOf('collab-a')]]),
+    m5Runtime: { frozen: new Map([['collab-a', reason]]) },
+  });
+}
+
+test('冻结写门：manager-fork / manager-pending / manager-offline 期间写拒绝，解冻后恢复', () => {
+  for (const reason of ['manager-fork', 'manager-pending', 'manager-offline']) {
+    const state = frozenManagerState(reason);
+    assert.equal(managerFreezeReasonOf(state, 'collab-a'), reason);
+    assert.ok(frozenWriteRefusalOf(state, 'collab-a').includes('冻结'));
+    const rejected = decideAdmission(state, contentFrameOf(), SOURCE_A);
+    assert.equal(rejected.ok, false, reason);
+    assert.ok(rejected.reason.includes('冻结'), rejected.reason);
+    assert.equal(state.counters.rejectedFrozen, 1, reason);
+    state.m5Runtime.frozen.delete('collab-a');
+    assert.equal(managerFreezeReasonOf(state, 'collab-a'), null);
+    assert.equal(frozenWriteRefusalOf(state, 'collab-a'), null);
+    assert.equal(decideAdmission(state, contentFrameOf(), SOURCE_A).ok, true, `${reason} 解冻后恢复写`);
+  }
+});
+
+test('冻结写门：收敛与退场帧仍放行（快照 / 接管 / 通告 / 离席 / 结束）', () => {
+  const state = frozenManagerState('manager-pending');
+  for (const type of ['snapshot', 'takeover', 'takeover-init', 'notice', 'leave', 'end']) {
+    assert.equal(decideAdmission(state, frameOf(type, { msgId: `msg-${type}`, collabId: 'collab-a', from: 'inst-peer', payload: {} }), SOURCE_A).ok, true, type);
+  }
+});
+
+test('冻结写门：运行态缺失时以持久化 freezeReason 兜底，杂散值不停写，归档后冻结不成立', () => {
+  const local = localManagerOf('collab-a');
+  local.freezeReason = 'manager-fork';
+  const state = makeState({ collabs: new Map([['collab-a', local]]), m5Runtime: { frozen: new Map() } });
+  assert.equal(managerFreezeReasonOf(state, 'collab-a'), 'manager-fork');
+  local.freezeReason = 'arbitrary';
+  assert.equal(managerFreezeReasonOf(state, 'collab-a'), null, '只认三态词表');
+  local.freezeReason = 'manager-offline';
+  local.ledger.status = 'terminated';
+  assert.equal(managerFreezeReasonOf(state, 'collab-a'), null, '终态优先于冻结');
 });

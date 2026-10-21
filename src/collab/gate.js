@@ -1,6 +1,6 @@
 import { ID_PATTERN, POST_KINDS } from '../net/protocol.js';
 import { CONFLICT_STATES, INVITE_THROTTLE_TABLE_MAX, MAX_PENDING_INVITES } from './model.js';
-import { forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf } from './local.js';
+import { currentManagerIdOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, seatsOfLocal } from './local.js';
 
 /* 入站门控（admit 决策）：invite 与「冲突裁定族」（freeze / unfreeze / decision）不按 collabId
  * 已知性判定（首个接触点 / 跨协作匹配——裁定帧的 collabId 是执行方那条，须按名匹配）；
@@ -11,6 +11,43 @@ import { forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localR
 
 const FROZEN_ALLOWED = new Set(['freeze', 'unfreeze', 'decision', 'takeover-init', 'takeover', 'notice', 'snapshot', 'end', 'leave']);
 const ARCHIVED_ALLOWED = new Set(['snapshot', 'notice', 'end', 'leave', 'history-request', 'history-bundle']);
+/* 任期冻结（设计 §1.3）：生命周期接线层把冻结核在 state.m5Runtime.frozen，冻结原因另落成员记录/载体。
+ * 直接读运行时容器而不 import 生命周期模块——后者反向依赖本模块的冲突匹配，静态依赖会成环。
+ * 运行态是主判据，持久化字段是重启恢复前的兜底；归档后冻结不再成立（终态优先）。 */
+const MANAGER_FREEZE_REASONS = new Set(['manager-offline', 'manager-pending', 'manager-fork']);
+const FROZEN_WRITE_REFUSAL = '协作已冻结：仅允许读台账 / 裁定 / 退出 / 终止';
+
+/* 任期冻结原因（无 = null）。只认三态词表——任意杂散字符串不得成为停写依据。 */
+export function managerFreezeReasonOf(state, collabId) {
+  const local = state.collabs?.get?.(collabId);
+  if (local !== undefined && isLocalArchivedState(local)) {
+    return null;
+  }
+  const runtime = state.m5Runtime?.frozen;
+  const runtimeReason = runtime instanceof Map ? runtime.get(collabId) : undefined;
+  const reason = typeof runtimeReason === 'string' ? runtimeReason : persistedFreezeReasonOf(local);
+  return typeof reason === 'string' && MANAGER_FREEZE_REASONS.has(reason) ? reason : null;
+}
+
+function persistedFreezeReasonOf(local) {
+  const reason = local?.freezeReason ?? local?.member?.freezeReason;
+  return typeof reason === 'string' && reason !== '' ? reason : null;
+}
+
+/* 冻结写门（服务 isWritable 的冻结判据）：共享态冻结（席位侧）或任期冻结任一命中即停写；
+ * 解冻/收敛后自然恢复。返回拒绝文案或 null。 */
+export function frozenWriteRefusalOf(state, collabId) {
+  const local = state.collabs?.get?.(collabId);
+  return local === undefined ? null : freezeRefusalOf(state, local);
+}
+
+function freezeRefusalOf(state, local) {
+  if (localStateOf(local) === 'frozen') {
+    return FROZEN_WRITE_REFUSAL;
+  }
+  const reason = managerFreezeReasonOf(state, local.collabId);
+  return reason === null ? null : `${FROZEN_WRITE_REFUSAL}（任期冻结：${reason}）`;
+}
 /* 冻结族词表导出：静音栅栏的「被忽略治理帧」判定（mute.js）取自同一权威——词表分叉即判据分叉。 */
 export const CONFLICT_FRAME_TYPES = new Set(['freeze', 'unfreeze', 'decision']);
 const FORUM_CHANNEL_TYPES = new Set(['join', 'history-request', 'history-bundle']);
@@ -77,13 +114,13 @@ export function decideAdmission(state, frame, meta) {
 
 /* 冻结 / 归档白名单门（状态相关分支的收口）：null = 本层无异议，交后续类型语义判定。 */
 function admitByLocalState(state, local, frame) {
-  const stateName = localStateOf(local);
-  if (stateName === 'frozen') {
+  const refusal = freezeRefusalOf(state, local);
+  if (refusal !== null) {
     if (FROZEN_ALLOWED.has(frame.type)) {
       return { ok: true };
     }
     state.counters.rejectedFrozen++;
-    return { ok: false, reason: '协作已冻结：仅允许读台账 / 裁定 / 退出 / 终止' };
+    return { ok: false, reason: refusal };
   }
   if (!isLocalArchivedState(local)) {
     return null;
@@ -343,20 +380,18 @@ function admitJoinRequest(state, frame, meta) {
   return null;
 }
 
-/* 回执帧的比对（设计 §2）：仅当本机申请台账存在三项逐条相符的记录才受理——collabId 相符、
- * from.instanceId 即受理该申请的站长实例（managerInstanceId）、payload.reqMsgId 即申请帧的
- * msgId（台账按它唯一）；且未过期——时效与台账过期剪除同一基准（now - sentAt < 申请时限，
- * 见加入台账的剪除判据）。时限取 state.joinRequestTtlMs（配置项的注入值——本门全部数值都走
- * 平铺注入，与邀请限频 / 请求限流同一样式）。无匹配 / 已过期一律拒并计数。
+/* 回执帧的比对（设计 §2/§4.4）：凭据是本机权威记录，不是帧内形状——
+ * ① 携 reqMsgId（join-request 路径）：申请台账三项逐条相符（collabId / 受理申请的站长实例 /
+ *    申请帧 msgId），且未过期（时效与台账剪除同一基准：now - sentAt < 申请时限）。
+ * ② 不携 reqMsgId（邀请接受 / 两段式 grant 的首份副本）：本机待处理申请（collabId + 站长实例 +
+ *    申请人会话，未过期）或已签发的入席记录（同 joinId 的席位）二选一——joinId 由站长在签发
+ *    grant 时才生成，申请人无从预先校验，故以「本机确实在等这家站长的回执」为受理证据。
+ * 无匹配 / 已过期一律拒并计数；副作用（建目录 / ack / 落盘 / 注入）必须晚于本判定。
  * 申请记录不在此移除：回执后的收尾（删记录、接线）归加入域。 */
 function admitJoinDecision(state, frame) {
   const reqMsgId = frame.payload?.reqMsgId;
   if (typeof reqMsgId !== 'string') {
-    /* joinId 式回执（邀请接受/两段式）：没有本机申请帧可对，准入按形状放行；
-     * 权威校验在加入域（joinId 未知/会话不符/过期一律 deny，不因准入放行而获准）。 */
-    return isJoinIdShape(frame.payload?.joinId)
-      ? { ok: true }
-      : rejectedJoinDecision(state, '回执缺申请帧标识与加入标识（joinId / reqMsgId 至少其一）——拒绝');
+    return admitJoinDecisionByRecord(state, frame);
   }
   const record = state.joinApplications.list().find((application) =>
     application.collabId === frame.collabId
@@ -370,6 +405,86 @@ function admitJoinDecision(state, frame) {
     return { ok: false, reason: '加入申请已过期——回执不再受理（时限内未收到回执的申请按失效处置）' };
   }
   return { ok: false, reason: '与本机加入申请台账不匹配（collabId / 站长实例 / 申请帧标识须逐项相符）——拒绝' };
+}
+
+/* 无申请帧标识的回执：本地证据二选一（待处理申请 / 已签发的入席记录），缺一即拒。
+ * 未知 collabId 也在本层拒绝——不得因「加入域稍后会判」而先建目录、ack、落盘、注入。 */
+function admitJoinDecisionByRecord(state, frame) {
+  const local = state.collabs?.get(frame.collabId);
+  const refusal = joinDecisionRecordRefusalOf(frame, local);
+  if (refusal !== null) {
+    return rejectedJoinDecision(state, refusal);
+  }
+  const matched = pendingApplicationOf(state, frame, local) !== null
+    || joiningSeatOf(local, frame) !== null
+    || localPendingJoinOf(state, frame) !== null;
+  return matched
+    ? { ok: true }
+    : rejectedJoinDecision(state, '与本机待处理申请 / 已签发入席记录不匹配——拒绝');
+}
+
+/* 同机两段式（本机既是站长又是申请人）：站长侧待批准记录就是「本机确实在等这条 grant」的证据。
+ * 仅限来源为本机的核内旁路——远端帧不得借用站长侧台账（那会绕过申请人侧申请记录）。 */
+function localPendingJoinOf(state, frame) {
+  if (frame.from?.instanceId !== state.self?.instanceId || typeof frame.payload?.sessionId !== 'string') {
+    return null;
+  }
+  return state.pendingJoinsOf(frame.collabId).find((record) => record.sessionId === frame.payload.sessionId) ?? null;
+}
+
+/* 形态 / 本机状态的前置拒绝（从 admitJoinDecisionByRecord 拆出的复杂度拆分点）。
+ * 不拒绝「来源为本机」：同机两会话的两段式入席同样走本链路（回环投递），
+ * 来源权威由申请台账的 managerInstanceId 与现任站长比对负责。 */
+function joinDecisionRecordRefusalOf(frame, local) {
+  if (!isJoinIdShape(frame.payload?.joinId)) {
+    return '回执缺申请帧标识与加入标识（joinId / reqMsgId 至少其一）——拒绝';
+  }
+  if (local !== undefined && isLocalArchivedState(local)) {
+    return '本机该协作已结束（或已退出）——迟到回执拒绝';
+  }
+  return null;
+}
+
+/* 待处理申请：collabId、受理申请的站长实例、申请人会话逐项相符且未过期。
+ * payload.sessionId 缺省（join-deny 不强制回带）时按 collabId + 站长实例匹配任意本机申请。 */
+function pendingApplicationOf(state, frame, local) {
+  const wantedSession = typeof frame.payload?.sessionId === 'string' ? frame.payload.sessionId : null;
+  if (!managerMatchesLocal(frame, local)) {
+    return null;
+  }
+  return state.joinApplications.list().find((application) =>
+    application.collabId === frame.collabId
+    && application.managerInstanceId === frame.from?.instanceId
+    && (wantedSession === null || application.sessionId === wantedSession)
+    && Date.now() - application.sentAt < state.joinRequestTtlMs) ?? null;
+}
+
+/* 已签发的入席记录：本机席位带着同一 joinId（两段式 grant 首份副本建席后，重发副本据此受理）。 */
+function joiningSeatOf(local, frame) {
+  if (local === undefined || !managerMatchesLocal(frame, local)) {
+    return null;
+  }
+  const wantedSession = typeof frame.payload?.sessionId === 'string' ? frame.payload.sessionId : null;
+  for (const seat of seatsOfLocal(local).values()) {
+    if (seat.joinId !== frame.payload?.joinId) {
+      continue;
+    }
+    if (wantedSession !== null && seat.sessionId !== wantedSession) {
+      continue;
+    }
+    return seat;
+  }
+  return null;
+}
+
+/* 本机记录已知现任站长时，回执来源必须与之相符（防冒名站长在申请窗口内下发伪回执）；
+ * 本机尚无该协作（申请先于入席）时由申请台账的 managerInstanceId 负责。 */
+function managerMatchesLocal(frame, local) {
+  if (local === undefined) {
+    return true;
+  }
+  const managerInstanceId = currentManagerIdOf(local);
+  return managerInstanceId === null || managerInstanceId === frame.from?.instanceId;
 }
 
 function rejectedJoinDecision(state, reason) {
