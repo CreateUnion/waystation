@@ -10,13 +10,15 @@
  *
  * 字段本身是对外契约（工具面与 schema 不变）：逐字节冻结在同名测试里，改动任一字符都会让它变红。
  *
- * 参与者是会话（0.2.0）：target / to 指向实例，targetSessionId / toSessionId 指向会话短码（必须成对给出）；
- * 移交与接管走一次性确认令牌。ws_handover 是双角色工具——站长发起（target）与目标确认（offerId）共用
- * 同一个工具，target 因此只在发起角色必填，schema 里放宽为可选、由描述约束角色。 */
+ * 参与者是会话（0.2.0）：target / to 指向实例，targetSessionId / toSessionId 指向会话（短码或完整标识，
+ * 必须成对给出，歧义或无匹配即拒绝）；移交与接管走一次性确认令牌。ws_handover 是双角色工具——站长发起
+ * （target＋targetSessionId 均必填）与目标确认/拒绝（offerId＋confirmToken＋decision）共用同一个工具，
+ * schema 里 target/targetSessionId 放宽为可选、由描述约束角色。 */
 
 /* 被邀请目标的条目 schema（创建邀请与增邀两工具共用同一形状，单一权威保持在本模块）。
- * targetSessionId＝对目标实例的**会话短码**指名（可选）：该目标的邀请只投这一会话、只有它能点头；
- * 省略 = 不指名（投目标机全部活跃会话，谁点头谁承接）——旧版对端忽略该字段，等同不指名（如实）。 */
+ * targetSessionId＝对目标实例的**会话**指名（可选，短码或完整标识）：该目标的邀请只投这一会话、
+ * 只有它能点头；省略 = 不指名（投目标机全部活跃会话，谁点头谁承接）。0.2.0 是硬断裂：旧版对端帧
+ * 无 cap 一律拒收，不存在「旧版忽略该字段」的兼容路径。 */
 
 const TARGET_ITEM_SCHEMA = {
   type: 'object',
@@ -25,7 +27,7 @@ const TARGET_ITEM_SCHEMA = {
     identityName: { type: 'string', description: '目标身份名（取自 ws_list_hosts；进邀请名单与同意门）' },
     address: { type: 'string', description: '目标地址（IP 字面量）' },
     port: { type: 'integer', description: '目标端口（取自 ws_list_hosts 的端点）' },
-    targetSessionId: { type: 'string', description: '指名会话短码（可选，精确匹配、不做前缀展开）：只投该目标实例上的这一会话、只有它能点头；省略 = 不指名（投全部活跃会话）' },
+    targetSessionId: { type: 'string', description: '指名会话（可选；短码或完整标识，精确匹配、不做前缀展开；歧义或无匹配即拒绝）：只投该目标实例上的这一会话、只有它能点头；省略 = 不指名（投全部活跃会话）' },
   },
   required: ['instanceId', 'identityName', 'address', 'port'],
 };
@@ -103,11 +105,12 @@ export const WS_CREATE_COLLAB_SPEC = {
 
 export const WS_APPROVE_INVITE_SPEC = {
   name: 'ws_approve_invite',
-  description: '对一条待回应邀请表态（同意 = 本调用会话加入协作；拒绝 = 本条不参与）。首次调用只返回“需要用户确认”与一次性令牌——须先向用户转述邀请、取得明确同意后携 confirmToken 重试；同意后进入两段式入席（joining，确认后转 member）。managed 下同意＝向站长申请；forum 下同意＝本会话直接发 join 成员事件。用户明确说“下一次无需确认”时可先用 ws_allow_next_invite 登记一次性豁免',
+  description: '对一条待回应邀请表态（同意 = 本调用会话加入协作；拒绝 = 本条不参与）。首次调用只返回“需要用户确认”与一次性令牌——须先向用户转述邀请、取得明确同意后携 confirmToken 重试；同意后进入两段式入席（joining，确认后转 member）。managed 下须携 inviteId 定位邀请记录，同意＝向站长申请；forum 无邀请簿记，同意＝本会话直接发 join 成员事件。用户明确说“下一次无需确认”时可先用 ws_allow_next_invite 登记一次性豁免',
   inputSchema: {
     type: 'object',
     properties: {
       collabId: { type: 'string', description: '协作标识（取自 ws_list_collabs 的待回应邀请条目）' },
+      inviteId: { type: 'string', description: '邀请记录标识（managed 必填；取自 ws_invite 返回的 inviteId 或 ws_list_collabs 的待回应邀请条目——同一协作可同时存在多条 open 邀请，仅凭 collabId 无法定位；forum 无邀请簿记，省略）' },
       approve: { type: 'boolean', description: 'true = 同意加入；false = 拒绝' },
       reason: { type: 'string', description: '拒绝原因（可选，仅拒绝时使用，≤200 字符）' },
       confirmToken: { type: 'string', description: '用户确认挑战令牌（可选）：首次调用会返回 needsUserConfirmation 与令牌；取得用户明确同意后携此令牌重试' },
@@ -127,13 +130,13 @@ export const WS_ALLOW_NEXT_INVITE_SPEC = {
 
 export const WS_WITHDRAW_INVITE_SPEC = {
   name: 'ws_withdraw_invite',
-  description: '撤回邀请（managed 仅站长；forum 仅撤回本机挂起记录并停止补投，已投出的邀请不可收回）：给 inviteId 撤回该条邀请记录；未给 inviteId 而给 target 时按目标撤回；两者都省略整条取消（协作终止）',
+  description: '撤回邀请（managed 仅站长；forum 仅撤回本机挂起记录并停止补投，已投出的邀请不可收回）：按 inviteId 撤回该条邀请记录；未给 inviteId 时按 target 精确匹配撤回该目标的一条邀请。inviteId 与 target 至少给一个，二者二选一——本工具不提供整条协作取消，结束协作请用 ws_end_collab',
   inputSchema: {
     type: 'object',
     properties: {
       collabId: { type: 'string', description: '协作标识' },
-      inviteId: { type: 'string', description: '邀请记录标识（可选；取自 ws_invite 返回的 inviteId——按记录撤回该条邀请）' },
-      target: { type: 'string', description: '被撤回目标的实例标识（可选；未给 inviteId 时按目标撤回；与 inviteId 都省略 = 整条取消）' },
+      inviteId: { type: 'string', description: '邀请记录标识（与 target 二选一；取自 ws_invite 返回的 inviteId 或 ws_list_collabs 的待回应邀请条目——按记录撤回该条邀请）' },
+      target: { type: 'string', description: '被撤回目标的实例标识（与 inviteId 二选一；精确匹配该目标的邀请记录）' },
     },
     required: ['collabId'],
   },
@@ -153,7 +156,7 @@ export const WS_VIEW_LEDGER_SPEC = {
 
 export const WS_SEND_MESSAGE_SPEC = {
   name: 'ws_send_message',
-  description: '发送协作域消息（发送者须为本机活跃且非 unverified 席位）：星型路由——成员发给站长，站长省略 to 即发全体成员；按目标机器去重、一机一帧，返回逐机器 msgId；离线时消息排队、对方重开后送达。to＝目标实例/地址，配可选 toSessionId（会话短码，精确匹配；只给会话参数会被拒绝）。讨论模式为发帖（人人可见、to / toSessionId 一律拒绝）：默认经中继（发起人）投递（成员投稿至中继、由其转达全员），中继不可达时自动降级直投——返回的 route 字段如实标注本机走的路（relay/degraded/fanout）、results 为投稿或直投的受理态，成员级结果经中继聚合捎回、未达者由对方周期对表收敛',
+  description: '发送协作域消息（发送者须为本机活跃且非 unverified 席位）：星型路由——成员发给站长，站长省略 to 即发全体成员；按目标机器去重、一机一帧，返回逐机器 msgId；席位宽限内断连的帧由本机核心暂存、重连后补投，判离席或冻结期丢弃，不保证送达。to＝目标实例/地址，配可选 toSessionId（会话，短码或完整标识，精确匹配；只给会话参数会被拒绝）。讨论模式为发帖（人人可见、to / toSessionId 一律拒绝）：默认经中继（发起人）投递（成员投稿至中继、由其转达全员），中继不可达时自动降级直投——返回的 route 字段如实标注本机走的路（relay/degraded/fanout）、results 为投稿或直投的受理态，成员级结果经中继聚合捎回、未达者由对方周期对表收敛',
   inputSchema: {
     type: 'object',
     properties: {
@@ -161,7 +164,7 @@ export const WS_SEND_MESSAGE_SPEC = {
       text: { type: 'string', description: '消息正文（必填，≤4000 字符）' },
       type: { type: 'string', description: '消息类型（可选，缺省 reply；可选值：topic / task / progress / issue / stop / reply）' },
       to: { type: 'string', description: '目标成员实例标识或地址（可选；须与 toSessionId 同时给出才能定向席位；协作：站长可选；成员省略即发给站长；讨论一律拒绝）' },
-      toSessionId: { type: 'string', description: '目标会话短码（可选，须与 to 同时给出；精确匹配，不做前缀展开）——只投该机器上的这一会话；讨论一律拒绝' },
+      toSessionId: { type: 'string', description: '目标会话（可选，须与 to 同时给出；短码或完整标识，精确匹配、不做前缀展开；歧义或无匹配即拒绝）——只投该机器上的这一会话；讨论一律拒绝' },
     },
     required: ['collabId', 'text'],
   },
@@ -182,7 +185,7 @@ export const WS_SET_MUTE_SPEC = {
 
 export const WS_LEAVE_COLLAB_SPEC = {
   name: 'ws_leave_collab',
-  description: '退出某条协作（只退本调用会话；协作由站长、讨论由发起人收通知并更新台账）——managed 下站长也可退出（触发自动移交，无其他成员则结束）；终态数据本地保留',
+  description: '退出某条协作（只退本调用会话）：managed 下站长也可退出（触发自动移交，无其他成员则结束），名单移除与台账由站长核写入；forum（讨论）不代写他人离席——各核按席位心跳本地过滤过期席位，成员事件由离席者本人签发，台账不由发起人代更新；终态数据本地保留',
   inputSchema: {
     type: 'object',
     properties: {
@@ -206,7 +209,7 @@ export const WS_END_COLLAB_SPEC = {
 
 export const WS_INVITE_SPEC = {
   name: 'ws_invite',
-  description: '邀请成员加入既有讨论（任何成员可发起、重复邀请幂等）或既有协作（managed 仅站长）：邀请记录生成 inviteId 供后续撤回 / 对账，forum 不生成、不返回 inviteId；已入席机器的新会话请走 ws_join 申请。目标可指名（targetSessionId 只投该会话）或不指名（投目标机当前全部活跃会话，各自独立成席）',
+  description: '邀请成员加入既有讨论（任何成员可发起、重复邀请幂等）或既有协作（managed 仅站长）：邀请记录生成 inviteId 供后续撤回 / 对账，forum 不生成、不返回 inviteId。目标可指名（targetSessionId 只投该会话）或不指名（投目标机当前全部活跃会话，各自独立成席）；参与者按会话计，同一机器上的多个会话各自成席，邀请按「该会话尚未成席」判定',
   inputSchema: {
     type: 'object',
     properties: {
@@ -257,7 +260,7 @@ export const WS_APPROVE_JOIN_SPEC = {
     type: 'object',
     properties: {
       collabId: { type: 'string', description: '协作标识（取自 ws_list_collabs 的 pendingJoins 条目所在协作）' },
-      sessionId: { type: 'string', description: '申请人会话标识（短码即可——取 pendingJoins 的 sessionId；精确匹配，不做前缀展开）' },
+      sessionId: { type: 'string', description: '申请人会话（短码或完整标识——取 pendingJoins 的 sessionId；精确匹配，不做前缀展开；歧义或无匹配即拒绝）' },
       approve: { type: 'boolean', description: 'true = 批准加入；false = 拒绝' },
       reason: { type: 'string', description: '拒绝原因（可选，仅拒绝时使用，≤200 字符）' },
     },
@@ -281,15 +284,17 @@ export const WS_DECIDE_SPEC = {
 
 export const WS_HANDOVER_SPEC = {
   name: 'ws_handover',
-  description: '显式移交（两段式，不开接管窗口）：站长发起＝target＋targetSessionId 指定目标席位（须在线、心跳新鲜），返回 offerId，等待目标用户确认（120 秒）；目标确认＝offerId＋confirmToken（首次调用只返回确认挑战与令牌，须经本机用户确认后携令牌重试）。接受后移交台账与端点：目标升站长、旧站长降为成员；超时后迟到的 accept 一律拒绝',
+  description: '显式移交（两段式，不开接管窗口）：站长发起角色＝target＋targetSessionId 均必填，指定活跃、心跳新鲜且端点已知的目标席位；调用立即返回「已发出」与 offerId，不阻塞等待（确认时限为 handoverConfirmTimeoutMs，默认 120 秒、可配置）。目标角色＝offerId＋confirmToken＋可选 decision（accept 缺省 / reject＋reason）：首次调用只返回确认挑战与令牌，须经本机用户确认后携令牌重试；用户拒绝时回 reject 回执，不得静默等待超时。接受后移交台账与端点：目标升站长、旧站长降为成员；超时后迟到的 accept 一律拒绝',
   inputSchema: {
     type: 'object',
     properties: {
       collabId: { type: 'string', description: '协作标识' },
-      target: { type: 'string', description: '目标成员实例标识（站长发起时必填；取自 ws_view_ledger 名单）' },
-      targetSessionId: { type: 'string', description: '目标会话短码（站长发起时与 target 同时给出；精确匹配，不做前缀展开）' },
-      offerId: { type: 'string', description: '移交邀约标识（目标确认时必填；站长发起成功后返回 offerId）' },
-      confirmToken: { type: 'string', description: '用户确认挑战令牌（confirmToken，目标确认时使用）：首次确认调用返回 needsUserConfirmation 与令牌；取得本机用户同意后携此令牌重试' },
+      target: { type: 'string', description: '目标成员实例标识（站长发起角色必填；取自 ws_view_ledger 名单）' },
+      targetSessionId: { type: 'string', description: '目标会话（站长发起角色必填，与 target 同时给出；短码或完整标识，精确匹配、不做前缀展开；歧义或无匹配即拒绝）' },
+      offerId: { type: 'string', description: '移交邀约标识（目标角色必填；站长发起成功后返回 offerId）' },
+      confirmToken: { type: 'string', description: '用户确认挑战令牌（confirmToken，目标角色使用）：首次确认调用返回 needsUserConfirmation 与令牌；取得本机用户同意后携此令牌重试' },
+      decision: { type: 'string', enum: ['accept', 'reject'], description: '目标侧决定（可选，缺省 accept）：reject＝拒绝本次移交并回执（须配 reason），不必等待确认时限到期' },
+      reason: { type: 'string', description: '拒绝原因（可选，仅 decision=reject 时使用，≤200 字符）' },
     },
     required: ['collabId'],
   },
@@ -297,7 +302,7 @@ export const WS_HANDOVER_SPEC = {
 
 export const WS_TAKE_OVER_SPEC = {
   name: 'ws_take_over',
-  description: '接管（成员侧）：仅当站长不可达（本地已冻结 manager-offline，或已超过站长失联判定时限）或自动移交后的接管窗口内可用；不再有收集窗口与候选优先序。首次调用只返回确认挑战与令牌——须先向本机用户确认后携 confirmToken 重试；无令牌的 confirm:true 一律拒绝。发起前先握手取可达成员最高 (managerTerm, version) 台账作基准，取不到则拒绝；接管后不开新窗口',
+  description: '接管（成员侧）：仅当站长不可达（本地已冻结 manager-offline，或已超过站长失联判定时限）或自动移交后的接管窗口内可用；不再有收集窗口与候选优先序。首次调用只返回确认挑战与令牌——须先向本机用户确认后携 confirmToken 重试；未携确认令牌的调用一律拒绝。发起前先握手取可达成员最高 (managerTerm, version) 台账作基准，取不到则拒绝；接管后不开新窗口',
   inputSchema: {
     type: 'object',
     properties: {

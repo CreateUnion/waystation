@@ -7,7 +7,7 @@ import { pingTool } from '../src/tools/ping.js';
 import { deliveryStatusTool } from '../src/tools/delivery-status.js';
 import { statusTool } from '../src/tools/status.js';
 import { checkInboxTool } from '../src/tools/check-inbox.js';
-import { listCollabsTool, createCollabTool, inviteTool, requestJoinTool, approveInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, setMuteTool, leaveCollabTool, endCollabTool, SEND_MESSAGE_TYPES } from '../src/tools/collab.js';
+import { listCollabsTool, createCollabTool, inviteTool, requestJoinTool, approveInviteTool, allowNextInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, setMuteTool, leaveCollabTool, endCollabTool, SEND_MESSAGE_TYPES } from '../src/tools/collab.js';
 import { joinTool, approveJoinTool } from '../src/tools/join.js';
 import { decideTool, handoverTool, takeOverTool } from '../src/tools/governance.js';
 import { MAX_COLLAB_MEMBERS } from '../src/net/protocol.js';
@@ -49,6 +49,7 @@ const SERVICE_DEFAULTS = {
   create: { ok: true, collabId: 'collab-1', invited: [{ instanceId: 'inst-b', ok: true, msgId: 'msg-1' }] },
   invite: { ok: true, collabId: 'collab-1', invited: [{ instanceId: 'inst-b', ok: true, msgId: 'msg-1' }] },
   approve: { ok: true, decision: 'approved' },
+  allowNextInvite: { ok: true, note: '已登记一次性豁免' },
   withdraw: { ok: true, scope: 'single', withdrawn: ['inst-b'] },
   view: { ok: true, source: 'local', version: 2, ledger: { collabId: 'collab-1', version: 2 } },
   send: { ok: true, msgId: 'msg-9', tier: 'queued', note: '已排队' },
@@ -62,7 +63,7 @@ const SERVICE_DEFAULTS = {
 };
 
 function fakeService(responses = {}) {
-  const calls = { list: 0, listInputs: [], create: [], invite: [], approve: [], withdraw: [], view: [], send: [], setMute: [], end: [], leave: [] };
+  const calls = { list: 0, listInputs: [], create: [], invite: [], approve: [], allowNextInvite: [], withdraw: [], view: [], send: [], setMute: [], end: [], leave: [] };
   /* 调用记录 + 响应注入（未注入口径取默认值）：工具层一律 await 结果，同步返回等价。 */
   const record = (name, input) => {
     calls[name].push(input);
@@ -78,6 +79,7 @@ function fakeService(responses = {}) {
     create: (input) => record('create', input),
     invite: (input) => record('invite', input),
     approve: (input) => record('approve', input),
+    allowNextInvite: (input) => record('allowNextInvite', input),
     withdraw: (input) => record('withdraw', input),
     view: (input) => record('view', input),
     send: (input) => record('send', input),
@@ -784,39 +786,45 @@ test('ws_approve_join：批准 / 拒绝两态透传（sessionId 短码原样、a
 
 test('ws_approve_invite：collabId 缺失 / approve 非布尔 → isError，不调服务', async () => {
   const collab = fakeService();
-  for (const args of [{}, { collabId: 'collab-1' }, { collabId: 'collab-1', approve: 'yes' }, { collabId: '  ', approve: true }]) {
+  for (const args of [{}, { collabId: 'collab-1' }, { collabId: 'collab-1', approve: 'yes' }, { collabId: '  ', approve: true }, { collabId: 'collab-1', inviteId: '  ', approve: true }]) {
     const result = await callCollabTool(approveInviteTool(), args, collab);
     assert.equal(result.isError, true, JSON.stringify(args));
   }
   assert.equal(collab.calls.approve.length, 0);
 });
 
-test('ws_approve_invite：同意与拒绝两态透传（reason 随拒绝；sessionId 随本会话上下文穿参——指名邀请点头判定用）', async () => {
+test('ws_approve_invite：同意与拒绝两态透传（reason 随拒绝；inviteId / sessionId 随参数与上下文穿参）', async () => {
   const collab = fakeService();
   await callCollabTool(approveInviteTool(), { collabId: ' collab-1 ', approve: true }, collab);
   await callCollabTool(approveInviteTool(), { collabId: 'collab-2', approve: false, reason: ' 人手不足 ' }, collab);
   assert.deepEqual(collab.calls.approve, [
-    { collabId: 'collab-1', approve: true, reason: undefined, sessionId: undefined },
-    { collabId: 'collab-2', approve: false, reason: '人手不足', sessionId: undefined },
+    { collabId: 'collab-1', inviteId: undefined, approve: true, reason: undefined, sessionId: undefined, confirmToken: undefined },
+    { collabId: 'collab-2', inviteId: undefined, approve: false, reason: '人手不足', sessionId: undefined, confirmToken: undefined },
   ], '无标识会话如实传空（点头判定由服务面判否）');
   await callCollabTool(approveInviteTool(), { collabId: 'collab-3', approve: true, reason: '随手填的' }, collab);
-  assert.deepEqual(collab.calls.approve[2], { collabId: 'collab-3', approve: true, reason: undefined, sessionId: undefined }, 'approve=true 时 reason 在工具层丢弃（描述口径：仅拒绝时使用）');
+  assert.deepEqual(collab.calls.approve[2], { collabId: 'collab-3', inviteId: undefined, approve: true, reason: undefined, sessionId: undefined, confirmToken: undefined }, 'approve=true 时 reason 在工具层丢弃（描述口径：仅拒绝时使用）');
   const sessionful = { ...collabContextOf(collab), sessionId: 'session-a-0123456789' };
-  await approveInviteTool().handler({ collabId: 'collab-4', approve: true }, sessionful);
-  assert.deepEqual(collab.calls.approve[3], { collabId: 'collab-4', approve: true, reason: undefined, sessionId: 'session-a-0123456789' }, 'context.sessionId 平铺穿参（点头判定的比对面）');
+  await approveInviteTool().handler({ collabId: 'collab-4', inviteId: ' inv-1 ', approve: true }, sessionful);
+  assert.deepEqual(collab.calls.approve[3], { collabId: 'collab-4', inviteId: 'inv-1', approve: true, reason: undefined, sessionId: 'session-a-0123456789', confirmToken: undefined }, 'inviteId 定位具体邀请记录、context.sessionId 平铺穿参（点头判定的比对面）');
 });
 
-test('ws_withdraw_invite：target 合法（字符串）与缺省（整条）两形态透传', async () => {
+test('ws_withdraw_invite：target 精确撤回透传；缺定位参数与 inviteId 路径均明确拒绝（不落整条终止旧路径）', async () => {
   const collab = fakeService();
   await callCollabTool(withdrawInviteTool(), { collabId: 'collab-1', target: ' inst-b ' }, collab);
-  await callCollabTool(withdrawInviteTool(), { collabId: 'collab-1' }, collab);
-  assert.deepEqual(collab.calls.withdraw, [
-    { collabId: 'collab-1', target: 'inst-b' },
-    { collabId: 'collab-1', target: undefined },
-  ]);
+  assert.deepEqual(collab.calls.withdraw, [{ collabId: 'collab-1', target: 'inst-b' }], '只按目标撤回单条记录');
+  const missing = await callCollabTool(withdrawInviteTool(), { collabId: 'collab-1' }, collab);
+  assert.equal(missing.isError, true);
+  assert.ok(missing.content[0].text.includes('ws_end_collab'), '缺定位参数时指向结束协作的唯一入口');
+  const pending = await callCollabTool(withdrawInviteTool(), { collabId: 'collab-1', inviteId: 'inv-1' }, collab);
+  assert.equal(pending.isError, true);
+  assert.ok(pending.content[0].text.includes('待接线'), 'inviteId 路径未接线时明确拒绝，不静默走旧路径');
+  const both = await callCollabTool(withdrawInviteTool(), { collabId: 'collab-1', inviteId: 'inv-1', target: 'inst-b' }, collab);
+  assert.equal(both.isError, true);
+  const badId = await callCollabTool(withdrawInviteTool(), { collabId: 'collab-1', inviteId: '  ' }, collab);
+  assert.equal(badId.isError, true);
   const bad = await callCollabTool(withdrawInviteTool(), { collabId: 'collab-1', target: 42 }, collab);
   assert.equal(bad.isError, true);
-  assert.equal(collab.calls.withdraw.length, 2);
+  assert.equal(collab.calls.withdraw.length, 1, '拒绝路径均未调服务（不会被解释为整条取消）');
 });
 
 test('ws_view_ledger：合法 → 输出 source / version / ledger；服务拒绝（无快照）→ isError', async () => {
@@ -858,10 +866,27 @@ test('ws_send_message：text 缺失 / type 非协作类 / to 非字符串 → is
 test('ws_send_message：合法 → 透传（type 缺省 reply、to 缺省 undefined）、输出含排队说明', async () => {
   const collab = fakeService();
   const result = await callCollabTool(sendMessageTool(), { collabId: ' collab-1 ', text: ' 请查收 ' }, collab);
-  assert.deepEqual(collab.calls.send, [{ collabId: 'collab-1', text: '请查收', type: 'reply', to: undefined }]);
+  assert.deepEqual(collab.calls.send, [{ collabId: 'collab-1', text: '请查收', type: 'reply', to: undefined, toSessionId: undefined, sessionId: undefined }]);
   const payload = JSON.parse(result.content[0].text);
   assert.equal(payload.tier, 'queued');
   assert.ok(payload.note.includes('已排队'));
+});
+
+test('ws_send_message：toSessionId 与 to 成对校验、本会话标识随上下文穿参', async () => {
+  const collab = fakeService();
+  const context = { ...collabContextOf(collab), sessionId: 'session-a-0123456789' };
+  const sent = await sendMessageTool().handler({ collabId: 'collab-1', text: '你好', to: 'inst-b', toSessionId: ' deadbeef ' }, context);
+  assert.equal(sent.isError, undefined);
+  assert.deepEqual(collab.calls.send, [{ collabId: 'collab-1', text: '你好', type: 'reply', to: 'inst-b', toSessionId: 'deadbeef', sessionId: 'session-a-0123456789' }], '定向席位与发送者会话均透传');
+  for (const args of [
+    { collabId: 'collab-2', text: '你好', toSessionId: 'deadbeef' },
+    { collabId: 'collab-3', text: '你好', to: 'inst-b', toSessionId: '  ' },
+    { collabId: 'collab-4', text: '你好', to: 'inst-b', toSessionId: 'bad id!' },
+  ]) {
+    const refused = await callCollabTool(sendMessageTool(), args, collab);
+    assert.equal(refused.isError, true, JSON.stringify(args));
+  }
+  assert.equal(collab.calls.send.length, 1, '拒绝路径不调服务');
 });
 
 test('ws_send_message：服务拒绝（冻结）→ isError + 原文案', async () => {
@@ -1059,7 +1084,7 @@ function fakeNet() {
   };
 }
 
-test('工具返回口径：21 工具成功载荷均为含 ok:true 的 JSON 对象（统一不变量）', async () => {
+test('工具返回口径：22 工具成功载荷均为含 ok:true 的 JSON 对象（统一不变量）', async () => {
   const net = fakeNet();
   const collab = fakeService();
   const join = fakeJoinService();
@@ -1073,8 +1098,9 @@ test('工具返回口径：21 工具成功载荷均为含 ok:true 的 JSON 对�
     { tool: checkInboxTool(), args: { collabId: 'collab-1' }, context: contextWith(net) },
     { tool: listCollabsTool(), args: {}, context: collabContextOf(collab) },
     { tool: createCollabTool(), args: { name: '项目', topic: '主题', targets: [single] }, context: collabContextOf(collab) },
-    { tool: approveInviteTool(), args: { collabId: 'collab-1', approve: true }, context: collabContextOf(collab) },
-    { tool: withdrawInviteTool(), args: { collabId: 'collab-1' }, context: collabContextOf(collab) },
+    { tool: approveInviteTool(), args: { collabId: 'collab-1', inviteId: 'inv-1', approve: true }, context: collabContextOf(collab) },
+    { tool: allowNextInviteTool(), args: {}, context: collabContextOf(collab) },
+    { tool: withdrawInviteTool(), args: { collabId: 'collab-1', target: 'inst-b' }, context: collabContextOf(collab) },
     { tool: viewLedgerTool(), args: { collabId: 'collab-1' }, context: collabContextOf(collab) },
     { tool: sendMessageTool(), args: { collabId: 'collab-1', text: '你好' }, context: collabContextOf(collab) },
     { tool: setMuteTool(), args: { collabId: 'collab-1', muted: true }, context: collabContextOf(collab) },
@@ -1088,7 +1114,7 @@ test('工具返回口径：21 工具成功载荷均为含 ok:true 的 JSON 对�
     { tool: handoverTool(), args: { collabId: 'collab-1', target: 'inst-b' }, context: collabContextOf(governance) },
     { tool: takeOverTool(), args: { collabId: 'collab-1' }, context: collabContextOf(governance) },
   ];
-  assert.equal(cases.length, 21, '覆盖全部 21 工具');
+  assert.equal(cases.length, 22, '覆盖全部 22 工具');
   for (const { tool, args, context } of cases) {
     const result = await tool.handler(args, context);
     assert.equal(result.isError, undefined, tool.name);

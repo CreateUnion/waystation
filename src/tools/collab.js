@@ -109,11 +109,17 @@ export function approveInviteTool() {
       /* reason 按描述语义归一：approve=true 时在工具层丢弃（服务层该分支本就不消费）——宁可少传，
        * 不让「同意 + 理由」这种无定义组合穿到线上。 */
       const reason = args.approve === false ? optionalTextArg(args, 'reason') : undefined;
+      /* inviteId 定位到具体邀请记录：同一协作可同时存在多条 open 邀请（指名 / 不指名、重发），
+       * 仅凭 collabId 无法确定同意的是哪一条；forum 无邀请簿记，省略。 */
+      const inviteId = optionalTextArg(args, 'inviteId');
+      if (args.inviteId !== undefined && inviteId === '') {
+        return errorResult('参数 inviteId 非法：需要非空白字符串（邀请记录标识）');
+      }
       /* 本会话标识平铺穿参（服务侧 caller.sessionId 备选形态亦收）：指名邀请的「只有该会话能点头」
        * 判定要拿点头会话做比对面；无标识会话如实传空（指名邀请被拒、未指名零变）。
        * confirmToken：用户确认挑战令牌（服务层首次调用签发，取得用户同意后重试时携带）。 */
       const confirmToken = optionalTextArg(args, 'confirmToken');
-      const result = await context.collab.approve({ collabId, approve: args.approve, reason, sessionId: context.sessionId, confirmToken });
+      const result = await context.collab.approve({ collabId, inviteId, approve: args.approve, reason, sessionId: context.sessionId, confirmToken });
       /* 用户确认挑战：结构化返回（令牌不能被 resultOf 的纯文案错误面吞掉）——
        * 代理据此把邀请摘要转述给用户，取得同意后携 confirmToken 重试。 */
       if (result?.needsUserConfirmation === true) {
@@ -145,13 +151,38 @@ export function withdrawInviteTool() {
       if (collabId === null) {
         return errorResult('参数 collabId 非法：需要非空白字符串');
       }
-      const target = optionalTextArg(args, 'target');
-      if (args.target !== undefined && target === '') {
-        return errorResult('参数 target 非法：需要非空白字符串（或省略表示整条取消）');
+      const parsed = withdrawArgsOf(args);
+      if (parsed.error !== undefined) {
+        return errorResult(parsed.error);
       }
-      return resultOf(await context.collab.withdraw({ collabId, target }));
+      return resultOf(await context.collab.withdraw({ collabId, target: parsed.target }));
     },
   };
+}
+
+/* 撤回的定位参数归一：inviteId 与 target 二选一。无定位参数时不得落到服务层的「target 缺省 =
+ * 整条撤回」路径——结束协作的唯一入口是 ws_end_collab（设计 §3.4），撤回工具只关闭邀请记录。 */
+function withdrawArgsOf(args) {
+  const inviteId = optionalTextArg(args, 'inviteId');
+  if (args.inviteId !== undefined && inviteId === '') {
+    return { error: '参数 inviteId 非法：需要非空白字符串（邀请记录标识）' };
+  }
+  const target = optionalTextArg(args, 'target');
+  if (args.target !== undefined && target === '') {
+    return { error: '参数 target 非法：需要非空白字符串（目标实例标识）' };
+  }
+  if (inviteId !== undefined && target !== undefined) {
+    return { error: '参数非法：inviteId 与 target 二选一（inviteId 定位单条邀请记录，target 按目标精确撤回）' };
+  }
+  if (inviteId === undefined && target === undefined) {
+    return { error: '参数非法：需要 inviteId（邀请记录标识）或 target（目标实例标识）——结束整条协作请用 ws_end_collab' };
+  }
+  /* 底层 outgoing.withdrawInvite 尚未接通 inviteId 路径（邀请簿记待接线）：在此明确拒绝，
+   * 不得静默走 target 缺省的旧路径。接线完成后由本工具把 inviteId 透传给服务层。 */
+  if (inviteId !== undefined) {
+    return { error: '参数 inviteId 暂不可用：服务层尚未接通按邀请记录撤回（邀请簿记待接线）——暂请用 target 精确撤回该目标的一条邀请，或等待接线完成' };
+  }
+  return { target };
 }
 
 export function viewLedgerTool() {
@@ -175,21 +206,40 @@ export function sendMessageTool() {
       if (collabId === null) {
         return errorResult('参数 collabId 非法：需要非空白字符串');
       }
-      const text = trimmedString(args, 'text');
-      if (text === '') {
-        return errorResult('参数 text 非法：需要非空白字符串（消息正文）');
+      const parsed = sendMessageArgsOf(args);
+      if (parsed.error !== undefined) {
+        return errorResult(parsed.error);
       }
-      const type = args.type === undefined ? 'reply' : args.type;
-      if (typeof type !== 'string' || !SEND_MESSAGE_TYPES.includes(type)) {
-        return errorResult(`参数 type 非法：可选值为 ${SEND_MESSAGE_TYPES.join(' / ')}（缺省 reply）`);
-      }
-      const to = optionalTextArg(args, 'to');
-      if (args.to !== undefined && to === '') {
-        return errorResult('参数 to 非法：需要非空白字符串（或省略）');
-      }
-      return resultOf(await context.collab.send({ collabId, text, type, to }));
+      /* 发送者会话随调用上下文穿参：本机多席时由服务层据此选定发件席位（缺省兜底只适用于
+       * 无席位表的历史调用链）。 */
+      return resultOf(await context.collab.send({ collabId, ...parsed.value, sessionId: context.sessionId }));
     },
   };
+}
+
+/* 消息参数归一（正文 / 类型 / 定向）：定向席位 = 实例 + 会话两步，只给 toSessionId 时无法定位
+ * 目标机器，工具层先拒（双字段必须成对）；歧义由服务层的 matchSessionByToken 语义兜底。 */
+function sendMessageArgsOf(args) {
+  const text = trimmedString(args, 'text');
+  if (text === '') {
+    return { error: '参数 text 非法：需要非空白字符串（消息正文）' };
+  }
+  const type = args.type === undefined ? 'reply' : args.type;
+  if (typeof type !== 'string' || !SEND_MESSAGE_TYPES.includes(type)) {
+    return { error: `参数 type 非法：可选值为 ${SEND_MESSAGE_TYPES.join(' / ')}（缺省 reply）` };
+  }
+  const to = optionalTextArg(args, 'to');
+  if (args.to !== undefined && to === '') {
+    return { error: '参数 to 非法：需要非空白字符串（或省略）' };
+  }
+  const toSessionId = toSessionIdArg(args);
+  if (toSessionId.error !== undefined) {
+    return { error: toSessionId.error };
+  }
+  if (toSessionId.value !== undefined && to === undefined) {
+    return { error: '参数非法：toSessionId 须与 to 同时给出（只给会话参数无法定位目标机器）' };
+  }
+  return { value: { text, type, to, toSessionId: toSessionId.value } };
 }
 
 export function setMuteTool() {
@@ -234,7 +284,7 @@ export function endCollabTool() {
   };
 }
 
-/* 工具返回口径（21 工具单一权威）：成功 = 顶层含 ok:true 的 JSON 对象（列表载荷用命名字段承载：
+/* 工具返回口径（22 工具单一权威）：成功 = 顶层含 ok:true 的 JSON 对象（列表载荷用命名字段承载：
  * hosts / rows / collabs）；失败 = errorResult 纯文案 + isError。新增工具一律照此。 */
 export function okResult(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
@@ -263,6 +313,19 @@ export function optionalTextArg(args, name) {
     return undefined;
   }
   return trimmedString(args, name);
+}
+
+/* 定向会话参数（toSessionId）：未给＝未定向；给了须为标识形态（短码是标识前缀，同一判据）——
+ * 「给了但形态坏」与「没给」必须分开，坏形态不得静默落回无定向发送。 */
+function toSessionIdArg(args) {
+  const value = optionalTextArg(args, 'toSessionId');
+  if (args.toSessionId === undefined) {
+    return { value: undefined };
+  }
+  if (typeof value !== 'string' || value === '' || !ID_PATTERN.test(value)) {
+    return { error: '参数 toSessionId 非法：需要会话标识（短码或完整标识）' };
+  }
+  return { value };
 }
 
 export function collabIdArg(args) {
