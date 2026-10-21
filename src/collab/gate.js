@@ -1,5 +1,5 @@
 import { ID_PATTERN, POST_KINDS } from '../net/protocol.js';
-import { CONFLICT_STATES, INVITE_THROTTLE_TABLE_MAX, MAX_PENDING_INVITES } from './model.js';
+import { CONFLICT_STATES, DEFAULT_PENDING_INVITES_MAX, INVITE_THROTTLE_TABLE_MAX, MAX_PENDING_INVITES } from './model.js';
 import { currentManagerIdOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, seatsOfLocal } from './local.js';
 
 /* 入站门控（admit 决策）：invite 与「冲突裁定族」（freeze / unfreeze / decision）不按 collabId
@@ -322,9 +322,11 @@ function admitInvite(state, frame, meta) {
     state.counters.invitesRejected++;
     return { ok: false, reason: '邀请过于频繁（同一来源限频）' };
   }
-  if (countPendingInvites(state) >= MAX_PENDING_INVITES) {
+  /* 上限取配置（与 pending-invites 存储容量同源）：旧实现固定 16，与配置缺省 64 分叉。 */
+  const pendingInvitesMax = pendingInvitesMaxOf(state);
+  if (countPendingInvites(state) >= pendingInvitesMax) {
     state.counters.invitesRejected++;
-    return { ok: false, reason: `待回应邀请已达上限（${MAX_PENDING_INVITES}）——先处置既有邀请或等待过期` };
+    return { ok: false, reason: `待回应邀请已达上限（${pendingInvitesMax}）——先处置既有邀请或等待过期` };
   }
   rememberInviteSource(state, source, now);
   return { ok: true };
@@ -374,6 +376,11 @@ function admitConflictFrame(state, frame) {
 }
 
 /* 待回应邀请数：成员侧 proposed 且未回应的本地记录（本机发起的提议中协作不算挂起）。 */
+function pendingInvitesMaxOf(state) {
+  const configured = state.config?.pendingInvitesMax;
+  return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_PENDING_INVITES_MAX;
+}
+
 function countPendingInvites(state) {
   let count = 0;
   for (const local of state.collabs.values()) {
@@ -429,6 +436,7 @@ function admitJoinRequest(state, frame, meta) {
     state.counters.joinRequestsRejected++;
     return { ok: false, reason: '加入申请过于频繁（同一来源限频）' };
   }
+  /* 这是「单协作待批准加入申请」上限（16），与目标机挂起邀请容量（config.pendingInvitesMax）不同域。 */
   if (state.pendingJoinsOf(frame.collabId).length >= MAX_PENDING_INVITES) {
     state.counters.joinRequestsRejected++;
     return { ok: false, reason: `待批准加入申请已达上限（${MAX_PENDING_INVITES}）——先处置既有申请或等待过期` };

@@ -265,15 +265,22 @@ async function unmuteAll(made, collabId) {
   setMuteOf(made, collabId, MEMBER_SESSION, false);
 }
 
-/* 本机讨论：本会话创建（发起席位），另一本机会话经「在席＝接线立即」加入（默认静音由被测面自证）。 */
+/* 本机讨论（两席）：远端发起人先邀请本机会话甲、同意；再指名邀请会话乙、同意。
+ * 讨论成员粒度＝会话——每次同意由该会话自己发 join 事件并落本会话席位（默认静音由被测面自证）。 */
+function namedForumInviteOf({ collabId, name, targetSessionId }) {
+  const frame = inviteFrame({ collabId, name });
+  frame.payload.targets = [{ instanceId: SELF_INSTANCE.instanceId, targetSessionId }];
+  return frame;
+}
+
 async function makeForum(made, { name = '联调项目' } = {}) {
-  const created = made.service.create({
-    name, topic: '发布联调', mode: 'forum', sessionId: MANAGER_SESSION, targets: [targetOf(SELF_A)],
-  });
-  assert.equal(created.ok, true, created.message);
-  const joined = await made.service.join.request({ collabId: created.collabId, sessionId: MEMBER_SESSION });
-  assert.equal(joined.ok, true, joined.message);
-  return created.collabId;
+  const collabId = `collab-mute-forum-${++seq}`;
+  for (const sessionId of [MANAGER_SESSION, MEMBER_SESSION]) {
+    const admitted = await receive(made.service, namedForumInviteOf({ collabId, name, targetSessionId: sessionId }));
+    assert.equal(admitted?.ok, true, admitted?.reason);
+    await approveWithConsent(made.service, { collabId, sessionId });
+  }
+  return collabId;
 }
 
 /* 本机协作：站长会话创建，另一本机会话经两段式（申请 → 批准）入席。 */

@@ -231,7 +231,10 @@ function isRelayedCopy(frame) {
  * 同一 collabId 的再次邀请不再丢弃（讨论侧"并发/重复邀请互认"与"退出后重入"两处修复，
  * 设计 §5.1/§5.4）；managed 的既有重复邀请语义（拒绝）不变。 */
 function handleInvite(state, frame, meta) {
-  recordPendingInvite(state, frame);
+  const landingFailure = inviteLandingFailureOf(state, frame);
+  if (landingFailure !== null) {
+    return landingFailure;
+  }
   const existing = state.collabs.get(frame.collabId);
   if (existing !== undefined) {
     receiveRepeatInvite(state, existing, frame, meta);
@@ -268,16 +271,31 @@ function handleInvite(state, frame, meta) {
   persistMember(state, local);
 }
 
+/* 邀请落点失败（载体写不成 / 挂起簿记写不进）时中止本次落地：继续建 member.json 会污染
+ * 已标记只读的目录，且这条邀请之后也无从接受（没有可核对的挂起记录）。 */
+function inviteLandingFailureOf(state, frame) {
+  const recorded = recordPendingInvite(state, frame);
+  if (recorded === null || recorded === undefined || recorded.ok === true) {
+    return null;
+  }
+  state.counters.inviteLandingAborted = (state.counters.inviteLandingAborted ?? 0) + 1;
+  state.log.warn('邀请落点登记失败——中止本次邀请落地（不建本地参与记录）', {
+    collabId: frame.collabId, reason: recorded.reason ?? recorded.message ?? 'unknown',
+  });
+  return { ok: false, reason: recorded.reason ?? 'invite-landing-failed', sessionDeliver: false };
+}
+
 /* 目标机挂起邀请登记（邀请/加入域）：未入席会话据此在注册时收到补投；forum 无邀请簿记（D18）。 */
 function recordPendingInvite(state, frame) {
   if (typeof state.join?.handleInviteFrame !== 'function') {
-    return;
+    return null;
   }
   const result = state.join.handleInviteFrame(frame);
   if (result?.ok !== true) {
     bump(state, 'pendingInviteRejected');
     state.log.warn('挂起邀请登记失败（已忽略）', { collabId: frame.collabId, reason: result?.reason ?? result?.ignored });
   }
+  return result;
 }
 
 /* 同 collabId 再次邀请（讨论与可重入的协作共用）：讨论＝就地互认——已加入者只学端点（重复 join
@@ -291,7 +309,8 @@ function receiveRepeatInvite(state, existing, frame, meta) {
   learnInviteEndpoints(state, existing, frame);
   if (localMode === 'forum' && incomingMode === 'forum') {
     state.counters.invitesReceived++;
-    if (selfJoinedOf(existing, state.self.instanceId)) {
+    /* 指名会话按席位判「已加入」：同机另一会话在席时，本会话仍要收到提议面并走自己的同意门。 */
+    if (selfJoinedOf(existing, state.self.instanceId, inviteTargetSessionOf(state, frame))) {
       return;   // 已加入：邀请幂等（并集吸收），不动本地成员面
     }
     resetProposedRecord(state, existing, frame);
@@ -304,6 +323,13 @@ function receiveRepeatInvite(state, existing, frame, meta) {
     return;
   }
   state.counters.invitesRejected++;
+}
+
+/* 邀请载荷里指向本机的指名会话（无指名＝null，退回实例口径）。 */
+function inviteTargetSessionOf(state, frame) {
+  const targets = Array.isArray(frame.payload?.targets) ? frame.payload.targets : [];
+  const own = targets.find((target) => target?.instanceId === state.self.instanceId);
+  return typeof own?.targetSessionId === 'string' && own.targetSessionId !== '' ? own.targetSessionId : null;
 }
 
 /* 可重入的本地终局：成员记录已退出（left），或邀请决策已拒绝 / 已撤回——重邀重新定格提议面。
@@ -503,6 +529,17 @@ function handleApproveResponse(state, frame) {
 }
 
 function handleDeclineResponse(state, frame) {
+  /* 0.2.0 邀请拒绝帧携 inviteId：发起侧据此关闭邀请记录（不只是计数）。 */
+  if (typeof frame.payload?.inviteId === 'string' && typeof state.join?.handleInviteDecline === 'function') {
+    const result = state.join.handleInviteDecline(frame);
+    if (result !== null && result !== undefined) {
+      /* 拒绝计数只在首次真实决定时 +1（幂等重发不重复计数）。 */
+      if (result.ok === true && result.idempotent !== true) {
+        countResponse(state, 'declined');
+      }
+      return result;
+    }
+  }
   applyInviteResponse(state, frame, 'declined');
 }
 
@@ -597,6 +634,10 @@ function broadcastRosterNotice(state, local) {
 
 /* 撤回到达（成员侧）：single 定格 withdrawn；all 终止并归档（终态数据本地保留）。 */
 function handleWithdrawInbound(state, frame) {
+  /* 0.2.0 撤回携 inviteId：目标端清对应挂起邀请，不留下一条永远可重试的死邀请。 */
+  if (typeof frame.payload?.inviteId === 'string' && typeof state.join?.withdrawPendingInvite === 'function') {
+    state.join.withdrawPendingInvite({ collabId: frame.collabId, inviteId: frame.payload.inviteId });
+  }
   const local = state.collabs.get(frame.collabId);
   if (local === undefined || local.role !== 'member') {
     return;

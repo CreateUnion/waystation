@@ -588,11 +588,16 @@ test('协作预演：撤回邀请记录（inviteId 定格；已撤回记录不�
   const again = await a.command({ cmd: 'withdraw_invite', collabId: created.collabId, inviteId });
   assert.equal(again.ok, true, JSON.stringify(again));
   assert.equal(again.idempotent, true, '重复撤回幂等');
-  /* 已撤回的邀请记录不再被同意面受理：乙仍可发同意帧，但站长侧 matchInvite 判 withdrawn，
-   * 不签发 join-grant——两边都不会建立。 */
+  /* 撤回帧到达目标后挂起记录清空（I-2）：乙不再持有可同意的邀请，同意面本地即拒。 */
+  await waitFor(async () => {
+    const listed = await b.command({ cmd: 'list_collabs' });
+    const entry = listed.collabs.find((candidate) => candidate.collabId === created.collabId);
+    return entry !== undefined && entry.pendingInvites.length === 0 ? true : null;
+  }, { timeoutMs: 15000 });
   const attempted = await b.command({ cmd: 'approve_invite', collabId: created.collabId, approve: true });
-  assert.equal(attempted.ok, true, JSON.stringify(attempted));
-  await new Promise((resolve) => setTimeout(resolve, 1500));   // 让同意帧往返并走完站长侧判定
+  assert.equal(attempted.ok, false, JSON.stringify(attempted));
+  assert.match(String(attempted.message), /撤回|邀请|已回应/, JSON.stringify(attempted));
+  await new Promise((resolve) => setTimeout(resolve, 1500));   // 让可能的同意帧往返并走完站长侧判定
   const aListed = await a.command({ cmd: 'list_collabs' });
   const bListed = await b.command({ cmd: 'list_collabs' });
   assert.equal(aListed.collabs.find((entry) => entry.collabId === created.collabId).state, 'proposed');

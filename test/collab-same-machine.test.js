@@ -5,7 +5,7 @@ import { collabFilePath } from '../src/paths.js';
 import { createCollabService } from '../src/collab/service.js';
 import { MUTE_FILE_NAME } from '../src/collab/mute.js';
 import { loadLedger } from '../src/collab/store.js';
-import { makeTempDir } from './helpers.js';
+import { makeTempDir, waitFor } from './helpers.js';
 
 /* 同机（单核）两会话各自成席（设计 §4.4「同机走核内旁路」）：两段式状态机、共享名单与本地席位
  * 一律照桌面语义成立，只是帧不经过网络——不因此缩小为「只有站长侧记录」。 */
@@ -55,6 +55,8 @@ function makeService(t, overrides = {}) {
     inviteMinIntervalMs: 0,
     syncPeerPicker: () => [],
     now: overrides.now,
+    bindings: overrides.bindings ?? null,
+    requestJoin: overrides.requestJoin ?? null,
   });
   return { dir, service, sent, deliveries, notices };
 }
@@ -227,4 +229,56 @@ test('取消静音摘要：基线缺失（旧文件）时明确降级为不带 N
   const unmuted = restarted.service.setMute({ collabId, sessionId: MANAGER_SESSION, muted: false });
   assert.equal(unmuted.ok, true, unmuted.message);
   assert.equal(lastNoticeTextOf(restarted), FORUM_DEGRADE_TEXT, '基线缺失：摘要降级不带 N');
+});
+
+/* —— I-4：讨论成员粒度＝会话；I-6：同机离线邀请保留并补投 —— */
+
+test('讨论同机双会话：未入席会话不得借实例身份自入席（走敲门）', async (t) => {
+  const bindings = new Map();
+  const knocked = [];
+  const made = makeService(t, {
+    bindings,
+    requestJoin: async ({ name }) => {
+      knocked.push(name);
+      return { ok: true, replies: [] };
+    },
+  });
+  const collabId = createCollabOf(made, '同机讨论', 'forum');
+  await made.service.registerBridgeEntry(MEMBER_SESSION, `bridge-${MEMBER_SESSION}`);
+
+  const asked = await made.service.join.request({ collabId, sessionId: MEMBER_SESSION });
+  assert.equal(asked.ok, true, asked.message);
+  assert.equal(asked.knocked, true, '未入席会话必须走敲门，不得因同机另一会话在席而自入席');
+  assert.deepEqual(knocked, ['同机讨论']);
+  assert.equal(bindings.has(collabId), false, '未放行前不得接线');
+  assert.equal(made.service.localSeatOf(collabId, MEMBER_SESSION), null, '未放行前不得建席');
+  const forumSeats = made.service.listLocalSeats(collabId).map((seat) => seat.sessionId);
+  assert.deepEqual(forumSeats, [MANAGER_SESSION], '只有发起会话在席');
+  const post = await made.service.send({ collabId, sessionId: MEMBER_SESSION, text: '幽灵发言' });
+  assert.equal(post.ok, false, '未入席会话不得发帖');
+
+  /* 发起会话自己已在席：直接接线（消费既有席位，不重开加入流程）。 */
+  const direct = await made.service.join.request({ collabId, sessionId: MANAGER_SESSION });
+  assert.equal(direct.ok, true, direct.message);
+  assert.equal(direct.bound, true);
+  assert.equal(bindings.get(collabId).sessionId, MANAGER_SESSION);
+});
+
+test('同机离线邀请：保留挂起记录，目标会话注册后补投（I-6）', async (t) => {
+  const made = makeService(t);
+  const collabId = createCollabOf(made, '同机离线邀请');
+  const invited = await made.service.join.createInvite({
+    collabId, managerSessionId: MANAGER_SESSION,
+    targetInstanceId: SELF.instanceId, targetSessionId: 'sess-late',
+  });
+  assert.equal(invited.ok, true, invited.message);
+  assert.equal(invited.pending, true, '目标会话未注册＝挂起，不是发送失败');
+  const pending = made.service.join.pendingInvitesFor({ collabId, sessionId: 'sess-late', inviteId: invited.inviteId });
+  assert.equal(pending.length, 1, '挂起邀请保留在 pending-invites');
+  assert.equal(made.deliveries.some((entry) => entry.sessionId === 'sess-late'), false, '离线会话本次没有注入');
+
+  await made.service.registerBridgeEntry('sess-late', 'bridge-late');
+  await waitFor(() => made.deliveries.some((entry) => entry.sessionId === 'sess-late'
+    && entry.type === 'invite' && entry.frame.payload?.inviteId === invited.inviteId) ? true : null, { timeoutMs: 2000 });
+  assert.equal(made.service.join.pendingInvitesFor({ collabId, sessionId: 'sess-late', inviteId: invited.inviteId }).length, 1, '补投成功不消费指名邀请（等目标决定）');
 });

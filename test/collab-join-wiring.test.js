@@ -625,11 +625,21 @@ test('本机目标：注入帧携 cap=2 与 from.sessionId；注入不可用时�
   assert.equal(localTarget.injected[0].frame.from.sessionId, MANAGER_SESSION);
   assert.equal(localTarget.sent.length, 0, '本机目标不走网络发送');
 
+  /* 形态类失败（注入面明确拒收）＝发送失败，邀请记录撤回。 */
   const broken = makeHarness(t);
-  broken.state.injectLocalSeat = () => ({ ok: false, reason: 'no-seat' });
+  broken.state.injectLocalSeat = () => ({ ok: false, reason: 'not-invite-target' });
   const refused = await broken.join.createInvite({ collabId: COLLAB, managerSessionId: MANAGER_SESSION, targetInstanceId: MANAGER_INSTANCE, targetSessionId: 'not-seated' });
   assert.equal(refused.ok, false);
   assert.match(refused.message, /注入|不可注入|发送失败/);
+
+  /* 离线类失败（目标会话未注册 / 桥离线）不是发送面故障：邀请与挂起记录都保留，等注册补投。 */
+  const offline = makeHarness(t);
+  offline.state.injectLocalSeat = () => ({ ok: false, reason: 'no-seat' });
+  const held = await offline.join.createInvite({ collabId: COLLAB, managerSessionId: MANAGER_SESSION, targetInstanceId: MANAGER_INSTANCE, targetSessionId: 'not-seated' });
+  assert.equal(held.ok, true, held.message);
+  assert.equal(held.pending, true);
+  assert.equal(readJson(invitesFilePath(offline.dir, COLLAB)).invites[0].state, 'open', '离线目标保留 open 邀请记录');
+  assert.equal(readJson(pendingInvitesFilePath(offline.dir, COLLAB)).invites[0].state, 'open', '离线目标保留挂起记录供补投');
 });
 
 /* —— 按名解析的能力字段（M12 接线点） —— */
@@ -914,15 +924,15 @@ test('本机不指名邀请：桥注册但未入席的会话也能收到（不�
   assert.equal(made.injected.every((entry) => entry.frame.type === 'invite'), true);
 });
 
-test('异步注入失败：resolve {ok:false} 视为发送失败，邀请记录撤回、grant 作废', async (t) => {
+test('异步注入失败：形态类 resolve {ok:false} 视为发送失败，邀请记录撤回、grant 作废', async (t) => {
   const refusedInvite = makeHarness(t);
   refusedInvite.state.self.instanceId = MANAGER_INSTANCE;
-  refusedInvite.state.injectLocalSeat = async () => ({ ok: false, reason: 'no-seat' });
+  refusedInvite.state.injectLocalSeat = async () => ({ ok: false, reason: 'bad-session' });
   const refused = await refusedInvite.join.createInvite({
     collabId: COLLAB, managerSessionId: MANAGER_SESSION, targetInstanceId: MANAGER_INSTANCE, targetSessionId: 'app-session-1',
   });
   assert.equal(refused.ok, false, '异步拒绝不得被当作已投递');
-  assert.match(refused.message, /邀请发送失败：no-seat/);
+  assert.match(refused.message, /邀请发送失败：bad-session/);
   assert.equal(readJson(invitesFilePath(refusedInvite.dir, COLLAB)).invites[0].state, 'withdrawn');
 
   const refusedGrant = makeHarness(t);
@@ -1099,7 +1109,8 @@ test('论坛在席加入：接线成功即补本机席位（member、默认静�
     endpoints: new Map(),
     snapshot: null,
     seats: new Map([[MANAGER_SESSION, seat(MANAGER_SESSION, 'manager')]]),
-    members: { includes: () => true, fold: () => [] },
+    /* 讨论成员粒度＝会话：本会话须有自己的 join 事件才走「已在席」直连分支。 */
+    members: { includes: () => true, fold: () => [{ instanceId: MANAGER_INSTANCE, sessionId: 'forum-session-1' }] },
     suspended: null,
   };
   made.state.collabs.set(COLLAB, forum);
@@ -1384,4 +1395,77 @@ test('C-3 重启恢复：未确认席位按载体里的站长席位续发 join-c
   assert.equal(confirm.to.instanceId, MANAGER_INSTANCE);
   assert.deepEqual(confirm.toSessions, [MANAGER_SESSION]);
   assert.equal(confirm.fromSessionId, 'app-session-1');
+});
+
+/* —— I-2：撤回/拒绝闭环 —— */
+
+test('撤回：关联在途 joining 作废并回 join-deny，目标端收到携 inviteId 的 withdraw 帧', async (t) => {
+  const made = makeHarness(t);
+  const invite = await made.join.createInvite({
+    collabId: COLLAB, managerSessionId: MANAGER_SESSION, targetInstanceId: 'inst-a', targetSessionId: 'app-session-1',
+  });
+  assert.equal(invite.ok, true, invite.message);
+  made.join.handleJoinRequest(joinRequestFrame('app-session-1'));
+  const approved = await made.join.approveJoin({ collabId: COLLAB, managerSessionId: MANAGER_SESSION, sessionId: 'app-session-1', approve: true });
+  assert.equal(approved.ok, true, approved.message);
+  assert.equal(made.join.pendingJoiningProjection(COLLAB).length, 1, 'grant 已签发、待确认');
+
+  const withdrawn = made.join.withdrawInvite({ collabId: COLLAB, managerSessionId: MANAGER_SESSION, inviteId: invite.inviteId });
+  assert.equal(withdrawn.ok, true, withdrawn.message);
+  assert.equal(withdrawn.joiningsAborted, 1, '撤回按邀请目标中止在途 grant');
+  assert.deepEqual(made.join.pendingJoiningProjection(COLLAB), [], '撤回后在途入席不再存在');
+  await waitFor(() => made.sent.some((frame) => frame.type === 'join-deny' && frame.payload?.joinId === approved.joinId) ? true : null, { timeoutMs: 1000 });
+  await waitFor(() => made.sent.some((frame) => frame.type === 'withdraw' && frame.payload?.inviteId === invite.inviteId) ? true : null, { timeoutMs: 1000 });
+  const declineFrame = made.sent.find((frame) => frame.type === 'withdraw');
+  assert.equal(declineFrame.payload.scope, 'single');
+  assert.equal(declineFrame.toSessions[0], 'app-session-1');
+  assert.equal(readJson(invitesFilePath(made.dir, COLLAB)).invites.find((record) => record.inviteId === invite.inviteId).state, 'withdrawn');
+});
+
+test('拒绝帧：发起侧按 inviteId 关闭指名邀请记录（不再只计数）', async (t) => {
+  const made = makeHarness(t);
+  const invite = await made.join.createInvite({
+    collabId: COLLAB, managerSessionId: MANAGER_SESSION, targetInstanceId: 'inst-a', targetSessionId: 'app-session-1',
+  });
+  assert.equal(invite.ok, true, invite.message);
+  const declined = made.join.handleInviteDecline({
+    v: 1, cap: COLLAB_CAPABILITY, type: 'decline', msgId: 'decline-1', collabId: COLLAB,
+    from: { instanceId: 'inst-a', identityName: '应用甲', sessionId: 'app-session-1' },
+    payload: { inviteId: invite.inviteId },
+  });
+  assert.equal(declined.ok, true, JSON.stringify(declined));
+  assert.equal(declined.declined, true);
+  const record = readJson(invitesFilePath(made.dir, COLLAB)).invites.find((entry) => entry.inviteId === invite.inviteId);
+  assert.equal(record.state, 'closed', '指名邀请在拒绝后关闭（open 记录不得残留）');
+});
+
+test('目标端撤回：挂起邀请置 withdrawn 并停投', async (t) => {
+  const made = makeHarness(t);
+  const invite = await made.join.createInvite({
+    collabId: COLLAB, managerSessionId: MANAGER_SESSION, targetInstanceId: MANAGER_INSTANCE, targetSessionId: 'app-session-1',
+  });
+  assert.equal(invite.ok, true, invite.message);
+  assert.equal(readJson(pendingInvitesFilePath(made.dir, COLLAB)).invites[0].state, 'open');
+  const withdrawn = made.join.withdrawPendingInvite({ collabId: COLLAB, inviteId: invite.inviteId });
+  assert.equal(withdrawn.ok, true, JSON.stringify(withdrawn));
+  assert.equal(withdrawn.withdrawn, 1);
+  assert.equal(readJson(pendingInvitesFilePath(made.dir, COLLAB)).invites[0].state, 'withdrawn');
+  assert.deepEqual(made.join.pendingInvitesFor({ collabId: COLLAB, sessionId: 'app-session-1' }), []);
+});
+
+test('站长更替作废（D5）：关闭该协作的 open 邀请并清空待批准申请', async (t) => {
+  const made = makeHarness(t);
+  const invite = await made.join.createInvite({
+    collabId: COLLAB, managerSessionId: MANAGER_SESSION, targetInstanceId: 'inst-a', targetSessionId: 'app-session-1',
+  });
+  assert.equal(invite.ok, true, invite.message);
+  made.join.handleJoinRequest(joinRequestFrame('app-session-1'));
+  assert.equal(made.join.pendingJoinsOf(COLLAB).length, 1, '待批准申请在册');
+
+  const invalidated = made.join.invalidateInvitesForManagerChange(COLLAB);
+  assert.equal(invalidated.withdrawn, 1, '旧站长的 open 邀请作废');
+  assert.equal(invalidated.clearedRequests, 1, '待批准申请同步清空');
+  assert.equal(made.join.pendingJoinsOf(COLLAB).length, 0);
+  const record = readJson(invitesFilePath(made.dir, COLLAB)).invites.find((entry) => entry.inviteId === invite.inviteId);
+  assert.equal(record.state, 'withdrawn');
 });

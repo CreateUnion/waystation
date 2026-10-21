@@ -481,9 +481,21 @@ export function forumReachIdsOf(local, selfId) {
   return [...ids];
 }
 
-/* 本机是否已在折叠成员表内（讨论的「已加入」判据：发帖与发 join 重播的前置）。 */
-export function selfJoinedOf(local, selfId) {
-  return local.members.includes(selfId);
+/* 本机是否已在折叠成员表内（讨论的「已加入」判据：发帖与发 join 重播的前置）。
+ * 讨论成员粒度＝会话（D2）：给了 sessionId 时只认同一 (instanceId, sessionId) 的 join 事件，
+ * 同机另一个会话在席不代表本会话在席；只有该实例的历史事件完全没有席位键时（旧数据）
+ * 才退回实例判据。不给 sessionId 的机器级调用（如敲门应答）保持实例口径。 */
+export function selfJoinedOf(local, selfId, sessionId = null) {
+  const folded = local.members.fold();
+  if (typeof sessionId === 'string' && sessionId !== '') {
+    const scoped = folded.filter((member) => member.instanceId === selfId
+      && typeof member.sessionId === 'string' && member.sessionId !== '');
+    if (scoped.length > 0) {
+      return scoped.some((member) => member.sessionId === sessionId);
+    }
+    return folded.some((member) => member.instanceId === selfId);
+  }
+  return folded.some((member) => member.instanceId === selfId);
 }
 
 /* 讨论的中继（= 发起人）身份读法（设计 §5.2/§9.1）：发起人本机即中继；成员取本地记录里

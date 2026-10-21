@@ -24,7 +24,7 @@ import { createPostsStore } from './posts.js';
 import { createMembersStore } from './members.js';
 import { createCounterStore } from './counter.js';
 import { createInjectedStore } from './injected.js';
-import { ledgerDigest, loadMember } from './store.js';
+import { ledgerDigest, listLocalCollabIds, loadMember } from './store.js';
 import { isSessionShortCode, matchSessionByToken, shortSessionId } from '../util/short-id.js';
 
 /* 加入域服务（会话级加入 §2/§4）：会话申请 / 站长批准 / 接线 / 拒绝呈现 ＋ 讨论直连。
@@ -109,6 +109,12 @@ function sessionJoinApiOf(joinState) {
     /* 确认重发轮的显式驱动面（测试与运维可确定性推进；周期推进由本域定时器自理）。 */
     retryPendingConfirms: (at) => retryPendingConfirmsOf(joinState, at),
     withdrawInvite: (input) => withdrawInviteOf(joinState, input ?? {}),
+    withdrawInviteByTarget: (input) => withdrawInviteByTargetOf(joinState, input ?? {}),
+    withdrawPendingInvite: (input) => withdrawPendingInviteOf(joinState, input ?? {}),
+    handleInviteDecline: (frame) => handleInviteDeclineOf(joinState, frame),
+    expireInvites: (at) => expireInvitesOf(joinState, at),
+    pruneTerminalPending: (at) => pruneTerminalPendingOf(joinState, at),
+    pendingInviteList: (input) => pendingInviteListOf(joinState, input ?? {}),
     registerPendingInvite: (input) => registerPendingInviteOf(joinState, input ?? {}),
     handleInviteFrame: (frame) => handleInviteFrameOf(joinState, frame),
     handleInviteApproval: (frame) => handleInviteApprovalOf(joinState, frame),
@@ -121,7 +127,8 @@ function sessionJoinApiOf(joinState) {
     ensureJoinedCarrier: (collabId, sessionId) => ensureJoinedCarrierOf(joinState, collabId, sessionId),
     expireJoining: (at) => expireJoiningOf(joinState, at),
     expirePendingInvites: (at) => expirePendingInvitesOf(joinState, at),
-    invalidateForManagerChange: (managerTerm) => invalidateForManagerChangeOf(joinState, managerTerm),
+    invalidateForManagerChange: (managerTerm, collabId) => invalidateForManagerChangeOf(joinState, managerTerm, collabId),
+    invalidateInvitesForManagerChange: (collabId) => invalidateInvitesForManagerChangeOf(joinState, collabId),
     abortJoining: (joinId, reason) => abortJoiningOf(joinState, joinId, reason),
     pendingRequestsOf: (collabId) => pendingRequestsOf(joinState, collabId),
   };
@@ -659,7 +666,8 @@ function validateReason(reason) {
  * （复用敲门原语：广播按名 → 应答随带 collabId → 任一成员放行 → 同意门 → 历史回填。
  * 本域只到「等待放行」为止——接线在同意门，谁点头谁承接）。 */
 async function requestForum(joinState, local, sessionId) {
-  if (selfJoinedOf(local, joinState.state.self.instanceId)) {
+  /* 讨论成员粒度＝会话：同机另一会话在席不能替本会话放行（无本会话 join 事件即走敲门）。 */
+  if (selfJoinedOf(local, joinState.state.self.instanceId, sessionId)) {
     if (bindSession(joinState, { collabId: local.collabId, sessionId, origin: 'join' }) !== true) {
       return { ok: false, message: '接线未落地（绑定表不可用）——本会话收不到该讨论的注入' };
     }
@@ -1756,10 +1764,28 @@ async function sendOpenedInviteOf(joinState, { ids, target, opened, books, paylo
     type: 'invite', payload, fromSessionId: ids.managerSessionId,
   });
   if (sent.ok !== true) {
+    /* 目标未注册 / 离线不是发送面故障：挂起邀请与邀请记录必须保留，等目标会话注册后补投
+     * （设计 §4.2/§4.3）。只有目标形态非法或本机投递面缺失才回滚——那类失败重试也不会好。 */
+    if (localTarget && isOfflineInviteFailureOf(sent)) {
+      return {
+        ok: true, inviteId: opened.inviteId, expiresAt: opened.expiresAt, target, pending: true,
+        delivery: sent,
+        note: '目标会话尚未注册或已离线——邀请已挂起，目标会话注册后自动补投',
+      };
+    }
     rollbackUnsentInviteOf(books, ids.collabId, opened.inviteId, localTarget);
     return failureMessage(`邀请发送失败：${sent.reason}——未留下未投递的邀请记录`);
   }
   return { ok: true, inviteId: opened.inviteId, expiresAt: opened.expiresAt, target, delivery: sent };
+}
+
+/* 同机投递的「离线类」失败词表：目标会话没有席位/桥、桥在线但交付失败、本机无活跃会话。
+ * 这些失败由挂起邀请补投兜底；形态类（bad-session / not-invite-target / unknown-collab）
+ * 与注入面缺失（未接线）不属于离线，重试也不会送达。 */
+const OFFLINE_INVITE_FAILURE_REASONS = new Set(['no-seat', 'seat-offline', '本机没有可投递的活跃会话']);
+
+function isOfflineInviteFailureOf(sent) {
+  return sent?.ok !== true && OFFLINE_INVITE_FAILURE_REASONS.has(sent?.reason);
 }
 
 function rollbackUnsentInviteOf(books, collabId, inviteId, pendingLocal) {
@@ -1955,9 +1981,10 @@ async function sendDeclineFrameOf(joinState, { collabId, inviteId, sessionId, re
   if (manager === undefined) {
     return { ...base, delivery: { ok: false, reason: '挂起记录缺少邀请者信息——decline 帧未发出' } };
   }
+  /* inviteId 随拒绝帧回传：发起侧据此关闭对应邀请记录（拒绝不只是计数）。 */
   const sent = await sendSeatFrame(joinState, {
     collabId, instanceId: manager.instanceId, sessionId: manager.sessionId, type: 'decline',
-    payload: reason === undefined ? {} : { reason }, fromSessionId: sessionId,
+    payload: { inviteId, ...(reason === undefined ? {} : { reason }) }, fromSessionId: sessionId,
   });
   return sent.ok === true
     ? { ...base, delivery: sent }
@@ -3205,12 +3232,161 @@ function withdrawInviteOf(joinState, input) {
     return failureMessage('只有站长会话可以撤回邀请');
   }
   const books = booksOf(joinState, collabId);
+  const record = books.invites.book.get(inviteId);
   const withdrawn = books.invites.book.withdrawInvite(inviteId);
   if (withdrawn.ok !== true) {
     return failureMessage(`邀请不可撤回：${withdrawn.reason}`, { reason: withdrawn.reason });
   }
   books.invites.save();
-  return { ok: true, inviteId, withdrawn: true, idempotent: withdrawn.idempotent === true };
+  const aborted = abortJoiningsForInviteOf(joinState, local, books, collabId, record);
+  if (withdrawn.idempotent !== true) {
+    notifyWithdrawnTargetsOf(joinState, collabId, record, managerSessionId);
+  }
+  return {
+    ok: true, inviteId, withdrawn: true, idempotent: withdrawn.idempotent === true,
+    ...(aborted > 0 ? { joiningsAborted: aborted } : {}),
+  };
+}
+
+/* 按目标机器撤回（工具面 target 参数）：0.2.0 的共享名单是 active-only，邀请在途态只在
+ * invites.json——按目标逐条关闭 open 记录并停投，再补撤回帧。 */
+function withdrawInviteByTargetOf(joinState, input) {
+  const context = withdrawTargetContextOf(joinState, input);
+  if (context.ok !== true) {
+    return context;
+  }
+  const { local, books, collabId, managerSessionId, targetInstanceId } = /** @type {any} */ (context);
+  const records = books.invites.book.list().filter((record) => record.state === 'open'
+    && record.targets.some((target) => target.instanceId === targetInstanceId));
+  if (records.length === 0) {
+    return failureMessage(`没有该目标的待回应邀请记录（${targetInstanceId}）——邀请可能已被接受、拒绝、撤回或过期`);
+  }
+  const withdrawn = [];
+  let aborted = 0;
+  for (const record of records) {
+    if (books.invites.book.withdrawInvite(record.inviteId).ok !== true) {
+      continue;
+    }
+    withdrawn.push(record.inviteId);
+    aborted += abortJoiningsForInviteOf(joinState, local, books, collabId, record);
+    notifyWithdrawnTargetsOf(joinState, collabId, record, managerSessionId);
+  }
+  if (withdrawn.length === 0) {
+    return failureMessage('邀请不可撤回（记录已关闭或已撤回）', { reason: 'closed' });
+  }
+  books.invites.save();
+  return { ok: true, target: targetInstanceId, withdrawnInviteIds: withdrawn, joiningsAborted: aborted };
+}
+
+/* 按目标撤回的前置：标识形态、本机记录、managed、站长席位（与按 inviteId 同一判据）。 */
+function withdrawTargetContextOf(joinState, input) {
+  const collabId = idOf(input.collabId);
+  const managerSessionId = idOf(input.managerSessionId);
+  const targetInstanceId = idOf(input.target);
+  if (collabId === null || managerSessionId === null || targetInstanceId === null) {
+    return failureMessage('参数非法：需要 collabId、站长会话标识与 target（目标实例标识）');
+  }
+  const local = joinState.state.collabs.get(collabId);
+  if (local === undefined) {
+    return failureMessage('本机没有该协作（collabId 不存在）');
+  }
+  if (localModeOf(local) === 'forum') {
+    return failureMessage('讨论无共享邀请簿记：forum 不产生 inviteId（设计 D18）', { code: 'forum-no-invite' });
+  }
+  if (!isManagerSession(joinState, local, managerSessionId)) {
+    return failureMessage('只有站长会话可以撤回邀请');
+  }
+  return { ok: true, local, books: booksOf(joinState, collabId), collabId, managerSessionId, targetInstanceId };
+}
+
+/* 撤回的关联收尾：该邀请目标的在途 joining 作废并回 join-deny(aborted)——否则已签发 grant
+ * 的会话仍可 confirm 入席（撤回语义失真）。 */
+function abortJoiningsForInviteOf(joinState, local, books, collabId, record) {
+  if (record === null) {
+    return 0;
+  }
+  const aborted = [];
+  for (const joining of books.joining.registry.list()) {
+    if (joining.collabId !== collabId || !inviteTargetsJoiningOf(record, joining)) {
+      continue;
+    }
+    if (books.joining.registry.abortJoining(joining.joinId, 'aborted').ok === true) {
+      aborted.push(joining);
+    }
+  }
+  if (aborted.length > 0) {
+    books.joining.save();
+    for (const joining of aborted) {
+      void sendJoinDenyOf(joinState, local, joining, joining.joinId, 'aborted', joining.managerTerm)
+        .catch((error) => joinState.log.warn('撤回后的 join-deny 发送失败', { collabId, joinId: joining.joinId, reason: error?.message }));
+    }
+  }
+  return aborted.length;
+}
+
+function inviteTargetsJoiningOf(record, joining) {
+  return record.targets.some((target) => target.instanceId === joining.instanceId
+    && (target.targetSessionId === undefined || target.targetSessionId === joining.sessionId));
+}
+
+/* 撤回帧：目标端据此清挂起记录；同机目标走核内旁路。投递结果只留痕（撤回已在本地生效）。 */
+function notifyWithdrawnTargetsOf(joinState, collabId, record, managerSessionId) {
+  if (record === null) {
+    return;
+  }
+  for (const target of record.targets) {
+    void sendSeatFrame(joinState, {
+      collabId, instanceId: target.instanceId, sessionId: target.targetSessionId,
+      type: 'withdraw', payload: { scope: 'single', inviteId: record.inviteId }, fromSessionId: managerSessionId,
+    }).then((sent) => {
+      if (sent.ok !== true) {
+        joinState.log.warn('撤回帧未送达目标（本地撤回已生效）', { collabId, inviteId: record.inviteId, reason: sent.reason });
+      }
+    }).catch((error) => {
+      joinState.log.warn('撤回帧发送异常（本地撤回已生效）', { collabId, inviteId: record.inviteId, reason: error?.message });
+    });
+  }
+}
+
+/* 目标端收到撤回：清对应挂起邀请（不按邀请记录冒充他人决定）。 */
+function withdrawPendingInviteOf(joinState, input) {
+  const collabId = idOf(input?.collabId);
+  const inviteId = idOf(input?.inviteId);
+  if (collabId === null || inviteId === null) {
+    return failureMessage('参数非法：需要 collabId 与 inviteId');
+  }
+  const books = booksOf(joinState, collabId);
+  const result = books.pending.store.withdrawPending({ collabId, inviteId });
+  if (result.ok === true) {
+    books.pending.save();
+  }
+  return result;
+}
+
+/* 发起侧收到拒绝帧：关闭对应邀请记录（指名邀请置 closed，不指名邀请保持 open 供其他会话）。
+ * 返回 null＝不是 0.2.0 簿记帧（交旧回应路径计数）。 */
+function handleInviteDeclineOf(joinState, frame) {
+  const ids = inviteDeclineIdsOf(frame);
+  if (ids === null) {
+    return null;
+  }
+  const local = joinState.state.collabs.get(ids.collabId);
+  if (local === undefined || local.role !== 'manager' || localModeOf(local) === 'forum') {
+    return null;
+  }
+  const books = booksOf(joinState, ids.collabId);
+  const result = books.invites.book.declineInvite(ids.inviteId, {
+    instanceId: ids.instanceId, sessionId: ids.sessionId, now: joinState.now(),
+  });
+  if (result.ok === true) {
+    books.invites.save();
+  }
+  return result;
+}
+
+function inviteDeclineIdsOf(frame) {
+  const values = allIdsOf(idOf(frame?.collabId), idOf(frame?.payload?.inviteId), idOf(frame?.from?.instanceId), idOf(frame?.from?.sessionId));
+  return values === null ? null : { collabId: values[0], inviteId: values[1], instanceId: values[2], sessionId: values[3] };
 }
 
 function registerPendingInviteOf(joinState, input) {
@@ -3451,6 +3627,45 @@ function pendingInvitesForOf(joinState, input) {
   return books.pending.store.matchPendingForSession({ collabId, sessionId, inviteId: input.inviteId, now: joinState.now() });
 }
 
+/* 清单面（ws_list_collabs 的待回应邀请）：open 与已过期记录都要露面（设计 §9：含过期），
+ * 至少给 inviteId / 目标会话 / 邀请者 / 有效期 / 状态——邀请消息丢失或核心重启后，
+ * 这是用户唯一能拿到 inviteId 的入口。 */
+function pendingInviteListOf(joinState, input) {
+  const collabId = idOf(input.collabId);
+  const sessionId = idOf(input.sessionId);
+  if (collabId === null || sessionId === null) {
+    return [];
+  }
+  const at = joinState.now();
+  const books = booksOf(joinState, collabId);
+  return books.pending.store.list()
+    .filter((record) => record.collabId === collabId)
+    .filter((record) => record.state === 'open' || record.state === 'expired')
+    .filter((record) => !record.acceptedSessions.includes(sessionId))
+    .filter((record) => record.targetSessionId === null || targetMatchesSessionOf(record.targetSessionId, sessionId))
+    .map((record) => pendingInviteViewOf(record, at));
+}
+
+function pendingInviteViewOf(record, at) {
+  const expired = record.state === 'expired' || at >= record.expiresAt;
+  return {
+    inviteId: record.inviteId,
+    collabId: record.collabId,
+    targetSessionId: record.targetSessionId,
+    from: { instanceId: record.fromManager.instanceId, sessionId: record.fromManager.sessionId },
+    expiresAt: new Date(record.expiresAt).toISOString(),
+    state: expired ? 'expired' : record.state,
+    expired,
+  };
+}
+
+function targetMatchesSessionOf(target, sessionId) {
+  if (target === sessionId) {
+    return true;
+  }
+  return isSessionShortCode(target) && matchSessionByToken([{ sessionId }], target) === sessionId;
+}
+
 /* 会话注册补投（设计 §4.2）：桥注册时把本机挂起邀请按簿记语义重投一次——指名按
  * targetSessionId 精确匹配，不指名匹配当前注册会话。投出成功不消费记录（不指名邀请不因
  * 一次接受失效；指名邀请在接受/拒绝时才置终态），投不出去保留待下轮注册再试。 */
@@ -3559,8 +3774,19 @@ function inviteApprovalIdsOf(frame) {
 /* 遍历本机已知协作的三账（已加载的 + 注册表在册但尚未取用的）：定时清理与站长更替作废
  * 不能只覆盖「碰巧已加载」的那几条。 */
 function allBooksOf(joinState) {
-  const collabIds = new Set([...joinState.books.keys(), ...joinState.state.collabs.keys()]);
+  const collabIds = new Set([
+    ...joinState.books.keys(),
+    ...joinState.state.collabs.keys(),
+    ...listLocalCollabIds(joinState.state.dataDir),
+  ]);
   return [...collabIds].map((collabId) => [collabId, booksOf(joinState, collabId)]);
+}
+
+/* 作废面可限定到单条协作（站长更替只影响该协作的邀请）：未给 collabId 时覆盖全部
+ * （仅供运维/测试的显式全量清扫）。 */
+function booksScopeOf(joinState, collabId) {
+  const scoped = idOf(collabId);
+  return scoped === null ? allBooksOf(joinState) : [[scoped, booksOf(joinState, scoped)]];
 }
 
 async function expireJoiningOf(joinState, at) {
@@ -3594,10 +3820,41 @@ function expirePendingInvitesOf(joinState, at) {
   return { expired };
 }
 
-async function invalidateForManagerChangeOf(joinState, managerTerm) {
+/* 发起侧 invites.json 的到期清理（记录整体移除）：不清理会永久累积 open 记录，
+ * 撤回/拒绝的定位面也会被过期记录污染。 */
+function expireInvitesOf(joinState, at) {
+  let expired = 0;
+  for (const [, books] of allBooksOf(joinState)) {
+    const result = books.invites.book.expireInvites(at);
+    if (result.expired > 0) {
+      books.invites.save();
+      expired += result.expired;
+    }
+  }
+  return { expired };
+}
+
+/* 目标侧终态挂起记录的保留窗：过期/消费/撤回后再留一天供观察窗解释去向，之后清理
+ * （容量面另由 pending store 的终态优先回收兜底）。 */
+const PENDING_TERMINAL_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+function pruneTerminalPendingOf(joinState, at) {
+  const cutoff = at - PENDING_TERMINAL_RETENTION_MS;
+  let pruned = 0;
+  for (const [, books] of allBooksOf(joinState)) {
+    const result = books.pending.store.pruneTerminal(cutoff);
+    if (result.pruned > 0) {
+      books.pending.save();
+      pruned += result.pruned;
+    }
+  }
+  return { pruned };
+}
+
+async function invalidateForManagerChangeOf(joinState, managerTerm, collabId = null) {
   let aborted = 0;
-  for (const [collabId, books] of allBooksOf(joinState)) {
-    const local = joinState.state.collabs.get(collabId);
+  for (const [scopedCollabId, books] of booksScopeOf(joinState, collabId)) {
+    const local = joinState.state.collabs.get(scopedCollabId);
     const result = books.joining.registry.invalidateForManagerChange(managerTerm);
     if (result.ok !== true || result.aborted.length === 0) {
       continue;
@@ -3611,6 +3868,30 @@ async function invalidateForManagerChangeOf(joinState, managerTerm) {
     }
   }
   return { aborted };
+}
+
+/* 站长更替的邀请面作废（D5）：旧站长签发的 open 邀请记录全部关闭，待批准加入申请同步清空，
+ * 由新站长按新名单重发。joining 的旧 term 作废由 invalidateForManagerChange 负责。 */
+function invalidateInvitesForManagerChangeOf(joinState, collabId = null) {
+  let withdrawn = 0;
+  let clearedRequests = 0;
+  for (const [scopedCollabId, books] of booksScopeOf(joinState, collabId)) {
+    const open = books.invites.book.list().filter((record) => record.state === 'open');
+    for (const record of open) {
+      if (books.invites.book.withdrawInvite(record.inviteId).ok === true) {
+        withdrawn++;
+      }
+    }
+    if (open.length > 0) {
+      books.invites.save();
+    }
+    const requests = joinState.pendingRequests.get(scopedCollabId);
+    if (requests !== undefined && requests.size > 0) {
+      clearedRequests += requests.size;
+      joinState.pendingRequests.delete(scopedCollabId);
+    }
+  }
+  return { withdrawn, clearedRequests };
 }
 
 function abortJoiningOf(joinState, joinId, reason) {

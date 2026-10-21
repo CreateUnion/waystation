@@ -1,11 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { COLLABS_DIR_NAME, carrierFilePath, collabDir, collabFilePath, seatFilePath } from '../src/paths.js';
-import { makeTempDir } from './helpers.js';
+import {
+  COLLABS_DIR_NAME, carrierFilePath, collabDir, collabFilePath, invitesFilePath, pendingInvitesFilePath, seatFilePath,
+} from '../src/paths.js';
+import { makeTempDir, waitFor } from './helpers.js';
 import { createCollabService } from '../src/collab/service.js';
+import { DEFAULT_PENDING_INVITES_MAX } from '../src/collab/model.js';
 import { createDispatch } from '../src/net/dispatch.js';
 import { createInbound } from '../src/net/inbound.js';
 import { POSTS_FILE_NAME } from '../src/collab/posts.js';
@@ -457,7 +460,7 @@ test('invite：来源为本机 / 名单不含本机 / 来源不在名单 → adm
   assert.equal(service.list().collabs.length, 0);
 });
 
-test('invite：同来源限频（可注入）与挂起上限（16）', async (t) => {
+test('invite：同来源限频（可注入）与挂起上限（配置 pendingInvitesMax 缺省 64）', async (t) => {
   const { service } = makeService(t, { inviteMinIntervalMs: 50 });
   const first = await receive(service, inviteFrame({ collabId: 'collab-r1' }));
   assert.equal(first.ok, true);
@@ -469,13 +472,13 @@ test('invite：同来源限频（可注入）与挂起上限（16）', async (t)
   assert.equal(third.ok, true);
 
   const { service: fresh } = makeService(t);
-  for (let index = 0; index < 16; index++) {
+  for (let index = 0; index < DEFAULT_PENDING_INVITES_MAX; index++) {
     const admitted = await receive(fresh, inviteFrame({ collabId: `collab-p${index}`, name: `项目-${index}` }));
     assert.equal(admitted.ok, true, String(index));
   }
-  const overflow = await receive(fresh, inviteFrame({ collabId: 'collab-p16', name: '项目-溢出' }));
+  const overflow = await receive(fresh, inviteFrame({ collabId: `collab-p${DEFAULT_PENDING_INVITES_MAX}`, name: '项目-溢出' }));
   assert.equal(overflow.ok, false);
-  assert.ok(overflow.reason.includes('上限'));
+  assert.ok(overflow.reason.includes(`上限（${DEFAULT_PENDING_INVITES_MAX}）`), overflow.reason);
 });
 
 test('approve：同意发帧并记 decision；同向重复幂等（不重复发帧）；改口拒绝', async (t) => {
@@ -723,7 +726,8 @@ test('冲突检测②（建立前）：全票后复检检出同名交集 → 冻
 test('freeze 接收：匹配 → 冻结 + 转达（originMsgId 承载防环）；重复副本不再转达；不匹配拒绝', async (t) => {
   const { service, sent } = makeService(t);
   const held = await activeTwoMemberCollab(t, service);
-  const noticeMembers = [peer('inst-a', '主机甲'), peer('inst-self', '本机', 17321)];
+  /* 签发者（inst-c）必须按席位在帧名单内（设计 §7.1 签发者校验）；inst-self 沿用邀请载荷的席位键。 */
+  const noticeMembers = [peer('inst-c', '主机丙'), peer('inst-a', '主机甲'), peer('inst-self', '本机', 17321)];
   const freeze = collabFrame('freeze', 'collab-remote', peer('inst-c', '主机丙'), {
     name: '联调项目',
     members: noticeMembers.map((entry) => ({ instanceId: entry.instanceId, identityName: entry.identityName })),
@@ -755,7 +759,7 @@ test('冻结期写拒绝：协作类消息与 send 均拒、白名单（snapshot
   const held = await activeTwoMemberCollab(t, service);
   await receive(service, collabFrame('freeze', 'collab-remote', peer('inst-c', '主机丙'), {
     name: '联调项目',
-    members: [peer('inst-a', '主机甲'), peer('inst-self', '本机', 17321)],
+    members: [peer('inst-c', '主机丙'), peer('inst-a', '主机甲'), peer('inst-self', '本机', 17321)],
   }));
   const write = await receive(service, collabFrame('reply', held, peer('inst-a', '主机甲'), { text: '冻结期消息' }));
   assert.equal(write.ok, false);
@@ -983,9 +987,13 @@ test('文本预校验：越界 topic 拒绝且本地台账零变更；stop / 拒
 });
 
 test('快照请求：站长席位应答当前台账；成员侧忽略', async (t) => {
-  const { service, sent, collabId } = managerWithTwoInvites(t);
+  const made = makeService(t);
+  const collabId = seededManagedCollab(made.dir, {
+    invited: [{ instanceId: 'inst-b', sessionId: 'sess-inst-b', identityName: '主机乙', state: 'member' }],
+  });
+  const service = reloadService(made);
   await receive(service, collabFrame('snapshot', collabId, peer('inst-b', '主机乙'), { kind: 'request' }));
-  const replies = sentOf(sent, 'snapshot', collabId).filter((frame) => frame.payload.kind === 'data');
+  const replies = sentOf(made.sent, 'snapshot', collabId).filter((frame) => frame.payload.kind === 'data');
   assert.equal(replies.length, 1);
   assert.equal(replies[0].to.instanceId, 'inst-b');
   const memberSide = makeService(t);
@@ -1253,7 +1261,7 @@ test('讨论收冻结族帧：受理 + ack + 忽略计数、状态不变、不�
   const { service, sent } = makeService(t);
   createForum(service);
   sent.length = 0;
-  const members = [peer('inst-c', '主机丙'), peer('inst-self', '本机', 17321)];
+  const members = [peer('inst-c', '主机丙'), { instanceId: 'inst-self', sessionId: SELF_SEAT, identityName: '本机' }];
   const freeze = collabFrame('freeze', 'collab-remote', peer('inst-c', '主机丙'), { name: '讨论甲', members, reason: '同名冲突' });
   const admitted = await receive(service, freeze);
   assert.equal(admitted.ok, true, '讨论命中的冻结帧：受理 + ack（防治理重试钉死）');
@@ -1715,7 +1723,7 @@ test('主动加入：敲门命中本机讨论 → 应答载荷（collabId / 主�
 test('主动加入：静音不抑制放行提示（提示属待办类、不经内容栅栏；应答为成员自动行为）', async (t) => {
   const { service, notices } = makeService(t);
   const collabId = createForum(service, { name: '讨论甲' });
-  const muted = await service.setMute({ collabId, muted: true });
+  const muted = await service.setMute({ collabId, sessionId: SELF_SEAT, muted: true });
   assert.equal(muted.ok, true);
   assert.deepEqual(service.hooks.sessionGate({ type: 'post', collabId }), { suppress: true }, '静音确已生效：实时帖被内容栅栏抑制');
   const replies = service.joinKnock(joinKnockOf('讨论甲'));
@@ -2329,4 +2337,126 @@ test('席位移除丢弃暂存：该席明细转为 dropped，而非从未到达
   assert.deepEqual(made.service.localSeatDeliveryOf(msgId, 'sess-local-2'), {
     collabId, msgId, sessionId: 'sess-local-2', status: 'dropped', complete: true,
   });
+});
+
+/* —— 0.2.0 席位审查回归（I-7 / I-8 / M-2 / M-5 / I-1） —— */
+
+function readJsonFile(file) {
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+test('清单：重启后 invite-stub 的待回应邀请随 ws_list_collabs 暴露 inviteId', async (t) => {
+  const made = makeService(t);
+  const frame = inviteFrame({ collabId: 'collab-stub' });
+  frame.payload.inviteId = 'inv-restart-1';
+  frame.payload.targets = [{ instanceId: made.self.instanceId, targetSessionId: 'sess-offline' }];
+  const admitted = await receive(made.service, frame);
+  assert.equal(admitted.ok, true, JSON.stringify(admitted));
+  assert.equal(readJsonFile(pendingInvitesFilePath(made.dir, 'collab-stub')).invites.length, 1);
+
+  const reloaded = reloadService(made);
+  const entry = reloaded.list({ sessionId: 'sess-offline' }).collabs.find((collab) => collab.collabId === 'collab-stub');
+  assert.ok(entry !== undefined, '仅挂起邀请的目录重启后仍在清单里（不参与注册表加载）');
+  assert.equal(entry.pendingInvites.length, 1);
+  assert.deepEqual(entry.pendingInvites[0].inviteId, 'inv-restart-1');
+  assert.equal(entry.pendingInvites[0].targetSessionId, 'sess-offline');
+  assert.equal(entry.pendingInvites[0].from.instanceId, 'inst-a');
+  assert.equal(entry.pendingInvites[0].state, 'open');
+  assert.equal(entry.pendingInvites[0].expired, false);
+  assert.equal(reloaded.list({ sessionId: 'sess-other' }).collabs.some((collab) => collab.collabId === 'collab-stub'), false, '非目标会话看不到指名邀请');
+});
+
+test('写门：内存 corrupt 标记 + 目录仍判 session-seats 时拒绝写（I-8）', async (t) => {
+  const made = makeService(t);
+  const created = made.service.create({ name: '损坏台账', topic: '主题', targets: [targetOf('b')] });
+  assert.equal(created.ok, true, created.message);
+  const collabId = created.collabId;
+  const dir = collabDir(made.dir, collabId);
+  /* 让台账无法重建：删掉席位与载体里的站长会话证据；台账写坏（非空 → 目录仍判半写/新形态）。 */
+  rmSync(join(dir, 'seats'), { recursive: true, force: true });
+  const carrier = readJsonFile(carrierFilePath(made.dir, collabId));
+  delete carrier.manager;
+  writeFileSync(carrierFilePath(made.dir, collabId), JSON.stringify(carrier));
+  writeFileSync(collabFilePath(made.dir, collabId, LEDGER_FILE_NAME), '{broken-ledger');
+
+  const reloaded = reloadService(made);
+  assert.equal(reloaded.isWritable(collabId), false, '台账不可重建即只读（内存标记）');
+  /* 重启后启动清理已把坏台账改名；重新写一个非空坏台账，让目录判档回到 session-seats。 */
+  writeFileSync(collabFilePath(made.dir, collabId, LEDGER_FILE_NAME), '{broken-again');
+  assert.equal(reloaded.isWritable(collabId), false, '目录回到 session-seats 也不得凭文件面放行内存只读标记');
+});
+
+test('静音：无会话标识一律拒绝，不按唯一席位兜底（M-2）', async (t) => {
+  const made = makeService(t);
+  const collabId = createForum(made.service);
+  const noSession = await made.service.setMute({ collabId, muted: true });
+  assert.equal(noSession.ok, false);
+  assert.match(noSession.message, /sessionId|会话标识/);
+  assert.equal(made.service.setMute({ collabId, sessionId: SELF_SEAT, muted: true }).ok, true);
+});
+
+test('邀请载体写失败：中止本地落地，不写 member.json（M-5）', async (t) => {
+  const made = makeService(t);
+  const collabId = 'collab-carrier-fail';
+  mkdirSync(collabDir(made.dir, collabId), { recursive: true });
+  /* 以目录占位 carrier.json：写载体必然失败（与磁盘满同属落点失败面）。 */
+  mkdirSync(join(collabDir(made.dir, collabId), 'carrier.json'));
+  const frame = inviteFrame({ collabId });
+  /* 直调消费面（准入面另判目录损坏）：验证「落地失败即中止」，不再写成员记录。 */
+  const consumed = await made.service.hooks.consume(frame, { remoteAddress: '127.0.0.1' });
+  assert.equal(consumed.ok, false);
+  assert.equal(consumed.reason, 'carrier-write-failed');
+  assert.equal(existsSync(join(collabDir(made.dir, collabId), MEMBER_FILE_NAME)), false, '载体失败后不得再写成员记录（污染只读目录）');
+  assert.equal(made.service.list().collabs.some((entry) => entry.collabId === collabId), false);
+});
+
+test('生命周期清扫：presence 节拍收敛过期挂起邀请与发起侧记录（I-1）', async (t) => {
+  const made = makeService(t, {
+    config: { inviteTtlMs: 40, seatPresenceIntervalMs: 30, managerProbeIntervalMs: 1000 },
+  });
+  const created = made.service.create({ name: '清扫项目', topic: '主题', targets: [targetOf('b')] });
+  assert.equal(created.ok, true, created.message);
+  made.service.start();
+  const invited = await made.service.join.createInvite({
+    collabId: created.collabId, managerSessionId: SELF_SEAT,
+    targetInstanceId: made.self.instanceId, targetSessionId: 'sess-late',
+  });
+  assert.equal(invited.ok, true, invited.message);
+  await waitFor(() => {
+    const book = readJsonFile(pendingInvitesFilePath(made.dir, created.collabId));
+    return book?.invites?.find((entry) => entry.inviteId === invited.inviteId)?.state === 'expired' ? true : null;
+  }, { timeoutMs: 4000 });
+  await waitFor(() => {
+    const book = readJsonFile(invitesFilePath(made.dir, created.collabId));
+    return (book?.invites ?? []).some((entry) => entry.inviteId === invited.inviteId) ? null : true;
+  }, { timeoutMs: 4000 });
+  made.service.close();
+});
+
+test('生命周期清扫：不在注册表的 invite-stub 目录也清理过期终态记录（I-1）', async (t) => {
+  const old = makeService(t);
+  const collabId = 'collab-old-terminal';
+  const dir = collabDir(old.dir, collabId);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(carrierFilePath(old.dir, collabId), JSON.stringify({
+    format: 'invite-stub', version: 1, collabId, name: '旧邀请', topic: '主题', mode: 'managed',
+    endpoints: {}, snapshotVersion: 0, createdAt: new Date().toISOString(),
+  }));
+  writeFileSync(pendingInvitesFilePath(old.dir, collabId), JSON.stringify({
+    version: 1,
+    invites: [{
+      inviteId: 'inv-old', collabId, fromManager: { instanceId: 'inst-a', sessionId: 'sess-a' },
+      targetSessionId: null, expiresAt: Date.now() - 2 * DAY, state: 'consumed', acceptedSessions: [],
+    }],
+  }));
+  old.service.start();
+  await waitFor(() => {
+    const book = readJsonFile(pendingInvitesFilePath(old.dir, collabId));
+    return (book?.invites ?? []).length === 0 ? true : null;
+  }, { timeoutMs: 4000 });
+  old.service.close();
 });

@@ -1020,6 +1020,18 @@ test('ws_invite / ws_withdraw_invite（真服务）：邀请簿记返回 inviteI
   const withdrawn = await withdrawInviteTool().handler({ collabId: created.collabId, inviteId: payload.invited[0].inviteId }, context);
   assert.equal(withdrawn.isError, undefined, withdrawn.content[0].text);
   assert.equal(JSON.parse(withdrawn.content[0].text).withdrawn, true, '按 inviteId 撤回该条记录');
+
+  /* 按 target 撤回走 invites.json 的目标匹配（0.2.0 共享名单没有 invited 行）。 */
+  const second = service.create({ name: '联调项目二', topic: '发布联调', targets: [target], sessionId });
+  assert.equal(second.ok, true, second.message);
+  const secondInvite = await inviteTool().handler({ collabId: second.collabId, targets: [target] }, context);
+  assert.equal(secondInvite.isError, undefined, secondInvite.content[0].text);
+  const secondInviteId = JSON.parse(secondInvite.content[0].text).invited[0].inviteId;
+  const byTarget = await withdrawInviteTool().handler({ collabId: second.collabId, target: target.instanceId }, context);
+  assert.equal(byTarget.isError, undefined, byTarget.content[0].text);
+  const withdrawnIds = JSON.parse(byTarget.content[0].text).withdrawnInviteIds;
+  assert.ok(withdrawnIds.includes(secondInviteId), '按目标撤回命中该条 open 记录');
+  assert.ok(withdrawnIds.length >= 1);
 });
 
 /* 真服务装配面（会话级 0.2.0 的接线前提）：邀请域与生命周期域的导出由 M2/M4/M5 在同批接线，
@@ -1811,4 +1823,41 @@ test('net stack：probeCapability 形态非法 / 降级 → 明确错误（不�
   assert.equal(skipped.ok, false);
   assert.equal(skipped.message, '端口段全满——本地功能可用');
   assert.equal(degraded.calls.length, 0, '降级态不触达组件');
+});
+
+/* —— I-7：清单面暴露待回应邀请（invite-stub 重启后仍可取到 inviteId） —— */
+test('ws_list_collabs：invite-stub 的待回应邀请随清单输出 inviteId / 目标会话 / 邀请者', async (t) => {
+  const dir = makeTempDir(t);
+  const first = realCollabServiceOf(dir);
+  const frame = {
+    v: 1,
+    cap: 2,
+    type: 'invite',
+    msgId: 'msg-inv-tool-1',
+    collabId: 'collab-stub-tool',
+    ts: new Date().toISOString(),
+    from: { instanceId: 'inst-a', sessionId: 'sess-a', identityName: '甲机', port: 17001 },
+    payload: {
+      name: '待回应项目',
+      topic: '主题',
+      mode: 'managed',
+      inviteId: 'inv-tool-1',
+      targets: [{ instanceId: 'inst-self', targetSessionId: 'sess-target' }],
+      members: [{ instanceId: 'inst-a', sessionId: 'sess-a', identityName: '甲机' }],
+    },
+  };
+  assert.equal((await first.hooks.admit(frame, { remoteAddress: '127.0.0.1' })).ok, true);
+  await first.hooks.consume(frame, { remoteAddress: '127.0.0.1' });
+
+  const service = realCollabServiceOf(dir);
+  const context = { ...collabContextOf(service), sessionId: 'sess-target' };
+  const listed = await listCollabsTool().handler({}, context);
+  assert.equal(listed.isError, undefined, listed.content[0].text);
+  const entry = JSON.parse(listed.content[0].text).collabs.find((collab) => collab.collabId === 'collab-stub-tool');
+  assert.ok(entry !== undefined, '仅挂起邀请的目录重启后仍出现在清单里');
+  assert.equal(entry.pendingInvites.length, 1);
+  assert.equal(entry.pendingInvites[0].inviteId, 'inv-tool-1', '工具输出直接给出 ws_approve_invite 的定位键');
+  assert.equal(entry.pendingInvites[0].targetSessionId, 'sess-target');
+  assert.deepEqual(entry.pendingInvites[0].from, { instanceId: 'inst-a', sessionId: 'sess-a' });
+  assert.equal(entry.pendingInvites[0].state, 'open');
 });

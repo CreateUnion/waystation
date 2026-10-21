@@ -487,6 +487,8 @@ function joinApiOf(state) {
     openInitialInvite: (input) => state.join.openInitialInvite(input),
     withdrawInitialInvite: (input) => state.join.withdrawInitialInvite(input),
     withdrawInvite: (input) => seatGovernedWrite(state, { ...input, sessionId: input?.managerSessionId }, () => state.join.withdrawInvite(input)),
+    /* 按目标撤回（工具面 target 参数）：0.2.0 协作的邀请在途态只在 invites.json。 */
+    withdrawInviteByTarget: (input) => seatGovernedWrite(state, { ...input, sessionId: input?.managerSessionId }, () => state.join.withdrawInviteByTarget(input)),
     acceptInvite: (input) => guardedWrite(state, input?.collabId, () => state.join.acceptInvite(input)),
     /* 签名与加入域契约一致：confirmJoining(joinId, sessionId, {instanceId,managerTerm,activeSeats?})。 */
     confirmJoining: (joinId, sessionId, input) => guardedWrite(state, input?.collabId, () => state.join.confirmJoining(joinId, sessionId, input)),
@@ -720,6 +722,29 @@ function startService(state) {
   startLiveness(state);
   startSyncEngine(state);
   runHandshake(state);
+  /* 邀请/在途入席的生命周期清扫挂到既有 presence 节拍（takeover.runPresenceTick）：
+   * 不新增定时器；清扫只触碰本机三本账，异常隔离不影响心跳。 */
+  state.joinLifecycleSweep = () => {
+    sweepJoinLifecycle(state).catch((error) => {
+      state.counters.eventFailures++;
+      state.log.warn('邀请生命周期清扫异常（已隔离）', { reason: error?.message });
+    });
+  };
+  state.joinLifecycleSweep();
+}
+
+/* 周期清扫（设计 §4.1/§4.2/§4.4.8）：过期挂起邀请置 expired、过期邀请记录整体移除、
+ * 终态挂起记录按保留窗清理、未确认 grant 超时作废并回 join-deny(expired)。 */
+async function sweepJoinLifecycle(state) {
+  const join = state.join;
+  if (typeof join !== 'object' || join === null) {
+    return;
+  }
+  const at = Date.now();
+  join.expirePendingInvites?.(at);
+  join.expireInvites?.(at);
+  join.pruneTerminalPending?.(at);
+  await join.expireJoining?.(at);
 }
 
 /* 注册表加载：collabs/ 目录逐协作恢复（成员记录或载体文件、台账 / 快照 / 席位可选）；
@@ -1000,7 +1025,62 @@ function listCollabs(state, input) {
   for (const [collabId, summary] of state.legacyViews) {
     collabs.push(legacyListEntryOf(collabId, summary));
   }
+  appendInviteStubEntries(state, collabs, caller);
   return { collabs };
+}
+
+/* 仅挂起邀请的目录（invite-stub）重启后不参与注册表加载；清单仍需让本会话看到待回应邀请
+ * 与 inviteId（设计 §9）——否则核心重启后用户拿不到可回应的定位键。 */
+function appendInviteStubEntries(state, collabs, caller) {
+  const known = new Set(collabs.map((entry) => entry.collabId));
+  for (const collabId of listLocalCollabIds(state.dataDir)) {
+    if (known.has(collabId) || state.legacyViews.has(collabId)) {
+      continue;
+    }
+    const kind = classifyCollabDir(collabDir(state.dataDir, collabId)).kind;
+    if (kind !== 'invite-stub') {
+      continue;
+    }
+    const entry = inviteStubListEntryOf(state, collabId, caller);
+    if (entry !== null) {
+      collabs.push(entry);
+    }
+  }
+}
+
+function inviteStubListEntryOf(state, collabId, caller) {
+  const pendingInvites = pendingInvitesOf(state, collabId, caller);
+  if (pendingInvites.length === 0) {
+    return null;
+  }
+  const carrier = readCarrier(collabDir(state.dataDir, collabId)).carrier;
+  if (carrier === null) {
+    return null;
+  }
+  return {
+    collabId,
+    name: carrier.name ?? collabId,
+    role: 'member',
+    mode: carrier.mode ?? 'managed',
+    state: 'proposed',
+    version: null,
+    memberCount: 0,
+    seatCount: 0,
+    muted: false,
+    archived: false,
+    managerOffline: false,
+    frozenUnresolved: false,
+    suspended: false,
+    handshakeUnresolved: false,
+    decision: null,
+    invitedAt: carrier.createdAt ?? null,
+    expiresAt: pendingInvites[0].expiresAt,
+    expired: pendingInvites.every((invite) => invite.expired),
+    sessionGranted: false,
+    sessionBound: false,
+    pendingJoins: [],
+    pendingInvites,
+  };
 }
 
 /* 旧协作的只读列表项（设计 §10）：状态按 completed 展示，内容取自迁移只读读取器。 */
@@ -1029,6 +1109,7 @@ function legacyListEntryOf(collabId, summary) {
     sessionGranted: false,
     sessionBound: false,
     pendingJoins: [],
+    pendingInvites: [],
   };
 }
 
@@ -1146,7 +1227,23 @@ function listEntryOf(state, local, now, caller) {
     ...inviteViewOf(local, now),
     ...sessionViewOf(state, local, caller),
     ...pendingJoinsViewOf(state, local),
+    pendingInvites: pendingInvitesOf(state, local.collabId, caller),
   };
+}
+
+/* 待回应邀请（本会话可见面）：inviteId 是回应工具的定位键，必须随清单下发。
+ * 取数面异常按空面处置（清单不因附属机制失败而失败）。 */
+function pendingInvitesOf(state, collabId, caller) {
+  if (caller === null || typeof state.join?.pendingInviteList !== 'function') {
+    return [];
+  }
+  try {
+    return state.join.pendingInviteList({ collabId, sessionId: caller.sessionId });
+  } catch (error) {
+    state.counters.loadFailures++;
+    state.log.warn('待回应邀请取数失败（按空面继续）', { collabId, reason: error.message });
+    return [];
+  }
 }
 
 /* 状态栏会话视图：本机席位表 + 冻结原因（只读展示面；无冻结原因时省略字段）。 */
@@ -1329,9 +1426,34 @@ function isSeatInviteDecision(input) {
 async function acceptSeatInviteNow(state, input) {
   const local = state.collabs.get(input?.collabId);
   if (local === undefined) {
-    return approveInvite(state, input);   // 本机无该协作记录：退回旧路径给出既有错误面
+    return acceptSeatInviteWithoutLocalOf(state, input);
   }
-  const consent = inviteAcceptanceConsentOf(state, local, input);
+  const consent = inviteAcceptanceConsentOf(state, {
+    collabId: local.collabId, sessionId: input.sessionId, confirmToken: input.confirmToken, approve: input.approve,
+    invite: inviteSummaryOfLocal(local),
+  });
+  if (consent !== null) {
+    return consent;
+  }
+  const result = await state.join.acceptInvite({ collabId: input.collabId, inviteId: input.inviteId, sessionId: input.sessionId });
+  if (result?.ok === true && result.bound === true) {
+    ensureSeatAfterJoin(state, result.collabId ?? input.collabId, result.sessionId ?? input.sessionId, 'member');
+  }
+  return result;
+}
+
+/* 重启后的邀请落点：invite-stub 不参与注册表加载（设计 §4.2：首次真正入席才升级），
+ * 但挂起邀请仍在盘上——本地无参与记录时照样走加入域（邀请簿记是唯一权威），
+ * 只在挂起记录确实不存在时才退回旧路径的「本机没有该协作」错误面。 */
+async function acceptSeatInviteWithoutLocalOf(state, input) {
+  const pending = pendingInviteRecordOf(state, input);
+  if (pending === null) {
+    return approveInvite(state, input);
+  }
+  const consent = inviteAcceptanceConsentOf(state, {
+    collabId: input.collabId, sessionId: input.sessionId, confirmToken: input.confirmToken, approve: input.approve,
+    invite: pendingInviteSummaryOf(state, pending),
+  });
   if (consent !== null) {
     return consent;
   }
@@ -1343,13 +1465,18 @@ async function acceptSeatInviteNow(state, input) {
 }
 
 /* 席位邀请的拒绝：与同意共用同一份一次性挑战 / 豁免（拒绝同样是有后果的用户决定）；拒绝不产生
- * 席位，故不做载体升级与对表触发，只把本地拒绝与 decline 帧交给加入域。 */
+ * 席位，故不做载体升级与对表触发，只把本地拒绝与 decline 帧交给加入域。
+ * 重启后本地无记录同样以挂起邀请为准（拒绝也要能经工具面送达发起侧）。 */
 async function declineSeatInviteNow(state, input) {
   const local = state.collabs.get(input?.collabId);
-  if (local === undefined) {
+  const pending = local === undefined ? pendingInviteRecordOf(state, input) : null;
+  if (local === undefined && pending === null) {
     return { ok: false, message: '本机没有该协作（collabId 不存在）——无从拒绝该邀请' };
   }
-  const consent = inviteAcceptanceConsentOf(state, local, input);
+  const consent = inviteAcceptanceConsentOf(state, {
+    collabId: input.collabId, sessionId: input.sessionId, confirmToken: input.confirmToken, approve: input.approve,
+    invite: local === undefined ? pendingInviteSummaryOf(state, pending) : inviteSummaryOfLocal(local),
+  });
   if (consent !== null) {
     return consent;
   }
@@ -1358,18 +1485,59 @@ async function declineSeatInviteNow(state, input) {
   });
 }
 
-function inviteAcceptanceConsentOf(state, local, { sessionId, confirmToken, approve }) {
+function pendingInviteRecordOf(state, input) {
+  if (!canLookupPendingInviteOf(state, input)) {
+    return null;
+  }
+  try {
+    return state.join.pendingInvitesFor({ collabId: input.collabId, sessionId: input.sessionId, inviteId: input.inviteId })[0] ?? null;
+  } catch (error) {
+    state.counters.loadFailures++;
+    state.log.warn('挂起邀请取数失败（按无记录处置）', { collabId: input?.collabId, reason: error?.message });
+    return null;
+  }
+}
+
+function canLookupPendingInviteOf(state, input) {
+  return typeof state.join?.pendingInvitesFor === 'function'
+    && typeof input?.inviteId === 'string' && typeof input?.sessionId === 'string';
+}
+
+/* 挂起记录没有展示名，名称/主题取邀请落点载体（邀请到达时已定格）。 */
+function pendingInviteSummaryOf(state, pending) {
+  const carrier = readCarrier(collabDir(state.dataDir, pending.collabId)).carrier;
+  const manager = pending.fromManager;
+  const managerName = carrier?.manager?.instanceId === manager.instanceId
+    ? carrier.manager.identityName
+    : manager.instanceId;
+  return {
+    collabId: pending.collabId,
+    name: carrierFieldOf(carrier, 'name', pending.collabId),
+    mode: carrierFieldOf(carrier, 'mode', 'managed'),
+    topic: carrierFieldOf(carrier, 'topic', null),
+    manager: { instanceId: manager.instanceId, identityName: managerName },
+    invitedAt: carrierFieldOf(carrier, 'createdAt', null),
+    expiresAt: new Date(pending.expiresAt).toISOString(),
+  };
+}
+
+function carrierFieldOf(carrier, key, fallback) {
+  const value = carrier?.[key];
+  return value === undefined || value === null ? fallback : value;
+}
+
+function inviteAcceptanceConsentOf(state, { collabId, sessionId, confirmToken, approve, invite }) {
   if (typeof sessionId !== 'string' || sessionId === '') {
     return null;
   }
-  if (consumeInviteWaiver(state, { sessionId }) || consumeInviteChallenge(state, { sessionId, collabId: local.collabId, token: confirmToken })) {
+  if (consumeInviteWaiver(state, { sessionId }) || consumeInviteChallenge(state, { sessionId, collabId, token: confirmToken })) {
     return null;
   }
   return {
     ok: false,
     needsUserConfirmation: true,
-    confirmToken: issueInviteChallenge(state, { sessionId, collabId: local.collabId }),
-    invite: inviteSummaryOfLocal(local),
+    confirmToken: issueInviteChallenge(state, { sessionId, collabId }),
+    invite,
     message: `${approve === false ? '拒绝' : '同意'}邀请需要用户明确确认：请把邀请信息转述给用户，取得明确同意后携带 confirmToken 重试；若用户明确表示下一次无需确认，可先用 ws_allow_next_invite 登记一次性豁免`,
   };
 }
@@ -1503,6 +1671,10 @@ function setMuteNow(state, input) {
   if (local === undefined) {
     return { ok: false, message: '本机没有该协作（collabId 不存在）——先看 ws_list_collabs' };
   }
+  /* 静音只改「本会话席位」：无会话标识的调用不猜唯一席位（设计 §5.4）——仅显式兼容开关放行。 */
+  if (!validSessionId(input?.sessionId) && state.legacySessionlessWrites !== true) {
+    return { ok: false, message: '缺少调用会话标识（sessionId）——静音按会话席位设置，不能按整机或唯一席位推断' };
+  }
   if (seatsOfLocal(local).size === 0) {
     /* 静音按会话席位：无席位（受邀未同意 / 旧路径）没有可改的对象。mute.json 已退役——
      * 只由旧协作读取面只读回退，新代码不再写（设计 §5.4/§6.2）。 */
@@ -1579,6 +1751,15 @@ function writableVerdictOf(state, collabId) {
   }
   const dir = collabDir(state.dataDir, collabId);
   const kind = classifyCollabDir(dir).kind;
+  /* 内存只读标记与文件标记同等权威（设计 §6.4）：目录判档可能仍是 session-seats
+   * （carrier＋seats 都在），但台账不可用/无法重建的标记只在内存——不得只凭目录放行。
+   * 只有本机台账确实恢复（站长侧 ledger 非空）且目录仍是 session-seats 才清除标记。 */
+  const memoryVerdict = state.readonlyCollabs.get(collabId);
+  if (memoryVerdict !== undefined) {
+    if (!readonlyMemoryClearedOf(state, collabId, kind)) {
+      return { ok: false, reason: memoryVerdict.reason };
+    }
+  }
   const legacyVerdict = legacyWriteVerdictOf(state, collabId, dir, kind);
   if (legacyVerdict !== null) {
     return legacyVerdict;
@@ -1636,6 +1817,23 @@ function memberRoleOfDir(dir) {
   } catch {
     return null;
   }
+}
+
+/* 内存只读标记的复核：目录回到 session-seats 且本机台账可用才可解除（失败安全）。
+ * 成员侧没有台账（ledger 恒 null），目录形态与席位证据成立即可；站长侧必须有台账。 */
+function readonlyMemoryClearedOf(state, collabId, kind) {
+  if (kind !== 'session-seats') {
+    return false;
+  }
+  const local = state.collabs.get(collabId);
+  if (local === undefined) {
+    return false;
+  }
+  if (local.role !== 'member' && local.ledger === null) {
+    return false;
+  }
+  state.readonlyCollabs.delete(collabId);
+  return true;
 }
 
 function rememberReadonly(state, collabId, verdict) {

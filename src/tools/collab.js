@@ -270,6 +270,11 @@ export function withdrawInviteTool() {
       if (parsed.inviteId !== undefined) {
         return withdrawByInviteId(parsed.inviteId, collabId, caller.sessionId, context);
       }
+      /* 0.2.0 协作按 invites.json 的目标撤回（共享名单是 active-only，旧名单路径无 invited 行）；
+       * 加入域面未暴露时退回旧路径（旧协作/直调夹具）。 */
+      if (typeof context.join?.withdrawInviteByTarget === 'function') {
+        return resultOf(context.join.withdrawInviteByTarget({ collabId, managerSessionId: caller.sessionId, target: parsed.target }));
+      }
       return resultOf(await context.collab.withdraw({ collabId, target: parsed.target, sessionId: caller.sessionId }));
     },
   };

@@ -202,11 +202,81 @@ test('目标会话离线：邀请落 pending-invites，核重启后仍可接受�
   assert.equal(restored[0].inviteId, invited.inviteId);
 
   await bringSessionOnline(member, 'seat-b1');
-  const accepted = await member.service.join.acceptInvite({ collabId, inviteId: invited.inviteId, sessionId: 'seat-b2' });
+  /* C-1：重启后 invite-stub 不参与注册表加载，但工具面（service.approve）必须仍能接受——
+   * 同意门保留：首次调用签挑战，携 confirmToken 重试才生效。 */
+  const challenge = await member.service.approve({ collabId, inviteId: invited.inviteId, sessionId: 'seat-b2', approve: true });
+  assert.equal(challenge.needsUserConfirmation, true, JSON.stringify(challenge));
+  const accepted = await member.service.approve({
+    collabId, inviteId: invited.inviteId, sessionId: 'seat-b2', approve: true, confirmToken: challenge.confirmToken,
+  });
   assert.equal(accepted.ok, true, String(accepted.message));
   await waitFor(async () => {
     const view = await manager.service.view({ collabId });
     return view.ledger?.members.some((seat) => seat.sessionId === 'seat-b2') ? true : null;
   }, { timeoutMs: 10000 });
   await waitFor(() => member.service.localSeatOf(collabId, 'seat-b2')?.unverified === false ? true : null, { timeoutMs: 10000 });
+});
+
+/* —— C-1 / I-2：重启后的拒绝与撤回闭环 —— */
+
+test('重启后拒绝邀请：service.approve(approve:false) 关闭发起侧记录且不建席', { timeout: TIMEOUT_MS }, async (t) => {
+  const manager = await startSessionNode(t, { identityName: '甲机', online: ['seat-manager'] });
+  const home = makeTempRoot(t);
+  let member = await startSessionNode(t, { home, identityName: '乙机', online: ['seat-b1'] });
+  linkSessionNodes(manager, member);
+  await bringSessionOnline(manager, 'seat-manager');
+  await bringSessionOnline(member, 'seat-b1');
+  const port = member.port;
+
+  const collabId = await createCollab(manager, member, '重启拒绝');
+  const invited = await sendInvite(manager, collabId, member, 'seat-b2');
+  await waitFor(() => {
+    const book = readJsonOrNull(pendingInvitesFilePath(home, collabId));
+    return book?.invites?.some((entry) => entry.inviteId === invited.inviteId) ? true : null;
+  }, { timeoutMs: 8000 });
+
+  const instanceId = member.self.instanceId;
+  await closeSessionNode(member);
+  await waitForRebindable(port);
+  member = await startSessionNode(t, { home, port, identityName: '乙机', instanceId, online: ['seat-b1'] });
+  await bringSessionOnline(member, 'seat-b1');
+
+  const challenge = await member.service.approve({ collabId, inviteId: invited.inviteId, sessionId: 'seat-b2', approve: false, reason: '暂不参与' });
+  assert.equal(challenge.needsUserConfirmation, true, JSON.stringify(challenge));
+  const declined = await member.service.approve({
+    collabId, inviteId: invited.inviteId, sessionId: 'seat-b2', approve: false, reason: '暂不参与', confirmToken: challenge.confirmToken,
+  });
+  assert.equal(declined.ok, true, String(declined.message));
+  assert.equal(declined.declined, true);
+
+  await waitFor(() => {
+    const record = readJson(invitesFilePath(manager.home, collabId)).invites.find((entry) => entry.inviteId === invited.inviteId);
+    return record?.state === 'closed' ? true : null;
+  }, { timeoutMs: 8000 });
+  assert.equal(member.service.localSeatOf(collabId, 'seat-b2'), null, '拒绝不建席');
+  const roster = (await manager.service.view({ collabId })).ledger?.members ?? [];
+  assert.equal(roster.some((seat) => seat.sessionId === 'seat-b2'), false, '共享名单不含被拒会话');
+});
+
+test('撤回邀请：目标端挂起记录转 withdrawn，之后不可再接受（I-2）', { timeout: TIMEOUT_MS }, async (t) => {
+  const { manager, member } = await startPair(t);
+  const collabId = await createCollab(manager, member, '撤回闭环');
+  const invited = await sendInvite(manager, collabId, member, 'seat-b2');
+  await waitInviteOrNull(member, 'seat-b2', (entry) => entry.payload?.inviteId === invited.inviteId);
+  await waitFor(() => {
+    const book = readJsonOrNull(pendingInvitesFilePath(member.home, collabId));
+    return book?.invites?.some((entry) => entry.inviteId === invited.inviteId) ? true : null;
+  }, { timeoutMs: 8000 });
+
+  const withdrawn = await manager.service.join.withdrawInvite({ collabId, managerSessionId: 'seat-manager', inviteId: invited.inviteId });
+  assert.equal(withdrawn.ok, true, String(withdrawn.message));
+  await waitFor(() => {
+    const record = readJson(pendingInvitesFilePath(member.home, collabId)).invites.find((entry) => entry.inviteId === invited.inviteId);
+    return record?.state === 'withdrawn' ? true : null;
+  }, { timeoutMs: 8000 });
+  const record = readJson(invitesFilePath(manager.home, collabId)).invites.find((entry) => entry.inviteId === invited.inviteId);
+  assert.equal(record.state, 'withdrawn', '发起侧记录同样关闭');
+
+  const accepted = await member.service.join.acceptInvite({ collabId, inviteId: invited.inviteId, sessionId: 'seat-b2' });
+  assert.equal(accepted.ok, false, '已撤回的邀请不可再接受');
 });

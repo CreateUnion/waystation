@@ -653,8 +653,22 @@ export function runPresenceTick(state) {
     sweepSeatGrace(state, mono);
     checkManagerLoss(state, mono);
     resendPendingChanges(state, mono);
+    runJoinLifecycleSweep(state);
   } catch (error) {
     state.log.error('席位心跳定时器异常（已隔离）', { reason: error.message });
+  }
+}
+
+/* 加入域的生命周期清扫经服务注入（避免 takeover → join 的模块环）；缺省无操作。 */
+function runJoinLifecycleSweep(state) {
+  if (typeof state.joinLifecycleSweep !== 'function') {
+    return;
+  }
+  try {
+    state.joinLifecycleSweep();
+  } catch (error) {
+    bump(state, 'eventFailures');
+    state.log.warn('邀请生命周期清扫异常（已隔离）', { reason: error?.message });
   }
 }
 
@@ -2697,12 +2711,19 @@ function broadcastManagerChanged(state, local, payload, signer, prevManager) {
   }
 }
 
-/* 变更先于提升发送：成员核此时还没有本地台账，名册取最近快照（含旧站长与其余成员）。 */
+/* 变更先于提升发送：成员核此时还没有本地台账，名册取最近快照（含旧站长与其余成员）。
+ * 快照可能落后于实际名单（后加入成员的快照尚未送达），协作端点表里的已知实例同样可达：
+ * 只按名册投递会让这些成员收不到站长变更，双站长分叉无从冻结。 */
 function managerChangeTargetsOf(local, prevManager) {
   const roster = local.ledger?.members ?? local.snapshot?.ledger?.members ?? [];
   const targets = new Map(roster.map((member) => [member.instanceId, member]));
   if (isPlainObject(prevManager) && !targets.has(prevManager.instanceId)) {
     targets.set(prevManager.instanceId, prevManager);
+  }
+  for (const instanceId of local.endpoints.keys()) {
+    if (!targets.has(instanceId)) {
+      targets.set(instanceId, { instanceId });
+    }
   }
   return targets;
 }

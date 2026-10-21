@@ -13,9 +13,13 @@ export const ARCHIVED_STATES = ['completed', 'terminated', 'left'];
 export const CONFLICT_STATES = ['proposed', 'active', 'frozen'];
 /* 冻结前状态集（解除冻结「回冻结前状态」的取值域；抢接 / 降级后恢复的成员态由此映射） */
 export const FROZEN_FROM_STATES = ['proposed', 'active'];
-/* 协作域边界常量（服务内多模块共用；上界防失控，取值按人机协作量级）：待回应邀请上限、
+/* 协作域边界常量（服务内多模块共用；上界防失控，取值按人机协作量级）：单协作待批准加入申请
+ * 上限（与目标机 pending-invites 的容量 `config.pendingInvitesMax` 是不同域，见 gate.js）、
  * 本机参与协作上限、任务板上限、邀请限频记录表容量。 */
 export const MAX_PENDING_INVITES = 16;
+/* 目标机挂起邀请上限的缺省（与 config 的 pendingInvitesMax 缺省一致）：gate 的入站邀请上限
+ * 以配置为准，配置缺失时用本值，避免与 pending store 容量（64）口径分叉。 */
+export const DEFAULT_PENDING_INVITES_MAX = 64;
 export const MAX_LOCAL_COLLABS = 64;
 export const MAX_BOARD_ENTRIES = 200;
 export const INVITE_THROTTLE_TABLE_MAX = 64;

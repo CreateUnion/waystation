@@ -394,7 +394,7 @@ export function inviteMembers(state, { collabId, targets, sessionId }) {
 
 /* 讨论邀请（既有路径保持不变）：任何成员可发起；名额数据源＝折叠成员表（被拒/被撤回者不占名额）。 */
 function inviteForumMembers(state, local, targets, fromSessionId) {
-  if (!selfJoinedOf(local, state.self.instanceId)) {
+  if (!selfJoinedOf(local, state.self.instanceId, fromSessionId)) {
     return { ok: false, message: '本机尚未加入该讨论（等待邀请或先回应邀请）——加入为成员后才能邀请他人' };
   }
   /* 上限检查点在放行/邀请步之前（设计 §5.6）；名额数据源 = 折叠成员表（含 invited 的旧名单口径
@@ -953,7 +953,7 @@ async function sendForumPost(state, local, { text, type, to, sessionId }) {
  * 行为——有运行时席位表时必须显式给本机活跃席位：缺标识会把「调用者没穿会话」误报成中继降级，
  * 冒名会话则会拿别人的席位盖章直投。 */
 function forumPostSenderOf(state, local, text, sessionId) {
-  if (!selfJoinedOf(local, state.self.instanceId)) {
+  if (!selfJoinedOf(local, state.self.instanceId, sessionId)) {
     return { ok: false, message: '本机尚未加入该讨论（等待邀请或先回应邀请）——加入后才能发言' };
   }
   const textRejection = textRejectionOf('reply', text);
@@ -2415,7 +2415,35 @@ export function promoteToManager(state, local, ledger) {
   applyManagerSeatRoles(state, local, ledger);
   persistMember(state, local);
   persistLedger(state, local);
+  invalidateJoinsOnManagerChange(state, local.collabId, ledger.managerTerm);
   pushSnapshot(state, local);
+}
+
+/* 站长更替的加入面作废（D5）：旧任期未确认 grant、旧 open 邀请与待批准申请一律作废，
+ * 由新站长重发。异常隔离——作废失败不得阻断任职与快照推送。 */
+function invalidateJoinsOnManagerChange(state, collabId, managerTerm) {
+  const join = state.join;
+  if (typeof join !== 'object' || join === null) {
+    return;
+  }
+  settleJoinInvalidation(state, () => join.invalidateInvitesForManagerChange?.(collabId), '邀请');
+  settleJoinInvalidation(state, () => join.invalidateForManagerChange?.(managerTerm, collabId), '在途入席');
+}
+
+function settleJoinInvalidation(state, run, label) {
+  try {
+    const result = run();
+    if (result !== null && typeof result?.then === 'function') {
+      result.catch((error) => reportJoinInvalidationFailure(state, label, error));
+    }
+  } catch (error) {
+    reportJoinInvalidationFailure(state, label, error);
+  }
+}
+
+function reportJoinInvalidationFailure(state, label, error) {
+  state.counters.eventFailures++;
+  state.log.warn(`站长更替的${label}作废异常（已隔离）`, { reason: error?.message });
 }
 
 /* 站长转移的席位侧同步：台账 manager 席位置 manager、其余本机席位回落 member；台账里有席位行
