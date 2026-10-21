@@ -4,7 +4,7 @@ import { networkInterfaces } from 'node:os';
 import { ANCHOR_PORT, SLOT_COUNT } from '../site.js';
 import { shortSessionId } from '../util/short-id.js';
 import { PARTICIPANTS_SOURCE_PROBE, PARTICIPANTS_SOURCE_SCAN } from './known-hosts.js';
-import { MAX_COLLAB_COUNT, MAX_DATAGRAM_BYTES, PARTICIPANTS_CAPABILITY, PROTOCOL_VERSION, fitJoinResolveAck, isIdentityName, isPort, newMsgId, supportsParticipants, validateJoinAck, validateJoinKnock, validateJoinResolve, validateJoinResolveAck, validateProbe, validateProbeAck, withParticipantsCapability } from './protocol.js';
+import { ID_PATTERN, MAX_COLLAB_COUNT, MAX_DATAGRAM_BYTES, PARTICIPANTS_CAPABILITY, PROTOCOL_VERSION, fitJoinResolveAck, isIdentityName, isPort, newMsgId, supportsParticipants, validateJoinAck, validateJoinKnock, validateJoinResolve, validateJoinResolveAck, validateProbe, validateProbeAck, withParticipantsCapability } from './protocol.js';
 
 /* 测试专用的全局发现开关（WAYSTATION_TEST_ 前缀，仅测试用）：进程级 e2e 起的临时核心不得向真实 LAN
  * 广播/探测——那会扫到用户真实运行的驿站核心，并向其注入探测/敲门事件。置 1 时本模块不绑定套接字、
@@ -71,7 +71,8 @@ export function broadcastTargets(interfaces) {
  * 调用时序由装配层保证：close 后套接字已关闭，再次调用上述任一入口（含 requestJoin 的解析变体）
  * 会以套接字错误失败（吵闹而非挂起）——失败即安全网，不属可依赖的语义。 */
 export function createDiscovery(options) {
-  const state = discoveryStateOf(options);
+  /* 出站数据报注入缝的缺省在此归一（状态构造保持线性：默认参数本身也是复杂度分支）。 */
+  const state = discoveryStateOf({ ...options, deliverDatagram: options.deliverDatagram ?? null });
   state.socket.on('message', (buffer, rinfo) => {
     onDatagram(state, buffer, rinfo);
   });
@@ -139,10 +140,13 @@ function discoveryStateOf({
   joinKnockRetryCount = JOIN_KNOCK_RETRY_COUNT,
   joinKnockRetryIntervalMs = JOIN_KNOCK_RETRY_INTERVAL_MS,
   joinKnockReplyMinIntervalMs = JOIN_KNOCK_REPLY_MIN_INTERVAL_MS,
+  /* 出站数据报的测试注入缝（生产一律缺省 = 真实 socket.send）：用于断言「回环绑定不向真实 LAN 发送」，
+   * 不改变任何出站目标计算。 */
+  deliverDatagram,
 }) {
   return {
     port, bindAddress, instanceId, identityName, getCollabCount, knownHosts, log, segmentBase,
-    onJoinKnock, onJoinResolve, activeSessions,
+    onJoinKnock, onJoinResolve, activeSessions, deliverDatagram,
     joinKnockWindowMs, joinKnockRetryCount, joinKnockRetryIntervalMs, joinKnockReplyMinIntervalMs,
     disabled: discoveryDisabledIn(process.env),
     socket: dgram.createSocket({ type: 'udp4', reuseAddr: false }),
@@ -225,7 +229,18 @@ function outboundTargets(state) {
   for (const entry of state.knownHosts.targets()) {
     targets.set(`${entry.address}:${entry.port}`, entry);
   }
-  return [...targets.values()];
+  /* 回环绑定 = 只服务本机回环的测试/单机场景：真实网卡的广播地址与清单里的非回环端点一律不投。
+   * 生产绑定（0.0.0.0 / LAN 地址）不受影响（设计 §5：测试与单机不得触达真实 LAN）。 */
+  const all = [...targets.values()];
+  return loopbackBound(state) ? all.filter((target) => isLoopbackAddress(target.address)) : all;
+}
+
+function loopbackBound(state) {
+  return typeof state.bindAddress === 'string' && state.bindAddress.startsWith('127.');
+}
+
+function isLoopbackAddress(address) {
+  return typeof address === 'string' && (address === '::1' || address.startsWith('127.'));
 }
 
 function probeDatagram(state, purpose) {
@@ -834,8 +849,10 @@ function optionalInstanceIdOf(input, apiName) {
   if (instanceId === undefined) {
     return null;
   }
-  if (typeof instanceId !== 'string' || instanceId === '') {
-    throw new TypeError(`${apiName} 的 instanceId 须为非空字符串，实际：${JSON.stringify(instanceId)}`);
+  /* 与协议标识判据同口径：形态不符的标识永远匹配不上任何应答（结果只会是未知），
+   * 属外部输入校验口径不齐——在启程前按编程错误拒绝。 */
+  if (typeof instanceId !== 'string' || !ID_PATTERN.test(instanceId)) {
+    throw new TypeError(`${apiName} 的 instanceId 须为 1–64 位字母数字与连字符，实际：${JSON.stringify(instanceId)}`);
   }
   return instanceId;
 }
@@ -1062,6 +1079,10 @@ function currentCollabCount(state) {
 function sendDatagram(state, buffer, targetPort, targetAddress, kind) {
   if (state.disabled) {
     return;   // 防御纵深：入口短路之外，任何出站路径都不得发出数据报
+  }
+  if (typeof state.deliverDatagram === 'function') {
+    state.deliverDatagram({ buffer, port: targetPort, address: targetAddress, kind });
+    return;
   }
   state.socket.send(buffer, targetPort, targetAddress, (error) => {
     if (error) {

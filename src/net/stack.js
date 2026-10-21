@@ -1,7 +1,7 @@
 import { isIP } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { OCCUPIER_PROBE_TIMEOUT_MS } from '../site.js';
-import { PROTOCOL_VERSION, isIdentityName, isPort, newMsgId } from './protocol.js';
+import { ID_PATTERN, PROTOCOL_VERSION, isIdentityName, isPort, newMsgId } from './protocol.js';
 
 /* 组件已被 close 后重试 start 的固定结论：一次性生命周期下重试不可能成功，恢复途径是重建组件（组合根职责） */
 const COMPONENTS_CLOSED = {
@@ -274,13 +274,14 @@ async function probeCapability(state, { address, port, instanceId, timeoutMs }) 
   }
 }
 
-/* 可选实例标识的形态把关（两条单播面共用）：没给＝不按实例归户；给了但形态坏不得静默忽略。 */
+/* 可选实例标识的形态把关（两条单播面共用）：没给＝不按实例归户；给了但形态坏不得静默忽略。
+ * 判据与协议标识（ID_PATTERN）同一口径：形态不符的标识永远匹配不上任何应答，收口在启程前。 */
 function instanceIdErrorOf(instanceId) {
   if (instanceId === undefined) {
     return null;
   }
-  if (typeof instanceId !== 'string' || instanceId === '') {
-    return '目标实例标识非法：需要非空字符串（或省略）';
+  if (typeof instanceId !== 'string' || !ID_PATTERN.test(instanceId)) {
+    return '目标实例标识非法：需要 1–64 位字母数字与连字符（或省略）';
   }
   return null;
 }

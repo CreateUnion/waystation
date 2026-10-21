@@ -1136,6 +1136,38 @@ test('静音：按本机席位聚合 mutedSeatCount；mute.json 的机器级布�
   assert.equal('muted' in meta, false, '详情 meta 不得再有机器级静音布尔');
 });
 
+test('归档席位：不进入 localSeats、不计入 mutedSeatCount 与讨论活跃数（与服务状态栏同口径）', (t) => {
+  const dataDir = makeTempDir(t);
+  writeConfigAt(dataDir, '甲机');
+  writeInstanceId(dataDir, 'inst-a');
+  writeFiles(collabDirIn(dataDir, 'main', 'c-forum-archived'), {
+    [CARRIER_FILE_NAME]: JSON.stringify(carrierRecord({ collabId: 'c-forum-archived', name: '讨论甲', mode: 'forum' })),
+    [MEMBERS_FILE_NAME]: jsonl(
+      memberEvent({ eventId: 'ev-a', instanceId: 'inst-a', identityName: '甲机', ts: T0 }),
+      memberEvent({ eventId: 'ev-b', instanceId: 'inst-b', identityName: '乙机', ts: tsPlus(1000) }),
+    ),
+    [`${SEATS_DIR_NAME}/${LOCAL_MANAGER_SESSION}.json`]: JSON.stringify(seatRecord({ role: 'member', joinSeq: 1 })),
+    [`${SEATS_DIR_NAME}/${LOCAL_MEMBER_SESSION}.json`]: JSON.stringify(seatRecord({
+      sessionId: LOCAL_MEMBER_SESSION,
+      role: 'member',
+      joinSeq: 2,
+      muted: true,
+      archivedAt: tsPlus(5000),
+    })),
+    [POSTS_FILE_NAME]: jsonl(postEntry()),
+  });
+  const data = createData(dataDir);
+  const entry = data.listCollabs().collabs[0];
+  const meta = data.readMeta('main', 'c-forum-archived', null);
+  assert.deepEqual(meta.sessions.localSeats.map((seat) => seat.sessionId), ['11112222'], '归档席位不出现在本机席位段');
+  assert.equal(meta.sessions.localSeatCount, 1);
+  assert.equal(meta.sessions.mutedSeatCount, 0, '归档席位不参与静音聚合');
+  assert.equal(meta.sessions.activeSeatCount, 2, '讨论活跃＝本机活跃 1 ＋远端 1（归档席不计）');
+  assert.equal(meta.memberCount, meta.sessions.activeSeatCount, '人数与活跃同源');
+  assert.equal(entry.sessions.localSeatCount, 1);
+  assert.deepEqual(entry.sessions.remoteSeats.map((seat) => seat.instanceId), ['inst-b'], '归档席位不得以远端成员身份重复出现');
+});
+
 test('静音：席位文件缺失/损坏时按 0 席静音（不读 mute.json 兜底）', (t) => {
   const dataDir = makeTempDir(t);
   writeFiles(collabDirIn(dataDir, 'main', 'c-1'), {

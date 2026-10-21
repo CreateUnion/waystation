@@ -85,22 +85,13 @@ export function createCollab(state, { name, topic, targets, mode, sessionId }) {
     return { ok: false, message: rejected };
   }
   const ledger = freshLedgerOf(state, name, topic, collabMode, sessionId);
-  const local = {
-    collabId: ledger.collabId,
-    role: 'manager',
-    ledger,
-    member: managerRecordOf(ledger),
-    endpoints: new Map(),
-    snapshot: null,
-    posts: createPostsStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
-    members: createMembersStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
-    counter: createCounterStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
-    /* 退役 mute.json 的兼容句柄（仅供尚未迁出的清理调用点）；静音权威是席位文件。 */
-    mute: retiredMuteHandle(),
-    injected: createInjectedStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log }),
-    suspended: null,
-    staleManagerId: null,
-  };
+  /* carrier 先行（设计 §8 / 契约 §3）：它是目录形态的第一份落盘证据。旧序把 member/ledger/首邀写在
+   * carrier 之前，崩溃窗口会留下「有 member.json、无 carrier」的目录——重启被判 legacy 永久只读。
+   * 此步失败即创建失败：任何协作数据都不落，首邀也不发。 */
+  if (!persistCreateCarrier(state, ledger, targets, sessionId)) {
+    return { ok: false, message: '协作载体文件写入失败——创建中止（未落任何协作数据、未发邀请）；请检查磁盘后重试' };
+  }
+  const local = createdLocalStateOf(state, ledger);
   registerCreateTargets(state, local, targets);
   state.collabs.set(ledger.collabId, local);
   if (collabMode === 'forum') {
@@ -117,6 +108,81 @@ export function createCollab(state, { name, topic, targets, mode, sessionId }) {
   state.openViewer?.({ root: state.viewerRoot, id: ledger.collabId });   // 触发 A：建立即开该协作页（开关在出口内现读）
   /* 新建实例的静音状态必为空（新 collabId 无旧文件），写点一的默认静音必然落笔——提醒同发。 */
   return { ok: true, collabId: ledger.collabId, invited, notice: DEFAULT_MUTE_NOTICE };
+}
+
+/* 新建协作的本机运行态容器（与加载路径同形；存储句柄按需构造，不落盘）。 */
+function createdLocalStateOf(state, ledger) {
+  const storeOptions = {
+    dataDir: state.dataDir,
+    collabId: ledger.collabId,
+    log: state.log,
+    onChange: () => notifyIndicatorChange(state),
+  };
+  return {
+    collabId: ledger.collabId,
+    role: 'manager',
+    ledger,
+    member: managerRecordOf(ledger),
+    endpoints: new Map(),
+    snapshot: null,
+    posts: createPostsStore(storeOptions),
+    members: createMembersStore(storeOptions),
+    counter: createCounterStore(storeOptions),
+    /* 退役 mute.json 的兼容句柄（仅供尚未迁出的清理调用点）；静音权威是席位文件。 */
+    mute: retiredMuteHandle(),
+    injected: createInjectedStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log }),
+    suspended: null,
+    staleManagerId: null,
+  };
+}
+
+/* 建协作的第一份落盘文件（carrier-first）：形态与服务的 ensureCarrierOf 同口径——名录/模式/端点
+ * 取已验证的目标与新建台账；站长席位记录创建者会话。写失败返回 false，由调用方整体中止创建。 */
+function persistCreateCarrier(state, ledger, targets, sessionId) {
+  try {
+    writeCarrier(collabDir(state.dataDir, ledger.collabId), createCarrierOf(state, ledger, targets, sessionId));
+    return true;
+  } catch (error) {
+    state.counters.persistFailures++;
+    state.log.warn('协作载体写入失败，创建中止（不落成员/台账/席位、不发邀请）', {
+      collabId: ledger.collabId,
+      reason: error.message,
+    });
+    return false;
+  }
+}
+
+function createCarrierOf(state, ledger, targets, sessionId) {
+  const carrier = {
+    format: CARRIER_FORMAT_SESSION_SEATS,
+    version: 1,
+    collabId: ledger.collabId,
+    name: ledger.name,
+    topic: ledger.topic,
+    mode: ledger.mode,
+    endpoints: endpointsOfTargets(targets),
+    snapshotVersion: ledger.version,
+    createdAt: new Date().toISOString(),
+    manager: {
+      instanceId: state.self.instanceId,
+      sessionId,
+      identityName: state.self.identityName,
+      term: ledger.managerTerm,
+    },
+  };
+  if (ledger.mode === 'forum') {
+    /* 讨论的发起人即中继归属（设计 §5.1/§5.3）：随载体持久化，与成员记录的 originator 同值。 */
+    carrier.originator = { instanceId: state.self.instanceId, sessionId, identityName: state.self.identityName };
+  }
+  return carrier;
+}
+
+function endpointsOfTargets(targets) {
+  const endpoints = {};
+  for (const target of targets) {
+    endpoints[target.instanceId] = { address: target.address, port: target.port };
+  }
+  return endpoints;
 }
 
 /* 建协目标登记（端点表 ＋ 已知主机学习；台账名单由 freshLedgerOf 定格）。 */
@@ -1813,6 +1879,10 @@ export function deliveryStatusOf(state, msgId) {
 /* 本机席位投递明细：本机旁路账优先；其余委托接收管线的 fanout 事实（接线注入）；
  * 未接线返回 unknown。 */
 export function localSeatDeliveryOf(state, msgId, sessionId) {
+  /* 参数形态先于账本命中校验：本机账命中时也不得把非法会话标识当作「已查过」放行。 */
+  if (typeof msgId !== 'string' || msgId === '' || typeof sessionId !== 'string' || !ID_PATTERN.test(sessionId)) {
+    throw new TypeError('localSeatDeliveryOf 需要合法的 msgId 与 sessionId');
+  }
   const entry = localDeliveryOf(state, msgId);
   if (entry !== null) {
     return {
@@ -3042,8 +3112,9 @@ function forumTargetsRejection(targets) {
   return null;
 }
 
-/* 目标数组形态与去重（含本机排除）。 */
-function targetsRejectionOf(targets, selfId) {
+/* 目标数组形态与去重（含本机排除）。服务层在能力探测之前先过这一关：含本机目标的创建应立刻
+ * 报「目标不能包含本机」，不得先空等一次自探测（自探测会被自身实例应答面丢弃）。 */
+export function targetsRejectionOf(targets, selfId) {
   if (!Array.isArray(targets) || targets.length < 1 || targets.length > MAX_COLLAB_MEMBERS - 1) {
     return `目标非法：需要 1–${MAX_COLLAB_MEMBERS - 1} 项`;
   }

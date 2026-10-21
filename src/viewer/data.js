@@ -715,7 +715,16 @@ function seatViewOf(seat) {
   if (seat.unverified === true) {
     view.unverified = true;
   }
+  if (isArchivedSeatView(seat)) {
+    view.archived = true;
+  }
   return view;
+}
+
+/* 归档席位（终态历史）：文件形态用 archivedAt 时间戳，运行时注入面另有 archived 布尔——两者同义。
+ * 归档席位退出注入、静音聚合与活跃判定（与状态栏视图同口径）。 */
+function isArchivedSeatView(seat) {
+  return seat.archived === true || (typeof seat.archivedAt === 'string' && seat.archivedAt !== '');
 }
 
 function isSeatRole(role) {
@@ -1131,19 +1140,19 @@ function sessionsOf(state, base, collabId, context) {
     return null;
   }
   const localInstanceId = localInstanceIdOf(state, base, member);
+  /* 远端排除仍用全量本机席位（含归档）：归档席位仍在共享台账名单里，若把它漏出排除集会
+   * 以「远端成员」身份重复出现。展示与计数只用活跃席位（与状态栏视图同口径）。 */
   const remoteSeats = remoteSeatsFor(mode, state, base, collabId, { ledger, localSeats, legacy, localInstanceId });
-  /* 讨论活跃席位＝两段可见行相加：成员事件不带 sessionId 时按机器折叠，若直接把折叠人数当活跃数，
-   * 同机双席会让「活跃 N 席｜本机 M 席｜远端 K 席」对不上（N≠M+K）。managed 仍取共享台账口径。 */
-  const activeSeatCount = mode === 'forum' ? localSeats.length + remoteSeats.length : managedActiveSeatCount;
+  const seats = activeSeatSummaryOf(localSeats, remoteSeats, mode, managedActiveSeatCount);
   const sessions = {
-    localSeats,
+    localSeats: seats.activeLocalSeats,
     remoteSeats,
     departed,
     pendingInvites,
     pendingJoins,
-    activeSeatCount,
-    localSeatCount: localSeats.length,
-    mutedSeatCount: localSeats.filter((seat) => seat.muted === true).length,
+    activeSeatCount: seats.activeSeatCount,
+    localSeatCount: seats.activeLocalSeats.length,
+    mutedSeatCount: seats.activeLocalSeats.filter((seat) => seat.muted === true).length,
   };
   const freezeReason = freezeReasonOf(ledger, carrier);
   if (freezeReason !== null) {
@@ -1161,6 +1170,15 @@ function sessionsOf(state, base, collabId, context) {
     sessions.readOnly = true;
   }
   return sessions;
+}
+
+/* 活跃席位计数：归档席位退出展示与计数（与状态栏同口径）；讨论活跃席位＝两段可见行相加——
+ * 成员事件不带 sessionId 时按机器折叠，若直接把折叠人数当活跃数，同机双席会让
+ * 「活跃 N 席｜本机 M 席｜远端 K 席」对不上（N≠M+K）。managed 仍取共享台账口径。 */
+function activeSeatSummaryOf(localSeats, remoteSeats, mode, managedActiveSeatCount) {
+  const activeLocalSeats = localSeats.filter((seat) => seat.archived !== true);
+  const activeSeatCount = mode === 'forum' ? activeLocalSeats.length + remoteSeats.length : managedActiveSeatCount;
+  return { activeLocalSeats, activeSeatCount };
 }
 
 /* 远端成员来源：旧协作取 legacy 摘要 roster；讨论取成员事件折叠；managed 取共享台账/快照。 */
@@ -1403,7 +1421,7 @@ function readMeta(state, root, collabId, after) {
   const ledger = lastOf(source.ledgerRows);
   const activeSeatCount = mode === 'forum'
     ? meta.memberCount
-    : (ledger === null ? (legacy === null ? localSeats.length : legacy.memberCount) : activeSeatCountOf(ledger));
+    : (ledger === null ? (legacy === null ? localSeats.filter((seat) => seat.archived !== true).length : legacy.memberCount) : activeSeatCountOf(ledger));
   const sessions = sessionsOf(state, base, collabId, {
     carrier, member, ledger, mode, localSeats, activeSeatCount, legacy, corruptSeatCount: localSeatView.corrupt,
   });

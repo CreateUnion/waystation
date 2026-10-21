@@ -160,6 +160,36 @@ test('写入失败：连接立即移出池并计数，下一次尝试重拨', { 
   assert.equal(tierOf(dispatch, sent.msgId), 'at-peer');
 });
 
+test('唤醒限频：高频入队不把慢退避退化成每 tick 一拨（唤醒配额按 retryIntervalMs 计）', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  transport.setDialFails(true);
+  const { dispatch } = makeDispatch(t, {
+    transport,
+    config: testConfig({ retryIntervalMs: 50, retrySlowIntervalMs: 60000, retryFastCount: 1, dispatchTickMs: 10 }),
+  });
+  dispatch.send(target({ payload: { text: '队头' } }));
+  dispatch.start();
+  await waitFor(() => transport.dials.length === 2, { timeoutMs: 2000 });   // 首投＋一次快退避
+  const baseline = transport.dials.length;
+
+  /* 300ms 内每 10ms 入队一次（30 次）：无限频时每次入队都把队头拨回当下，tick=10ms 最多约 30 拨；
+   * 限频后每 retryIntervalMs（50ms）至多一次，期望约 6 次。 */
+  for (let index = 0; index < 30; index++) {
+    dispatch.send(target({ payload: { text: `连发${index}` } }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const during = transport.dials.length - baseline;
+  assert.ok(during <= 8, `唤醒限频：300ms 内拨号约 6 次，实际 ${during}`);
+  assert.ok(during >= 1, '间隔外的新入队仍能唤醒队头');
+
+  /* 配额在间隔后刷新：再等过一个 retryIntervalMs 的单次入队应能触发一次新拨号。 */
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  const beforeRefresh = transport.dials.length;
+  dispatch.send(target({ payload: { text: '刷新' } }));
+  await waitFor(() => transport.dials.length > beforeRefresh, { timeoutMs: 1000 });
+  assert.equal(transport.dials.length, beforeRefresh + 1);
+});
+
 test('长退避期间新入队：唤醒单元立即重拨，重发不被队头退避挡在后面', { timeout: 15000 }, async (t) => {
   const transport = createFakeTransport();
   transport.setDialFails(true);

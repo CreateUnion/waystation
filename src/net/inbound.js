@@ -1,4 +1,5 @@
 import { collabDir, collabFilePath, ensureDir } from '../paths.js';
+import { listLocalCollabIds } from '../collab/store.js';
 import { appendLine, loadLines, replaceFile } from '../storage.js';
 import { COLLAB_CAPABILITY, GOVERNANCE_TYPES, ID_PATTERN, MAX_ACTIVE_SEATS, PROTOCOL_VERSION, isPort, newMsgId, withCollabCapability } from './protocol.js';
 import { CONFLICT_FRAME_TYPES } from '../collab/gate.js';
@@ -65,6 +66,9 @@ export function createInbound({ dataDir, config, self, dispatch, hooks = {}, log
     log,
     boxes: new Map(),       // collabId → { path, seen: Map, appendsSinceCompact }（懒加载：首个消息到达时才建）
     chains: new WeakMap(),  // connection → Promise（同连接串行）
+    /* 扇出在途面（record → Promise）：同一 msgId 的逐席扇出必须单飞——重复帧可能经另一条连接并发到达，
+     * 两个循环交错推进共享的 pending/outcomes 会把未注入的席位记成已注入（静默漏投）。 */
+    fanoutFlights: new WeakMap(),
     counters: emptyCounters(),
   };
   return {
@@ -534,14 +538,37 @@ function safeListSeats(state, collabId) {
 }
 
 /* 逐席扇出：每席独立走静音栅栏（治理事件豁免）→ 注入面。注入面异常时保留该席在 pending，
- * 本轮停止并等待重复帧补扇出（不得把未完成当成已投递）。 */
+ * 本轮停止并等待重复帧补扇出（不得把未完成当成已投递）。
+ * 单飞：同一记录的扇出循环同一时刻只允许一个在途——重复帧等待在途落地后复查 pending，
+ * 需要补投时再串行开下一轮；绝不并行推进共享的 pending/outcomes。 */
 async function runSeatFanout(state, box, frame, record, meta) {
+  const inflight = state.fanoutFlights.get(record);
+  if (inflight !== undefined) {
+    await inflight;
+    if (record.fanout.pending.length === 0) {
+      return firstSuccessOf(record);
+    }
+    return runSeatFanout(state, box, frame, record, meta);
+  }
+  const flight = fanoutLoop(state, box, frame, record, meta);
+  state.fanoutFlights.set(record, flight);
+  try {
+    return await flight;
+  } finally {
+    state.fanoutFlights.delete(record);
+  }
+}
+
+async function fanoutLoop(state, box, frame, record, meta) {
   let firstSuccess = null;
   while (record.fanout.pending.length > 0) {
     const sessionId = record.fanout.pending[0];
     const outcome = await fanoutOneSeat(state, frame, sessionId, meta);
     if (outcome === null) {
       break;
+    }
+    if (record.fanout.pending[0] !== sessionId) {
+      continue;   // 队头已被并发推进：不得错摘别人的席位（防御性复查，单飞下不应发生）
     }
     record.fanout.pending.shift();
     record.fanout.done.push(sessionId);
@@ -865,15 +892,25 @@ function loadSeenWindow(state, box, collabId) {
     state.log.warn('收件流水有残缺记录，按可解析条目载入', { collabId, tailDropped: loaded.tailDropped, corruptLines: loaded.corruptLines.length });
   }
   const windowStart = Date.now() - state.config.messageTtlMs;
-  for (const record of loaded.entries) {
-    const fresh = freshEntryOf(record, windowStart);
-    if (fresh !== null) {
-      box.seen.set(fresh.msgId, { receivedAtMs: fresh.receivedAtMs, record });
-    }
+  for (const entry of foldedRecordsOf(loaded.entries, windowStart)) {
+    box.seen.set(entry.msgId, { receivedAtMs: entry.receivedAtMs, record: entry.record });
   }
   if (loaded.entries.length > box.seen.size) {
     compactInbox(state, box);
   }
+}
+
+/* 收件流水的折叠投影（后写胜、顺序按首次到达）：D11 扇出进度会为同一 msgId 追加多行，
+ * 未折叠直接返回会让同一查询在进程内与重启后结果不同（total 被放大、limit 把更早消息挤出窗口）。 */
+function foldedRecordsOf(entries, windowStart) {
+  const byMsgId = new Map();
+  for (const record of entries) {
+    const fresh = freshEntryOf(record, windowStart);
+    if (fresh !== null) {
+      byMsgId.set(fresh.msgId, { ...fresh, record });
+    }
+  }
+  return [...byMsgId.values()];
 }
 
 /* 去重窗口口径：保留期内收到的记录参与去重（窗口外的同 msgId 视为新消息）；
@@ -1025,7 +1062,9 @@ function recordVisibleTo(record, sessionId) {
 }
 
 /* 本机席位投递明细（契约查询面）：按 (msgId, sessionId) 取扇出结果。
- * 只查已载入的协作收件盒——msgId 是全局唯一标识，运行期查询足够；未知返回 unknown 不抛错。 */
+ * 先查已载入的协作收件盒；未命中再按需折叠载入盘上收件流水（重启后内存态为空，
+ * 但本机投递账已随 inbox.jsonl 持久化——查询面不得因「未载入」而谎报 unknown）。
+ * msgId 是全局唯一标识，未知返回 unknown 不抛错。 */
 function localSeatDeliveryOf(state, msgId, sessionId) {
   if (typeof msgId !== 'string' || msgId === '' || typeof sessionId !== 'string' || !ID_PATTERN.test(sessionId)) {
     throw new TypeError('localSeatDeliveryOf 需要合法的 msgId 与 sessionId');
@@ -1037,7 +1076,45 @@ function localSeatDeliveryOf(state, msgId, sessionId) {
     }
     return { collabId, msgId, sessionId, ...seatStatusOf(record, sessionId) };
   }
+  const fromDisk = diskRecordOf(state, msgId);
+  if (fromDisk !== null) {
+    return { collabId: fromDisk.collabId, msgId, sessionId, ...seatStatusOf(fromDisk.record, sessionId) };
+  }
   return { collabId: null, msgId, sessionId, status: 'unknown', complete: false };
+}
+
+/* 盘上收件流水的按 msgId 查找（只读、不建 box/目录）：逐个协作目录折叠后比对。
+ * 单个协作读失败只计数告警并继续——查询面不得因一个坏目录误报其他协作的消息不存在。 */
+function diskRecordOf(state, msgId) {
+  for (const collabId of safeCollabIds(state)) {
+    const record = diskRecordIn(state, collabId, msgId);
+    if (record !== null) {
+      return { collabId, record };
+    }
+  }
+  return null;
+}
+
+function diskRecordIn(state, collabId, msgId) {
+  try {
+    const windowStart = Date.now() - state.config.messageTtlMs;
+    const loaded = loadLines(collabFilePath(state.dataDir, collabId, INBOX_FILE_NAME));
+    return foldedRecordsOf(loaded.entries, windowStart).find((entry) => entry.msgId === msgId)?.record ?? null;
+  } catch (error) {
+    state.counters.persistFailures++;
+    state.log.warn('收件流水读取失败（本机席位明细查询）', { collabId, reason: error.message });
+    return null;
+  }
+}
+
+function safeCollabIds(state) {
+  try {
+    return listLocalCollabIds(state.dataDir);
+  } catch (error) {
+    state.counters.persistFailures++;
+    state.log.warn('协作目录列举失败（本机席位明细查询）', { reason: error.message });
+    return [];
+  }
 }
 
 function seatStatusOf(record, sessionId) {
@@ -1083,7 +1160,7 @@ function inboxRecordsOf(state, collabId) {
       state.log.warn('收件流水查询：残缺记录按可解析条目返回', { collabId, tailDropped: loaded.tailDropped, corruptLines: loaded.corruptLines.length });
     }
     const windowStart = Date.now() - state.config.messageTtlMs;
-    return loaded.entries.filter((record) => freshEntryOf(record, windowStart) !== null);
+    return foldedRecordsOf(loaded.entries, windowStart).map((entry) => entry.record);
   } catch (error) {
     state.counters.persistFailures++;
     state.log.warn('收件流水读取失败（查询路径）', { collabId, reason: error.message });

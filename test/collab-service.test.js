@@ -6,6 +6,8 @@ import { join } from 'node:path';
 import { COLLABS_DIR_NAME, carrierFilePath, collabDir, collabFilePath, seatFilePath } from '../src/paths.js';
 import { makeTempDir } from './helpers.js';
 import { createCollabService } from '../src/collab/service.js';
+import { createDispatch } from '../src/net/dispatch.js';
+import { createInbound } from '../src/net/inbound.js';
 import { POSTS_FILE_NAME } from '../src/collab/posts.js';
 import { LEDGER_FILE_NAME, MEMBER_FILE_NAME, appendLedger, ledgerDigest, loadLedger } from '../src/collab/store.js';
 
@@ -15,6 +17,11 @@ function quietLog() {
   return { info: () => {}, warn: () => {}, error: () => {} };
 }
 
+/* 可选注入项的缺省归一：把 `??` 分支从构造大量选项的夹具里移出（保持夹具复杂度可读）。 */
+function optionOf(value, fallback = null) {
+  return value === undefined ? fallback : value;
+}
+
 /* 服务单测脚手架：真临时目录 + 假发送（捕获出队消息）+ 假直投（捕获直投消息）+ 假清单 + 本机提示捕获
  * （notify 注入面——放行提示等 local-alert 的落点）；hooks 直调模拟接收管线（admit 通过才 consume——
  * 与真实管线同序；落盘/ack 属接收管线自身用例，不在此重复）。overrides.self 供双节点夹具区分身份；
@@ -22,14 +29,14 @@ function quietLog() {
  * 对表对端选取默认静默（syncPeerPicker 返回空序）——由专门的对表用例注入真实对端，
  * 其余用例不被环境性直投噪音干扰。 */
 function makeService(t, overrides = {}) {
-  const dir = makeTempDir(t);
+  const dir = overrides.dataDir ?? makeTempDir(t);
   const sent = [];
   const direct = [];
   const remembered = [];
   const notices = [];
   const self = overrides.self ?? { instanceId: 'inst-self', identityName: '本机', port: 17321 };
   const config = { inviteTtlMs: DAY, ...(overrides.config ?? {}) };
-  const knownHosts = { remember: (entry) => remembered.push(entry) };
+  const knownHosts = optionOf(overrides.knownHosts, { remember: (entry) => remembered.push(entry) });
   const sendDirect = overrides.sendDirect === undefined
     ? (message) => {
         direct.push(message);
@@ -47,6 +54,10 @@ function makeService(t, overrides = {}) {
     sendDirect,
     knownHosts,
     notify: (frame) => notices.push(frame),
+    probeCapability: optionOf(overrides.probeCapability),
+    deliveryStatusOf: optionOf(overrides.deliveryStatusOf),
+    localSeatDeliveryOf: optionOf(overrides.localSeatDeliveryOf),
+    deliverSeat: overrides.deliverSeat,
     log: quietLog(),
     ledgerFetchTimeoutMs: overrides.ledgerFetchTimeoutMs ?? 60,
     inviteMinIntervalMs: overrides.inviteMinIntervalMs ?? 0,
@@ -2073,4 +2084,249 @@ test('讨论发帖：帖子列表落盘、重载恢复（序号续增、重复�
   await receive(reloaded, forumPostFrame(collabId, peer('inst-self', '本机', 17321), { postId: posted.postId, postSeq: 1, text: '第一条' }));
   assert.equal((await reloaded.view({ collabId })).posts.length, 2, '重载后同（作者, postId）的重复副本仍不入列');
   assert.equal(reloaded.stats().postsDuplicated, 1);
+});
+
+/* —— 0.2.0 集成修复：carrier-first / 本机投递查询接线 / 丢弃事实 / 建协闸门顺序 —— */
+
+const SELF_NODE = { instanceId: 'inst-self', identityName: '本机', port: 17321 };
+
+function collabDirIdsOf(dir) {
+  try {
+    return readdirSync(join(dir, 'collabs'), { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch {
+    return [];
+  }
+}
+
+function anyCarrierUnder(dir) {
+  return collabDirIdsOf(dir).some((id) => existsSync(carrierFilePath(dir, id)));
+}
+
+test('建协落盘顺序：carrier 先于目标登记/成员/台账/首邀——登记目标时 carrier 已在盘上', async (t) => {
+  let dir = null;
+  const carrierSeenAtRemember = [];
+  const made = makeService(t, {
+    knownHosts: {
+      remember: () => {
+        carrierSeenAtRemember.push(anyCarrierUnder(dir));
+      },
+    },
+  });
+  dir = made.dir;
+  const result = await made.service.create({
+    name: '载体先行',
+    topic: '主题',
+    targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }],
+    sessionId: 'sess-self',
+  });
+  assert.equal(result.ok, true, result.message);
+  assert.deepEqual(carrierSeenAtRemember, [true], '已知主机登记（成员/台账/首邀之前）时 carrier 必须已落盘');
+  assert.equal(existsSync(carrierFilePath(dir, result.collabId)), true);
+});
+
+test('建协：carrier 写失败则整体中止——不发首邀、不落成员/台账', (t) => {
+  const made = makeService(t);
+  /* collabs 位置是普通文件：carrier 的目录创建必失败（创建路径的第一份写）。 */
+  writeFileSync(join(made.dir, 'collabs'), 'block');
+  const result = made.service.create({
+    name: '载失败',
+    topic: '主题',
+    targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }],
+    sessionId: 'sess-self',
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.message, /载体/);
+  assert.deepEqual(made.sent, [], '首邀不得在 carrier 失败后发出');
+  assert.equal(made.service.list().collabs.length, 0);
+});
+
+test('建协后续步骤失败：carrier 已落盘，目录重启后不得被判 legacy', async (t) => {
+  let dir = null;
+  let sabotaged = false;
+  const made = makeService(t, {
+    knownHosts: {
+      remember: () => {
+        if (sabotaged) {
+          return;
+        }
+        sabotaged = true;
+        /* 目标登记发生在 carrier 之后：把新协作的 seats 位置换成普通文件，模拟席位落盘失败
+         * （成员/台账仍会写成功，首邀因无签发席位而停发）。 */
+        const [collabId] = readdirSync(join(dir, 'collabs'));
+        writeFileSync(join(collabDir(dir, collabId), 'seats'), 'block');
+      },
+    },
+  });
+  dir = made.dir;
+  const created = await made.service.create({
+    name: '后半失败',
+    topic: '主题',
+    targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }],
+    sessionId: 'sess-self',
+  });
+  assert.equal(created.ok, true, created.message);
+  assert.equal(made.sent.length, 0, '创建者席位落盘失败：首邀不发');
+  const reloaded = reloadService(made);
+  const entry = reloaded.list().collabs.find((item) => item.collabId === created.collabId);
+  assert.ok(entry, '目录仍应作为新形态协作载入');
+  assert.equal(entry.legacy, undefined, 'carrier 先行：失败窗口不得把目录判成 legacy');
+  assert.equal(reloaded.isWritable(created.collabId), true, '已写台账的目录不属于半写只读');
+});
+
+test('建协闸门：目标包含本机时立即拒绝，不发起自探测（误导性能力文案不得先出现）', async (t) => {
+  let probes = 0;
+  const made = makeService(t, {
+    probeCapability: async () => {
+      probes++;
+      return { capability: 'unknown' };
+    },
+  });
+  const result = await made.service.create({
+    name: '自目标',
+    topic: '主题',
+    targets: [{ instanceId: 'inst-self', identityName: '本机', address: '127.0.0.1', port: 17321 }],
+    sessionId: 'sess-self',
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.message, /本机|重复/);
+  assert.equal(probes, 0, '形态拒绝先于能力探测');
+});
+
+/* —— 本机旁路查询接线（I2）：真服务＋真 dispatch＋真 inbound 的同机双席 —— */
+
+function seedSameMachineCollab(dir, { collabId = 'collab-same-machine', memberSeat = 'sess-local-2' } = {}) {
+  seededManagedCollab(dir, {
+    collabId,
+    name: '同机协作',
+    topic: '投递主题',
+    status: 'active',
+    invited: [{ instanceId: 'inst-self', sessionId: memberSeat, identityName: '本机', state: 'member', joinSeq: 2 }],
+  });
+  writeSeatFile(dir, collabId, memberSeat, { role: 'member', joinSeq: 2 });
+  return collabId;
+}
+
+function wiredQueryConfigOf() {
+  return {
+    queueMaxPerCollab: 100,
+    messageTtlMs: 600000,
+    retryIntervalMs: 200,
+    retrySlowIntervalMs: 60000,
+    retryFastCount: 2,
+    dispatchTickMs: 50,
+    sessionSeatGraceMs: 60000,
+    stagedMaxPerSeat: 100,
+    stagedMaxPerCollab: 500,
+  };
+}
+
+/* 真 dispatch（不入网、不 start）＋真 inbound 的查询接线：与生产 deliveryWiringOf 同一接缝。 */
+function buildWiredQueries(dir) {
+  const config = wiredQueryConfigOf();
+  const dispatch = createDispatch({
+    dataDir: dir,
+    config,
+    transport: { setFrameHandler: () => {}, stats: () => ({}) },
+    self: SELF_NODE,
+    log: quietLog(),
+  });
+  const inbound = createInbound({ dataDir: dir, config, self: SELF_NODE, dispatch, log: quietLog() });
+  return { config, dispatch, inbound };
+}
+
+function buildWiredService(t, dir, { delivered, offline = false } = {}) {
+  const wired = buildWiredQueries(dir);
+  const service = createCollabService({
+    dataDir: dir,
+    config: wired.config,
+    self: SELF_NODE,
+    send: (message) => wired.dispatch.send(message),
+    sendDirect: (message) => wired.dispatch.sendDirect(message),
+    knownHosts: { remember: () => {} },
+    deliverSeat: (frame, seat) => {
+      if (offline) {
+        return false;
+      }
+      delivered?.push({ sessionId: seat.sessionId, msgId: frame?.msgId ?? null });
+      return true;
+    },
+    deliveryStatusOf: (msgId) => wired.dispatch.deliveryStatusOf(msgId),
+    localSeatDeliveryOf: (msgId, sessionId) => wired.inbound.localSeatDeliveryOf(msgId, sessionId),
+    log: quietLog(),
+    syncPeerPicker: () => [],
+  });
+  t.after(() => service.close());
+  return { service, ...wired };
+}
+
+test('同机双席：发送省略 to → 本机旁路机器级终态与收件席明细可查；重启后收件席明细仍可查', async (t) => {
+  const made = makeService(t);
+  const collabId = seedSameMachineCollab(made.dir);
+  const delivered = [];
+  const first = buildWiredService(t, made.dir, { delivered });
+  await first.service.registerBridgeEntry('sess-local-2', 'bridge-local-2');
+  const sent = await first.service.send({ collabId, text: '同机双席', sessionId: 'sess-self' });
+  assert.equal(sent.ok, true, sent.message);
+  assert.deepEqual(delivered.map((entry) => entry.sessionId), ['sess-local-2'], '同机目标走本机旁路');
+  assert.deepEqual(sent.results.map((entry) => entry.instanceId), ['inst-self']);
+  assert.equal(sent.results[0].local, true);
+
+  const row = first.service.deliveryStatusOf(sent.msgId);
+  assert.equal(row?.tier, 'session', '本机旁路机器级终态立即成立');
+  assert.equal(row?.toInstanceId, 'inst-self');
+  assert.deepEqual(row?.toSessions, ['sess-local-2']);
+  assert.equal(first.service.localSeatDeliveryOf(sent.msgId, 'sess-local-2').status, 'injected');
+
+  const restarted = buildWiredService(t, made.dir, {});
+  const afterRestart = restarted.service.localSeatDeliveryOf(sent.msgId, 'sess-local-2');
+  assert.equal(afterRestart.status, 'injected', '重启后按需折叠载入收件流水，收件席明细仍可查');
+  assert.equal(afterRestart.collabId, collabId);
+  assert.throws(() => restarted.service.localSeatDeliveryOf(sent.msgId, 'bad id!'), TypeError);
+});
+
+/* —— 暂存丢弃事实（m4）：超限丢最旧 / 席位移除后仍可答「dropped」 —— */
+
+function localContentFrame(collabId, msgId, text = '暂存') {
+  return {
+    v: 1,
+    cap: 2,
+    type: 'reply',
+    msgId,
+    collabId,
+    from: { instanceId: 'inst-peer', sessionId: 'sess-peer', identityName: '主机乙', port: 17321 },
+    ts: new Date().toISOString(),
+    payload: { text },
+  };
+}
+
+test('暂存超限丢弃：丢最旧并留下 dropped 事实（不再回落 unknown）', async (t) => {
+  const dir = makeTempDir(t);
+  const collabId = seedSameMachineCollab(dir);
+  const made = makeService(t, { dataDir: dir, config: { stagedMaxPerSeat: 1, stagedMaxPerCollab: 10 }, deliverSeat: () => false });
+  const firstMsg = randomUUID();
+  const secondMsg = randomUUID();
+  const first = await made.service.injectLocalSeat(collabId, 'sess-local-2', localContentFrame(collabId, firstMsg, '一'));
+  const second = await made.service.injectLocalSeat(collabId, 'sess-local-2', localContentFrame(collabId, secondMsg, '二'));
+  assert.equal(first.staged, true);
+  assert.equal(second.staged, true);
+  assert.deepEqual(made.service.localSeatDeliveryOf(firstMsg, 'sess-local-2'), {
+    collabId, msgId: firstMsg, sessionId: 'sess-local-2', status: 'dropped', complete: true,
+  });
+  assert.equal(made.service.localSeatDeliveryOf(secondMsg, 'sess-local-2').status, 'staged');
+});
+
+test('席位移除丢弃暂存：该席明细转为 dropped，而非从未到达的 unknown', async (t) => {
+  const dir = makeTempDir(t);
+  const collabId = seedSameMachineCollab(dir);
+  const made = makeService(t, { dataDir: dir, deliverSeat: () => false });
+  const msgId = randomUUID();
+  const injected = await made.service.injectLocalSeat(collabId, 'sess-local-2', localContentFrame(collabId, msgId));
+  assert.equal(injected.staged, true);
+  const left = await made.service.leave({ collabId, sessionId: 'sess-local-2' });
+  assert.equal(left.ok, true, left.message);
+  assert.deepEqual(made.service.localSeatDeliveryOf(msgId, 'sess-local-2'), {
+    collabId, msgId, sessionId: 'sess-local-2', status: 'dropped', complete: true,
+  });
 });

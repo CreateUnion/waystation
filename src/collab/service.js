@@ -28,7 +28,11 @@ import { matchSessionByToken, shortSessionId } from '../util/short-id.js';
 import { decideAdmission, frozenWriteRefusalOf, managerFreezeReasonOf, SYNC_REQUEST_MAX, SYNC_REQUEST_WINDOW_MS } from './gate.js';
 import { handleEvent, maybeEstablish } from './events.js';
 import { localModeOf, localNameOf, localRosterOf, localStateOf, localTopicOf, persistLedger, persistMember } from './local.js';
-import { applyRelayedReport, approveInvite, contentCountOf, countLiveCollabs, createCollab, endCollab, handleJoinKnock, inviteMembers, leaveCollab, notifyLocal, sendMessage, viewLedger, withdrawInvite } from './outgoing.js';
+import {
+  applyRelayedReport, approveInvite, contentCountOf, countLiveCollabs, createCollab, deliveryStatusOf as outgoingDeliveryStatusOf, endCollab,
+  handleJoinKnock, inviteMembers, leaveCollab, localSeatDeliveryOf as outgoingLocalSeatDeliveryOf, notifyLocal, sendMessage, targetsRejectionOf,
+  viewLedger, withdrawInvite,
+} from './outgoing.js';
 import { JOIN_REPLAY_INTERVALS_MS, SYNC_MAX_REQUESTS_PER_CYCLE, SYNC_MAX_SOURCES_PER_CYCLE, SYNC_REPLY_TIMEOUT_MS, SYNC_SOFT_BUNDLE_BYTES, SYNC_TAIL_POSTS, SYNC_TAIL_WINDOW_MS, runSyncCycle, runSyncSweep, startSyncEngine, stopSyncEngine, triggerSync } from './sync.js';
 import {
   HANDSHAKE_REPLY_TIMEOUT_MS, TAKEOVER_PROBE_INTERVAL_MS, autoTransfer, clearFreezeReason, freezeOnManagerOffline, m5RuntimeOf,
@@ -246,6 +250,8 @@ function seatStateOf(options) {
     readonlyCollabs: new Map(),  // collabId → { reason }（recovery / 半写 / 站长席位缺失）
     legacyRejections: createLegacyRejectionCounter(),
     stagedSeq: 0,   // 暂存到达序（跨席位「丢最旧」的判据）
+    stagedBySeat: new Map(),            // 协作+席位 → 暂存中的 msgId 集（判离席丢弃时落事实）
+    droppedLocalDeliveries: new Map(),  // 席位+msgId → {collabId}（已丢弃的暂存事实，有界内存）
     /* 静音摘要基线（collabId + sessionId → 累计读数）：进程内，不落盘（契约 §8）；
      * 重启后为空 → 取消静音按既有降级文案（不带 N）。 */
     muteBaselines: new Map(),
@@ -374,8 +380,10 @@ function apiOf(state) {
     view: (input) => viewLedger(state, input),
     ...lifecycleApiOf(state),
     describe: (collabId) => describeCollab(state, collabId),
-    deliveryStatusOf: (msgId) => (typeof state.deliveryStatusOf === 'function' ? state.deliveryStatusOf(msgId) : null),
-    localSeatDeliveryOf: (msgId, sessionId) => localSeatDeliveryOfOf(state, msgId, sessionId),
+    /* 本机旁路的机器级账在出站层（发送核写入）：查询必须先看它，再回落到注入的发送调度器查询。
+     * 不先查本机账时，纯本机消息根本没有 outbox 行（ws_delivery_status 返回空行集）。 */
+    deliveryStatusOf: (msgId) => outgoingDeliveryStatusOf(state, msgId),
+    localSeatDeliveryOf: (msgId, sessionId) => outgoingLocalSeatDeliveryOf(state, msgId, sessionId),
     count: () => countLiveCollabs(state),
     sync: (input) => syncNow(state, input),
     stats: () => statsOf(state),
@@ -1749,6 +1757,12 @@ async function createNowWithCapability(state, input) {
   if (!validSessionId(input?.sessionId)) {
     return { ok: false, message: '本会话无会话标识（CLAUDE_CODE_SESSION_ID 缺失）——不得创建协作；请重开会话或检查客户端环境' };
   }
+  /* 目标形态先行（含「不能包含本机」）：本机目标的自探测会被自身实例应答面丢弃，先跑闸门只会
+   * 空等两轮探测再报「无法确认目标支持会话级协作」——误导性错误。 */
+  const targetsRejection = targetsRejectionOf(input?.targets, state.self.instanceId);
+  if (targetsRejection !== null) {
+    return { ok: false, message: targetsRejection };
+  }
   const refusal = await capabilityRefusalOfTargets(state, input?.targets);
   if (refusal !== null) {
     return refusal;
@@ -2048,6 +2062,7 @@ function noteSeatRemoval(state, collabId, sessionId, outcome) {
   forgetMuteBaseline(state, collabId, sessionId);
   if (outcome.stagedDropped > 0) {
     state.counters.seatStagedDropped += outcome.stagedDropped;
+    noteStagedDroppedOnRemoval(state, collabId, sessionId);
   }
   if (outcome.fileRemoved !== true) {
     state.counters.seatFileRemoveFailures++;
@@ -2296,8 +2311,9 @@ function noteSeatOutcome(seat, msgId, outcome) {
 function stageSeatFrame(state, local, seat, frame) {
   state.stagedSeq++;
   seat.staged.push({ frame, seq: state.stagedSeq });
+  rememberStagedOf(state, local.collabId, seat.sessionId, frame?.msgId);
   while (seat.staged.length > state.stagedMaxPerSeat) {
-    dropStagedFrame(state, seat, seat.staged.shift());
+    dropStagedFrame(state, local, seat, seat.staged.shift());
   }
   while (stagedCountOf(local) > state.stagedMaxPerCollab) {
     dropOldestStaged(state, local);
@@ -2305,12 +2321,16 @@ function stageSeatFrame(state, local, seat, frame) {
   state.counters.seatsStaged++;
 }
 
-function dropStagedFrame(state, seat, entry) {
+/* 丢帧必须同时释放 msgId 去重（允许重投），但仍要留下「到过且被丢弃」的事实——查询面要能区分
+ * 「从未到达」（unknown）与「判离席/超限丢弃」（dropped，设计 §5.3 明细取值）。 */
+function dropStagedFrame(state, local, seat, entry) {
   seat.stagedDropped++;
   state.counters.seatStagedDropped++;
   const msgId = entry?.frame?.msgId;
   if (typeof msgId === 'string') {
     forgetSeatMessage(seat, msgId);
+    forgetStagedOf(state, local.collabId, seat.sessionId, msgId);
+    noteSeatDropped(state, local.collabId, seat.sessionId, msgId);
   }
 }
 
@@ -2337,7 +2357,94 @@ function dropOldestStaged(state, local) {
   if (oldest === null) {
     return;
   }
-  dropStagedFrame(state, oldest, oldest.staged.shift());
+  dropStagedFrame(state, local, oldest, oldest.staged.shift());
+}
+
+/* 暂存索引（collabId+sessionId → msgId 集）：席位被移除时其暂存帧由席位层整体丢弃，
+ * 服务层必须仍能为这些 msgId 落「丢弃」事实——所以暂存事实在服务层单独跟一份索引。 */
+const STAGED_INDEX_SEP = '\u0000';
+const DROPPED_LOCAL_MAX = 512;
+
+function stagedIndexKeyOf(collabId, sessionId) {
+  return `${collabId}${STAGED_INDEX_SEP}${sessionId}`;
+}
+
+function stagedIndexOf(state) {
+  if (!(state.stagedBySeat instanceof Map)) {
+    state.stagedBySeat = new Map();
+  }
+  return state.stagedBySeat;
+}
+
+function rememberStagedOf(state, collabId, sessionId, msgId) {
+  if (typeof msgId !== 'string' || !validSessionId(sessionId)) {
+    return;
+  }
+  const index = stagedIndexOf(state);
+  const key = stagedIndexKeyOf(collabId, sessionId);
+  const held = index.get(key) ?? new Set();
+  held.add(msgId);
+  index.set(key, held);
+}
+
+function forgetStagedOf(state, collabId, sessionId, msgId) {
+  if (typeof msgId !== 'string') {
+    return;
+  }
+  const index = stagedIndexOf(state);
+  const key = stagedIndexKeyOf(collabId, sessionId);
+  const held = index.get(key);
+  if (held === undefined) {
+    return;
+  }
+  held.delete(msgId);
+  if (held.size === 0) {
+    index.delete(key);
+  }
+}
+
+/* 丢弃事实（sessionId+msgId → collabId）：有界内存、插入序淘汰；只服务查询面，
+ * 不影响去重（丢弃后同 msgId 仍可重投，成功注入会以更新的席位事实覆盖查询结果）。 */
+function droppedLocalKeyOf(sessionId, msgId) {
+  return `${sessionId}${STAGED_INDEX_SEP}${msgId}`;
+}
+
+function noteSeatDropped(state, collabId, sessionId, msgId) {
+  if (typeof msgId !== 'string' || !validSessionId(sessionId)) {
+    return;
+  }
+  if (!(state.droppedLocalDeliveries instanceof Map)) {
+    state.droppedLocalDeliveries = new Map();
+  }
+  const ledger = state.droppedLocalDeliveries;
+  const key = droppedLocalKeyOf(sessionId, msgId);
+  ledger.delete(key);
+  ledger.set(key, { collabId });
+  while (ledger.size > DROPPED_LOCAL_MAX) {
+    ledger.delete(ledger.keys().next().value);
+  }
+}
+
+function droppedLocalFactOf(state, msgId, sessionId) {
+  const ledger = state.droppedLocalDeliveries;
+  if (!(ledger instanceof Map)) {
+    return null;
+  }
+  return ledger.get(droppedLocalKeyOf(sessionId, msgId)) ?? null;
+}
+
+/* 席位移除：把该席仍在暂存中的帧事实转为「丢弃」（席位层已整体丢弃这些帧）。 */
+function noteStagedDroppedOnRemoval(state, collabId, sessionId) {
+  const index = stagedIndexOf(state);
+  const key = stagedIndexKeyOf(collabId, sessionId);
+  const held = index.get(key);
+  if (held === undefined) {
+    return;
+  }
+  index.delete(key);
+  for (const msgId of held) {
+    noteSeatDropped(state, collabId, sessionId, msgId);
+  }
 }
 
 /* 桥注册/注销（设计 §3.2）：注册即绑定该会话在本机全部协作的席位并补投暂存（按到达序）。
@@ -2362,7 +2469,7 @@ async function registerBridgeNow(state, sessionId, bridgeId) {
       seat.flushing = true;
       await seatFlushDelay();
     }
-    flushed += await flushStagedOf(state, seat);
+    flushed += await flushStagedOf(state, local, seat);
   }
   state.counters.seatBridgeRegistrations++;
   const invites = await replayPendingInvitesOnRegisterOf(state, sessionId);
@@ -2392,7 +2499,7 @@ function seatFlushDelay() {
   return new Promise((resolve) => setTimeout(resolve, 50));
 }
 
-async function flushStagedOf(state, seat) {
+async function flushStagedOf(state, local, seat) {
   seat.flushing = true;
   let flushed = 0;
   try {
@@ -2403,6 +2510,7 @@ async function flushStagedOf(state, seat) {
       }
       seat.staged.shift();
       flushed++;
+      forgetStagedOf(state, local.collabId, seat.sessionId, entry.frame?.msgId);
       noteSeatOutcome(seat, entry.frame?.msgId ?? null, 'injected');
       noteLocalDelivery(state, entry.frame?.collabId, seat.sessionId, entry.frame, 'injected');
     }
@@ -2449,6 +2557,15 @@ function localSeatDeliveryOfOf(state, msgId, sessionId) {
     if (seat.staged.some((entry) => entry.frame?.msgId === msgId)) {
       return { collabId: local.collabId, msgId, sessionId, status: 'staged', complete: false };
     }
+  }
+  return fallbackSeatStatusOf(state, msgId, sessionId);
+}
+
+/* 席位事实未命中时的回落：先看「到过且被丢弃」的有界事实，再委托接收管线的落盘扇出面。 */
+function fallbackSeatStatusOf(state, msgId, sessionId) {
+  const dropped = droppedLocalFactOf(state, msgId, sessionId);
+  if (dropped !== null) {
+    return { collabId: dropped.collabId, msgId, sessionId, status: 'dropped', complete: true };
   }
   if (typeof state.inboundLocalSeatDeliveryOf === 'function') {
     return state.inboundLocalSeatDeliveryOf(msgId, sessionId);

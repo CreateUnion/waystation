@@ -42,7 +42,7 @@ for (const peer of knownPeers) {
 }
 let sessionWriterOk = true;
 /* 网络组件在协作服务之后构造（生产组合根同序），能力探测经闭包在运行期触达。 */
-const net = { stack: null };
+const net = { stack: null, inbound: null };
 /* adapter: true = 走真适配器（读本进程环境变量——预演进程须在目标会话的 shell 下启动）；
  * 缺省 = set_writer 开关桩（自动预演用，不依赖真实会话）。描述器指向协作服务（与生产同参）。 */
 const adapter = options.adapter === true
@@ -57,6 +57,12 @@ const collab = createCollabService({
   config,
   self,
   send: (message) => dispatch.send(message),
+  /* 直投面与查询面按生产组合根同参注入（deliveryWiringOf）：预演的「机器级状态＋本机席位明细」
+   * 与生产走同一接缝——少了这两个注入，本机旁路账的查询永远走不到。 */
+  sendDirect: (message) => dispatch.sendDirect(message),
+  deliveryStatusOf: (msgId) => dispatch.deliveryStatusOf(msgId),
+  localSeatDeliveryOf: (msgId, sessionId) => net.inbound?.localSeatDeliveryOf(msgId, sessionId)
+    ?? { collabId: null, msgId, sessionId, status: 'unknown', complete: false },
   probe: (address, port) => dispatch.ping({ address, port }),
   reassign: (payload) => dispatch.reassignPeer(payload),
   notify: adapter !== null ? (frame) => adapter.deliverFrame(frame) : null,
@@ -100,6 +106,7 @@ const inbound = createInbound({
     deliverToSession: adapter !== null ? (frame) => adapter.deliverFrame(frame) : () => sessionWriterOk,
   },
 });
+net.inbound = inbound;
 const stack = createNetStack({ discovery, transport, dispatch, inbound, port, self, scanWindowMs: config.scanWindowMs, log });
 net.stack = stack;
 

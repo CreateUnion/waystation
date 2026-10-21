@@ -663,3 +663,68 @@ test('指名邀请的 targetSessionId 非法：整帧拒绝并计数（不得退
   assert.equal(reportsOf(dispatch).length, 0);
   assert.throws(() => readInbox(dir));
 });
+
+/* —— 并发重复帧（C1）与重启一致性（I1/I2 入站侧） —— */
+
+test('并发重复帧：同一 msgId 经两条连接同时到达时扇出单飞，每席只注入一次、outcomes 无脏键', { timeout: 15000 }, async (t) => {
+  const calls = [];
+  const injector = {
+    async inject(collabId, sessionId, frame) {
+      calls.push({ collabId, sessionId, msgId: frame.msgId });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return { ok: true, delivered: true };
+    },
+  };
+  const { inbound, dir, dispatch } = makeInbound(t, { injector });
+  const sent = frame({ toSessions: ['sess-b1', 'sess-b2'] });
+  inbound.onFrame(createFakeConnection('127.0.0.2'), sent);
+  inbound.onFrame(createFakeConnection('127.0.0.3'), sent);
+  await waitFor(() => inbound.localSeatDeliveryOf(sent.msgId, 'sess-b1').status === 'injected'
+    && inbound.localSeatDeliveryOf(sent.msgId, 'sess-b2').status === 'injected');
+  await waitFor(() => reportsOf(dispatch).length >= 1);
+  await new Promise((resolve) => setTimeout(resolve, 80));
+
+  assert.deepEqual(calls.map((call) => call.sessionId).sort(), ['sess-b1', 'sess-b2'], '每席只注入一次');
+  assert.equal(calls.every((call) => call.msgId === sent.msgId), true);
+  const record = readInbox(dir).filter((entry) => entry.msgId === sent.msgId).at(-1);
+  assert.deepEqual(Object.keys(record.fanout.outcomes).sort(), ['sess-b1', 'sess-b2'], 'outcomes 键集合等于目标集');
+  assert.equal(Object.keys(record.fanout.outcomes).includes('undefined'), false, '不得产生 undefined 键');
+  assert.deepEqual(record.fanout.done.sort(), ['sess-b1', 'sess-b2']);
+  assert.deepEqual(record.fanout.pending, []);
+  assert.equal(record.fanout.complete, true);
+});
+
+test('checkInbox 重启一致性：seatMode 扇出多行折叠为每 msgId 一条，进程内与重启后逐字段相等', { timeout: 15000 }, async (t) => {
+  const dir = makeTempDir(t);
+  const first = makeInbound(t, { dataDir: dir, seats: [seat('sess-b1'), seat('sess-b2')] });
+  const sent = frame({ toSessions: ['sess-b1', 'sess-b2'] });
+  first.inbound.onFrame(createFakeConnection(), sent);
+  await waitFor(() => reportsOf(first.dispatch).length === 1);
+  await waitFor(() => first.inbound.localSeatDeliveryOf(sent.msgId, 'sess-b2').status === 'injected');
+  const before = first.inbound.checkInbox({ collabId: 'collab-1' });
+  assert.ok(readInbox(dir).length >= 4, '扇出进度为同一 msgId 追加多行');
+
+  const restarted = makeInbound(t, { dataDir: dir });
+  const after = restarted.inbound.checkInbox({ collabId: 'collab-1' });
+  assert.deepEqual(after, before, '同一查询在进程内与重启后结果一致');
+  assert.equal(after.total, 1, '同一 msgId 不得因多行被重复计数');
+});
+
+test('localSeatDeliveryOf 重启后按需载盘：未载入的收件流水也给出收件席明细', { timeout: 15000 }, async (t) => {
+  const dir = makeTempDir(t);
+  const first = makeInbound(t, { dataDir: dir, seats: [seat('sess-b1')] });
+  const sent = frame({ toSessions: ['sess-b1'] });
+  first.inbound.onFrame(createFakeConnection(), sent);
+  await waitFor(() => first.inbound.localSeatDeliveryOf(sent.msgId, 'sess-b1').status === 'injected');
+
+  /* 新实例未接收任何帧（state.boxes 为空）——查询必须自行折叠载入盘上收件流水。 */
+  const restarted = makeInbound(t, { dataDir: dir });
+  const detail = restarted.inbound.localSeatDeliveryOf(sent.msgId, 'sess-b1');
+  assert.equal(detail.collabId, 'collab-1');
+  assert.equal(detail.status, 'injected');
+  assert.equal(detail.complete, true);
+  assert.deepEqual(restarted.inbound.localSeatDeliveryOf('msg-unknown-1', 'sess-b1'), {
+    collabId: null, msgId: 'msg-unknown-1', sessionId: 'sess-b1', status: 'unknown', complete: false,
+  });
+  assert.throws(() => restarted.inbound.localSeatDeliveryOf('', 'sess-b1'), TypeError);
+});

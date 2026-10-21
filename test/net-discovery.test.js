@@ -1343,6 +1343,49 @@ test('单播能力探测参数：非法地址 / 端口 / 窗口 / 实例标识�
   await assert.rejects(a.node.probeCapability({ ...target, timeoutMs: 0 }), TypeError);
   await assert.rejects(a.node.probeCapability({ ...target, instanceId: 42 }), TypeError);
   await assert.rejects(a.node.probeCapability({ ...target, instanceId: '' }), TypeError);
+  await assert.rejects(a.node.probeCapability({ ...target, instanceId: 'bad id!' }), TypeError, '形态须与协议标识同口径');
+  await assert.rejects(a.node.probeCapability({ ...target, instanceId: 'x'.repeat(65) }), TypeError);
+});
+
+/* —— 进程内发现面隔离（I3）：回环绑定不得向真实 LAN 发送数据报 —— */
+
+test('回环绑定：扫描/自介的每个出站目标都是回环地址；生产绑定（0.0.0.0）行为不变', { timeout: 15000 }, async (t) => {
+  const knownHosts = createKnownHosts({ dataDir: makeTempDir(t), log: quietLog() });
+  knownHosts.remember({ address: '127.0.0.1', port: 17321 });
+  knownHosts.remember({ address: '192.168.1.50', port: 17322 });
+  const sent = [];
+  const node = createDiscovery({
+    port: 7399,
+    bindAddress: '127.0.0.1',
+    instanceId: SELF_A.instanceId,
+    identityName: SELF_A.identityName,
+    getCollabCount: () => 0,
+    knownHosts,
+    log: quietLog(),
+    deliverDatagram: (datagram) => sent.push(datagram),
+  });
+  t.after(() => node.close());
+  node.announce();
+  await node.scan({ windowMs: 5 });
+  assert.ok(sent.length > 0, '回环清单目标照常投递');
+  assert.deepEqual(sent.filter((datagram) => !datagram.address.startsWith('127.')), [],
+    '回环绑定不得向非回环地址（真实广播 / LAN 清单）发送任何数据报');
+
+  const lanSent = [];
+  const lanNode = createDiscovery({
+    port: 7398,
+    bindAddress: '0.0.0.0',
+    instanceId: SELF_A.instanceId,
+    identityName: SELF_A.identityName,
+    getCollabCount: () => 0,
+    knownHosts,
+    log: quietLog(),
+    deliverDatagram: (datagram) => lanSent.push(datagram),
+  });
+  t.after(() => lanNode.close());
+  lanNode.announce();
+  assert.ok(lanSent.some((datagram) => datagram.address === '192.168.1.50'),
+    '生产绑定不受回环过滤影响：清单里的 LAN 目标照常发送');
 });
 
 test('旧版对端缺能力字段：join-ack 与按名解析结果记 0（不支持）', { timeout: 15000 }, async (t) => {

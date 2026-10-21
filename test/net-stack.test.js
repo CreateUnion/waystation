@@ -382,6 +382,8 @@ test('requestJoinResolve：讨论名 / 目标地址 / 端口形态非法 → 明
     [{ name: '甲\n乙', address: '127.0.0.2', port: 17321 }, '讨论名非法'],
     [{ name: '联调讨论', address: 'localhost', port: 17321 }, '目标地址非法'],
     [{ name: '联调讨论', address: '127.0.0.2', port: 0 }, '目标端口非法'],
+    [{ name: '联调讨论', address: '127.0.0.2', port: 17321, instanceId: 'bad id!' }, '目标实例标识非法'],
+    [{ name: '联调讨论', address: '127.0.0.2', port: 17321, instanceId: 'x'.repeat(65) }, '目标实例标识非法'],
   ];
   for (const [args, expected] of cases) {
     const result = await stack.requestJoinResolve(args);
