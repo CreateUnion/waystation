@@ -8,6 +8,7 @@ import {
   classifyOccupant, createProbeSession, findSameRootSessions, isSameRootPeer, isSameRootSessionEntry,
   probeSegmentStations, probeStation,
 } from '../src/site.js';
+import { DISCOVERY_DISABLE_ENV } from '../src/net/discovery.js';
 import { PROTOCOL_VERSION, validateProbe } from '../src/net/protocol.js';
 import { CONFIG_FILE_NAME, RUN_DIR_NAME, coreJsonPath, sessionFilePath } from '../src/paths.js';
 import { INSTANCE_ID_FILE } from '../src/instance-id.js';
@@ -531,6 +532,17 @@ test('① 无关程序占用端口 → 降级服务（ready＋指引）；占用
   const port = await pickFreePort();
   const root = makeCoreRoot(t, port);
   const squatter = await startSilentSquatter(t, port);
+  /* 本用例的前提是「发现层 UDP 端口被占」：发现隔离开关会让发现层根本不绑定套接字，
+   * 占用因此不成立（核心会正常 ready）。临时关闭该开关；锚点段取空闲段，不触达真实站点段。 */
+  const savedDiscoveryFlag = process.env[DISCOVERY_DISABLE_ENV];
+  delete process.env[DISCOVERY_DISABLE_ENV];
+  t.after(() => {
+    if (savedDiscoveryFlag === undefined) {
+      delete process.env[DISCOVERY_DISABLE_ENV];
+    } else {
+      process.env[DISCOVERY_DISABLE_ENV] = savedDiscoveryFlag;
+    }
+  });
   const started = await startCore({ env: coreEnvOf(root, await pickFreeSegment()) });
   t.after(() => started.core.stop());
   assert.equal(started.core.status(), 'ready', '①② 降级服务：核心照常 ready，本地工具照常');

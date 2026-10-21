@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { makeTempDir } from './helpers.js';
 import { DEFAULT_VIEWER_PORT, openViewerOnStart, openViewerWindow, viewerConsentNoticeOf } from '../src/viewer/launch.js';
 import { createCollabService } from '../src/collab/service.js';
+import { withCollabCapability } from '../src/net/protocol.js';
 import { CONFIG_FILE_NAME } from '../src/paths.js';
 
 /* 自动开窗的拉起出口（openViewerWindow）与触发 B 判定（openViewerOnStart）的判别用例：
@@ -356,23 +357,27 @@ function makeService(t, overrides = {}) {
   return { service, sent, dir };
 }
 
+/* 邀请帧（0.2.0 形态）：协作域帧带 cap=2，from 带签发会话；members 是席位条目（同机多会话各自成席）。
+ * 讨论模式没有邀请簿记、同意即入席，触发 A 的「同意成功即开窗」出口与协作模式共用同一实现。 */
 function inviteFrame(collabId) {
-  return {
+  return withCollabCapability({
     v: 1,
     type: 'invite',
     msgId: `msg-inv-${collabId}`,
-    from: { instanceId: 'inst-a', identityName: '主机甲', port: 17321 },
+    from: { instanceId: 'inst-a', sessionId: 'sess-a', identityName: '主机甲', port: 17321 },
     collabId,
     ts: new Date().toISOString(),
     payload: {
+      mode: 'forum',
       name: '联调项目',
       topic: '发布联调',
       members: [
-        { instanceId: 'inst-a', identityName: '主机甲' },
-        { instanceId: 'inst-self', identityName: '本机' },
+        { instanceId: 'inst-a', sessionId: 'sess-a', identityName: '主机甲' },
+        { instanceId: 'inst-self', sessionId: 'sess-self', identityName: '本机' },
       ],
+      targets: [{ instanceId: 'inst-self' }],
     },
-  };
+  });
 }
 
 async function receive(service, frame) {
@@ -384,7 +389,12 @@ async function receive(service, frame) {
 }
 
 function createInput() {
-  return { name: '联调项目', topic: '主题', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }] };
+  return {
+    sessionId: 'sess-self',
+    name: '联调项目',
+    topic: '主题',
+    targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }],
+  };
 }
 
 test('触发 A：创建成功 → openViewer(ref) 被调且 ref＝{ root, id }', (t) => {
@@ -400,7 +410,9 @@ test('触发 A：同意加入成功 → openViewer(ref) 被调且 ref 正确', a
   const { service } = makeService(t, { viewerRoot: 'main', openViewer: (ref) => opened.push(ref) });
   await receive(service, inviteFrame('collab-inv'));
   assert.deepEqual(opened, [], '受邀未同意不弹');
-  const approved = await service.approve({ collabId: 'collab-inv', approve: true });
+  /* 同意门要求用户明确确认：先登记一次性豁免，代表用户已同意本次入席。 */
+  service.allowNextInvite({ sessionId: 'sess-self' });
+  const approved = await service.approve({ collabId: 'collab-inv', approve: true, sessionId: 'sess-self' });
   assert.equal(approved.ok, true);
   assert.deepEqual(opened, [{ root: 'main', id: 'collab-inv' }]);
 });
@@ -409,7 +421,8 @@ test('触发 A：拒绝邀请 → 不弹（入席成功才拉起）', async (t) 
   const opened = [];
   const { service } = makeService(t, { viewerRoot: 'main', openViewer: (ref) => opened.push(ref) });
   await receive(service, inviteFrame('collab-inv'));
-  const declined = await service.approve({ collabId: 'collab-inv', approve: false, reason: '人手不足' });
+  service.allowNextInvite({ sessionId: 'sess-self' });
+  const declined = await service.approve({ collabId: 'collab-inv', approve: false, reason: '人手不足', sessionId: 'sess-self' });
   assert.equal(declined.ok, true);
   assert.deepEqual(opened, []);
 });

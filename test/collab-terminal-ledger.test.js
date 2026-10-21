@@ -97,7 +97,7 @@ test('冻结裁定终止：落盘终态可被 loadLedger 加载，不回退到�
   const frozen = loadLedger(harness.dir, collabId);
   assert.equal(frozen.ledger?.status, 'frozen', '前置：冻结行已落盘');
 
-  const decided = harness.service.decide({ collabId, choice: 'terminate' });
+  const decided = harness.service.decide({ collabId, choice: 'terminate', sessionId: CREATOR_SESSION });
   assert.equal(decided.ok, true, JSON.stringify(decided));
 
   const ledger = assertTerminalOnDisk(harness.dir, collabId);
@@ -171,7 +171,7 @@ test('整条撤回：落盘终态可被 loadLedger 加载，不回退到撤回�
   const proposed = loadLedger(harness.dir, collabId);
   assert.equal(proposed.ledger?.status, 'proposed', '前置：提议行已落盘');
 
-  const withdrawn = harness.service.withdraw({ collabId });
+  const withdrawn = harness.service.withdraw({ collabId, sessionId: CREATOR_SESSION });
   assert.equal(withdrawn.ok, true, JSON.stringify(withdrawn));
   assert.equal(withdrawn.scope, 'all');
 

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
-import { MAX_FRAME_BYTES, newMsgId } from '../src/net/protocol.js';
+import { MAX_FRAME_BYTES, newMsgId, withCollabCapability } from '../src/net/protocol.js';
 import { MAX_INBOUND_CONNECTIONS, createTransport } from '../src/net/transport.js';
 import { pickFreePort, waitFor } from './helpers.js';
 
@@ -9,8 +9,18 @@ function quietLog() {
   return { info: () => {}, warn: () => {}, error: () => {} };
 }
 
+/* 协作域帧（0.2.0）：除传输类帧外根节点必须带 cap=2，from 必须带签发会话标识——
+ * 缺任一项都会在入站校验阶段被判坏帧并关连接，到不了帧处理器。 */
 function collabFrame(text) {
-  return { v: 1, msgId: newMsgId(), type: 'reply', from: { instanceId: 'inst-a', identityName: '主机甲' }, collabId: 'collab-1', ts: new Date().toISOString(), payload: { text } };
+  return withCollabCapability({
+    v: 1,
+    msgId: newMsgId(),
+    type: 'reply',
+    from: { instanceId: 'inst-a', sessionId: 'sess-a', identityName: '主机甲' },
+    collabId: 'collab-1',
+    ts: new Date().toISOString(),
+    payload: { text },
+  });
 }
 
 async function listenTransport(t, onFrame) {
