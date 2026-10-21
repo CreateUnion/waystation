@@ -2,7 +2,31 @@
  * 纯逻辑：只读 state/ctx、返回 {accepted,nextState,freezeReason,actions,reason}，不写盘、不发帧。
  *
  * state 只含共享台账的任期面：{managerTerm, manager:{instanceId,sessionId,identityName,term}|null, version, managerWindow?}。
- * 入参帧须先过协议层形态校验；本模块只做受理语义判定。冻结态、auto-offer、名单/可达性等证据经 ctx 传入。
+ * 入参帧须先过协议层形态校验；本模块只做受理语义判定。
+ *
+ * ctx 接线契约（缺省一律按拒绝/不采纳处理，防止接线漏传导致 fail-open）：
+ * - now：本地毫秒时刻，窗口与超时比较；缺省 Date.now()。
+ * - localFrozen：null | manager-offline | manager-pending | manager-fork；缺省视为活跃。
+ * - memberSeats 或 isMemberSeat：A3/A4 与 offline catch-up 的成员资格；缺省 → source-not-member。
+ * - managerReachable:false / managerDeparted:true：A4 站长不可达证据；缺省 → manager-reachability-unknown。
+ *   只有探测完成/已判离席才可传，不得把该字段的缺省值当成 false 传入。
+ * - autoOffers / autoOffer：A2 本地 offer 记录；缺省 → auto-offer-missing 并请求快照走 A10。
+ * - autoInFlight：A4 未解决 auto 在途；缺省 false。
+ * - pendingOfferId / pendingTarget：manager-pending 正在等待的 offer/目标；缺省 → pending-offer-mismatch。
+ * - acceptedManager：{term,manager,source}——本核按 A1–A4 采纳过的更高 term manager；source 为受理该变更的
+ *   签发席位。只用于更高 term 快照 catch-up，且快照来源必须等于 source；同 term 快照不认该记录。
+ * - handshakeHighest：{term,version,manager}——本轮 handshake 最高 pair；offline catch-up 缺省 → 冻结。
+ * - authorizedEvidence：{via,authorizedAt,term,manager}——fork 收敛证据，必须绑定快照；缺省/不匹配 → 保持冻结。
+ * - pendingCatchupExpired / rejectedChangeFrom：快照先到的超时/已拒变更证据；缺省保持 pending（接线须在超时后置位）。
+ * - suspended / handoverTarget：显式移交等待中的目标席位；缺省 → 不按 handover-pending 受理。
+ * - windowBaseAt：本地开窗生效时刻（§2A.6 收敛基准）；缺省退回绝对 endsAt 并封顶。
+ * - sessionTakeoverWindowMs / windowSkewMs：窗口配置；缺省 60000 / 10000。
+ * - ledgerDigestOf(ledger) 或 digestVerified:true：快照完整性唯一入口；digestVerified 只能由已重算 digest 的接线置位。
+ * - from：快照入口的传输对端席位（帧无 from 时）；manager-changed 必须自带 from。
+ * - syncExpired：A6 对表超时。
+ * 快照的 auto 追赶三证据只从 frame.ledger.events 读取（auto-offer、via=auto 的 manager-changed、旧站长 leave），
+ * 不接受外部 ctx 拼装；事件形态见 hasAutoCatchupEvidence。
+ *
  * 返回的 actions 由接线层执行：adopt / request-snapshot / open-window / close-window / clear-freeze /
  * freeze / report / handshake / ack / ack-snapshot-stored / store-pending-catchup / count-reject。 */
 
@@ -45,14 +69,20 @@ function nowOf(ctx) {
   return Number.isFinite(ctx.now) ? ctx.now : Date.now();
 }
 
-function windowMsOf(ctx) {
-  const value = ctx.sessionTakeoverWindowMs;
-  return Number.isFinite(value) && value > 0 ? value : DEFAULT_WINDOW_MS;
+/* 调用方既可能传 ctx（sessionTakeoverWindowMs），也可能传 helper 选项（windowMs）；
+ * 两个名字都认，避免配置窗口 >60s 时被静默回落成默认值。 */
+function windowMsOf(options) {
+  const direct = Number.isFinite(options.windowMs) ? options.windowMs : undefined;
+  const configured = Number.isFinite(options.sessionTakeoverWindowMs) ? options.sessionTakeoverWindowMs : undefined;
+  const value = direct === undefined ? configured : direct;
+  return value !== undefined && value > 0 ? value : DEFAULT_WINDOW_MS;
 }
 
-function skewMsOf(ctx) {
-  const value = ctx.windowSkewMs;
-  return Number.isFinite(value) && value >= 0 ? value : DEFAULT_WINDOW_SKEW_MS;
+function skewMsOf(options) {
+  const direct = Number.isFinite(options.skewMs) ? options.skewMs : undefined;
+  const configured = Number.isFinite(options.windowSkewMs) ? options.windowSkewMs : undefined;
+  const value = direct === undefined ? configured : direct;
+  return value !== undefined && value >= 0 ? value : DEFAULT_WINDOW_SKEW_MS;
 }
 
 function sameSeat(left, right) {
@@ -61,10 +91,12 @@ function sameSeat(left, right) {
     && left.sessionId === right.sessionId;
 }
 
+/* 时间戳按毫秒比较：协议接受多种可解析格式，同一时刻的不同序列化不应判成分叉。 */
 function sameWindow(left, right) {
   return isPlainObject(left) && isPlainObject(right)
     && left.windowBaseTerm === right.windowBaseTerm
-    && left.windowEndsAt === right.windowEndsAt;
+    && Number.isFinite(timeOf(left.windowEndsAt))
+    && timeOf(left.windowEndsAt) === timeOf(right.windowEndsAt);
 }
 
 function isWindowShape(window) {
@@ -163,7 +195,7 @@ function stateFromChange(frame, window) {
 function snapshotNextState(snapshot) {
   return {
     managerTerm: snapshot.managerTerm,
-    manager: managerSeatOf(snapshot.manager, snapshot.managerTerm),
+    manager: snapshot.manager === null ? null : managerSeatOf(snapshot.manager, snapshot.managerTerm),
     version: snapshot.version,
     ...(snapshot.managerWindow === undefined ? {} : { managerWindow: { ...snapshot.managerWindow } }),
   };
@@ -177,7 +209,7 @@ function snapshotStateOf(frame) {
   if (!snapshotLedgerHeadMatches(ledger, frame)) {
     return null;
   }
-  const window = ledger.managerWindow === undefined ? frame.managerWindow : ledger.managerWindow;
+  const window = ledger.managerWindow;
   if (window !== undefined && !isWindowShape(window)) {
     return null;
   }
@@ -190,10 +222,37 @@ function snapshotStateOf(frame) {
 }
 
 function snapshotLedgerHeadMatches(ledger, frame) {
-  if (!isTerm(ledger.managerTerm) || !isVersion(ledger.version) || !isPeer(ledger.manager)) {
+  if (!isTerm(ledger.managerTerm) || !isVersion(ledger.version)) {
+    return false;
+  }
+  if (ledger.manager !== null && !isPeer(ledger.manager)) {
     return false;
   }
   return ledger.managerTerm === frame.managerTerm && ledger.version === frame.version;
+}
+
+/* 帧窗口与台账窗口必须同源：design §2A.1 要求 managerWindow 与帧一致，
+ * 不一致按损坏拒收；只在一侧出现同样视为损坏，不能拿帧窗口去补台账。 */
+function snapshotWindowCorrupt(frame) {
+  const ledgerWindow = frame.ledger.managerWindow;
+  const frameWindow = frame.managerWindow;
+  if (ledgerWindow === undefined && frameWindow === undefined) {
+    return false;
+  }
+  if (ledgerWindow === undefined || frameWindow === undefined) {
+    return true;
+  }
+  return !sameWindow(ledgerWindow, frameWindow);
+}
+
+/* 快照携带的窗口同样受 1 分钟纠错窗约束：远期 windowEndsAt 视为损坏，
+ * 防止「同 term 快照不改 term 但把窗口挪到远期」。 */
+function snapshotWindowProblem(snapshot, ctx) {
+  if (snapshot.managerWindow === undefined) {
+    return null;
+  }
+  const endsAt = timeOf(snapshot.managerWindow.windowEndsAt);
+  return endsAt - nowOf(ctx) > windowMsOf(ctx) + skewMsOf(ctx) ? 'snapshot-window-invalid' : null;
 }
 
 /* 快照完整性（设计 §2A.1/A1）：digest 由接收方重算，纯判定层只接受显式验证结果；
@@ -353,7 +412,8 @@ function acceptAuto(state, frame, ctx) {
     return rejected(state, windowProblem);
   }
   if (!hasMatchingAutoOffer(ctx, frame)) {
-    return rejected(state, 'auto-offer-missing');
+    /* 没收到 auto-offer 的节点不凭本帧改任期：拉快照走 A10 台账追赶（设计 A2 的回退面）。 */
+    return rejected(state, 'auto-offer-missing', { actions: ['count-reject', 'request-snapshot'] });
   }
   const window = { windowBaseTerm: frame.term, windowEndsAt: frame.windowEndsAt };
   const remaining = managerWindowRemaining(window, nowOf(ctx), {
@@ -373,7 +433,10 @@ function autoWindowProblem(frame, ctx) {
   if (!Number.isFinite(endsAt)) {
     return 'window-missing';
   }
-  if (endsAt < effectiveAt) {
+  if (endsAt <= effectiveAt) {
+    return 'window-invalid';
+  }
+  if (effectiveAt > nowOf(ctx) + skewMsOf(ctx)) {
     return 'window-invalid';
   }
   return endsAt - effectiveAt > windowMsOf(ctx) + skewMsOf(ctx) ? 'window-invalid' : null;
@@ -475,6 +538,7 @@ function windowAcceptsTakeover(window, authorizedAt, ctx) {
   const authorizedAtMs = timeOf(authorizedAt);
   return Number.isFinite(authorizedAtMs)
     && authorizedAtMs <= endsAt
+    && authorizedAtMs <= nowMs + skewMs
     && endsAt - authorizedAtMs <= windowMs + skewMs;
 }
 
@@ -483,12 +547,31 @@ function acceptSnapshot(state, frame, ctx) {
   if (!isStateShape(state) || snapshot === null) {
     return rejected(state, 'frame-invalid');
   }
-  if (!snapshotDigestVerified(frame, ctx)) {
-    return rejected(state, 'digest-unverified');
+  const precheck = snapshotPrecheck(state, frame, snapshot, ctx);
+  if (precheck !== null) {
+    return precheck;
+  }
+  if (snapshot.manager === null) {
+    return acceptTerminalSnapshot(state, snapshot, frame, ctx);
   }
   if (state.manager === null) {
     return rejected(state, 'no-local-manager');
   }
+  return acceptNonTerminalSnapshot(state, snapshot, frame, ctx);
+}
+
+function snapshotPrecheck(state, frame, snapshot, ctx) {
+  if (snapshotWindowCorrupt(frame)) {
+    return rejected(state, 'snapshot-corrupt');
+  }
+  if (!snapshotDigestVerified(frame, ctx)) {
+    return rejected(state, 'digest-unverified');
+  }
+  const windowProblem = snapshotWindowProblem(snapshot, ctx);
+  return windowProblem === null ? null : rejected(state, windowProblem);
+}
+
+function acceptNonTerminalSnapshot(state, snapshot, frame, ctx) {
   if (snapshot.managerTerm < state.managerTerm) {
     return rejected(state, 'term-behind');
   }
@@ -502,6 +585,45 @@ function acceptSnapshot(state, frame, ctx) {
   return acceptHigherSnapshot(state, snapshot, frame, ctx);
 }
 
+/* 终态台账（manager:null）允许参与收敛（设计 §3.4 / D17）：本地活跃时只接受 term+1 且来源为成员，
+ * 本地已终态时按 version 幂等/推进；同 term 活跃→终态视为分叉，不做静默改写。 */
+function acceptTerminalSnapshot(state, snapshot, frame, ctx) {
+  if (snapshot.managerTerm < state.managerTerm) {
+    return rejected(state, 'term-behind');
+  }
+  if (snapshot.managerTerm === state.managerTerm) {
+    if (state.manager !== null) {
+      return frozen(state, 'snapshot-same-term-conflict');
+    }
+    return terminalVersionResult(state, snapshot);
+  }
+  if (state.manager === null) {
+    return terminalVersionResult(state, snapshot);
+  }
+  if (snapshot.managerTerm !== state.managerTerm + 1) {
+    return frozen(state, 'snapshot-untrusted-higher-term');
+  }
+  if (!isMemberSource(ctx, sourceOf(frame, ctx))) {
+    return rejected(state, 'source-not-member');
+  }
+  const actions = state.managerWindow === undefined ? ['adopt'] : ['adopt', 'close-window'];
+  return accepted(terminalNextState(snapshot), 'snapshot-terminal-accepted', actions);
+}
+
+function terminalVersionResult(state, snapshot) {
+  if (snapshot.version < state.version) {
+    return rejected(state, 'version-behind');
+  }
+  if (snapshot.version === state.version) {
+    return idempotent(state, 'snapshot-idempotent', ['ack-snapshot-stored']);
+  }
+  return accepted(terminalNextState(snapshot), 'snapshot-terminal-accepted', ['adopt']);
+}
+
+function terminalNextState(snapshot) {
+  return { managerTerm: snapshot.managerTerm, manager: null, version: snapshot.version };
+}
+
 /* 同 term 快照只允许现任站长 / 已受理过的新站长签发；窗口以本地为准：
  * 快照未带窗口时保留本地窗口，快照窗口与本地不同视为台账分叉，绝不静默改写（A11/A12）。 */
 function acceptSameTermSnapshot(state, snapshot, frame, ctx) {
@@ -512,7 +634,7 @@ function acceptSameTermSnapshot(state, snapshot, frame, ctx) {
   if (!sameSeat(snapshot.manager, state.manager)) {
     return frozen(state, 'snapshot-same-term-conflict');
   }
-  if (!sameTermSnapshotSourceAllowed(state, snapshot, frame, ctx)) {
+  if (!sameTermSnapshotSourceAllowed(state, frame, ctx)) {
     return rejected(state, 'snapshot-source-not-manager');
   }
   const windowResult = sameTermWindowOf(state, snapshot);
@@ -538,12 +660,11 @@ function sameTermSnapshotFrozen(state, ctx) {
   return null;
 }
 
-function sameTermSnapshotSourceAllowed(state, snapshot, frame, ctx) {
+/* 同 term 名单快照只认现任站长席位（offline 冻结时按 §7.1 放行名单成员做 catch-up）；
+ * 不接受 acceptedManager 之类的历史授权——同 term 的高 version 必须由当前站长自己签发。 */
+function sameTermSnapshotSourceAllowed(state, frame, ctx) {
   const source = sourceOf(frame, ctx);
   if (sameSeat(source, state.manager)) {
-    return true;
-  }
-  if (isAcceptedManagerSeat(ctx.acceptedManager, snapshot)) {
     return true;
   }
   if (ctx.localFrozen === 'manager-offline') {
@@ -631,22 +752,26 @@ function acceptHigherSnapshot(state, snapshot, frame, ctx) {
   if (sameSeat(source, state.manager)) {
     return accepted(snapshotNextState(snapshot), 'snapshot-manager-accepted', ['adopt']);
   }
-  if (isAcceptedManagerSeat(ctx.acceptedManager, snapshot)) {
+  if (isAcceptedManagerSeat(ctx.acceptedManager, snapshot, source)) {
     return accepted(snapshotNextState(snapshot), 'snapshot-accepted-manager-accepted', ['adopt']);
   }
   if (handoverPendingMatches(ctx, source, snapshot)) {
     return accepted(snapshotNextState(snapshot), 'snapshot-handover-accepted', ['adopt']);
   }
-  if (hasAutoCatchupEvidence(state, snapshot, source, ctx)) {
+  if (hasAutoCatchupEvidence(state, snapshot, source, frame)) {
     return accepted(snapshotNextState(snapshot), 'snapshot-auto-catchup-accepted', ['adopt']);
   }
   return pendingOrFrozenSnapshot(state, snapshot, source, ctx);
 }
 
-function isAcceptedManagerSeat(value, snapshot) {
+/* acceptedManager 必须绑定来源席位：记录里没有 source 或来源不符一律不认，
+ * 防止任意成员借历史记录给同 term/更高 term 快照背书。 */
+function isAcceptedManagerSeat(value, snapshot, source) {
   return isPlainObject(value)
     && value.term === snapshot.managerTerm
-    && sameSeat(value.manager, snapshot.manager);
+    && sameSeat(value.manager, snapshot.manager)
+    && isRef(value.source)
+    && sameSeat(value.source, source);
 }
 
 /* 显式移交等待中只向在途 offer 的目标取台账；来源/快照 manager 都必须等于该目标。 */
@@ -665,34 +790,59 @@ function handoverPendingTarget(ctx) {
   return null;
 }
 
-/* 离线错过 auto-offer 的追赶路径（设计 §2A.2 A10）：三证据必须与本地任期连续——
- * offer.baseTerm=本地 term、快照/change term=本地+1，且 offer/change/leave 席位互相印证。
- * 任一条不满足都不得直接采纳，term 跳变交由 handshake 对表。 */
-function hasAutoCatchupEvidence(state, snapshot, source, ctx) {
+/* 离线错过 auto-offer 的追赶路径（设计 §2A.2 A10）：三证据必须来自快照台账自身
+ * （frame.ledger.events，随 digest 一起受完整性校验），不能由外部 ctx 拼装：
+ * auto-offer 的 baseTerm/prevManager/target、via=auto 的 manager-changed、旧站长 leave/manager-session-closed。
+ * 同时要求任期连续（快照 term=本地+1），term 跳变交由 handshake 对表。 */
+function hasAutoCatchupEvidence(state, snapshot, source, frame) {
   if (snapshot.managerTerm !== state.managerTerm + 1) {
     return false;
   }
   if (!sameSeat(source, snapshot.manager)) {
     return false;
   }
-  const { offer, change, leave } = ctx.autoCatchup ?? {};
-  if (!isPlainObject(offer) || !isPlainObject(change) || !isPlainObject(leave)) {
+  const events = ledgerEventsOf(frame);
+  const offer = events.find((event) => eventTypeOf(event) === 'auto-offer'
+    && autoOfferEventMatches(event, state, snapshot));
+  if (offer === undefined) {
     return false;
   }
-  return autoChangeMatchesOffer(state, snapshot, offer, change)
-    && sameSeat(leave, state.manager)
-    && leave.reason === AUTO_CATCHUP_LEAVE_REASON;
+  const change = events.find((event) => eventTypeOf(event) === 'manager-changed'
+    && autoChangeEventMatches(event, state, snapshot, offer));
+  if (change === undefined) {
+    return false;
+  }
+  return events.some((event) => leaveEventMatches(event, state.manager));
 }
 
-function autoChangeMatchesOffer(state, snapshot, offer, change) {
-  return offer.baseTerm === state.managerTerm
-    && change.via === 'auto'
-    && change.offerId === offer.offerId
-    && change.term === snapshot.managerTerm
-    && sameSeat(change.prevManager, state.manager)
-    && sameSeat(change.prevManager, offer.prevManager)
-    && sameSeat(change.manager, snapshot.manager)
-    && sameSeat(offer.target, snapshot.manager);
+function ledgerEventsOf(frame) {
+  const events = isPlainObject(frame.ledger) ? frame.ledger.events : undefined;
+  return Array.isArray(events) ? events : [];
+}
+
+function eventTypeOf(event) {
+  return isPlainObject(event) ? (event.type ?? event.event) : undefined;
+}
+
+function autoOfferEventMatches(event, state, snapshot) {
+  return event.baseTerm === state.managerTerm
+    && sameSeat(event.prevManager, state.manager)
+    && sameSeat(event.target, snapshot.manager);
+}
+
+function autoChangeEventMatches(event, state, snapshot, offer) {
+  return event.via === 'auto'
+    && event.offerId === offer.offerId
+    && event.term === snapshot.managerTerm
+    && sameSeat(event.prevManager, state.manager)
+    && sameSeat(event.manager, snapshot.manager);
+}
+
+function leaveEventMatches(event, seat) {
+  if (!isPlainObject(event) || event.reason !== AUTO_CATCHUP_LEAVE_REASON) {
+    return false;
+  }
+  return sameSeat(isPlainObject(event.seat) ? event.seat : event, seat);
 }
 
 /* 活跃态收到未受理来源的更高 term 快照：term=本地+1 且来源自称新站长时先暂存等变更；

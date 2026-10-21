@@ -5,7 +5,18 @@
  * - seat-presence 按列表级刷新：只刷新 sessions 数组内的席位，同机未列出的旧席位标 unlisted；
  * - 其它协作帧只有直连来源才刷新，转达副本（payload.originMsgId）不刷新原发送者；
  * - 超时只用本地接收时刻（调用方传入 now）；帧自带时间只作偏斜参考，不进入 lastSeenAt；
- * - 过期项保留为 tombstone（expired=true），避免「删掉即无记录即可达」的 fail-open。 */
+ * - 过期项保留为 tombstone（expired=true），避免「删掉即无记录即可达」的 fail-open。
+ *
+ * 调用契约（缺证据一律拒绝，防止接线漏传导致 fail-open）：
+ * - now：本地接收时刻（单调钟）。
+ * - applyDirectFrame(...,{peerInstanceId})：传输对端实例，必须等于 frame.from.instanceId；
+ *   缺省 → peer-missing，不匹配 → peer-mismatch。
+ * - applySeatPresence(...,{peerInstanceId, mode, relayPeerInstanceId, currentRelayPeerInstanceId})：
+ *   直连要求 peerInstanceId === notice.instanceId；forum 中继转发的列表要求
+ *   peerInstanceId === relayPeerInstanceId === currentRelayPeerInstanceId（relayPeerInstanceId 是连接对端＝转达者，
+ *   不是原发机器；notice.instanceId 仍是原发机器）。managed/旧中继/缺 peer → relay-rejected 或 peer-missing。
+ * - isReachable / autoSuccessorCandidates：hasEndpoint 必须显式 true/false、timeoutMs>0；
+ *   缺省按不可达（fail-closed）。expired/unlisted 优先于 lastSeenAt。 */
 
 const KEY_SEPARATOR = '\u0000';
 
@@ -57,9 +68,9 @@ export function applySeatPresence(table, notice, now, options = {}) {
   if (!isPresenceNotice(notice)) {
     return { refreshed: [], unlisted: [] };
   }
-  const relayRejection = relayRejectionOf(notice, options);
-  if (relayRejection !== null) {
-    return { refreshed: [], unlisted: [], reason: relayRejection };
+  const sourceRejection = presenceSourceRejection(notice, options);
+  if (sourceRejection !== null) {
+    return { refreshed: [], unlisted: [], reason: sourceRejection };
   }
   const listed = new Set(notice.sessions);
   const refreshed = [];
@@ -84,14 +95,24 @@ function isPresenceNotice(notice) {
     && isSessionList(notice.sessions);
 }
 
-function relayRejectionOf(notice, options) {
-  if (originOf(notice) === null) {
-    return null;
+/* 直连要求传输对端就是原发机器；forum 中继转发只放行「连接对端＝本机记录的当前中继」的那一份。
+ * 转达者的身份来自连接，不来自帧内 from；缺 peer 证据一律拒绝。 */
+function presenceSourceRejection(notice, options) {
+  const peer = options.peerInstanceId;
+  if (typeof peer !== 'string' || peer === '') {
+    return 'peer-missing';
   }
+  if (originOf(notice) === null) {
+    return peer === notice.instanceId ? null : 'peer-mismatch';
+  }
+  const relayPeer = options.relayPeerInstanceId;
   const viaCurrentRelay = options.mode === 'forum'
-    && typeof options.relayInstanceId === 'string'
-    && options.relayInstanceId === options.currentRelayInstanceId;
-  return viaCurrentRelay ? null : 'relay-rejected';
+    && typeof relayPeer === 'string'
+    && relayPeer === options.currentRelayPeerInstanceId;
+  if (!viaCurrentRelay) {
+    return 'relay-rejected';
+  }
+  return peer === relayPeer ? null : 'peer-mismatch';
 }
 
 function freshEntry(notice, sessionId, at) {
@@ -131,7 +152,7 @@ function markUnlisted(table, collabId, instanceId, listed, at) {
 /* 直连帧才算证据：转达副本的 from 是原发者、连接来源是转达者，
  * 用转达副本刷新会让「原发机器已离线」被无限期掩盖。
  * lastSeenAt 一律用本地接收时刻；帧自带 at 只记录为 reportedAt 供偏斜诊断。 */
-export function applyDirectFrame(table, frame, now) {
+export function applyDirectFrame(table, frame, now, options = {}) {
   const at = Number.isFinite(now) ? now : Date.now();
   if (originOf(frame) !== null) {
     return { refreshed: false, reason: 'relayed' };
@@ -139,6 +160,10 @@ export function applyDirectFrame(table, frame, now) {
   const direct = directSourceOf(frame);
   if (direct === null) {
     return { refreshed: false, reason: 'invalid' };
+  }
+  const peerProblem = peerProblemOf(direct, options);
+  if (peerProblem !== null) {
+    return { refreshed: false, reason: peerProblem };
   }
   const reportedAt = Number.isFinite(frame.at) ? frame.at : null;
   const key = keyOf(direct.collabId, direct.instanceId, direct.sessionId);
@@ -174,6 +199,14 @@ function directSourceOf(frame) {
     return null;
   }
   return { collabId, instanceId, sessionId };
+}
+
+function peerProblemOf(direct, options) {
+  const peer = options.peerInstanceId;
+  if (typeof peer !== 'string' || peer === '') {
+    return 'peer-missing';
+  }
+  return peer === direct.instanceId ? null : 'peer-mismatch';
 }
 
 /* 判离席由调用方决定；本函数把超时项标记为 tombstone 并返回被标记的条目。
