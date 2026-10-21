@@ -4,6 +4,7 @@ import { collabFilePath, resolveDataDir } from '../src/paths.js';
 import { ID_PATTERN } from '../src/net/protocol.js';
 import { isPostEntryShape, POSTS_FILE_NAME } from '../src/collab/posts.js';
 import { foldMemberEvents, isMemberEventShape, MEMBERS_FILE_NAME } from '../src/collab/members.js';
+import { isLegacyLedgerRow } from '../src/collab/legacy.js';
 import { isLedgerShape } from '../src/collab/model.js';
 import { LEDGER_FILE_NAME, loadMember } from '../src/collab/store.js';
 import { metaViewOf } from '../src/viewer/meta.js';
@@ -243,12 +244,13 @@ function onMemberLine(view, line) {
   }
 }
 
-/* 台账行：留最后一条通过形态校验的完整行（与 loadLedger 同判据）；坏行跳过并留痕
+/* 台账行：留最后一条通过形态校验的完整行（新形态按 loadLedger 同判据，0.1.x 旧形态按旧判据——
+ * 新校验器 0.2.0 起要求 managerTerm/席位 sessionId，旧归档不能拿它读）；坏行跳过并留痕
  * （与帖 / 成员流同一提示，回放与增量一致——三面口径统一）。半写尾行到不了这里：
  * 尾读器缓冲至换行才算行。 */
 function onLedgerLine(view, line) {
   const ledger = parseJsonOrNull(line);
-  if (!isLedgerShape(ledger)) {
+  if (!isLedgerShape(ledger) && !isLegacyLedgerRow(ledger)) {
     systemLine(BAD_LINE_NOTICE);
     return;
   }

@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { CARRIER_FILE_NAME as PATHS_CARRIER_FILE_NAME } from '../src/paths.js';
 import { makeTempDir } from './helpers.js';
 import {
   CARRIER_FILE_NAME,
@@ -58,6 +59,30 @@ test('carrier 形态：session-seats 全字段与 invite-stub 最小形态均通
     createdAt: TS,
   };
   assert.equal(isCarrierShape(stub), true);
+});
+
+test('carrier 版本上界与 invite-stub 快照约束：未来版本不静默降级', (t) => {
+  assert.equal(CARRIER_FILE_NAME, PATHS_CARRIER_FILE_NAME, '文件名权威在路径层');
+  assert.equal(isCarrierShape(sampleCarrier({ version: 2 })), false, '高于本版形态版本按不可用拒绝');
+  const stub = (overrides = {}) => ({
+    format: CARRIER_FORMAT_INVITE_STUB,
+    version: 1,
+    collabId: 'collab-2',
+    name: '受邀项目',
+    topic: '待入席',
+    mode: 'managed',
+    endpoints: {},
+    snapshotVersion: 0,
+    createdAt: TS,
+    ...overrides,
+  });
+  assert.equal(isCarrierShape(stub({ snapshotVersion: 5 })), false, '邀请占位不允许声称已有快照');
+  assert.equal(isCarrierShape(stub({ snapshotVersion: 0 })), true);
+
+  const dir = collabDirOf(t);
+  writeFileSync(carrierPath(dir), JSON.stringify(sampleCarrier({ version: 2 })));
+  assert.equal(readCarrier(dir).status, 'corrupt');
+  assert.equal(readCarrierFormat(dir), CARRIER_FORMAT_SESSION_SEATS, 'format 标记仍可识别（目录形态不倒退）');
 });
 
 test('carrier 形态：逐字段非法一律拒绝，不做清洗', () => {

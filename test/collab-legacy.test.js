@@ -1,11 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { makeTempDir } from './helpers.js';
 import {
   createLegacyRejectionCounter,
   isLegacyCollab,
+  isLegacyLedgerRow,
   markLegacyCompleted,
   readLegacyCollab,
 } from '../src/collab/legacy.js';
@@ -224,6 +225,84 @@ test('readLegacyCollab：归档后的旧目录仍可读并带 archivedAt', (t) =
   assert.equal(summary.readOnly, true);
   assert.equal(summary.archivedAt, TS);
   assert.equal(summary.memberCount, 2);
+});
+
+test('readLegacyCollab：归档目录清理 member.json 后仍可从台账读', (t) => {
+  const dir = collabDirOf(t);
+  writeJson(dir, 'member.json', legacyMember());
+  writeLedger(dir, [legacyLedger(3)]);
+  assert.equal(markLegacyCompleted(dir, { now: TS }).ok, true);
+  rmSync(join(dir, 'member.json'));
+
+  const summary = readLegacyCollab(dir);
+  assert.notEqual(summary, null);
+  assert.equal(summary.name, '旧协作');
+  assert.equal(summary.role, null);
+  assert.equal(summary.memberCount, 2);
+  assert.equal(summary.archivedAt, TS);
+});
+
+test('readLegacyCollab：member.json 合法 JSON 但形态不符 → 告警并回退台账', (t) => {
+  const dir = collabDirOf(t);
+  writeJson(dir, 'member.json', legacyMember({ manager: null }));
+  writeLedger(dir, [legacyLedger(1)]);
+  const summary = readLegacyCollab(dir);
+  assert.equal(summary.role, null);
+  assert.equal(summary.name, '旧协作');
+  assert.ok(summary.warnings.some((warning) => /member\.json 形态不符/.test(warning)));
+});
+
+test('readLegacyCollab：snapshot.json 解析失败与信封形态不符均告警', (t) => {
+  const broken = collabDirOf(t, 'a');
+  writeJson(broken, 'member.json', legacyMember());
+  writeFileSync(join(broken, 'snapshot.json'), '{ broken');
+  const brokenSummary = readLegacyCollab(broken);
+  assert.ok(brokenSummary.warnings.some((warning) => /snapshot\.json 解析失败/.test(warning)));
+
+  const badEnvelope = collabDirOf(t, 'b');
+  writeJson(badEnvelope, 'member.json', legacyMember());
+  writeJson(badEnvelope, 'snapshot.json', legacySnapshot(legacyLedger(1), { digest: 'not-a-digest' }));
+  const envelopeSummary = readLegacyCollab(badEnvelope);
+  assert.ok(envelopeSummary.warnings.some((warning) => /snapshot\.json 形态不符/.test(warning)));
+  assert.equal(envelopeSummary.memberCount, 2, '回退成员记录定格名单');
+});
+
+test('readLegacyCollab：混合目录里的 0.2.0 台账行按非法旧行跳过', (t) => {
+  const dir = collabDirOf(t);
+  writeJson(dir, 'member.json', legacyMember());
+  const newShape = legacyLedger(2, {
+    managerTerm: 1,
+    joinSeqNext: 2,
+    members: [{ instanceId: 'inst-a', sessionId: 'session-a', identityName: '主机甲', role: 'manager', state: 'member', joinedAt: TS }],
+  });
+  writeLedger(dir, [legacyLedger(1), newShape]);
+  assert.equal(isLegacyLedgerRow(legacyLedger(1)), true);
+  assert.equal(isLegacyLedgerRow(newShape), false);
+
+  const summary = readLegacyCollab(dir);
+  assert.equal(summary.memberCount, 2, '取旧行而不是 0.2.0 行');
+  assert.ok(summary.warnings.some((warning) => /ledger\.jsonl 有 1 行/.test(warning)));
+});
+
+test('readLegacyCollab：recovery 标记与 member.json 并存时不判旧档案', (t) => {
+  const dir = collabDirOf(t);
+  writeJson(dir, 'member.json', legacyMember());
+  writeJson(dir, 'recovery.json', { state: 'half-created', at: TS, reason: 'carrier-without-ledger' });
+  assert.equal(isLegacyCollab(dir), false);
+  assert.equal(readLegacyCollab(dir), null);
+});
+
+test('readLegacyCollab：旧讨论坏行跳过并告警，不拖垮有效折叠', (t) => {
+  const dir = collabDirOf(t);
+  writeJson(dir, 'member.json', legacyMember({ mode: 'forum' }));
+  const events = [
+    { eventId: 'event-1', kind: 'join', instanceId: 'inst-a', identityName: '主机甲', ts: TS },
+    { eventId: 'event-2', kind: 'join', instanceId: 'inst-b', identityName: '主机乙', ts: TS },
+  ];
+  writeFileSync(join(dir, 'members.jsonl'), `${events.map((event) => JSON.stringify(event)).join('\n')}\n{oops not json\n`);
+  const summary = readLegacyCollab(dir);
+  assert.equal(summary.memberCount, 2);
+  assert.ok(summary.warnings.some((warning) => /members\.jsonl 有 1 行/.test(warning)));
 });
 
 test('readLegacyCollab：非 legacy 目录返回 null', (t) => {

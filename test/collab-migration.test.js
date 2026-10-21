@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { makeTempDir } from './helpers.js';
 import {
@@ -10,6 +10,8 @@ import {
   RECOVERY_FILE_NAME,
   isMigrationShape,
   isRecoveryShape,
+  loadMigration,
+  loadRecovery,
   readMigration,
   readRecovery,
   recoveryPath,
@@ -115,12 +117,17 @@ test('assertWritable：空目录、缺失目录、正常新形态与邀请占位
 
   const full = join(root, 'full');
   writeCarrier(full, sessionSeatsCarrier());
-  writeFileSync(join(full, 'ledger.jsonl'), '');
+  writeFileSync(join(full, 'ledger.jsonl'), '{"version":1}\n');
   assert.deepEqual(assertWritable(full), { ok: true });
 
   const stub = join(root, 'stub');
   writeCarrier(stub, sessionSeatsCarrier({ format: 'invite-stub', snapshotVersion: 0 }));
   assert.deepEqual(assertWritable(stub), { ok: true });
+
+  const pending = join(root, 'pending');
+  mkdirSync(pending);
+  writeFileSync(join(pending, 'pending-invites.json'), '{}');
+  assert.deepEqual(assertWritable(pending), { ok: true }, '仅挂起邀请的目录不判损坏');
 });
 
 test('assertWritable：legacy/recovery/半写目录一律拒绝', (t) => {
@@ -150,6 +157,100 @@ test('assertWritable：legacy/recovery/半写目录一律拒绝', (t) => {
   assert.equal(assertWritable(join(root, 'absent-recovery'), { recovery: true }).reason, 'recovery');
 });
 
+test('assertWritable：损坏 carrier 与无标记非空目录按只读拒绝（fail-safe）', (t) => {
+  const root = makeTempDir(t);
+
+  const truncated = join(root, 'truncated');
+  mkdirSync(truncated);
+  writeFileSync(join(truncated, 'carrier.json'), '{"format":"session-seats"');
+  const truncatedResult = assertWritable(truncated);
+  assert.equal(truncatedResult.ok, false);
+  assert.equal(truncatedResult.reason, 'corrupt');
+
+  const emptyCarrier = join(root, 'empty-carrier');
+  mkdirSync(emptyCarrier);
+  writeFileSync(join(emptyCarrier, 'carrier.json'), '');
+  assert.equal(assertWritable(emptyCarrier).reason, 'corrupt');
+
+  const unmarked = join(root, 'unmarked');
+  mkdirSync(unmarked);
+  writeFileSync(join(unmarked, 'ledger.jsonl'), '{"version":1}\n');
+  const unmarkedResult = assertWritable(unmarked);
+  assert.equal(unmarkedResult.ok, false);
+  assert.equal(unmarkedResult.reason, 'corrupt');
+
+  const inboxOnly = join(root, 'inbox-only');
+  mkdirSync(inboxOnly);
+  writeFileSync(join(inboxOnly, 'inbox.jsonl'), '');
+  assert.equal(assertWritable(inboxOnly).reason, 'corrupt');
+
+  /* 标记文件存在但形态坏：不得当作「无标记」放行。 */
+  const brokenMarker = join(root, 'broken-legacy-marker');
+  mkdirSync(brokenMarker);
+  writeFileSync(join(brokenMarker, MIGRATION_FILE_NAME), JSON.stringify({ legacy: false }));
+  writeFileSync(join(brokenMarker, 'ledger.jsonl'), '{"version":1}\n');
+  assert.equal(assertWritable(brokenMarker).reason, 'corrupt');
+});
+
+test('assertWritable：零字节台账按未落盘处理，标记文件不可读不得放行', (t) => {
+  const root = makeTempDir(t);
+
+  const zeroLedger = join(root, 'zero-ledger');
+  writeCarrier(zeroLedger, sessionSeatsCarrier());
+  writeFileSync(join(zeroLedger, 'ledger.jsonl'), '');
+  const zeroResult = assertWritable(zeroLedger);
+  assert.equal(zeroResult.ok, false);
+  assert.equal(zeroResult.reason, 'recovery');
+
+  const brokenMarker = join(root, 'broken-marker');
+  writeCarrier(brokenMarker, sessionSeatsCarrier());
+  writeFileSync(join(brokenMarker, 'ledger.jsonl'), '{"version":1}\n');
+  mkdirSync(join(brokenMarker, RECOVERY_FILE_NAME));
+  const markerResult = assertWritable(brokenMarker);
+  assert.equal(markerResult.ok, false);
+  assert.equal(markerResult.reason, 'corrupt');
+  assert.equal(loadRecovery(brokenMarker).status, 'unreadable');
+});
+
+test('assertWritable：迁移后的归档目录仍拒绝写', (t) => {
+  const dir = collabDirOf(t);
+  writeFileSync(join(dir, 'member.json'), JSON.stringify(legacyMemberRecord()));
+  writeFileSync(join(dir, 'ledger.jsonl'), '{"version":1}\n');
+  assert.equal(markLegacyCompleted(dir, { now: TS }).ok, true);
+  const result = assertWritable(dir);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'legacy');
+  assert.equal(result.detail, MIGRATION_FILE_NAME);
+});
+
+test('标记读取分状态：missing/corrupt/unreadable 可区分', (t) => {
+  const dir = collabDirOf(t);
+  assert.equal(loadRecovery(dir).status, 'missing');
+  assert.equal(loadMigration(dir).status, 'missing');
+
+  writeFileSync(join(dir, RECOVERY_FILE_NAME), '{ broken');
+  assert.equal(loadRecovery(dir).status, 'corrupt');
+  writeFileSync(join(dir, MIGRATION_FILE_NAME), JSON.stringify({ legacy: false }));
+  assert.equal(loadMigration(dir).status, 'corrupt');
+
+  rmSync(join(dir, RECOVERY_FILE_NAME));
+  mkdirSync(join(dir, RECOVERY_FILE_NAME));
+  assert.equal(loadRecovery(dir).status, 'unreadable');
+});
+
+test('写入器入参非法：reason 超长拒绝且不落盘', (t) => {
+  const dir = collabDirOf(t);
+  const tooLong = 'x'.repeat(201);
+  const recovery = writeRecovery(dir, { now: TS, reason: tooLong });
+  assert.equal(recovery.ok, false);
+  assert.equal(readRecovery(dir), null);
+
+  writeFileSync(join(dir, 'member.json'), JSON.stringify(legacyMemberRecord()));
+  const migration = markLegacyCompleted(dir, { now: TS, reason: tooLong });
+  assert.equal(migration.ok, false);
+  assert.equal(readMigration(dir), null);
+});
+
 test('markLegacyCompleted：写 migration.json、幂等、不改旧台账', (t) => {
   const dir = collabDirOf(t);
   writeFileSync(join(dir, 'member.json'), JSON.stringify(legacyMemberRecord()));
@@ -175,6 +276,16 @@ test('markLegacyCompleted：非 legacy 目录拒绝写入', (t) => {
   assert.equal(result.ok, false);
   assert.equal(result.record, null);
   assert.equal(existsSync(join(dir, MIGRATION_FILE_NAME)), false);
+});
+
+test('markLegacyCompleted：新形态目录混入 migration.json 时不得报归档成功', (t) => {
+  const dir = collabDirOf(t);
+  writeCarrier(dir, sessionSeatsCarrier());
+  writeFileSync(join(dir, 'ledger.jsonl'), '{"version":1}\n');
+  writeFileSync(join(dir, MIGRATION_FILE_NAME), JSON.stringify({ legacy: true, archivedAt: TS, reason: 'legacy-format' }));
+  const result = markLegacyCompleted(dir, { now: TS });
+  assert.equal(result.ok, false);
+  assert.equal(result.record, null);
 });
 
 test('markLegacyCompleted：写失败继续只读并告警', (t) => {

@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ID_PATTERN, MAX_TOPIC_CHARS, isCollabMode, isIdentityName, isPort, isPresentationText } from '../net/protocol.js';
+import { CARRIER_FILE_NAME } from '../paths.js';
 import { writeJsonAtomic } from '../storage.js';
 
 /* 协作载体文件（设计 §6.2）：0.2.0 起每个协作目录的第一份落盘文件。
@@ -12,13 +13,16 @@ import { writeJsonAtomic } from '../storage.js';
  * manager/originator/forumMeta/syncCursor/name/topic/mode/endpoints → 本文件；
  * roster → 共享快照/peerView；pendingInvites/targetSessionId → pending-invites.json。 */
 
-export const CARRIER_FILE_NAME = 'carrier.json';
+/* 文件名权威在路径层；这里只转出给 M8 的消费方，避免与 paths.js 的常量漂移。 */
+export { CARRIER_FILE_NAME };
 export const CARRIER_FORMAT_SESSION_SEATS = 'session-seats';
 export const CARRIER_FORMAT_INVITE_STUB = 'invite-stub';
 export const CARRIER_FORMATS = [CARRIER_FORMAT_SESSION_SEATS, CARRIER_FORMAT_INVITE_STUB];
-/* 本文件自身的形态版本：0.2.0 首次引入，后续形态变更递增。 */
+/* 本文件自身的形态版本：0.2.0 首次引入，后续形态变更递增。读到更高版本按不可用处理
+ * （fail-safe：不静默降级重写，避免把未来版本的文件覆盖成旧形态）。 */
 export const CARRIER_VERSION = 1;
 
+/* 等价于路径层的 carrierFilePath(dataDir, collabId)，本模块的读写面只收已经拼好的目录。 */
 export function carrierPath(dir) {
   return join(dir, CARRIER_FILE_NAME);
 }
@@ -54,8 +58,14 @@ function isCarrierTextShape(carrier) {
 }
 
 function isCarrierVersionShape(carrier) {
-  return Number.isInteger(carrier.version) && carrier.version >= 1
-    && Number.isInteger(carrier.snapshotVersion) && carrier.snapshotVersion >= 0;
+  if (!Number.isInteger(carrier.version) || carrier.version < 1 || carrier.version > CARRIER_VERSION) {
+    return false;
+  }
+  if (!Number.isInteger(carrier.snapshotVersion) || carrier.snapshotVersion < 0) {
+    return false;
+  }
+  /* 邀请占位尚无快照：固定 0，防止把「已入席后」的载体误标成 stub。 */
+  return carrier.format !== CARRIER_FORMAT_INVITE_STUB || carrier.snapshotVersion === 0;
 }
 
 /* 站长席位：0.2.0 起必须带 sessionId 与单调任期 term（旧形态只有 instanceId/identityName）。 */

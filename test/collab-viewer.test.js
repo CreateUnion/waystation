@@ -360,6 +360,17 @@ test('元状态：名称/状态变化各印一行系统行（站长席读台账�
   await viewer.waitForText('状态：已结束');
 });
 
+test('旧台账：0.1.x 形态按旧判据读取（不因 0.2.0 校验器收严整段判坏）', async (t) => {
+  const home = makeStationDir(t);
+  seedCollab(home, { posts: 1, seat: 'manager' });
+  const viewer = startViewer(t, { home });
+  await viewer.waitForText('帖子正文 1');
+  assert.equal(viewer.lines()[0], '【架构讨论】进行中 ｜ 1 人');
+  assert.equal(viewer.countOf('跳过一条无法解析的记录行'), 0);
+  appendJson(collabPath(home, 'ledger.jsonl'), ledgerOf({ version: 2, name: '旧台账改名' }));
+  await viewer.waitForText('名称：旧台账改名');
+});
+
 test('台账流坏行：回放与增量均印跳过提示（原恒静默面）', async (t) => {
   const home = makeStationDir(t);
   seedCollab(home, { posts: 1, seat: 'manager' });

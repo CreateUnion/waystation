@@ -1,20 +1,18 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { basename, join } from 'node:path';
-import { ID_PATTERN, MAX_COLLAB_MEMBERS, MAX_TOPIC_CHARS, isCollabMode, isIdentityName, isPort, isPresentationText } from '../net/protocol.js';
+import { DIGEST_PATTERN, ID_PATTERN, MAX_COLLAB_MEMBERS, MAX_TOPIC_CHARS, isCollabMode, isIdentityName, isPort, isPresentationText } from '../net/protocol.js';
+import { PENDING_INVITES_FILE_NAME } from '../paths.js';
 import { writeJsonAtomic } from '../storage.js';
-import { CARRIER_FORMAT_SESSION_SEATS, readCarrierFormat } from './carrier.js';
-import { foldMemberEvents, isMemberEventShape } from './members.js';
-import { MIGRATION_FILE_NAME, RECOVERY_FILE_NAME, isMigrationShape, readMigration, readRecovery } from './migration.js';
+import { CARRIER_FILE_NAME, CARRIER_FORMAT_INVITE_STUB, readCarrier, readCarrierFormat } from './carrier.js';
+import { MEMBERS_FILE_NAME } from './members.js';
+import { MIGRATION_FILE_NAME, RECOVERY_FILE_NAME, isMigrationShape, loadMigration, loadRecovery, readMigration, readRecovery } from './migration.js';
+import { LEDGER_FILE_NAME, MEMBER_FILE_NAME, SNAPSHOT_FILE_NAME } from './store.js';
 
 /* 存量（0.1.x）协作的只读面（设计 §8）：旧目录以 member.json 为本地参与记录、台账形态也没有
  * sessionId/joinSeq/managerTerm。0.2.0 把它们整目录归档为只读 legacy，不做迁移改写——
- * 因此本文件的判据与读取器必须自带「旧形态」校验，不能复用会随 0.2.0 改形的 model.js 校验器。
+ * 因此本文件的判据与读取器自带「旧形态」校验，不复用会随 0.2.0 改形的 model.js/members.js 校验器。
  * 读取面零写盘：台账尾部半行只忽略，绝不截断（截断修复属存储写面）。 */
 
-const MEMBER_FILE_NAME = 'member.json';
-const SNAPSHOT_FILE_NAME = 'snapshot.json';
-const LEDGER_FILE_NAME = 'ledger.jsonl';
-const MEMBERS_FILE_NAME = 'members.jsonl';
 const LOCAL_LEFT_STATE = 'left';
 const LEGACY_ROLES = ['manager', 'member'];
 const LEGACY_MEMBER_STATES = ['invited', 'approved', 'declined', 'withdrawn', 'member', 'left'];
@@ -24,12 +22,13 @@ export const DEFAULT_LEGACY_REASON = 'legacy-format';
 
 /** legacy 判据（设计 §8）：有旧 member.json，且 carrier 没有新形态 format 标记，且无
  * migration/recovery 标记。缺 carrier 且无 member.json 的目录不自动判 legacy（按损坏另处理）。
- * 已写 migration.json 的目录不再算「待迁移 legacy」，但仍是可读档案（见 legacyReadable）。 */
+ * 已写 migration.json 的目录不再算「待迁移 legacy」，但仍是可读档案（见 isLegacyReadable）。 */
 export function isLegacyCollab(dir) {
   return isLegacyReadable(dir) && readMigration(dir) === null;
 }
 
-/* 可读档案面：未迁移的旧目录与已归档旧目录都可读；新形态目录与半写恢复目录不可读。 */
+/* 可读档案面：未迁移的旧目录与已归档旧目录都可读（归档后即使 member.json 被清理，
+ * 只要 migration 标记与台账/快照还在就仍能展示）；新形态目录与半写恢复目录不可读。 */
 function isLegacyReadable(dir) {
   if (readCarrierFormat(dir) !== null) {
     return false;
@@ -37,10 +36,80 @@ function isLegacyReadable(dir) {
   if (readRecovery(dir) !== null) {
     return false;
   }
-  return existsSync(join(dir, MEMBER_FILE_NAME));
+  if (existsSync(join(dir, MEMBER_FILE_NAME))) {
+    return true;
+  }
+  return readMigration(dir) !== null
+    && (existsSync(join(dir, LEDGER_FILE_NAME)) || existsSync(join(dir, SNAPSHOT_FILE_NAME)));
 }
 
-/** 写门（设计 §6.4）：legacy、半写新协作、已有 recovery 标记的目录一律拒绝写。
+/** 目录形态分类：写门与启动扫描共用同一次判定（避免多处各自拼判据后分叉）。
+ * kind ∈ missing | empty | session-seats | invite-stub | legacy | archived-legacy | recovery | corrupt。
+ * corrupt 含：carrier 不可读、无任何已识别标记的非空目录、标记文件不可读。 */
+export function classifyCollabDir(dir) {
+  const recovery = loadRecovery(dir);
+  if (recovery.status === 'ok') {
+    return { kind: 'recovery', detail: RECOVERY_FILE_NAME };
+  }
+  const migration = loadMigration(dir);
+  if (migration.status === 'ok') {
+    return { kind: 'archived-legacy', detail: MIGRATION_FILE_NAME };
+  }
+  const carrier = readCarrier(dir);
+  if (carrier.status === 'corrupt') {
+    return { kind: 'corrupt', detail: CARRIER_FILE_NAME };
+  }
+  const markerBroken = isBrokenMarker(recovery) || isBrokenMarker(migration);
+  if (carrier.status === 'ok') {
+    return markerBroken ? { kind: 'corrupt', detail: 'marker' } : carrierKind(dir, carrier.carrier);
+  }
+  if (existsSync(join(dir, MEMBER_FILE_NAME))) {
+    return { kind: 'legacy', detail: MEMBER_FILE_NAME };
+  }
+  if (markerBroken) {
+    return { kind: 'corrupt', detail: 'marker' };
+  }
+  if (existsSync(join(dir, PENDING_INVITES_FILE_NAME))) {
+    return { kind: 'invite-stub', detail: PENDING_INVITES_FILE_NAME };
+  }
+  return emptyOrUnknownKind(dir);
+}
+
+function isBrokenMarker(marker) {
+  return marker.status === 'corrupt' || marker.status === 'unreadable';
+}
+
+function carrierKind(dir, carrier) {
+  if (carrier.format === CARRIER_FORMAT_INVITE_STUB) {
+    return { kind: 'invite-stub', detail: CARRIER_FILE_NAME };
+  }
+  return ledgerWritten(dir)
+    ? { kind: 'session-seats', detail: CARRIER_FILE_NAME }
+    : { kind: 'recovery', detail: 'carrier-without-ledger' };
+}
+
+/* 零字节台账按「尚未落」处理：非终态的合法台账至少有一行（状态/名单），空文件只能是半写。 */
+function ledgerWritten(dir) {
+  try {
+    return statSync(join(dir, LEDGER_FILE_NAME)).size > 0;
+  } catch {
+    return false;
+  }
+}
+
+function emptyOrUnknownKind(dir) {
+  try {
+    return readdirSync(dir).length === 0
+      ? { kind: 'empty' }
+      : { kind: 'corrupt', detail: 'unmarked-directory' };
+  } catch (error) {
+    return error.code === 'ENOENT'
+      ? { kind: 'missing' }
+      : { kind: 'corrupt', detail: 'unreadable-directory' };
+  }
+}
+
+/** 写门（设计 §6.4）：legacy、已归档 legacy、半写新协作、损坏目录一律拒绝写。
  * 内存标记（legacy/recovery）优先——启动迁移在内存里保留判定，文件标记只是重启后的证据。
  * 返回值不抛出：调用方按 reason 转成工具错误/入站拒绝计数。 */
 export function assertWritable(collabDir, options = {}) {
@@ -50,32 +119,28 @@ export function assertWritable(collabDir, options = {}) {
   if (options.recovery === true) {
     return { ok: false, reason: 'recovery', detail: 'memory-flag' };
   }
-  if (readMigration(collabDir) !== null) {
-    return { ok: false, reason: 'legacy', detail: MIGRATION_FILE_NAME };
+  const classification = classifyCollabDir(collabDir);
+  if (classification.kind === 'legacy' || classification.kind === 'archived-legacy') {
+    return { ok: false, reason: 'legacy', detail: classification.detail };
   }
-  if (readRecovery(collabDir) !== null) {
-    return { ok: false, reason: 'recovery', detail: RECOVERY_FILE_NAME };
+  if (classification.kind === 'recovery') {
+    return { ok: false, reason: 'recovery', detail: classification.detail };
   }
-  if (isHalfCreated(collabDir)) {
-    return { ok: false, reason: 'recovery', detail: 'carrier-without-ledger' };
-  }
-  if (isLegacyCollab(collabDir)) {
-    return { ok: false, reason: 'legacy', detail: 'member.json' };
+  if (classification.kind === 'corrupt') {
+    return { ok: false, reason: 'corrupt', detail: classification.detail };
   }
   return { ok: true };
 }
 
-/* 半写：新形态标记已落、台账未落。invite-stub 无台账属合法形态，不在此列（设计 §8）。 */
-function isHalfCreated(dir) {
-  return readCarrierFormat(dir) === CARRIER_FORMAT_SESSION_SEATS && !existsSync(join(dir, LEDGER_FILE_NAME));
-}
-
-/** 归档标记：原子写 migration.json，幂等（已有合规标记不重写）；失败只告警并返回失败结果，
- * 调用方继续按只读处理（失败安全），不改写旧台账。 */
+/** 归档标记：原子写 migration.json，幂等（已有合规标记且目录仍是可读档案时不重写）；
+ * 失败只告警并返回失败结果，调用方继续按只读处理（失败安全），不改写旧台账。 */
 export function markLegacyCompleted(collabDir, options = {}) {
   const existing = readMigration(collabDir);
   if (existing !== null) {
-    return { ok: true, record: existing, written: false };
+    if (isLegacyReadable(collabDir)) {
+      return { ok: true, record: existing, written: false };
+    }
+    return { ok: false, record: null, written: false, error: new Error('目录有 migration.json 但不是可读的 legacy 档案，拒绝按归档处理') };
   }
   if (!isLegacyCollab(collabDir)) {
     return { ok: false, record: null, written: false, error: new Error('目录不是 legacy 形态，拒绝写 migration.json') };
@@ -121,7 +186,7 @@ function applyForumRoster(summary, dir, warnings) {
   if (events.length === 0) {
     return summary;
   }
-  const roster = foldMemberEvents(events).map((entry) => ({
+  const roster = foldLegacyMemberEvents(events).map((entry) => ({
     instanceId: entry.instanceId,
     identityName: entry.identityName,
     role: null,
@@ -142,7 +207,7 @@ function readLegacyMemberEvents(dir, warnings) {
       continue;
     }
     const parsed = parseJsonOrNull(line);
-    if (parsed === null || !isMemberEventShape(parsed)) {
+    if (parsed === null || !isLegacyMemberEventShape(parsed)) {
       skipped += 1;
       continue;
     }
@@ -152,6 +217,46 @@ function readLegacyMemberEvents(dir, warnings) {
     warnings.push(`members.jsonl 有 ${skipped} 行不是合法成员事件，已跳过（只读不修复）`);
   }
   return events;
+}
+
+/* 0.1.x 成员事件判据与折叠（与 members.js 的现行校验器分开：未来给事件加 sessionId 等必填字段时，
+ * 旧归档仍应按旧形状可读）。 */
+function isLegacyMemberEventShape(entry) {
+  if (!isPlainObject(entry) || !isId(entry.eventId)) {
+    return false;
+  }
+  if (entry.kind !== 'join' && entry.kind !== 'leave') {
+    return false;
+  }
+  return isId(entry.instanceId) && isIdentityName(entry.identityName) && isTimestamp(entry.ts);
+}
+
+function foldLegacyMemberEvents(events) {
+  const latest = new Map();
+  for (const event of events) {
+    const held = latest.get(event.instanceId);
+    if (held === undefined || compareLegacyEvents(event, held) > 0) {
+      latest.set(event.instanceId, event);
+    }
+  }
+  const members = [];
+  for (const event of latest.values()) {
+    if (event.kind === 'join') {
+      members.push({ instanceId: event.instanceId, identityName: event.identityName });
+    }
+  }
+  return members.sort((left, right) => (left.instanceId < right.instanceId ? -1 : 1));
+}
+
+function compareLegacyEvents(left, right) {
+  const byTs = Date.parse(left.ts) - Date.parse(right.ts);
+  if (byTs !== 0) {
+    return byTs;
+  }
+  if (left.eventId === right.eventId) {
+    return 0;
+  }
+  return left.eventId < right.eventId ? -1 : 1;
 }
 
 function legacySummary(dir, member, current, warnings) {
@@ -233,7 +338,7 @@ function readLegacySnapshot(dir, warnings) {
   if (loaded === undefined || loaded === null) {
     return null;
   }
-  if (!isPlainObject(loaded) || !isLegacyLedger(loaded.ledger)) {
+  if (!isLegacySnapshotShape(loaded)) {
     warnings.push('snapshot.json 形态不符（旧判据），已忽略');
     return null;
   }
@@ -353,7 +458,11 @@ function isLegacyLedgerHead(ledger) {
     && LEGACY_COLLAB_STATES.includes(ledger.status);
 }
 
+/* 0.2.0 专属字段出现即拒绝：混合目录里不能把新台账行当旧档案的最后状态。 */
 function isLegacyLedgerTail(ledger) {
+  if (ledger.managerTerm !== undefined || ledger.joinSeqNext !== undefined || ledger.managerWindow !== undefined) {
+    return false;
+  }
   if (!Array.isArray(ledger.board) || !isTimestamp(ledger.createdAt) || !isTimestamp(ledger.updatedAt)) {
     return false;
   }
@@ -368,12 +477,34 @@ function isLegacyMemberRows(members) {
 }
 
 function isLegacyMemberRow(entry) {
+  if (entry === null || entry === undefined) {
+    return false;
+  }
+  if (entry.sessionId !== undefined || entry.joinSeq !== undefined) {
+    return false;
+  }
   return isPlainObject(entry)
     && isId(entry.instanceId)
     && isIdentityName(entry.identityName)
     && LEGACY_ROLES.includes(entry.role)
     && LEGACY_MEMBER_STATES.includes(entry.state)
     && isTimestamp(entry.joinedAt);
+}
+
+function isLegacySnapshotShape(snapshot) {
+  if (!isPlainObject(snapshot) || snapshot.managerTerm !== undefined || snapshot.managerWindow !== undefined) {
+    return false;
+  }
+  if (!Number.isInteger(snapshot.version) || snapshot.version < 1) {
+    return false;
+  }
+  if (typeof snapshot.digest !== 'string' || !DIGEST_PATTERN.test(snapshot.digest)) {
+    return false;
+  }
+  if (!isTimestamp(snapshot.receivedAt) || !isLegacyPeer(snapshot.from)) {
+    return false;
+  }
+  return isLegacyLedger(snapshot.ledger);
 }
 
 function isLegacyPeer(peer) {
@@ -397,6 +528,11 @@ function isEndpointShape(endpoint) {
     return false;
   }
   return isPort(endpoint.port);
+}
+
+/** 旧台账判据（供观察窗/脚本的旧形态只读分支复用）：0.2.0 台账行会被显式拒绝。 */
+export function isLegacyLedgerRow(ledger) {
+  return isLegacyLedger(ledger);
 }
 
 /* 旧版对端帧与旧协作写路径的拒绝计数（函数级，接线归 M2/M3）：设计 §6.4 的 legacyInboundRejected
