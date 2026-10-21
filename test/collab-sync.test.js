@@ -786,13 +786,7 @@ test('会话注入分流：拉取两件套帧从不注入（含回填帖）；ma
 
 /* —— 成员侧邀请端到端与跨重启基线 —— */
 
-test('任何成员可邀请端到端：成员侧构造邀请 → 被邀同意 → join → 回填（讨论邀请链闭合）', {
-  /* 产品缺陷 ISSUE：受邀加入的讨论会话不落本地席位（approve 的论坛路径不建席位），
-   * 且 `join.request` 的在席接线收尾未 await（`joinRequestNow` 对 async 域调用判 ok 恒假），
-   * 于是成员侧没有签发邀请的身份（inviteSenderSeatOf 要求活跃席位）。夹具无法在不改 src 的
-   * 前提下造出该身份——本用例待缺陷修复后恢复（覆盖由 e2e-session-invites 的受邀入席链兜底）。 */
-  skip: '产品缺陷 ISSUE：论坛受邀会话无本地席位，成员侧无法签发邀请（approve/join.request 席位收尾缺失）',
-}, async (t) => {
+test('任何成员可邀请端到端：成员侧构造邀请 → 被邀同意 → join → 回填（讨论邀请链闭合）', async (t) => {
   const { wire, selfB, b, collabId, a } = await makeForumPair(t);
   await injectPosts(a.service, collabId, postsOf(3));
   await awaitSync(b.service.sync({ collabId }));   // B 先追平（回填 3 帖）
@@ -807,7 +801,8 @@ test('任何成员可邀请端到端：成员侧构造邀请 → 被邀同意 �
   const inviteMessage = sentOf(b.sent, 'invite', collabId)[0];
   assert.equal(inviteMessage.payload.mode, 'forum');
   assert.equal(inviteMessage.payload.topic, '议题');
-  assert.deepEqual(inviteMessage.payload.members.map((entry) => entry.instanceId).sort(), ['inst-a', 'inst-b', 'inst-c'], '名单 = 折叠成员表 ∪ 目标');
+  assert.deepEqual(inviteMessage.payload.members.map((entry) => entry.instanceId).sort(), ['inst-a', 'inst-b'], '成员条目只含已知席位');
+  assert.deepEqual(inviteMessage.payload.targets.map((entry) => entry.instanceId), ['inst-c'], '目标机器只由 targets 描述');
   await wire.hop(madeC.service, inviteMessage, selfB);
   const joined = await madeC.service.approve({ collabId, approve: true });
   assert.equal(joined.ok, true, joined.message);
