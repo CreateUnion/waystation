@@ -1454,6 +1454,7 @@ test('终态拒绝回执（N-3）：已撤回 / 已过期邀请的 approve 回 j
   const deny = deliveredOf(made.sent, 'join-deny').at(-1);
   assert.equal(deny.payload.sessionId, 'app-session-1', '回执指名到申请会话（目标端据此回滚申请）');
   assert.equal(deny.payload.joinId, invite.inviteId, '无在途 grant 时以 inviteId 兜底定位');
+  assert.equal(deny.payload.inviteId, invite.inviteId, '回执独立携 inviteId，便于追溯是哪条邀请被拒');
   assert.equal(deny.payload.reason, 'aborted');
   assert.equal(deny.to.instanceId, 'inst-a');
   assert.deepEqual(deny.toSessions, ['app-session-1']);
@@ -1468,7 +1469,9 @@ test('终态拒绝回执（N-3）：已撤回 / 已过期邀请的 approve 回 j
   assert.equal(expired.ok, false);
   assert.equal(expired.reason, 'expired');
   await waitFor(() => deliveredOf(expiring.sent, 'join-deny').length > 0 ? true : null, { timeoutMs: 1000 });
-  assert.equal(deliveredOf(expiring.sent, 'join-deny').at(-1).payload.reason, 'expired');
+  const expiredDeny = deliveredOf(expiring.sent, 'join-deny').at(-1);
+  assert.equal(expiredDeny.payload.reason, 'expired');
+  assert.equal(expiredDeny.payload.inviteId, late.inviteId, '过期回执同样携 inviteId');
 });
 
 test('重复 approve：邀请 TTL 在 grant 窗口内到期时仍续发同一 grant，不回终态拒绝', async (t) => {
@@ -1508,6 +1511,35 @@ test('重复 approve：名单已含本席时幂等成功，不回终态拒绝也
     1,
     '名单不重复登记',
   );
+  const snapshots = deliveredOf(made.sent, 'snapshot');
+  assert.equal(snapshots.length, 1, '名单已含时重复 approve 补发当前快照（受邀方据此清 unverified）');
+  assert.ok(snapshots[0].payload.ledger.members.some((entry) => entry.sessionId === 'app-session-1'), '快照含本席');
+  assert.deepEqual(snapshots[0].toSessions, ['app-session-1'], '快照只投本席会话');
+  assert.equal(again.delivery?.ok, true, '返回体如实携带快照投递结果');
+});
+
+test('重复 approve：在途 grant 已过期时重签新 joinId，新 joinId 可确认入席', async (t) => {
+  const made = makeHarness(t, { config: { inviteTtlMs: 300000, joinConfirmTtlMs: 60000 } });
+  const invite = await made.join.createInvite({
+    collabId: COLLAB, managerSessionId: MANAGER_SESSION, targetInstanceId: 'inst-a', targetSessionId: 'app-session-1',
+  });
+  const first = await made.join.handleInviteApproval(inviteApprovalFrame(invite.inviteId, 'app-session-1'));
+  assert.equal(first.joining, true, first.message);
+  made.advance(61000);
+  made.sent.length = 0;
+  const again = await made.join.handleInviteApproval(inviteApprovalFrame(invite.inviteId, 'app-session-1'));
+  assert.equal(again.ok, true, again.message);
+  assert.notEqual(again.joinId, first.joinId, '过期在途记录按换新签新 joinId');
+  assert.equal(deliveredOf(made.sent, 'join-grant').length, 1, '重签走 join-grant');
+  assert.equal(deliveredOf(made.sent, 'join-deny').length, 0, '邀请仍 open 时不得回终态拒绝');
+  assert.deepEqual(
+    made.join.pendingJoiningProjection(COLLAB).map((entry) => entry.joinId),
+    [again.joinId],
+    '在途投影只剩新 joinId',
+  );
+  const confirmed = await made.join.handleJoinConfirm(joinConfirmFrame(again.joinId, 'app-session-1'));
+  assert.equal(confirmed.action, 'join-confirmed', '新 joinId 仍可确认入名单');
+  assert.equal(made.local.ledger.members.filter((entry) => entry.sessionId === 'app-session-1').length, 1);
 });
 
 test('目标端撤回：挂起邀请置 withdrawn 并停投', async (t) => {

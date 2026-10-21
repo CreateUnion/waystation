@@ -1935,11 +1935,21 @@ async function resendAcceptOf(joinState, record, { collabId, inviteId, sessionId
   if (idOf(manager.sessionId) === null) {
     return failureMessage('挂起邀请缺少邀请者会话标识——approve 无法重发（请重新邀请）', { reason: 'unknown-manager', inviteId });
   }
+  /* 首份 grant 到达时申请台账已清；站长重签的新 joinId 只有在本机仍有该申请时才过准入门。
+   * 重发前按首次接受同口径补记，重复接受才不会「resent:true 却永远进不了席」。 */
+  pruneApplications(joinState);
+  const rebuilt = findApplication(joinState, collabId, sessionId) === null;
+  if (rebuilt) {
+    rememberInviteAcceptanceOf(joinState, { collabId, sessionId, managerInstanceId: manager.instanceId });
+  }
   const sent = await sendSeatFrame(joinState, {
     collabId, instanceId: manager.instanceId, sessionId: manager.sessionId, type: 'approve',
     payload: { inviteId }, fromSessionId: sessionId,
   });
   if (sent.ok !== true) {
+    if (rebuilt) {
+      forgetInviteAcceptanceOf(joinState, collabId, sessionId);
+    }
     return failureMessage(`邀请接受帧重发失败：${sent.reason}——邀请记录仍在，可重试`, { reason: 'send-failed', inviteId });
   }
   return { ok: true, accepted: true, pending: true, idempotent: true, inviteId, resent: true, delivery: sent };
@@ -2127,7 +2137,10 @@ async function approveInviteForSeat(joinState, input) {
    * 重复 approve 是重试而非新申请——邀请 TTL 到期/已接受只说明「不能再新开一次入席」，
    * 不得据此把已成立的席位或仍有效的 grant 打回终态（目标端会据此回滚席位，造成名单与席位分叉）。 */
   if (isRosterMember(local, input.instanceId, input.sessionId)) {
-    return { ok: true, member: true, alreadyMember: true, inviteId: input.inviteId };
+    /* 名单已含时重复 approve 是重试：补发当前快照，受邀方据此清 unverified；
+     * 快照投递失败只如实回传，不改变「已入席」的既成事实。 */
+    const delivery = await sendSnapshotToSeatOf(joinState, local, { instanceId: input.instanceId, sessionId: input.sessionId });
+    return { ok: true, member: true, alreadyMember: true, inviteId: input.inviteId, delivery };
   }
   const existing = books.joining.registry.find(input.collabId, input.sessionId);
   if (existing !== null && joinState.now() < existing.expiresAt) {
@@ -2165,6 +2178,9 @@ async function beginSeatJoiningOf(joinState, local, books, input) {
   if (begun.ok !== true) {
     return beginJoiningFailureOf(joinState, local, input, begun);
   }
+  if (typeof begun.previousJoinId === 'string') {
+    forgetSeatDraftOf(joinState, begun.previousJoinId);
+  }
   joinState.seatNames.set(begun.joinId, input.identityName ?? joinState.state.self.identityName);
   if (input.inviteId !== undefined) {
     joinState.joinInvites.set(begun.joinId, { inviteId: input.inviteId, instanceId: input.instanceId, sessionId: input.sessionId });
@@ -2172,6 +2188,7 @@ async function beginSeatJoiningOf(joinState, local, books, input) {
   const saved = books.joining.save();
   if (saved.ok !== true) {
     books.joining.registry.abortJoining(begun.joinId, 'aborted');
+    forgetSeatDraftOf(joinState, begun.joinId);
     return failureMessage(`在途入席台账写入失败：${saved.reason}——未签发 join-grant`, { reason: 'persist-failed' });
   }
   return { ok: true, joinId: begun.joinId, record: books.joining.registry.get(begun.joinId) };
@@ -2216,6 +2233,7 @@ async function grantSeatOf(joinState, local, books, record, managerSessionId, in
   });
   if (sent.ok !== true) {
     books.joining.registry.abortJoining(record.joinId, 'aborted');
+    forgetSeatDraftOf(joinState, record.joinId);
     books.joining.save();
     return failureMessage(`join-grant 发送失败：${sent.reason}——在途 grant 已作废`, { reason: 'send-failed' });
   }
@@ -2489,13 +2507,13 @@ function confirmJoiningOf(joinState, joinId, sessionId, input) {
   if (prepared.ok !== true) {
     return prepared;
   }
-  const refusal = confirmStateRefusalOf(found, /** @type {any} */ (prepared), joinId);
+  const refusal = confirmStateRefusalOf(joinState, found, /** @type {any} */ (prepared), joinId);
   if (refusal !== null) {
     return refusal;
   }
   const confirmed = found.books.joining.registry.confirmJoining(joinId, sessionId, /** @type {any} */ (prepared).confirmInput);
   if (confirmed.ok !== true) {
-    return confirmFailureOf(found, confirmed);
+    return confirmFailureOf(joinState, found, joinId, confirmed);
   }
   return finishConfirmOf(joinState, found, sessionId, prepared, joinId);
 }
@@ -2503,19 +2521,22 @@ function confirmJoiningOf(joinState, joinId, sessionId, input) {
 /* confirm 前的当前态校验（不依赖入站门）：协作归档/终态一律拒绝；未入名单的旧 grant 必须仍属
  * 本机当前任期——站长更替后旧 grant 不得在任期内落地（已入名单的席位保留，见设计 §4.4.8）。
  * fail-closed：两种拒绝都作废在途记录并落盘，避免幽灵 grant 滞留到下次清扫。 */
-function confirmStateRefusalOf(found, prepared, joinId) {
+function confirmStateRefusalOf(joinState, found, prepared, joinId) {
   if (prepared.local === undefined || isLocalArchivedState(prepared.local)) {
-    return refuseStaleJoinOf(found, joinId, 'aborted', '协作已结束（或本机已退出）——在途 grant 已作废');
+    return refuseStaleJoinOf(joinState, found, joinId, 'aborted', '协作已结束（或本机已退出）——在途 grant 已作废');
   }
   if (prepared.alreadyMember !== true && found.record.managerTerm !== managerTermOf(prepared.local)) {
-    return refuseStaleJoinOf(found, joinId, 'manager-changed', '站长任期已变更（managerTerm 不符）——旧 grant 已作废');
+    return refuseStaleJoinOf(joinState, found, joinId, 'manager-changed', '站长任期已变更（managerTerm 不符）——旧 grant 已作废');
   }
   return null;
 }
 
-function refuseStaleJoinOf(found, joinId, reason, message) {
-  found.books.joining.registry.abortJoining(joinId, reason);
+function refuseStaleJoinOf(joinState, found, joinId, reason, message) {
+  const aborted = found.books.joining.registry.abortJoining(joinId, reason);
   found.books.joining.save();
+  if (aborted.ok === true) {
+    forgetSeatDraftOf(joinState, joinId);
+  }
   return failureMessage(message, { reason });
 }
 
@@ -2565,9 +2586,10 @@ function finishConfirmOf(joinState, found, sessionId, prepared, joinId) {
   return { ok: true, member: true, joinId, joinSeq: committed.joinSeq, version: preparedData.local?.ledger?.version ?? null };
 }
 
-function confirmFailureOf(found, confirmed) {
+function confirmFailureOf(joinState, found, joinId, confirmed) {
   if (confirmed.reason === 'expired') {
     found.books.joining.save();
+    forgetSeatDraftOf(joinState, joinId);
   }
   const messages = {
     expired: '在途入席已过期（joinId 已作废）',
@@ -2651,8 +2673,19 @@ function nameForSeat(joinState, record) {
   return record.instanceId === joinState.state.self.instanceId ? joinState.state.self.identityName : record.instanceId;
 }
 
+/* 随 joinId 存放的姓名与邀请归属条目只服务于该次确认；在途记录换新、作废或确认为席位后
+ * 就再没有读取点，不同步清掉会让每次过期重试在进程内留一条永不回收的旧条目。 */
+function forgetSeatDraftOf(joinState, joinId) {
+  if (typeof joinId !== 'string') {
+    return;
+  }
+  joinState.seatNames.delete(joinId);
+  joinState.joinInvites.delete(joinId);
+}
+
 function markInviteAcceptedOf(joinState, books, joinId, record) {
   const held = joinState.joinInvites.get(joinId);
+  joinState.seatNames.delete(joinId);
   if (held === undefined) {
     return;
   }
@@ -3368,6 +3401,7 @@ function abortJoiningsForInviteOf(joinState, local, books, collabId, record) {
       continue;
     }
     if (books.joining.registry.abortJoining(joining.joinId, 'aborted').ok === true) {
+      forgetSeatDraftOf(joinState, joining.joinId);
       aborted.push(joining);
     }
   }
@@ -3900,7 +3934,7 @@ async function sendInviteRejectionReceiptOf(joinState, { collabId, inviteId, ins
   const joinId = joining !== null && joining.instanceId === instanceId ? joining.joinId : inviteId;
   await sendSeatFrame(joinState, {
     collabId, instanceId, sessionId, type: 'join-deny',
-    payload: { joinId, reason: reason === 'expired' ? 'expired' : 'aborted', sessionId },
+    payload: { joinId, inviteId, reason: reason === 'expired' ? 'expired' : 'aborted', sessionId },
     fromSessionId: managerSessionId,
   }).catch((error) => joinState.log.warn('邀请终态拒绝回执发送失败', { collabId, inviteId, reason: error?.message }));
 }
@@ -3948,6 +3982,7 @@ async function expireJoiningOf(joinState, at) {
     books.joining.save();
     expired += result.expired;
     for (const record of result.records) {
+      forgetSeatDraftOf(joinState, record.joinId);
       if (local !== undefined) {
         await sendJoinDenyOf(joinState, local, record, record.joinId, 'expired', record.managerTerm);
       }
@@ -4010,6 +4045,7 @@ async function invalidateForManagerChangeOf(joinState, managerTerm, collabId = n
     books.joining.save();
     aborted += result.aborted.length;
     for (const record of result.abortedRecords) {
+      forgetSeatDraftOf(joinState, record.joinId);
       if (local !== undefined) {
         await sendJoinDenyOf(joinState, local, record, record.joinId, 'manager-changed', record.managerTerm);
       }
@@ -4051,6 +4087,7 @@ function abortJoiningOf(joinState, joinId, reason) {
   if (aborted.ok !== true) {
     return failureMessage(`在途入席不可中止：${aborted.reason}`, { reason: aborted.reason });
   }
+  forgetSeatDraftOf(joinState, joinId);
   found.books.joining.save();
   return { ok: true, joinId, reason: aborted.reason, record: aborted.record };
 }
@@ -4064,6 +4101,7 @@ function releaseJoiningOf(joinState, collabId, sessionId) {
   const books = booksOf(joinState, collab);
   const released = books.joining.registry.releaseJoining(collab, session);
   if (released.ok === true && released.released === true) {
+    forgetSeatDraftOf(joinState, released.record?.joinId);
     books.joining.save();
   }
   return released;

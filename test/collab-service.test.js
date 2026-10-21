@@ -1926,7 +1926,8 @@ test('同机敲门放行指引不指名：指引只给身份与端点，放行�
   const knocker = 'sess-knock-b';
   const made = makeService(t, {
     requestJoin: async ({ name }) => {
-      /* 同机回环：发现层把敲门回送到本机（与真实 UDP 回环同形）。 */
+      /* 直接调用 joinKnock 的合成路径：发现层会丢弃本机自答，这里绕过发现层，只用确定性输入
+       * 验证放行指引与同意门守卫（不是真实 UDP 回环的复刻）。 */
       made.service.joinKnock({
         instanceId: 'inst-self', identityName: '本机', address: '127.0.0.1', port: 17321, knockId: 'knock-n4', name,
       });
@@ -2725,4 +2726,140 @@ test('生命周期清扫：不在注册表的 invite-stub 目录也清理过期�
     return (book?.invites ?? []).length === 0 ? true : null;
   }, { timeoutMs: 4000 });
   old.service.close();
+});
+
+/* —— 0.2.0 两段式重试面：站内直投帧的手工转达（不经网络层） —— */
+
+/* 出站消息 → 完整协议帧：捕获面只有 to/fromSessionId 等投递字段，接收面需要 v/cap/from/ts。
+ * 身份取发送方 self，会话取消息的签发席位——与真实出站组帧同一取数面。 */
+function relayFrameOf(message, senderSelf) {
+  seq++;
+  const from = { ...senderSelf };
+  if (typeof message.fromSessionId === 'string') {
+    from.sessionId = message.fromSessionId;
+  }
+  return {
+    v: 1,
+    cap: 2,
+    type: message.type,
+    msgId: `relay-${seq}`,
+    collabId: message.collabId,
+    from,
+    ts: new Date().toISOString(),
+    payload: message.payload,
+  };
+}
+
+function lastSentOf(list, type) {
+  return list.filter((message) => message.type === type).at(-1) ?? null;
+}
+
+async function relayInto(target, message, senderSelf) {
+  assert.ok(message !== null, `缺少待转达的 ${senderSelf.instanceId} 出站帧`);
+  return receive(target, relayFrameOf(message, senderSelf));
+}
+
+/* 重试入席的双机夹具：站长侧在途 TTL 短（便于自然过期），受邀侧确认重发轮拉长（避免噪音帧）。 */
+function resendPairOf(t) {
+  const manager = makeService(t, {
+    self: { instanceId: 'inst-m', identityName: '主机甲', port: 17401 },
+    config: { joinConfirmTtlMs: 1000, seatPresenceIntervalMs: 20 },
+  });
+  const member = makeService(t, {
+    self: { instanceId: 'inst-a', identityName: '应用甲', port: 17402 },
+    config: { joinConfirmTtlMs: 60000 },
+  });
+  t.after(() => manager.service.close());
+  const created = manager.service.create({
+    name: '重试入席',
+    topic: '主题',
+    mode: 'managed',
+    sessionId: 'sess-m',
+    targets: [{ instanceId: 'inst-a', identityName: '应用甲', address: '127.0.0.1', port: 17402 }],
+  });
+  assert.equal(created.ok, true, String(created.message));
+  return { manager, member, collabId: created.collabId };
+}
+
+/* 一次完整的「受邀方接受 → approve 到站长 → 站长签 grant → grant 回受邀方」，
+ * 返回双方观察到的结论；confirm 是否转达由调用方决定（重试用例要模拟丢帧）。 */
+async function acceptThroughGrantOf(pair, inviteId) {
+  const { manager, member, collabId } = pair;
+  const accepted = await member.service.join.acceptInvite({ collabId, inviteId, sessionId: 'sess-a' });
+  assert.equal(accepted.ok, true, String(accepted.message));
+  assert.equal((await relayInto(manager.service, lastSentOf(member.direct, 'approve'), member.self)).ok, true, 'approve 进入站长核');
+  const grant = lastSentOf(manager.direct, 'join-grant');
+  const admitted = await relayInto(member.service, grant, manager.self);
+  assert.equal(admitted.ok, true, admitted.ok === true ? 'grant 通过受邀方准入门' : `grant 未通过受邀方准入门：${admitted.reason}`);
+  return { accepted, grant };
+}
+
+test('重复接受：在途 grant 过期后站长重签 joinId，受邀方重建申请台账后准入并 confirm 入名单', async (t) => {
+  const pair = resendPairOf(t);
+  const { manager, member, collabId } = pair;
+  const invited = await manager.service.join.createInvite({
+    collabId, managerSessionId: 'sess-m', targetInstanceId: 'inst-a', targetSessionId: 'sess-a',
+  });
+  assert.equal(invited.ok, true, String(invited.message));
+  assert.equal((await relayInto(member.service, lastSentOf(manager.direct, 'invite'), manager.self)).ok, true, '邀请进入受邀核');
+
+  const first = await acceptThroughGrantOf(pair, invited.inviteId);
+  assert.equal(lastSentOf(member.direct, 'join-confirm').payload.joinId, first.grant.payload.joinId, '受邀方对首份 grant 发 confirm');
+
+  /* 模拟 confirm 丢失且站长不可达：丢弃 confirm，只让站长侧在途记录按 TTL 自然过期
+   * （过期回执照发但不转达——不可达的语义）。 */
+  manager.service.start();
+  await waitFor(() => manager.service.join.pendingJoiningProjection(collabId).length === 0 ? true : null, { timeoutMs: 4000 });
+  assert.equal(lastSentOf(manager.direct, 'join-deny')?.payload.joinId, first.grant.payload.joinId, '过期回执指向旧 joinId（本用例按不可达丢弃）');
+
+  member.direct.length = 0;
+  const again = await acceptThroughGrantOf(pair, invited.inviteId);
+  assert.equal(again.accepted.resent, true, '未成席的重复接受重发 approve');
+  assert.notEqual(again.grant.payload.joinId, first.grant.payload.joinId, '站长对仍 open 的邀请重签新 joinId');
+  const confirm2 = lastSentOf(member.direct, 'join-confirm');
+  assert.equal(confirm2.payload.joinId, again.grant.payload.joinId, '受邀方对新 joinId 发出 confirm');
+  assert.equal((await relayInto(manager.service, confirm2, member.self)).ok, true, 'confirm 进入站长核');
+
+  const rows = (await manager.service.view({ collabId })).ledger.members
+    .filter((entry) => entry.instanceId === 'inst-a' && entry.sessionId === 'sess-a');
+  assert.equal(rows.length, 1, 'confirm 后本席进入共享名单');
+  const snapshot = lastSentOf(manager.direct, 'snapshot');
+  assert.equal((await relayInto(member.service, snapshot, manager.self)).ok, true, '入名单后快照回到本席');
+  assert.notEqual(member.service.localSeatOf(collabId, 'sess-a')?.unverified, true, '含本席快照清除未确认标记');
+});
+
+test('同机双会话（N-4）：敲门者已有自己的 join 事件时，另一点头会话可触发接线', async (t) => {
+  const collabId = 'collab-n4-selfjoined';
+  const knocker = 'sess-knock-b';
+  const other = 'sess-knock-c';
+  const bindings = new Map();
+  const made = makeService(t, {
+    requestJoin: async () => ({ ok: true, replies: [] }),
+    bindings,
+  });
+  await receive(made.service, inviteFrame({
+    collabId, name: '讨论甲', mode: 'forum',
+    members: [peer('inst-a', '主机甲'), peer('inst-self', '本机', 17321)],
+  }));
+  const knocked = await made.service.join.request({ name: '讨论甲', sessionId: knocker });
+  assert.equal(knocked.ok, true, knocked.message);
+  assert.equal(knocked.knocked, true, '敲门登记在册');
+
+  /* 敲门者自己的 join 事件经对表回填到达（回填合并不滤本机实例；入站 join 帧则会滤，
+   * 因此这里必须走成员事件并集这条真实面）。 */
+  const selfJoin = {
+    eventId: randomUUID(), kind: 'join', instanceId: 'inst-self', sessionId: knocker,
+    identityName: '本机', ts: new Date().toISOString(),
+  };
+  const bucket = await receive(made.service, collabFrame('history-bundle', collabId, peer('inst-a', '主机甲'), {
+    cursor: null, more: false, posts: [], overlap: [], meta: {}, members: [selfJoin], endpoints: {},
+  }));
+  assert.equal(bucket.ok, true, '敲门者的历史 join 事件随对表回填落地');
+
+  const accepted = await approveInviteWithConsentOf(made.service, collabId, other);
+  assert.equal(accepted.ok, true, accepted.message);
+  assert.equal(accepted.joined, true, '点头的是 C 自己');
+  await waitFor(() => made.service.localSeatOf(collabId, knocker) !== null ? true : null, { timeoutMs: 2000 });
+  assert.equal(made.service.localSeatOf(collabId, knocker)?.state, 'member', '敲门者已有 join 事件：接线不被幽灵席位守卫拦下');
+  assert.equal(bindings.get(collabId)?.sessionId, knocker, '接线落到敲门会话');
 });
