@@ -4,6 +4,7 @@ import dgram from 'node:dgram';
 import { networkInterfaces } from 'node:os';
 import {
   CAPABILITY_PROBE_RETRY_BACKOFF_MS,
+  DISCOVERY_DISABLE_ENV,
   DISCOVERY_REPLY_MIN_INTERVAL_MS,
   JOIN_KNOCK_RETRY_COUNT,
   JOIN_KNOCK_RETRY_INTERVAL_MS,
@@ -16,8 +17,8 @@ import {
   fitProbeAckDatagram,
 } from '../src/net/discovery.js';
 import { createKnownHosts, participantsStateOf } from '../src/net/known-hosts.js';
-import { MAX_COLLAB_COUNT, fitJoinResolveAck } from '../src/net/protocol.js';
-import { makeTempDir, pickFreePort, waitFor } from './helpers.js';
+import { MAX_COLLAB_COUNT, PROTOCOL_VERSION, fitJoinResolveAck, validateProbe, validateProbeAck } from '../src/net/protocol.js';
+import { makeTempDir, pickFreePort, testDiscoveryOffEnv, waitFor } from './helpers.js';
 
 const SELF_A = { instanceId: 'aaaaaaaa-0000-4000-8000-000000000001', identityName: '主机甲' };
 const SELF_B = { instanceId: 'bbbbbbbb-0000-4000-8000-000000000002', identityName: '主机乙' };
@@ -1444,4 +1445,98 @@ test('体积整形保留能力字段：probe-ack 先弃会话、join-ack 先截�
   assert.equal(resolveFit.participants, 2, '弃名保能力字段');
   assert.equal(Object.hasOwn(resolveFit, 'name'), false);
   assert.ok(Buffer.byteLength(JSON.stringify(resolveFit)) <= 512);
+});
+
+/* —— 测试专用发现开关（进程级 e2e 的 LAN 隔离）：缺省关闭、置位后不绑定不发报 —— */
+
+/* 同进程内临时切换开关：用例结束原样恢复，避免污染本文件其它用例（Node 测试文件内串行执行）。 */
+async function withDiscoverySwitch(value, run) {
+  const previous = process.env[DISCOVERY_DISABLE_ENV];
+  if (value === undefined) {
+    delete process.env[DISCOVERY_DISABLE_ENV];
+  } else {
+    process.env[DISCOVERY_DISABLE_ENV] = value;
+  }
+  try {
+    return await run();
+  } finally {
+    if (previous === undefined) {
+      delete process.env[DISCOVERY_DISABLE_ENV];
+    } else {
+      process.env[DISCOVERY_DISABLE_ENV] = previous;
+    }
+  }
+}
+
+test('testDiscoveryOffEnv：统一构造 e2e 环境（继承父环境＋开关置位，overrides 后置）', () => {
+  const env = testDiscoveryOffEnv({ WAYSTATION_HOME: 'D:\\tmp\\ws-home' });
+  assert.equal(env[DISCOVERY_DISABLE_ENV], '1');
+  assert.equal(env.WAYSTATION_HOME, 'D:\\tmp\\ws-home');
+  assert.equal(env.PATH, process.env.PATH, '继承父进程环境（spawn 子进程需要完整的基底）');
+});
+
+test('测试开关开启：不绑定端口、不发送任何数据报，扫描/敲门/解析/探测返回空或未知', { timeout: 15000 }, async (t) => {
+  await withDiscoverySwitch('1', async () => {
+    /* 裸对端占住端口：开关若仍尝试绑定即 EADDRINUSE——启动成功本身即「不绑定」的证据。 */
+    const { raw, received } = await startRawPeer(t);
+    const occupiedPort = raw.address().port;
+    const knownHosts = createKnownHosts({ dataDir: makeTempDir(t), log: quietLog() });
+    knownHosts.remember({ address: '127.0.0.1', port: occupiedPort });
+    const node = createDiscovery({
+      port: occupiedPort,
+      bindAddress: '127.0.0.1',
+      instanceId: SELF_A.instanceId,
+      identityName: SELF_A.identityName,
+      getCollabCount: () => 0,
+      knownHosts,
+      log: quietLog(),
+    });
+    t.after(() => node.close());
+    await node.start();
+    assert.equal(node.stats().bound, false, '开关开启不得绑定套接字（端口被占也能正常启动）');
+    assert.equal(node.stats().disabled, true);
+    assert.deepEqual(await node.scan({ windowMs: 120 }), [], '扫描返回空清单');
+    assert.deepEqual(await node.requestJoin({ name: '联调讨论' }), [], '敲门返回空清单');
+    assert.equal(
+      await node.requestJoinResolve({ name: '联调讨论', address: '127.0.0.1', port: occupiedPort, timeoutMs: 120 }),
+      null,
+      '按名解析按「窗口内无应答」收口',
+    );
+    assert.deepEqual(
+      await node.probeCapability({ address: '127.0.0.1', port: occupiedPort, timeoutMs: 120 }),
+      { capability: 'unknown', responder: null },
+      '能力探测按未知收口',
+    );
+    node.announce();
+    await new Promise((resolve) => setTimeout(resolve, 300));   // 给任何漏发数据报留出到达窗口
+    assert.deepEqual(received, [], '开关开启时不得发出任何数据报（广播、清单单播、敲门、单播探测）');
+    const counters = node.stats();
+    assert.deepEqual([counters.selfIntroductions, counters.joinKnocksSent, counters.joinResolveRequestsSent, counters.capabilityProbesSent], [0, 0, 0, 0], '自介、敲门、解析、探测一条都未发出');
+    assert.equal(knownHosts.stats().remembered, 1, '清单只有用例预置的一条，发现面未新增写入');
+  });
+});
+
+test('测试开关关闭（缺省）：发现面照常发送与收敛（单播探测不受影响）', { timeout: 15000 }, async (t) => {
+  await withDiscoverySwitch(undefined, async () => {
+    const portA = await pickFreePort();
+    const portB = await pickFreePort();
+    const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port: portA });
+    await startFakePeer(t, { port: portB, address: '127.0.0.2', participants: 2 });
+    assert.equal(a.node.stats().disabled, false, '未设置开关时发现面保持既有行为');
+    const result = await a.node.probeCapability({ address: '127.0.0.2', port: portB });
+    assert.equal(result.capability, 'supported', '探测请求已发出并收到应答');
+    assert.equal(a.node.stats().capabilityProbesSent, 1);
+  });
+});
+
+test('测试开关只关发现面：协议校验与纯函数照常工作', async () => {
+  await withDiscoverySwitch('1', () => {
+    const probe = { v: PROTOCOL_VERSION, type: 'probe', instanceId: SELF_A.instanceId, identityName: SELF_A.identityName };
+    assert.equal(validateProbe(probe).ok, true, '合法探测报文仍通过校验');
+    assert.equal(validateProbe({ ...probe, v: 2 }).ok, false, '版本不符仍被拒绝');
+    const ack = { v: PROTOCOL_VERSION, type: 'probe-ack', instanceId: SELF_B.instanceId, identityName: SELF_B.identityName, collabCount: 0, port: 17321 };
+    assert.equal(validateProbeAck(ack).ok, true, '扫描应答校验不受开关影响');
+    assert.deepEqual(broadcastTargets({ eth: [{ family: 'IPv4', address: '10.1.2.3', netmask: '255.255.255.0', internal: false }] }), ['10.1.2.255']);
+    assert.deepEqual(fitProbeAckDatagram(ack), ack, '体积整形纯函数照常工作');
+  });
 });

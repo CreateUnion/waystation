@@ -4,8 +4,16 @@ import { tmpdir } from 'node:os';
 import { createServer } from 'node:net';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { DISCOVERY_DISABLE_ENV } from '../src/net/discovery.js';
 
 export const repoRoot = fileURLToPath(new URL('..', import.meta.url));
+
+/** 进程级 e2e 的统一发现隔离环境：spawn 临时核心（含桥按需拉起核心的子进程）时传入——
+ * 临时核心不得向真实 LAN 广播/探测，否则会扫到用户真实运行的核心并向其注入探测/敲门事件。
+ * overrides 后置，便于用例再覆盖 WAYSTATION_HOME 等变量。 */
+export function testDiscoveryOffEnv(overrides = {}) {
+  return { ...process.env, [DISCOVERY_DISABLE_ENV]: '1', ...overrides };
+}
 
 // 每个用例独立的临时目录，用例结束自动清理——测试绝不触碰真实 ~/.waystation
 export function makeTempDir(t) {

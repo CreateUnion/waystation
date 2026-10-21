@@ -6,6 +6,12 @@ import { shortSessionId } from '../util/short-id.js';
 import { PARTICIPANTS_SOURCE_PROBE, PARTICIPANTS_SOURCE_SCAN } from './known-hosts.js';
 import { MAX_COLLAB_COUNT, MAX_DATAGRAM_BYTES, PARTICIPANTS_CAPABILITY, PROTOCOL_VERSION, fitJoinResolveAck, isIdentityName, isPort, newMsgId, supportsParticipants, validateJoinAck, validateJoinKnock, validateJoinResolve, validateJoinResolveAck, validateProbe, validateProbeAck, withParticipantsCapability } from './protocol.js';
 
+/* 测试专用的全局发现开关（WAYSTATION_TEST_ 前缀，仅测试用）：进程级 e2e 起的临时核心不得向真实 LAN
+ * 广播/探测——那会扫到用户真实运行的驿站核心，并向其注入探测/敲门事件。置 1 时本模块不绑定套接字、
+ * 不发送任何数据报：scan/requestJoin 返回空清单、requestJoinResolve 返回 null、probeCapability 返回 unknown；
+ * 纯函数与注入面（回调、清单）照常可用。生产不得设置：未设置时行为与既有完全一致。 */
+export const DISCOVERY_DISABLE_ENV = 'WAYSTATION_TEST_DISABLE_DISCOVERY';
+
 export const DISCOVERY_REPLY_MIN_INTERVAL_MS = 250;
 const MAX_THROTTLED_SOURCES = 64;
 
@@ -118,6 +124,12 @@ function initialCounters() {
   };
 }
 
+/* 开关判定每次构造现读环境（不在模块加载时定格）：同进程的单元测试可开关切换，
+ * 生产缺省路径只多一次环境查表。 */
+function discoveryDisabledIn(env) {
+  return env[DISCOVERY_DISABLE_ENV] === '1';
+}
+
 /* 发现层状态构造：注入缝、套接字、限流表与计数器一次性定格，与行为函数分离。 */
 function discoveryStateOf({
   port, bindAddress = '0.0.0.0', instanceId, identityName, getCollabCount, knownHosts, log, segmentBase = ANCHOR_PORT,
@@ -132,6 +144,7 @@ function discoveryStateOf({
     port, bindAddress, instanceId, identityName, getCollabCount, knownHosts, log, segmentBase,
     onJoinKnock, onJoinResolve, activeSessions,
     joinKnockWindowMs, joinKnockRetryCount, joinKnockRetryIntervalMs, joinKnockReplyMinIntervalMs,
+    disabled: discoveryDisabledIn(process.env),
     socket: dgram.createSocket({ type: 'udp4', reuseAddr: false }),
     counters: initialCounters(),
     collectors: new Set(),
@@ -151,6 +164,11 @@ function discoveryStateOf({
 }
 
 function start(state) {
+  if (state.disabled) {
+    /* 开关开启：连绑定都不做——不占端口、不收任何真实 LAN 报文，从根上杜绝「扫到真实核心」。
+     * 关闭后再启动仍按一次性生命周期语义拒绝（与生产路径的失败面一致）。 */
+    return state.closed ? Promise.reject(new Error('发现组件已关闭，不可再次启动')) : Promise.resolve();
+  }
   // resolve 无参调用：显式 Promise<void> 让类型检查接受 0 参 resolve
   return /** @type {Promise<void>} */ (new Promise((resolve, reject) => {
     state.socket.once('error', reject);
@@ -188,6 +206,7 @@ function statsOf(state) {
     ...state.counters,
     rejected: { ...state.counters.rejected },
     bound: state.bound,
+    disabled: state.disabled,
     scanning: state.collectors.size,
     capabilityProbesInFlight: state.capabilityCollectors.size,
   };
@@ -222,6 +241,9 @@ function probeDatagram(state, purpose) {
  * 发送失败只告警不重试、每次进程启动各发一次（含崩溃自愈重启）。
  * 作用：段内监听者即时把本站点（地址:端口）记入清单——先启动方零动作即掌握后启动者。 */
 function announce(state) {
+  if (state.disabled) {
+    return;
+  }
   try {
     const probe = probeDatagram(state);
     for (const target of outboundTargets(state)) {
@@ -775,6 +797,9 @@ function resolveReplyOf(datagram, rinfo, observed) {
 async function requestJoinResolve(state, input = {}) {
   const target = resolveTargetOf(input);
   const timeoutMs = resolveTimeoutOf(input);
+  if (state.disabled) {
+    return null;   // 测试开关：不发起单播询问，直接按「窗口内无应答」收口
+  }
   /** @type {{ resolveId: string, reply: Record<string, unknown> | null, replies: number, targetInstanceId: string | null }} */
   const collector = { resolveId: newMsgId(), reply: null, replies: 0, targetInstanceId: target.instanceId };
   state.resolveCollectors.add(collector);
@@ -847,6 +872,9 @@ async function sendResolveRequests(state, resolveId, target, timeoutMs) {
 async function probeCapability(state, input = {}) {
   const target = capabilityTargetOf(input);
   const timeoutMs = capabilityTimeoutOf(input);
+  if (state.disabled) {
+    return { capability: 'unknown', responder: null };   // 测试开关：不发单播探测，结论如实为未知
+  }
   /** @type {{ target: { address: string, port: number, instanceId: string | null }, reply: Record<string, unknown> | null, wake: (() => void) | null }} */
   const collector = { target, reply: null, wake: null };
   state.capabilityCollectors.add(collector);
@@ -1032,6 +1060,9 @@ function currentCollabCount(state) {
 }
 
 function sendDatagram(state, buffer, targetPort, targetAddress, kind) {
+  if (state.disabled) {
+    return;   // 防御纵深：入口短路之外，任何出站路径都不得发出数据报
+  }
   state.socket.send(buffer, targetPort, targetAddress, (error) => {
     if (error) {
       state.counters.sendFailures++;
@@ -1046,6 +1077,9 @@ function sendDatagram(state, buffer, targetPort, targetAddress, kind) {
 async function scan(state, { windowMs }) {
   if (!Number.isInteger(windowMs) || windowMs < 1 || windowMs > MAX_QUESTION_TIMEOUT_MS) {
     throw new TypeError(`scan 需要合法的 windowMs（1–${MAX_QUESTION_TIMEOUT_MS} 毫秒）`);
+  }
+  if (state.disabled) {
+    return [];   // 测试开关：不扫描（广播与清单单播都不发），立即以空清单收口
   }
   const collector = new Map();
   state.collectors.add(collector);
@@ -1072,7 +1106,11 @@ async function requestJoin(state, input = {}) {
     throw new TypeError(`requestJoin 需要合法的讨论名（≤64 字符、不含不可见字符的呈现文本），实际：${JSON.stringify(name)}`);
   }
   /* instanceId 可选：敲门按广播发出，给了目标实例就只采信该实例的应答（工具层若已锁定目标）。 */
-  const collector = { knockId: newMsgId(), entries: new Map(), targetInstanceId: optionalInstanceIdOf(input, 'requestJoin') };
+  const targetInstanceId = optionalInstanceIdOf(input, 'requestJoin');
+  if (state.disabled) {
+    return [];   // 测试开关：不广播敲门、不收应答（参数契约仍在启程前校验）
+  }
+  const collector = { knockId: newMsgId(), entries: new Map(), targetInstanceId };
   state.joinCollectors.add(collector);
   try {
     await sendKnocks(state, wanted, collector.knockId);
