@@ -14,9 +14,8 @@ import { checkInboxTool } from '../src/tools/check-inbox.js';
 import { listCollabsTool, createCollabTool, approveInviteTool, allowNextInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, setMuteTool, leaveCollabTool, endCollabTool, inviteTool, requestJoinTool, SEND_MESSAGE_TYPES } from '../src/tools/collab.js';
 import { joinTool, approveJoinTool } from '../src/tools/join.js';
 import { decideTool, handoverTool, takeOverTool } from '../src/tools/governance.js';
-import { COLLAB_MODES, DEFAULT_COLLAB_MODE, MAX_COLLAB_MEMBERS, MAX_IDENTITY_NAME_CHARS, MAX_MESSAGE_TEXT_CHARS, MAX_REASON_CHARS, MAX_TOPIC_CHARS } from '../src/net/protocol.js';
+import { COLLAB_MODES, DEFAULT_COLLAB_MODE, MAX_ACTIVE_SEATS, MAX_IDENTITY_NAME_CHARS, MAX_MESSAGE_TEXT_CHARS, MAX_REASON_CHARS, MAX_TOPIC_CHARS } from '../src/net/protocol.js';
 import { MAX_FORUM_MEMBERS } from '../src/collab/model.js';
-import { buildDefaults } from '../src/config.js';
 import { CHECK_INBOX_DEFAULT_LIMIT, CHECK_INBOX_MAX_LIMIT } from '../src/net/inbound.js';
 
 /* 工具面冻结：name / description / inputSchema 是对外契约（MCP 客户端可见）——规格外提到
@@ -95,9 +94,8 @@ test('规格模块纯净：无取模块语句，导出全为数据', () => {
  * 一律拿真实常量（协议 / 协作模型 / 配置默认值）或真实行为反查；常量改了而规格没跟上，这里响亮失败。 */
 test('规格文本与协议 / 服务常量取值一致', async () => {
   const createCollab = SPECS_BY_NAME.ws_create_collab.inputSchema.properties;
-  const targetLimit = MAX_COLLAB_MEMBERS - 1;
+  const targetLimit = MAX_ACTIVE_SEATS - 1;
   const forumTargetLimit = MAX_FORUM_MEMBERS - 1;
-  const takeoverWindowSec = buildDefaults('本机').takeoverWindowMs / 1000;
 
   assert.ok(createCollab.targets.description.includes(`1–${targetLimit} 项`));
   assert.ok(createCollab.targets.description.includes(`至多 ${forumTargetLimit} 项`));
@@ -113,11 +111,91 @@ test('规格文本与协议 / 服务常量取值一致', async () => {
   assert.ok(SPECS_BY_NAME.ws_send_message.inputSchema.properties.type.description.includes(SEND_MESSAGE_TYPES.join(' / ')));
   assert.ok(SPECS_BY_NAME.ws_check_inbox.description.includes(`默认 ${CHECK_INBOX_DEFAULT_LIMIT} 条、上限 ${CHECK_INBOX_MAX_LIMIT} 条`));
   assert.ok(SPECS_BY_NAME.ws_check_inbox.inputSchema.properties.limit.description.includes(`默认 ${CHECK_INBOX_DEFAULT_LIMIT}，上限 ${CHECK_INBOX_MAX_LIMIT}`));
-  assert.ok(SPECS_BY_NAME.ws_take_over.description.includes(`默认 ${takeoverWindowSec}s`));
   /* 「缺省 reply」不是常量、而是工具层对缺省消息类型的承诺：调 handler 反查真实值
    * （服务层另有一层同值兜底，属纵深防御）。 */
   const defaultType = await sendMessageDefaultType();
   assert.ok(SPECS_BY_NAME.ws_send_message.inputSchema.properties.type.description.includes(`缺省 ${defaultType}`));
+});
+
+/* 会话级参与者 0.2.0 的工具面形态（设计 §9）：这些字段是 handler 接线的对前面——缺一个就说明
+ * 规格没跟上设计。此处只断言「存在与语义关键词」，措辞变动不红；逐字节面由冻结快照兜底。 */
+test('会话级工具面：双字段定向与确认令牌齐备', () => {
+  const propertiesOf = (name) => SPECS_BY_NAME[name].inputSchema.properties;
+
+  const sendMessage = propertiesOf('ws_send_message');
+  assert.ok(sendMessage.to.description.includes('实例'));
+  assert.ok(sendMessage.toSessionId.description.includes('短码'));
+  assert.ok(sendMessage.toSessionId.description.includes('精确匹配'));
+  assert.deepEqual(SPECS_BY_NAME.ws_send_message.inputSchema.required, ['collabId', 'text']);
+
+  const handover = propertiesOf('ws_handover');
+  assert.ok(handover.targetSessionId.description.includes('短码'));
+  assert.ok(handover.offerId.description.includes('offerId'));
+  assert.ok(handover.confirmToken.description.includes('confirmToken'));
+  assert.equal(handover.target.description.includes('发起'), true, 'target 只在站长发起角色使用');
+  assert.deepEqual(SPECS_BY_NAME.ws_handover.inputSchema.required, ['collabId'], '双角色：目标确认不带 target');
+  assert.ok(SPECS_BY_NAME.ws_handover.description.includes('120'));
+  assert.ok(SPECS_BY_NAME.ws_handover.description.includes('不开'));
+
+  const takeOver = propertiesOf('ws_take_over');
+  assert.ok(takeOver.confirmToken.description.includes('令牌'));
+  assert.equal(Object.hasOwn(takeOver, 'confirm'), false, '无令牌的 confirm:true 不再暴露');
+  assert.deepEqual(SPECS_BY_NAME.ws_take_over.inputSchema.required, ['collabId']);
+  assert.ok(SPECS_BY_NAME.ws_take_over.description.includes('不可达'));
+  assert.ok(SPECS_BY_NAME.ws_take_over.description.includes('窗口'));
+});
+
+test('会话级工具面：返回面与其余工具同步会话语义', () => {
+  const propertiesOf = (name) => SPECS_BY_NAME[name].inputSchema.properties;
+
+  assert.ok(SPECS_BY_NAME.ws_invite.description.includes('inviteId'));
+  assert.ok(SPECS_BY_NAME.ws_invite.description.includes('forum'));
+  assert.equal(Object.hasOwn(propertiesOf('ws_withdraw_invite'), 'inviteId'), true, '撤回作用于 inviteId 记录');
+
+  assert.ok(SPECS_BY_NAME.ws_list_collabs.description.includes('sessionRole'));
+  assert.ok(SPECS_BY_NAME.ws_list_collabs.description.includes('sessionState'));
+  assert.ok(SPECS_BY_NAME.ws_list_collabs.description.includes('freezeReason'));
+  assert.ok(SPECS_BY_NAME.ws_list_collabs.description.includes('pendingJoins'));
+  for (const legacyField of ['localBound', 'localGranted', 'grantedRemote', 'published']) {
+    assert.equal(SPECS_BY_NAME.ws_list_collabs.description.includes(legacyField), false, `旧四视图字段 ${legacyField} 已移除`);
+  }
+
+  assert.ok(SPECS_BY_NAME.ws_list_hosts.description.includes('participants'));
+  assert.ok(SPECS_BY_NAME.ws_check_inbox.description.includes('本会话'));
+  assert.ok(SPECS_BY_NAME.ws_delivery_status.description.includes('机器级'));
+  assert.ok(SPECS_BY_NAME.ws_delivery_status.description.includes('席位明细'));
+  assert.ok(SPECS_BY_NAME.ws_set_mute.description.includes('本席位'));
+  assert.equal(SPECS_BY_NAME.ws_set_mute.description.includes('跨会话不丢'), false);
+  assert.ok(SPECS_BY_NAME.ws_leave_collab.description.includes('只退本调用会话'));
+  assert.ok(SPECS_BY_NAME.ws_approve_join.inputSchema.properties.sessionId.description.includes('精确匹配'));
+  assert.ok(SPECS_BY_NAME.ws_approve_join.description.includes('joining'));
+  assert.ok(SPECS_BY_NAME.ws_join.description.includes('两段式'));
+  assert.ok(SPECS_BY_NAME.ws_approve_invite.description.includes('两段式'));
+});
+
+/* 参数面不回退（设计 §9）：除 ws_handover 因双角色放宽 target 外，既有必填项一律保持——
+ * 工具面对外承诺的最小参数集不得在本批静默缩水。 */
+test('既有必填项保持（ws_handover 双角色为例外）', () => {
+  const required = {
+    ws_ping: ['address', 'port'],
+    ws_check_inbox: ['collabId'],
+    ws_create_collab: ['name', 'topic', 'targets'],
+    ws_approve_invite: ['collabId', 'approve'],
+    ws_withdraw_invite: ['collabId'],
+    ws_view_ledger: ['collabId'],
+    ws_send_message: ['collabId', 'text'],
+    ws_set_mute: ['collabId', 'muted'],
+    ws_leave_collab: ['collabId'],
+    ws_end_collab: ['collabId'],
+    ws_invite: ['collabId', 'targets'],
+    ws_request_join: ['name'],
+    ws_approve_join: ['collabId', 'sessionId', 'approve'],
+    ws_decide: ['collabId'],
+    ws_take_over: ['collabId'],
+  };
+  for (const [name, expected] of Object.entries(required)) {
+    assert.deepEqual(SPECS_BY_NAME[name].inputSchema.required, expected, `${name} 的必填项不得缩水`);
+  }
 });
 
 /* 未传 type 时工具层实际发出的类型——假 collab 只记录入参。 */
@@ -129,23 +207,15 @@ async function sendMessageDefaultType() {
   return sent.type;
 }
 
-/* 冻结基准：21 工具注册后 JSON.stringify(registry.list(), null, 2) 的全量输出（本批从当前树生成）。
+/* 冻结基准：22 工具注册后 JSON.stringify(registry.list(), null, 2) 的全量输出（本批从当前树生成）。
  * 文本级固化——缩进与换行也是比对范围，故整段贴在此处、不手工编辑。
- * 新增本机段带来的两条描述变更（有意对外变更）：ws_list_hosts 描述补「本机段 self 与同机
- * sameMachine 标注」、ws_list_collabs 描述补「是否静音」——描述同步后按规程整体重冻，md5 由
- * 5f087a6b36bcbdd2ab37ed5fb0fec9c4（改造前基准）更新为 56533a014d0eafc7be51e92f67d85911
- * （10871 字符）；其余 17 项与全部 schema 逐字节未动（本次 diff 只有下方两行描述变化）。
- * 站长更名批与讨论侧措辞修的描述变更（有意对外变更）：工具描述统一改称「站长」（10 行），
- * 五处再作模式精确化（ws_end_collab / ws_withdraw_invite / ws_approve_invite / ws_send_message·to
- * / ws_leave_collab——补「讨论为发起人」「邀请方」等两模式口径）——按规程重冻，md5 由
- * 56533a014d0eafc7be51e92f67d85911 更新为 05adcc78fd1add8e83b902b536bd18ae（10893 字符）；
- * 全部 schema 与结构逐字节未动。
- * 会话级加入批（工具面 19→21，本次重冻的批准流程即本批）：新增 ws_join / ws_approve_join 两件
- * （注册序插在 ws_request_join 之后、ws_decide 之前）；ws_create_collab 与 ws_invite 的 targets
- * 条目 schema 增可选 targetSessionId（指名会话短码——创建时与后续邀请同规）——按「须人批准的
- * 对外变更」规程整体重冻，md5 由 05adcc78fd1add8e83b902b536bd18ae 更新为
- * e93ce1f55ba032743a4723f803b97031（13247 字符）；其余 19 项 name / description 与全部必须
- * 字段逐字节未动（diff 只有两条新增项与 targets 的一处加法字段）。 */
+ * 会话级参与者 0.2.0（工具面保持 22 项，本次重冻的批准流程即本批）：名单与参与者粒度改为会话——
+ * ws_send_message 增 toSessionId、ws_handover 增 targetSessionId/offerId/confirmToken 并放宽为双角色、
+ * ws_take_over 以 confirmToken 取代无令牌 confirm、ws_invite 描述 inviteId 与 forum 例外、
+ * ws_withdraw_invite 增 inviteId、ws_list_collabs / ws_list_hosts / ws_check_inbox / ws_delivery_status
+ * 换会话级返回面；其余描述同步会话级语义。按「须人批准的对外变更」规程整体重冻，
+ * md5 由 e93ce1f55ba032743a4723f803b97031（13247 字符）更新为 29aee52b9ad324f5797c9f4ccd2eb6fb（15641 字符）。
+ * 工具数与顺序（22 项）未变。 */
 const FROZEN_LIST_JSON = `[
   {
     "name": "ws_status",
@@ -157,7 +227,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_list_hosts",
-    "description": "扫描局域网中在线的驿站（广播段扫 + 单播兜底）：列出身份名、地址:端口与当前参与协作数；载荷另含本机段 self（本机身份、端口与活跃终端会话），同机其他数据根的实例在 hosts 里带 sameMachine 标注",
+    "description": "扫描局域网中在线的驿站（广播段扫 + 单播兜底）：列出身份名、地址:端口、当前参与协作数、对端活跃会话短码与 participants 能力（支持 / 不支持 / 未知——会话级协作要求对端为「支持」，未知可先单播探测）；载荷另含本机段 self（本机身份、端口与活跃终端会话），同机其他数据根的实例在 hosts 里带 sameMachine 标注",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -186,7 +256,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_delivery_status",
-    "description": "查询已发消息的投递状态（已排队 / 已到对方驿站 / 已投进对方会话——「已投进会话」不等于已被阅读）；讨论模式的帖不落持久队列，两路投递（经中继投稿、降级直投）共用同一档位面：投递中 / 已到对方驿站 / 已投进对方会话 / 未达（待对表收敛，note 字段说明）——中继路径下「已到对方驿站」= 投稿达中继（成员级结果由中继聚合捎回），「已排队」档不适用；系统内部回报条目不逐行列出（其条数见 reportRows）",
+    "description": "查询已发消息的投递状态：投递记账按机器级——一条逻辑消息向 N 台机器发送＝N 个机器帧、逐机器 msgId（已排队 / 已到对方驿站 / 已投进对方会话——「已投进会话」不等于已被阅读）；本机接收侧另显示逐席位明细（已注入 / 暂存待重连 / 判离席丢弃），远端只显示机器级。讨论模式的帖不落持久队列，两路投递（经中继投稿、降级直投）共用同一档位面：投递中 / 已到对方驿站 / 已投进对方会话 / 未达（待对表收敛，note 字段说明）——中继路径下「已到对方驿站」= 投稿达中继（成员级结果由中继聚合捎回），「已排队」档不适用；系统内部回报条目不逐行列出（其条数见 reportRows）",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -203,7 +273,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_check_inbox",
-    "description": "读取某协作的收件流水（按保留期窗口）：返回最近的消息（含已投递与未投递；默认 50 条、上限 500 条，以 limit 参数为准）",
+    "description": "读取某协作的收件流水（按保留期窗口）：只返回本会话的收件（含已投递与未投递；默认 50 条、上限 500 条，以 limit 参数为准）；机器级治理提示（如离席、站长变更、结束）对全本机会话可见",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -223,7 +293,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_list_collabs",
-    "description": "列出本机参与的全部协作（角色、状态、待回应邀请与是否过期、是否静音）——新建协作与同意门处置的入口",
+    "description": "列出本机参与的全部协作（本会话的 sessionRole / sessionState、冻结原因 freezeReason、待回应邀请与是否过期、是否静音）——站长侧条目另含 pendingJoins（两段式入席的待确认申请）；新建协作与同意门处置的入口",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -231,7 +301,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_create_collab",
-    "description": "发起协作或讨论（模式创建时定死、不可变）：向选中目标并行发出邀请（对方在同意门点头后加入）；目标取自 ws_list_hosts 的实例标识与端点",
+    "description": "发起协作或讨论（模式创建时定死、不可变）：创建会话即入席——managed 下本会话任站长（joinSeq=1），forum 下任发起人/中继；向选中目标并行发出邀请（对方在同意门点头后两段式入席）；targets 可带 targetSessionId 指名目标会话；目标取自 ws_list_hosts 的实例标识与端点",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -271,7 +341,7 @@ const FROZEN_LIST_JSON = `[
               },
               "targetSessionId": {
                 "type": "string",
-                "description": "指名会话短码（可选）：只投该目标实例上的这一会话、只有它能点头；省略 = 不指名（投全部活跃会话）"
+                "description": "指名会话短码（可选，精确匹配、不做前缀展开）：只投该目标实例上的这一会话、只有它能点头；省略 = 不指名（投全部活跃会话）"
               }
             },
             "required": [
@@ -292,7 +362,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_approve_invite",
-    "description": "对一条待回应邀请表态（同意 = 加入协作；拒绝 = 本条不参与）。首次调用只返回“需要用户确认”与一次性令牌——须先向用户转述邀请、取得明确同意后携 confirmToken 重试；用户明确说“下一次无需确认”时可先用 ws_allow_next_invite 登记一次性豁免",
+    "description": "对一条待回应邀请表态（同意 = 本调用会话加入协作；拒绝 = 本条不参与）。首次调用只返回“需要用户确认”与一次性令牌——须先向用户转述邀请、取得明确同意后携 confirmToken 重试；同意后进入两段式入席（joining，确认后转 member）。managed 下同意＝向站长申请；forum 下同意＝本会话直接发 join 成员事件。用户明确说“下一次无需确认”时可先用 ws_allow_next_invite 登记一次性豁免",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -321,7 +391,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_allow_next_invite",
-    "description": "登记一次性邀请确认豁免：仅当用户明确表示「下一次邀请无需确认」时调用；下一次同意 / 拒绝邀请将直接生效并消耗豁免（核心重启后失效）",
+    "description": "登记一次性邀请确认豁免：仅当用户明确表示「下一次邀请无需确认」时调用；下一次同意 / 拒绝邀请将直接生效并消耗豁免（核心重启后失效）。不适用于移交 / 接管等治理确认——那些一律走各自的一次性令牌",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -329,7 +399,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_withdraw_invite",
-    "description": "撤回邀请（站长；讨论为发起人，仅提议中）：指定 target 撤回该条；省略 target 整条取消（协作终止）",
+    "description": "撤回邀请（managed 仅站长；forum 仅撤回本机挂起记录并停止补投，已投出的邀请不可收回）：给 inviteId 撤回该条邀请记录；未给 inviteId 而给 target 时按目标撤回；两者都省略整条取消（协作终止）",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -337,9 +407,13 @@ const FROZEN_LIST_JSON = `[
           "type": "string",
           "description": "协作标识"
         },
+        "inviteId": {
+          "type": "string",
+          "description": "邀请记录标识（可选；取自 ws_invite 返回的 inviteId——按记录撤回该条邀请）"
+        },
         "target": {
           "type": "string",
-          "description": "被撤回成员的实例标识（可选；省略 = 整条取消）"
+          "description": "被撤回目标的实例标识（可选；未给 inviteId 时按目标撤回；与 inviteId 都省略 = 整条取消）"
         }
       },
       "required": [
@@ -349,7 +423,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_view_ledger",
-    "description": "查看协作台账：站长本机直读；成员在线时向站长拉取（source=live），站长离线回退本地快照并标注可能非最新；讨论模式=本地合并视图（帖子列表＋成员表＋端点，标注「本地视图，未与全员核对」）",
+    "description": "查看协作台账：名单按会话（机器身份名 / 会话短码），含离席历史，旧版协作只读显示；站长本机直读；成员在线时向站长拉取（source=live），站长离线回退本地快照并标注可能非最新；讨论模式=本地合并视图（帖子列表＋成员表＋端点，标注「本地视图，未与全员核对」）",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -365,7 +439,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_send_message",
-    "description": "发送协作域消息（星型路由：成员发给站长；站长省略 to 即发全体成员）——离线时消息排队、对方重开后送达；讨论模式为发帖（人人可见、to 参数一律拒绝）：默认经中继（发起人）投递（成员投稿至中继、由其转达全员），中继不可达时自动降级直投——返回的 route 字段如实标注本机走的路（relay/degraded/fanout）、results 为投稿或直投的受理态，成员级结果经中继聚合捎回、未达者由对方周期对表收敛",
+    "description": "发送协作域消息（发送者须为本机活跃且非 unverified 席位）：星型路由——成员发给站长，站长省略 to 即发全体成员；按目标机器去重、一机一帧，返回逐机器 msgId；离线时消息排队、对方重开后送达。to＝目标实例/地址，配可选 toSessionId（会话短码，精确匹配；只给会话参数会被拒绝）。讨论模式为发帖（人人可见、to / toSessionId 一律拒绝）：默认经中继（发起人）投递（成员投稿至中继、由其转达全员），中继不可达时自动降级直投——返回的 route 字段如实标注本机走的路（relay/degraded/fanout）、results 为投稿或直投的受理态，成员级结果经中继聚合捎回、未达者由对方周期对表收敛",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -383,7 +457,11 @@ const FROZEN_LIST_JSON = `[
         },
         "to": {
           "type": "string",
-          "description": "目标成员实例标识（协作：站长可选；成员省略即发给站长；讨论一律拒绝）"
+          "description": "目标成员实例标识或地址（可选；须与 toSessionId 同时给出才能定向席位；协作：站长可选；成员省略即发给站长；讨论一律拒绝）"
+        },
+        "toSessionId": {
+          "type": "string",
+          "description": "目标会话短码（可选，须与 to 同时给出；精确匹配，不做前缀展开）——只投该机器上的这一会话；讨论一律拒绝"
         }
       },
       "required": [
@@ -394,7 +472,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_set_mute",
-    "description": "设置或取消某条协作 / 讨论的静音（纯本地行为开关、不广播、对端无感）：静音期实时内容（讨论帖、协作内容消息）不再注入本会话——经查看器 / ws_check_inbox / ws_view_ledger 补看；结束、邀请与治理等待办照常注入；取消静音时给一行「静音期间新增 N 条」摘要；静音状态持久（跨会话不丢）",
+    "description": "设置或取消某条协作 / 讨论中本会话的静音（纯本地行为开关、不广播、对端无感）：只改本席位，同机其他会话不受影响；静音期实时内容（讨论帖、协作内容消息）不再注入本会话——经查看器 / ws_check_inbox / ws_view_ledger 补看；结束、邀请、离席、站长变更与治理等待办照常注入；取消静音时给一行「静音期间新增 N 条」摘要；静音状态随本机席位持久（席位删除即清理）",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -415,7 +493,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_leave_collab",
-    "description": "退出某条协作（本机不再参与；协作由站长、讨论由发起人收通知并更新台账）——终态数据本地保留",
+    "description": "退出某条协作（只退本调用会话；协作由站长、讨论由发起人收通知并更新台账）——managed 下站长也可退出（触发自动移交，无其他成员则结束）；终态数据本地保留",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -431,7 +509,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_end_collab",
-    "description": "结束协作（站长；讨论为发起人）：全员收到结束通告、各机把终态台账转归档——结束后不再接受任何协作域消息",
+    "description": "结束协作（managed 仅站长会话；讨论为发起人）：全员收到结束通告、各机把终态台账转归档——结束后不再接受任何协作域消息",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -447,7 +525,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_invite",
-    "description": "邀请成员加入既有讨论（任何成员可发起、重复邀请幂等）或既有协作（仅站长；目标机器不得已在有效名单内——已入席机器的新会话请走 ws_join 申请；终局行可重邀）",
+    "description": "邀请成员加入既有讨论（任何成员可发起、重复邀请幂等）或既有协作（managed 仅站长）：邀请记录生成 inviteId 供后续撤回 / 对账，forum 不生成、不返回 inviteId；已入席机器的新会话请走 ws_join 申请。目标可指名（targetSessionId 只投该会话）或不指名（投目标机当前全部活跃会话，各自独立成席）",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -479,7 +557,7 @@ const FROZEN_LIST_JSON = `[
               },
               "targetSessionId": {
                 "type": "string",
-                "description": "指名会话短码（可选）：只投该目标实例上的这一会话、只有它能点头；省略 = 不指名（投全部活跃会话）"
+                "description": "指名会话短码（可选，精确匹配、不做前缀展开）：只投该目标实例上的这一会话、只有它能点头；省略 = 不指名（投全部活跃会话）"
               }
             },
             "required": [
@@ -515,7 +593,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_join",
-    "description": "申请加入协作或讨论（本会话尚未在席时发起）：协作＝申请——给 collabId 直接申请，只给 name＋target 时先对该目标单播按名解析出 collabId 再申请（名称不广播）；申请直投站长、站长批准后接线本会话。讨论＝本机在席时本会话直接接线生效（无批准门），未在席时封装敲门全流程（等待放行，接线在同意门）。会话标识取本会话上下文——无会话标识的会话无法申请加入（明确拒）。",
+    "description": "申请加入协作或讨论（本会话尚未在席时发起）：协作＝两段式申请——给 collabId 直接申请，只给 name＋target 时先对该目标单播按名解析出 collabId 再申请（名称不广播）；申请直投站长，站长批准后本会话进入 joining，确认（join-confirm）后成为 member。讨论＝本机在席时本会话直接接线生效（无批准门），未在席时封装敲门全流程（等待放行，接线在同意门）。会话标识取本会话上下文——无会话标识的会话无法申请加入（明确拒）。",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -550,7 +628,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_approve_join",
-    "description": "批准或拒绝一条待回应的加入申请（站长侧）：批准＝授权申请人会话（写获准台账＋回执接线本会话）；拒绝＝回执携原因并出待批准面。待批准清单见 ws_list_collabs 条目的 pendingJoins；批准是活人门（无人点头＝新窗口加不进协作，如实）。",
+    "description": "批准或拒绝一条待回应的加入申请（站长侧）：批准＝把申请人置入 joining（两段式入席，等对方 join-confirm；收到 confirm 后先入名单再回快照）；拒绝＝回执携原因并出待批准面。待批准清单见 ws_list_collabs 条目的 pendingJoins；批准是活人门（无人点头＝新会话加不进协作，如实）。",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -560,7 +638,7 @@ const FROZEN_LIST_JSON = `[
         },
         "sessionId": {
           "type": "string",
-          "description": "申请人会话标识（短码即可——取 pendingJoins 的 sessionId；接收侧做唯一前缀匹配）"
+          "description": "申请人会话标识（短码即可——取 pendingJoins 的 sessionId；精确匹配，不做前缀展开）"
         },
         "approve": {
           "type": "boolean",
@@ -613,7 +691,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_handover",
-    "description": "显式交接（站长席位）：把站长席位移交给在线成员（先确认后删除——对方校验并回执后本机才清理台账）；目标离线会被拒绝（应急走 ws_take_over 抢接）",
+    "description": "显式移交（两段式，不开接管窗口）：站长发起＝target＋targetSessionId 指定目标席位（须在线、心跳新鲜），返回 offerId，等待目标用户确认（120 秒）；目标确认＝offerId＋confirmToken（首次调用只返回确认挑战与令牌，须经本机用户确认后携令牌重试）。接受后移交台账与端点：目标升站长、旧站长降为成员；超时后迟到的 accept 一律拒绝",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -623,18 +701,29 @@ const FROZEN_LIST_JSON = `[
         },
         "target": {
           "type": "string",
-          "description": "目标成员实例标识（取自 ws_view_ledger 名单）"
+          "description": "目标成员实例标识（站长发起时必填；取自 ws_view_ledger 名单）"
+        },
+        "targetSessionId": {
+          "type": "string",
+          "description": "目标会话短码（站长发起时与 target 同时给出；精确匹配，不做前缀展开）"
+        },
+        "offerId": {
+          "type": "string",
+          "description": "移交邀约标识（目标确认时必填；站长发起成功后返回 offerId）"
+        },
+        "confirmToken": {
+          "type": "string",
+          "description": "用户确认挑战令牌（confirmToken，目标确认时使用）：首次确认调用返回 needsUserConfirmation 与令牌；取得本机用户同意后携此令牌重试"
         }
       },
       "required": [
-        "collabId",
-        "target"
+        "collabId"
       ]
     }
   },
   {
     "name": "ws_take_over",
-    "description": "抢接（成员侧，站长被判失联后）：缺省发起——广播收集窗口（默认 30s）并持续探测原站长；窗口结束若本机为最高优先候选，经本机人确认后用 confirm: true 生效（含生效前最后探测）、false 放弃（顺位候选会收到重排提示）",
+    "description": "接管（成员侧）：仅当站长不可达（本地已冻结 manager-offline，或已超过站长失联判定时限）或自动移交后的接管窗口内可用；不再有收集窗口与候选优先序。首次调用只返回确认挑战与令牌——须先向本机用户确认后携 confirmToken 重试；无令牌的 confirm:true 一律拒绝。发起前先握手取可达成员最高 (managerTerm, version) 台账作基准，取不到则拒绝；接管后不开新窗口",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -642,9 +731,9 @@ const FROZEN_LIST_JSON = `[
           "type": "string",
           "description": "协作标识"
         },
-        "confirm": {
-          "type": "boolean",
-          "description": "确认分支：true = 生效；false = 放弃；省略 = 发起收集窗口"
+        "confirmToken": {
+          "type": "string",
+          "description": "用户确认挑战令牌：首次调用返回 needsUserConfirmation 与令牌；取得本机用户确认后携此令牌重试"
         }
       },
       "required": [
