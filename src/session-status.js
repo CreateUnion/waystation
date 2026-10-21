@@ -35,7 +35,7 @@ export function isIndicatedCollab(entry) {
  *
  * 席位来源（0.2.0）：传入 sessionId 且条目携 sessions.localSeats 时，按短码命中「本会话的席位」，
  * role/muted 取该席位；命不中＝本会话没有该协作的席位，条目剔除。未传 sessionId 或条目没有
- * 席位表时沿用旧条目字段（组合根接线前的兼容路径，不改变状态文件版本）。 */
+ * 席位表时沿用旧条目字段（兼容旧调用方与旧清单，不改变状态文件版本）。 */
 export function indicatedEntriesOf(entries, indicators, sessionId = null) {
   const readings = new Map((indicators ?? []).map((reading) => [reading.collabId, reading.msgCount]));
   const projected = [];
