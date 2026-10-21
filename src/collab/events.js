@@ -923,7 +923,7 @@ function sameSeat(left, right) {
 
 function termMapsOf(state) {
   const runtime = m5RuntimeOf(state);
-  for (const name of ['termState', 'acceptedManagerMap', 'rejectedChangeFromMap', 'authorizedEvidenceMap']) {
+  for (const name of ['termState', 'acceptedManagerMap', 'authorizedEvidenceMap']) {
     if (!(runtime[name] instanceof Map)) {
       runtime[name] = new Map();
     }
@@ -931,7 +931,6 @@ function termMapsOf(state) {
   return {
     termState: runtime.termState,
     accepted: runtime.acceptedManagerMap,
-    rejected: runtime.rejectedChangeFromMap,
     authorized: runtime.authorizedEvidenceMap,
   };
 }
@@ -998,9 +997,9 @@ function termCtxOf(state, local, frame) {
     acceptedManager: maps.accepted.get(local.collabId),
     handshakeHighest: highestHandshakeOf(state, local.collabId),
     authorizedEvidence: maps.authorized.get(local.collabId),
-    rejectedChangeFrom: maps.rejected.get(local.collabId),
     suspended: suspendCtxOf(state, local),
     handoverTarget: runtime.handoverTargets.get(local.collabId),
+    handoverBaseTerm: runtime.pendingHandovers.get(local.collabId)?.baseTerm,
     windowBaseAt: runtime.managerWindowBaseAt.get(local.collabId),
     sessionTakeoverWindowMs: windowMsOf(state),
     windowSkewMs: 10000,
@@ -1085,9 +1084,6 @@ function handleManagerChanged(state, frame) {
   const ctx = termCtxOf(state, local, frame);
   const bypass = oldManagerTakeoverBypass(state, local, termState, change);
   const result = bypass ?? acceptManagerChange(termState, change, ctx);
-  if (result.accepted !== true && /** @type {any} */ (result).idempotent !== true) {
-    termMapsOf(state).rejected.set(local.collabId, { instanceId: frame.from.instanceId, sessionId: frame.from.sessionId });
-  }
   if (result.accepted === true && isPlainObject(frame.payload.endpoint)) {
     learnManagerEndpoint(state, local, result.nextState.manager, frame.payload.endpoint);
   }
@@ -1127,7 +1123,6 @@ function oldManagerTakeoverBypass(state, local, termState, change) {
 function applyManagerResult(state, local, frame, result) {
   if (result.freezeReason !== undefined) {
     applyManagerFreeze(state, local.collabId, result.freezeReason);
-    termMapsOf(state).rejected.set(local.collabId, { instanceId: frame.from.instanceId, sessionId: frame.from.sessionId });
     return;
   }
   if (result.accepted === true && result.nextState !== undefined) {
@@ -1184,7 +1179,6 @@ function applyAcceptedNextState(state, local, frame, nextState) {
     manager: { instanceId: nextState.manager.instanceId, sessionId: nextState.manager.sessionId, identityName: nextState.manager.identityName },
     source: { instanceId: frame.from.instanceId, sessionId: frame.from.sessionId },
   });
-  maps.rejected.delete(local.collabId);
   maps.termState.set(local.collabId, nextState);
   runtime.managerPending.delete(local.collabId);
   runtime.managerEvidenceAt.set(local.collabId, Date.now());
@@ -1211,7 +1205,6 @@ function applyTerminalAdoption(state, local, nextState) {
   const maps = termMapsOf(state);
   /* acceptedManager 保留：本地终态后的权威台账恢复需要它作来源证据（不得在采纳终态时清掉）。 */
   maps.termState.set(local.collabId, { managerTerm: nextState.managerTerm, manager: null, version: nextState.version });
-  maps.rejected.delete(local.collabId);
   runtime.managerPending.delete(local.collabId);
   runtime.managerWindowBaseAt.delete(local.collabId);
   if (local.role === 'manager') {
@@ -1315,7 +1308,7 @@ function snapshotSourceAuthorized(state, local, frame, termState, ctx) {
   }
   const accepted = ctx.acceptedManager;
   if (isPlainObject(accepted) && accepted.term === ledgerTermOf(ledger) && sameSeat(accepted.manager, manager)
-    && sameSeat(accepted.source, source)) {
+    && sameSeat(accepted.manager, source)) {
     return true;
   }
   const handoverTarget = m5RuntimeOf(state).handoverTargets.get(local.collabId);
