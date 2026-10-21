@@ -49,6 +49,7 @@ export function createNetStack({ discovery, transport, dispatch, inbound, port, 
     pingHost: (options) => pingHost(state, options),
     requestJoin: (options) => requestJoin(state, options ?? {}),
     requestJoinResolve: (options) => requestJoinResolve(state, options ?? {}),
+    probeCapability: (options) => probeCapability(state, options ?? {}),
     send: (message) => state.dispatch.send(message),
     deliveryStatus: (query) => state.dispatch.deliveryStatus(query ?? {}),
     checkInbox: (query) => state.inbound.checkInbox(query),
@@ -223,7 +224,7 @@ async function requestJoin(state, { name }) {
  * 讨论名与目标端点（来自扫描列表 / 已知主机清单）在启程前把关——不发畸形载荷、也不做无谓的收答等待；
  * reply 为 null = 窗口内没有应答（不可达 / 丢包），与「答了未命中」（found:false）是两回事，
  * 由调用方按各自语义处置（统一文案由工具层承载）。 */
-async function requestJoinResolve(state, { name, address, port, timeoutMs }) {
+async function requestJoinResolve(state, { name, address, port, instanceId, timeoutMs }) {
   if (!state.available) {
     return { ok: false, message: state.message };
   }
@@ -237,11 +238,51 @@ async function requestJoinResolve(state, { name, address, port, timeoutMs }) {
   if (!isPort(port)) {
     return { ok: false, message: '目标端口非法：需要 1–65535 的整数（端口来源以扫描列表为准）' };
   }
+  const instanceError = instanceIdErrorOf(instanceId);
+  if (instanceError !== null) {
+    return { ok: false, message: instanceError };
+  }
   try {
-    return { ok: true, reply: await state.discovery.requestJoinResolve({ name: wanted, address, port, timeoutMs }) };
+    /* instanceId 是对端归户证据（同机多实例时只采信该实例的应答），原样透传给发现面。 */
+    return { ok: true, reply: await state.discovery.requestJoinResolve({ name: wanted, address, port, ...(instanceId === undefined ? {} : { instanceId }), timeoutMs }) };
   } catch (error) {
     return { ok: false, message: `按名解析失败：${error.message}` };
   }
+}
+
+/* 能力单播探测（发现面 → 工具面）：未知先探测的闸门在服务层，工具层只经此转调；
+ * instanceId 同按名解析——给了就只认该实例的应答，不做来源地址归户。 */
+async function probeCapability(state, { address, port, instanceId, timeoutMs }) {
+  if (!state.available) {
+    return { ok: false, message: state.message };
+  }
+  if (typeof address !== 'string' || isIP(address) === 0) {
+    return { ok: false, message: '目标地址非法：需要 IPv4/IPv6 字面量（不做域名解析）' };
+  }
+  if (!isPort(port)) {
+    return { ok: false, message: '目标端口非法：需要 1–65535 的整数（端口来源以扫描列表为准）' };
+  }
+  const instanceError = instanceIdErrorOf(instanceId);
+  if (instanceError !== null) {
+    return { ok: false, message: instanceError };
+  }
+  try {
+    const result = await state.discovery.probeCapability({ address, port, ...(instanceId === undefined ? {} : { instanceId }), ...(timeoutMs === undefined ? {} : { timeoutMs }) });
+    return { ok: true, ...result };
+  } catch (error) {
+    return { ok: false, message: `能力探测失败：${error.message}` };
+  }
+}
+
+/* 可选实例标识的形态把关（两条单播面共用）：没给＝不按实例归户；给了但形态坏不得静默忽略。 */
+function instanceIdErrorOf(instanceId) {
+  if (instanceId === undefined) {
+    return null;
+  }
+  if (typeof instanceId !== 'string' || instanceId === '') {
+    return '目标实例标识非法：需要非空字符串（或省略）';
+  }
+  return null;
 }
 
 function statusOf(state) {

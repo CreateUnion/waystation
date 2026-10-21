@@ -1,3 +1,4 @@
+import { participantsStateOf } from '../net/known-hosts.js';
 import { shortSessionId } from '../util/short-id.js';
 import { WS_LIST_HOSTS_SPEC } from './specs.js';
 
@@ -27,6 +28,9 @@ export function hostsTool() {
         collabCount: host.collabCount,
         lastSeenAt: host.lastSeenAt,
         sameMachine: host.sameMachine === true,
+        /* 会话级参与者能力三态（设计 §7.2）：2＝支持、0＝旧版应答缺字段、缺席＝从未观测到。
+         * 未知先探测的闸门在服务层；这里只如实呈现，不擅自对全表发起探测。 */
+        participants: participantsStateOf(host),
         ...sessionsFieldOf(host),
       }));
       const sessions = context.activeSessions();

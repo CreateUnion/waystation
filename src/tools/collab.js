@@ -18,12 +18,25 @@ export const SEND_MESSAGE_TYPES = POST_KINDS;
 const MAX_TARGETS = MAX_COLLAB_MEMBERS - 1;   // 目标上限 = 名单上限减发起者本人（单一权威：protocol.MAX_COLLAB_MEMBERS）
 
 /* 清单的会话视角（本会话是否获准 / 是否绑定）要判在调用者身上：调用上下文已注入本会话标识，
- * 工具层只把它原样转交（判定归协作服务——无标识会话如实传空，由服务判否）。 */
+ * 工具层只把它原样转交（判定归协作服务——无标识会话如实传空，由服务判否）。
+ * sessionRole / sessionState 是「本会话」的席位视角，服务清单给的是本机角色/状态——
+ * 逐条按调用会话现取席位，未入席如实给 null（不拿机器角色冒充会话角色）。 */
 export function listCollabsTool() {
   return {
     ...WS_LIST_COLLABS_SPEC,
-    handler: async (_args, context) => okResult({ ok: true, ...context.collab.list({ sessionId: context.sessionId }) }),
+    handler: async (_args, context) => {
+      const listed = context.collab.list({ sessionId: context.sessionId });
+      const collabs = Array.isArray(listed.collabs)
+        ? listed.collabs.map((entry) => withSessionSeatFields(context, entry))
+        : listed.collabs;
+      return okResult({ ok: true, ...listed, collabs });
+    },
   };
+}
+
+function withSessionSeatFields(context, entry) {
+  const seat = context.collab.localSeatOf?.(entry.collabId, context.sessionId) ?? null;
+  return { ...entry, sessionRole: seat?.role ?? null, sessionState: seat?.state ?? null };
 }
 
 export function createCollabTool() {
@@ -62,9 +75,51 @@ export function inviteTool() {
       if (targets === null) {
         return errorResult(targetsErrorMessage());
       }
+      /* 邀请簿记归加入域：逐目标签发 inviteId（撤回 / 对账的定位键）。加入域面未暴露时
+       * 回退旧邀请面（论坛与尚未接线的装配），不让工具层直接依赖 outgoing 内部。 */
+      if (typeof context.join?.createInvite === 'function') {
+        return inviteViaJoinDomain(collabId, targets, context);
+      }
       return resultOf(await context.collab.invite({ collabId, targets }));
     },
   };
+}
+
+async function inviteViaJoinDomain(collabId, targets, context) {
+  const invited = [];
+  for (const target of targets) {
+    const created = await context.join.createInvite(inviteCallOf(collabId, target, context));
+    /* 论坛无邀请簿记（设计 D18）：整批回退旧邀请面，forum 不生成也不返回 inviteId。 */
+    if (created.code === 'forum-no-invite') {
+      return resultOf(await context.collab.invite({ collabId, targets }));
+    }
+    /* 逐目标如实回报：前面的目标可能已发出邀请，不能用一个错误吞掉已签发的事实。 */
+    invited.push(created.ok === true
+      ? inviteRecordOf(target, created)
+      : { instanceId: target.instanceId, ok: false, reason: created.message });
+  }
+  return okResult({ ok: true, collabId, invited });
+}
+
+function inviteCallOf(collabId, target, context) {
+  return {
+    collabId,
+    managerSessionId: context.sessionId,
+    targetInstanceId: target.instanceId,
+    ...(target.targetSessionId === undefined ? {} : { targetSessionId: target.targetSessionId }),
+  };
+}
+
+/* 逐目标结果沿用旧邀请面的形状（instanceId / ok / msgId），另携 inviteId 与有效期。 */
+function inviteRecordOf(target, created) {
+  const record = { instanceId: target.instanceId, ok: true, inviteId: created.inviteId };
+  if (created.expiresAt !== undefined) {
+    record.expiresAt = created.expiresAt;
+  }
+  if (created.delivery?.msgId !== undefined) {
+    record.msgId = created.delivery.msgId;
+  }
+  return record;
 }
 
 /* targets 非法时的统一文案（两工具共用——形状与上限同一权威）。 */
@@ -155,6 +210,9 @@ export function withdrawInviteTool() {
       if (parsed.error !== undefined) {
         return errorResult(parsed.error);
       }
+      if (parsed.inviteId !== undefined) {
+        return withdrawByInviteId(parsed.inviteId, collabId, context);
+      }
       return resultOf(await context.collab.withdraw({ collabId, target: parsed.target }));
     },
   };
@@ -177,12 +235,16 @@ function withdrawArgsOf(args) {
   if (inviteId === undefined && target === undefined) {
     return { error: '参数非法：需要 inviteId（邀请记录标识）或 target（目标实例标识）——结束整条协作请用 ws_end_collab' };
   }
-  /* 底层 outgoing.withdrawInvite 尚未接通 inviteId 路径（邀请簿记待接线）：在此明确拒绝，
-   * 不得静默走 target 缺省的旧路径。接线完成后由本工具把 inviteId 透传给服务层。 */
-  if (inviteId !== undefined) {
-    return { error: '参数 inviteId 暂不可用：服务层尚未接通按邀请记录撤回（邀请簿记待接线）——暂请用 target 精确撤回该目标的一条邀请，或等待接线完成' };
+  return inviteId === undefined ? { target } : { inviteId };
+}
+
+/* 按邀请记录撤回（邀请簿记）：定位键是 inviteId，签发者为本会话；
+ * 加入域面未暴露时明确报错（不得静默落回 target / 整条撤回路径）。 */
+function withdrawByInviteId(inviteId, collabId, context) {
+  if (typeof context.join?.withdrawInvite !== 'function') {
+    return errorResult('参数 inviteId 暂不可用：服务层尚未暴露按邀请记录撤回（join.withdrawInvite）');
   }
-  return { target };
+  return resultOf(context.join.withdrawInvite({ collabId, managerSessionId: context.sessionId, inviteId }));
 }
 
 export function viewLedgerTool() {
@@ -253,7 +315,8 @@ export function setMuteTool() {
       if (typeof args.muted !== 'boolean') {
         return errorResult('参数 muted 非法：需要布尔值（true 进入静音 / false 取消静音）');
       }
-      return resultOf(await context.collab.setMute({ collabId, muted: args.muted }));
+      /* 静音按会话（本席位）：调用会话随上下文穿参，服务写该席位并落盘；工具层不碰持久化文件。 */
+      return resultOf(await context.collab.setMute({ collabId, muted: args.muted, sessionId: context.sessionId }));
     },
   };
 }

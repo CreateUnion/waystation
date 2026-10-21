@@ -816,3 +816,30 @@ const FROZEN_LIST_JSON = `[
     }
   }
 ]`;
+
+/* schema 与 handler 的同源证明（不能只查描述）：schema 声明的可用形态必须 handler 可达；
+ * schema 未声明的退役参数必须被 handler 拒绝——否则规格与行为再次分叉。 */
+test('schema-handler 一致：ws_handover 目标角色不带 target 即可确认；ws_take_over 拒绝退役 confirm', async () => {
+  const confirmCalls = [];
+  const takeOverCalls = [];
+  const collab = {
+    confirmHandover(input) {
+      confirmCalls.push(input);
+      return { ok: true, accepted: true, message: '已回执接受' };
+    },
+    takeOver(input) {
+      takeOverCalls.push(input);
+      return { ok: true, applied: true, message: '已接管' };
+    },
+  };
+  const context = { instanceId: 'inst-self', config: { identityName: '本机', port: 17321 }, collab, net: {}, sessionId: 'session-a-0123456789' };
+  const confirmed = await handoverTool().handler({ collabId: 'collab-1', offerId: 'offer-1', confirmToken: 'tok-1' }, context);
+  assert.equal(confirmed.isError, undefined, 'schema 的 offerId+confirmToken 目标角色必须可达（不得再强制 target）');
+  assert.deepEqual(confirmCalls, [{ collabId: 'collab-1', sessionId: 'session-a-0123456789', offerId: 'offer-1', token: 'tok-1' }]);
+  const retired = await takeOverTool().handler({ collabId: 'collab-1', confirm: true }, context);
+  assert.equal(retired.isError, true, 'schema 未声明的 confirm 必须被拒绝（退役参数不得静默透传）');
+  assert.equal(takeOverCalls.length, 0);
+  const begun = await takeOverTool().handler({ collabId: 'collab-1', confirmToken: 'tok-1' }, context);
+  assert.equal(begun.isError, undefined);
+  assert.deepEqual(takeOverCalls, [{ collabId: 'collab-1', sessionId: 'session-a-0123456789', token: 'tok-1' }]);
+});

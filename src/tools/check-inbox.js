@@ -16,7 +16,13 @@ export function checkInboxTool() {
       if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > CHECK_INBOX_MAX_LIMIT)) {
         return { content: [{ type: 'text', text: `参数 limit 非法：需要 1–${CHECK_INBOX_MAX_LIMIT} 的整数（可选，不传用默认 ${CHECK_INBOX_DEFAULT_LIMIT}）` }], isError: true };
       }
-      const result = context.net.checkInbox({ collabId, limit: args.limit ?? CHECK_INBOX_DEFAULT_LIMIT });
+      /* 按本会话过滤（设计 §9）：只取投给本席位的记录；机器级治理提示仍对全本机会话可见。
+       * 调用上下文没有会话标识时如实不传（服务按全本机可见面返回），不伪造。 */
+      const query = { collabId, limit: args.limit ?? CHECK_INBOX_DEFAULT_LIMIT };
+      if (typeof context.sessionId === 'string' && context.sessionId !== '') {
+        query.sessionId = context.sessionId;
+      }
+      const result = context.net.checkInbox(query);
       return { content: [{ type: 'text', text: JSON.stringify({ ok: true, ...result }, null, 2) }] };
     },
   };
