@@ -6,15 +6,17 @@ import { ID_PATTERN, MAX_ACTIVE_SEATS } from '../net/protocol.js';
  * 站长侧 joining（已发 grant、待 confirm 的席位）。本模块只做状态判定与去重，不写盘、不发帧、不读服务层：
  * 持久化与网络投递由接线方按返回的 reason 决定，判定逻辑因此可在 PC 上单测。
  * 时间一律经注入时钟推进（调用参数可覆盖），过期判定与容量淘汰因此确定可复现。
+ * 作用域：每协作一个实例（invites.json / pending-invites.json / joins.json 位于协作目录，键不含 collabId），
+ * 不得跨协作复用；入口的 collabId 校验只是串台防线，不是复用支持。
  * 返回的 reason 是模块内部词表；只有 JOIN_DENY_REASONS 可直接进 join-deny，其余按接线语义转成快照/本地错误
- * （joinDenyReasonOf 只做兜底映射；already-member 须由接线按 H-I4 回快照，不得当 deny 投递）。 */
+ * （joinDenyReasonOf 只做兜底映射；already-member 须由接线回快照，不得当 deny 投递，见设计 §4.4.6）。 */
 
 export const PENDING_INVITE_CAPACITY = 64;
 export const JOINING_TTL_MS = 60000;
 /* 在途入席不超过活跃席位硬顶：joining 不占活跃席位，但未确认记录也不得无界堆积。 */
 export const MAX_JOINING = MAX_ACTIVE_SEATS;
 
-/* join-deny 的协议词表（协议层只收这四个）；内部失败原因经 joinDenyReasonOf 收敛。 */
+/* join-deny 的协议词表；单一权威在协议层校验器，本表与之逐字一致，测试用真帧交叉核验。 */
 export const JOIN_DENY_REASONS = ['expired', 'aborted', 'manager-changed', 'capacity'];
 
 export function joinDenyReasonOf(reason) {
@@ -134,6 +136,7 @@ function rememberDecline(state, inviteId, seat) {
 
 /* —— 发起侧邀请簿记（站长机） —— */
 
+/* restore(records)：records 为 invites.json 的 invites 数组（设计 §4.1 形态）。 */
 /**
  * @param {{ now?: () => number }} [options]
  */
@@ -403,6 +406,7 @@ function restoredSeatListOf(raw) {
 
 /* —— 目标机挂起邀请 —— */
 
+/* restore(records,{capacity?})：records 为 pending-invites.json 的 invites 数组；超容量按淘汰策略裁剪。 */
 /**
  * @param {{ now?: () => number, capacity?: number }} [options]
  */
@@ -425,7 +429,7 @@ export function createPendingInvites({ now = Date.now, capacity = PENDING_INVITE
     withdrawPending: (input) => withdrawPending(state, input ?? {}),
     expirePending: (at) => expirePending(state, at),
     pruneTerminal: (at) => pruneTerminalPending(state, at),
-    restore: (records) => restorePending(state, records),
+    restore: (records, options) => restorePending(state, records, options ?? {}),
     get: (input) => getPending(state, input ?? {}),
     list: () => [...state.records.values()].map(clonePending),
     stats: () => ({ ...state.counters, size: state.records.size }),
@@ -457,6 +461,7 @@ function applyPendingInvite(state, input) {
     state: parsed.state,
     evicted: evicted === null ? null : evicted.inviteId,
     evictedState: evicted === null ? null : evicted.state,
+    evictedCount: evicted === null ? 0 : evicted.evictedCount,
   };
 }
 
@@ -507,27 +512,32 @@ function keepDuplicate(state, incoming, existing) {
   if (existing.state === 'open' && incoming.expiresAt > existing.expiresAt) {
     existing.expiresAt = incoming.expiresAt;
   }
-  return { ok: true, inviteId: existing.inviteId, duplicate: true, state: existing.state, evicted: null, evictedState: null };
+  return { ok: true, inviteId: existing.inviteId, duplicate: true, state: existing.state, evicted: null, evictedState: null, evictedCount: 0 };
 }
 
 /* 容量：先回收终态记录（expired/consumed/withdrawn），全部终态清空后才淘汰 open 中最早过期者。
- * 这样死记录不会挤掉仍在 TTL 内的有效邀请；丢 open 邀请才计 dropped，回收终态只计 reclaimed。 */
+ * 这样死记录不会挤掉仍在 TTL 内的有效邀请；丢 open 邀请才计 dropped，回收终态只计 reclaimed。
+ * 循环到 size < capacity，超限恢复后的账也能在一次写入时收敛回上限。 */
 function evictIfFull(state) {
-  if (state.records.size < state.capacity) {
-    return null;
+  /** @type {{ inviteId: string, state: PendingState } | null} */
+  let last = null;
+  let evictedCount = 0;
+  while (state.records.size >= state.capacity) {
+    const victim = evictionVictimOf(state);
+    if (victim === null) {
+      break;
+    }
+    state.records.delete(victim.key);
+    state.declines.delete(victim.key);
+    if (victim.record.state === 'open') {
+      state.counters.dropped++;
+    } else {
+      state.counters.reclaimed++;
+    }
+    last = { inviteId: victim.record.inviteId, state: victim.record.state };
+    evictedCount++;
   }
-  const victim = evictionVictimOf(state);
-  if (victim === null) {
-    return null;
-  }
-  state.records.delete(victim.key);
-  state.declines.delete(victim.key);
-  if (victim.record.state === 'open') {
-    state.counters.dropped++;
-  } else {
-    state.counters.reclaimed++;
-  }
-  return { inviteId: victim.record.inviteId, state: victim.record.state };
+  return last === null ? null : { ...last, evictedCount };
 }
 
 /**
@@ -562,19 +572,20 @@ function earlierExpiryOf(held, key, record) {
   return held;
 }
 
-/* 补投面：指名只看目标会话，不指名对本机全部会话可见；已接受/拒绝/过期/撤回均不再冒泡。 */
+/* 补投面：指名只看目标会话，不指名对本机全部会话可见；已接受/拒绝/过期/撤回均不再冒泡。
+ * collabId 必填（每协作一 store 的显式声明）：不传即返回空，避免调用方误把跨协作记录补投出去。 */
 function matchPendingForSession(state, input) {
   const sessionId = asId(input?.sessionId);
+  const collabId = asId(input?.collabId);
   const inviteId = optionalIdOf(input?.inviteId);
-  const collabId = optionalIdOf(input?.collabId);
-  if (sessionId === null || inviteId.ok !== true || collabId.ok !== true) {
+  if (sessionId === null || collabId === null || inviteId.ok !== true) {
     return [];
   }
   const at = clockOf(state, input?.now);
   return [...state.records.values()]
+    .filter((record) => record.collabId === collabId)
     .filter((record) => pendingVisibleOf(record, sessionId, at, state.declines.get(pendingKey(record.inviteId, record.targetSessionId))))
     .filter((record) => inviteId.value === null || record.inviteId === inviteId.value)
-    .filter((record) => collabId.value === null || record.collabId === collabId.value)
     .map(clonePending);
 }
 
@@ -808,11 +819,13 @@ function pruneTerminalPending(state, at) {
   return { pruned: inviteIds.length, inviteIds };
 }
 
-/* 重启恢复：整表替换；状态与 acceptedSessions 原样恢复，会话级拒绝不持久化（见 invites restore 说明）。 */
-function restorePending(state, records) {
+/* 重启恢复：整表替换；状态与 acceptedSessions 原样恢复，会话级拒绝不持久化（见 invites restore 说明）。
+ * 文件可能被旧版本/手工编辑成超容量：按同一「终态优先、再最早过期」策略裁回 capacity，超出部分计入 rejected。 */
+function restorePending(state, records, options) {
   if (!Array.isArray(records)) {
     return failure('invalid');
   }
+  const limit = isPositiveInt(options?.capacity) ? options.capacity : state.capacity;
   const restored = new Map();
   let rejected = 0;
   for (const raw of records) {
@@ -824,9 +837,29 @@ function restorePending(state, records) {
     }
     restored.set(key, record);
   }
+  rejected += trimPendingRestored(state, restored, limit);
+  state.capacity = limit;
   state.records = restored;
   state.declines.clear();
   return { ok: true, restored: restored.size, rejected };
+}
+
+function trimPendingRestored(state, records, limit) {
+  let trimmed = 0;
+  while (records.size > limit) {
+    const victim = evictionVictimOf({ records });
+    if (victim === null) {
+      break;
+    }
+    records.delete(victim.key);
+    if (victim.record.state === 'open') {
+      state.counters.dropped++;
+    } else {
+      state.counters.reclaimed++;
+    }
+    trimmed++;
+  }
+  return trimmed;
 }
 
 function restoredPendingOf(raw) {
@@ -896,6 +929,8 @@ function pendingKey(inviteId, targetSessionId) {
 
 /* —— 两段式入席（站长侧 joining 台账） —— */
 
+/* restore(records,{collabId,maxJoining?})：records 为 joins.json 的 pendingJoins（仅未确认）。
+ * pendingJoins() 是反向投影（只含未确认、无 collabId/confirmed 字段），供接线原样写盘。 */
 /**
  * @param {{ now?: () => number, joiningTtlMs?: number, maxJoining?: number, maxActiveSeats?: number }} [options]
  */
@@ -927,7 +962,8 @@ export function createJoiningRegistry({
     releaseJoining: (collabId, sessionId) => releaseJoining(state, collabId, sessionId),
     expireJoining: (at) => expireJoining(state, at),
     invalidateForManagerChange: (managerTerm) => invalidateForManagerChange(state, managerTerm),
-    restore: (records) => restoreJoining(state, records),
+    pendingJoins: () => [...state.byJoinId.values()].filter((record) => !record.confirmed).map(joiningPersistOf),
+    restore: (records, options) => restoreJoining(state, records, options ?? {}),
     get: (joinId) => cloneJoiningOrNull(joiningOf(state, joinId)),
     find: (collabId, sessionId) => findJoining(state, collabId, sessionId),
     list: () => [...state.byJoinId.values()].map(cloneJoining),
@@ -935,7 +971,9 @@ export function createJoiningRegistry({
   };
 }
 
-/* 发 grant：写 joining 前先查活跃席位容量；同 (collabId,sessionId) 已有记录则复用并换新 joinId（旧 joinId 立即失效）。 */
+/* 发 grant：写 joining 前先查活跃席位容量。同 (collabId,sessionId) 已有记录时仅同实例可刷新并换新 joinId；
+ * 另一实例用同 sessionId 申请不得覆盖他人 grant（返回 instance-mismatch），避免跨实例 DoS。
+ * 已在共享名单的会话由接线在调用前短路（返回既有席位）；joins.json 只恢复未确认记录。 */
 function beginJoining(state, input) {
   const prepared = beginInputOf(input);
   if (prepared === null) {
@@ -949,7 +987,8 @@ function beginJoining(state, input) {
   return createWithinCapacity(state, prepared, at);
 }
 
-/* 新建 joining 的两处容量检查（begin 与 refresh 的失配兜底共用）：activeSeats 必填，缺省即 invalid。 */
+/* 新建 joining 的两处容量检查（begin 与 refresh 的失配兜底共用）：activeSeats 为共享名单当前活跃席位
+ * （不含本席），必填，缺省即 invalid。 */
 function createWithinCapacity(state, prepared, at) {
   if (prepared.activeSeats >= state.maxActiveSeats) {
     return failure('capacity');
@@ -982,7 +1021,8 @@ function beginIdsOf(input) {
   return { collabId, instanceId, sessionId };
 }
 
-/* activeSeats 是容量判定的唯一输入，必须由接线显式取当前活跃席位数；缺省即 invalid（fail-closed）。 */
+/* activeSeats 是容量判定的唯一输入，必须由接线显式取共享名单当前活跃席位数（不含本席）；
+ * 缺省即 invalid（fail-closed）。 */
 function activeSeatsOf(value) {
   return Number.isInteger(value) && value >= 0 ? value : null;
 }
@@ -992,6 +1032,9 @@ function refreshJoining(state, joinId, prepared, at) {
   if (held === undefined) {
     state.byKey.delete(joinKey(prepared.collabId, prepared.sessionId));
     return createWithinCapacity(state, prepared, at);
+  }
+  if (held.instanceId !== prepared.instanceId) {
+    return failure('instance-mismatch');
   }
   if (held.confirmed) {
     return failure('already-member');
@@ -1027,12 +1070,29 @@ function createJoining(state, prepared, at) {
 }
 
 /* confirm：校验席位键两半（instanceId+sessionId）与必填 managerTerm；已确认即幂等 member。
- * grantVersion 仅记录、version 推进不影响受理（设计 §4.4.7/T19）；activeSeats 必填，缺省即 invalid。 */
+ * grantVersion 仅记录、version 推进不影响受理（设计 §4.4.7 版本校验口径）。
+ * activeSeats 口径＝共享名单当前活跃席位数，**不含本席**（本席确认后才入名单）；必填，缺省即 invalid。
+ * 顺序：confirmJoining → 写共享名单 → 失败 unconfirmJoining → 重试；幂等 member:true 时由接线重做名单写入。
+ * alreadyMember=true 表示名单已含本席（崩溃后重放），跳过容量检查，但实例/会话/term 仍校验。 */
 function confirmJoining(state, joinId, sessionId, input) {
   const record = joiningOf(state, joinId);
   if (record === undefined) {
     return failure('unknown');
   }
+  const pre = confirmPreconditionOf(record, sessionId, input);
+  if (pre.ok !== true) {
+    return pre;
+  }
+  const settled = settledConfirmOf(record, joinId);
+  if (settled !== null) {
+    return settled;
+  }
+  const blocked = confirmBlockOf(state, record, input, pre.alreadyMember);
+  return blocked === null ? markConfirmed(state, record, input?.now) : blocked;
+}
+
+/* 确认前的必填面：席位键两半、managerTerm（形态与任期相等，幂等路径同样复核）、alreadyMember 布尔。 */
+function confirmPreconditionOf(record, sessionId, input) {
   const identity = confirmIdentityOf(record, sessionId, input?.instanceId);
   if (identity.ok !== true) {
     return identity;
@@ -1040,12 +1100,13 @@ function confirmJoining(state, joinId, sessionId, input) {
   if (!isPositiveInt(input?.managerTerm)) {
     return failure('invalid');
   }
-  const settled = settledConfirmOf(record, joinId);
-  if (settled !== null) {
-    return settled;
+  if (input.managerTerm !== record.managerTerm) {
+    return failure('manager-changed');
   }
-  const blocked = confirmBlockOf(state, record, input);
-  return blocked === null ? markConfirmed(state, record, input?.now) : blocked;
+  const alreadyMember = alreadyMemberFlagOf(input?.alreadyMember);
+  return alreadyMember.ok === true
+    ? { ok: true, alreadyMember: alreadyMember.value }
+    : failure('invalid');
 }
 
 /* 席位键两半都要比：同 sessionId 跨机器不得确认他人的 grant。 */
@@ -1063,23 +1124,31 @@ function confirmIdentityOf(record, sessionId, instanceId) {
   return { ok: true };
 }
 
+function alreadyMemberFlagOf(value) {
+  if (value === undefined) {
+    return { ok: true, value: false };
+  }
+  return typeof value === 'boolean' ? { ok: true, value } : { ok: false };
+}
+
+/* 已确认记录的幂等路径仍复核 instanceId/sessionId/managerTerm（在 precondition 完成），只跳过容量。 */
 function settledConfirmOf(record, joinId) {
   return record.confirmed
     ? { ok: true, member: true, joinId, idempotent: true, joinedAt: record.confirmedAt }
     : null;
 }
 
-/* confirm 的拒绝面：过期（顺手删记录）、managerTerm 不符、活跃席位容量不足；除过期外失败保留 joining。
- * 接线应在名单写入成功后再调用 markConfirmed；写名单失败时用 unconfirmJoining 回滚并重试。 */
-function confirmBlockOf(state, record, input) {
+/* confirm 的拒绝面：过期（顺手删记录）与活跃席位容量不足；除过期外失败保留 joining。
+ * 名单已含本席（alreadyMember）或记录已确认时跳过容量；名单写入失败必须由接线调 unconfirmJoining 回滚。 */
+function confirmBlockOf(state, record, input, alreadyMember) {
   const at = clockOf(state, input?.now);
   if (at >= record.expiresAt) {
     removeJoining(state, record.joinId, record);
     state.counters.expired++;
     return failure('expired');
   }
-  if (input.managerTerm !== record.managerTerm) {
-    return failure('manager-changed');
+  if (alreadyMember) {
+    return null;
   }
   const activeSeats = activeSeatsOf(input.activeSeats);
   if (activeSeats === null) {
@@ -1088,6 +1157,7 @@ function confirmBlockOf(state, record, input) {
   return activeSeats >= state.maxActiveSeats ? failure('capacity') : null;
 }
 
+/* confirm 的内部提交步（不单独导出）：接线只调 confirmJoining；名单写失败用 unconfirmJoining 回滚。 */
 function markConfirmed(state, record, at) {
   const now = clockOf(state, at);
   record.confirmed = true;
@@ -1096,8 +1166,8 @@ function markConfirmed(state, record, at) {
   return { ok: true, member: true, joinId: record.joinId, idempotent: false, joinedAt: now };
 }
 
-/* 名单写入失败的模块侧回滚：把已确认记录退回未确认，joinId 与 TTL 保留，confirm 可重试。
- * 未确认记录按幂等成功返回（无状态可回滚）；未知 joinId 返回 unknown。 */
+/* 名单写入失败的模块侧回滚（接线义务）：把已确认记录退回未确认，joinId 与 TTL 保留，confirm 可重试。
+ * 接线在 confirmJoining 成功后写名单失败时**必调**本方法；未确认记录按幂等成功返回，未知 joinId 返回 unknown。 */
 function unconfirmJoining(state, joinId) {
   const record = joiningOf(state, joinId);
   if (record === undefined) {
@@ -1133,8 +1203,9 @@ function abortJoining(state, joinId, reason = 'aborted') {
   };
 }
 
-/* 离席释放：confirmed 记录是「本任期已入席」的缓存，不是永久席位；席位离席/被移除时必须释放，
- * 否则同 (collabId,sessionId) 再入席会一直撞 already-member。未确认记录同样可释放（作废）。 */
+/* 离席释放（接线义务）：confirmed 记录是「本任期已入席」的缓存，不是永久席位；会话离席、被移除、
+ * 名单移除或协作结束时**必调**本方法，否则同 (collabId,sessionId) 再入席会一直撞 already-member。
+ * 未确认记录同样可释放（作废并计入 aborted）。 */
 function releaseJoining(state, collabId, sessionId) {
   const collab = asId(collabId);
   const session = asId(sessionId);
@@ -1207,31 +1278,56 @@ function joiningIdentityOf(record) {
   };
 }
 
-/* 重启恢复：整表替换并重建 (collabId,sessionId) → joinId 索引；重复 joinId/席位键视为坏条丢弃。
- * 计数器不恢复（只作运行期观测）；已确认记录恢复后可继续幂等 confirm，也可由 releaseJoining 释放。 */
-function restoreJoining(state, records) {
+/* 重启恢复：只吃 joins.json 的 pendingJoins 形态（collabId 由调用方按协作目录注入）。
+ * 设计形态不含 confirmed/confirmedAt/collabId：confirmed 缺省 false；已确认席位以共享名单为准，
+ * 不从 joins.json 恢复，confirmed:true 的记录一律拒收。整表替换并重建席位键索引；
+ * 重复 joinId/席位键与坏字段计入 rejected；超过 maxJoining 时保留 requestedAt 最新的 grant，其余拒收。 */
+function restoreJoining(state, records, options) {
   if (!Array.isArray(records)) {
     return failure('invalid');
   }
+  const collabId = asId(options?.collabId);
+  if (collabId === null) {
+    return failure('invalid');
+  }
+  const limit = isPositiveInt(options?.maxJoining) ? options.maxJoining : state.maxJoining;
+  const kept = joinAcceptedOf(state, records, collabId);
   const byJoinId = new Map();
   const byKey = new Map();
-  let rejected = 0;
-  for (const raw of records) {
-    const record = restoredJoiningOf(raw);
-    const key = record === null ? null : joinKey(record.collabId, record.sessionId);
-    if (record === null || key === null || byJoinId.has(record.joinId) || byKey.has(key)) {
+  let rejected = kept.rejected;
+  for (const record of kept.records) {
+    const key = joinKey(record.collabId, record.sessionId);
+    if (byJoinId.has(record.joinId) || byKey.has(key)) {
       rejected++;
       continue;
     }
     byJoinId.set(record.joinId, record);
     byKey.set(key, record.joinId);
   }
+  rejected += trimJoiningTo(byJoinId, byKey, limit);
   state.byJoinId = byJoinId;
   state.byKey = byKey;
+  state.maxJoining = limit;
   return { ok: true, restored: byJoinId.size, rejected };
 }
 
-function restoredJoiningOf(raw) {
+function joinAcceptedOf(state, records, collabId) {
+  const accepted = [];
+  let rejected = 0;
+  for (const raw of records) {
+    const record = restoredJoiningOf(raw, collabId);
+    if (record === null) {
+      rejected++;
+      continue;
+    }
+    accepted.push(record);
+  }
+  return { records: accepted, rejected };
+}
+
+/* 设计形态：{joinId,instanceId,sessionId,managerTerm,grantVersion,requestedAt,expiresAt}。
+ * 兼容模块 list() 里多出的 collabId（必须与注入值一致）；confirmed 只接受缺省或 false。 */
+function restoredJoiningOf(raw, collabId) {
   if (!isPlainRecord(raw)) {
     return null;
   }
@@ -1239,26 +1335,34 @@ function restoredJoiningOf(raw) {
   if (ids === null || !restoredJoiningFieldsOk(raw)) {
     return null;
   }
+  if (raw.collabId !== undefined && asId(raw.collabId) !== collabId) {
+    return null;
+  }
+  if (raw.confirmed !== undefined && raw.confirmed !== false) {
+    return null;
+  }
   return {
-    ...ids,
+    joinId: ids.joinId,
+    collabId,
+    instanceId: ids.instanceId,
+    sessionId: ids.sessionId,
     managerTerm: raw.managerTerm,
     grantVersion: raw.grantVersion,
     requestedAt: raw.requestedAt,
     expiresAt: raw.expiresAt,
-    confirmed: raw.confirmed,
-    confirmedAt: raw.confirmedAt,
+    confirmed: false,
+    confirmedAt: null,
   };
 }
 
 function restoredJoiningIdsOf(raw) {
   const joinId = asId(raw.joinId);
-  const collabId = asId(raw.collabId);
   const instanceId = asId(raw.instanceId);
   const sessionId = asId(raw.sessionId);
-  if (joinId === null || collabId === null || instanceId === null || sessionId === null) {
+  if (joinId === null || instanceId === null || sessionId === null) {
     return null;
   }
-  return { joinId, collabId, instanceId, sessionId };
+  return { joinId, instanceId, sessionId };
 }
 
 function restoredJoiningFieldsOk(raw) {
@@ -1268,10 +1372,40 @@ function restoredJoiningFieldsOk(raw) {
   if (!isTimestamp(raw.requestedAt) || !isTimestamp(raw.expiresAt) || raw.expiresAt < raw.requestedAt) {
     return false;
   }
-  if (typeof raw.confirmed !== 'boolean') {
-    return false;
+  return raw.confirmed === undefined || raw.confirmed === false;
+}
+
+/* 超限恢复按「最新 grant 优先」裁剪：requestedAt 大者保留，同刻按 joinId 稳定排序。 */
+function trimJoiningTo(byJoinId, byKey, limit) {
+  if (byJoinId.size <= limit) {
+    return 0;
   }
-  return raw.confirmed ? isTimestamp(raw.confirmedAt) : raw.confirmedAt === null;
+  const ordered = [...byJoinId.values()]
+    .sort((left, right) => right.requestedAt - left.requestedAt || left.joinId.localeCompare(right.joinId));
+  const keep = new Set(ordered.slice(0, limit).map((record) => record.joinId));
+  let trimmed = 0;
+  for (const [joinId, record] of [...byJoinId]) {
+    if (keep.has(joinId)) {
+      continue;
+    }
+    byJoinId.delete(joinId);
+    byKey.delete(joinKey(record.collabId, record.sessionId));
+    trimmed++;
+  }
+  return trimmed;
+}
+
+/* joins.json 的持久化投影：只写未确认记录，字段严格按设计 §4.4.2（不混入 confirmed/collabId）。 */
+function joiningPersistOf(record) {
+  return {
+    joinId: record.joinId,
+    instanceId: record.instanceId,
+    sessionId: record.sessionId,
+    managerTerm: record.managerTerm,
+    grantVersion: record.grantVersion,
+    requestedAt: record.requestedAt,
+    expiresAt: record.expiresAt,
+  };
 }
 
 function joiningOf(state, joinId) {
