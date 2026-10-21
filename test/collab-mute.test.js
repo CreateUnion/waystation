@@ -3,21 +3,26 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { collabFilePath } from '../src/paths.js';
+import { collabFilePath, seatFilePath } from '../src/paths.js';
 import { makeTempDir, waitFor } from './helpers.js';
 import { createCollabService } from '../src/collab/service.js';
 import { createInbound } from '../src/net/inbound.js';
 import { createMuteStore, isMuteShape, MUTE_FILE_NAME } from '../src/collab/mute.js';
 import { createInjectedStore, isInjectedRecordShape, INJECTED_FILE_NAME } from '../src/collab/injected.js';
 
-/* 静音开关与注入标记（讨论模式 §5.7）的用例面：store 与栅栏判定（服务直调）、取消摘要与
- * 跨重启持久、清理挂点（退出 / 归档）、真管线（接收管线 → 服务钩子 → 假会话注入）的抑制与
- * 吸收路径前件（标记为真才回报终态；join 通道不受影响）。 */
+/* 静音开关与注入标记的用例面（设计 §5.4）：席位级静音（本机会话逐席位判定）、取消摘要与跨重启
+ * 持久、清理挂点（退出 / 结束 / 撤回）、真管线（接收管线 → 服务钩子 → 本机席位注入）的抑制与
+ * 吸收路径前件。席位一律经真实链路建立：本机创建/加入（核内旁路）、邀请同意后接线、远端两段式
+ * 入席；不直接构造席位文件绕过入席行为。 */
 
 const DAY = 24 * 60 * 60 * 1000;
-
-const SELF_A = { instanceId: 'inst-a', identityName: '主机甲', port: 17321 };
-const SELF_B = { instanceId: 'inst-b', identityName: '主机乙', port: 17322 };
+const SELF_A = { instanceId: 'inst-a', identityName: '主机甲', port: 17321, sessionId: 'sess-peer-a' };
+const SELF_B = { instanceId: 'inst-b', identityName: '主机乙', port: 17322, sessionId: 'sess-peer-b' };
+const SELF_INSTANCE = { instanceId: 'inst-self', identityName: '本机', port: 17321 };
+const MANAGER_SESSION = 'sess-manager-a';
+const MEMBER_SESSION = 'sess-member-b';
+const FORUM_SUMMARY_TAIL = '静音期与回填内容不进注入，经查看器/ws_view_ledger 补看';
+const MANAGED_SUMMARY_TAIL = '经 ws_check_inbox 补看';
 
 function makeLog() {
   const logs = [];
@@ -31,38 +36,80 @@ function makeLog() {
   };
 }
 
-/* 服务夹具（静音面）：真临时目录 + 假发送（记账）+ 假提示面（摘要捕获）+ 告警捕获；
- * overrides.dir 传既有目录即「重建服务」（跨重启持久用例）。 */
+/* 服务夹具：真临时目录 + 真席位表 + 假发送（记账）+ 假桥投递（记录逐席注入）+ 告警捕获。
+ * bindings 与桥注册是组合根接线面，夹具按生产同形注入（论坛加入的「接线落地」判据依赖它们）。 */
 function makeService(t, overrides = {}) {
   const dir = overrides.dir ?? makeTempDir(t);
-  const sent = [];
-  const notices = [];
-  const { logs, log } = makeLog();
-  const self = { instanceId: 'inst-self', identityName: '本机', port: 17321 };
-  const service = createCollabService({
-    dataDir: dir,
-    config: { inviteTtlMs: DAY },
-    self,
-    send: (message) => { sent.push(message); return { ok: true, msgId: `q-${sent.length}` }; },
-    sendDirect: () => ({ ok: true, msgId: 'd-1' }),
-    notify: (frame) => { notices.push(frame); },
-    knownHosts: { remember: () => {} },
-    log,
+  const made = {
+    dir,
+    sent: [],
+    direct: [],
+    notices: [],
+    deliveries: [],
+    bindings: new Map(),
+    self: SELF_INSTANCE,
+    ...makeLog(),
+  };
+  made.service = createCollabService(serviceOptionsOf(made, overrides));
+  for (const sessionId of [MANAGER_SESSION, MEMBER_SESSION]) {
+    made.service.registerBridgeEntry(sessionId, `bridge-${sessionId}`);
+  }
+  return made;
+}
+
+function serviceOptionsOf(made, overrides) {
+  return {
+    dataDir: made.dir,
+    config: {
+      inviteTtlMs: DAY,
+      joinRequestTtlMs: DAY,
+      joinConfirmTtlMs: DAY,
+      messageTtlMs: 600000,
+      ...(overrides.config ?? {}),
+    },
+    self: made.self,
+    send: (message) => {
+      made.sent.push(message);
+      return { ok: true, msgId: `q-${made.sent.length}` };
+    },
+    sendDirect: (message) => {
+      made.direct.push(message);
+      return { ok: true, msgId: `d-${made.direct.length}` };
+    },
+    notify: (frame) => {
+      made.notices.push(frame);
+      return true;
+    },
+    deliverSeat: (frame, seat) => {
+      made.deliveries.push({ sessionId: seat.sessionId, type: frame.type, msgId: frame.msgId, frame });
+      return true;
+    },
+    knownHosts: { remember: () => {}, lookup: () => undefined },
+    bindings: bindingsFacadeOf(made),
+    bridgeIdOf: (sessionId) => `bridge-${sessionId}`,
+    log: made.log,
     ledgerFetchTimeoutMs: 30,
     inviteMinIntervalMs: 0,
     pullReplyTimeoutMs: 60,
     syncPeerPicker: () => [],
     joinReplayIntervalsMs: [10, 20, 40],
-  });
-  return { service, sent, notices, logs, dir, self };
+  };
 }
 
-/* 接收管线级夹具（真接收管线 + 真服务消费 + 假会话注入面 + 假连接）：四钩子与生产组合根同形。 */
+function bindingsFacadeOf(made) {
+  return {
+    set: (collabId, entry) => made.bindings.set(collabId, entry),
+    get: (collabId) => made.bindings.get(collabId),
+    entries: () => [...made.bindings.entries()],
+  };
+}
+
+/* 接收管线级夹具：真接收管线 + 真服务消费 + 逐席位注入面（listSeats/injectSeat 与生产组合根
+ * 同形；两个钩子都注入才启用席位扇出路径）。 */
 function makePipedService(t, overrides = {}) {
   const made = makeService(t, overrides);
-  const session = [];
-  const reports = [];
-  const inbound = createInbound({
+  made.reports = [];
+  made.inbound = createInbound({
     dataDir: made.dir,
     config: { messageTtlMs: 600000 },
     self: made.self,
@@ -70,18 +117,22 @@ function makePipedService(t, overrides = {}) {
       resolvePong: () => false,
       onAck: () => {},
       onDeliveryReport: () => {},
-      send: (message) => { reports.push(message); return { ok: true }; },
+      send: (message) => {
+        made.reports.push(message);
+        return { ok: true };
+      },
     },
     hooks: {
       admit: (frame, meta) => made.service.hooks.admit(frame, meta),
       consume: (frame, meta) => made.service.hooks.consume(frame, meta),
-      sessionGate: (frame) => made.service.hooks.sessionGate(frame),
+      sessionGate: (frame, meta) => made.service.hooks.sessionGate(frame, meta),
       sessionDelivered: (frame) => made.service.hooks.sessionDelivered(frame),
-      deliverToSession: (frame) => { session.push(frame); return true; },
+      listSeats: (collabId) => made.service.listInjectableTargets(collabId),
+      injectSeat: (collabId, sessionId, frame) => made.service.injectLocalSeat(collabId, sessionId, frame),
     },
     log: { info: () => {}, warn: () => {}, error: () => {} },
   });
-  return { ...made, inbound, session, reports };
+  return made;
 }
 
 function fakeConnection(remoteAddress = '127.0.0.1') {
@@ -95,43 +146,67 @@ function fakeConnection(remoteAddress = '127.0.0.1') {
 
 let seq = 0;
 
-function peer(instanceId, identityName, port = 17321) {
-  return { instanceId, identityName, port };
+function localPeerOf(sessionId) {
+  return { ...SELF_INSTANCE, sessionId };
 }
 
-function targetOf(member) {
-  return { instanceId: member.instanceId, identityName: member.identityName, address: '127.0.0.2', port: member.port };
+function targetOf(peer) {
+  return { instanceId: peer.instanceId, identityName: peer.identityName, address: '127.0.0.2', port: peer.port };
 }
 
-function collabFrame(type, collabId, from, payload) {
+function collabFrame(type, collabId, from, payload, toSessions = null) {
   seq++;
-  return { v: 1, type, msgId: `msg-${type}-${seq}`, from: { instanceId: from.instanceId, identityName: from.identityName, port: from.port }, collabId, ts: new Date().toISOString(), payload };
-}
-
-function inviteFrame({ collabId, name = '联调项目', mode = 'forum' } = {}) {
-  seq++;
-  const roster = [SELF_A, { instanceId: 'inst-self', identityName: '本机', port: 17321 }];
   return {
     v: 1,
-    type: 'invite',
-    msgId: `msg-inv-${seq}`,
-    from: { instanceId: SELF_A.instanceId, identityName: SELF_A.identityName, port: SELF_A.port },
-    collabId: collabId ?? `collab-${seq}`,
+    cap: 2,
+    type,
+    msgId: `msg-${type}-${seq}`,
+    from: { instanceId: from.instanceId, identityName: from.identityName, port: from.port, sessionId: from.sessionId },
+    collabId,
     ts: new Date().toISOString(),
-    payload: { name, topic: '发布联调', mode, members: roster.map((entry) => ({ instanceId: entry.instanceId, identityName: entry.identityName })) },
+    payload,
+    ...(toSessions === null ? {} : { toSessions }),
   };
 }
 
-function postFrameOf(collabId, from, { postId, postSeq = 1, kind = 'reply', text }) {
-  return collabFrame('post', collabId, from, { post: { postId, seq: postSeq, kind, text } });
+/* 讨论邀请：不指名（名单含邀请者与本机会话）、无 inviteId（讨论无邀请簿记）。 */
+function inviteFrame({ collabId, name = '联调项目', inviter = SELF_A } = {}) {
+  seq++;
+  const roster = [inviter, { ...SELF_INSTANCE, sessionId: MEMBER_SESSION }];
+  return {
+    v: 1,
+    cap: 2,
+    type: 'invite',
+    msgId: `msg-inv-${seq}`,
+    from: { instanceId: inviter.instanceId, identityName: inviter.identityName, port: inviter.port, sessionId: inviter.sessionId },
+    collabId: collabId ?? `collab-${seq}`,
+    ts: new Date().toISOString(),
+    payload: {
+      name,
+      topic: '发布联调',
+      mode: 'forum',
+      members: roster.map((entry) => ({ instanceId: entry.instanceId, sessionId: entry.sessionId, identityName: entry.identityName })),
+    },
+  };
 }
 
-function joinFrameOf(collabId, from) {
-  return collabFrame('join', collabId, from, { eventId: randomUUID(), ts: new Date().toISOString() });
+function postFrameOf(collabId, from, { postId, postSeq = 1, kind = 'reply', text }, toSessions = null) {
+  return collabFrame('post', collabId, from, { post: { postId, seq: postSeq, kind, text } }, toSessions);
 }
 
-function freezeFrameOf(from, name, members) {
-  return collabFrame('freeze', 'collab-freeze-1', from, { name, members: members.map((entry) => ({ instanceId: entry.instanceId, identityName: entry.identityName })) });
+function joinFrameOf(collabId, from, eventId = randomUUID()) {
+  return collabFrame('join', collabId, from, { eventId, ts: new Date().toISOString() });
+}
+
+function endFrameOf(collabId, from) {
+  return collabFrame('end', collabId, from, {});
+}
+
+function freezeFrameOf(collabId, from, name, members) {
+  return collabFrame('freeze', collabId, from, {
+    name,
+    members: members.map((entry) => ({ instanceId: entry.instanceId, sessionId: entry.sessionId, identityName: entry.identityName })),
+  });
 }
 
 async function receive(service, frame, remoteAddress = '127.0.0.1') {
@@ -150,279 +225,383 @@ function injectedPath(dir, collabId) {
   return collabFilePath(dir, collabId, INJECTED_FILE_NAME);
 }
 
-function suppressedOf(service, frame) {
-  return service.hooks.sessionGate(frame).suppress === true;
+function seatPath(dir, collabId, sessionId) {
+  return seatFilePath(dir, collabId, sessionId);
 }
 
-function sessionPosts(made) {
-  return made.session.filter((frame) => frame.type === 'post');
+function seatOf(service, collabId, sessionId) {
+  return service.listLocalSeats(collabId).find((seat) => seat.sessionId === sessionId) ?? null;
+}
+
+function suppressedOf(service, frame, sessionId) {
+  return service.hooks.sessionGate(frame, { sessionId }).suppress === true;
+}
+
+function deliveriesOf(made, sessionId, type = null) {
+  return made.deliveries.filter((entry) => entry.sessionId === sessionId && (type === null || entry.type === type));
+}
+
+function postDeliveriesOf(made, sessionId) {
+  return deliveriesOf(made, sessionId, 'post');
 }
 
 function reportFor(made, msgId) {
   return made.reports.some((message) => message.payload?.refMsgId === msgId);
 }
 
-/* 成员侧讨论（经邀请 + 同意）：默认名 联调项目、邀请者 主机甲。
- * 入席即默认静音（本文件主题即静音面）——夹具代表「普通（未静音）」基线，随即显式取消：
- * 断言不许依赖系统默认值，静音态的建立由用例自己显式给出。 */
-async function makeMemberForum(made, { collabId, name = '联调项目' } = {}) {
-  await receive(made.service, inviteFrame({ collabId, name, mode: 'forum' }));
-  await made.service.approve({ collabId, approve: true });
-  made.service.setMute({ collabId, muted: false });
+function resumeNoticeTextOf(made) {
+  const notice = made.notices.filter((entry) => entry.payload?.event === 'local-alert').at(-1);
+  return notice?.payload?.text ?? '';
+}
+
+function setMuteOf(made, collabId, sessionId, muted) {
+  const result = made.service.setMute({ collabId, sessionId, muted });
+  assert.equal(result.ok, true, result.message);
+  return result;
+}
+
+async function unmuteAll(made, collabId) {
+  setMuteOf(made, collabId, MANAGER_SESSION, false);
+  setMuteOf(made, collabId, MEMBER_SESSION, false);
+}
+
+/* 本机讨论：本会话创建（发起席位），另一本机会话经「在席＝接线立即」加入（默认静音由被测面自证）。 */
+async function makeForum(made, { name = '联调项目' } = {}) {
+  const created = made.service.create({
+    name, topic: '发布联调', mode: 'forum', sessionId: MANAGER_SESSION, targets: [targetOf(SELF_A)],
+  });
+  assert.equal(created.ok, true, created.message);
+  const joined = await made.service.join.request({ collabId: created.collabId, sessionId: MEMBER_SESSION });
+  assert.equal(joined.ok, true, joined.message);
+  return created.collabId;
+}
+
+/* 本机协作：站长会话创建，另一本机会话经两段式（申请 → 批准）入席。 */
+function createManaged(made, { name = '协作甲', target = SELF_B } = {}) {
+  const created = made.service.create({ name, topic: '主题', mode: 'managed', sessionId: MANAGER_SESSION, targets: [targetOf(target)] });
+  assert.equal(created.ok, true, created.message);
+  return created.collabId;
+}
+
+async function makeManaged(made, { name = '协作甲' } = {}) {
+  const collabId = createManaged(made, { name });
+  const asked = await made.service.join.request({ collabId, sessionId: MEMBER_SESSION });
+  assert.equal(asked.ok, true, asked.message);
+  const approved = await made.service.join.approve({ collabId, sessionId: MEMBER_SESSION, managerSessionId: MANAGER_SESSION, approve: true });
+  assert.equal(approved.ok, true, approved.message);
   return collabId;
 }
 
-/* 站长席位侧协作（managed）：本机发起、单目标（同上前置：显式取消入席默认静音）。 */
-function makeManaged(made, { name = '协作甲', target = SELF_B } = {}) {
-  const collabId = made.service.create({ name, topic: '主题', targets: [targetOf(target)] }).collabId;
-  made.service.setMute({ collabId, muted: false });
+/* 成员侧讨论：接收邀请 → 用户确认门 → 同意（发出 join 成员事件）→ 本会话接线（落本机席位）。 */
+async function makeMemberForum(made, { collabId, name = '联调项目', inviter = SELF_A } = {}) {
+  const admitted = await receive(made.service, inviteFrame({ collabId, name, inviter }));
+  assert.equal(admitted?.ok, true, admitted?.reason);
+  await approveWithConsent(made.service, { collabId, sessionId: MEMBER_SESSION });
+  const joined = await made.service.join.request({ collabId, sessionId: MEMBER_SESSION });
+  assert.equal(joined.ok, true, joined.message);
   return collabId;
 }
 
-/* 站长席位侧讨论：本机发起（讨论创建跳过同名冲突检查）、成员 join（同上前置：显式取消入席默认静音）。 */
-async function makeManagerForum(made, { name = '联调项目', member = SELF_B } = {}) {
-  const collabId = made.service.create({ name, topic: '议题', mode: 'forum', targets: [targetOf(member)] }).collabId;
-  made.service.setMute({ collabId, muted: false });
-  const joined = joinFrameOf(collabId, peer(member.instanceId, member.identityName, member.port));
-  await receive(made.service, joined);
-  return { collabId, joined };
+/* 同意门是产品行为（首次挑战、携令牌重试），夹具按真实两步走，不豁免确认。 */
+async function approveWithConsent(service, { collabId, sessionId }) {
+  const first = await service.approve({ collabId, approve: true, sessionId });
+  const result = first?.needsUserConfirmation === true
+    ? await service.approve({ collabId, approve: true, sessionId, confirmToken: first.confirmToken })
+    : first;
+  assert.equal(result.ok, true, result.message);
+  return result;
 }
 
-test('静音开关：入席默认静音、显式取消后不抑制、设静音落盘形态、重建服务后仍静音、校验面明确报错', async (t) => {
+/* 远端成员两段式入席：join-request → 站长批准（直投 join-grant）→ join-confirm 回执。 */
+async function joinRemoteMember(made, collabId, connection) {
+  const from = { instanceId: SELF_B.instanceId, identityName: SELF_B.identityName, port: SELF_B.port, sessionId: SELF_B.sessionId };
+  made.inbound.onFrame(connection, {
+    v: 1, cap: 2, type: 'join-request', msgId: `join-req-${++seq}`, from, collabId, ts: new Date().toISOString(),
+    payload: { sessionId: SELF_B.sessionId },
+  });
+  await waitFor(() => (made.service.join.pendingJoinsOf(collabId).length === 1 ? true : null));
+  const approved = await made.service.join.approve({ collabId, sessionId: SELF_B.sessionId, managerSessionId: MANAGER_SESSION, approve: true });
+  assert.equal(approved.ok, true, approved.message);
+  const grant = made.direct.find((message) => message.type === 'join-grant' && message.payload?.sessionId === SELF_B.sessionId);
+  assert.ok(grant !== undefined, '批准必须签发 join-grant');
+  made.inbound.onFrame(connection, {
+    v: 1, cap: 2, type: 'join-confirm', msgId: `join-cfm-${++seq}`, from, collabId, ts: new Date().toISOString(),
+    payload: { joinId: grant.payload.joinId, managerTerm: grant.payload.managerTerm, version: grant.payload.version },
+  });
+  await waitFor(async () => {
+    const viewed = await made.service.view({ collabId });
+    return viewed.ledger?.members.some((row) => row.sessionId === SELF_B.sessionId) === true ? true : null;
+  });
+}
+
+async function sendForumPost(made, collabId, text) {
+  const sent = await made.service.send({ collabId, sessionId: MANAGER_SESSION, text });
+  assert.equal(sent.ok, true, sent.message);
+}
+
+test('静音开关：入席默认静音、显式取消后不抑制、席位落盘形态、重建服务后仍静音、校验面明确报错', async (t) => {
   const made = makeService(t);
-  /* 入席（受邀 + 同意）不走夹具：本用例要断言默认态本身，前置与断言都显式——先看默认静音，
-   * 再显式取消得到「普通（未静音）」基线，后续断言全部建立在这个显式前置上。 */
-  const collabId = 'collab-mute-persist';
-  await receive(made.service, inviteFrame({ collabId, mode: 'forum' }));
-  await made.service.approve({ collabId, approve: true });
-  assert.equal(suppressedOf(made.service, { type: 'post', collabId }), true, '入席即默认静音');
-  made.service.setMute({ collabId, muted: false });
-  assert.equal(suppressedOf(made.service, { type: 'post', collabId }), false, '显式取消静音后不抑制');
-  assert.equal(made.service.list().collabs[0].muted, false, '清单行带当前静音态（供 ws_list_collabs 出参）');
-  assert.deepEqual(made.service.setMute({ collabId, muted: true }), { ok: true, collabId, muted: true });
-  assert.equal(made.service.list().collabs[0].muted, true, '切换后清单行即时反映');
-  assert.deepEqual(JSON.parse(readFileSync(mutePath(made.dir, collabId), 'utf8')), { v: 1, muted: true, baseline: 0 }, '落盘形态：v/muted/baseline');
+  const collabId = await makeForum(made, { name: '联调项目' });
+  assert.equal(seatOf(made.service, collabId, MANAGER_SESSION).muted, true, '发起席位入席即默认静音');
+  assert.equal(seatOf(made.service, collabId, MEMBER_SESSION).muted, true, '同机加入席位同样默认静音');
+  assert.equal(suppressedOf(made.service, { type: 'post', collabId }, MEMBER_SESSION), true, '默认静音期内容不注入');
+  await unmuteAll(made, collabId);
+  assert.equal(suppressedOf(made.service, { type: 'post', collabId }, MEMBER_SESSION), false, '显式取消静音后不抑制');
+  assert.equal(made.service.list({ sessionId: MEMBER_SESSION }).collabs[0].muted, false, '清单行按本机席位聚合静音态');
+  assert.deepEqual(made.service.setMute({ collabId, sessionId: MEMBER_SESSION, muted: true }), { ok: true, collabId, muted: true });
+  assert.equal(seatOf(made.service, collabId, MEMBER_SESSION).muted, true, '切换后本席即时反映');
+  assert.equal(made.service.list({ sessionId: MEMBER_SESSION }).collabs[0].muted, true, '清单行聚合随席位切换');
+  const seatRecord = JSON.parse(readFileSync(seatPath(made.dir, collabId, MEMBER_SESSION), 'utf8'));
+  assert.equal(seatRecord.sessionId, MEMBER_SESSION);
+  assert.equal(seatRecord.muted, true, '静音态落在本机席位文件（设计 §6.1）');
   const reloaded = makeService(t, { dir: made.dir });
-  assert.equal(suppressedOf(reloaded.service, { type: 'post', collabId }), true, '重建服务后仍静音（跨重启持久）');
-  const unknown = made.service.setMute({ collabId: 'no-such', muted: true });
+  assert.equal(seatOf(reloaded.service, collabId, MEMBER_SESSION).muted, true, '重建服务后席位静音仍在');
+  assert.equal(suppressedOf(reloaded.service, { type: 'post', collabId }, MEMBER_SESSION), true, '重建后按席位继续抑制');
+  assert.equal(suppressedOf(reloaded.service, { type: 'post', collabId }, MANAGER_SESSION), false, '同机另一席不受影响');
+  const unknown = made.service.setMute({ collabId: 'no-such', sessionId: MEMBER_SESSION, muted: true });
   assert.equal(unknown.ok, false);
   assert.ok(unknown.message.includes('collabId 不存在'), unknown.message);
-  const badType = made.service.setMute({ collabId, muted: 'yes' });
+  const badType = made.service.setMute({ collabId, sessionId: MEMBER_SESSION, muted: 'yes' });
   assert.equal(badType.ok, false);
   assert.ok(badType.message.includes('布尔'), badType.message);
+  const noSeat = made.service.setMute({ collabId, sessionId: 'sess-ghost', muted: true });
+  assert.equal(noSeat.ok, false);
+  assert.ok(noSeat.message.includes('没有席位'), noSeat.message);
 });
 
-test('静音栅栏判定：讨论帖与协作六类内容抑制；结束 / 邀请 / 快照 / 治理等待办照常', async (t) => {
+test('静音栅栏判定：内容类按收件席位抑制；结束 / 邀请 / 快照 / 治理等待办照常', async (t) => {
   const made = makeService(t);
-  const forumId = await makeMemberForum(made, { collabId: 'collab-gate-forum' });
-  const managedId = makeManaged(made, { name: '协作甲' });
-  made.service.setMute({ collabId: forumId, muted: true });
-  made.service.setMute({ collabId: managedId, muted: true });
-  assert.equal(suppressedOf(made.service, { type: 'post', collabId: forumId }), true, '讨论实时帖：静音期不注入');
-  assert.equal(suppressedOf(made.service, { type: 'end', collabId: forumId }), false, '结束（终态）：照常');
-  assert.equal(suppressedOf(made.service, { type: 'join', collabId: forumId }), false, 'join：照常');
-  assert.equal(suppressedOf(made.service, { type: 'notice', collabId: forumId }), false, '通知类：照常');
-  assert.equal(suppressedOf(made.service, { type: 'snapshot', collabId: forumId }), false, '快照类：照常');
-  assert.equal(suppressedOf(made.service, { type: 'invite', collabId: 'collab-invite-x' }), false, '邀请（同意门）：照常');
+  const forumId = await makeForum(made, { name: '联调项目' });
+  const managedId = await makeManaged(made, { name: '协作甲' });
+  await unmuteAll(made, forumId);
+  await unmuteAll(made, managedId);
+  setMuteOf(made, forumId, MEMBER_SESSION, true);
+  setMuteOf(made, managedId, MEMBER_SESSION, true);
+  assert.equal(suppressedOf(made.service, { type: 'post', collabId: forumId }, MEMBER_SESSION), true, '讨论实时帖：静音席不注入');
+  assert.equal(suppressedOf(made.service, { type: 'post', collabId: forumId }, MANAGER_SESSION), false, '同机另一席照常（逐席位判定）');
+  assert.equal(suppressedOf(made.service, { type: 'end', collabId: forumId }, MEMBER_SESSION), false, '结束（终态）：照常');
+  assert.equal(suppressedOf(made.service, { type: 'join', collabId: forumId }, MEMBER_SESSION), false, 'join：照常');
+  assert.equal(suppressedOf(made.service, { type: 'notice', collabId: forumId }, MEMBER_SESSION), false, '通知类：照常');
+  assert.equal(suppressedOf(made.service, { type: 'snapshot', collabId: forumId }, MEMBER_SESSION), false, '快照类：照常');
+  assert.equal(suppressedOf(made.service, { type: 'invite', collabId: 'collab-invite-x' }, MEMBER_SESSION), false, '邀请（同意门）：照常');
   for (const kind of ['topic', 'task', 'progress', 'issue', 'stop', 'reply']) {
-    assert.equal(suppressedOf(made.service, { type: kind, collabId: managedId }), true, `${kind}：静音期不注入`);
+    assert.equal(suppressedOf(made.service, { type: kind, collabId: managedId }, MEMBER_SESSION), true, `${kind}：静音席不注入`);
   }
-  assert.equal(suppressedOf(made.service, { type: 'notice', collabId: managedId }), false, '协作通知类：照常');
-  /* 协作侧治理等待办（freeze / unfreeze / decision 命中本机 managed）：帧有处置意义，照常注入。 */
-  const from = peer(SELF_B.instanceId, SELF_B.identityName, SELF_B.port);
+  assert.equal(suppressedOf(made.service, { type: 'notice', collabId: managedId }, MEMBER_SESSION), false, '协作通知类：照常');
   for (const type of ['freeze', 'unfreeze', 'decision']) {
-    const frame = { ...freezeFrameOf(from, '协作甲', [SELF_B]), type };
-    assert.equal(suppressedOf(made.service, frame), false, `协作侧 ${type}（本机有处置面）：照常`);
+    const frame = { ...freezeFrameOf(managedId, SELF_B, '协作甲', [SELF_B]), type };
+    assert.equal(suppressedOf(made.service, frame, MEMBER_SESSION), false, `治理等待办 ${type}：照常`);
   }
-  made.service.setMute({ collabId: forumId, muted: false });
-  assert.equal(suppressedOf(made.service, { type: 'post', collabId: forumId }), false, '取消后即时恢复判定');
+  setMuteOf(made, forumId, MEMBER_SESSION, false);
+  assert.equal(suppressedOf(made.service, { type: 'post', collabId: forumId }, MEMBER_SESSION), false, '取消后即时恢复判定');
 });
 
-test('被忽略治理帧不注入会话：命中讨论即置抑制（未静音也如此）；同名 managed 命中照常注入（待办价值优先）', async (t) => {
+test('被忽略治理帧不注入会话：命中讨论即置抑制（未静音也如此）；同名 managed 命中照常注入', async (t) => {
   const made = makePipedService(t);
-  /* 先建 managed（同名冲突检查只施于 managed），后建讨论（讨论创建跳过检查）。 */
-  makeManaged(made, { name: '联调项目' });
-  const forumId = await makeMemberForum(made, { collabId: 'collab-freeze-forum', name: '联调项目' });
-  const connection = fakeConnection();
-  const from = peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port);
-  /* 冻结族三型（freeze / unfreeze / decision）命中讨论：受理 + ack、忽略计数、不注入、无终态回报。 */
+  const connection = fakeConnection('127.0.0.2');
+  const managedId = createManaged(made, { name: '联调项目' });
+  await joinRemoteMember(made, managedId, connection);
+  const forumId = await makeMemberForum(made, { collabId: 'collab-governance-forum', name: '联调项目' });
+  setMuteOf(made, managedId, MANAGER_SESSION, true);
+  setMuteOf(made, forumId, MEMBER_SESSION, true);
   const types = ['freeze', 'unfreeze', 'decision'];
   for (const [index, type] of types.entries()) {
-    const frame = { ...freezeFrameOf(from, '联调项目', [SELF_A]), type };   // 只在讨论名单内（成员侧 roster = 发起人 + 本机）
-    const sessionBefore = made.session.length;
+    const frame = { ...freezeFrameOf(`collab-foreign-${index}`, SELF_A, '联调项目', [SELF_A]), type };
     made.inbound.onFrame(connection, frame);
     await waitFor(() => (made.service.stats().forumGovernanceIgnored === index + 1 ? true : null));
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(connection.sent.some((entry) => entry.type === 'ack' && entry.ackFor === frame.msgId), true, `${type}：受理 + ack（防治理重试钉死）`);
-    assert.equal(made.session.length, sessionBefore, `${type}：被忽略帧不注入会话（未静音也如此）`);
-    assert.equal(made.inbound.stats().sessionSuppressed, index + 1, `${type}：抑制走消费侧声明（sessionSuppressed）`);
-    assert.equal(reportFor(made, frame.msgId), false, `${type}：不发终态回报（发送侧维持第二档）`);
-    assert.equal(suppressedOf(made.service, frame), false, '栅栏层未静音不抑制——不注入由消费侧声明保证');
+    assert.equal(deliveriesOf(made, MEMBER_SESSION).some((entry) => entry.msgId === frame.msgId), false, `${type}：被忽略帧不注入会话`);
+    assert.equal(reportFor(made, frame.msgId), false, `${type}：不发终态回报`);
   }
-  /* 栅栏层的静音兜底仍在（T3M 冻结面）：静音期命中讨论由栅栏层再抑制一层。 */
-  made.service.setMute({ collabId: forumId, muted: true });
-  const mutedHit = { ...freezeFrameOf(from, '联调项目', [SELF_A]), type: 'freeze' };
-  assert.equal(suppressedOf(made.service, mutedHit), true, '静音期命中讨论：栅栏层同样抑制');
-  made.service.setMute({ collabId: forumId, muted: false });
-
-  /* 同名 managed 命中：帧有处置意义——照常注入（忽略计数与抑制计数均不增）。 */
+  const sameCollab = freezeFrameOf(forumId, SELF_A, '联调项目', [SELF_A]);
+  assert.equal(suppressedOf(made.service, sameCollab, MEMBER_SESSION), false, '治理帧不受静音抑制；讨论的忽略由消费侧声明');
   const ignoredBefore = made.service.stats().forumGovernanceIgnored;
-  const suppressedBefore = made.inbound.stats().sessionSuppressed;
-  const managedHit = freezeFrameOf(from, '联调项目', [SELF_B]);   // 只在 managed 名册内
-  managedHit.payload.reason = '同名冲突';
+  const managedHit = freezeFrameOf(managedId, SELF_B, '联调项目', [SELF_B]);
   made.inbound.onFrame(connection, managedHit);
-  await waitFor(() => (made.session.some((entry) => entry.msgId === managedHit.msgId) ? true : null));
+  await waitFor(() => (deliveriesOf(made, MANAGER_SESSION).some((entry) => entry.msgId === managedHit.msgId) ? true : null));
   assert.equal(made.service.stats().forumGovernanceIgnored, ignoredBefore, 'managed 命中不落讨论忽略计数');
-  assert.equal(made.inbound.stats().sessionSuppressed, suppressedBefore, 'managed 命中不落抑制计数');
+  assert.equal(deliveriesOf(made, MANAGER_SESSION).some((entry) => entry.msgId === managedHit.msgId), true, '站长席静音仍注入治理等待办');
 });
 
 test('取消静音的错过内容摘要：N=静音期新增（讨论=帖 / 协作=内容消息）；重复设静音不重置基线；重复取消不发摘要', async (t) => {
-  const made = makeService(t);
-  const fromA = peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port);
-  const forumId = await makeMemberForum(made, { collabId: 'collab-summary-forum' });
-  await receive(made.service, postFrameOf(forumId, fromA, { postId: 'post-a1', postSeq: 1, text: '静音前甲' }));
-  await receive(made.service, postFrameOf(forumId, fromA, { postId: 'post-a2', postSeq: 2, text: '静音前乙' }));
-  made.service.setMute({ collabId: forumId, muted: true });
-  await receive(made.service, postFrameOf(forumId, fromA, { postId: 'post-a3', postSeq: 3, text: '静音期帖' }));
-  assert.equal((await made.service.view({ collabId: forumId })).posts.length, 3, '静音期帖照常落盘（只做减法）');
-  made.service.setMute({ collabId: forumId, muted: false });
-  const notice = made.notices.at(-1);
-  assert.equal(notice.type, 'notice');
-  assert.equal(notice.payload.event, 'local-alert');
-  assert.equal(notice.collabId, forumId);
-  assert.equal(notice.payload.text, '静音期间本讨论新增 1 条——静音期与回填内容不进注入，经查看器/ws_view_ledger 补看');
-  const noticeCount = made.notices.length;
-  made.service.setMute({ collabId: forumId, muted: false });
-  assert.equal(made.notices.length, noticeCount, '未静音时再取消：不发无意义摘要');
-  /* 重复设静音不重置基线：两次「设静音」之间与之后到达的帖都并入同一窗口。 */
-  made.service.setMute({ collabId: forumId, muted: true });
-  await receive(made.service, postFrameOf(forumId, fromA, { postId: 'post-a4', postSeq: 4, text: '窗口一' }));
-  made.service.setMute({ collabId: forumId, muted: true });
-  await receive(made.service, postFrameOf(forumId, fromA, { postId: 'post-a5', postSeq: 5, text: '窗口二' }));
-  made.service.setMute({ collabId: forumId, muted: false });
-  assert.equal(made.notices.at(-1).payload.text, '静音期间本讨论新增 2 条——静音期与回填内容不进注入，经查看器/ws_view_ledger 补看');
-  /* 协作侧：N = 内容消息计数增量；文案直达收件箱工具。 */
-  const managedId = makeManaged(made, { name: '协作乙' });
-  const fromB = peer(SELF_B.instanceId, SELF_B.identityName, SELF_B.port);
-  made.service.setMute({ collabId: managedId, muted: true });
-  await receive(made.service, collabFrame('progress', managedId, fromB, { text: '静音期进度一' }));
-  await receive(made.service, collabFrame('progress', managedId, fromB, { text: '静音期进度二' }));
-  made.service.setMute({ collabId: managedId, muted: false });
-  assert.equal(made.notices.at(-1).payload.text, '静音期间本协作新增 2 条——经 ws_check_inbox 补看');
-});
-
-test('基线缺失与坏文件：baseline null 的旧形态摘要降级不带 N；坏文件按默认不静音并留痕', async (t) => {
-  const made = makeService(t);
-  const collabId = await makeMemberForum(made, { collabId: 'collab-summary-degrade' });
-  const file = mutePath(made.dir, collabId);
-  writeFileSync(file, JSON.stringify({ v: 1, muted: true, baseline: null }));
-  const reloaded = makeService(t, { dir: made.dir });
-  assert.equal(suppressedOf(reloaded.service, { type: 'post', collabId }), true, '基线缺失不影响静音本身');
-  reloaded.service.setMute({ collabId, muted: false });
-  assert.equal(reloaded.notices.at(-1).payload.text, '静音期间本讨论可能有新内容——静音期与回填内容不进注入，经查看器/ws_view_ledger 补看', '基线缺失：摘要降级为不带 N');
-  writeFileSync(file, '{ 坏文件');
-  const reloaded2 = makeService(t, { dir: made.dir });
-  assert.equal(suppressedOf(reloaded2.service, { type: 'post', collabId }), false, '坏文件按默认（不静音）继续');
-  assert.ok(reloaded2.logs.some((entry) => entry.message.includes('静音状态文件不可用')), '坏文件必须留痕（告警）');
-});
-
-test('静音期首帧帖：不注入不记真；重复副本不回报终态；取消后仍不进注入；新帖即时恢复注入', async (t) => {
   const made = makePipedService(t);
-  const { collabId } = await makeManagerForum(made);
-  made.service.setMute({ collabId, muted: true });
+  const forumId = await makeForum(made, { name: '联调项目' });
+  await unmuteAll(made, forumId);
+  made.notices.length = 0;
+  await sendForumPost(made, forumId, '静音前甲');
+  await sendForumPost(made, forumId, '静音前乙');
+  setMuteOf(made, forumId, MEMBER_SESSION, true);
+  await sendForumPost(made, forumId, '静音期帖');
+  assert.equal((await made.service.view({ collabId: forumId })).posts.length, 3, '静音期帖照常落盘（只做减法）');
+  setMuteOf(made, forumId, MEMBER_SESSION, false);
+  assert.equal(resumeNoticeTextOf(made), `静音期间本讨论新增 1 条——${FORUM_SUMMARY_TAIL}`);
+  const noticeCount = made.notices.length;
+  setMuteOf(made, forumId, MEMBER_SESSION, false);
+  assert.equal(made.notices.length, noticeCount, '未静音时再取消：不发无意义摘要');
+  setMuteOf(made, forumId, MEMBER_SESSION, true);
+  await sendForumPost(made, forumId, '窗口一');
+  setMuteOf(made, forumId, MEMBER_SESSION, true);
+  await sendForumPost(made, forumId, '窗口二');
+  setMuteOf(made, forumId, MEMBER_SESSION, false);
+  assert.equal(resumeNoticeTextOf(made), `静音期间本讨论新增 2 条——${FORUM_SUMMARY_TAIL}`, '重复设静音不重置基线');
+  const managedId = await makeManaged(made, { name: '协作乙' });
+  await unmuteAll(made, managedId);
+  setMuteOf(made, managedId, MANAGER_SESSION, true);
   const connection = fakeConnection();
-  const from = peer(SELF_B.instanceId, SELF_B.identityName, SELF_B.port);
-  const first = postFrameOf(collabId, from, { postId: 'post-m1', seq: 1, text: '静音期首帧' });
+  const fromMember = localPeerOf(MEMBER_SESSION);
+  made.inbound.onFrame(connection, collabFrame('progress', managedId, fromMember, { text: '静音期进度一' }, [MANAGER_SESSION]));
+  made.inbound.onFrame(connection, collabFrame('progress', managedId, fromMember, { text: '静音期进度二' }, [MANAGER_SESSION]));
+  await waitFor(() => (made.service.indicators().find((item) => item.collabId === managedId)?.msgCount === 2 ? true : null));
+  setMuteOf(made, managedId, MANAGER_SESSION, false);
+  assert.equal(resumeNoticeTextOf(made), `静音期间本协作新增 2 条——${MANAGED_SUMMARY_TAIL}`);
+});
+
+test('同机两席静音互不影响：一席静音不抑制另一席；摘要基线按协作共用（设计未要求每席独立摘要）', async (t) => {
+  const made = makePipedService(t);
+  const collabId = await makeManaged(made, { name: '协作甲' });
+  await unmuteAll(made, collabId);
+  const connection = fakeConnection();
+  setMuteOf(made, collabId, MANAGER_SESSION, true);
+  made.inbound.onFrame(connection, collabFrame('progress', collabId, localPeerOf(MEMBER_SESSION), { text: '给站长席' }, [MANAGER_SESSION]));
+  await waitFor(() => (made.service.indicators().find((item) => item.collabId === collabId)?.msgCount === 1 ? true : null));
+  made.inbound.onFrame(connection, collabFrame('progress', collabId, localPeerOf(MANAGER_SESSION), { text: '给成员席' }, [MEMBER_SESSION]));
+  await waitFor(() => (deliveriesOf(made, MEMBER_SESSION, 'progress').length === 1 ? true : null));
+  assert.equal(deliveriesOf(made, MANAGER_SESSION, 'progress').length, 0, '静音席不注入');
+  assert.equal(deliveriesOf(made, MEMBER_SESSION, 'progress')[0].frame.payload.text, '给成员席', '未静音席照常注入');
+  /* 两席同时静音（共用协作级基线）后，先取消的一席按差值给 N，后取消的那席基线已被清空：
+   * 摘要降级为不带 N——设计只写「静音按会话、逐席判定」，没有要求每席独立摘要基线。 */
+  setMuteOf(made, collabId, MEMBER_SESSION, true);
+  setMuteOf(made, collabId, MANAGER_SESSION, false);
+  assert.equal(resumeNoticeTextOf(made), `静音期间本协作新增 2 条——${MANAGED_SUMMARY_TAIL}`);
+  setMuteOf(made, collabId, MEMBER_SESSION, false);
+  assert.equal(resumeNoticeTextOf(made), `静音期间本协作可能有新内容——${MANAGED_SUMMARY_TAIL}`, '共用基线被前一席取消清空后，后一席降级为不带 N（不虚构数字）');
+});
+
+test('基线缺失与坏基线文件：摘要降级不带 N；静音态由席位文件权威，坏文件留痕', async (t) => {
+  const made = makeService(t);
+  const collabId = await makeManaged(made, { name: '协作甲' });
+  setMuteOf(made, collabId, MANAGER_SESSION, true);
+  writeFileSync(mutePath(made.dir, collabId), JSON.stringify({ v: 1, muted: true, baseline: null }));
+  const reloaded = makeService(t, { dir: made.dir });
+  assert.equal(suppressedOf(reloaded.service, { type: 'progress', collabId }, MANAGER_SESSION), true, '基线缺失不影响席位静音');
+  setMuteOf(reloaded, collabId, MANAGER_SESSION, false);
+  assert.equal(resumeNoticeTextOf(reloaded), `静音期间本协作可能有新内容——${MANAGED_SUMMARY_TAIL}`, '基线缺失：摘要降级为不带 N');
+  setMuteOf(reloaded, collabId, MANAGER_SESSION, true);
+  writeFileSync(mutePath(made.dir, collabId), '{ 坏文件');
+  const reloaded2 = makeService(t, { dir: made.dir });
+  assert.equal(suppressedOf(reloaded2.service, { type: 'progress', collabId }, MANAGER_SESSION), true, '坏基线文件不改变席位静音态');
+  assert.ok(reloaded2.logs.some((entry) => entry.message.includes('静音状态文件不可用')), '坏文件必须留痕（告警）');
+  setMuteOf(reloaded2, collabId, MANAGER_SESSION, false);
+  assert.equal(resumeNoticeTextOf(reloaded2), `静音期间本协作可能有新内容——${MANAGED_SUMMARY_TAIL}`, '坏基线：摘要同样降级');
+});
+
+test('静音期首帧帖：不注入不记真；重复副本无注入事实不回报；取消后仍不进注入；新帖即时恢复注入', async (t) => {
+  const made = makePipedService(t);
+  const collabId = await makeForum(made, { name: '联调项目' });
+  await unmuteAll(made, collabId);
+  made.deliveries.length = 0;
+  const connection = fakeConnection();
+  setMuteOf(made, collabId, MEMBER_SESSION, true);
+  const first = postFrameOf(collabId, localPeerOf(MANAGER_SESSION), { postId: 'post-m1', text: '静音期首帧' }, [MEMBER_SESSION]);
   made.inbound.onFrame(connection, first);
   await waitFor(() => made.service.stats().postsIn === 1);
-  assert.equal(sessionPosts(made).length, 0, '静音期帖不进注入');
-  assert.equal(made.inbound.stats().sessionGated, 1, '静音栅栏计数留痕');
-  assert.equal(reportFor(made, first.msgId), false, '被抑制帧不发终态回报（发送侧维持第二档）');
+  assert.equal(postDeliveriesOf(made, MEMBER_SESSION).length, 0, '静音期帖不进注入');
+  assert.equal(made.inbound.stats().fanoutGated, 1, '静音栅栏按收件席位计数留痕');
+  assert.equal(reportFor(made, first.msgId), true, '零注入也回报机器级终态（投递保证按机器级）');
   assert.equal(existsSync(injectedPath(made.dir, collabId)), false, '静音期首帧不记真');
   assert.equal((await made.service.view({ collabId })).posts.length, 1, '静音期帖照常落盘');
   const copy = { ...first, msgId: `${first.msgId}-copy` };
   made.inbound.onFrame(connection, copy);
   await waitFor(() => made.service.stats().postsDuplicated === 1);
   await new Promise((resolve) => setTimeout(resolve, 30));
-  assert.equal(sessionPosts(made).length, 0, '重复副本不注入');
+  assert.equal(postDeliveriesOf(made, MEMBER_SESSION).length, 0, '重复副本不注入');
   assert.equal(reportFor(made, copy.msgId), false, '前件为假（未注入过）：不回报终态');
-  made.service.setMute({ collabId, muted: false });
-  assert.equal(made.notices.at(-1).payload.text, '静音期间本讨论新增 1 条——静音期与回填内容不进注入，经查看器/ws_view_ledger 补看');
-  const again = { ...first, msgId: `${first.msgId}-again` };
-  made.inbound.onFrame(connection, again);
+  setMuteOf(made, collabId, MEMBER_SESSION, false);
+  assert.equal(resumeNoticeTextOf(made), `静音期间本讨论新增 1 条——${FORUM_SUMMARY_TAIL}`);
+  made.inbound.onFrame(connection, { ...first, msgId: `${first.msgId}-again` });
   await waitFor(() => made.service.stats().postsDuplicated === 2);
   await new Promise((resolve) => setTimeout(resolve, 30));
-  assert.equal(sessionPosts(made).length, 0, '静音期首帧取消后仍不进注入（去重吸收）——边角行为留证');
-  const later = postFrameOf(collabId, from, { postId: 'post-m2', seq: 2, text: '恢复后新帖' });
+  assert.equal(postDeliveriesOf(made, MEMBER_SESSION).length, 0, '静音期首帧取消后仍不进注入（去重吸收）');
+  const later = postFrameOf(collabId, localPeerOf(MANAGER_SESSION), { postId: 'post-m2', postSeq: 2, text: '恢复后新帖' }, [MEMBER_SESSION]);
   made.inbound.onFrame(connection, later);
-  await waitFor(() => sessionPosts(made).length === 1, { timeoutMs: 2000 });
+  await waitFor(() => postDeliveriesOf(made, MEMBER_SESSION).length === 1, { timeoutMs: 2000 });
   assert.equal(reportFor(made, later.msgId), true, '恢复注入：回报终态');
 });
 
 test('已注入标记：正常注入记真（跨重启保留）；重复副本回报终态以标记为前件；join 重复副本不受静音影响', async (t) => {
   const made = makePipedService(t);
-  const { collabId, joined } = await makeManagerForum(made);
+  const collabId = await makeForum(made, { name: '联调项目' });
+  await unmuteAll(made, collabId);
+  made.deliveries.length = 0;
   const connection = fakeConnection();
-  const from = peer(SELF_B.instanceId, SELF_B.identityName, SELF_B.port);
-  const first = postFrameOf(collabId, from, { postId: 'post-n1', seq: 1, text: '正常帖' });
+  const first = postFrameOf(collabId, localPeerOf(MANAGER_SESSION), { postId: 'post-n1', text: '正常帖' }, [MEMBER_SESSION]);
   made.inbound.onFrame(connection, first);
-  await waitFor(() => sessionPosts(made).length === 1);
-  assert.equal(reportFor(made, first.msgId), true, '注入成功回报终态（现状回归）');
+  await waitFor(() => postDeliveriesOf(made, MEMBER_SESSION).length === 1);
+  assert.equal(reportFor(made, first.msgId), true, '注入成功回报终态');
   const records = readFileSync(injectedPath(made.dir, collabId), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
-  assert.deepEqual(records, [{ authorId: SELF_B.instanceId, postId: 'post-n1' }], '注入成功记真');
+  assert.deepEqual(records, [{ authorId: SELF_INSTANCE.instanceId, postId: 'post-n1' }], '注入成功记真');
   const copy = { ...first, msgId: `${first.msgId}-copy` };
   made.inbound.onFrame(connection, copy);
   await waitFor(() => made.service.stats().postsDuplicated === 1);
   await waitFor(() => (reportFor(made, copy.msgId) ? true : null));
-  assert.equal(sessionPosts(made).length, 1, '重复副本不二次注入');
-  /* 跨重启：标记持久——重启后的重复副本仍回报终态。 */
+  assert.equal(postDeliveriesOf(made, MEMBER_SESSION).length, 1, '重复副本不二次注入');
   const reloaded = makePipedService(t, { dir: made.dir });
   const connection2 = fakeConnection();
   const copy2 = { ...first, msgId: `${first.msgId}-copy2` };
   reloaded.inbound.onFrame(connection2, copy2);
   await waitFor(() => reloaded.service.stats().postsDuplicated === 1);
   await waitFor(() => (reportFor(reloaded, copy2.msgId) ? true : null));
-  assert.equal(sessionPosts(reloaded).length, 0, '重启后不注入');
-  /* join 重复副本：不注入但照常回报终态；静音不改变该通道（isolated 于帖通道前件之外）。 */
-  reloaded.service.setMute({ collabId, muted: true });
+  assert.equal(postDeliveriesOf(reloaded, MEMBER_SESSION).length, 0, '重启后不注入');
+  const memberForumId = await makeMemberForum(made, { collabId: 'collab-join-dup', name: '联调项目二' });
+  setMuteOf(made, memberForumId, MEMBER_SESSION, true);
+  const joined = joinFrameOf(memberForumId, SELF_A, 'event-join-dup');
+  made.inbound.onFrame(connection, joined);
+  await waitFor(() => made.service.stats().forumJoinsIn >= 1);
   const joinCopy = { ...joined, msgId: `${joined.msgId}-copy` };
-  reloaded.inbound.onFrame(connection2, joinCopy);
-  await waitFor(() => reloaded.service.stats().forumJoinDuplicates === 1);
-  await waitFor(() => (reportFor(reloaded, joinCopy.msgId) ? true : null));
+  made.inbound.onFrame(connection, joinCopy);
+  await waitFor(() => made.service.stats().forumJoinDuplicates === 1);
+  await waitFor(() => (reportFor(made, joinCopy.msgId) ? true : null));
+  assert.equal(deliveriesOf(made, MEMBER_SESSION, 'join').filter((entry) => entry.msgId === joinCopy.msgId).length, 0, 'join 重复副本不注入');
 });
 
 test('清理挂点：成员退出（讨论）与站长结束 / 整条撤回（协作）清理静音状态', async (t) => {
   const made = makeService(t);
-  const forumId = await makeMemberForum(made, { collabId: 'collab-clear-leave' });
-  made.service.setMute({ collabId: forumId, muted: true });
+  const forumId = await makeMemberForum(made, { collabId: 'collab-clear-leave', name: '联调项目' });
+  setMuteOf(made, forumId, MEMBER_SESSION, true);
   assert.equal(existsSync(mutePath(made.dir, forumId)), true);
-  assert.equal(made.service.leave({ collabId: forumId }).ok, true);
-  assert.equal(existsSync(mutePath(made.dir, forumId)), false, '退出清理静音文件');
-  assert.equal(suppressedOf(makeService(t, { dir: made.dir }).service, { type: 'post', collabId: forumId }), false, '重入从默认（不静音）开始');
-  const managedEnd = makeManaged(made, { name: '协作结束' });
-  await receive(made.service, collabFrame('approve', managedEnd, peer(SELF_B.instanceId, SELF_B.identityName, SELF_B.port), {}));
-  made.service.setMute({ collabId: managedEnd, muted: true });
+  assert.equal(made.service.leave({ collabId: forumId, sessionId: MEMBER_SESSION }).ok, true);
+  assert.equal(seatOf(made.service, forumId, MEMBER_SESSION), null, '离席删除本机席位');
+  assert.equal(existsSync(mutePath(made.dir, forumId)), false, '退出清理静音基线文件');
+  assert.equal(suppressedOf(made.service, { type: 'post', collabId: forumId }, MEMBER_SESSION), false, '离席后不静音');
+  assert.equal(made.service.setMute({ collabId: forumId, sessionId: MEMBER_SESSION, muted: true }).ok, false, '离席后不能改席位静音');
+  const managedEnd = await makeManaged(made, { name: '协作结束' });
+  setMuteOf(made, managedEnd, MANAGER_SESSION, true);
   assert.equal(existsSync(mutePath(made.dir, managedEnd)), true);
-  assert.equal(made.service.end({ collabId: managedEnd }).ok, true);
-  assert.equal(existsSync(mutePath(made.dir, managedEnd)), false, '结束清理静音文件');
-  const managedWithdraw = makeManaged(made, { name: '协作撤回' });
-  made.service.setMute({ collabId: managedWithdraw, muted: true });
+  assert.equal(made.service.end({ collabId: managedEnd, sessionId: MANAGER_SESSION }).ok, true);
+  assert.equal(seatOf(made.service, managedEnd, MANAGER_SESSION), null, '结束删除全部本机席位');
+  assert.equal(existsSync(mutePath(made.dir, managedEnd)), false, '结束清理静音基线文件');
+  const managedWithdraw = createManaged(made, { name: '协作撤回' });
+  setMuteOf(made, managedWithdraw, MANAGER_SESSION, true);
   assert.equal(existsSync(mutePath(made.dir, managedWithdraw)), true);
-  assert.equal(made.service.withdraw({ collabId: managedWithdraw }).ok, true);
-  assert.equal(existsSync(mutePath(made.dir, managedWithdraw)), false, '整条撤回清理静音文件');
+  assert.equal(made.service.withdraw({ collabId: managedWithdraw, sessionId: MANAGER_SESSION }).ok, true);
+  assert.equal(existsSync(mutePath(made.dir, managedWithdraw)), false, '整条撤回清理静音基线文件');
 });
 
-test('静音期结束帧照常注入；成员侧归档（handleEnd）同时清理静音状态', async (t) => {
+test('静音期结束帧照常注入；成员侧归档（handleEnd）清理静音基线，归档后内容由准入拒绝', async (t) => {
   const made = makePipedService(t);
-  const collabId = await makeMemberForum(made, { collabId: 'collab-end-inject' });
-  made.service.setMute({ collabId, muted: true });
-  const connection = fakeConnection();
-  const endFrame = collabFrame('end', collabId, peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port), {});
-  made.inbound.onFrame(connection, endFrame);
-  await waitFor(() => (made.session.some((frame) => frame.type === 'end') ? true : null));
-  assert.equal(made.inbound.stats().sessionGated, 0, '结束帧不落入抑制集（只做减法）');
-  assert.equal(existsSync(mutePath(made.dir, collabId)), false, '归档清理静音状态');
-  assert.equal(suppressedOf(makeService(t, { dir: made.dir }).service, { type: 'post', collabId }), false, '归档后重建服务：不静音');
+  const collabId = await makeMemberForum(made, { collabId: 'collab-end-inject', name: '联调项目' });
+  setMuteOf(made, collabId, MEMBER_SESSION, true);
+  made.deliveries.length = 0;
+  const connection = fakeConnection('127.0.0.2');
+  made.inbound.onFrame(connection, endFrameOf(collabId, SELF_A));
+  await waitFor(() => deliveriesOf(made, MEMBER_SESSION, 'end').length === 1);
+  assert.equal(made.inbound.stats().sessionGated, 0, '结束帧不落入静音抑制集（只做减法）');
+  assert.equal(existsSync(mutePath(made.dir, collabId)), false, '归档清理静音基线文件');
+  const post = postFrameOf(collabId, SELF_A, { postId: 'post-after-end', text: '归档后' });
+  const admitted = await made.service.hooks.admit(post, { remoteAddress: '127.0.0.2' });
+  assert.equal(admitted.ok, false, '归档后内容由准入拒绝（不依赖残留席位静音）');
+  assert.match(admitted.reason, /已结束/);
 });
 
 /* —— store 级补测（与 members / counter 同族口径：形态单测、坏载、读写失败面） —— */
