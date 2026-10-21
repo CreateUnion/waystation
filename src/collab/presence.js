@@ -22,7 +22,8 @@
  * - applyDirectFrame(table, frame, now, options)：frame 为完整协作帧；options.peerInstanceId 是连接对端，
  *   必须等于 frame.from.instanceId；转达副本（顶层或 payload.originMsgId）不刷新，返回 relayed。
  * - isReachable / autoSuccessorCandidates：hasEndpoint 必须显式 true/false、timeoutMs>0、now 有限；
- *   缺省按不可达（fail-closed）。expired/unlisted 优先于 lastSeenAt。 */
+ *   缺省按不可达（fail-closed）。expired/unlisted 优先于 lastSeenAt。
+ * - expireSeats：now/timeoutMs 非法 → 返回 []（不判离、不回落墙钟）；两处出口无 reason，按 fail-closed 处理。 */
 
 const KEY_SEPARATOR = '\u0000';
 

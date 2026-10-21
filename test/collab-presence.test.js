@@ -251,6 +251,7 @@ test('expireSeats：超时项保留为 tombstone 且只返回一次，刷新后�
   applyList(table, listNotice('inst-b', ['session-b']), NOW + 1000);
   assert.deepEqual(expireSeats(table, NOW + TIMEOUT - 1, TIMEOUT), []);
   assert.deepEqual(expireSeats(table, NOW + TIMEOUT), [], '缺 timeout 不判离');
+  assert.deepEqual(expireSeats(table, undefined, TIMEOUT), [], '缺 now 不判离，不回落墙钟');
   assert.equal(presenceOf(table, 'inst-a', 'session-a').expired, false);
   const expired = expireSeats(table, NOW + TIMEOUT, TIMEOUT);
   assert.deepEqual(expired.map((entry) => entry.sessionId), ['session-a']);

@@ -16,14 +16,15 @@
  * - autoOffers / autoOffer：A2 与 A10 离线追赶的本地 offer 记录；缺省 → auto-offer-missing / 快照不可追赶。
  * - autoInFlight：A4 未解决 auto 在途；缺省 false。
  * - pendingOfferId / pendingTarget：manager-pending 正在等待的 offer/目标；缺省 → pending-offer-mismatch。
- * - acceptedManager：{term,manager,source}——本核按 A1–A4 受理过的更高 term manager，source 为受理该变更的
- *   签发席位。正常流里采纳与状态推进同步完成，此时同 term 快照走「来源＝现任站长」；本记录服务两类窗口：
+ * - acceptedManager：{term,manager,source}——本核按 A1–A4 受理过的更高 term manager。授权绑定按 record.manager
+ *   （受理目标席位），record.source 只是签发者审计（A1 handover 由旧站长签发），不参与来源匹配。
+ *   正常流里采纳与状态推进同步完成，此时同 term 快照走「来源＝现任站长」；本记录服务两类窗口：
  *   ① 已受理但本地状态尚未推进（落盘/重启间隙）；② 本地已进入终态后，经受理的新站长恢复权威台账。
- *   快照来源必须等于 source，manager 必须等于快照 manager；同 term 名单快照不认该记录。
- * - handshakeHighest：{term,version,manager}——本轮 handshake 最高 pair；offline catch-up 与
- *   终态恢复缺省 → 冻结/拒收；终态 pair 的 manager 为 null。
+ * - handshakeHighest：{term,version,manager}——本轮 handshake 最高 pair；只服务 offline catch-up，
+ *   不构成终态恢复/覆盖授权（终态 pair 的 manager 为 null）。
  * - authorizedEvidence：{via,authorizedAt,term,manager}——fork 收敛证据，必须绑定快照；缺省/不匹配 → 保持冻结。
- * - suspended / handoverTarget：显式移交等待中的目标席位；缺省 → 不按 handover-pending 受理。
+ * - suspended / handoverTarget：显式移交等待中的目标席位；终态恢复的 handover 证据另需 handoverBaseTerm
+ *   且 baseTerm < 快照 term；缺省 → 不按 handover-pending 受理。
  * - windowBaseAt：本地开窗生效时刻（§2A.6 收敛基准）；缺省退回绝对 endsAt 并封顶。
  * - sessionTakeoverWindowMs / windowSkewMs：窗口配置；缺省 60000 / 10000；windowMs:0 视为未提供。
  * - ledgerDigestOf(ledger) 或 digestVerified:true：快照完整性唯一入口；digestVerified 只能由已重算 digest 的接线置位。
@@ -31,9 +32,10 @@
  * - syncExpired：A6 对表超时。
  *
  * 快照入站形态：帧（或 payload）必须携 managerTerm/version/digest/ledger；台账携 managerWindow 时帧必须携
- * 同值 managerWindow（生产方义务在快照发送端，缺字段会被协议层按坏帧拒收）。台账 manager:null 只按终态台账受理
- * （status 须为 completed/terminated）。auto 离线追赶只认 ctx.autoOffers 中本机已收的匹配记录
- * （baseTerm/prevManager/target）；快照台账 events 不作为证据——无签名时事件可自造（2026-10-21 裁定）。
+ * 同值 managerWindow（生产方义务在快照发送端，缺字段会被协议层按坏帧拒收）。台账形态与终态对齐：
+ * status∈{completed,terminated} 必须 manager:null，非终态必须 manager 非空，不满足按损坏拒收。
+ * auto 离线追赶只认 ctx.autoOffers 中本机已收的匹配记录（baseTerm/prevManager/target）；
+ * 快照台账 events 不作为证据——无签名时事件可自造（2026-10-21 裁定）。
  *
  * 返回的 actions 由接线层执行：adopt / request-snapshot / open-window / close-window / clear-freeze /
  * freeze / report / handshake / ack / ack-snapshot-stored / count-reject。 */
@@ -66,11 +68,6 @@ function isPeer(value) {
 
 function isVersion(value) {
   return Number.isInteger(value) && value >= 1;
-}
-
-/* 终态判定只认台账 status：manager:null 必须与终态状态同时出现，否则按形态损坏拒收。 */
-function isTerminalStatus(status) {
-  return status === 'completed' || status === 'terminated';
 }
 
 function timeOf(value) {
@@ -228,8 +225,7 @@ function snapshotStateOf(frame) {
   if (window !== undefined && !isWindowShape(window)) {
     return null;
   }
-  /* manager:null 只按终态台账受理：非终态状态或残留窗口都不得进入终态分支。 */
-  if (ledger.manager === null && (!isTerminalStatus(ledger.status) || window !== undefined)) {
+  if (!isTerminalLedgerConsistent(ledger, window)) {
     return null;
   }
   return {
@@ -238,6 +234,13 @@ function snapshotStateOf(frame) {
     version: ledger.version,
     ...(window === undefined ? {} : { managerWindow: { ...window } }),
   };
+}
+
+/* 台账终态形态（与名单内核 model.js 的 isTerminalLedger 同一词表）：status 终态必须 manager:null
+ * 且无残留窗口，非终态必须 manager 非空；形态不成立按损坏拒收，不进入任期判定。 */
+function isTerminalLedgerConsistent(ledger, window) {
+  const terminal = ledger.status === 'completed' || ledger.status === 'terminated';
+  return (ledger.manager === null) === terminal && (!terminal || window === undefined);
 }
 
 function snapshotLedgerHeadMatches(ledger, frame) {
@@ -662,7 +665,7 @@ function acceptSameTermTerminal(state, snapshot, source, ctx) {
   return accepted(terminalNextState(snapshot), 'snapshot-terminal-accepted', terminalAdoptActions(state, freezeNote(ctx)));
 }
 
-/* 活跃态的更高 term 终态：只认经 A1–A4 受理过的新站长（acceptedManager 绑定 term/manager/source）。 */
+/* 活跃态的更高 term 终态：只认经 A1–A4 受理过的新站长（acceptedManager 按 record.manager 绑定来源）。 */
 function acceptHigherTerminal(state, snapshot, source, ctx) {
   if (snapshot.managerTerm !== state.managerTerm + 1
     || !isAcceptedTerminalSource(ctx.acceptedManager, snapshot.managerTerm, source)) {
@@ -672,51 +675,65 @@ function acceptHigherTerminal(state, snapshot, source, ctx) {
 }
 
 /* 本地已终态时，终态快照只做本地只读副本的 version 收敛（§3.4：同样无站长的核可采用）；
- * 更高 term 的终态必须有权威证据，防止成员用伪造终态台账把本地 term 永久钉高。 */
+ * 更高 term 的终态必须有受理记录，防止成员用伪造终态台账把本地 term 永久钉高——
+ * handshake 只是 peer 自报 pair，不构成授权。 */
 function acceptTerminalAfterTerminal(state, snapshot, source, ctx) {
   if (snapshot.managerTerm === state.managerTerm) {
     return terminalVersionResult(state, snapshot);
   }
-  const authorized = isAcceptedTerminalSource(ctx.acceptedManager, snapshot.managerTerm, source)
-    || matchesHandshakeHighest(snapshot, ctx.handshakeHighest);
-  if (!authorized) {
+  if (!isAcceptedTerminalSource(ctx.acceptedManager, snapshot.managerTerm, source)) {
     return rejected(state, 'snapshot-terminal-untrusted', { actions: ['count-reject', 'request-snapshot'] });
   }
   return accepted(terminalNextState(snapshot), 'snapshot-terminal-accepted', ['adopt']);
 }
 
-/* 更高 term 的终态来源：记录里的 manager 与来源必须是同一新站长席位（source 由受理时记录）。 */
+/* 更高 term 的终态来源：受理记录的 manager 即新站长席位（record.source 只作签发者审计）。 */
 function isAcceptedTerminalSource(value, term, source) {
   return isPlainObject(value)
     && value.term === term
-    && isRef(value.manager)
     && isRef(value.source)
-    && sameSeat(value.manager, source)
-    && sameSeat(value.source, source);
+    && sameSeat(value.manager, source);
 }
 
-/* 本地终态后的非终态权威台账恢复（设计 §3.4：更高 term 权威台账覆盖本地终态，不得永久拒收）：
- * 来源必须可绑定到经受理的权威——A1–A4 受理记录 / handover 目标 / 本地 auto-offer / handshake 最高 pair。 */
+/* 本地终态后的非终态权威台账恢复（设计 §3.4）：只接受更高 term、manager 非空、来源＝快照 manager，
+ * 且具备受理证据——acceptedManager（按 record.manager 绑定）/ handover 目标 / 本机 auto-offer。
+ * handshakeHighest 只用于请求/比较快照；同 term 一律不得覆盖终态（A12）。 */
 function acceptSnapshotAfterTerminal(state, snapshot, frame, ctx) {
   const source = sourceOf(frame, ctx);
   if (snapshot.managerTerm < state.managerTerm) {
     return rejected(state, 'term-behind');
   }
-  if (snapshot.managerTerm === state.managerTerm) {
-    /* 同 term 的 manager 冲突按 A12 处理：只有本核受理过的 A1–A4 记录能证明它不是分叉。 */
-    if (!isAcceptedManagerSeat(ctx.acceptedManager, snapshot, source) || snapshot.version <= state.version) {
-      return rejected(state, 'snapshot-not-authorized', { actions: ['count-reject', 'request-snapshot'] });
-    }
-    return accepted(snapshotNextState(snapshot), 'snapshot-terminal-overridden', ['adopt']);
-  }
-  const authorized = isAcceptedManagerSeat(ctx.acceptedManager, snapshot, source)
-    || handoverPendingMatches(ctx, source, snapshot)
-    || hasLocalAutoOfferCatchup(state, snapshot, source, ctx)
-    || matchesHandshakeHighest(snapshot, ctx.handshakeHighest);
+  const authorized = snapshot.managerTerm > state.managerTerm
+    && sameSeat(source, snapshot.manager)
+    && terminalOverrideEvidence(state, snapshot, source, ctx);
   if (!authorized) {
     return rejected(state, 'snapshot-not-authorized', { actions: ['count-reject', 'request-snapshot'] });
   }
   return accepted(snapshotNextState(snapshot), 'snapshot-terminal-overridden', ['adopt']);
+}
+
+function terminalOverrideEvidence(state, snapshot, source, ctx) {
+  return isAcceptedManagerSeat(ctx.acceptedManager, snapshot, source)
+    || handoverTargetOverride(ctx, snapshot, source)
+    || hasTerminalAutoOffer(snapshot, source, ctx);
+}
+
+/* handover 在途记录只认目标与任期基准：baseTerm 必须低于快照 term，陈旧 offer 不能背书更高任期。 */
+function handoverTargetOverride(ctx, snapshot, source) {
+  if (!isTerm(ctx.handoverBaseTerm) || ctx.handoverBaseTerm >= snapshot.managerTerm) {
+    return false;
+  }
+  return handoverPendingMatches(ctx, source, snapshot);
+}
+
+/* 本地终态已无站长，auto-offer 只按「目标＝快照 manager、baseTerm+1＝快照 term」绑定。 */
+function hasTerminalAutoOffer(snapshot, source, ctx) {
+  if (!sameSeat(source, snapshot.manager)) {
+    return false;
+  }
+  return autoOffersOf(ctx).some((offer) => isPlainObject(offer)
+    && offer.baseTerm + 1 === snapshot.managerTerm
+    && sameSeat(offer.target, snapshot.manager));
 }
 
 function terminalVersionResult(state, snapshot) {
@@ -845,7 +862,7 @@ function acceptOfflineCatchup(state, snapshot, frame, ctx) {
   return frozen(state, 'snapshot-catchup-mismatch');
 }
 
-/* handshake 最高 pair 与快照一致性：终态 pair 的 manager 为 null（设计 §3.4 的本地只读终态）。 */
+/* handshake 最高 pair 与快照一致性（只用于 offline catch-up 对表）：终态 pair 的 manager 为 null。 */
 function matchesHandshakeHighest(snapshot, highest) {
   if (!isPlainObject(highest)
     || highest.term !== snapshot.managerTerm
@@ -890,15 +907,15 @@ function acceptHigherSnapshot(state, snapshot, frame, ctx) {
   return frozen(state, 'snapshot-untrusted-higher-term');
 }
 
-/* acceptedManager 必须绑定来源席位：记录里没有 source 或来源不符一律不认，
- * 防止任意成员借历史记录给同 term/更高 term 快照背书。
- * 本分支服务「已受理未采纳」窗口：记录 term 可以领先本地 state（例如采纳后落盘/重启间隙）。 */
+/* acceptedManager 必须绑定受理记录里的 manager 席位（record.manager），不按 record.source：
+ * A1 handover 由旧站长签发，快照来源是新站长，按 source 绑定会误拒。source 仍作形态校验（签发者审计），
+ * 但不参与来源匹配。本分支服务「已受理未采纳」窗口：记录 term 可以领先本地 state（落盘/重启间隙）。 */
 function isAcceptedManagerSeat(value, snapshot, source) {
   return isPlainObject(value)
     && value.term === snapshot.managerTerm
-    && sameSeat(value.manager, snapshot.manager)
     && isRef(value.source)
-    && sameSeat(value.source, source);
+    && sameSeat(value.manager, snapshot.manager)
+    && sameSeat(value.manager, source);
 }
 
 /* 显式移交等待中只向在途 offer 的目标取台账；来源/快照 manager 都必须等于该目标。 */

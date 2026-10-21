@@ -295,7 +295,7 @@ test('A2 auto：来源新站长且匹配 auto-offer → 受理并写入窗口与
   assert.ok(result.actions.includes('open-window'));
 });
 
-test('A2 auto：无匹配 auto-offer → 拒收计数且不改 manager（T2a）', () => {
+test('A2 auto：无匹配 auto-offer → 拒收计数且不改 manager', () => {
   const frame = changeOf({
     via: 'auto',
     from: SEAT_C,
@@ -574,15 +574,21 @@ test('A10 快照：digest 未验证或不匹配 → 拒收，不得采纳', () =
   accepts(acceptManagerChange(stateOf(), frame, snapshotCtx()));
 });
 
-test('A10 快照：已受理过的新站长（绑定来源）与 handover-pending 目标可受理', () => {
+test('A10 快照：已受理过的新站长与 handover-pending 目标可受理', () => {
   const frame = snapshotOf({ manager: SEAT_C, from: SEAT_C });
-  const record = { term: 2, manager: seatRef(SEAT_C), source: seatRef(SEAT_C) };
+  /* A1 handover 的受理记录由旧站长签发：来源按 record.manager 绑定，record.source 只作审计。 */
+  const record = { term: 2, manager: seatRef(SEAT_C), source: seatRef(SEAT_A) };
   accepts(acceptManagerChange(stateOf(), frame, snapshotCtx({ acceptedManager: record })));
-  const wrongSource = acceptManagerChange(stateOf(), frame, snapshotCtx({
-    acceptedManager: { ...record, source: seatRef(SEAT_B) },
+  const wrongManager = acceptManagerChange(stateOf(), frame, snapshotCtx({
+    acceptedManager: { ...record, manager: seatRef(SEAT_B) },
   }));
-  rejects(wrongSource);
-  assert.equal(wrongSource.freezeReason, 'manager-fork');
+  rejects(wrongManager);
+  assert.equal(wrongManager.freezeReason, 'manager-fork');
+  const wrongTerm = acceptManagerChange(stateOf(), frame, snapshotCtx({
+    acceptedManager: { ...record, term: 3 },
+  }));
+  rejects(wrongTerm);
+  assert.equal(wrongTerm.freezeReason, 'manager-fork');
   const missingSource = acceptManagerChange(stateOf(), frame, snapshotCtx({
     acceptedManager: { term: 2, manager: seatRef(SEAT_C) },
   }));
@@ -603,7 +609,7 @@ test('A10 快照：已受理过的新站长（绑定来源）与 handover-pendin
   rejects(acceptManagerChange(stateOf(), target, snapshotCtx({ suspended: 'handover-pending' })));
 });
 
-test('A10 追赶（I-3）：只认本机已收的匹配 auto-offer，快照自造 events + 自算 digest 一律拒绝并冻结', () => {
+test('A10 追赶：只认本机已收的匹配 auto-offer，快照自造 events + 自算 digest 一律拒绝并冻结', () => {
   const state = stateOf();
   const forgedEvents = catchupEvents({
     offer: { target: seatRef(SEAT_C) },
@@ -720,7 +726,7 @@ test('A13/A14：同 term 同 version 幂等、低 term 拒收', () => {
   rejects(acceptManagerChange(stateOf({ term: 2, version: 12 }), snapshotOf({ term: 1, version: 9, manager: SEAT_A, from: SEAT_A }), snapshotCtx()), 'term-behind');
 });
 
-test('终态快照 C-1：成员用更高 term 的 manager:null 结束协作 → 拒绝且不改状态', () => {
+test('终态快照：成员用更高 term 的 manager:null 结束协作 → 拒绝且不改状态', () => {
   const state = stateOf();
   const attack = snapshotOf({ term: 2, version: 11, manager: null, from: SEAT_B });
   const result = acceptManagerChange(state, attack, snapshotCtx({ memberSeats: [SEAT_B] }));
@@ -747,16 +753,20 @@ test('终态快照：同 term 活跃核只接受现任站长；成员副本拒�
   rejects(acceptManagerChange(state, snapshotOf({ term: 1, version: 10, manager: null, from: SEAT_A }), snapshotCtx()), 'version-not-newer');
 });
 
-test('终态快照：更高 term 只认经 A1–A4 受理的新站长（acceptedManager 绑定来源）', () => {
-  const record = { term: 2, manager: seatRef(SEAT_C), source: seatRef(SEAT_C) };
+test('终态快照：更高 term 只认经 A1–A4 受理的新站长', () => {
+  /* A1 形态：签发者是旧站长（record.source），受理的新站长是 record.manager。 */
+  const record = { term: 2, manager: seatRef(SEAT_C), source: seatRef(SEAT_A) };
   const frame = snapshotOf({ term: 2, version: 11, manager: null, from: SEAT_C });
   accepts(acceptManagerChange(stateOf(), frame, snapshotCtx({ acceptedManager: record })));
   rejects(acceptManagerChange(stateOf(), frame, snapshotCtx({
-    acceptedManager: { ...record, source: seatRef(SEAT_B) },
+    acceptedManager: { ...record, manager: seatRef(SEAT_B) },
+  })), 'snapshot-terminal-untrusted');
+  rejects(acceptManagerChange(stateOf(), frame, snapshotCtx({
+    acceptedManager: { ...record, term: 3 },
   })), 'snapshot-terminal-untrusted');
   rejects(acceptManagerChange(stateOf(), frame, snapshotCtx({
     acceptedManager: { term: 2, manager: seatRef(SEAT_C) },
-  })), 'snapshot-terminal-untrusted');
+  })), 'snapshot-terminal-untrusted', '受理记录必须携签发者 source');
   rejects(acceptManagerChange(stateOf(), frame, snapshotCtx({ memberSeats: [SEAT_C] })), 'snapshot-terminal-untrusted');
 });
 
@@ -776,36 +786,64 @@ test('终态快照：fork/pending 不得被解除；offline 仅认本地现任�
   assert.ok(offlineByManager.actions.includes('clear-freeze'));
 });
 
-test('终态不可逆（I-2）：经受理的更高 term 非终态权威台账可覆盖本地终态', () => {
+test('终态覆盖：只接受更高 term、来源＝快照 manager 且具备受理证据的权威台账', () => {
   const terminalState = stateOf({ term: 2, version: 11, manager: null });
   const frame = snapshotOf({ term: 3, version: 12, manager: SEAT_C, from: SEAT_C });
   const unauthorized = acceptManagerChange(terminalState, frame, snapshotCtx());
   rejects(unauthorized, 'snapshot-not-authorized');
   assert.ok(unauthorized.actions.includes('request-snapshot'));
-  const record = { term: 3, manager: seatRef(SEAT_C), source: seatRef(SEAT_C) };
+  const record = { term: 3, manager: seatRef(SEAT_C), source: seatRef(SEAT_A) };
   const restored = acceptManagerChange(terminalState, frame, snapshotCtx({ acceptedManager: record }));
   accepts(restored);
   assert.equal(restored.nextState.managerTerm, 3);
   assert.equal(restored.nextState.manager.sessionId, SEAT_C.sessionId);
-  const byHandshake = acceptManagerChange(terminalState, frame, snapshotCtx({
+  const wrongSource = snapshotOf({ term: 3, version: 12, manager: SEAT_C, from: SEAT_B });
+  rejects(acceptManagerChange(terminalState, wrongSource, snapshotCtx({ acceptedManager: record })), 'snapshot-not-authorized');
+  rejects(acceptManagerChange(terminalState, frame, snapshotCtx({
+    acceptedManager: { term: 3, manager: seatRef(SEAT_C) },
+  })), 'snapshot-not-authorized', '缺签发者 source 的受理记录不构成证据');
+  rejects(acceptManagerChange(terminalState, frame, snapshotCtx({
     handshakeHighest: { term: 3, version: 12, manager: seatRef(SEAT_C) },
-  }));
-  accepts(byHandshake);
+  })), 'snapshot-not-authorized', 'handshake 只用于请求/比较快照，不构成覆盖授权');
   const sameTerm = snapshotOf({ term: 2, version: 12, manager: SEAT_C, from: SEAT_C });
-  rejects(acceptManagerChange(terminalState, sameTerm, snapshotCtx()), 'snapshot-not-authorized');
   rejects(acceptManagerChange(terminalState, sameTerm, snapshotCtx({
-    handshakeHighest: { term: 2, version: 12, manager: seatRef(SEAT_C) },
-  })), 'snapshot-not-authorized', '同 term 冲突不得靠 handshake 覆盖');
-  accepts(acceptManagerChange(terminalState, sameTerm, snapshotCtx({
-    acceptedManager: { term: 2, manager: seatRef(SEAT_C), source: seatRef(SEAT_C) },
-  })));
-  const auto = snapshotOf({ term: 3, version: 12, manager: SEAT_B, from: SEAT_B });
-  accepts(acceptManagerChange(terminalState, auto, snapshotCtx({
-    autoOffers: [autoOfferOf({ baseTerm: 2, prevManager: seatRef(SEAT_C), target: seatRef(SEAT_B) })],
-  })));
+    acceptedManager: { term: 2, manager: seatRef(SEAT_C), source: seatRef(SEAT_A) },
+  })), 'snapshot-not-authorized', '同 term 不得覆盖终态（A12）');
 });
 
-test('终态副本收敛：同 term 按 version 推进；更高 term 必须有权威证据（防 term 钉高）', () => {
+test('终态覆盖：handover 目标与本地 auto-offer 证据绑定 target/term', () => {
+  const terminalState = stateOf({ term: 2, version: 11, manager: null });
+  const frame = snapshotOf({ term: 3, version: 12, manager: SEAT_C, from: SEAT_C });
+  const handoverCtx = (extra = {}) => snapshotCtx({
+    suspended: { state: 'handover-pending', target: seatRef(SEAT_C) },
+    handoverBaseTerm: 2,
+    ...extra,
+  });
+  accepts(acceptManagerChange(terminalState, frame, handoverCtx()));
+  rejects(acceptManagerChange(terminalState, frame, handoverCtx({ handoverBaseTerm: 3 })),
+    'snapshot-not-authorized', 'baseTerm 必须低于快照 term');
+  rejects(acceptManagerChange(terminalState, frame, handoverCtx({ handoverBaseTerm: undefined })),
+    'snapshot-not-authorized', '缺 baseTerm 的 handover 记录不构成证据');
+  rejects(acceptManagerChange(terminalState, frame, handoverCtx({
+    suspended: { state: 'handover-pending', target: seatRef(SEAT_B) },
+  })), 'snapshot-not-authorized');
+  const auto = snapshotOf({ term: 3, version: 12, manager: SEAT_B, from: SEAT_B });
+  const autoOffer = (extra = {}) => autoOfferOf({
+    baseTerm: 2,
+    prevManager: seatRef(SEAT_C),
+    target: seatRef(SEAT_B),
+    ...extra,
+  });
+  accepts(acceptManagerChange(terminalState, auto, snapshotCtx({ autoOffers: [autoOffer()] })));
+  rejects(acceptManagerChange(terminalState, auto, snapshotCtx({
+    autoOffers: [autoOffer({ baseTerm: 1 })],
+  })), 'snapshot-not-authorized', 'offer 的 baseTerm+1 必须等于快照 term');
+  rejects(acceptManagerChange(terminalState, auto, snapshotCtx({
+    autoOffers: [autoOffer({ target: seatRef(SEAT_C) })],
+  })), 'snapshot-not-authorized');
+});
+
+test('终态副本收敛：同 term 按 version 推进；更高 term 必须有受理证据（防 term 钉高）', () => {
   const terminalState = stateOf({ term: 2, version: 11, manager: null });
   const sameTerm = snapshotOf({ term: 2, version: 12, manager: null, from: SEAT_B });
   const advanced = acceptManagerChange(terminalState, sameTerm, snapshotCtx({ memberSeats: [SEAT_B] }));
@@ -815,11 +853,14 @@ test('终态副本收敛：同 term 按 version 推进；更高 term 必须有�
   rejects(acceptManagerChange(terminalState, snapshotOf({ term: 2, version: 10, manager: null, from: SEAT_B }), snapshotCtx()), 'version-behind');
   const higher = snapshotOf({ term: 9, version: 20, manager: null, from: SEAT_B });
   rejects(acceptManagerChange(terminalState, higher, snapshotCtx({ memberSeats: [SEAT_B] })), 'snapshot-terminal-untrusted');
-  const byHandshake = acceptManagerChange(terminalState, higher, snapshotCtx({
+  rejects(acceptManagerChange(terminalState, higher, snapshotCtx({
     handshakeHighest: { term: 9, version: 20, manager: null },
+  })), 'snapshot-terminal-untrusted', 'handshake 不得把本地 term 钉高');
+  const byAccepted = acceptManagerChange(terminalState, higher, snapshotCtx({
+    acceptedManager: { term: 9, manager: seatRef(SEAT_B), source: seatRef(SEAT_A) },
   }));
-  accepts(byHandshake);
-  assert.equal(byHandshake.nextState.managerTerm, 9);
+  accepts(byAccepted);
+  assert.equal(byAccepted.nextState.managerTerm, 9);
 });
 
 test('终态形态：manager:null 必须携终态 status，且不得残留窗口', () => {
@@ -844,6 +885,17 @@ test('终态形态：manager:null 必须携终态 status，且不得残留窗口
     ledger: withWindow,
     from: { ...SEAT_B },
   }, snapshotCtx({ memberSeats: [SEAT_B] })), 'frame-invalid');
+  /* 反向形态：终态 status 必须 manager:null；M1 形态当前仍放行，M5 侧按损坏拒收。 */
+  const terminalWithManager = ledgerOf({ term: 2, version: 11, manager: SEAT_B, status: 'completed' });
+  assert.equal(isLedgerShape(terminalWithManager), true);
+  rejects(acceptManagerChange(stateOf(), {
+    kind: 'data',
+    managerTerm: 2,
+    version: 11,
+    digest: ledgerDigest(terminalWithManager),
+    ledger: terminalWithManager,
+    from: { ...SEAT_B },
+  }, snapshotCtx()), 'frame-invalid');
 });
 
 test('快照窗口：帧/台账不一致按损坏拒收；同刻不同格式不误判；远期窗口拒收', () => {
@@ -949,9 +1001,31 @@ test('真实链路：validateMessage 通过后由 acceptManagerChange 受理；�
     memberSeats: [SEAT_B],
   })), 'snapshot-terminal-untrusted');
   const missingTerm = wireEnvelope({ kind: 'data', version: 11, digest: frame.digest, ledger: frame.ledger });
-  assert.equal(validateMessage(missingTerm).ok, false, '快照生产端必须携 managerTerm（I-4）');
+  assert.equal(validateMessage(missingTerm).ok, false, '快照生产端必须携 managerTerm');
   const missingWindow = wireEnvelope({ kind: 'data', version: 11, managerTerm: 2, digest: frame.digest, ledger: frame.ledger });
-  assert.equal(validateMessage(missingWindow).ok, false, '台账带窗口时帧必须携同值 managerWindow（I-4）');
+  assert.equal(validateMessage(missingWindow).ok, false, '台账带窗口时帧必须携同值 managerWindow');
+});
+
+/* 端到端近似：按 events.js 的 acceptSnapshotFrame 顺序走协议校验 → 自洽 → digest 重算 → 任期判决，
+ * 证明「本地终态 + 合法更高 term 台账」在真实入站形态下可恢复（不是纯函数假绿）。 */
+test('真实链路：本地终态 + 合法更高 term 权威台账经 wire 校验后可恢复', () => {
+  const terminalState = stateOf({ term: 2, version: 11, manager: null });
+  const frame = snapshotOf({ term: 3, version: 12, manager: SEAT_C, from: SEAT_C });
+  const envelope = wireEnvelope(wirePayloadOf(frame), SEAT_C);
+  assert.deepEqual(validateMessage(envelope), { ok: true });
+  assert.equal(envelope.payload.ledger.collabId, envelope.collabId);
+  assert.equal(ledgerDigest(envelope.payload.ledger), envelope.payload.digest, '入站 digest 必须可重算');
+  const inbound = { ...envelope.payload, from: envelope.from };
+  const restored = acceptManagerChange(terminalState, inbound, snapshotCtx({
+    acceptedManager: { term: 3, manager: seatRef(SEAT_C), source: seatRef(SEAT_A) },
+    memberSeats: [SEAT_C],
+  }));
+  accepts(restored);
+  assert.equal(restored.nextState.managerTerm, 3);
+  assert.equal(restored.nextState.manager.sessionId, SEAT_C.sessionId);
+  assert.equal(restored.nextState.version, 12);
+  rejects(acceptManagerChange(terminalState, inbound, snapshotCtx({ memberSeats: [SEAT_C] })),
+    'snapshot-not-authorized', '同一入站帧缺受理证据时必须拒收');
 });
 
 test('compareSnapshot：排序/冲突/幂等，且与任期判决分类一致', () => {
