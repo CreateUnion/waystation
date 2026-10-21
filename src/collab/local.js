@@ -291,14 +291,14 @@ export function upsertLocalSeat(local, seat, { persist = false, dataDir = null, 
 }
 
 function nextSeatOf(existing, seat, bridgeId) {
-  if (existing !== undefined) {
-    return { ...existing, ...seat };
-  }
-  const next = runtimeSeatOf(seat);
+  const held = existing !== undefined ? { ...existing, ...seat } : runtimeSeatOf(seat);
+  /* 显式给出的桥标识必须落到合并结果上：席位在桥注册之后才建立（受邀同意、席位重建）
+   * 时，核心已经记下该会话的桥，但合并分支若忽略入参，席位就会保持 bridgeId=null，
+   * 内容帧只能进暂存等下一次重连。空值不覆盖既有绑定（调用方未给≠桥已失效）。 */
   if (typeof bridgeId === 'string' && bridgeId !== '') {
-    next.bridgeId = bridgeId;
+    held.bridgeId = bridgeId;
   }
-  return next;
+  return held;
 }
 
 function saveSeatQuietly(local, dataDir, seat) {
@@ -398,7 +398,15 @@ export function localRosterOf(local) {
  * 这是讨论模式成员语义的单一取数面：邀请名额判定、帖扇出、控制事件广播都经它——
  * managed 的 roster/台账名单不再是讨论成员关系的权威（被拒/被撤回者不占名额、退出者即时出表）。 */
 export function foldedMembersOf(local) {
-  return local.members.fold();
+  return local.members.fold().map((member) => withSessionSeatOf(local, member));
+}
+
+/* 折叠结果补席位键（设计 D13）：成员事件本身携 sessionId，但折叠只产出身份字段；
+ * 邀请载荷与名单匹配按席位键逐条校验，缺 sessionId 的条目会被对端协议层整帧拒收。
+ * 旧事件没有该字段时不编造——调用方按缺省处理，绝不用同机其他会话的标识顶替。 */
+function withSessionSeatOf(local, member) {
+  const sessionId = local.members.latestEventOf(member.instanceId)?.sessionId;
+  return typeof sessionId === 'string' ? { ...member, sessionId } : member;
 }
 
 /* 讨论的群体可达面（控制事件广播 / 对表候选 / 拉取应答准入的共用成员集）：
@@ -455,10 +463,15 @@ export function localTopicOf(local) {
   return typeof raw === 'string' ? raw : null;
 }
 
-/* 本机自播成员事件（设计 §5.4/§5.5）：join/leave 由成员本人发出——事件时刻取该作者的
+/** 本机自播成员事件（设计 §5.4/§5.5）：join/leave 由成员本人发出——事件时刻取该作者的
  * 单调基线（帖子与事件共用：与帖子序同源、跨重启落盘）。
- * 返回事件（已并入本地日志）或 null（形态异常/重复——新事件 id 不会重复）。 */
-export function emitOwnMemberEvent(state, local, kind) {
+ * 返回事件（已并入本地日志）或 null（形态异常/重复——新事件 id 不会重复）。
+ * @param {any} state
+ * @param {any} local
+ * @param {'join' | 'leave'} kind
+ * @param {string | null} [sessionId]
+ */
+export function emitOwnMemberEvent(state, local, kind, sessionId = null) {
   const event = {
     eventId: newMemberEventId(),
     kind,
@@ -466,6 +479,11 @@ export function emitOwnMemberEvent(state, local, kind) {
     identityName: state.self.identityName,
     ts: allocateOwnEventStamp(state, local),
   };
+  /* 席位键随事件广播：讨论成员粒度是会话，邀请载荷与名单折叠都按 (instanceId, sessionId)
+   * 校验；缺字段的事件在折叠后无法定位到具体会话。 */
+  if (typeof sessionId === 'string' && sessionId !== '') {
+    event.sessionId = sessionId;
+  }
   return local.members.apply(event) === 'added' ? event : null;
 }
 

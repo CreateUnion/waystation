@@ -81,7 +81,7 @@ export function createCollab(state, { name, topic, targets, mode, sessionId }) {
     /* 发起人实例标识 = 中继归属（设计 §5.1/§5.3）：本机即中继，随记录持久化
      * （随即发出的邀请载荷与 bundle 元状态携带它；成员据此定位中继）。 */
     local.member.originator = { instanceId: state.self.instanceId, identityName: state.self.identityName };
-    emitOwnMemberEvent(state, local, 'join');   // 发起人自创建即在成员表内（"第一个"，设计 §5.1）
+    emitOwnMemberEvent(state, local, 'join', sessionId);   // 发起人自创建即在成员表内（"第一个"，设计 §5.1）
   }
   persistMember(state, local);
   persistLedger(state, local);
@@ -250,7 +250,7 @@ function inviteForumMembers(state, local, targets, fromSessionId) {
   }
   const invited = [];
   for (const target of targets) {
-    const payload = applyInviteNaming(forumInvitePayloadOf(state, local, topic, targets), target);
+    const payload = applyInviteNaming(forumInvitePayloadOf(state, local, topic), target);
     const result = sendTo(state, local.collabId, target.instanceId, { address: target.address, port: target.port }, 'invite', payload, { fromSessionId });
     invited.push({ instanceId: target.instanceId, ok: result.ok === true, msgId: result.msgId, reason: result.reason });
     state.counters.invitesSent++;
@@ -286,18 +286,12 @@ function inviteManagedMembers(state, local, targets, fromSessionId) {
 }
 
 /* 讨论邀请载荷（发送侧公共构造）：名/主题/模式 + **发起人实例标识（中继归属）** +
- * **折叠成员表 ∪ 本次目标**（被邀者据此校验名单含自己与来源）+ 现端点表。
+ * **折叠成员表的席位条目** + 现端点表。目标机器另由 targets 描述（设计 §2.2），不要求出现在
+ * members 中——成员条目必须能通过协议层的席位键校验。
  * 发起人标识随最新邀请定格（中继归属不得由邀请者推断——邀请者≠发起人）；本机未知时省略
- * （不臆造——被邀者按「中继未知」降级直投，待对表补学）。名单 2–32 由协议层照旧校验。 */
-function forumInvitePayloadOf(state, local, topic, targets) {
-  const members = foldedMembersOf(local).map((member) => seatEntryOf(member));
-  const seen = new Set(members.map((member) => member.instanceId));
-  for (const target of targets) {
-    if (!seen.has(target.instanceId)) {
-      seen.add(target.instanceId);
-      members.push(seatEntryOf(target));
-    }
-  }
+ * （不臆造——被邀者按「中继未知」降级直投，待对表补学）。 */
+function forumInvitePayloadOf(state, local, topic) {
+  const members = forumSeatEntriesOf(local);
   const payload = {
     name: localNameOf(local),
     topic,
@@ -310,6 +304,27 @@ function forumInvitePayloadOf(state, local, topic, targets) {
     payload.originator = { instanceId: relay.instanceId, identityName: relay.identityName };
   }
   return payload;
+}
+
+/* 邀请名单条目（设计 D13/§2.2）：折叠成员表按席位键去重后转协议条目；缺 sessionId 的旧事件
+ * 不编造条目——协议层要求每项 instanceId + sessionId + identityName，混入残缺条目会让整帧被拒。
+ * 本次邀请的目标机器另由 targets 描述，不要求出现在 members 中。 */
+function forumSeatEntriesOf(local) {
+  const seen = new Set();
+  const members = [];
+  for (const member of foldedMembersOf(local)) {
+    const entry = seatEntryOf(member);
+    if (typeof entry.sessionId !== 'string') {
+      continue;
+    }
+    const key = `${entry.instanceId}\u0000${entry.sessionId}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    members.push(entry);
+  }
+  return members;
 }
 
 /* —— 主动加入（设计 §5.6）：成员侧敲门命中处理 —— */
@@ -477,7 +492,7 @@ function decideForumInvite(state, local, wanted, reason, sessionId) {
   persistMember(state, local);
   if (wanted === 'approved') {
     upgradeInviteStubCarrier(state, local, sessionId);
-    const event = emitOwnMemberEvent(state, local, 'join');
+    const event = emitOwnMemberEvent(state, local, 'join', sessionId);
     if (event !== null) {
       state.counters.forumJoinsOut++;
       startJoinReplay(state, local, event, sessionId);
@@ -522,7 +537,7 @@ function ensureJoinedSeatOf(state, local, sessionId) {
     state: 'member',
     joinSeq: 1,
     joinedAt: new Date().toISOString(),
-  }, { persist: true, dataDir: state.dataDir });
+  }, { persist: true, dataDir: state.dataDir, bridgeId: bridgeIdOfSession(state, target) });
 }
 
 function inviteStubCarrierOf(dir) {
@@ -1212,7 +1227,7 @@ function leaveForum(state, local, sessionId) {
     return { ok: false, message: '讨论已结束（或已退出）' };
   }
   stopJoinReplay(state, local);
-  const event = emitOwnMemberEvent(state, local, 'leave');
+  const event = emitOwnMemberEvent(state, local, 'leave', sessionId ?? firstActiveSessionIdOf(local) ?? undefined);
   if (event !== null) {
     state.counters.forumLeavesOut++;
   }
@@ -2682,7 +2697,8 @@ export function invitePayloadOf(ledger, extraMembers = [], endpoints = null) {
   return payload;
 }
 
-/* 席位条目（邀请载荷的名单行）：只取协议定义字段；缺 sessionId 的旧行不编造，交由协议层拒收。 */
+/* 席位条目（邀请载荷的名单行）：只取协议定义字段；缺 sessionId 的旧行不编造——
+ * 调用方按「无法形成合法条目」跳过，绝不借用同机其他会话的标识。 */
 function seatEntryOf(member) {
   const sessionId = typeof member.sessionId === 'string' ? member.sessionId : member.targetSessionId;
   return {

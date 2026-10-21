@@ -107,59 +107,26 @@ export function inviteTool() {
   };
 }
 
-/* 邀请前的能力闸门（设计 §7.2）：加入域的 createInvite 不做能力判定，若工具层不预检，就会对
- * 旧版对端留下已签发的邀请记录并向调用方报成功。逐目标单播探测一次（探测结果写入 known-hosts，
- * 服务层闸门可复用），不支持/无法确认的目标如实拒绝。探测面不可用的装配无法判定——如实标记
- * unverified 而不是把未知当支持。 */
-async function capabilityVerdictsOf(targets, context) {
-  const probe = context.net?.probeCapability;
-  if (typeof probe !== 'function') {
-    return targets.map(() => ({ state: 'unverified' }));
-  }
-  const verdicts = [];
-  for (const target of targets) {
-    verdicts.push(await capabilityVerdictOf(probe, target));
-  }
-  return verdicts;
-}
-
-async function capabilityVerdictOf(probe, target) {
-  const probed = await probeCapabilityResultOf(probe, target);
-  if (probed?.ok !== true) {
-    return { state: 'unknown', reason: `无法确认目标驿站（${target.instanceId}）支持会话级协作：${probed?.message ?? '能力探测失败'}——未发出邀请` };
-  }
-  if (probed.capability === 'supported') {
-    return { state: 'supported' };
-  }
-  if (probed.capability === 'unsupported') {
-    return { state: 'unsupported', reason: `目标驿站（${target.instanceId}）版本不支持会话级协作（需 0.2.0+）——未发出邀请` };
-  }
-  return { state: 'unknown', reason: `无法确认目标驿站（${target.instanceId}）支持会话级协作——未发出邀请（请确认对方为 0.2.0+ 且在线）` };
-}
-
-/* 探测面异常按「能力未确认」归一：探测失败不得被当成支持而放行邀请。 */
-async function probeCapabilityResultOf(probe, target) {
-  try {
-    return await probe({ address: target.address, port: target.port, instanceId: target.instanceId });
-  } catch (error) {
-    return { ok: false, message: error?.message ?? '能力探测失败' };
-  }
+/* 邀请前的能力闸门（设计 §7.2）归服务层：加入域的 createInvite 与旧邀请面的 invite 走同一
+ * 证据链——已知支持直接放行、已知不支持拒绝、未知才单播探测一次。工具层不再自带探测：那样
+ * 会对已知支持的目标也发一次 UDP，一旦应答丢包就 fail-closed，并把服务层已短路的目标再问一遍。
+ * 探测面不可用的装配无法判定——如实标记 unverified 而不是把未知当支持。 */
+function capabilityVerdictsOf(targets, context) {
+  const state = typeof context.net?.probeCapability === 'function' ? 'delegated' : 'unverified';
+  return targets.map(() => ({ state }));
 }
 
 async function inviteViaJoinDomain(collabId, targets, verdicts, sessionId, context) {
   const invited = [];
   for (const [index, target] of targets.entries()) {
     const verdict = verdicts[index];
-    if (verdict.state === 'unsupported' || verdict.state === 'unknown') {
-      invited.push({ instanceId: target.instanceId, ok: false, reason: verdict.reason });
-      continue;
-    }
     const created = await context.join.createInvite(inviteCallOf(collabId, target, sessionId));
     /* 论坛无邀请簿记（设计 D18）：整批回退旧邀请面，forum 不生成也不返回 inviteId。 */
     if (created.code === 'forum-no-invite') {
       return inviteViaLegacySurface(collabId, targets, verdicts, sessionId, context);
     }
-    /* 逐目标如实回报：前面的目标可能已发出邀请，不能用一个错误吞掉已签发的事实。 */
+    /* 能力拒绝（已知不支持 / 探测后仍未知）与业务拒绝一样由服务层逐目标回报——工具层只封装，
+     * 不再根据自身探测另下一份结论。前面的目标可能已发出邀请，不能用一个错误吞掉已签发的事实。 */
     invited.push(created.ok === true
       ? inviteRecordOf(target, created, verdict)
       : { instanceId: target.instanceId, ok: false, reason: created.message });
@@ -198,13 +165,9 @@ function inviteRecordOf(target, created, verdict) {
   return record;
 }
 
-/* 旧邀请面（论坛 / 加入域未接线）：能力闸门按整批前置（与 service.invite 的既有口径一致）；
- * 旧面不逐目标携带结论，探测面缺失时以顶层标记如实说明能力未经确认。 */
+/* 旧邀请面（论坛 / 加入域未接线）：能力闸门归 service.invite（同一服务层证据链），工具层只
+ * 做输出封装；旧面不逐目标携带结论，探测面缺失时以顶层标记如实说明能力未经确认。 */
 async function inviteViaLegacySurface(collabId, targets, verdicts, sessionId, context) {
-  const refused = verdicts.find((verdict) => verdict.state === 'unsupported' || verdict.state === 'unknown');
-  if (refused !== undefined) {
-    return errorResult(refused.reason);
-  }
   const result = await context.collab.invite({ collabId, targets, sessionId });
   if (result.ok === true && verdicts.some((verdict) => verdict.state === 'unverified')) {
     return okResult({ ...result, capability: 'unverified' });
