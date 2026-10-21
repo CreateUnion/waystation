@@ -97,6 +97,7 @@ function sessionJoinApiOf(joinState) {
     openInitialInvite: (input) => openInitialInviteOf(joinState, input ?? {}),
     withdrawInitialInvite: (input) => withdrawInitialInviteOf(joinState, input ?? {}),
     acceptInvite: (input) => acceptInviteOf(joinState, input ?? {}),
+    declineInvite: (input) => declineInviteOf(joinState, input ?? {}),
     requestJoin: (input) => requestJoinOf(joinState, input ?? {}),
     approveJoin: (input) => approveJoinOf(joinState, input ?? {}),
     confirmJoining: (joinId, sessionId, input) => confirmJoiningOf(joinState, joinId, sessionId, input ?? {}),
@@ -1863,6 +1864,71 @@ function alreadyAcceptedInviteOf(books, { collabId, inviteId, sessionId }) {
   return record !== null && record.acceptedSessions.includes(sessionId)
     ? { ok: true, accepted: true, idempotent: true, inviteId }
     : failureMessage('邀请不存在、已过期或不属于本会话');
+}
+
+/* 拒绝席位邀请（0.2.0 邀请簿记）：本地拒绝先生效（挂起邀请消费 ＋ 本会话记入拒绝），再向邀请者
+ * 补发 decline 帧作簿记——与讨论拒绝同一口径：簿记帧失败只如实标注，不改本地结论。重复拒绝按
+ * 幂等返回且不重复投递——站长侧的 decline 计数只应记真实决定。 */
+async function declineInviteOf(joinState, input) {
+  const context = /** @type {any} */ (declineContextOf(joinState, input));
+  if (context.ok !== true) {
+    return context;
+  }
+  const { collabId, inviteId, sessionId } = context;
+  const booked = /** @type {any} */ (declinePendingOf(joinState, { collabId, inviteId, sessionId }));
+  if (booked.ok !== true) {
+    return booked;
+  }
+  if (booked.declined.idempotent === true) {
+    return { ok: true, declined: true, idempotent: true, consumed: booked.declined.consumed === true, inviteId };
+  }
+  return sendDeclineFrameOf(joinState, { ...context, booked });
+}
+
+/* 拒绝的前置面：参数形态、forum 无邀请簿记、原因按协议呈现判据校验（先校验，后落地拒绝）。 */
+function declineContextOf(joinState, input) {
+  const ids = /** @type {any} */ (acceptInviteIdsOf(input));
+  if (ids.ok !== true) {
+    return ids;
+  }
+  const local = joinState.state.collabs.get(ids.collabId);
+  if (local !== undefined && localModeOf(local) === 'forum') {
+    return failureMessage('讨论无邀请簿记：forum 的拒绝走成员事件，不使用 inviteId（设计 D18）', { code: 'forum-no-invite' });
+  }
+  const reason = validateReason(input.reason);
+  return reason.ok === true ? { ...ids, reason: reason.reason } : failureMessage(reason.message);
+}
+
+/* 本地拒绝（先落账再发帧）：matchPending 取的是可见记录（用于取邀请者），declineForSession
+ * 负责匹配目标会话与幂等 / 反向决定的判定。 */
+function declinePendingOf(joinState, { collabId, inviteId, sessionId }) {
+  const books = booksOf(joinState, collabId);
+  const at = joinState.now();
+  const visible = books.pending.store.matchPendingForSession({ collabId, sessionId, inviteId, now: at });
+  const declined = books.pending.store.declineForSession({ collabId, inviteId, sessionId, now: at });
+  if (declined.ok !== true) {
+    return failureMessage(`邀请已不可拒绝：${declined.reason}`, { reason: declined.reason });
+  }
+  books.pending.save();
+  return { ok: true, visible, declined };
+}
+
+/* decline 帧是簿记面：投递结果如实回传，失败不撤销已成立的本地拒绝。 */
+async function sendDeclineFrameOf(joinState, { collabId, inviteId, sessionId, reason, booked }) {
+  const base = {
+    ok: true, declined: true, idempotent: false, consumed: booked.declined.consumed === true, inviteId,
+  };
+  const manager = booked.visible[0]?.fromManager;
+  if (manager === undefined) {
+    return { ...base, delivery: { ok: false, reason: '挂起记录缺少邀请者信息——decline 帧未发出' } };
+  }
+  const sent = await sendSeatFrame(joinState, {
+    collabId, instanceId: manager.instanceId, sessionId: manager.sessionId, type: 'decline',
+    payload: reason === undefined ? {} : { reason }, fromSessionId: sessionId,
+  });
+  return sent.ok === true
+    ? { ...base, delivery: sent }
+    : { ...base, delivery: sent, note: `拒绝已本地生效；decline 帧未送达：${sent.reason}` };
 }
 
 function acceptInviteIdsOf(input) {

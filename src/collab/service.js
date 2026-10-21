@@ -1267,10 +1267,20 @@ function approveNow(state, input) {
     return refusal;
   }
   /* 0.2.0 两段式：带 inviteId 的同意走加入域的邀请接受（校验邀请簿记 → 签发 join-grant）；
-   * 旧 approveInvite 只做机器级「回应已记录」，不产生席位。 */
-  if (isSeatInviteAcceptance(input)) {
-    return acceptSeatInviteNow(state, input);
+   * 带 inviteId 的拒绝同样走加入域（消费挂起邀请 ＋ 补发 decline 帧）——旧 approveInvite 只做
+   * 机器级「回应已记录」，不认会话级邀请簿记，会把拒绝误判为「不在待回应邀请状态」。 */
+  if (isSeatInviteDecision(input)) {
+    return seatInviteDecisionOf(state, input);
   }
+  return approveLegacyOf(state, input);
+}
+
+function seatInviteDecisionOf(state, input) {
+  return input.approve === true ? acceptSeatInviteNow(state, input) : declineSeatInviteNow(state, input);
+}
+
+/* 旧路径的同意收尾：升级讨论落点并按需要触发一轮回填对表；拒绝或无加入不触发。 */
+function approveLegacyOf(state, input) {
   const result = approveInvite(state, input);
   if (result.ok === true && result.joined === true) {
     const local = state.collabs.get(input?.collabId);
@@ -1300,10 +1310,12 @@ function upgradeJoinedCarrierOf(state, local, sessionId) {
   }
 }
 
-/* 席位邀请的同意（0.2.0 两段式）：邀请簿记校验与 join-grant 签发在加入域；本层只保留
- * 用户确认门（与旧路径同一份一次性挑战/豁免）并接席位收尾。 */
-function isSeatInviteAcceptance(input) {
-  return input?.approve === true && typeof input?.inviteId === 'string' && input.inviteId !== '';
+/* 席位邀请的决定（0.2.0 两段式）：邀请簿记校验与 join-grant 签发在加入域；本层只保留
+ * 用户确认门（与旧路径同一份一次性挑战/豁免）并接席位收尾。带 inviteId 的布尔决定
+ * （同意 / 拒绝）都走加入域；非布尔真值保留旧路径语义。 */
+function isSeatInviteDecision(input) {
+  return typeof input?.inviteId === 'string' && input.inviteId !== ''
+    && (input.approve === true || input.approve === false);
 }
 
 async function acceptSeatInviteNow(state, input) {
@@ -1322,7 +1334,23 @@ async function acceptSeatInviteNow(state, input) {
   return result;
 }
 
-function inviteAcceptanceConsentOf(state, local, { sessionId, confirmToken }) {
+/* 席位邀请的拒绝：与同意共用同一份一次性挑战 / 豁免（拒绝同样是有后果的用户决定）；拒绝不产生
+ * 席位，故不做载体升级与对表触发，只把本地拒绝与 decline 帧交给加入域。 */
+async function declineSeatInviteNow(state, input) {
+  const local = state.collabs.get(input?.collabId);
+  if (local === undefined) {
+    return { ok: false, message: '本机没有该协作（collabId 不存在）——无从拒绝该邀请' };
+  }
+  const consent = inviteAcceptanceConsentOf(state, local, input);
+  if (consent !== null) {
+    return consent;
+  }
+  return state.join.declineInvite({
+    collabId: input.collabId, inviteId: input.inviteId, sessionId: input.sessionId, reason: input.reason,
+  });
+}
+
+function inviteAcceptanceConsentOf(state, local, { sessionId, confirmToken, approve }) {
   if (typeof sessionId !== 'string' || sessionId === '') {
     return null;
   }
@@ -1334,7 +1362,7 @@ function inviteAcceptanceConsentOf(state, local, { sessionId, confirmToken }) {
     needsUserConfirmation: true,
     confirmToken: issueInviteChallenge(state, { sessionId, collabId: local.collabId }),
     invite: inviteSummaryOfLocal(local),
-    message: '同意邀请需要用户明确确认：请把邀请信息转述给用户，取得明确同意后携带 confirmToken 重试；若用户明确表示下一次无需确认，可先用 ws_allow_next_invite 登记一次性豁免',
+    message: `${approve === false ? '拒绝' : '同意'}邀请需要用户明确确认：请把邀请信息转述给用户，取得明确同意后携带 confirmToken 重试；若用户明确表示下一次无需确认，可先用 ws_allow_next_invite 登记一次性豁免`,
   };
 }
 

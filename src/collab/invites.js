@@ -434,6 +434,7 @@ export function createPendingInvites({ now = Date.now, capacity = PENDING_INVITE
     applyPendingInvite: (input) => applyPendingInvite(state, input ?? {}),
     matchPendingForSession: (input) => matchPendingForSession(state, input ?? {}),
     consumeForSession: (input) => consumeForSession(state, input ?? {}),
+    declineForSession: (input) => declineForSession(state, input ?? {}),
     withdrawPending: (input) => withdrawPending(state, input ?? {}),
     expirePending: (at) => expirePending(state, at),
     pruneTerminal: (at) => pruneTerminalPending(state, at),
@@ -623,6 +624,21 @@ function consumeForSession(state, input) {
     return failure(found.reason);
   }
   return consumeRecord(state, found.record, ids.sessionId, flagged.value, input?.now);
+}
+
+/* 会话级拒绝（设计 §4.3「拒绝 = 本条不参与」）：判定次序与 consumeForSession(declined:true) 完全一致
+ * （过期 → 已决定 → 记录状态），复用同一 declined 账与消费语义——指名记录整条 consumed、不指名记录
+ * 只挡本会话。reason 只供接线方组 decline 帧，本模块不落账。 */
+function declineForSession(state, input) {
+  const ids = consumeIdsOf(input);
+  if (ids === null) {
+    return failure('invalid');
+  }
+  const found = pendingSeatOf(state, ids.collabId, ids.inviteId, ids.sessionId);
+  if (found.record === null) {
+    return failure(found.reason);
+  }
+  return consumeRecord(state, found.record, ids.sessionId, true, input?.now);
 }
 
 function consumeIdsOf(input) {
