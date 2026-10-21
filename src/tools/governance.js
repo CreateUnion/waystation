@@ -140,11 +140,13 @@ async function handoverTargetCall(value, collabId, context) {
   return resultOf(result);
 }
 
-function rejectHandoverCall(value, collabId, context) {
+async function rejectHandoverCall(value, collabId, context) {
   if (typeof context.collab.rejectHandover !== 'function') {
     return errorResult('目标拒绝移交不可用：服务层尚未暴露拒绝入口（rejectHandover）——本次未回执');
   }
-  return resultOf(context.collab.rejectHandover({ collabId, sessionId: context.sessionId, offerId: value.offerId, reason: value.reason }));
+  /* 拒绝要发帧回执，服务入口必然是异步的：不 await 会把 Promise 当结果对象，
+   * 走到 result.ok !== true 分支产出空文案（用户看不到拒绝是否生效）。 */
+  return resultOf(await context.collab.rejectHandover({ collabId, sessionId: context.sessionId, offerId: value.offerId, reason: value.reason }));
 }
 
 export function takeOverTool() {

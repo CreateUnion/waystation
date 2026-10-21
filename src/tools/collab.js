@@ -98,6 +98,12 @@ async function inviteViaJoinDomain(collabId, targets, context) {
       ? inviteRecordOf(target, created)
       : { instanceId: target.instanceId, ok: false, reason: created.message });
   }
+  /* 一个都没签发出＝本次邀请失败：顶层 ok:true 会让代理把「谁也没邀请到」当成功——
+   * 逐目标原因回传（含 collab 级前置拒绝：非站长会话 / 无席位 / 已归档），供调用方修正后重试。 */
+  if (invited.every((entry) => entry.ok !== true)) {
+    const details = invited.map((entry) => `${entry.instanceId}：${entry.reason ?? '未知原因'}`).join('；');
+    return errorResult(`邀请全部失败（${invited.length} 个目标）：${details}`);
+  }
   return okResult({ ok: true, collabId, invited });
 }
 
@@ -329,7 +335,9 @@ export function leaveCollabTool() {
       if (collabId === null) {
         return errorResult('参数 collabId 非法：需要非空白字符串');
       }
-      return resultOf(await context.collab.leave({ collabId }));
+      /* 离席按会话（设计 §3.4/§9）：只退本会话的席位，同机其他席位与整机兼容记录不受牵连——
+       * 会话标识随上下文穿参，缺标识由服务如实拒绝（不落到按首个活跃席位代签）。 */
+      return resultOf(await context.collab.leave({ collabId, sessionId: context.sessionId }));
     },
   };
 }

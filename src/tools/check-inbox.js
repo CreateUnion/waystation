@@ -16,12 +16,14 @@ export function checkInboxTool() {
       if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > CHECK_INBOX_MAX_LIMIT)) {
         return { content: [{ type: 'text', text: `参数 limit 非法：需要 1–${CHECK_INBOX_MAX_LIMIT} 的整数（可选，不传用默认 ${CHECK_INBOX_DEFAULT_LIMIT}）` }], isError: true };
       }
-      /* 按本会话过滤（设计 §9）：只取投给本席位的记录；机器级治理提示仍对全本机会话可见。
-       * 调用上下文没有会话标识时如实不传（服务按全本机可见面返回），不伪造。 */
-      const query = { collabId, limit: args.limit ?? CHECK_INBOX_DEFAULT_LIMIT };
-      if (typeof context.sessionId === 'string' && context.sessionId !== '') {
-        query.sessionId = context.sessionId;
+      /* 按本会话过滤（设计 §1.2/§9）：收件流水是逐席位的，没有会话标识就无法确定该给谁看——
+       * 必须拒绝，不得退回「全本机收件」（那会把同机其他会话的消息泄露给无标识调用方）。 */
+      const sessionId = typeof context.sessionId === 'string' ? context.sessionId.trim() : '';
+      if (sessionId === '') {
+        return { content: [{ type: 'text', text: '本会话无会话标识：ws_check_inbox 按会话过滤（设计 §1.2），无法确定收件席位——请从带会话标识的终端调用' }], isError: true };
       }
+      /* 机器级治理提示（无席位指向的记录）仍由服务面按全本机会话可见处理。 */
+      const query = { collabId, limit: args.limit ?? CHECK_INBOX_DEFAULT_LIMIT, sessionId };
       const result = context.net.checkInbox(query);
       return { content: [{ type: 'text', text: JSON.stringify({ ok: true, ...result }, null, 2) }] };
     },
