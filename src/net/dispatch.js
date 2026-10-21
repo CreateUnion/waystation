@@ -17,6 +17,9 @@ const DIRECT_RETRY_INTERVAL_MS = 1000;
 const DIRECT_RECORD_TTL_MS = 10 * 60 * 1000;
 const DIRECT_RECORD_MAX = 512;
 
+/* 待发条目有界等待的缺省上限（调用方显式给值时以调用方为准；5s 与设计 §3.3 的退出冲刷窗口同口径）。 */
+const OUTBOUND_WAIT_DEFAULT_MS = 5000;
+
 /* 发送调度（设计 §10）：按「协作 × 对端」单元串行投递（FIFO 保序），ack 推进，超时重传。
  * 节律：首投立即；未 ack 的重试恒定 retryIntervalMs，连续 retryFastCount 次后转 retrySlowIntervalMs，
  * 直至送达 / 过期——节律参数与容量、过期的权威在 outbox，本层只驱动「何时再试一次」。
@@ -42,6 +45,8 @@ export function createDispatch(options) {
     resolvePong: (frame) => resolvePong(state, frame),
     ping: (options) => ping(state, options),
     deliveryStatus: (query) => deliveryStatus(state, query),
+    pendingOutboundOf: (query) => pendingOutboundOf(state, query ?? {}),
+    awaitOutboundSettled: (query, timeoutMs) => awaitOutboundSettled(state, query ?? {}, timeoutMs),
     reassignPeer: (payload) => reassignPeer(state, payload),
     setClientFrameRouter: (router) => {
       state.clientFrameRouter = router;
@@ -77,6 +82,7 @@ function buildState({ dataDir, config, transport, self, log, onRelayedReport = n
     pendingPings: new Map(),   // ping msgId → { resolve, startedAt, timer }
     directRecords: new Map(),  // 直投 msgId → 投递记录（短时保留；查询行集来源）
     directWaiters: new Map(),  // 直投 msgId → { resolve, timer }（单次尝试的 ack 等待面）
+    outboundWaiters: new Set(), // 待发条目的有界等待面（ack / 终态 / 超时 / 停止结算）
     directActive: new Map(),   // 单元键 → 在途直投数（空闲连接判定据此不关闭在用连接）
     counters: emptyCounters(),
     clientFrameRouter: null,
@@ -103,6 +109,9 @@ function emptyCounters() {
     directAcked: 0,
     directSession: 0,
     directUndelivered: 0,
+    pendingQueries: 0,
+    outboundWaits: 0,
+    outboundWaitTimeouts: 0,
   };
 }
 
@@ -141,7 +150,19 @@ async function stop(state) {
   }
   state.pendingPings.clear();
   settleDirectWaiters(state);
+  settleOutboundWaitersOnStop(state);
   await Promise.allSettled([...state.pendingDials]);
+}
+
+/* 停止路径的等待面统一解挂：发送已截止，未结算条目如实报告为「已停止」——不留跨停止的挂起定时器。 */
+function settleOutboundWaitersOnStop(state) {
+  for (const waiter of [...state.outboundWaiters]) {
+    if (!state.outboundWaiters.delete(waiter)) {
+      continue;
+    }
+    clearTimeout(waiter.timer);
+    waiter.resolve({ settled: false, reason: 'stopped', pending: pendingOutboundOf(state, waiter.query) });
+  }
 }
 
 /* 直投等待面统一解挂（stop 路径）：以 'stopped' 终止单次尝试等待——任务层据此收尾为「未达」。 */
@@ -584,6 +605,7 @@ function onAck(state, msgId) {
   if (located.outbox.markAcked(msgId, Date.now())) {
     state.counters.ackedTotal++;
     closeConnectionIfIdle(state, located.collabId, located.entry.to.instanceId);
+    settleOutboundWaiters(state);
   }
 }
 
@@ -604,6 +626,7 @@ function onDeliveryReport(state, { refMsgId, tier }) {
   if (located.outbox.markSessionDelivered(refMsgId, Date.now())) {
     state.counters.deliveredTotal++;
     closeConnectionIfIdle(state, located.collabId, located.entry.to.instanceId);
+    settleOutboundWaiters(state);
   }
 }
 
@@ -720,6 +743,82 @@ function directStatusRow(record) {
     note: record.state === 'undelivered' ? '未达——待对表收敛（对方周期拉取后自动追平）' : null,
     reason: record.reason ?? null,
   };
+}
+
+/* 待发条目查询（只读面：核心退出冲刷 / 重启对账消费）：只返回仍为 queued 的条目——
+ * acked（已到对方驿站）/ session / expired 都属已结算，不再计入「待发」。查询只惰性载入协作目录，
+ * 不启 tick、不调度（与 deliveryStatus 同口径）。 */
+function pendingOutboundOf(state, query) {
+  state.counters.pendingQueries++;
+  ensureLoadedCollabs(state);
+  const rows = [];
+  for (const [collabId, outbox] of state.outboxes) {
+    if (!queryMatchesCollab(query, collabId)) {
+      continue;
+    }
+    for (const entry of outbox.entries()) {
+      if (entry.state !== 'queued' || !queryMatchesEntry(query, entry)) {
+        continue;
+      }
+      rows.push(statusRow(collabId, entry));
+    }
+  }
+  return rows;
+}
+
+function queryMatchesCollab(query, collabId) {
+  return typeof query.collabId !== 'string' || query.collabId === '' || query.collabId === collabId;
+}
+
+function queryMatchesEntry(query, entry) {
+  return typeof query.type !== 'string' || query.type === '' || query.type === entry.type;
+}
+
+/* 待发条目的有界等待（ack / 过期终态唤醒；到点或停止如实返回）。返回：
+ * { settled, reason: 'settled' | 'timeout' | 'stopped', pending: 行集 }。 */
+function awaitOutboundSettled(state, query, timeoutMs) {
+  const limit = Number.isInteger(timeoutMs) && timeoutMs > 0 ? timeoutMs : OUTBOUND_WAIT_DEFAULT_MS;
+  const pending = pendingOutboundOf(state, query);
+  if (pending.length === 0) {
+    return Promise.resolve({ settled: true, reason: 'settled', pending: [] });
+  }
+  state.counters.outboundWaits++;
+  return new Promise((resolve) => {
+    const waiter = /** @type {{ query: any, resolve: (value: any) => void, timer: any }} */ ({ query, resolve, timer: null });
+    /* 显式 await 的等待面持有定时器：调用方要等出结论，提前退出会让等待悬空
+     * （与直投等待面同口径；退出路径上网络/IPC 句柄仍在，不会因本定时器延长进程寿命）。 */
+    waiter.timer = setTimeout(() => settleOutboundWaiterOnTimeout(state, waiter), limit);
+    state.outboundWaiters.add(waiter);
+  });
+}
+
+function settleOutboundWaiterOnTimeout(state, waiter) {
+  if (!state.outboundWaiters.delete(waiter)) {
+    return;
+  }
+  clearTimeout(waiter.timer);
+  const pending = pendingOutboundOf(state, waiter.query);
+  state.counters.outboundWaitTimeouts++;
+  state.log.warn('待发消息有界等待超时（按截止点返回）', {
+    type: waiter.query.type ?? null,
+    collabId: waiter.query.collabId ?? null,
+    pending: pending.length,
+  });
+  waiter.resolve({ settled: false, reason: 'timeout', pending });
+}
+
+/* 结算唤醒（ack / 会话回报 / 过期）：逐等待面复查——仍有匹配待发条目的继续等，其余按「已结算」返回。 */
+function settleOutboundWaiters(state) {
+  for (const waiter of [...state.outboundWaiters]) {
+    if (pendingOutboundOf(state, waiter.query).length > 0) {
+      continue;
+    }
+    if (!state.outboundWaiters.delete(waiter)) {
+      continue;
+    }
+    clearTimeout(waiter.timer);
+    waiter.resolve({ settled: true, reason: 'settled', pending: [] });
+  }
 }
 
 /* 队列改投（协作层在降级 / 移交时消费）：把该协作发往旧对端的未确认条目改投新对端。
@@ -990,9 +1089,11 @@ function closeIdleConnections(state) {
 
 function pruneAll(state, now) {
   let recycled = 0;
+  let expiredInRound = 0;
   for (const outbox of state.outboxes.values()) {
     const result = outbox.prune(now);
     recycled += result.dropped;
+    expiredInRound += result.expired.length;
     if (result.expired.length > 0) {
       state.counters.expiredTotal += result.expired.length;
       state.log.warn('发送队列条目过期（未送达，查询入口可查）', { expired: result.expired });
@@ -1000,6 +1101,9 @@ function pruneAll(state, now) {
   }
   if (recycled > 0) {
     rebuildEntryIndex(state);   // 有回收才重建：稳态零开销
+  }
+  if (expiredInRound > 0) {
+    settleOutboundWaiters(state);   // 过期是终态：等待面按「已结算」唤醒
   }
 }
 

@@ -904,3 +904,38 @@ test('sendDirect：同对端两条并发——连接复用、活动计数正确�
   await waitFor(() => transport.connections[0].closed, { timeoutMs: 2000 });   // 直投清零 + 队列无待投 → tick 回收
   assert.equal(dispatch.deliveryStatus({ collabId: 'collab-f' }).length, 3);
 });
+
+test('pendingOutboundOf / awaitOutboundSettled：按类型查待发、ack 即结算、到点如实超时', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  // 不启调度：条目停在 queued，ack / 超时两条结算路径可确定地观测
+  const { dispatch } = makeDispatch(t, { transport });
+  t.after(() => dispatch.stop());
+  const leave = dispatch.send(target({ type: 'leave', payload: {} }));
+  const reply = dispatch.send(target({ type: 'reply', payload: { text: '普通' } }));
+  assert.deepEqual(dispatch.pendingOutboundOf({ type: 'leave' }).map((row) => row.msgId), [leave.msgId]);
+  assert.equal(dispatch.pendingOutboundOf({ type: 'leave' })[0].tier, 'queued');
+
+  const acked = dispatch.awaitOutboundSettled({ type: 'leave' }, 2000);
+  dispatch.onAck(leave.msgId);
+  const ackOutcome = await acked;
+  assert.equal(ackOutcome.settled, true);
+  assert.equal(ackOutcome.reason, 'settled');
+  assert.deepEqual(dispatch.pendingOutboundOf({ type: 'leave' }), [], 'ack 后不再计入待发');
+
+  const timed = await dispatch.awaitOutboundSettled({ type: 'reply' }, 50);
+  assert.equal(timed.settled, false);
+  assert.equal(timed.reason, 'timeout');
+  assert.deepEqual(timed.pending.map((row) => row.msgId), [reply.msgId], '超时如实报告仍未结算的条目');
+});
+
+test('awaitOutboundSettled：调度器停止即解挂等待面（不留挂起定时器）', { timeout: 15000 }, async (t) => {
+  const transport = createFakeTransport();
+  const { dispatch } = makeDispatch(t, { transport });
+  const sent = dispatch.send(target({ type: 'leave', payload: {} }));
+  const waiting = dispatch.awaitOutboundSettled({ type: 'leave' }, 5000);
+  await dispatch.stop();
+  const outcome = await waiting;
+  assert.equal(outcome.settled, false);
+  assert.equal(outcome.reason, 'stopped');
+  assert.deepEqual(outcome.pending.map((row) => row.msgId), [sent.msgId]);
+});

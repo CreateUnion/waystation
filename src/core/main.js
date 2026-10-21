@@ -88,6 +88,9 @@ const VIEWER_SCRIPT_PATH = fileURLToPath(new URL('../../scripts/ws-viewer.js', i
  * @property {{ stop: () => void } | null} lifetime
  * @property {{ stop: () => void } | null} retry
  * @property {boolean} stopped
+ * @property {number} leaveFlushMs
+ * @property {number | null} stopReconcileMs
+ * @property {any} stopReconcile
  * @property {any} config
  * @property {string} logDir
  * @property {any} log
@@ -819,6 +822,10 @@ function buildComponents(state) {
     monoClock: () => performance.now(),
     send: (message) => dispatch.send(message),
     sendDirect: (message) => dispatch.sendDirect(message),
+    /* 待发 leave 只读查询（退出冲刷/重启对账）：服务层不私接 net 内部结构。 */
+    pendingOutboundOf: (query) => dispatch.pendingOutboundOf(query),
+    /* 桥注册证据（重启对账）：会话在宽限内重绑过即撤销该席位的待补发判定。 */
+    onSessionRebound: (sessionId) => noteStopReconcileRebound(state, sessionId),
     probe: (address, port) => dispatch.ping({ address, port }),
     reassign: (payload) => dispatch.reassignPeer(payload),
     ...deliveryWiringOf(state),
@@ -1058,8 +1065,13 @@ function markReady(state) {
 /* 核心退出标记（设计 §3.3）：记下退出时本机席位快照，供重启对账补发未完成的 leave。
  * 标记写失败只告警——不得阻断退出（退出优先于留痕）。 */
 const CORE_STOP_FILE_NAME = 'core-stop.json';
+/* 退出前 leave 有界冲刷窗口（设计 §3.3：ack 或 5s 超时）与测试注入缝（生效闸 NODE_TEST_CONTEXT）。 */
+const STOP_LEAVE_FLUSH_MS = 5000;
+const STOP_LEAVE_FLUSH_ENV = 'WAYSTATION_TEST_CORE_STOP_LEAVE_MS';
+const STOP_RECONCILE_ENV = 'WAYSTATION_TEST_CORE_STOP_RECONCILE_MS';
+const DEFAULT_STOP_RECONCILE_MS = 60000;   // 与 config.sessionSeatGraceMs 缺省同值，仅配置缺席时兜底
 
-function writeCoreStopMarker(state) {
+function writeCoreStopMarker(state, pendingLeave = false) {
   if (state.collab === null) {
     return;
   }
@@ -1067,10 +1079,53 @@ function writeCoreStopMarker(state) {
     writeJsonAtomic(join(runDir(state.dataDir), CORE_STOP_FILE_NAME), {
       at: new Date().toISOString(),
       seats: seatSnapshotForStopOf(state),
-      pendingLeave: false,
+      pendingLeave: pendingLeave === true,
     });
   } catch (error) {
     state.log?.warn?.('核心退出标记写入失败（重启对账缺少依据）', { reason: error.message });
+  }
+}
+
+/* 退出前的 leave 有界冲刷（设计 §3.3）：本轮有席位移除、或 outbox 存在待发 leave 时，
+ * 等一次 ack / 终态（最多 state.leaveFlushMs）再收摊；返回冲刷后是否仍有未送达的 leave。
+ * 条件不得写成「有活跃席位时」——最后一人离席时该条件为假（G-I5）。 */
+async function flushLeaveBeforeStop(state) {
+  const dispatch = state.dispatch;
+  if (dispatch === null) {
+    return false;
+  }
+  const query = { type: 'leave' };
+  const pendingBefore = dispatch.pendingOutboundOf(query);
+  if (pendingBefore.length === 0 && removedSeatsOf(state) === 0) {
+    return false;
+  }
+  const outcome = await dispatch.awaitOutboundSettled(query, state.leaveFlushMs);
+  const pending = dispatch.pendingOutboundOf(query);
+  logLeaveFlushOutcome(state, { pendingBefore: pendingBefore.length, pending: pending.length, reason: outcome.reason });
+  return pending.length > 0;
+}
+
+/* 退出优先：冲刷面的任何异常只留痕，不得阻断收尾（未送达条目仍在 outbox，重启照常补发）。 */
+async function flushLeaveBeforeStopSafely(state) {
+  try {
+    return await flushLeaveBeforeStop(state);
+  } catch (error) {
+    state.log?.warn?.('核心退出前 leave 冲刷异常（已隔离，继续收尾）', { reason: error.message });
+    return false;
+  }
+}
+
+function removedSeatsOf(state) {
+  return state.collab?.stopLeaveState?.().removedSeats ?? 0;
+}
+
+function logLeaveFlushOutcome(state, { pendingBefore, pending, reason }) {
+  if (pending > 0) {
+    state.log?.warn?.('核心退出前 leave 未确认送达（标记待重启补发）', { pending, reason });
+    return;
+  }
+  if (pendingBefore > 0) {
+    state.log?.info?.('核心退出前 leave 已在限时内结算', { count: pendingBefore });
   }
 }
 
@@ -1093,6 +1148,160 @@ function seatsOfCollab(state, collabId) {
   }));
 }
 
+/* 重启对账（设计 §3.3）：读上次退出的 core-stop.json；marker 内席位在宽限内未重新绑定桥的，
+ * 交回既有离席路径（成员核发 leave / 站长核移除名单行），完成后回写 pendingLeave:false。
+ * marker 保留不删（审计）。宽限起点＝本核恢复时刻（会话重绑窗口由本核起算）。 */
+function scheduleCoreStopReconciliation(state) {
+  const marker = readCoreStopMarker(state);
+  if (marker === null) {
+    return;
+  }
+  const seats = marker.seats.filter(isCoreStopSeatOf);
+  const pending = seats.filter((seat) => !seatReboundOrGone(state, seat));
+  if (pending.length === 0) {
+    finalizeCoreStopMarker(state, marker);
+    return;
+  }
+  const delayMs = state.stopReconcileMs ?? positiveSeatGraceMsOf(state);
+  /* 「宽限内重绑」以注册事件为准（见 noteStopReconcileRebound）：重绑后又断开也属已重绑，
+   * 其后的离席由常规 noteSeatClosed 宽限接管，本对账不得提前补发。 */
+  const held = /** @type {{ marker: any, pending: any[], timer: any }} */ ({ marker, pending, timer: null });
+  held.timer = setTimeout(() => {
+    state.stopReconcile = null;
+    try {
+      reconcileCoreStopSeats(state, marker, held.pending);
+    } catch (error) {
+      state.log?.warn?.('核心重启对账异常（已隔离，marker 保留原状）', { reason: error.message });
+    }
+  }, delayMs);
+  held.timer.unref?.();
+  state.stopReconcile = held;
+  state.log?.info?.('核心重启对账：标记内席位等待宽限内重绑', { seats: pending.length, delayMs });
+}
+
+/* 桥注册即证据：marker 内同名会话在宽限内重绑过，从待补发集合移除；集合清空即完成对账。 */
+function noteStopReconcileRebound(state, sessionId) {
+  const held = state.stopReconcile;
+  if (held === null) {
+    return;
+  }
+  const before = held.pending.length;
+  held.pending = held.pending.filter((seat) => seat.sessionId !== sessionId);
+  if (held.pending.length === before || held.pending.length > 0) {
+    return;
+  }
+  clearStopReconcileTimer(state);
+  state.stopReconcile = null;
+  finalizeCoreStopMarker(state, held.marker);
+}
+
+function readCoreStopMarker(state) {
+  const raw = readCoreStopMarkerText(state);
+  return raw === null ? null : parseCoreStopMarker(state, raw);
+}
+
+function readCoreStopMarkerText(state) {
+  try {
+    return readFileSync(join(runDir(state.dataDir), CORE_STOP_FILE_NAME), 'utf8');
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      state.log?.warn?.('核心退出标记读取失败（跳过重启对账）', { reason: error.message });
+    }
+    return null;
+  }
+}
+
+function parseCoreStopMarker(state, raw) {
+  try {
+    const parsed = JSON.parse(raw);
+    const shaped = parsed !== null && typeof parsed === 'object'
+      && typeof parsed.at === 'string' && Array.isArray(parsed.seats);
+    return shaped ? parsed : null;
+  } catch (error) {
+    state.log?.warn?.('核心退出标记损坏（跳过重启对账）', { reason: error.message });
+    return null;
+  }
+}
+
+function isCoreStopSeatOf(seat) {
+  return seat !== null && typeof seat === 'object'
+    && typeof seat.collabId === 'string' && seat.collabId !== ''
+    && typeof seat.sessionId === 'string' && seat.sessionId !== '';
+}
+
+/* 已重绑（桥在位）或已不存在/已非活跃席位即无需补发 leave。 */
+function seatReboundOrGone(state, markerSeat) {
+  const seat = state.collab?.seatForRouting?.(markerSeat.collabId, markerSeat.sessionId) ?? null;
+  if (seat === null || seat.state !== 'member') {
+    return true;
+  }
+  return typeof seat.bridgeId === 'string' && seat.bridgeId !== '';
+}
+
+function reconcileCoreStopSeats(state, marker, seats) {
+  const leaveSent = leaveUnboundSeatsOf(state, seats);
+  const pendingLeave = state.dispatch?.pendingOutboundOf?.({ type: 'leave' }).length ?? 0;
+  state.log?.info?.('核心重启对账完成', { seats: seats.length, leaveSent, pendingLeave });
+  finalizeCoreStopMarker(state, marker);
+}
+
+function leaveUnboundSeatsOf(state, seats) {
+  let leaveSent = 0;
+  for (const markerSeat of seats) {
+    if (!seatReboundOrGone(state, markerSeat) && leaveSeatForStopReconciliation(state, markerSeat)) {
+      leaveSent++;
+    }
+  }
+  return leaveSent;
+}
+
+function leaveSeatForStopReconciliation(state, markerSeat) {
+  const input = { collabId: markerSeat.collabId, sessionId: markerSeat.sessionId };
+  const result = state.collab?.leave?.(input);
+  if (result?.ok === true) {
+    return true;
+  }
+  noteReconcileLeaveFailure(state, input, result);
+  return false;
+}
+
+function noteReconcileLeaveFailure(state, input, result) {
+  state.log?.warn?.('核心重启对账补发离席未成功（远端最坏按会话超时收敛）', {
+    ...input,
+    reason: result?.message ?? result?.reason ?? '未知原因',
+  });
+}
+
+function finalizeCoreStopMarker(state, marker) {
+  if (marker.pendingLeave !== true) {
+    return;
+  }
+  try {
+    writeJsonAtomic(join(runDir(state.dataDir), CORE_STOP_FILE_NAME), {
+      at: marker.at,
+      seats: marker.seats,
+      pendingLeave: false,
+    });
+  } catch (error) {
+    state.log?.warn?.('核心退出标记回写失败（重启对账已执行，标记仍标待补发）', { reason: error.message });
+  }
+}
+
+/* 退出前撤销尚未到点的对账：本次收尾会写新 marker，旧 marker 的席位判定不得在停止后复活。 */
+function clearStopReconcileTimer(state) {
+  const held = state.stopReconcile;
+  if (held === null) {
+    return;
+  }
+  clearTimeout(held.timer);
+  held.timer = null;
+}
+
+function positiveSeatGraceMsOf(state) {
+  const graceMs = state.config?.sessionSeatGraceMs;
+  return Number.isInteger(graceMs) && graceMs > 0 ? graceMs : DEFAULT_STOP_RECONCILE_MS;
+}
+
 /* 有序收尾（正常退出路径）：停宽限计时 → 停心跳 → 收协作等待面 → 关网络栈 → 关 IPC →
  * 删运行描述符（对证锁仍为自己）。本函数不退出进程：退出码由调用方决定（宽限到期走 exit 闩锁，
  * 入口据此以约定码退出）。 */
@@ -1103,7 +1312,10 @@ async function stopCore(state) {
   state.stopped = true;
   state.grace?.cancel();
   clearSeatGraceTimer(state);
-  writeCoreStopMarker(state);
+  clearStopReconcileTimer(state);
+  state.stopReconcile = null;
+  const pendingLeave = await flushLeaveBeforeStopSafely(state);
+  writeCoreStopMarker(state, pendingLeave);
   state.heartbeat?.stop();
   stopWaitingMachinery(state);
   state.detector?.close();
@@ -1170,6 +1382,15 @@ function seatLifetimeState() {
   return { idleSince: null, seatGraceTimer: null };
 }
 
+/* 退出冲刷与重启对账的运行态字段（测试注入缝只在 NODE_TEST_CONTEXT 下生效）。 */
+function stopRuntimeState(env) {
+  return {
+    leaveFlushMs: testNumber(env, STOP_LEAVE_FLUSH_ENV, 50, 60000) ?? STOP_LEAVE_FLUSH_MS,
+    stopReconcileMs: testNumber(env, STOP_RECONCILE_ENV, 50, 600000),   // null＝按 config.sessionSeatGraceMs
+    stopReconcile: null,   // { marker, pending, timer }：启动对账进行中的待办席位列
+  };
+}
+
 /** @param {Record<string, string | undefined>} env @param {RootOk} root @returns {CoreState} */
 function createCoreState(env, root) {
   return {
@@ -1177,6 +1398,7 @@ function createCoreState(env, root) {
       console.error(`waystation-core: ${message}`);
     },
     params: lifecycleParams(env),
+    ...stopRuntimeState(env),
     dataDir: root.dataDir,
     port: root.port,
     portSource: root.portSource,
@@ -1229,6 +1451,7 @@ async function runServiceSequence(state) {
   await startNetStack(state);
   await listenIpc(state);
   markReady(state);
+  scheduleCoreStopReconciliation(state);
 }
 
 /** 启动失败的收场：先最小回收已构造组件（停心跳与已起的服务面——in-process 调用不留单例残留），

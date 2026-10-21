@@ -563,6 +563,129 @@ test('I-9 核心退出写 core-stop.json：席位快照落盘供重启对账', a
   );
 });
 
+/* I-10：本轮有席位移除且 leave 待发——核心退出先做有界冲刷，marker 如实标记 pendingLeave。
+ * 本机为成员核（站长在远端），离席帧入 outbox 后无对端可 ack，只能由截止点收尾。 */
+test('I-10 核心退出：本轮席位移除 + 待发 leave → 有界冲刷后 pendingLeave:true', { timeout: 30000 }, async (t) => {
+  const home = makeCoreHome(t);
+  const managerPort = await pickFreePort();
+  seedMemberCollab(home, managerPort);
+  const result = await startCoreReady(t, async () => {
+    const port = await pickFreePort();
+    writeCoreConfig(home, {
+      port, sessionSeatGraceMs: 5000, dispatchTickMs: 50, retryIntervalMs: 200, retrySlowIntervalMs: 60000, dialTimeoutMs: 150,
+    });
+    return {
+      env: {
+        ...coreEnv(home),
+        NODE_TEST_CONTEXT: 'core-startup-test',
+        WAYSTATION_TEST_GRACE_MS: '30000',
+        WAYSTATION_TEST_CORE_STOP_LEAVE_MS: '200',
+      },
+      mainDir: home,
+    };
+  });
+  assert.equal(result.core.net.status().available, true, '本用例需要调度器在跑（leave 要实际尝试投递）');
+  const collab = result.core.context.collab;
+  const left = collab.leave({ collabId: 'collab-member', sessionId: 'sess-dev' });
+  assert.equal(left.ok, true, JSON.stringify(left));
+  assert.equal(collab.stopLeaveState().removedSeats, 1, '本轮席位移除可查询（重复回调不得重复计数）');
+  assert.equal(collab.stopLeaveState().leaveFramesSent, 1, 'leave 帧已入队');
+
+  const startedAt = Date.now();
+  await result.core.stop();
+  const elapsedMs = Date.now() - startedAt;
+  const marker = JSON.parse(readFileSync(join(home, 'run', 'core-stop.json'), 'utf8'));
+  assert.equal(marker.pendingLeave, true, '5s 窗口内未确认：marker 如实标记待补发');
+  assert.ok(elapsedMs >= 150, `应等待有界窗口（实际 ${elapsedMs}ms）`);
+  assert.ok(elapsedMs < 5000, `有界等待不得拖长退出（实际 ${elapsedMs}ms）`);
+  const outboxRows = readFileSync(join(collabDir(home, 'collab-member'), 'outbox.jsonl'), 'utf8')
+    .trim().split('\n').map((line) => JSON.parse(line));
+  const leaveRows = outboxRows.filter((row) => row.type === 'leave');
+  assert.ok(leaveRows.length > 0, '未送达的 leave 必须留在 outbox（重启补发依据）');
+  assert.ok(leaveRows.at(-1).attempts >= 1, '有界冲刷应至少尝试投递一次（append 记录取最后一条）');
+});
+
+/* I-11：重启对账——marker 内席位宽限内未重绑 → 走既有 leave 路径，完成后回写 pendingLeave:false，
+ * 标记文件保留（审计），席位文件随离席移除，leave 帧留在 outbox 等对端可达。 */
+test('I-11 重启对账：marker 内未重绑席位补发 leave 并回写 pendingLeave:false（marker 保留）', { timeout: 30000 }, async (t) => {
+  const home = makeCoreHome(t);
+  const managerPort = await pickFreePort();
+  seedMemberCollab(home, managerPort);
+  const markerPath = seedStopMarker(home);
+  await startReconcileCore(t, home, 150);
+  await waitFor(() => {
+    try {
+      return JSON.parse(readFileSync(markerPath, 'utf8')).pendingLeave === false;
+    } catch {
+      return false;
+    }
+  }, { timeoutMs: 5000 });
+  const marker = JSON.parse(readFileSync(markerPath, 'utf8'));
+  assert.equal(marker.pendingLeave, false, '对账完成后回写 false');
+  assert.deepEqual(
+    marker.seats.map((seat) => [seat.collabId, seat.sessionId]),
+    [['collab-member', 'sess-dev']],
+    'marker 保留原席位快照（审计不删）',
+  );
+  assert.equal(existsSync(seatFilePath(home, 'collab-member', 'sess-dev')), false, '未重绑席位按离席移除');
+  const outboxRows = readFileSync(join(collabDir(home, 'collab-member'), 'outbox.jsonl'), 'utf8')
+    .trim().split('\n').map((line) => JSON.parse(line));
+  assert.ok(outboxRows.some((row) => row.type === 'leave'), '对账 leave 已入 outbox');
+});
+
+/* I-12：宽限内重绑过即算恢复——此后即使又断开（bridgeId 归空）也不得由对账提前补发 leave，
+ * 其离席由常规 noteSeatClosed 宽限接管。 */
+test('I-12 重启对账：宽限内重绑过的席位不补发 leave，marker 回写 false', { timeout: 30000 }, async (t) => {
+  const home = makeCoreHome(t);
+  const managerPort = await pickFreePort();
+  seedMemberCollab(home, managerPort);
+  const markerPath = seedStopMarker(home);
+  const result = await startReconcileCore(t, home, 300);
+  await result.core.context.collab.registerBridgeEntry('sess-dev', 'bridge-rebind');
+  await result.core.context.collab.unregisterBridgeEntry('sess-dev', 'bridge-rebind');
+  await waitFor(() => {
+    try {
+      return JSON.parse(readFileSync(markerPath, 'utf8')).pendingLeave === false;
+    } catch {
+      return false;
+    }
+  }, { timeoutMs: 5000 });
+  assert.equal(existsSync(seatFilePath(home, 'collab-member', 'sess-dev')), true, '重绑席位保留');
+  assert.equal(existsSync(join(collabDir(home, 'collab-member'), 'outbox.jsonl')), false, '不得补发 leave');
+});
+
+
+/* 重启对账用例的共用启动面与 marker 夹具（宽限内是否重绑由用例自行决定）。 */
+async function startReconcileCore(t, home, reconcileMs) {
+  return startCoreReady(t, async () => {
+    const port = await pickFreePort();
+    writeCoreConfig(home, {
+      port, sessionSeatGraceMs: 5000, dispatchTickMs: 50, retryIntervalMs: 200, retrySlowIntervalMs: 60000, dialTimeoutMs: 150,
+    });
+    return {
+      env: {
+        ...coreEnv(home),
+        NODE_TEST_CONTEXT: 'core-startup-test',
+        WAYSTATION_TEST_GRACE_MS: '30000',
+        WAYSTATION_TEST_CORE_STOP_RECONCILE_MS: String(reconcileMs),
+        WAYSTATION_TEST_CORE_STOP_LEAVE_MS: '200',
+      },
+      mainDir: home,
+    };
+  });
+}
+
+function seedStopMarker(home) {
+  const markerPath = join(home, 'run', 'core-stop.json');
+  mkdirSync(join(home, 'run'), { recursive: true });
+  writeFileSync(markerPath, JSON.stringify({
+    at: new Date().toISOString(),
+    seats: [{ collabId: 'collab-member', sessionId: 'sess-dev', role: 'member', state: 'member' }],
+    pendingLeave: true,
+  }));
+  return markerPath;
+}
+
 /* 有席位的核心数据根：一个活跃站长席位（新形态 carrier + 台账 + seats/）。 */
 async function startSeatHome(t) {
   const home = makeCoreHome(t);
@@ -602,6 +725,29 @@ function seedSeatCollab(home) {
   mkdirSync(join(collabDir(home, collabId), 'seats'), { recursive: true });
   writeFileSync(seatFilePath(home, collabId, 'sess-mgr'), JSON.stringify({
     version: 1, sessionId: 'sess-mgr', role: 'manager', state: 'member', joinSeq: 1, joinedAt: now, muted: true,
+  }));
+}
+
+/* 成员核数据根：站长在远端（inst-mgr，端点指向无监听端口），本机仅一个成员席位 sess-dev。
+ * 离席走「成员发 leave」路径：帧入 outbox，不依赖本机台账。 */
+function seedMemberCollab(home, managerPort) {
+  const collabId = 'collab-member';
+  const now = new Date().toISOString();
+  mkdirSync(collabDir(home, collabId), { recursive: true });
+  writeFileSync(carrierFilePath(home, collabId), JSON.stringify({
+    format: 'session-seats', version: 1, collabId, name: '成员用例', topic: '主题',
+    mode: 'managed', endpoints: {}, snapshotVersion: 1, createdAt: now,
+  }));
+  writeFileSync(join(collabDir(home, collabId), 'member.json'), JSON.stringify({
+    collabId, name: '成员用例', role: 'member', state: 'active',
+    manager: { instanceId: 'inst-mgr', identityName: '远端站长' },
+    endpoints: { 'inst-mgr': { address: '127.0.0.1', port: managerPort } },
+    roster: [{ instanceId: 'inst-mgr', identityName: '远端站长' }],
+    mode: 'managed', decision: null, topic: '主题',
+  }));
+  mkdirSync(join(collabDir(home, collabId), 'seats'), { recursive: true });
+  writeFileSync(seatFilePath(home, collabId, 'sess-dev'), JSON.stringify({
+    version: 1, sessionId: 'sess-dev', role: 'member', state: 'member', joinSeq: 1, joinedAt: now, muted: false,
   }));
 }
 

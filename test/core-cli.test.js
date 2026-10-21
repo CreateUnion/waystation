@@ -2,12 +2,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { IPC_VERSION, createIpcServer, endpointFor } from '../src/core/ipc.js';
 import { coreJsonPath } from '../src/paths.js';
+import { startCore } from '../src/core/main.js';
 import { parseCoreArgs, readCoreStatus, runCoreCli, stopCore } from '../src/core-cli.js';
-import { makeTempDir, repoRoot } from './helpers.js';
+import { makeTempDir, pickFreePort, repoRoot } from './helpers.js';
 
 /* `waystation core status|stop` 的判别测试（CLI 契约面）：全部临时根＋桩 core.json，绝不触碰真实
  * ~/.waystation、不占用站点端口段。正常停止路径起桩 IPC 服务端做真端点往返（断言帧与退出判定）；
@@ -457,4 +458,27 @@ test('进程级：bin 分派 core status|stop（无核心）→ 退出 0；core 
   assert.equal(top.status, 0, top.stderr);
   assert.ok(top.stderr.includes('core status'), '顶层帮助应列出 core 子命令');
   assert.ok(top.stderr.includes('purge-data'), '顶层帮助既有子命令不回归');
+});
+
+/* 真核心经 CLI 停止：core stop 走 replace 帧触发有序收尾——core-stop.json 落盘并保留（审计），
+ * 无待发 leave 时 pendingLeave:false。桩核心用例只验 CLI 消费契约，本用例补真实收尾面。 */
+test('core stop：真实核心有序退出后保留 core-stop.json（pendingLeave=false）', { timeout: 30000 }, async (t) => {
+  const home = makeTempDir(t);
+  const port = await pickFreePort();
+  writeFileSync(join(home, 'config.json'), JSON.stringify({
+    port, scanWindowMs: 300, dialTimeoutMs: 1500, probeTimeoutMs: 300, viewerAutoOpen: false,
+  }));
+  const result = await startCore({
+    env: { ...process.env, WAYSTATION_HOME: home, NODE_TEST_CONTEXT: 'core-cli-test', WAYSTATION_TEST_GRACE_MS: '30000' },
+  });
+  assert.equal(result.ok, true, result.message);
+  t.after(async () => {
+    await result.core.stop();
+  });
+  const { code, output } = await runCli(['stop'], { env: { ...process.env, ...fastStopEnv(home) } });
+  assert.equal(code, 0, output);
+  const marker = JSON.parse(readFileSync(join(home, 'run', 'core-stop.json'), 'utf8'));
+  assert.equal(marker.pendingLeave, false);
+  assert.ok(Array.isArray(marker.seats));
+  assert.equal(typeof marker.at, 'string');
 });

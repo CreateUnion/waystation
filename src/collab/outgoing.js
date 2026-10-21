@@ -1703,11 +1703,21 @@ export function sendTo(state, collabId, instanceId, endpoint, type, payload, opt
   const result = state.send(message);
   if (result.ok === true) {
     state.counters.messagesSent++;
+    noteLeaveFrameSent(state, type, result.msgId);
     return result;
   }
   state.counters.sendFailures++;
   state.log.warn('协作消息入队失败', { collabId, type, to: instanceId, reason: result.reason });
   return result;
+}
+
+/* 离席帧留账（进程内）：核心退出冲刷按本轮 leave 计数与待发 msgId 判定，不另设持久字段。 */
+function noteLeaveFrameSent(state, type, msgId) {
+  if (type !== 'leave') {
+    return;
+  }
+  state.counters.leaveFramesSent = (state.counters.leaveFramesSent ?? 0) + 1;
+  state.stopLeaveMsgIds?.add?.(msgId);
 }
 
 /* 缺省发送席位的窄口径：本机恰一席才采用；多席必须显式穿参（无 sessionId 不再猜站长）。

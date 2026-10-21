@@ -83,6 +83,8 @@ const SEAT_INBOX_MAX = 200;
  *   requestJoin?: ((options: object) => Promise<any>) | null,
  *   requestJoinResolve?: ((options: object) => Promise<any>) | null,
  *   probeCapability?: ((options: object) => Promise<any>) | null,
+ *   pendingOutboundOf?: ((query: object) => any[]) | null,
+ *   onSessionRebound?: ((sessionId: string) => void) | null,
  *   joinRequestRetryMs?: number, joinRequestRetryMaxMs?: number, now?: () => number,
  *   deliveryStatusOf?: ((msgId: string) => any) | null,
  *   localSeatDeliveryOf?: ((msgId: string, sessionId: string) => any) | null,
@@ -255,6 +257,8 @@ function seatStateOf(options) {
     /* 静音摘要基线（collabId + sessionId → 累计读数）：进程内，不落盘（契约 §8）；
      * 重启后为空 → 取消静音按既有降级文案（不带 N）。 */
     muteBaselines: new Map(),
+    /* 本轮 leave 帧 msgId（进程内，不落盘）：核心退出冲刷时用于留痕与待发判定。 */
+    stopLeaveMsgIds: new Set(),
   };
 }
 
@@ -269,6 +273,10 @@ function coreStateOf(options) {
     selfEndpoint: pickOption(options, 'selfEndpoint', null),
     monoClock: pickOption(options, 'monoClock', null),
     knownHosts: options.knownHosts,
+    /* 待发出站查询面（组合根注入 dispatch 的只读查询）：核心退出对账只取数，不私接 net 内部结构。 */
+    pendingOutboundOf: pickOption(options, 'pendingOutboundOf', null),
+    /* 桥注册证据注入面（核心重启对账）：注册即回调，异常隔离不阻断绑定主链。 */
+    onSessionRebound: pickOption(options, 'onSessionRebound', null),
     log: options.log,
     probe: options.probe ?? null,
     reassign: options.reassign ?? null,
@@ -384,6 +392,8 @@ function apiOf(state) {
      * 不先查本机账时，纯本机消息根本没有 outbox 行（ws_delivery_status 返回空行集）。 */
     deliveryStatusOf: (msgId) => outgoingDeliveryStatusOf(state, msgId),
     localSeatDeliveryOf: (msgId, sessionId) => outgoingLocalSeatDeliveryOf(state, msgId, sessionId),
+    /* 核心退出对账面（只读）：本轮席位移除 / leave 帧计数 + 仍在 outbox 的待发 leave msgId。 */
+    stopLeaveState: () => stopLeaveStateOf(state),
     count: () => countLiveCollabs(state),
     sync: (input) => syncNow(state, input),
     stats: () => statsOf(state),
@@ -1335,6 +1345,20 @@ function describeCollab(state, collabId) {
   return { name: localNameOf(local), mode: localModeOf(local) };
 }
 
+/* 核心退出对账面（只读）：计数取自本轮运行态，待发列表经注入的 dispatch 查询现取——
+ * 跨轮残留的 outbox leave 同样可见（重启补发的判据）。查询面未注入时如实返回空列表。 */
+function stopLeaveStateOf(state) {
+  const pending = typeof state.pendingOutboundOf === 'function'
+    ? state.pendingOutboundOf({ type: 'leave' })
+    : [];
+  return {
+    removedSeats: state.counters.seatRemovals,
+    leaveFramesSent: state.counters.leaveFramesSent,
+    leaveMsgIds: [...state.stopLeaveMsgIds],
+    pendingLeaveMsgIds: pending.map((row) => row.msgId),
+  };
+}
+
 function statsOf(state) {
   const byState = {};
   for (const local of state.collabs.values()) {
@@ -2257,6 +2281,12 @@ function noteSeatRemoval(state, collabId, sessionId, outcome) {
   if (!outcome.existed) {
     return;
   }
+  /* 显式离席路径会经 removeLocalSeat 钩子与 removeSeatOf 各调一次本函数（同一 outcome 对象）：
+   * 按 outcome 去重，席位移除计数不得重复累加。 */
+  if (outcome.countedSeatRemoval !== true) {
+    outcome.countedSeatRemoval = true;
+    state.counters.seatRemovals = (state.counters.seatRemovals ?? 0) + 1;
+  }
   forgetMuteBaseline(state, collabId, sessionId);
   if (outcome.stagedDropped > 0) {
     state.counters.seatStagedDropped += outcome.stagedDropped;
@@ -2652,6 +2682,7 @@ async function registerBridgeNow(state, sessionId, bridgeId) {
     return { ok: false, reason: 'bad-bridge' };
   }
   state.sessionBridges.set(sessionId, bridgeId);
+  noteSessionRebound(state, sessionId);
   let seats = 0;
   let flushed = 0;
   for (const local of state.collabs.values()) {
@@ -2672,6 +2703,19 @@ async function registerBridgeNow(state, sessionId, bridgeId) {
   state.counters.seatBridgeRegistrations++;
   const invites = await replayPendingInvitesOnRegisterOf(state, sessionId);
   return { ok: true, seats, flushed, invites: invites.delivered };
+}
+
+/* 桥注册回调（附属面）：核心重启对账据此认定「宽限内重绑过」；注入面异常不得影响注册主链。 */
+function noteSessionRebound(state, sessionId) {
+  if (typeof state.onSessionRebound !== 'function') {
+    return;
+  }
+  try {
+    state.onSessionRebound(sessionId);
+  } catch (error) {
+    state.counters.eventFailures++;
+    state.log.warn('桥注册回调异常（已隔离）', { sessionId, reason: error?.message });
+  }
 }
 
 /* 注册补投之二（设计 §4.2）：本机挂起邀请按簿记语义重投给刚注册的会话——指名精确匹配、
@@ -2904,6 +2948,7 @@ function emptySeatCounters() {
     seatSelfSkipped: 0,
     seatDeliverFailures: 0,
     seatStagedDropped: 0,
+    seatRemovals: 0,      // 本轮本机席位移除数（所有 removeLocalSeat 路径经同一钩子，去重计数）
     seatBridgeRegistrations: 0,
     seatFileCorrupt: 0,
     seatPersistFailures: 0,
@@ -2970,6 +3015,7 @@ function emptyFlowCounters() {
     endedIn: 0,
     left: 0,
     leftIn: 0,
+    leaveFramesSent: 0,   // 本轮入队的 leave 帧数（核心退出冲刷的触发信号）
     topicsIn: 0,
     progressIn: 0,
     noticesIn: 0,
