@@ -1,5 +1,6 @@
 import { MAX_BOARD_ENTRIES, canTransition, isLedgerShape } from './model.js';
-import { inferredFrozenFrom, isLocalArchivedState, localNameOf, localRosterOf, localStateOf, managerSeatOfLocal, persistLedger, persistMember, persistSnapshot } from './local.js';
+import { archiveLocalSeatsOfState, inferredFrozenFrom, isLocalArchivedState, localNameOf, localRosterOf, localStateOf, managerSeatOfLocal, persistLedger, persistMember, persistSnapshot } from './local.js';
+import { forgetMuteBaselinesOfCollab } from './mute.js';
 import { ledgerDigest } from './store.js';
 import { managerFreezeReasonOf, matchConflictCollabs, noteForumGovernanceIgnored } from './gate.js';
 import { endpointFor, governanceTargets, invitePayloadOf, mutateLedger, notifyLocal, relayGovernance, sendTo, sendToRoster } from './outgoing.js';
@@ -97,7 +98,10 @@ export function terminateLocalCopy(state, local, reason, { localOnly = false } =
     persistMember(state, local);
     persistLocalTerminalSnapshot(state, local);
   }
-  local.mute.clear();
+  /* 终态归档与 end 帧入口同口径：本机席位写 archivedAt（退出注入与静音聚合）、清本协作的
+   * 静音基线；席位文件保留（契约 §8，删除属停点）。 */
+  archiveLocalSeatsOfState(state, local);
+  forgetMuteBaselinesOfCollab(state, local.collabId);
   state.counters.freezeTerminatedLocal++;
   state.log.warn('本机该条协作已终止', { collabId: local.collabId, reason });
   return true;

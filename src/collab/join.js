@@ -15,14 +15,14 @@ import { joinDenyReasonOf } from './invites.js';
 import { writeRecovery } from './migration.js';
 import {
   currentManagerIdOf, isLocalArchivedState, listLocalSeatsOf, localModeOf, localNameOf, localRosterOf, localSeatOfLocal,
-  localStateOf, localTopicOf, managerSeatOfLocal, persistMember, removeLocalSeat, seatsOfLocal, selfJoinedOf, upsertLocalSeat,
+  localStateOf, localTopicOf, managerSeatOfLocal, persistMember, removeLocalSeat, retiredMuteHandle, seatsOfLocal, selfJoinedOf,
+  upsertLocalSeat,
 } from './local.js';
 import { LOCAL_LEFT_STATE } from './model.js';
 import { endpointFor, invitePayloadOf, mutateLedger } from './outgoing.js';
 import { createPostsStore } from './posts.js';
 import { createMembersStore } from './members.js';
 import { createCounterStore } from './counter.js';
-import { createMuteStore } from './mute.js';
 import { createInjectedStore } from './injected.js';
 import { ledgerDigest, loadMember } from './store.js';
 import { isSessionShortCode, matchSessionByToken, shortSessionId } from '../util/short-id.js';
@@ -497,26 +497,18 @@ function matchApplication(joinState, frame) {
     && joinState.now() - application.sentAt < ttlOf(joinState)) ?? null;
 }
 
-/* 批准回执（设计 §2）：写本机获准台账 → 写绑定（origin:grant——离线会话＝持久映射、重开即活）
- * → 删申请记录 → 开该协作页（「进入即见」）。授权对象＝回执携的会话，须与命中记录一致
- * （准入门不比对会话标识，这一步在本域补：不一致的回执不得改他会话的绑定）。
- * 获准入账被拒即整条回执不落地（不接线、不删申请记录：杜绝「已接线未获准」）。 */
+/* 批准回执（设计 §2）：补本机席位（获准权威＝共享名单/本机席位）→ 写绑定（origin:grant——
+ * 离线会话＝持久映射、重开即活）→ 删申请记录 → 开该协作页（「进入即见」）。授权对象＝回执
+ * 携的会话，须与命中记录一致（准入门不比对会话标识，这一步在本域补：不一致的回执不得改
+ * 他会话的绑定）。joins.json 的 approvals 已退役（契约 §4），回执不再写盘。 */
 function handleJoinGrantLegacy(joinState, frame) {
   const record = matchGrantedApplication(joinState, frame);
   if (record === null) {
     return null;
   }
-  const written = writeApproval(joinState, {
-    collabId: record.collabId,
-    instanceId: joinState.state.self.instanceId,
-    sessionId: record.sessionId,
-    origin: 'grant',
-    grantedAt: joinState.now(),
-    approvedBy: approverOf(frame?.from),
-  });
-  if (written !== true) {
-    joinState.log.warn('获准条目形态不符，回执未落地（不接线、申请记录保留）', { collabId: record.collabId, sessionId: record.sessionId });
-    return null;
+  const local = joinState.state.collabs.get(record.collabId);
+  if (local !== undefined) {
+    ensureBoundSeatOf(joinState, local, record.sessionId);
   }
   finishGranted(joinState, { collabId: record.collabId, sessionId: record.sessionId });
   return { ok: true, action: 'granted', collabId: record.collabId, sessionId: record.sessionId };
@@ -546,12 +538,6 @@ function handleJoinDenyLegacy(joinState, frame) {
   clearApplications(joinState, record.collabId, record.sessionId);
   presentDenial(joinState, { collabId: record.collabId, sessionId: record.sessionId, reason: reasonOf(frame?.payload?.reason) });
   return { ok: true, action: 'denied', collabId: record.collabId, sessionId: record.sessionId };
-}
-
-/* 批准人（获准台账的 approvedBy）：join-grant 不携该字段，取回执帧的来处——身份名优先（人读面），
- * 缺失退回实例标识（两者同过身份名白名单）。 */
-function approverOf(from) {
-  return isIdentityName(from?.identityName) ? from.identityName : idOf(from?.instanceId);
 }
 
 /* 获准的接线收尾（批准回执与站长侧本机自批共用）：写绑定 → 删申请记录 → 开页。 */
@@ -590,24 +576,6 @@ function openCollabView(joinState, collabId) {
   if (joinState.openViewer !== null) {
     joinState.openViewer({ root: MAIN_VIEWER_ROOT, id: collabId });
   }
-}
-
-/* 获准入账（设计 §7）：写前 load 刷新——同一份台账另有两个获准写入点（创建 / 同意邀请），
- * 就地写回会用陈旧内存覆盖他域刚写的获准名单。 */
-function writeApproval(joinState, approval) {
-  const store = storeOf(joinState, approval.collabId);
-  store.load();
-  const written = store.addApproval({
-    instanceId: approval.instanceId,
-    sessionId: approval.sessionId,
-    origin: approval.origin,
-    grantedAt: approval.grantedAt,
-    approvedBy: approval.approvedBy,
-  });
-  if (!written) {
-    joinState.log.warn('获准条目形态不符，未入账（该会话未获准）', { collabId: approval.collabId, sessionId: approval.sessionId });
-  }
-  return written;
 }
 
 /* 拒绝呈现：一行本机提示（协作名 ＋ 本会话短码 ＋ 原因），按**申请会话**寻址投递——被拒会话
@@ -963,7 +931,8 @@ function matchPending(joinState, records, wanted) {
 }
 
 /* 批准落地：申请人会话在本机（本机自批）＝本机直接接线（回执无从经网络回到自己）；
- * 远端申请人＝补入席（未在册时）＋投回执＋落批准记录。获准入账被拒一律不接线。 */
+ * 远端申请人＝补入席（未在册时）＋投回执。approvals 已退役（契约 §4）：获准权威是共享名单
+ * 与本机席位，批准不再写本地获准台账。 */
 function grantPending(joinState, plan) {
   return plan.pending.instanceId === joinState.state.self.instanceId
     ? completeLocalGrant(joinState, plan)
@@ -971,16 +940,17 @@ function grantPending(joinState, plan) {
 }
 
 function completeLocalGrant(joinState, plan) {
-  if (writeApproval(joinState, approvalOf(plan, plan.pending.instanceId)) !== true) {
-    return { ok: false, message: '获准条目形态不符，未入账（未接线）——待批准面保留，可重试' };
+  const local = joinState.state.collabs.get(plan.collabId);
+  if (local !== undefined) {
+    ensureBoundSeatOf(joinState, local, plan.pending.sessionId);
   }
   plan.store.removePendingJoin(plan.pending.sessionId);
   finishGranted(joinState, { collabId: plan.collabId, sessionId: plan.pending.sessionId });
   return { ok: true, collabId: plan.collabId, sessionId: plan.pending.sessionId, local: true, bound: true };
 }
 
-/* 远端申请人：先补入席（申请人机器尚未在册时）、再投授权回执、最后落批准记录——回执 / 邀请发不
- * 出去都按「未处置」收口（待批准面保留，可重试），获准入账失败同样不接线。 */
+/* 远端申请人：先补入席（申请人机器尚未在册时）、再投授权回执——回执 / 邀请发不出去都按
+ * 「未处置」收口（待批准面保留，可重试）；批准记录不落本机（权威在共享名单与申请人席位）。 */
 function completeRemoteGrant(joinState, plan) {
   const seated = ensureApplicantSeated(joinState, plan);
   if (seated.ok !== true) {
@@ -989,9 +959,6 @@ function completeRemoteGrant(joinState, plan) {
   const sent = sendPendingDecision(joinState, plan, 'join-grant', { sessionId: plan.pending.sessionId });
   if (sent.ok !== true) {
     return sent;
-  }
-  if (writeApproval(joinState, approvalOf(plan, plan.pending.instanceId)) !== true) {
-    return { ok: false, message: '获准条目形态不符，未入账（未接线）——待批准面保留，可重试' };
   }
   plan.store.removePendingJoin(plan.pending.sessionId);
   return { ok: true, collabId: plan.collabId, sessionId: plan.pending.sessionId, sent: true, seated: seated.seated };
@@ -1137,17 +1104,6 @@ function denyPending(joinState, plan, reason) {
   }
   plan.store.removePendingJoin(plan.pending.sessionId);
   return { ok: true, collabId: plan.collabId, sessionId: plan.pending.sessionId, sent: true };
-}
-
-function approvalOf(plan, instanceId) {
-  return {
-    collabId: plan.collabId,
-    instanceId,
-    sessionId: plan.pending.sessionId,
-    origin: 'grant',
-    grantedAt: plan.grantedAt,
-    approvedBy: plan.approvedBy,
-  };
 }
 
 /* 回执直投（设计 §2：回执是即时帧）：申请帧标识 ＋ 回执特有载荷；端点未知 / 发送面拒绝都如实返回
@@ -2728,7 +2684,8 @@ function provisionalLocalOf(joinState, collabId, manager, carrier = null) {
     posts: createPostsStore(base),
     members: createMembersStore(base),
     counter: createCounterStore(base),
-    mute: createMuteStore(base),
+    /* 退役 mute.json 的兼容句柄：静音权威是席位文件的 muted（契约 §8）。 */
+    mute: retiredMuteHandle(),
     injected: createInjectedStore(base),
     suspended: null,
     staleManagerId: null,

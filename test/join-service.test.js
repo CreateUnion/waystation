@@ -545,13 +545,8 @@ test('join-grant 到达：写本机获准台账＋接线（离线会话写持久
   await made.service.join.request({ collabId: 'collab-remote', sessionId: 'newcomer-1' });
   const reqMsgId = applicationsOf(made.dir)[0].msgId;
   await made.service.hooks.consume(grantFrame('collab-remote', 'newcomer-1', reqMsgId), { remoteAddress: '127.0.0.1' });
-  const approvals = approvalsOf(made.dir, 'collab-remote');
-  assert.equal(approvals.length, 1);
-  assert.deepEqual(
-    { sessionId: approvals[0].sessionId, origin: approvals[0].origin, approvedBy: approvals[0].approvedBy, instanceId: approvals[0].instanceId },
-    { sessionId: 'newcomer-1', origin: 'grant', approvedBy: '主机甲', instanceId: 'inst-self' },
-    '批准人取回执帧的 from（join-grant 不携 approvedBy）',
-  );
+  assert.deepEqual(approvalsOf(made.dir, 'collab-remote'), [], '获准台账退役：join-grant 不写 approvals');
+  assert.equal(made.service.localSeatOf('collab-remote', 'newcomer-1')?.state, 'member', '获准以本机席位为权威');
   assert.equal(made.service.join.isGranted('collab-remote', 'newcomer-1'), true);
   assert.deepEqual(applicationsOf(made.dir), [], '回执落地即删申请记录');
   const binding = made.bindings.get('collab-remote');
@@ -1154,7 +1149,7 @@ test('批准（本机自批）：获准条目形态不符＝不写绑定、不�
   assert.equal(made.service.list({ sessionId: 'newcomer-1' }).collabs[0].sessionBound, true);
 });
 
-test('join-grant：获准条目形态不符＝不写绑定、不删申请记录（回执不作数，申请仍待决）', async (t) => {
+test('join-grant 收尾不再依赖获准条目形态：本地时钟偏斜不影响席位与接线', async (t) => {
   const clock = { skew: 0 };
   const made = makeService(t, { now: () => 1700000000000 + clock.skew });
   await activeMemberCollab(t, made, 'collab-remote');
@@ -1163,10 +1158,10 @@ test('join-grant：获准条目形态不符＝不写绑定、不删申请记录�
   const reqMsgId = applicationsOf(made.dir)[0].msgId;
   clock.skew = 0.5;
   await made.service.hooks.consume(grantFrame('collab-remote', 'newcomer-1', reqMsgId), { remoteAddress: '127.0.0.1' });
-  assert.equal(made.bindings.get('collab-remote'), null, '未获准即不接线');
-  assert.deepEqual(approvalsOf(made.dir, 'collab-remote'), []);
-  assert.equal(applicationsOf(made.dir).length, 1, '申请记录保留（回执未落地）');
-  assert.deepEqual(made.opened, [], '不开窗');
+  assert.equal(made.bindings.get('collab-remote')?.sessionId, 'newcomer-1', '获准以席位/名单为权威，接线照常');
+  assert.deepEqual(approvalsOf(made.dir, 'collab-remote'), [], '不再落获准条目');
+  assert.deepEqual(applicationsOf(made.dir), [], '回执落地即删申请记录');
+  assert.deepEqual(made.opened, [{ root: 'main', id: 'collab-remote' }], '照常开窗');
 });
 
 /* —— 修复轮：守卫 / 错误分支覆盖 —— */

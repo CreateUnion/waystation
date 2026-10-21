@@ -6,8 +6,10 @@ import {
   COLLABS_DIR_NAME,
   JOIN_APPLICATIONS_FILE_NAME,
   JOINS_FILE_NAME,
+  collabFilePath,
   joinApplicationsFilePath,
   joinsFilePath,
+  seatFilePath,
 } from '../src/paths.js';
 import {
   APPROVAL_ORIGINS,
@@ -16,9 +18,11 @@ import {
   isApprovalShape,
   isJoinApplicationShape,
   isJoinApplicationsShape,
+  isJoiningRecordShape,
   isJoinsShape,
   isPendingJoinShape,
 } from '../src/collab/joins.js';
+import { LEDGER_FILE_NAME } from '../src/collab/store.js';
 import { makeTempDir } from './helpers.js';
 
 /* 会话级加入的两本台账（设计 §7）的用例面：形态谓词逐字段拒、读写往返与同会话幂等覆盖、
@@ -37,8 +41,39 @@ function makeLog() {
   };
 }
 
+/* 同时满足 v1 待批准与 v2 未确认 joining 两种形态：v1 读侧兼容与 v2 写侧共用同一夹具。 */
 function pendingRecord(overrides = {}) {
-  return { instanceId: 'inst-a', identityName: '主机甲', sessionId: 'session-a1', requestedAt: 1000, ...overrides };
+  return {
+    joinId: 'join-a1', instanceId: 'inst-a', identityName: '主机甲', sessionId: 'session-a1',
+    managerTerm: 1, grantVersion: 1, requestedAt: 1000, expiresAt: 60000, ...overrides,
+  };
+}
+
+function seatRecord(overrides = {}) {
+  return {
+    version: 1, sessionId: 'session-a1', role: 'member', state: 'member', muted: true,
+    joinSeq: 1, joinedAt: '2026-01-01T00:00:00.000Z', ...overrides,
+  };
+}
+
+/* 合法 managed 台账（只含站长一行）：用于验证「共享名单为获准权威」。 */
+function managerLedger(collabId) {
+  const at = '2026-01-01T00:00:00.000Z';
+  return {
+    version: 1,
+    collabId,
+    name: '项目',
+    topic: '主题',
+    mode: 'managed',
+    status: 'active',
+    managerTerm: 1,
+    manager: { instanceId: 'inst-m', sessionId: 'session-m', identityName: '主机甲', term: 1 },
+    joinSeqNext: 2,
+    members: [{ instanceId: 'inst-m', sessionId: 'session-m', identityName: '主机甲', role: 'manager', state: 'member', joinSeq: 1, joinedAt: at }],
+    board: [],
+    createdAt: at,
+    updatedAt: at,
+  };
 }
 
 function approvalRecord(overrides = {}) {
@@ -87,6 +122,10 @@ test('加入台账形态谓词：顶层两名单齐备、条目逐字段拒', ()
   assert.equal(isPendingJoinShape(pendingRecord({ requestedAt: 1.5 })), false);
   assert.equal(isPendingJoinShape(pendingRecord({ requestedAt: '1000' })), false, '毫秒数而非 ISO 串');
   assert.equal(isPendingJoinShape(null), false);
+  assert.equal(isJoiningRecordShape(pendingRecord()), true, 'v2 未确认 joining');
+  assert.equal(isJoiningRecordShape(pendingRecord({ confirmed: true })), false, 'confirmed 不得落盘');
+  assert.equal(isJoiningRecordShape(pendingRecord({ joinId: undefined })), false, '缺 joinId');
+  assert.equal(isJoiningRecordShape(pendingRecord({ expiresAt: 500 })), false, '过期早于申请时刻');
   assert.equal(isApprovalShape(approvalRecord()), true);
   assert.equal(isApprovalShape(approvalRecord({ origin: 'join' })), false, 'origin 词表外');
   assert.equal(isApprovalShape(approvalRecord({ grantedAt: -1 })), false);
@@ -102,27 +141,27 @@ test('加入台账形态谓词：顶层两名单齐备、条目逐字段拒', ()
   assert.equal(isJoinApplicationShape(applicationRecord({ sentAt: NaN })), false);
 });
 
-test('加入台账读写往返：入账落盘、重建载入、同会话幂等覆盖', (t) => {
+test('加入台账读写往返：写侧只产 v2（无 approvals）、重建载入、同会话幂等覆盖', (t) => {
   const dir = makeTempDir(t);
   const { log } = makeLog();
   const store = createJoinsStore({ dataDir: dir, collabId: 'collab-1', log });
   assert.deepEqual([store.pendingJoins(), store.approvals()], [[], []], '无文件即空态');
   assert.equal(store.addPendingJoin(pendingRecord()), true);
   assert.equal(store.addApproval(approvalRecord()), true);
+  assert.deepEqual(store.approvals(), [approvalRecord()], '获准仅内存可见（旧读兼容）');
   const file = joinsFilePath(dir, 'collab-1');
   assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), {
-    v: 1,
+    v: 2,
     pendingJoins: [pendingRecord()],
-    approvals: [approvalRecord()],
-  }, '落盘形态：版本 + 两名单');
+  }, '落盘形态：v2 只含 pendingJoins，approvals 不写回');
   const reloaded = createJoinsStore({ dataDir: dir, collabId: 'collab-1', log });
-  assert.deepEqual(reloaded.pendingJoins(), [pendingRecord()], '待批准跨重建');
-  assert.deepEqual(reloaded.approvals(), [approvalRecord()], '获准跨重建');
+  assert.deepEqual(reloaded.pendingJoins(), [pendingRecord()], '未确认 joining 跨重建');
+  assert.deepEqual(reloaded.approvals(), [], 'approvals 不跨重启（权威是名单/席位）');
   assert.equal(reloaded.addPendingJoin(pendingRecord({ requestedAt: 3000 })), true);
   assert.deepEqual(reloaded.pendingJoins(), [pendingRecord({ requestedAt: 3000 })], '同会话重复入账只留一条（刷新）');
   assert.equal(reloaded.addApproval(approvalRecord({ origin: 'invite', grantedAt: 4000 })), true);
-  assert.deepEqual(reloaded.approvals(), [approvalRecord({ origin: 'invite', grantedAt: 4000 })]);
-  assert.deepEqual([reloaded.stats().persists, reloaded.stats().pendingJoins, reloaded.stats().approvals], [2, 1, 1]);
+  assert.deepEqual(reloaded.approvals(), [approvalRecord({ origin: 'invite', grantedAt: 4000 })], '内存面可更新');
+  assert.deepEqual([reloaded.stats().persists, reloaded.stats().pendingJoins, reloaded.stats().approvals], [1, 1, 1], 'persists 只属 pendingJoins（获准不写盘）');
   assert.equal(reloaded.addPendingJoin(pendingRecord({ sessionId: 'session-b2' })), true);
   assert.equal(reloaded.pendingJoins().length, 2, '异会话并列');
 });
@@ -188,7 +227,7 @@ test('加入台账获准判定与移除：命中 / 未命中、移除即落盘�
   assert.equal(store.removePendingJoin(undefined), false);
   const reloaded = createJoinsStore({ dataDir: dir, collabId: 'collab-grant', log });
   assert.deepEqual(reloaded.pendingJoins(), [], '移除即时落盘');
-  assert.equal(reloaded.approvals().length, 2);
+  assert.deepEqual(reloaded.approvals(), [], '获准不落盘：重启后不回来');
 });
 
 test('加入台账拒绝面与失败面：形态不符拒入账、写 / 删失败内存态继续、clear 删文件', (t) => {
@@ -218,8 +257,8 @@ test('加入台账拒绝面与失败面：形态不符拒入账、写 / 删失�
   const rmDir = makeTempDir(t);
   const rmLog = makeLog();
   const rmStore = createJoinsStore({ dataDir: rmDir, collabId: 'collab-rm', log: rmLog.log });
-  rmStore.addApproval(approvalRecord());
   const rmFile = joinsFilePath(rmDir, 'collab-rm');
+  seedFile(rmFile, { v: 2, pendingJoins: [] });
   rmSync(rmFile);
   mkdirSync(rmFile, { recursive: true });
   rmStore.clear();
@@ -241,6 +280,44 @@ test('加入台账 load：显式重读覆盖内存态（外部改写即生效、
   store.load();
   assert.deepEqual(store.pendingJoins(), [], '重读遇坏档归空态');
   assert.equal(store.stats().corruptLoads, 1);
+});
+
+test('获准不写 approvals：旧档仅内存兼容；重启后以共享名单与席位为准', (t) => {
+  const dir = makeTempDir(t);
+  const { log } = makeLog();
+  const store = createJoinsStore({ dataDir: dir, collabId: 'collab-authority', log });
+  assert.equal(store.addPendingJoin(pendingRecord()), true);
+  assert.equal(store.addApproval(approvalRecord()), true);
+  assert.deepEqual(store.approvals(), [approvalRecord()], '同进程内旧判据仍可读');
+  assert.deepEqual(JSON.parse(readFileSync(joinsFilePath(dir, 'collab-authority'), 'utf8')), {
+    v: 2,
+    pendingJoins: [pendingRecord()],
+  }, '写侧只有 v2 pendingJoins，approvals 不落盘');
+  assert.deepEqual(createJoinsStore({ dataDir: dir, collabId: 'collab-authority', log }).approvals(), [], '重启不恢复 approvals');
+
+  /* 旧 v1 档：既无台账也无席位时，approvals 作只读兼容。 */
+  seedFile(joinsFilePath(dir, 'collab-legacy'), { v: 1, pendingJoins: [], approvals: [approvalRecord()] });
+  assert.equal(createJoinsStore({ dataDir: dir, collabId: 'collab-legacy', log }).isGranted('session-a1'), true, '旧档兼容');
+
+  /* 席位为准：同会话席位已归档（终态）→ approvals 不得复活获准。 */
+  seedFile(seatFilePath(dir, 'collab-legacy', 'session-a1'), seatRecord({ archivedAt: '2026-01-01T00:00:00.000Z' }));
+  assert.equal(createJoinsStore({ dataDir: dir, collabId: 'collab-legacy', log }).isGranted('session-a1'), false, '归档席位退出获准面');
+
+  /* 名单为准：台账存在且名单没有该会话 → approvals 不再是权威。 */
+  seedFile(collabFilePath(dir, 'collab-roster', LEDGER_FILE_NAME), `${JSON.stringify(managerLedger('collab-roster'))}\n`);
+  seedFile(joinsFilePath(dir, 'collab-roster'), { v: 1, pendingJoins: [], approvals: [approvalRecord()] });
+  assert.equal(createJoinsStore({ dataDir: dir, collabId: 'collab-roster', log }).isGranted('session-a1'), false, '共享名单为权威');
+});
+
+test('旧 v1 待批准条目不经写回：不落 v2、不覆盖在途 join', (t) => {
+  const dir = makeTempDir(t);
+  const made = makeLog();
+  const store = createJoinsStore({ dataDir: dir, collabId: 'collab-legacy-write', log: made.log });
+  const legacyPending = { instanceId: 'inst-a', sessionId: 'session-a1', requestedAt: 1000 };
+  assert.equal(store.addPendingJoin(legacyPending), true, '旧条目仍可入内存批准面');
+  assert.equal(existsSync(joinsFilePath(dir, 'collab-legacy-write')), false, '旧形态不写 v2 文件');
+  assert.equal(store.stats().persistSkips, 1);
+  assert.ok(made.logs.some((entry) => entry.message.includes('含旧 v1 条目')), '跳过写回留痕');
 });
 
 test('加入申请台账坏载：不可解析 / 形态不符归空态、单条形态不符逐条丢弃留痕', (t) => {

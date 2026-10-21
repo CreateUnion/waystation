@@ -5,6 +5,7 @@ import {
 } from '../paths.js';
 import { ID_PATTERN, MAX_ACTIVE_SEATS, isIdentityName } from '../net/protocol.js';
 import { createInvitesBook, createJoiningRegistry, createPendingInvites, MAX_JOINING } from './invites.js';
+import { isSeatArchived, loadSeats } from './local.js';
 import { loadLedger } from './store.js';
 
 /* 会话级加入的本地台账（设计 §4/§6.2）：
@@ -114,22 +115,27 @@ export function isJoinApplicationShape(record) {
     && isMillisecond(record.sentAt);
 }
 
-/* 获准判据：0.2.0 的权威是共享名单（该会话已是活跃席位）；approvals 仅作旧档兼容面。
- * 名单读不出（尚未落盘）时退回旧获准段——两者都是本地记录，判据面不可抛。 */
+/* 获准判据（契约 §4）：0.2.0 的权威是共享名单与本机席位——台账在就以名单为准；成员机没有
+ * 台账，以席位文件为准。approvals 只在既无台账也无席位（尚未升级的旧档）时作只读兼容，
+ * 不再参与任何写侧；判据面不可抛，读故障退到下一层。 */
 function isGrantedOf(state, sessionId) {
   if (!isIdText(sessionId)) {
     return false;
   }
-  if (state.approvals.some((entry) => entry.sessionId === sessionId)) {
-    return true;
-  }
   try {
     const loaded = loadLedger(state.dataDir, state.collabId);
     const ledger = /** @type {any} */ (loaded.ledger);
-    return (ledger?.members ?? []).some((member) => member.sessionId === sessionId && member.state === 'member');
+    if (ledger !== null) {
+      return (ledger.members ?? []).some((member) => member.sessionId === sessionId && member.state === 'member');
+    }
   } catch {
-    return false;
+    // 台账读不出：交给席位与旧档判据
   }
+  const seat = loadSeats(state.dataDir, state.collabId).seats.get(sessionId);
+  if (seat !== undefined) {
+    return seat.state === 'member' && !isSeatArchived(seat);
+  }
+  return state.approvals.some((entry) => entry.sessionId === sessionId);
 }
 
 /**
@@ -146,7 +152,7 @@ export function createJoinsStore({ dataDir, collabId, log }) {
     dataDir,
     pendingJoins: [],
     approvals: [],
-    counters: { corruptLoads: 0, corruptRecords: 0, persists: 0, persistFailures: 0, clears: 0 },
+    counters: { corruptLoads: 0, corruptRecords: 0, persists: 0, persistSkips: 0, persistFailures: 0, clears: 0 },
   };
   loadJoins(state);
   return {
@@ -311,15 +317,14 @@ function addPendingJoin(state, record) {
   return true;
 }
 
-/* 入账获准（会话侧 / 站长侧各记本机相关条目）：获准是接线的前件——先落台账再动绑定，
- * 中途失败时宁可「已获准未接线」（重试接线即可），不可「已接线未获准」（准入门无据可查）。 */
+/* 入账获准（仅旧档内存兼容面）：approvals 段已退役（契约 §4），不再写盘——获准权威是共享
+ * 名单 / 本机席位。保留本函数只为旧调用面在同进程内可查，重启后以名单与席位重新判定。 */
 function addApproval(state, record) {
   const entry = shapeGuardedEntry(state, '获准', record, isApprovalShape);
   if (entry === null) {
     return false;
   }
   state.approvals = upsertByKey(state.approvals, entry, 'sessionId');
-  persistJoins(state);
   return true;
 }
 
@@ -334,12 +339,19 @@ function removePendingJoin(state, sessionId) {
   return true;
 }
 
-/* 落盘：协作目录惰性创建（首次写入时建）＋原子替换（storage 层，crash 面只留孤儿临时文件）。
+/* 落盘只产 v2（契约 §4）：写侧唯一形态 {v:2,pendingJoins}，approvals 不再写回。
+ * 旧 v1 待批准条目不是 v2 joining 形态：整档跳过不写——写回会把旧批准面混进 v2，
+ * 并可能覆盖加入域刚落的在途 grant。协作目录惰性创建＋原子替换（crash 面只留孤儿临时文件）；
  * 失败只计数告警——内存台账继续服务本会话，丢的是跨重启的持久性，不是当下的批准链。 */
 function persistJoins(state) {
+  if (!state.pendingJoins.every(isJoiningRecordShape)) {
+    state.counters.persistSkips++;
+    state.log.warn(`${state.label}含旧 v1 条目（不写回：v2 只落未确认 joining）`, { ...state.logFields });
+    return;
+  }
   try {
     ensureDir(collabDir(state.dataDir, state.collabId));
-    writeJsonAtomic(state.file, { v: 1, pendingJoins: state.pendingJoins, approvals: state.approvals });
+    writeJsonAtomic(state.file, { v: 2, pendingJoins: state.pendingJoins });
     state.counters.persists++;
   } catch (error) {
     state.counters.persistFailures++;

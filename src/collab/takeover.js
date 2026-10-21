@@ -6,8 +6,10 @@ import { autoOfferFilePath, collabDir, collabRunDir, departedFilePath, ensureDir
 import { newMsgId } from '../net/protocol.js';
 import { isArchived } from './model.js';
 import {
-  currentManagerIdOf, isLocalArchivedState, localModeOf, localRosterOf, localStateOf, localVersionOf, persistMember, persistSnapshot, removeLocalSeat,
+  archiveLocalSeatsOfState, currentManagerIdOf, isLocalArchivedState, localModeOf, localRosterOf, localStateOf, localVersionOf,
+  persistMember, persistSnapshot, removeLocalSeat,
 } from './local.js';
+import { forgetMuteBaselinesOfCollab } from './mute.js';
 import { checkFrozenDeadlines } from './freeze.js';
 import { adoptNewManager, endpointFor, governanceTargets, notifyLocal, promoteToManager, relayGovernance, sendTo, sendToRoster } from './outgoing.js';
 import { appendLedger, ledgerDigest } from './store.js';
@@ -1164,7 +1166,8 @@ function clearLocalParticipation(state, local) {
     local.member.archivedAt = new Date().toISOString();
     persistMember(state, local);
   }
-  local.mute?.clear?.();
+  /* 只清进程内静音基线：本机可能还有同协作的其他活跃席位，不能归档全部席位。 */
+  forgetMuteBaselinesOfCollab(state, local.collabId);
   bump(state, 'localSeatsLeft');
 }
 
@@ -1211,7 +1214,9 @@ export function writeLocalTerminalCopy(state, local) {
     local.member.archivedAt = terminal.updatedAt;
     persistMember(state, local);
   }
-  local.mute?.clear?.();
+  /* 本地终态与 end 帧入口同口径：归档本机席位（退出注入与静音聚合）并清静音基线。 */
+  archiveLocalSeatsOfState(state, local);
+  forgetMuteBaselinesOfCollab(state, local.collabId);
   bump(state, 'localTerminalCopies');
   state.log.info('站长离线且最后一人离席——已写本地只读终态副本', { collabId: local.collabId });
   return true;
