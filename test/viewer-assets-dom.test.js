@@ -334,6 +334,28 @@ test('讨论（forum）会话渲染：列表摘要人数与活跃席位同源，
   ]);
 });
 
+test('讨论（forum）同机双席：列表三数相加闭合（活跃＝本机＋远端）', async () => {
+  /* 数据层保证 activeSeatCount＝localSeats＋remoteSeats；这里锁定 UI 不改写、不另行折叠。 */
+  const env = createEnv();
+  await bootList(env, [{
+    root: 'main', id: 'demo-dual', name: '讨论乙', mode: 'forum', state: 'active', memberCount: 3, count: 1, updatedAt: 1760000000000,
+    sessions: {
+      activeSeatCount: 3,
+      localSeats: [
+        { identityName: '甲机', sessionId: 'aaaa1111', role: 'member', state: 'member', joinSeq: 1, muted: false },
+        { identityName: '甲机', sessionId: 'aaaa2222', role: 'member', state: 'member', joinSeq: 2, muted: false },
+      ],
+      remoteSeats: [{ instanceId: 'inst-c', identityName: '丙机', role: 'member', state: 'member' }],
+      departed: [],
+      pendingInvites: [],
+      pendingJoins: [],
+    },
+  }]);
+  const row = findAll(env.byId['list-view'], 'collab-row')[0];
+  assert.ok(textOf(row).includes('3 人'), textOf(row));
+  assert.ok(textOf(row).includes('会话：活跃 3 席｜本机 2 席｜远端 1 席'), textOf(row));
+});
+
 test('详情成员区：旧版只读标记与三段如实零（0 席/0 席/0 条）', async () => {
   const env = createEnv();
   await bootDetail(env, { rows: [], reset: true, skipped: 0 }, metaBody({

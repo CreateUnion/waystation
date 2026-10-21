@@ -15,6 +15,7 @@ import { MUTE_FILE_NAME } from '../src/collab/mute.js';
 import { INBOX_FILE_NAME } from '../src/net/inbound.js';
 import { OUTBOX_FILE_NAME } from '../src/net/outbox.js';
 import { SEAT_FILE_VERSION, isSeatShape } from '../src/collab/local.js';
+import { clearFreezeReason, persistFreezeReason } from '../src/collab/takeover.js';
 import { INSTANCE_ID_FILE } from '../src/instance-id.js';
 
 /* 0.2.0 本地文件形态：观察窗按设计 §6.2 的文件名就地定义读取面，夹具以各模块导出的
@@ -261,6 +262,9 @@ const LOCAL_MEMBER_SESSION = '9999888877776666';
 const REMOTE_MEMBER_SESSION = 'aaaabbbbccccdddd';
 const REMOTE_DEPARTED_SESSION = 'ccccddddeeeeffff';
 const PENDING_JOIN_SESSION = 'ddddeeeeffff0000';
+/* 讨论席位折叠：本机实例上未落座的会话、远端实例的第二个会话（同机双席按席位键分开）。 */
+const FORUM_UNSEATED_LOCAL_SESSION = '7777888899990000';
+const REMOTE_SECOND_SESSION = 'aaaabbbbcccc1111';
 
 function carrierRecord(over = {}) {
   return {
@@ -333,7 +337,9 @@ function fullSeatFiles() {
       joinSeq: 3,
       muted: true,
     })),
-    [LEDGER_FILE_NAME]: jsonl(sessionLedgerOf({ collabId: 'c-1', status: 'frozen', freezeReason: 'manager-offline' })),
+    /* 冻结原因按运行时写入面落在 carrier（台账只留状态）；读取面以 carrier 为权威。 */
+    [CARRIER_FILE_NAME]: JSON.stringify({ ...carrierRecord({ collabId: 'c-1' }), freezeReason: 'manager-offline' }),
+    [LEDGER_FILE_NAME]: jsonl(sessionLedgerOf({ collabId: 'c-1', status: 'frozen' })),
     [DEPARTED_FILE_NAME]: `${jsonl(
       { instanceId: 'inst-c', sessionId: REMOTE_DEPARTED_SESSION, reason: 'manager-session-closed', term: 3, at: tsPlus(5000) },
     )}${JSON.stringify({ bad: 'line' })}\n`,
@@ -989,7 +995,7 @@ test('listCollabs：主目录＋sites 双根（同名 id 两目录）、非 ID_P
   ]);
   assert.equal(collabs[0].sessions.activeSeatCount, 2);   // 成员席位取快照名单
   assert.equal(collabs[1].sessions.activeSeatCount, 2);   // 站长席位取台账名单
-  assert.equal(collabs[1].sessions.remoteSeats.length, 1);   // 本机站长席不重复列为远端
+  assert.equal(collabs[1].sessions.remoteSeats.length, 2);   // 无本机席位文件承接：本机站长行保留在远端段，不静默消失
   assert.equal(collabs[2].sessions.activeSeatCount, 2);   // 讨论取成员事件折叠
 });
 
@@ -1235,10 +1241,11 @@ test('sessions：讨论远端成员按真实事件形态折叠——本机实例
   assert.deepEqual(meta.sessions, expected);
   assert.equal(meta.memberCount, 3, '讨论人数与活跃席位同源（本机 1 + 远端 2）');
   assert.equal(meta.sessions.activeSeatCount, meta.memberCount, '不得一人三席');
+  assert.equal(meta.sessions.activeSeatCount, meta.sessions.localSeatCount + meta.sessions.remoteSeats.length, 'UI 三数自洽');
   assert.equal(meta.mode, 'forum');
 });
 
-test('sessions：讨论本机双席不重复计入远端；活跃数与成员折叠同源', (t) => {
+test('sessions：讨论本机双席不重复计入远端；活跃数＝本机＋远端、人数同源', (t) => {
   const dataDir = makeTempDir(t);
   writeConfigAt(dataDir, '甲机');
   writeInstanceId(dataDir, 'inst-a');
@@ -1260,28 +1267,68 @@ test('sessions：讨论本机双席不重复计入远端；活跃数与成员折
   assert.equal(meta.sessions.localSeatCount, 2, '本机两席都在本机席位段');
   assert.deepEqual(meta.sessions.remoteSeats.map((seat) => seat.instanceId), ['inst-b'], '本机实例不得再列为远端');
   assert.equal(meta.sessions.activeSeatCount, meta.memberCount, '活跃数与人数同源');
-  assert.equal(meta.sessions.activeSeatCount, 2, '生产成员事件按机器折叠：本机实例只计一次');
+  assert.equal(meta.sessions.activeSeatCount, 3, '活跃＝本机 2 席＋远端 1 席：本机会话按席位计、远端按机器折叠');
+  assert.equal(meta.sessions.activeSeatCount, meta.sessions.localSeatCount + meta.sessions.remoteSeats.length, 'UI 三数自洽');
 });
 
-test('sessions：freezeReason——台账非空值优先、carrier 兜底，null/空串不遮蔽 carrier', (t) => {
+test('sessions：讨论成员事件带 sessionId 时按席位键折叠——本机会话按短码排除，未落座的本机会话仍保留', (t) => {
   const dataDir = makeTempDir(t);
-  writeFreezeReasonFixture(dataDir, 'c-ledger', {
+  writeConfigAt(dataDir, '甲机');
+  writeInstanceId(dataDir, 'inst-a');
+  writeFiles(collabDirIn(dataDir, 'main', 'c-forum-seat'), {
+    [CARRIER_FILE_NAME]: JSON.stringify(carrierRecord({ collabId: 'c-forum-seat', name: '讨论甲', mode: 'forum' })),
+    [MEMBERS_FILE_NAME]: jsonl(
+      memberEvent({ eventId: 'ev-a', instanceId: 'inst-a', sessionId: LOCAL_MANAGER_SESSION, ts: T0 }),
+      memberEvent({ eventId: 'ev-b', instanceId: 'inst-a', sessionId: LOCAL_MEMBER_SESSION, ts: tsPlus(1000) }),
+      memberEvent({ eventId: 'ev-c', instanceId: 'inst-a', sessionId: FORUM_UNSEATED_LOCAL_SESSION, ts: tsPlus(2000) }),
+      memberEvent({ eventId: 'ev-d1', instanceId: 'inst-b', sessionId: REMOTE_MEMBER_SESSION, ts: tsPlus(3000) }),
+      memberEvent({ eventId: 'ev-d2', instanceId: 'inst-b', sessionId: REMOTE_SECOND_SESSION, ts: tsPlus(4000) }),
+      memberEvent({ eventId: 'ev-d1-leave', kind: 'leave', instanceId: 'inst-b', sessionId: REMOTE_MEMBER_SESSION, ts: tsPlus(5000) }),
+    ),
+    [`${SEATS_DIR_NAME}/${LOCAL_MANAGER_SESSION}.json`]: JSON.stringify(seatRecord({ role: 'member', joinSeq: 1 })),
+    [`${SEATS_DIR_NAME}/${LOCAL_MEMBER_SESSION}.json`]: JSON.stringify(seatRecord({
+      sessionId: LOCAL_MEMBER_SESSION,
+      role: 'member',
+      joinSeq: 2,
+    })),
+    [POSTS_FILE_NAME]: jsonl(postEntry()),
+  });
+  const data = createData(dataDir);
+  const entry = data.listCollabs().collabs[0];
+  assert.equal(entry.sessions.localSeatCount, 2);
+  assert.deepEqual(entry.sessions.remoteSeats.map((seat) => seat.sessionId), ['77778888', 'aaaabbbb'],
+    '按席位键折叠：本机已落座两席不重复；未落座的本机会话与远端同机另一席各占一行');
+  assert.deepEqual(entry.sessions.remoteSeats.map((seat) => seat.instanceId), ['inst-a', 'inst-b']);
+  assert.equal(entry.sessions.activeSeatCount, 4, '活跃＝本机 2 席＋远端 2 席');
+  assert.equal(entry.memberCount, 4, '讨论人数取同一折叠结果（不是按机器折叠的 2 人）');
+  assert.equal(entry.sessions.activeSeatCount, entry.sessions.localSeatCount + entry.sessions.remoteSeats.length, 'UI 三数自洽');
+  const meta = data.readMeta('main', 'c-forum-seat', null);
+  assert.equal(meta.memberCount, meta.sessions.activeSeatCount, '列表与详情同一来源');
+});
+
+test('sessions：freezeReason——carrier 权威、台账仅兼容兜底（台账残留旧值不得遮蔽 carrier、也不得在解除后复活）', (t) => {
+  const dataDir = makeTempDir(t);
+  writeFreezeReasonFixture(dataDir, 'c-carrier-wins', {
     ledgerReason: 'manager-fork',
     carrierReason: 'manager-offline',
   });
-  writeFreezeReasonFixture(dataDir, 'c-carrier', { carrierReason: 'manager-pending' });
+  writeFreezeReasonFixture(dataDir, 'c-carrier-only', { carrierReason: 'manager-pending' });
+  writeFreezeReasonFixture(dataDir, 'c-ledger-only', { ledgerReason: 'manager-fork', withCarrier: false });
   writeFreezeReasonFixture(dataDir, 'c-null', { ledgerReason: null, carrierReason: 'manager-offline' });
   writeFreezeReasonFixture(dataDir, 'c-empty', { ledgerReason: '', carrierReason: 'manager-offline' });
+  writeFreezeReasonFixture(dataDir, 'c-cleared', { ledgerReason: 'manager-fork', carrierReason: undefined });
   writeFreezeReasonFixture(dataDir, 'c-plain', {});
   const byId = new Map(createData(dataDir).listCollabs().collabs.map((entry) => [entry.id, entry]));
-  assert.equal(byId.get('c-ledger').sessions.freezeReason, 'manager-fork', '台账非空值优先');
-  assert.equal(byId.get('c-carrier').sessions.freezeReason, 'manager-pending', '承运人兜底');
+  assert.equal(byId.get('c-carrier-wins').sessions.freezeReason, 'manager-offline', 'carrier 新值优先于台账旧值');
+  assert.equal(byId.get('c-carrier-only').sessions.freezeReason, 'manager-pending', 'carrier 有值即取');
+  assert.equal(byId.get('c-ledger-only').sessions.freezeReason, 'manager-fork', '无 carrier 的兼容形态才回退台账');
   assert.equal(byId.get('c-null').sessions.freezeReason, 'manager-offline', 'null 不得遮蔽 carrier');
   assert.equal(byId.get('c-empty').sessions.freezeReason, 'manager-offline', '空串不得遮蔽 carrier');
+  assert.equal('freezeReason' in byId.get('c-cleared').sessions, false, 'carrier 已清除时台账残留旧值不得复活冻结原因');
   assert.equal('freezeReason' in byId.get('c-plain').sessions, false, '缺省不造字段');
 });
 
-function writeFreezeReasonFixture(dataDir, collabId, { ledgerReason = undefined, carrierReason = undefined } = {}) {
+function writeFreezeReasonFixture(dataDir, collabId, { ledgerReason = undefined, carrierReason = undefined, withCarrier = true } = {}) {
   const carrier = carrierRecord({ collabId });
   if (carrierReason !== undefined) {
     carrier.freezeReason = carrierReason;
@@ -1291,10 +1338,36 @@ function writeFreezeReasonFixture(dataDir, collabId, { ledgerReason = undefined,
     ledger.freezeReason = ledgerReason;
   }
   writeFiles(collabDirIn(dataDir, 'main', collabId), {
-    [CARRIER_FILE_NAME]: JSON.stringify(carrier),
+    ...(withCarrier ? { [CARRIER_FILE_NAME]: JSON.stringify(carrier) } : {}),
     [LEDGER_FILE_NAME]: jsonl(ledger),
   });
 }
+
+test('sessions：freezeReason 真实写路径（运行时落盘形态）——persist 写 carrier、clear 后字段消失（台账旧值不遮蔽）', (t) => {
+  const dataDir = makeTempDir(t);
+  const collabId = 'c-freeze-write';
+  const dir = collabDirIn(dataDir, 'main', collabId);
+  writeFiles(dir, {
+    [CARRIER_FILE_NAME]: JSON.stringify(carrierRecord({ collabId })),
+    /* 台账残留旧冻结原因：写入面只写 carrier，任何台账旧值都不得遮蔽 carrier 的新值/清除。 */
+    [LEDGER_FILE_NAME]: jsonl(ledgerOf({ collabId, status: 'frozen', freezeReason: 'manager-fork' })),
+  });
+  const state = {
+    dataDir,
+    collabs: new Map([[collabId, { collabId, member: null }]]),
+    counters: {},
+    log: { info() {}, warn() {}, error() {} },
+    config: {},
+  };
+  assert.equal(persistFreezeReason(state, collabId, 'manager-offline'), true);
+  const data = createData(dataDir);
+  assert.equal(data.readMeta('main', collabId, null).sessions.freezeReason, 'manager-offline', 'carrier 新值优先');
+  assert.equal(JSON.parse(readFileSync(join(dir, CARRIER_FILE_NAME), 'utf8')).freezeReason, 'manager-offline', '落盘在 carrier');
+  assert.equal(clearFreezeReason(state, collabId), true);
+  const thawed = data.readMeta('main', collabId, null);
+  assert.equal('freezeReason' in thawed.sessions, false, '解除后字段消失（台账旧值不得让它复活）');
+  assert.equal('freezeReason' in JSON.parse(readFileSync(join(dir, CARRIER_FILE_NAME), 'utf8')), false, 'carrier 字段已删除');
+});
 
 test('sessions：冻结→解除后不再显示旧原因（写入方清空台账与 carrier 即消失）', (t) => {
   const dataDir = makeTempDir(t);
@@ -1339,6 +1412,22 @@ test('sessions：离席历史只读——真实形态条目展示、坏行跳过
   assert.deepEqual(byId.get('c-nodeparted').sessions.departed, [], '无离席文件＝如实空，不造条目');
 });
 
+test('sessions：离席历史的 sessionId:null（生产者实例级离席）按条目展示计数，非法非 null 标识仍跳过', (t) => {
+  const dataDir = makeTempDir(t);
+  writeSessionFixture(dataDir, 'c-departed-null', {
+    [DEPARTED_FILE_NAME]: jsonl(
+      { instanceId: 'inst-d', sessionId: null, reason: 'session-timeout', term: 2, at: tsPlus(6000) },
+      { instanceId: 'inst-e', sessionId: 42, reason: 'manager-lost' },
+      { instanceId: 'inst-c', sessionId: REMOTE_DEPARTED_SESSION, reason: 'manager-session-closed', at: tsPlus(5000) },
+    ),
+  });
+  const entry = createData(dataDir).listCollabs().collabs.find((collab) => collab.id === 'c-departed-null');
+  assert.deepEqual(entry.sessions.departed, [
+    { instanceId: 'inst-d', reason: 'session-timeout', at: tsPlus(6000) },
+    { instanceId: 'inst-c', sessionId: 'ccccdddd', reason: 'manager-session-closed', at: tsPlus(5000) },
+  ], 'null 是合法的实例级离席形态（不是坏行）；非 null 非法标识仍按坏行跳过');
+});
+
 test('sessions：坏 JSON carrier/recovery 明确告警不静默，页面按可读来源降级', (t) => {
   const dataDir = makeTempDir(t);
   writeFiles(collabDirIn(dataDir, 'main', 'c-badcarrier'), {
@@ -1373,6 +1462,59 @@ test('sessions：坏席位文件告警并计数（按不存在处理），合法
   assert.equal(entry.sessions.localSeatCount, 1);
   assert.equal(entry.sessions.localSeats[0].sessionId, '11112222');
   assert.equal(warnings.filter((args) => String(args[0]).includes('席位文件损坏')).length, 2);
+});
+
+test('sessions：本机席位文件缺失/损坏时本机参与者不从两段同时消失——台账行留在远端段、活跃数闭合', (t) => {
+  const dataDir = makeTempDir(t);
+  writeInstanceId(dataDir, 'mgr-1');
+  for (const collabId of ['c-missing-seat', 'c-corrupt-seat']) {
+    writeFiles(collabDirIn(dataDir, 'main', collabId), {
+      [CARRIER_FILE_NAME]: JSON.stringify(carrierRecord({ collabId })),
+      [LEDGER_FILE_NAME]: jsonl(ledgerOf({ collabId })),
+      ...(collabId === 'c-corrupt-seat' ? { [`${SEATS_DIR_NAME}/${LOCAL_MANAGER_SESSION}.json`]: '{坏 JSON' } : {}),
+    });
+  }
+  const byId = new Map(createData(dataDir).listCollabs().collabs.map((entry) => [entry.id, entry]));
+  for (const collabId of ['c-missing-seat', 'c-corrupt-seat']) {
+    const entry = byId.get(collabId);
+    assert.equal(entry.sessions.localSeatCount, 0, `${collabId}：席位文件不可用＝本机段为空`);
+    assert.deepEqual(entry.sessions.remoteSeats.map((seat) => seat.sessionId), ['11112222', 'aaaabbbb'],
+      `${collabId}：本机台账行保留在远端段（不得两段同时消失）`);
+    assert.equal(entry.sessions.activeSeatCount, 2, `${collabId}：活跃数仍取台账`);
+    assert.equal(entry.sessions.activeSeatCount, entry.sessions.localSeatCount + entry.sessions.remoteSeats.length,
+      `${collabId}：可见行数与活跃数闭合`);
+  }
+  assert.equal('corruptSeatCount' in byId.get('c-missing-seat').sessions, false, '缺失不是损坏');
+  assert.equal(byId.get('c-corrupt-seat').sessions.corruptSeatCount, 1, '损坏按不存在处理但告警计数');
+});
+
+test('sessions：讨论本机席位文件缺失/损坏时成员事件保留在远端段，人数与可见席位自洽', (t) => {
+  const dataDir = makeTempDir(t);
+  writeConfigAt(dataDir, '甲机');
+  writeInstanceId(dataDir, 'inst-a');
+  for (const collabId of ['c-forum-missing-seat', 'c-forum-corrupt-seat']) {
+    writeFiles(collabDirIn(dataDir, 'main', collabId), {
+      [CARRIER_FILE_NAME]: JSON.stringify(carrierRecord({ collabId, mode: 'forum' })),
+      [MEMBERS_FILE_NAME]: jsonl(
+        memberEvent({ eventId: 'ev-a', instanceId: 'inst-a', identityName: '甲机', ts: T0 }),
+        memberEvent({ eventId: 'ev-b', instanceId: 'inst-b', identityName: '乙机', ts: tsPlus(1000) }),
+      ),
+      ...(collabId === 'c-forum-corrupt-seat' ? { [`${SEATS_DIR_NAME}/${LOCAL_MANAGER_SESSION}.json`]: '{坏 JSON' } : {}),
+      [POSTS_FILE_NAME]: jsonl(postEntry()),
+    });
+  }
+  const byId = new Map(createData(dataDir).listCollabs().collabs.map((entry) => [entry.id, entry]));
+  for (const collabId of ['c-forum-missing-seat', 'c-forum-corrupt-seat']) {
+    const entry = byId.get(collabId);
+    assert.equal(entry.sessions.localSeatCount, 0, `${collabId}：本机席位不可用＝本机段为空`);
+    assert.deepEqual(entry.sessions.remoteSeats.map((seat) => seat.instanceId), ['inst-a', 'inst-b'],
+      `${collabId}：本机实例的成员事件保留在远端段`);
+    assert.equal(entry.sessions.activeSeatCount, 2, `${collabId}：活跃＝两段可见行`);
+    assert.equal(entry.memberCount, 2, `${collabId}：讨论人数与活跃同源`);
+    assert.equal(entry.sessions.activeSeatCount, entry.sessions.localSeatCount + entry.sessions.remoteSeats.length,
+      `${collabId}：UI 三数自洽`);
+  }
+  assert.equal(byId.get('c-forum-corrupt-seat').sessions.corruptSeatCount, 1, '损坏仍告警计数');
 });
 
 test('sessions：legacy 讨论事件轨不套用新形态判据（不读旧 members.jsonl、不计坏行）', (t) => {
@@ -1482,7 +1624,7 @@ test('sessions：席位文件形态与运行时 isSeatShape 一致——版本�
   assert.equal(entry.sessions.localSeatCount, 2);
 });
 
-test('sessions：旧协作（member.json，无 carrier 标记）＝legacy 只读；旧名单作远端成员、本机站长席不重复列出', (t) => {
+test('sessions：旧协作（member.json，无 carrier 标记）＝legacy 只读；旧名单作远端成员、无本机席位时本机旧站长行保留在远端段', (t) => {
   const dataDir = makeTempDir(t);
   writeFiles(collabDirIn(dataDir, 'main', 'c-1'), {
     [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ collabId: 'c-1' })),
@@ -1493,6 +1635,7 @@ test('sessions：旧协作（member.json，无 carrier 标记）＝legacy 只读
     localSeats: [],
     remoteSeats: [
       { instanceId: 'inst-b', identityName: '乙机', role: 'member', state: 'member' },
+      { instanceId: 'mgr-1', identityName: '甲机', role: 'manager', state: 'member' },
     ],
     departed: [],
     pendingInvites: [],
@@ -1562,7 +1705,7 @@ test('只读白名单：data.js 的 import 只含白名单符号（防未来漂�
     ['../paths.js', ['COLLABS_DIR_NAME', 'CONFIG_FILE_NAME', 'SEATS_DIR_NAME', 'SITES_DIR_NAME', 'carrierFilePath', 'collabDir', 'collabFilePath', 'departedFilePath', 'invitesFilePath', 'joinsFilePath', 'pendingInvitesFilePath']],
     ['../net/protocol.js', ['ID_PATTERN', 'MAX_MESSAGE_TEXT_CHARS', 'POST_KINDS', 'isIdentityName']],
     ['../collab/posts.js', ['isPostEntryShape']],
-    ['../collab/members.js', ['foldMemberEvents', 'isMemberEventShape']],
+    ['../collab/members.js', ['isMemberEventShape']],
     ['../collab/model.js', ['isLedgerShape', 'isTimestamp']],
     ['../collab/store.js', ['loadMember']],
     ['../collab/legacy.js', ['readLegacyCollab']],

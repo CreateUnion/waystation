@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { join } from 'node:path';
 import { createSessionStatusWriter, indicatedEntriesOf, isIndicatedCollab } from '../src/session-status.js';
 import { coreJsonPath, sessionFilePath } from '../src/paths.js';
-import { makeTempDir, pickFreePort, repoRoot, waitFor } from './helpers.js';
+import { makeTempDir, pickFreePort, repoRoot, testDiscoveryOffEnv, waitFor } from './helpers.js';
 
 function quietLog() {
   const entries = [];
@@ -117,6 +117,21 @@ test('指示条目席位来源：同机多席按全 ID 与短码分别命中各�
   const byShort = indicatedEntriesOf(entries, [], 'bbbb3333');
   assert.equal(byShort[0].role, 'member');
   assert.equal(byShort[0].muted, true);
+});
+
+test('指示条目席位来源：同机席位短码歧义＝无法判定本会话（条目剔除，不猜其中一席）', () => {
+  /* 进程级夹具曾用 session-seat-fx / session-other-fx：前 8 位同为 session-，短码匹配歧义。
+   * 生产标识是 UUID，前 8 位天然唯一；此处锁定「歧义即拒」这一规则本身，防止夹具再撞短码。 */
+  const entries = [{
+    collabId: 'collab-collide', name: '撞码协作', state: 'active', mode: 'managed', memberCount: 2,
+    sessions: {
+      localSeats: [
+        { sessionId: 'session-seat-fx', role: 'manager', state: 'member', joinSeq: 1, muted: false },
+        { sessionId: 'session-other-fx', role: 'member', state: 'member', joinSeq: 2, muted: true },
+      ],
+    },
+  }];
+  assert.deepEqual(indicatedEntriesOf(entries, [], 'session-seat-fx'), [], '同短码两席＝歧义，条目剔除');
 });
 
 test('归档条目不进指示面：归档与非归档混合清单 → 文件 collabs 仅保留非归档', (t) => {
@@ -423,11 +438,14 @@ test('进程级：会话状态文件按席位表过滤并按本会话席位取�
   const home = makeStationDir(t);
   const port = await pickFreePort();
   writeFileSync(join(home, 'config.json'), JSON.stringify({ port, scanWindowMs: 300, dialTimeoutMs: 1500, viewerAutoOpen: false }));
-  const sessionId = 'session-seat-fx';
-  writeDualSeatStatusFixtures(home, sessionId, 'session-other-fx');
+  /* 会话短码＝前 8 位：同机双席的标识必须在短码上也可区分，否则短码精确匹配判歧义（按设计拒绝）。
+   * 生产标识是 UUID，前 8 位天然唯一；夹具沿用会撞短码的旧名会制造假红。 */
+  const sessionId = '5ea70001-aaaa-bbbb-cccc-000000000001';
+  writeDualSeatStatusFixtures(home, sessionId, '0d0e0002-aaaa-bbbb-cccc-000000000002');
   const child = spawn(process.execPath, [join(repoRoot, 'src', 'index.js')], {
     cwd: repoRoot,
-    env: { ...process.env, WAYSTATION_HOME: home, CLAUDE_CODE_SESSION_ID: sessionId, WAYSTATION_TEST_GRACE_MS: '1500' },
+    /* 发现隔离：临时核心不得向真实 LAN 广播/探测（测试开关见 src/net/discovery.js）。 */
+    env: testDiscoveryOffEnv({ WAYSTATION_HOME: home, CLAUDE_CODE_SESSION_ID: sessionId, WAYSTATION_TEST_GRACE_MS: '1500' }),
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   registerChild(t, child);
@@ -461,7 +479,8 @@ test('进程级：会话标识经环境注入 → 核心为注册桥写文件（
   const sessionId = 'session-process-1';
   const child = spawn(process.execPath, [join(repoRoot, 'src', 'index.js')], {
     cwd: repoRoot,
-    env: { ...process.env, WAYSTATION_HOME: home, CLAUDE_CODE_SESSION_ID: sessionId, WAYSTATION_TEST_GRACE_MS: '1500' },
+    /* 发现隔离：临时核心不得向真实 LAN 广播/探测（测试开关见 src/net/discovery.js）。 */
+    env: testDiscoveryOffEnv({ WAYSTATION_HOME: home, CLAUDE_CODE_SESSION_ID: sessionId, WAYSTATION_TEST_GRACE_MS: '1500' }),
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   registerChild(t, child);

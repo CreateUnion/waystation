@@ -40,7 +40,7 @@ import {
 } from '../paths.js';
 import { ID_PATTERN, MAX_MESSAGE_TEXT_CHARS, POST_KINDS, isIdentityName } from '../net/protocol.js';
 import { isPostEntryShape } from '../collab/posts.js';
-import { foldMemberEvents, isMemberEventShape } from '../collab/members.js';
+import { isMemberEventShape } from '../collab/members.js';
 import { isLedgerShape, isTimestamp } from '../collab/model.js';
 import { loadMember } from '../collab/store.js';
 import { readLegacyCollab } from '../collab/legacy.js';
@@ -758,9 +758,10 @@ function remoteSeatsOf(ledger, localSeats, localInstanceId) {
     return [];
   }
   const localSessionIds = new Set(localSeats.map((seat) => seat.sessionId));
+  const hasLocalSeats = localSeats.length > 0;
   const remote = [];
   for (const member of ledger.members) {
-    const view = remoteSeatViewOf(member, localSessionIds, localInstanceId);
+    const view = remoteSeatViewOf(member, localSessionIds, localInstanceId, hasLocalSeats);
     if (view !== null) {
       remote.push(view);
     }
@@ -768,8 +769,8 @@ function remoteSeatsOf(ledger, localSeats, localInstanceId) {
   return remote.sort(compareSeatViews);
 }
 
-function remoteSeatViewOf(member, localSessionIds, localInstanceId) {
-  if (!isRemoteSeatCandidate(member, localSessionIds, localInstanceId)) {
+function remoteSeatViewOf(member, localSessionIds, localInstanceId, hasLocalSeats) {
+  if (!isRemoteSeatCandidate(member, localSessionIds, localInstanceId, hasLocalSeats)) {
     return null;
   }
   const sessionId = textFieldOf(member.sessionId);
@@ -789,15 +790,21 @@ function remoteSeatViewOf(member, localSessionIds, localInstanceId) {
   return view;
 }
 
-function isRemoteSeatCandidate(member, localSessionIds, localInstanceId) {
+function isRemoteSeatCandidate(member, localSessionIds, localInstanceId, hasLocalSeats) {
   if (!isPlainObject(member) || !isSeatRole(member.role) || typeof member.state !== 'string') {
     return false;
   }
-  if (localInstanceId !== null && member.instanceId === localInstanceId) {
-    return false;
+  return !isOwnRow(textFieldOf(member.sessionId), member.instanceId, localSessionIds, localInstanceId, hasLocalSeats);
+}
+
+/* 本机行排除边界（共享台账/旧名单/成员事件共用）：会话级行只在短码命中本机席位时排除；
+ * 实例级行（无会话标识）只有在本机确有席位承接时才按实例排除。席位文件缺失/损坏时本机
+ * 参与者留在远端段，不得从「本机」与「远端」两段同时消失（损坏另有 corruptSeatCount 告警）。 */
+function isOwnRow(sessionId, instanceId, localSessionIds, localInstanceId, hasLocalSeats) {
+  if (sessionId !== null) {
+    return localSessionIds.has(shortSessionId(sessionId));
   }
-  const sessionId = textFieldOf(member.sessionId);
-  return sessionId === null || !localSessionIds.has(shortSessionId(sessionId));
+  return hasLocalSeats && localInstanceId !== null && instanceId === localInstanceId;
 }
 
 /* 本机实例标识：数据根 instance-id 是权威（观察窗独立进程也能读）；缺失时退回旧参与记录里的
@@ -827,9 +834,10 @@ function instanceIdOfRoot(state, base) {
  * 字段缺失时只呈现机器与短码，不伪造角色/状态。 */
 function legacyRosterSeatsOf(legacy, localSeats, localInstanceId) {
   const localSessionIds = new Set(localSeats.map((seat) => seat.sessionId));
+  const hasLocalSeats = localSeats.length > 0;
   const remote = [];
   for (const entry of Array.isArray(legacy.roster) ? legacy.roster : []) {
-    const view = legacyRosterSeatViewOf(entry, localSessionIds, localInstanceId);
+    const view = legacyRosterSeatViewOf(entry, localSessionIds, localInstanceId, hasLocalSeats);
     if (view !== null) {
       remote.push(view);
     }
@@ -837,8 +845,8 @@ function legacyRosterSeatsOf(legacy, localSeats, localInstanceId) {
   return remote.sort(compareSeatViews);
 }
 
-function legacyRosterSeatViewOf(entry, localSessionIds, localInstanceId) {
-  if (!isLegacyRosterCandidate(entry, localSessionIds, localInstanceId)) {
+function legacyRosterSeatViewOf(entry, localSessionIds, localInstanceId, hasLocalSeats) {
+  if (!isLegacyRosterCandidate(entry, localSessionIds, localInstanceId, hasLocalSeats)) {
     return null;
   }
   const sessionId = textFieldOf(entry.sessionId);
@@ -859,22 +867,18 @@ function legacyRosterSeatViewOf(entry, localSessionIds, localInstanceId) {
   return view;
 }
 
-function isLegacyRosterCandidate(entry, localSessionIds, localInstanceId) {
+function isLegacyRosterCandidate(entry, localSessionIds, localInstanceId, hasLocalSeats) {
   if (!isPlainObject(entry) || !hasInstanceId(entry)) {
     return false;
   }
-  if (localInstanceId !== null && entry.instanceId === localInstanceId) {
-    return false;
-  }
-  const sessionId = textFieldOf(entry.sessionId);
-  return sessionId === null || !localSessionIds.has(shortSessionId(sessionId));
+  return !isOwnRow(textFieldOf(entry.sessionId), entry.instanceId, localSessionIds, localInstanceId, hasLocalSeats);
 }
 
 /* 讨论的远端成员取自成员事件折叠（forum 无共享台账）：按席位键取每个键的最新事件，
  * 只有最新仍是 join 者才在席——leave 之后不得残留，也不得只看最新 join。
- * 生产事件只写 instanceId（一台机器一个会话），事件若携 sessionId 则按会话分席。
- * 本机实例按数据根 instance-id 排除（本机会话已在本机席位段，不能重复计入远端）；
- * 事件携会话标识时再按短码排除一次。讨论人数与本折叠同源。 */
+ * 成员事件不带 sessionId 时按机器折叠（生产现状）；带 sessionId 时同机多会话各占一席（设计 §1.1）。
+ * 本机行只在能匹配本机席位时排除：会话级行比会话短码；机器级行要求本机确有席位承接——
+ * 席位文件缺失/损坏时该行留在远端段，不得从两段同时消失。讨论人数＝本机席位＋远端席位，同一折叠。 */
 function forumActiveMemberEventsOf(state, base, collabId) {
   const members = readParsedFile(state, collabFilePath(base, collabId, MEMBERS_FILE_NAME), classifyMemberLine);
   return members === null ? [] : foldForumMemberEvents(dedupeMemberEvents(members.rows));
@@ -905,12 +909,13 @@ function forumSeatKeyOf(event) {
 
 function forumRemoteSeatsOf(state, base, collabId, localSeats, localInstanceId) {
   const localSessionIds = new Set(localSeats.map((seat) => seat.sessionId));
+  const hasLocalSeats = localSeats.length > 0;
   const remote = [];
   for (const event of forumActiveMemberEventsOf(state, base, collabId)) {
-    if (localInstanceId !== null && event.instanceId === localInstanceId) {
+    if (isOwnRow(textFieldOf(event.sessionId), event.instanceId, localSessionIds, localInstanceId, hasLocalSeats)) {
       continue;
     }
-    const view = forumRemoteSeatViewOf(event, localSessionIds);
+    const view = forumRemoteSeatViewOf(event);
     if (view !== null) {
       remote.push(view);
     }
@@ -929,11 +934,8 @@ function compareMemberEvents(left, right) {
   return left.eventId < right.eventId ? -1 : 1;
 }
 
-function forumRemoteSeatViewOf(event, localSessionIds) {
+function forumRemoteSeatViewOf(event) {
   const sessionId = textFieldOf(event.sessionId);
-  if (sessionId !== null && localSessionIds.has(shortSessionId(sessionId))) {
-    return null;
-  }
   const view = { instanceId: event.instanceId, role: 'member', state: 'member' };
   const name = textFieldOf(event.identityName);
   if (name !== null) {
@@ -956,7 +958,7 @@ function classifyDepartedLine(parsed) {
   if (!isPlainObject(parsed) || !hasInstanceId(parsed)) {
     return { skip: true };
   }
-  if (parsed.sessionId !== undefined && !(typeof parsed.sessionId === 'string' && ID_PATTERN.test(parsed.sessionId))) {
+  if (!isDepartedSessionIdShape(parsed.sessionId)) {
     return { skip: true };
   }
   if (parsed.reason !== undefined && typeof parsed.reason !== 'string') {
@@ -966,6 +968,15 @@ function classifyDepartedLine(parsed) {
     return { skip: true };
   }
   return { row: parsed };
+}
+
+/* 生产者（takeover.appendDeparted）把缺省会话标识规范成 null 落盘：null 是合法的实例级离席
+ * 形态，按条目展示；只有「非 null 且非法」才是坏行。 */
+function isDepartedSessionIdShape(sessionId) {
+  if (sessionId === undefined || sessionId === null) {
+    return true;
+  }
+  return typeof sessionId === 'string' && ID_PATTERN.test(sessionId);
 }
 
 function departedViewOf(row, names) {
@@ -1110,7 +1121,7 @@ function hasInstanceId(entry) {
 /* 会话席位视图（设计 §10）：三段（本机/远端/离席）＋活跃席位数＋静音聚合＋邀请/入席待办＋
  * 冻结原因；旧协作与半写目录另带只读标记。完全无数据源（空目录）＝整段省略。 */
 function sessionsOf(state, base, collabId, context) {
-  const { carrier, member, ledger, mode, localSeats, activeSeatCount, legacy, corruptSeatCount } = context;
+  const { carrier, member, ledger, mode, localSeats, activeSeatCount: managedActiveSeatCount, legacy, corruptSeatCount } = context;
   const recovery = recoveryOf(state, base, collabId);
   const names = knownHostNamesOf(state, base);
   const departed = departedOf(state, base, collabId, names);
@@ -1121,14 +1132,15 @@ function sessionsOf(state, base, collabId, context) {
   }
   const localInstanceId = localInstanceIdOf(state, base, member);
   const remoteSeats = remoteSeatsFor(mode, state, base, collabId, { ledger, localSeats, legacy, localInstanceId });
+  /* 讨论活跃席位＝两段可见行相加：成员事件不带 sessionId 时按机器折叠，若直接把折叠人数当活跃数，
+   * 同机双席会让「活跃 N 席｜本机 M 席｜远端 K 席」对不上（N≠M+K）。managed 仍取共享台账口径。 */
+  const activeSeatCount = mode === 'forum' ? localSeats.length + remoteSeats.length : managedActiveSeatCount;
   const sessions = {
     localSeats,
     remoteSeats,
     departed,
     pendingInvites,
     pendingJoins,
-    /* 活跃席位与元状态人数同源：讨论不得一边按成员事件折叠出「1 人」、一边把本机/离席者
-     * 重复计入「3 席」。 */
     activeSeatCount,
     localSeatCount: localSeats.length,
     mutedSeatCount: localSeats.filter((seat) => seat.muted === true).length,
@@ -1170,10 +1182,14 @@ function hasSessionSource({ carrier, member, ledger, localSeats, departed, pendi
   return localSeats.length > 0 || departed.length > 0 || pendingInvites.length > 0 || pendingJoins.length > 0 || corruptSeatCount > 0;
 }
 
-/* 冻结原因只读共享态已有字段（台账非空值优先、carrier 兜底）；空串/null 不得遮蔽 carrier 的
- * 有效原因，解除冻结后写入方把值清空即不再显示；缺失即省略，不在观察窗自造。 */
+/* 冻结原因以 carrier 为权威（写入面只写载体/成员记录）：carrier 在场时只认它的值，空串/null/
+ * 已清除都不得回落到台账——否则解除冻结后台账残留旧值会让「冻结」永久复活。台账字段仅在整档
+ * 没有 carrier 的兼容形态下兜底；两边都无有效值即省略，不在观察窗自造。 */
 function freezeReasonOf(ledger, carrier) {
-  return nonEmptyReasonOf(ledger?.freezeReason) ?? nonEmptyReasonOf(carrier?.freezeReason);
+  if (carrier !== null) {
+    return nonEmptyReasonOf(carrier.freezeReason);
+  }
+  return nonEmptyReasonOf(ledger?.freezeReason);
 }
 
 function nonEmptyReasonOf(value) {
@@ -1277,14 +1293,14 @@ function dedupeMemberEvents(rows) {
   return events;
 }
 
-/* 讨论事件轨：文件序；现人数＝截至并含该事件按 foldMemberEvents 折叠（历史人数按事件前缀折叠，
- * 不是文件末尾的现人数——逐条回看才如实）。 */
+/* 讨论事件轨：文件序；现人数＝截至并含该事件按与头部/远端同一条席位折叠（历史人数按事件前缀
+ * 折叠，不是文件末尾的现人数——逐条回看才如实）。 */
 function forumEventRows(events) {
   const rows = [];
   const prefix = [];
   for (const event of events) {
     prefix.push(event);
-    const count = foldMemberEvents(prefix).length;
+    const count = foldForumMemberEvents(prefix).length;
     rows.push({ id: event.eventId, ts: event.ts, text: `${event.identityName} ${MEMBER_EVENT_VERBS[event.kind]}（现 ${count} 人）` });
   }
   return rows;
@@ -1391,7 +1407,11 @@ function readMeta(state, root, collabId, after) {
   const sessions = sessionsOf(state, base, collabId, {
     carrier, member, ledger, mode, localSeats, activeSeatCount, legacy, corruptSeatCount: localSeatView.corrupt,
   });
-  return sessions === null ? meta : { ...meta, sessions };
+  if (sessions === null) {
+    return meta;
+  }
+  /* 讨论人数与活跃席位同源（列表「N 人」与「活跃 N 席」取同一折叠结果）。 */
+  return mode === 'forum' ? { ...meta, memberCount: sessions.activeSeatCount, sessions } : { ...meta, sessions };
 }
 
 /* 讨论元状态：名/态取 carrier（新形态）或 legacy 旧协作摘要/参与记录；成员数＝事件折叠；
@@ -1536,6 +1556,9 @@ function summarizeCollab(state, site, collabId) {
   });
   if (sessions !== null) {
     entry.sessions = sessions;
+    if (mode === 'forum') {
+      entry.memberCount = sessions.activeSeatCount;   // 讨论人数与活跃席位同源
+    }
   }
   return entry;
 }
