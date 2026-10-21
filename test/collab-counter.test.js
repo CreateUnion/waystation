@@ -101,7 +101,8 @@ function indicatorOf(service, collabId) {
   return found === undefined ? null : found.msgCount;
 }
 
-/* 组合根同形接线（index.js 的两条）：真会话状态写入端 + 指示回调即时刷新。 */
+/* 组合根同形接线（core/main.js 的两条）：真会话状态写入端 + 指示回调即时刷新。
+ * 条目按本会话席位投影（0.2.0：role/muted 取自 seats/<sessionId>.json）。 */
 function makeObservedStation(t) {
   const dir = makeTempDir(t);
   const holder = { service: null };
@@ -114,7 +115,7 @@ function makeObservedStation(t) {
       identityName: '本机',
       site: null,
       port: 17321,
-      collabs: indicatedEntriesOf(holder.service.list().collabs.filter(isIndicatedCollab), holder.service.indicators()),
+      collabs: indicatedEntriesOf(holder.service.list().collabs.filter(isIndicatedCollab), holder.service.indicators(), SESSION_ID),
     }),
     log: quietLog(),
     heartbeatMs: HEARTBEAT_NEVER_MS,
@@ -190,7 +191,7 @@ test('计数存储：落盘失败只计数告警、内存态继续', (t) => {
 
 test('协作计数：六类内容消息各计一次、治理与控制类不计，回调逐条触发', async (t) => {
   const { service, dir, indicatorChanges } = makeService(t);
-  const created = service.create({ name: '联调项目', topic: '发布联调', targets: [target('inst-b')] });
+  const created = service.create({ name: '联调项目', topic: '发布联调', targets: [target('inst-b')], sessionId: SESSION_ID });
   assert.equal(created.ok, true);
   const peerB = peer('inst-b', '主机乙');
   for (const kind of ['topic', 'task', 'progress', 'issue', 'stop', 'reply']) {
@@ -212,7 +213,7 @@ test('协作计数：六类内容消息各计一次、治理与控制类不计�
 test('协作计数：跨重启保留并继续累计（同一数据目录重建服务）', async (t) => {
   const dir = makeTempDir(t);
   const first = makeService(t, { dir });
-  const created = first.service.create({ name: '联调项目', topic: '发布联调', targets: [target('inst-b')] });
+  const created = first.service.create({ name: '联调项目', topic: '发布联调', targets: [target('inst-b')], sessionId: SESSION_ID });
   const peerB = peer('inst-b', '主机乙');
   await receive(first.service, collabFrame('reply', created.collabId, peerB, { text: '第一条' }));
   await receive(first.service, collabFrame('reply', created.collabId, peerB, { text: '第二条' }));
@@ -226,7 +227,7 @@ test('协作计数：跨重启保留并继续累计（同一数据目录重建�
 
 test('讨论计数：帖列表条目数（重复副本不计）、回填帖同样计入', async (t) => {
   const { service } = makeService(t);
-  const created = service.create({ name: '讨论甲', topic: '议题', mode: 'forum', targets: [target('inst-b')] });
+  const created = service.create({ name: '讨论甲', topic: '议题', mode: 'forum', targets: [target('inst-b')], sessionId: SESSION_ID });
   assert.equal(created.ok, true);
   const peerB = peer('inst-b', '主机乙');
   await receive(service, postFrame(created.collabId, peerB, { postId: 'post-1', seq: 1, text: '帖一' }));
@@ -242,7 +243,7 @@ test('讨论计数：帖列表条目数（重复副本不计）、回填帖同�
 
 test('ws_list_collabs 载荷零变化：受理内容消息前后输出逐字节一致、无计数外溢字段', async (t) => {
   const { service } = makeService(t);
-  const created = service.create({ name: '联调项目', topic: '发布联调', targets: [target('inst-b')] });
+  const created = service.create({ name: '联调项目', topic: '发布联调', targets: [target('inst-b')], sessionId: SESSION_ID });
   const before = await listCollabsTool().handler({}, { collab: service });
   await receive(service, collabFrame('reply', created.collabId, peer('inst-b', '主机乙'), { text: '一条' }));
   const after = await listCollabsTool().handler({}, { collab: service });
@@ -256,7 +257,7 @@ test('ws_list_collabs 载荷零变化：受理内容消息前后输出逐字节�
 
 test('即时刷新：协作受理一条内容消息后，不等心跳会话状态文件已含新计数', async (t) => {
   const station = makeObservedStation(t);
-  const created = station.service.create({ name: '联调项目', topic: '发布联调', targets: [target('inst-b')] });
+  const created = station.service.create({ name: '联调项目', topic: '发布联调', targets: [target('inst-b')], sessionId: SESSION_ID });
   station.writer.start();
   assert.equal(station.entryOf(created.collabId).msgCount, 0);
   const peerB = peer('inst-b', '主机乙');
@@ -269,7 +270,7 @@ test('即时刷新：协作受理一条内容消息后，不等心跳会话状�
 
 test('即时刷新：讨论的实时帖、回填帖与成员变化都不等心跳', async (t) => {
   const station = makeObservedStation(t);
-  const created = station.service.create({ name: '讨论甲', topic: '议题', mode: 'forum', targets: [target('inst-b')] });
+  const created = station.service.create({ name: '讨论甲', topic: '议题', mode: 'forum', targets: [target('inst-b')], sessionId: SESSION_ID });
   station.writer.start();
   assert.equal(station.entryOf(created.collabId).msgCount, 0);
   assert.equal(station.entryOf(created.collabId).memberCount, 1, '发起人自创建即在成员表内');
@@ -287,14 +288,14 @@ test('即时刷新：讨论的实时帖、回填帖与成员变化都不等心�
 
 test('即时刷新：静音开关同样不等心跳——muted 随指示面进入会话状态文件（读取端缺字段按未静音）', (t) => {
   const station = makeObservedStation(t);
-  const created = station.service.create({ name: '联调项目', topic: '发布联调', targets: [target('inst-b')] });
+  const created = station.service.create({ name: '联调项目', topic: '发布联调', targets: [target('inst-b')], sessionId: SESSION_ID });
   station.writer.start();
-  station.service.setMute({ collabId: created.collabId, muted: false });   // 新建即默认静音：显式取「未静音」基线
+  station.service.setMute({ collabId: created.collabId, sessionId: SESSION_ID, muted: false });   // 新建即默认静音：显式取「未静音」基线
   assert.equal('muted' in station.entryOf(created.collabId), false, '未静音：字段缺省（加性口径——旧读取端不受扰）');
   const before = station.refreshes();
-  station.service.setMute({ collabId: created.collabId, muted: true });
+  station.service.setMute({ collabId: created.collabId, sessionId: SESSION_ID, muted: true });
   assert.equal(station.entryOf(created.collabId).muted, true, '设静音即刷新');
   assert.equal(station.refreshes(), before + 1, '静音切换触发一次观察面刷新');
-  station.service.setMute({ collabId: created.collabId, muted: false });
+  station.service.setMute({ collabId: created.collabId, sessionId: SESSION_ID, muted: false });
   assert.equal('muted' in station.entryOf(created.collabId), false, '取消静音：字段随之缺省');
 });
