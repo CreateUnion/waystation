@@ -100,9 +100,17 @@ export function isLedgerRosterShape(members, { mode = DEFAULT_COLLAB_MODE, allow
     return false;
   }
   const seen = new Set();
+  let lastJoinSeq = 0;
   for (const entry of members) {
     if (!isSeatMemberShape(entry, mode)) {
       return false;
+    }
+    if (mode === DEFAULT_COLLAB_MODE) {
+      /* joinSeq 单调不减（设计 §2.5/§6.3）：严格递减是损坏；相等允许（分区期间重复序号，按席位破平）。 */
+      if (entry.joinSeq < lastJoinSeq) {
+        return false;
+      }
+      lastJoinSeq = entry.joinSeq;
     }
     const key = `${entry.instanceId}\u0000${entry.sessionId}`;
     if (seen.has(key)) {
@@ -123,6 +131,10 @@ function isRosterSizeShape(members, allowEmpty) {
 
 function isSeatMemberShape(entry, mode) {
   if (!isSeatIdentityShape(entry)) {
+    return false;
+  }
+  /* forum 无站长（D10）：中继/发起人只记在 manager 字段，名单行不得出现 role=manager。 */
+  if (mode !== DEFAULT_COLLAB_MODE && entry.role !== 'member') {
     return false;
   }
   if (!ROLES.includes(entry.role) || entry.state !== 'member') {
@@ -184,8 +196,11 @@ function managerRowMatches(ledger) {
     && row.identityName === ledger.manager.identityName;
 }
 
-/* forum：manager 字段可作中继/发起人记录（D10），名单行不带 joinSeq；joinSeqNext 出现才校验。 */
+/* forum：manager 字段可作中继/发起人记录（D10），名单行不带 joinSeq；无站长更替 ⇒ 不接受 managerWindow。 */
 function isForumLedgerShape(ledger) {
+  if (ledger.managerWindow !== undefined) {
+    return false;
+  }
   if (ledger.joinSeqNext !== undefined && !isSeqValue(ledger.joinSeqNext)) {
     return false;
   }
@@ -209,9 +224,11 @@ function isManagerWindowShape(window, terminal, managerTerm) {
   if (terminal) {
     return false;
   }
+  /* 窗口由 auto 变更在「新任期」上开启（§2A.5③：managerWindow.windowBaseTerm = 变更后的 managerTerm）；
+   * 更高 term 的变更会关闭旧窗口——陈旧窗口（base < term）一律按损坏拒收。 */
   return isPlainObject(window)
     && isSeqValue(window.windowBaseTerm)
-    && window.windowBaseTerm <= managerTerm
+    && window.windowBaseTerm === managerTerm
     && isTimestamp(window.windowEndsAt);
 }
 
@@ -329,10 +346,15 @@ function ledgerStateOf(value) {
     return null;
   }
   const ledger = isPlainObject(value.ledger) ? value.ledger : value;
-  if (!isSeqValue(ledger.managerTerm) || !Number.isInteger(ledger.version) || ledger.version < 1 || !isPlainObject(ledger.manager)) {
+  if (!isSeqValue(ledger.managerTerm) || !Number.isInteger(ledger.version) || ledger.version < 1) {
     return null;
   }
-  if (!isIdLike(ledger.manager.instanceId) || !isIdLike(ledger.manager.sessionId)) {
+  /* 终态台账允许 manager:null（D17）：空 manager 键参与同 term 比较（双方 null 比 version/幂等，
+   * 一方 null 一方非 null → 冲突），不得因终态而拒绝排序。 */
+  if (ledger.manager === null) {
+    return { term: ledger.managerTerm, version: ledger.version, managerKey: '' };
+  }
+  if (!isPlainObject(ledger.manager) || !isIdLike(ledger.manager.instanceId) || !isIdLike(ledger.manager.sessionId)) {
     return null;
   }
   return {

@@ -147,7 +147,8 @@ test('迁移表默认模式：mode 缺省 = managed——既有调用点语义�
 test('模式形态：缺省通过、词表内通过、词表外拒（台账与成员记录同判据）', () => {
   assert.equal(isLedgerShape(sampleLedger()), true, '缺 mode（旧数据）通过');
   assert.equal(isLedgerShape(sampleLedger({ mode: 'managed' })), true);
-  assert.equal(isLedgerShape(sampleLedger({ mode: 'forum' })), true);
+  assert.equal(isLedgerShape(forumLedger()), true);
+  assert.equal(isLedgerShape(sampleLedger({ mode: 'forum' })), false, 'forum 名单不得含 role=manager 行');
   assert.equal(isLedgerShape(sampleLedger({ mode: 'discussion' })), false);
   assert.equal(isLedgerShape(sampleLedger({ mode: 42 })), false);
   assert.equal(isMemberRecordShape(sampleMember()), true, '旧 member.json 形态留给 legacy 读取器');
@@ -278,16 +279,22 @@ test('forum 席位：joinSeq 可省、存在则须合法；席位键唯一性照
   assert.equal(isLedgerShape(forumLedger({ members: [seat(), seat({ instanceId: 'inst-a', sessionId: 'sess-a2' })] })), true);
 });
 
-test('managerWindow：可选 {windowBaseTerm,windowEndsAt}；baseTerm 不超前、时间戳合法', () => {
+test('forum 无站长：名单含 role=manager 行拒；managerWindow 不属于 discussion', () => {
+  assert.equal(isLedgerShape(forumLedger({ members: [seat({ role: 'manager' })] })), false);
+  assert.equal(isLedgerShape(forumLedger({ managerWindow: { windowBaseTerm: 1, windowEndsAt: AT } })), false);
+});
+
+test('managerWindow：baseTerm 必须等于当前 managerTerm（陈旧窗口＝损坏）、时间戳合法', () => {
   const ledger = sampleLedger({
     managerTerm: 2,
     manager: managerOf({ term: 2 }),
-    managerWindow: { windowBaseTerm: 1, windowEndsAt: AT },
+    managerWindow: { windowBaseTerm: 2, windowEndsAt: AT },
   });
   assert.equal(isLedgerShape(ledger), true);
+  assert.equal(isLedgerShape({ ...ledger, managerWindow: { windowBaseTerm: 1, windowEndsAt: AT } }), false, '陈旧窗口拒收');
   assert.equal(isLedgerShape({ ...ledger, managerWindow: { windowBaseTerm: 3, windowEndsAt: AT } }), false);
   assert.equal(isLedgerShape({ ...ledger, managerWindow: { windowBaseTerm: 0, windowEndsAt: AT } }), false);
-  assert.equal(isLedgerShape({ ...ledger, managerWindow: { windowBaseTerm: 1, windowEndsAt: 'x' } }), false);
+  assert.equal(isLedgerShape({ ...ledger, managerWindow: { windowBaseTerm: 2, windowEndsAt: 'x' } }), false);
   assert.equal(isLedgerShape({ ...ledger, managerWindow: 'x' }), false);
   assert.equal(isLedgerShape({ ...ledger, managerWindow: null }), false);
 });
@@ -302,6 +309,32 @@ test('isLedgerRosterShape：空名单按非终态/终态分别判定；mode 决�
   assert.equal(isLedgerRosterShape(many), true);
   assert.equal(isLedgerRosterShape([...many, seat({ sessionId: 'sess-extra', joinSeq: 33 })]), false);
   assert.equal(isLedgerRosterShape([seat(), seat()]), false);
+});
+
+test('managed 名单 joinSeq 单调不减：严格递减拒收、相等允许（分区重复序号破平）', () => {
+  const decreasing = sampleLedger({
+    members: [
+      seat({ role: 'manager', joinSeq: 1 }),
+      seat({ instanceId: 'inst-b', sessionId: 'sess-b', identityName: '乙', joinSeq: 5 }),
+      seat({ instanceId: 'inst-c', sessionId: 'sess-c', identityName: '丙', joinSeq: 3 }),
+    ],
+  });
+  assert.equal(isLedgerShape(decreasing), false, '严格递减＝损坏');
+  const equal = sampleLedger({
+    members: [
+      seat({ role: 'manager', joinSeq: 1 }),
+      seat({ instanceId: 'inst-b', sessionId: 'sess-b', identityName: '乙', joinSeq: 2 }),
+      seat({ instanceId: 'inst-c', sessionId: 'sess-c', identityName: '丙', joinSeq: 2 }),
+    ],
+  });
+  assert.equal(isLedgerShape(equal), true, '相等允许');
+  assert.equal(isLedgerShape(sampleLedger({
+    members: [
+      seat({ role: 'manager', joinSeq: 1 }),
+      seat({ instanceId: 'inst-b', sessionId: 'sess-b', identityName: '乙', joinSeq: 2 }),
+      seat({ instanceId: 'inst-c', sessionId: 'sess-c', identityName: '丙', joinSeq: 3 }),
+    ],
+  })), true, '递增合法');
 });
 
 test('compareSnapshot：按 (managerTerm, version) 字典序；同 term 不同 manager 冲突；同 term/version 幂等', () => {
@@ -320,6 +353,14 @@ test('compareSnapshot：也接受台账对象（无 ledger 包装）', () => {
   const left = { managerTerm: 3, version: 5, manager: { instanceId: 'inst-a', sessionId: 'sess-a' } };
   const right = { managerTerm: 3, version: 4, manager: { instanceId: 'inst-a', sessionId: 'sess-a' } };
   assert.equal(compareSnapshot(left, right).order, 1);
+});
+
+test('compareSnapshot：终态 manager:null 参与比较——同 null 比 version/幂等，null 与席位同 term 冲突', () => {
+  const terminal = (version) => ({ managerTerm: 1, version, manager: null });
+  assert.equal(compareSnapshot(terminal(3), terminal(4)).order, -1);
+  assert.equal(compareSnapshot(terminal(4), terminal(4)).idempotent, true);
+  assert.equal(compareSnapshot(terminal(3), snapshotOf(1, 9)).conflict, true);
+  assert.equal(compareSnapshot(terminal(3), { managerTerm: 1, version: 3 }).ok, false, 'manager 字段缺失仍是非法形态');
 });
 
 test('isSnapshotShape：合法通过；digest 非 64 位小写十六进制或 ledger 形态坏拒', () => {
@@ -356,4 +397,22 @@ test('成员记录（legacy）：冻结标记与 originator 判据不变', () =>
   assert.equal(isMemberRecordShape(sampleMember({ frozenAt: 'x' })), false);
   assert.equal(isMemberRecordShape(sampleMember({ originator: { instanceId: 'inst-a', identityName: '主机甲' } })), true);
   assert.equal(isMemberRecordShape(sampleMember({ originator: { instanceId: 'inst-a' } })), false);
+});
+
+test('成员记录（legacy）：坏字段逐一拒（role / state / manager / endpoints / roster / 时间戳 / decision）', () => {
+  const cases = [
+    sampleMember({ role: 'owner' }),
+    sampleMember({ state: 'paused' }),
+    sampleMember({ manager: { instanceId: 'bad id!', identityName: '甲' } }),
+    sampleMember({ endpoints: { 'inst-a': { address: '', port: 17321 } } }),
+    sampleMember({ endpoints: { 'inst-a': { address: '127.0.0.1', port: 70000 } } }),
+    sampleMember({ endpoints: { 'bad id!': { address: '127.0.0.1', port: 1 } } }),
+    sampleMember({ roster: [] }),
+    sampleMember({ roster: [{ instanceId: 'inst-a', identityName: '甲\u0007乙' }] }),
+    sampleMember({ invitedAt: 'not-a-time' }),
+    sampleMember({ decision: 'maybe' }),
+  ];
+  for (const candidate of cases) {
+    assert.equal(isMemberRecordShape(candidate), false, JSON.stringify(candidate).slice(0, 60));
+  }
 });

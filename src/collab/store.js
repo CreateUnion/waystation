@@ -33,21 +33,35 @@ export function appendLedger(dataDir, ledger) {
 
 /* 加载台账并给出损坏事实：取最后一条通过形态校验的完整行。
  * corrupt = 「文件里有内容但没有一条可用」（中间坏行 / 结构不符 / 仅剩半写尾行被截断）——
- * 由调用方决定隔离与重建；干净的空文件不算损坏。 */
+ * 由调用方决定隔离与重建；干净的空文件不算损坏。
+ * badLines（仅 >0 时出现）= 最后一条合法行之后的坏行数（含解析失败行）——加载仍回退到最后合法行，
+ * 但调用方须据此告警；旧形态行在新协作目录同样计入。 */
 /**
  * @param {string} dataDir
  * @param {string} collabId
- * @returns {{ ledger: object | null, corrupt: boolean }}
+ * @returns {{ ledger: object | null, corrupt: boolean, badLines?: number }}
  */
 export function loadLedger(dataDir, collabId) {
   const loaded = loadLines(collabFilePath(dataDir, collabId, LEDGER_FILE_NAME));
+  let invalidAfter = 0;
   for (let index = loaded.entries.length - 1; index >= 0; index--) {
     const entry = loaded.entries[index];
     if (isLedgerShape(entry)) {
-      return { ledger: /** @type {object} */ (entry), corrupt: false };
+      return ledgerLoadResult(/** @type {object} */ (entry), false, invalidAfter + loaded.corruptLines.length);
     }
+    invalidAfter++;
   }
-  return { ledger: null, corrupt: loaded.entries.length > 0 || loaded.corruptLines.length > 0 || loaded.tailDropped };
+  return ledgerLoadResult(null, loaded.entries.length > 0 || loaded.corruptLines.length > 0 || loaded.tailDropped, 0);
+}
+
+/* 干净加载保持旧返回形态（无 badLines 字段）；只有确实存在坏行时才追加告警计数。 */
+function ledgerLoadResult(ledger, corrupt, badLines) {
+  /** @type {{ ledger: object | null, corrupt: boolean, badLines?: number }} */
+  const result = { ledger, corrupt };
+  if (badLines > 0) {
+    result.badLines = badLines;
+  }
+  return result;
 }
 
 /* 损坏台账隔离：改名 `.corrupt-<ts>` 保留排查依据（与 known-hosts / config 的损坏处置同一手法）。

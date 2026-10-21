@@ -52,6 +52,12 @@ export const MESSAGE_TYPES = [
  * PROTOCOL_VERSION 保持 1：断裂靠能力字段显式声明，不靠版本号。 */
 export const COLLAB_CAPABILITY = 2;
 
+/* 出站构造 helper：发送侧（dispatch.frameOf 等属主）统一用它叠加 cap，避免「自家预检拒自家帧」。
+ * 纯函数、不改入参；transport 帧加了也无害（校验器对它们豁免）。 */
+export function withCollabCapability(frame) {
+  return { ...frame, cap: COLLAB_CAPABILITY };
+}
+
 /* 帖的语义徽标词表（设计 §5.2：协作类六类＝帖子类型、仅作标签——topic 帖按普通帖处理、
  * 不改任何元状态）。与 ws_send_message 的类型面同一词表（工具层直接引用本常量，单一权威）。 */
 export const POST_KINDS = ['topic', 'task', 'progress', 'issue', 'stop', 'reply'];
@@ -101,7 +107,7 @@ function validateIdentityFields(frame) {
   if (!isId(frame.msgId)) {
     return refuse('msgId 非法');
   }
-  const from = validateFrom(frame.from);
+  const from = validateFrom(frame.from, frame.type);
   if (!from.ok) {
     return from;
   }
@@ -245,7 +251,7 @@ function validateTypeSpecific(frame) {
   return { ok: true };
 }
 
-function validateFrom(from) {
+function validateFrom(from, type) {
   if (!isPlainObject(from) || !isId(from.instanceId)) {
     return refuse('from.instanceId 非法');
   }
@@ -256,6 +262,21 @@ function validateFrom(from) {
    * 存在则必须合法（1–65535 整数）：非法值不得流入回拨寻址。 */
   if (from.port !== undefined && !isPort(from.port)) {
     return refuse('from.port 非法（1–65535 的整数）');
+  }
+  return fromSessionRejection(from, type);
+}
+
+/* 签发席位（设计 §5.1）：协作域帧的 from 必须携 sessionId（A1/A2 来源判定、leave、join-confirm 都按它）；
+ * transport 帧（ping/pong/ack）允许缺省，存在则同样过标识判据。 */
+function fromSessionRejection(from, type) {
+  if (type !== undefined && TRANSPORT_TYPES.includes(type)) {
+    if (from.sessionId !== undefined && !isId(from.sessionId)) {
+      return refuse('from.sessionId 非法（存在则须为 1–64 位字母数字与连字符）');
+    }
+    return { ok: true };
+  }
+  if (!isId(from.sessionId)) {
+    return refuse('from.sessionId 非法（协作域帧需携带签发会话标识）');
   }
   return { ok: true };
 }
@@ -1175,7 +1196,25 @@ function validateManagerChangedNotice(payload) {
   if (windowIssue !== null) {
     return windowIssue;
   }
+  const windowFieldIssue = managerChangeWindowFieldRejection(payload);
+  if (windowFieldIssue !== null) {
+    return windowFieldIssue;
+  }
   return managerChangeViaRejection(payload);
+}
+
+/* 窗口字段只属于开窗的 via（显式移交/initial/takeover-manual 无窗口；takeover 关闭窗口不带 endsAt）。 */
+function managerChangeWindowFieldRejection(payload) {
+  if (payload.windowEndsAt !== undefined && payload.via !== 'auto') {
+    return refuse('manager-changed.windowEndsAt 仅 auto 可携（其余 via 不开窗）');
+  }
+  if (payload.windowBaseTerm !== undefined && payload.via !== 'takeover') {
+    return refuse('manager-changed.windowBaseTerm 仅 takeover 可携');
+  }
+  if (payload.authorizedAt !== undefined && !['auto', 'takeover', 'takeover-manual'].includes(payload.via)) {
+    return refuse('manager-changed.authorizedAt 仅 auto / takeover / takeover-manual 可携');
+  }
+  return null;
 }
 
 function managerChangeCoreRejection(payload) {
@@ -1463,7 +1502,10 @@ function validateDecisionMarks(payload) {
   return validateReasonPayload(payload);
 }
 
-/* 移交（先确认后删除）：offer 携带整份台账与摘要、accept 为回执、reject 为拒绝。 */
+/* 移交（先确认后删除，设计 §2A.1/§2A.4）：offer 携带 offerId + 基准任期 + 台账/端点/过期时刻；
+ * accept/reject 必须回指同一 offerId，防止无主回执破坏「先确认后删除」。 */
+const HANDOVER_REJECT_REASONS = ['expired', 'version-changed', 'manager-changed', 'rejected'];
+
 function validateHandoverPayload(payload) {
   if (!isPlainObject(payload)) {
     return refuse('handover 缺少 payload');
@@ -1475,41 +1517,54 @@ function validateHandoverPayload(payload) {
     return validateHandoverAccept(payload);
   }
   if (payload.kind === 'reject') {
-    return validateReasonPayload(payload);
+    return validateHandoverReject(payload);
   }
   return refuse('handover.kind 非法（offer / accept / reject）');
 }
 
-/* offer：版本 + 摘要 + 台账整份；endpoints（可选加法字段）= 旧站长视角的端点全表
- * （instanceId → {address, port}）——受让方逐项学习后立即可直投老成员（端点互盲修复）。 */
 function validateHandoverOffer(payload) {
+  if (!isId(payload.offerId)) {
+    return refuse('handover.offerId 非法（1–64 位字母数字与连字符）');
+  }
+  if (!isManagerTerm(payload.baseTerm)) {
+    return refuse(`handover.baseTerm 非法（1–${MAX_MANAGER_TERM} 的整数）`);
+  }
   if (!isVersionedDigestPayload(payload)) {
     return refuse('handover.version / digest 非法（版本 ≥1 整数、摘要 64 位小写十六进制）');
   }
   if (!isPlainObject(payload.ledger)) {
     return refuse('handover.ledger 非法（须为台账对象）');
   }
-  if (payload.endpoints === undefined) {
-    return { ok: true };
+  if (!isTimestamp(payload.expiresAt)) {
+    return refuse('handover.expiresAt 非法（时间戳）');
   }
-  if (!isPlainObject(payload.endpoints)) {
-    return refuse('handover.endpoints 非法（须为对象：实例标识 → {address, port}）');
+  /* 端点全表必填（设计 §2A.1）：受让方据此解除与老成员的端点互盲。 */
+  return bundleEndpointsRejection(payload.endpoints, 'handover.endpoints') ?? { ok: true };
+}
+
+function validateHandoverAccept(payload) {
+  if (!isId(payload.offerId)) {
+    return refuse('handover.offerId 非法（1–64 位字母数字与连字符）');
   }
-  for (const [instanceId, endpoint] of Object.entries(payload.endpoints)) {
-    if (!isId(instanceId)) {
-      return refuse('handover.endpoints 键非法（需 1–64 位字母数字与连字符的实例标识）');
-    }
-    const rejection = endpointEntryRejection(endpoint, 'handover.endpoints 项');
-    if (!rejection.ok) {
-      return rejection;
-    }
+  if (!isManagerTerm(payload.baseTerm)) {
+    return refuse(`handover.baseTerm 非法（1–${MAX_MANAGER_TERM} 的整数）`);
+  }
+  if (!isVersionedDigestPayload(payload)) {
+    return refuse('handover.version / digest 非法（版本 ≥1 整数、摘要 64 位小写十六进制）');
+  }
+  /* confirm 为用户确认在线上帧的显式标记（可选）：存在则须为布尔，防字符串真值混入。 */
+  if (payload.confirm !== undefined && typeof payload.confirm !== 'boolean') {
+    return refuse('handover.confirm 非法（布尔）');
   }
   return { ok: true };
 }
 
-function validateHandoverAccept(payload) {
-  if (!isVersionedDigestPayload(payload)) {
-    return refuse('handover.version / digest 非法（版本 ≥1 整数、摘要 64 位小写十六进制）');
+function validateHandoverReject(payload) {
+  if (!isId(payload.offerId)) {
+    return refuse('handover.offerId 非法（1–64 位字母数字与连字符）');
+  }
+  if (typeof payload.reason !== 'string' || !HANDOVER_REJECT_REASONS.includes(payload.reason)) {
+    return refuse(`handover.reject.reason 非法（${HANDOVER_REJECT_REASONS.join(' / ')}）`);
   }
   return { ok: true };
 }
@@ -1561,18 +1616,39 @@ function validateTakeoverReport(payload) {
   return { ok: true };
 }
 
-/* 抢接生效通告：基准版本 + 恢复台账摘要（新站长身份以帧 from 为准）。 */
+/* 抢接生效通告（设计 §2A.6/§7.1；v4 下为兼容观测，不单独产生 term 变更）：
+ * 窗口基准任期 + 新任期递增 + 恢复台账摘要 + 授权时刻；term 必须等于 windowBaseTerm+1。 */
 function validateTakeoverPayload(payload) {
   if (!isPlainObject(payload)) {
     return refuse('takeover 缺少 payload');
   }
-  if (!Number.isInteger(payload.baseVersion) || payload.baseVersion < 1) {
+  const baseIssue = takeoverBaseRejection(payload);
+  if (baseIssue !== null) {
+    return baseIssue;
+  }
+  return validateReasonPayload(payload);
+}
+
+function takeoverBaseRejection(payload) {
+  if (!isVersion(payload.baseVersion)) {
     return refuse('takeover.baseVersion 非法（≥1 的整数）');
+  }
+  if (!isManagerTerm(payload.windowBaseTerm) || !isManagerTerm(payload.term)) {
+    return refuse(`takeover.windowBaseTerm / term 非法（1–${MAX_MANAGER_TERM} 的整数）`);
+  }
+  if (payload.term !== payload.windowBaseTerm + 1) {
+    return refuse('takeover.term 须等于 windowBaseTerm + 1');
+  }
+  if (!isVersion(payload.version)) {
+    return refuse('takeover.version 非法（≥1 的整数）');
+  }
+  if (!isTimestamp(payload.authorizedAt)) {
+    return refuse('takeover.authorizedAt 非法（时间戳）');
   }
   if (typeof payload.digest !== 'string' || !DIGEST_PATTERN.test(payload.digest)) {
     return refuse('takeover.digest 非法（64 位小写十六进制）');
   }
-  return validateReasonPayload(payload);
+  return null;
 }
 
 function isPeerShape(peer) {
@@ -1634,8 +1710,8 @@ function snapshotConsistencyRejection(payload, frame) {
   if (ledger.collabId !== undefined && ledger.collabId !== frame.collabId) {
     return refuse('snapshot 台账的 collabId 与帧不一致');
   }
-  if (payload.managerWindow !== undefined && !sameManagerWindow(payload.managerWindow, ledger.managerWindow)) {
-    return refuse('snapshot.managerWindow 与台账不一致');
+  if (!sameManagerWindow(payload.managerWindow, ledger.managerWindow)) {
+    return refuse('snapshot.managerWindow 与台账不一致（任一侧存在即须两侧一致）');
   }
   return { ok: true };
 }
