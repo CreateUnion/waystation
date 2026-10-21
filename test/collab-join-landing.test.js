@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { carrierFilePath, collabDir, pendingInvitesFilePath } from '../src/paths.js';
 import { createCollabService } from '../src/collab/service.js';
 import { classifyCollabDir } from '../src/collab/legacy.js';
+import { loadSeats } from '../src/collab/local.js';
+import { validateMessage } from '../src/net/protocol.js';
 import { MIGRATION_FILE_NAME } from '../src/collab/migration.js';
 import { makeTempDir } from './helpers.js';
 
@@ -123,9 +125,9 @@ function memberRecordOf(collabId, role = 'member') {
   };
 }
 
-function seatFileOf(sessionId, role = 'member') {
+function seatFileOf(sessionId, role = 'member', overrides = {}) {
   return {
-    version: 1, sessionId, role, state: 'member', joinSeq: 2, joinedAt: TS, muted: false,
+    version: 1, sessionId, role, state: 'member', joinSeq: 2, joinedAt: TS, muted: false, ...overrides,
   };
 }
 
@@ -293,6 +295,13 @@ test('挂起邀请补投：离线非席位目标在桥注册时收到指名邀�
   assert.equal(delivered.length, 1);
   assert.equal(delivered[0].frame.payload.inviteId, 'inv-replay-named-1');
   assert.deepEqual(delivered[0].frame.payload.targets, [{ instanceId: SELF.instanceId, targetSessionId: 'seat-late' }]);
+  assert.equal(delivered[0].frame.from.sessionId, MANAGER.sessionId, '补投帧 from 必携签发会话（协议域帧）');
+  assert.deepEqual(
+    delivered[0].frame.payload.members,
+    [{ instanceId: MANAGER.instanceId, sessionId: MANAGER.sessionId, identityName: MANAGER.instanceId }],
+    'members 为席位条目（携 sessionId），不随补投丢席位键',
+  );
+  assert.equal(validateMessage(delivered[0].frame).ok, true, '补投帧须过真实协议校验');
 
   const accepted = await made.service.join.acceptInvite({ collabId, inviteId: 'inv-replay-named-1', sessionId: 'seat-late' });
   assert.equal(accepted.ok, true, accepted.message);
@@ -317,4 +326,26 @@ test('挂起邀请补投：不指名邀请对每个注册会话各投一次，�
     assert.equal(delivered[0].frame.payload.inviteId, 'inv-replay-broadcast-1');
     assert.equal(delivered[0].frame.payload.targets[0].targetSessionId, undefined, '不指名邀请的目标描述不指名');
   }
+});
+
+/* —— I-9：席位加载上限只约束非归档席位 —— */
+
+test('席位加载上限只计非归档席位：32+ 归档不挤掉活跃席', (t) => {
+  const root = makeTempDir(t);
+  const collabId = 'collab-archived-seats';
+  const seatDir = join(collabDir(root, collabId), 'seats');
+  mkdirSync(seatDir, { recursive: true });
+  for (let index = 0; index < 33; index++) {
+    const sessionId = `arch-${String(index).padStart(2, '0')}`;
+    writeJsonFile(join(seatDir, `${sessionId}.json`), seatFileOf(sessionId, 'member', { archivedAt: TS }));
+  }
+  const archivedOnly = loadSeats(root, collabId);
+  assert.equal(archivedOnly.seats.size, 33, '归档席位全部载入（历史保留，不占活跃上限）');
+  assert.equal(archivedOnly.corrupt, 0, '归档席位不计入超限丢弃');
+
+  writeJsonFile(join(seatDir, 'zzzz-active.json'), seatFileOf('zzzz-active'));
+  const withActive = loadSeats(root, collabId);
+  assert.equal(withActive.seats.size, 34);
+  assert.equal(withActive.seats.has('zzzz-active'), true, '第 33 个之后出现/加载的活跃席仍被读入');
+  assert.equal(withActive.corrupt, 0);
 });

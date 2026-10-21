@@ -121,10 +121,13 @@ function runtimeSeatOf(record) {
   };
 }
 
-/** 读一个协作目录下的全部席位文件：坏文件跳过并计数（不删除不清洗）。 */
+/** 读一个协作目录下的全部席位文件：坏文件跳过并计数（不删除不清洗）。
+ * 上限只约束非归档席位：归档席位是历史保留（设计 §2.5/§10），长寿命讨论累计超过上限时
+ * 不得把仍在活跃的席位挤出加载面——归档席位照常载入，但不占活跃名额。 */
 export function loadSeats(dataDir, collabId) {
   const seats = new Map();
   let corrupt = 0;
+  let active = 0;
   for (const entry of readSeatDirents(dataDir, collabId)) {
     if (!entry.isFile() || !entry.name.endsWith('.json')) {
       continue;
@@ -139,9 +142,13 @@ export function loadSeats(dataDir, collabId) {
       corrupt++;
       continue;
     }
-    if (seats.size >= MAX_ACTIVE_SEATS) {
+    const archived = isSeatArchived(record);
+    if (!archived && active >= MAX_ACTIVE_SEATS) {
       corrupt++;
       continue;
+    }
+    if (!archived) {
+      active++;
     }
     seats.set(sessionId, runtimeSeatOf(record));
   }
@@ -439,19 +446,18 @@ export function localRosterOf(local) {
  * 这是讨论模式成员语义的单一取数面：邀请名额判定、帖扇出、控制事件广播都经它——
  * managed 的 roster/台账名单不再是讨论成员关系的权威（被拒/被撤回者不占名额、退出者即时出表）。 */
 export function foldedMembersOf(local) {
-  return local.members.fold().map((member) => withSessionSeatOf(local, member));
+  return local.members.fold().map(withSessionSeatOf);
 }
 
-/* 折叠结果补席位键（设计 D13）：邀请载荷与名单匹配按席位键逐条校验，缺 sessionId 的条目会被
- * 对端协议层整帧拒收。折叠产出已携 sessionId 时必须原样保留（同机多会话各一行）；
- * 只有旧事件（无席位键）才回退按 instanceId 反查最新事件——反查只能得到该机器最近一个会话，
- * 用它覆盖在场值会把同机两行改写成同一席位（视图重复、邀请名单丢行）。 */
-function withSessionSeatOf(local, member) {
+/* 折叠结果的席位键标注（设计 D13/§10）：折叠产出已携 sessionId 时原样保留（同机多会话各一行）；
+ * 旧事件没有席位键时保持**实例级**并显式标注来源——同一个实例最近的会话不代表这条历史属于它，
+ * 用 latestEventOf 补键会把旧实例历史误配到当前会话（邀请载荷/冲突匹配面错误归属）。
+ * 缺席位键的行在组协议名单时按「无席位」跳过，不伪造条目。 */
+function withSessionSeatOf(member) {
   if (typeof member.sessionId === 'string' && member.sessionId !== '') {
     return member;
   }
-  const sessionId = local.members.latestEventOf(member.instanceId)?.sessionId;
-  return typeof sessionId === 'string' && sessionId !== '' ? { ...member, sessionId } : member;
+  return { ...member, sessionId: null, seatScope: 'instance' };
 }
 
 /* 讨论的群体可达面（控制事件广播 / 对表候选 / 拉取应答准入的共用成员集）：

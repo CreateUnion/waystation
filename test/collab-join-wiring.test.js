@@ -9,6 +9,7 @@ import { isLedgerShape, isMemberRecordShape } from '../src/collab/model.js';
 import { COLLAB_CAPABILITY, MAX_ACTIVE_SEATS, validateMessage } from '../src/net/protocol.js';
 import { carrierFilePath, collabDir, collabFilePath, invitesFilePath, pendingInvitesFilePath, joinsFilePath } from '../src/paths.js';
 import { MEMBER_FILE_NAME, loadMember } from '../src/collab/store.js';
+import { foldedMembersOf } from '../src/collab/local.js';
 import { classifyCollabDir, isLegacyCollab } from '../src/collab/legacy.js';
 import { MIGRATION_FILE_NAME } from '../src/collab/migration.js';
 import { makeTempDir, waitFor } from './helpers.js';
@@ -271,7 +272,7 @@ test('pending-invites：登记/补投匹配；指名邀请只对目标会话可�
   assert.deepEqual(approve.toSessions, ['remote-mgr'], '接受帧指名回站长会话');
 });
 
-test('pending-invites：不指名邀请多席各自接受；首个接受不消费整条；同会话重复接受幂等', async (t) => {
+test('pending-invites：不指名邀请多席各自接受；首个接受不消费整条；未成席的重复接受重发 approve', async (t) => {
   const made = makeHarness(t);
   made.join.registerPendingInvite({
     collabId: COLLAB, inviteId: 'inv-open-1',
@@ -285,7 +286,7 @@ test('pending-invites：不指名邀请多席各自接受；首个接受不消�
   const pending = readJson(pendingInvitesFilePath(made.dir, COLLAB));
   assert.equal(pending.invites[0].state, 'open', '不指名邀请保持 open（多席）');
   assert.deepEqual(pending.invites[0].acceptedSessions, ['app-session-1', 'app-session-2'], '同一会话只登记一次');
-  assert.equal(deliveredOf(made.sent, 'approve').length, 2, '重复接受幂等短路：不再发第二次 approve');
+  assert.equal(deliveredOf(made.sent, 'approve').length, 3, '未成席的重复接受重发 approve（grant 丢帧可恢复）');
 });
 
 test('pending-invites：过期/未知/形态坏一律拒；接受未过期邀请后过期重放不再受理', async (t) => {
@@ -1110,4 +1111,277 @@ test('论坛在席加入：接线成功即补本机席位（member、默认静�
   assert.equal(created.role, 'member');
   assert.equal(created.muted, true, '默认静音写席位，不写退役 mute.json');
   assert.equal(forum.seats.get(MANAGER_SESSION).role, 'manager', '已有席位（发起人）不被覆盖');
+});
+
+/* —— C-3：确认/接受两段式的丢帧重试与超时回滚 —— */
+
+function mutableClockAt(start = NOW) {
+  const ref = { value: start };
+  return { ref, now: () => ref.value };
+}
+
+function applicantWithClock(t, clock) {
+  return applicantHarnessOf(t, { overrides: { clock: clock.now } });
+}
+
+async function grantedApplicantOf(t, { joinId = 'join-retry-1', clock = mutableClockAt() } = {}) {
+  const applicant = applicantWithClock(t, clock);
+  applicant.state.joinApplications.add({
+    collabId: COLLAB, sessionId: 'app-session-1', managerInstanceId: MANAGER_INSTANCE, msgId: `apply-${joinId}`, sentAt: NOW,
+    managerAddress: '127.0.0.1', managerPort: 17321,
+  });
+  const result = await applicant.join.handleJoinGrant(joinGrantFrame(joinId));
+  assert.equal(result.ok, true, result.reason);
+  return applicant;
+}
+
+test('C-3 join-confirm 丢帧：按 joinConfirmTtlMs/3 重发，快照清除 unverified 后停轮', async (t) => {
+  const clock = mutableClockAt();
+  const applicant = await grantedApplicantOf(t, { joinId: 'join-retry-1', clock });
+  assert.equal(deliveredOf(applicant.sent, 'join-confirm').length, 1, '首帧已发');
+
+  clock.ref.value += 20000;   // joinConfirmTtlMs 60000 / 3
+  const retried = await applicant.join.retryPendingConfirms();
+  assert.deepEqual(retried, { retried: 1, rolledBack: 0 });
+  const confirms = deliveredOf(applicant.sent, 'join-confirm');
+  assert.equal(confirms.length, 2, '重发轮续发 confirm');
+  assert.equal(confirms[1].payload.joinId, 'join-retry-1');
+  assert.equal(confirms[1].fromSessionId, 'app-session-1');
+  assert.equal(confirms[1].to.instanceId, MANAGER_INSTANCE);
+  assert.deepEqual(confirms[1].toSessions, [MANAGER_SESSION], '重发仍指名站长会话');
+
+  applicant.state.collabs.get(COLLAB).seats.get('app-session-1').unverified = false;
+  clock.ref.value += 20000;
+  const stopped = await applicant.join.retryPendingConfirms();
+  assert.deepEqual(stopped, { retried: 0, rolledBack: 0 });
+  assert.equal(deliveredOf(applicant.sent, 'join-confirm').length, 2, '含本席快照到达后不再重发');
+});
+
+test('C-3 确认重发轮由定时器自行推进（无需外部调用）', async (t) => {
+  const applicant = applicantHarnessOf(t, { overrides: { config: { joinConfirmTtlMs: 60 }, clock: () => NOW } });
+  applicant.state.joinApplications.add({
+    collabId: COLLAB, sessionId: 'app-session-1', managerInstanceId: MANAGER_INSTANCE, msgId: 'apply-timer', sentAt: NOW,
+    managerAddress: '127.0.0.1', managerPort: 17321,
+  });
+  assert.equal((await applicant.join.handleJoinGrant(joinGrantFrame('join-timer-1'))).ok, true);
+  await waitFor(() => deliveredOf(applicant.sent, 'join-confirm').length >= 2 ? true : null, { timeoutMs: 3000 });
+  assert.equal(deliveredOf(applicant.sent, 'join-confirm')[1].payload.joinId, 'join-timer-1');
+  applicant.state.collabs.get(COLLAB).seats.get('app-session-1').unverified = false;
+  await new Promise((resolve) => setTimeout(resolve, 80));   // 下一拍观察到已收敛即停轮
+});
+
+test('C-3 join-confirm 超时：grant 过期后停止重发，宽限期满回滚未确认席位并提示', async (t) => {
+  const clock = mutableClockAt();
+  const notices = [];
+  const applicant = applicantWithClock(t, clock);
+  applicant.state.notify = (frame) => {
+    notices.push(frame);
+    return true;
+  };
+  applicant.state.joinApplications.add({
+    collabId: COLLAB, sessionId: 'app-session-1', managerInstanceId: MANAGER_INSTANCE, msgId: 'apply-retry-timeout', sentAt: NOW,
+    managerAddress: '127.0.0.1', managerPort: 17321,
+  });
+  assert.equal((await applicant.join.handleJoinGrant(joinGrantFrame('join-timeout-1'))).ok, true);
+
+  clock.ref.value += 60000;   // grant 过期
+  const holding = await applicant.join.retryPendingConfirms();
+  assert.deepEqual(holding, { retried: 0, rolledBack: 0 }, '过期后不再发帧，只等宽限');
+  assert.equal(deliveredOf(applicant.sent, 'join-confirm').length, 1, '过期后不重发');
+  assert.equal(applicant.state.collabs.get(COLLAB).seats.has('app-session-1'), true, '宽限期内席位仍在（防幽灵席位误回滚）');
+
+  clock.ref.value += 300000;   // sessionSeatTimeoutMs 宽限期满
+  const rolled = await applicant.join.retryPendingConfirms();
+  assert.deepEqual(rolled, { retried: 0, rolledBack: 1 });
+  assert.equal(applicant.state.collabs.get(COLLAB).seats.has('app-session-1'), false, '未确认席位已回滚');
+  assert.match(notices.at(-1)?.payload?.text ?? '', /入席未确认/, '回滚是可见的失败路径（定向提示）');
+});
+
+test('C-3 受邀接受重试：未成席重发 approve；成席后只回幂等不重复发帧', async (t) => {
+  const applicant = applicantHarnessOf(t, {
+    overrides: { knownHosts: { lookup: () => ({ address: '127.0.0.1', port: 18002 }), remember: () => {} } },
+  });
+  applicant.join.registerPendingInvite({
+    collabId: COLLAB, inviteId: 'inv-resend-1',
+    fromManager: { instanceId: MANAGER_INSTANCE, sessionId: MANAGER_SESSION },
+    targetSessionId: 'app-session-1', expiresAt: NOW + 60000,
+  });
+  const first = await applicant.join.acceptInvite({ collabId: COLLAB, inviteId: 'inv-resend-1', sessionId: 'app-session-1' });
+  assert.equal(first.ok, true, first.message);
+  const again = await applicant.join.acceptInvite({ collabId: COLLAB, inviteId: 'inv-resend-1', sessionId: 'app-session-1' });
+  assert.equal(again.ok, true, again.message);
+  assert.equal(again.idempotent, true);
+  assert.equal(again.resent, true, '未成席的重复接受必须重发 approve');
+  const approves = deliveredOf(applicant.sent, 'approve');
+  assert.equal(approves.length, 2);
+  assert.equal(approves[1].payload.inviteId, 'inv-resend-1');
+  assert.equal(approves[1].fromSessionId, 'app-session-1');
+
+  applicant.state.collabs.set(COLLAB, {
+    collabId: COLLAB,
+    role: 'member',
+    ledger: null,
+    member: { collabId: COLLAB, role: 'member', state: 'active', name: '受邀项目', topic: '主题', mode: 'managed' },
+    endpoints: new Map(),
+    snapshot: null,
+    seats: new Map([['app-session-1', seat('app-session-1')]]),
+    suspended: null,
+  });
+  const seated = await applicant.join.acceptInvite({ collabId: COLLAB, inviteId: 'inv-resend-1', sessionId: 'app-session-1' });
+  assert.equal(seated.ok, true);
+  assert.equal(seated.idempotent, true);
+  assert.equal(seated.resent, undefined, '已成席不再发 approve');
+  assert.equal(deliveredOf(applicant.sent, 'approve').length, 2);
+});
+
+test('C-3 受邀接受重试：邀请过期后不再重发 approve（如实报过期）', async (t) => {
+  const clock = mutableClockAt();
+  const applicant = applicantHarnessOf(t, {
+    overrides: {
+      clock: clock.now,
+      knownHosts: { lookup: () => ({ address: '127.0.0.1', port: 18002 }), remember: () => {} },
+    },
+  });
+  applicant.join.registerPendingInvite({
+    collabId: COLLAB, inviteId: 'inv-resend-expired',
+    fromManager: { instanceId: MANAGER_INSTANCE, sessionId: MANAGER_SESSION },
+    targetSessionId: 'app-session-1', expiresAt: NOW + 1000,
+  });
+  assert.equal((await applicant.join.acceptInvite({ collabId: COLLAB, inviteId: 'inv-resend-expired', sessionId: 'app-session-1' })).ok, true);
+  clock.ref.value += 2000;
+  const late = await applicant.join.acceptInvite({ collabId: COLLAB, inviteId: 'inv-resend-expired', sessionId: 'app-session-1' });
+  assert.equal(late.ok, false);
+  assert.equal(late.reason, 'expired');
+  assert.equal(deliveredOf(applicant.sent, 'approve').length, 1, '过期后不重发');
+});
+
+test('C-3 同机接受：两段式发送失败不消费挂起邀请，恢复后可重试成功', async (t) => {
+  const made = makeHarness(t);
+  made.state.self.instanceId = MANAGER_INSTANCE;
+  const invited = await made.join.createInvite({
+    collabId: COLLAB, managerSessionId: MANAGER_SESSION, targetInstanceId: MANAGER_INSTANCE, targetSessionId: 'app-session-1',
+  });
+  assert.equal(invited.ok, true, invited.message);
+
+  const originalInject = made.state.injectLocalSeat;
+  made.state.injectLocalSeat = async () => ({ ok: false, reason: 'gate-rejected' });
+  const failed = await made.join.acceptInvite({ collabId: COLLAB, inviteId: invited.inviteId, sessionId: 'app-session-1' });
+  assert.equal(failed.ok, false);
+  assert.equal(made.join.pendingInvitesFor({ collabId: COLLAB, sessionId: 'app-session-1' }).length, 1, '失败保留挂起邀请');
+  assert.equal(readJson(invitesFilePath(made.dir, COLLAB)).invites[0].state, 'open', '邀请记录仍可重试');
+
+  made.state.injectLocalSeat = originalInject;
+  const retried = await made.join.acceptInvite({ collabId: COLLAB, inviteId: invited.inviteId, sessionId: 'app-session-1' });
+  assert.equal(retried.ok, true, retried.message);
+  assert.equal(retried.accepted, true);
+  assert.equal(retried.joining, true, '重试后 grant 重新签发');
+  assert.equal(made.join.pendingInvitesFor({ collabId: COLLAB, sessionId: 'app-session-1' }).length, 0);
+  assert.equal(readJson(pendingInvitesFilePath(made.dir, COLLAB)).invites[0].state, 'consumed', '成功后才消费');
+});
+
+test('I-10 成员判定只认共享名单：本地席位在但名单不含该席时不得短路成 alreadyMember', async (t) => {
+  const made = makeHarness(t);
+  made.state.self.instanceId = MANAGER_INSTANCE;
+  made.local.seats.set('app-session-1', seat('app-session-1'));
+  const invite = await made.join.createInvite({
+    collabId: COLLAB, managerSessionId: MANAGER_SESSION, targetInstanceId: MANAGER_INSTANCE, targetSessionId: 'app-session-1',
+  });
+  assert.equal(invite.ok, true, invite.message);
+  const granted = await made.join.handleInviteApproval(inviteApprovalFrame(invite.inviteId, 'app-session-1', MANAGER_INSTANCE));
+  assert.equal(granted.ok, true, granted.message);
+  assert.equal(granted.joining, true, '名单没有该席：照常签发 grant，不得因本地席位文件短路');
+  assert.equal(granted.alreadyMember, undefined);
+  assert.equal(made.local.ledger.members.some((row) => row.sessionId === 'app-session-1'), false, '确认前不写名单');
+
+  const confirmed = await made.join.handleJoinConfirm(joinConfirmFrame(granted.joinId, 'app-session-1', MANAGER_INSTANCE));
+  assert.equal(confirmed.action, 'join-confirmed');
+  assert.equal(
+    made.local.ledger.members.some((row) => row.sessionId === 'app-session-1' && row.state === 'member'),
+    true,
+    'confirm 后以共享名单为准入席',
+  );
+});
+
+test('M-7 讨论旧成员事件：折叠保持实例级并标注来源，不按最近会话伪造席位键', () => {
+  const local = {
+    members: {
+      fold: () => [{ instanceId: 'inst-old', identityName: '旧机' }],
+      latestEventOf: () => ({ sessionId: 'sess-recent' }),
+    },
+  };
+  const rows = foldedMembersOf(local);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].instanceId, 'inst-old');
+  assert.equal(rows[0].sessionId, null, '旧事件不补最近会话的席位键');
+  assert.equal(rows[0].seatScope, 'instance', '显式标注实例级来源');
+});
+
+function resumeFixtureOf(t) {
+  const dir = makeTempDir(t);
+  const made = quietLog();
+  const local = {
+    collabId: COLLAB,
+    role: 'member',
+    ledger: null,
+    member: { collabId: COLLAB, role: 'member', state: 'active', name: '续发项目', topic: '主题', mode: 'managed' },
+    endpoints: new Map(),
+    snapshot: null,
+    seats: new Map([['app-session-1', {
+      version: 1, sessionId: 'app-session-1', role: 'member', state: 'member', muted: true,
+      unverified: true, joinId: 'join-resume-1', grantVersion: 3, joinedAt: new Date(NOW).toISOString(),
+    }]]),
+    suspended: null,
+  };
+  mkdirSync(dirname(carrierFilePath(dir, COLLAB)), { recursive: true });
+  writeFileSync(carrierFilePath(dir, COLLAB), JSON.stringify({
+    format: 'session-seats', version: 1, collabId: COLLAB, name: '续发项目', topic: '主题', mode: 'managed',
+    endpoints: {},
+    manager: { instanceId: MANAGER_INSTANCE, sessionId: MANAGER_SESSION, identityName: '主机甲', term: 2 },
+    snapshotVersion: 0, createdAt: new Date(NOW).toISOString(),
+  }));
+  return { dir, made, local };
+}
+
+function resumeJoinOf({ dir, made, local }) {
+  const sent = [];
+  const state = {
+    dataDir: dir,
+    config: { inviteTtlMs: 60000, pendingInvitesMax: 4, joinConfirmTtlMs: 60000, sessionSeatTimeoutMs: 300000 },
+    self: { instanceId: 'inst-a', identityName: '应用甲', port: 17400 },
+    collabs: new Map([[COLLAB, local]]),
+    knownHosts: { lookup: () => ({ address: '127.0.0.1', port: 18001 }), remember: () => {} },
+    log: made.log,
+    notify: () => true,
+    injectLocalSeat: async () => ({ ok: true, delivered: true }),
+    listLocalSeats: () => [],
+    joinApplications: createJoinApplicationsStore({ dataDir: dir, log: made.log }),
+    counters: { persistFailures: 0 },
+    clock: () => NOW,
+    joinRequestRetryMs: 3600000,
+  };
+  const join = createJoinDomain({
+    state,
+    send: (message) => {
+      sent.push(message);
+      return { ok: true, msgId: `resume-${sent.length}` };
+    },
+    openViewer: null,
+    log: made.log,
+    now: state.clock,
+  });
+  return { join, sent };
+}
+
+test('C-3 重启恢复：未确认席位按载体里的站长席位续发 join-confirm', async (t) => {
+  const { join, sent } = resumeJoinOf(resumeFixtureOf(t));
+  const result = await join.retryPendingConfirms();
+  assert.deepEqual(result, { retried: 1, rolledBack: 0 });
+  const confirm = sent.find((message) => message.type === 'join-confirm');
+  assert.ok(confirm !== undefined, '重启后恢复重发轮');
+  assert.equal(confirm.payload.joinId, 'join-resume-1');
+  assert.equal(confirm.payload.managerTerm, 2, '站长任期取自载体（本地记录无台账）');
+  assert.equal(confirm.payload.version, 3, 'grantVersion 取自席位文件');
+  assert.equal(confirm.to.instanceId, MANAGER_INSTANCE);
+  assert.deepEqual(confirm.toSessions, [MANAGER_SESSION]);
+  assert.equal(confirm.fromSessionId, 'app-session-1');
 });

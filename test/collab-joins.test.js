@@ -1,20 +1,27 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
   COLLABS_DIR_NAME,
+  INVITES_FILE_NAME,
   JOIN_APPLICATIONS_FILE_NAME,
   JOINS_FILE_NAME,
+  PENDING_INVITES_FILE_NAME,
   collabFilePath,
+  invitesFilePath,
   joinApplicationsFilePath,
   joinsFilePath,
+  pendingInvitesFilePath,
   seatFilePath,
 } from '../src/paths.js';
 import {
   APPROVAL_ORIGINS,
+  createInvitesFileStore,
   createJoinApplicationsStore,
+  createJoiningFileStore,
   createJoinsStore,
+  createPendingInvitesFileStore,
   isApprovalShape,
   isJoinApplicationShape,
   isJoinApplicationsShape,
@@ -87,6 +94,12 @@ function applicationRecord(overrides = {}) {
 function seedFile(file, value) {
   mkdirSync(dirname(file), { recursive: true });
   writeFileSync(file, typeof value === 'string' ? value : JSON.stringify(value));
+}
+
+function backupsOf(file, marker) {
+  return readdirSync(dirname(file))
+    .filter((name) => name.startsWith(`${marker}-`))
+    .map((name) => join(dirname(file), name));
 }
 
 /* 占位文件堵住目录创建路径（与 members / mute 同款失败面夹具）：父目录成文件即令写盘失败。 */
@@ -166,7 +179,7 @@ test('加入台账读写往返：写侧只产 v2（无 approvals）、重建载�
   assert.equal(reloaded.pendingJoins().length, 2, '异会话并列');
 });
 
-test('加入台账坏载：不可解析 / 形态不符 / 读取失败归空态并留痕', (t) => {
+test('加入台账坏载：不可解析 / 形态不符 / 读取失败归空态并留痕；整档损坏先留 .corrupt 备份', (t) => {
   const dir = makeTempDir(t);
   seedFile(joinsFilePath(dir, 'collab-broken'), '{"v":1,');
   const broken = makeLog();
@@ -174,20 +187,80 @@ test('加入台账坏载：不可解析 / 形态不符 / 读取失败归空态�
   assert.deepEqual([brokenStore.pendingJoins(), brokenStore.approvals()], [[], []]);
   assert.equal(brokenStore.stats().corruptLoads, 1);
   assert.ok(broken.logs.some((entry) => entry.message.includes('加入台账文件不可用') && entry.fields.reason === '无法解析'), '不可解析留痕');
+  const brokenBackups = backupsOf(joinsFilePath(dir, 'collab-broken'), `${JOINS_FILE_NAME}.corrupt`);
+  assert.equal(brokenBackups.length, 1, '整档损坏先备份（不得静默清零后覆盖）');
+  assert.equal(readFileSync(brokenBackups[0], 'utf8'), '{"v":1,', '备份保留原始字节');
+  assert.equal(brokenStore.stats().corruptBackups, 1);
+  assert.equal(existsSync(joinsFilePath(dir, 'collab-broken')), false, '原文件已改名留证');
+
   seedFile(joinsFilePath(dir, 'collab-shape'), { v: 3, pendingJoins: [], approvals: [] });
   const shaped = makeLog();
   const shapedStore = createJoinsStore({ dataDir: dir, collabId: 'collab-shape', log: shaped.log });
   assert.deepEqual(shapedStore.approvals(), [], '形态不符按空态');
   assert.ok(shaped.logs.some((entry) => entry.fields.reason === '形态不符'), '形态不符留痕');
+  assert.equal(backupsOf(joinsFilePath(dir, 'collab-shape'), `${JOINS_FILE_NAME}.corrupt`).length, 1, '形态不符同样留档');
+
   mkdirSync(joinsFilePath(dir, 'collab-dir'), { recursive: true });
   const unreadable = makeLog();
   const dirStore = createJoinsStore({ dataDir: dir, collabId: 'collab-dir', log: unreadable.log });
   assert.deepEqual(dirStore.pendingJoins(), [], '读取失败按空态继续');
   assert.equal(dirStore.stats().corruptLoads, 1, '非 ENOENT 读故障并入损坏面');
   assert.ok(unreadable.logs.some((entry) => entry.message.includes('加入台账文件不可用')), '读取失败留痕');
+  assert.equal(statSync(joinsFilePath(dir, 'collab-dir')).isDirectory(), true, '路径被目录占住时无原始字节可留，保持原样');
+  assert.equal(dirStore.stats().corruptBackups, 0);
   const fresh = makeLog();
   createJoinsStore({ dataDir: makeTempDir(t), collabId: 'collab-fresh', log: fresh.log });
   assert.deepEqual(fresh.logs, [], '首次运行无文件：静默空态');
+});
+
+test('0.2.0 三本账整档损坏：先留 .corrupt-<ts> 备份，再按空态继续并可安全重写', (t) => {
+  const dir = makeTempDir(t);
+  const made = makeLog();
+  const base = { dataDir: dir, log: made.log, now: () => 1000 };
+
+  seedFile(invitesFilePath(dir, 'collab-inv'), '{"version":1,"invites":[');
+  const invites = createInvitesFileStore({ ...base, collabId: 'collab-inv', ttlMs: 60000 });
+  assert.deepEqual(invites.list(), []);
+  const inviteBackups = backupsOf(invitesFilePath(dir, 'collab-inv'), `${INVITES_FILE_NAME}.corrupt`);
+  assert.equal(inviteBackups.length, 1);
+  assert.equal(readFileSync(inviteBackups[0], 'utf8'), '{"version":1,"invites":[');
+  assert.equal(invites.save().ok, true, '备份后按空态重写不覆盖证据');
+  assert.deepEqual(JSON.parse(readFileSync(invitesFilePath(dir, 'collab-inv'), 'utf8')), { version: 1, invites: [] });
+
+  seedFile(pendingInvitesFilePath(dir, 'collab-pending'), '不是 JSON');
+  const pending = createPendingInvitesFileStore({ ...base, collabId: 'collab-pending' });
+  assert.deepEqual(pending.list(), []);
+  const pendingBackups = backupsOf(pendingInvitesFilePath(dir, 'collab-pending'), `${PENDING_INVITES_FILE_NAME}.corrupt`);
+  assert.equal(pendingBackups.length, 1);
+  assert.equal(readFileSync(pendingBackups[0], 'utf8'), '不是 JSON');
+
+  seedFile(joinsFilePath(dir, 'collab-join'), { v: 2, pendingJoins: '坏' });
+  const joining = createJoiningFileStore({ ...base, collabId: 'collab-join', joiningTtlMs: 60000 });
+  assert.deepEqual(joining.pendingJoins(), []);
+  const joiningBackups = backupsOf(joinsFilePath(dir, 'collab-join'), `${JOINS_FILE_NAME}.corrupt`);
+  assert.equal(joiningBackups.length, 1);
+  assert.deepEqual(JSON.parse(readFileSync(joiningBackups[0], 'utf8')), { v: 2, pendingJoins: '坏' });
+  assert.equal(joining.stats().corruptBackups, 1);
+});
+
+test('joins.json v1 首次 v2 写：原档留为 .v1-<ts>，approvals 不静默丢失；回退旧读侧仍可恢复', (t) => {
+  const dir = makeTempDir(t);
+  const file = joinsFilePath(dir, 'collab-v1-upgrade');
+  const original = JSON.stringify({ v: 1, pendingJoins: [], approvals: [approvalRecord()] });
+  seedFile(file, original);
+  const made = makeLog();
+  const joining = createJoiningFileStore({ dataDir: dir, collabId: 'collab-v1-upgrade', log: made.log, joiningTtlMs: 60000 });
+  assert.equal(joining.save().ok, true);
+  const backups = backupsOf(file, `${JOINS_FILE_NAME}.v1`);
+  assert.equal(backups.length, 1, '首次 v2 写前留档');
+  assert.equal(readFileSync(backups[0], 'utf8'), original, '留档保留原始字节（含 approvals）');
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { v: 2, pendingJoins: [] }, '写侧只产 v2');
+  assert.equal(joining.save().ok, true);
+  assert.equal(backupsOf(file, `${JOINS_FILE_NAME}.v1`).length, 1, '同一进程只留档一次');
+
+  writeFileSync(file, readFileSync(backups[0], 'utf8'));
+  assert.equal(createJoinsStore({ dataDir: dir, collabId: 'collab-v1-upgrade', log: made.log }).isGranted('session-a1'), true,
+    '回退旧版：留档可还原 approvals 获准面');
 });
 
 test('加入台账坏载：单条形态不符逐条丢弃，好条目照旧载入', (t) => {

@@ -1,4 +1,4 @@
-import { readFileSync, rmSync } from 'node:fs';
+import { copyFileSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs';
 import { writeJsonAtomic } from '../storage.js';
 import {
   collabDir, ensureDir, invitesFilePath, joinApplicationsFilePath, joinsFilePath, pendingInvitesFilePath, runDir,
@@ -142,7 +142,8 @@ function isGrantedOf(state, sessionId) {
  * @param {{ dataDir: string, collabId: string, log: any }} options
  */
 export function createJoinsStore({ dataDir, collabId, log }) {
-  /** @type {{ collabId: string, log: any, label: string, logFields: Record<string, unknown>, file: string, dataDir: string, pendingJoins: any[], approvals: any[], counters: any }} */
+  /** @type {{ collabId: string, log: any, label: string, logFields: Record<string, unknown>, file: string, dataDir: string,
+   *   pendingJoins: any[], approvals: any[], legacyFileOnDisk: boolean, legacyBackedUp: boolean, counters: any }} */
   const state = {
     collabId,
     log,
@@ -152,7 +153,12 @@ export function createJoinsStore({ dataDir, collabId, log }) {
     dataDir,
     pendingJoins: [],
     approvals: [],
-    counters: { corruptLoads: 0, corruptRecords: 0, persists: 0, persistSkips: 0, persistFailures: 0, clears: 0 },
+    legacyFileOnDisk: false,
+    legacyBackedUp: false,
+    counters: {
+      corruptLoads: 0, corruptRecords: 0, corruptBackups: 0, corruptBackupFailures: 0,
+      persists: 0, persistSkips: 0, persistFailures: 0, clears: 0,
+    },
   };
   loadJoins(state);
   return {
@@ -180,7 +186,10 @@ export function createJoinApplicationsStore({ dataDir, log }) {
     file: joinApplicationsFilePath(dataDir),
     dataDir,
     applications: [],
-    counters: { corruptLoads: 0, corruptRecords: 0, adds: 0, removes: 0, pruned: 0, pruneRefusals: 0, persistFailures: 0 },
+    counters: {
+      corruptLoads: 0, corruptRecords: 0, corruptBackups: 0, corruptBackupFailures: 0,
+      adds: 0, removes: 0, pruned: 0, pruneRefusals: 0, persistFailures: 0,
+    },
   };
   loadApplications(state);
   return {
@@ -205,6 +214,10 @@ function loadJoins(state) {
   if (!isJoinsShape(parsed)) {
     traceCorruptLoad(state, '形态不符');
     return;
+  }
+  state.legacyFileOnDisk = isLegacyJoinsPayload(parsed);
+  if (!state.legacyFileOnDisk) {
+    state.legacyBackedUp = false;
   }
   const pendingShape = parsed.v === 2 ? isJoiningRecordShape : isPendingJoinShape;
   const pendingSection = parsed.v === 2 ? '在途入席' : '待批准';
@@ -262,9 +275,35 @@ function parseJsonOrNull(text) {
   }
 }
 
+/* 整档损坏的留证（契约 §4/设计 §6.3）：先把原文件改名成 `<file>.corrupt-<ts>`（保留原始字节），
+ * 再按空态继续——后续 begin/accept/register 的写入不得静默覆盖排障证据。
+ * 目录/无法改名的形态（如路径被目录占住）不搬动：没有「原始字节」可留，原样保持并计数。 */
 function traceCorruptLoad(state, reason) {
   state.counters.corruptLoads++;
-  state.log.warn(`${state.label}文件不可用（按空态继续）`, { ...state.logFields, reason });
+  const backup = quarantineCorruptFile(state);
+  state.log.warn(`${state.label}文件不可用（按空态继续）`, {
+    ...state.logFields,
+    reason,
+    ...(backup === null ? {} : { backup }),
+  });
+}
+
+function quarantineCorruptFile(state) {
+  const backup = `${state.file}.corrupt-${Date.now()}`;
+  try {
+    if (!statSync(state.file).isFile()) {
+      return null;
+    }
+    renameSync(state.file, backup);
+    state.counters.corruptBackups++;
+    return backup;
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      state.counters.corruptBackupFailures++;
+      state.log.warn(`${state.label}损坏文件备份失败（原文件保持不动）`, { ...state.logFields, reason: error.message });
+    }
+    return null;
+  }
 }
 
 /* 单条形态不符逐条丢弃（其余照常载入）：整档形态成立说明文件确是台账，个别坏条不该让全档作废；
@@ -347,6 +386,9 @@ function persistJoins(state) {
   if (!state.pendingJoins.every(isJoiningRecordShape)) {
     state.counters.persistSkips++;
     state.log.warn(`${state.label}含旧 v1 条目（不写回：v2 只落未确认 joining）`, { ...state.logFields });
+    return;
+  }
+  if (backupLegacyJoinsFile(state).ok !== true) {
     return;
   }
   try {
@@ -520,7 +562,13 @@ function fileStoreStateOf(dataDir, file, label, collabId, log) {
     collabId,
     log,
     logFields: { collabId },
-    counters: { corruptLoads: 0, corruptRecords: 0, persists: 0, persistFailures: 0, restored: 0, rejected: 0 },
+    counters: {
+      corruptLoads: 0, corruptRecords: 0, corruptBackups: 0, corruptBackupFailures: 0,
+      persists: 0, persistFailures: 0, restored: 0, rejected: 0,
+    },
+    /* joins.json 的 v1 留档：首次 v2 写前把旧档备份成 `<file>.v1-<ts>`（approvals 不得静默丢弃）。 */
+    legacyFileOnDisk: false,
+    legacyBackedUp: false,
   };
 }
 
@@ -575,12 +623,16 @@ function restorePendingInvitesFile(state, store, records, options = undefined) {
 }
 
 /* joins.json 只读 pendingJoins；v1 的旧待批准行没有 joinId/term，交给 restore 逐条拒收并计数。
- * 不覆盖 v1 文件：旧读侧仍可能使用同一文件，写点由调用方在真正产生 v2 记录后触发。 */
+ * v1 文件只在首次 v2 写前留档，读侧不覆盖它：旧读侧仍可能使用同一文件。 */
 function loadJoiningFile(state, registry) {
   const parsed = readParsed(state);
   const records = parsed !== null && isRecord(parsed) && Array.isArray(parsed.pendingJoins) ? parsed.pendingJoins : [];
   if (parsed !== null && !Array.isArray(parsed.pendingJoins)) {
     traceCorruptLoad(state, '形态不符');
+  }
+  state.legacyFileOnDisk = isLegacyJoinsPayload(parsed);
+  if (!state.legacyFileOnDisk) {
+    state.legacyBackedUp = false;
   }
   const restored = registry.restore(records, { collabId: state.collabId });
   state.counters.restored = restored.ok === true ? restored.restored : 0;
@@ -588,8 +640,44 @@ function loadJoiningFile(state, registry) {
   return restored;
 }
 
+/* v1 旧档（或带 approvals 段的旧形态）：首次 v2 写会让 approvals 退出磁盘——写前必须留档。 */
+function isLegacyJoinsPayload(parsed) {
+  if (!isRecord(parsed) || !Array.isArray(parsed.pendingJoins)) {
+    return false;
+  }
+  return parsed.v === 1 || (Array.isArray(parsed.approvals) && parsed.approvals.length > 0);
+}
+
 function saveJoiningFile(state, registry) {
+  const backedUp = backupLegacyJoinsFile(state);
+  if (backedUp.ok !== true) {
+    return backedUp;
+  }
   return writeStoreFile(state, { v: JOINS_FILE_VERSION, pendingJoins: registry.pendingJoins() });
+}
+
+/* 首次 v2 写前把 v1 原文件复制为 `<file>.v1-<ts>`（原文件仍由原子写替换；备份保留 approvals 与
+ * 旧记录的原始字节，回退 0.1.x 时可人工恢复）。复制失败即拒绝本次写入——宁可晚一轮入席，
+ * 也不得未备份就抹掉旧数据（契约 §4「旧文件留盘不删」）。 */
+function backupLegacyJoinsFile(state) {
+  if (!state.legacyFileOnDisk || state.legacyBackedUp) {
+    return { ok: true };
+  }
+  const backup = `${state.file}.v1-${Date.now()}`;
+  try {
+    copyFileSync(state.file, backup);
+    state.legacyBackedUp = true;
+    state.log.info(`${state.label}旧档已留档（首次 v2 写）`, { ...state.logFields, backup });
+    return { ok: true, backup };
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      state.legacyFileOnDisk = false;
+      return { ok: true };
+    }
+    state.counters.persistFailures++;
+    state.log.warn(`${state.label}旧档留档失败（拒绝本次 v2 写入，旧数据保持原样）`, { ...state.logFields, reason: error.message });
+    return { ok: false, reason: `legacy-backup-failed: ${error.message}` };
+  }
 }
 
 /* 显式恢复（启动面）：容量上限只作本次裁剪，不写回 registry 的运行期配置（由构造参数决定）。 */

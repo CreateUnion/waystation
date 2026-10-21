@@ -14,9 +14,9 @@ import {
 import { joinDenyReasonOf } from './invites.js';
 import { writeRecovery } from './migration.js';
 import {
-  currentManagerIdOf, isLocalArchivedState, listLocalSeatsOf, localModeOf, localNameOf, localRosterOf, localSeatOfLocal,
-  localStateOf, localTopicOf, managerSeatOfLocal, persistMember, removeLocalSeat, retiredMuteHandle, seatsOfLocal, selfJoinedOf,
-  upsertLocalSeat,
+  currentManagerIdOf, isLocalArchivedState, isSeatArchived, listLocalSeatsOf, localModeOf, localNameOf, localRosterOf,
+  localSeatOfLocal, localStateOf, localTopicOf, managerSeatOfLocal, persistMember, removeLocalSeat, retiredMuteHandle, seatsOfLocal,
+  selfJoinedOf, upsertLocalSeat,
 } from './local.js';
 import { LOCAL_LEFT_STATE } from './model.js';
 import { endpointFor, invitePayloadOf, mutateLedger } from './outgoing.js';
@@ -40,6 +40,9 @@ import { isSessionShortCode, matchSessionByToken, shortSessionId } from '../util
 export const JOIN_REQUEST_TTL_MS = 24 * 60 * 60 * 1000;
 export const JOIN_REQUEST_RETRY_MS = 30000;
 export const JOIN_REQUEST_RETRY_MAX_MS = 300000;
+/* 确认重发的停等宽限缺省（config.sessionSeatTimeoutMs 缺省同接管面）：grant 过期后停止重发，
+ * 再等这么久仍无含本席的快照才回滚本机席位——给「站长已提交、快照丢帧」留重发取快照的窗口。 */
+export const SEAT_TIMEOUT_FALLBACK_MS = 300000;
 
 const JOIN_APPLICATION_LABEL = '加入申请';
 const MAIN_VIEWER_ROOT = 'main';
@@ -55,7 +58,8 @@ const JOIN_TIMEOUT_VERSION_HINT = '对端可能版本不支持加入申请（需
 export function createJoinDomain({ state, send = null, openViewer = null, log = null, now = Date.now }) {
   /** @type {{ state: any, send: any, openViewer: any, log: any, now: () => number, stores: Map<string, any>,
    *   retries: Map<string, any>, knocks: Map<string, any>, books: Map<string, any>,
-   *   pendingRequests: Map<string, Map<string, any>>, joinInvites: Map<string, any>, seatNames: Map<string, string> }} */
+   *   pendingRequests: Map<string, Map<string, any>>, joinInvites: Map<string, any>, seatNames: Map<string, string>,
+   *   confirmRetries: Map<string, any> }} */
   const joinState = {
     state,
     send: typeof send === 'function' ? send : null,
@@ -64,6 +68,7 @@ export function createJoinDomain({ state, send = null, openViewer = null, log = 
     now: typeof now === 'function' ? now : Date.now,
     stores: new Map(),      // collabId → 加入台账（惰性构造；写前 load 刷新，并入他域写入的获准）
     retries: new Map(),     // 申请重发轮（键＝协作 ＋ 会话）
+    confirmRetries: new Map(),   // 入席确认重发轮（键＝协作 ＋ 会话；清除 unverified 前续发）
     knocks: new Map(),      // 讨论名 → 敲门登记（请求会话 ＋ 时刻：同意门落地时把席位交回请求会话）
     books: new Map(),       // collabId → { invites, pending, joining }（0.2.0 三份文件，每协作一份）
     pendingRequests: new Map(),   // collabId → Map(instanceId\0sessionId, 待批准申请；仅内存）
@@ -101,6 +106,8 @@ function sessionJoinApiOf(joinState) {
     requestJoin: (input) => requestJoinOf(joinState, input ?? {}),
     approveJoin: (input) => approveJoinOf(joinState, input ?? {}),
     confirmJoining: (joinId, sessionId, input) => confirmJoiningOf(joinState, joinId, sessionId, input ?? {}),
+    /* 确认重发轮的显式驱动面（测试与运维可确定性推进；周期推进由本域定时器自理）。 */
+    retryPendingConfirms: (at) => retryPendingConfirmsOf(joinState, at),
     withdrawInvite: (input) => withdrawInviteOf(joinState, input ?? {}),
     registerPendingInvite: (input) => registerPendingInviteOf(joinState, input ?? {}),
     handleInviteFrame: (frame) => handleInviteFrameOf(joinState, frame),
@@ -1272,7 +1279,7 @@ function reconcileJoiningWithRoster(joinState, collabId, books) {
     changed = true;
   }
   for (const record of books.joining.registry.list()) {
-    if (isRosterMember(joinState, local, record.instanceId, record.sessionId)) {
+    if (isRosterMember(local, record.instanceId, record.sessionId)) {
       books.joining.registry.releaseJoining(collabId, record.sessionId);
       changed = true;
     }
@@ -1280,6 +1287,8 @@ function reconcileJoiningWithRoster(joinState, collabId, books) {
   if (changed) {
     books.joining.save();
   }
+  /* 重启/重读后恢复确认重发轮：未确认席位必须在清除 unverified 前持续重发（设计 §4.4.6）。 */
+  resumeConfirmRetriesOfLocal(joinState, local);
 }
 
 function inviteTtlOf(joinState) {
@@ -1317,22 +1326,16 @@ function rosterRowsOf(local) {
   return local.snapshot?.ledger?.members ?? local.member?.roster ?? [];
 }
 
-/* 名单已含本席（崩溃重放 / 重复 confirm 的短路判据）：只认活跃席位，不看本地席位缓存。
- * unverified 席位按未确认处理——它只是「已发 confirm、等名单快照」的本地事实；把它当成员会
- * 让 confirm 走幂等短路而不写共享名单（同机旁路的发送面同步跑完整链时必现）。 */
-function isRosterMember(joinState, local, instanceId, sessionId) {
+/* 名单已含本席（崩溃重放 / 重复 confirm 的短路判据）：只认共享名单 / 快照。
+ * 本地席位文件不是成员权威——站长台账重建或回退到不含该席的快照后，旧席位文件仍可能写着
+ * member；把它当成员会让批准与 confirm 短路而不写共享名单，形成「本机可见、对端不可见」的
+ * 双权威分叉（I-10）。本地席位只服务「同 joinId 崩溃重放」的确认重发（resendConfirmForGrantOf
+ * 按 joinId 匹配），不参与成员判定。 */
+function isRosterMember(local, instanceId, sessionId) {
   if (local === undefined || idOf(instanceId) === null || idOf(sessionId) === null) {
     return false;
   }
-  const rows = rosterRowsOf(local);
-  if (rows.some((row) => row.instanceId === instanceId && row.sessionId === sessionId && row.state === 'member')) {
-    return true;
-  }
-  const seat = localSeatOfLocal(local, sessionId);
-  return instanceId === joinState.state.self.instanceId
-    && seat !== null
-    && seat.state === 'member'
-    && seat.unverified !== true;
+  return rosterRowsOf(local).some((row) => row.instanceId === instanceId && row.sessionId === sessionId && row.state === 'member');
 }
 
 /* 容量口径（设计 §2.5/§4.4.2）：共享名单活跃席位数，**不含正在 joining 的本席**。
@@ -1835,7 +1838,7 @@ async function acceptInviteOf(joinState, input) {
   const books = booksOf(joinState, collabId);
   const visible = books.pending.store.matchPendingForSession({ collabId, sessionId, inviteId, now: joinState.now() });
   if (visible.length === 0) {
-    return alreadyAcceptedInviteOf(books, { collabId, inviteId, sessionId });
+    return alreadyAcceptedInviteOf(joinState, books, { collabId, inviteId, sessionId });
   }
   const manager = visible[0].fromManager;
   const result = manager.instanceId === joinState.state.self.instanceId && isManagerSession(joinState, local, manager.sessionId)
@@ -1858,12 +1861,42 @@ function markMemberAcceptedOf(joinState, collabId) {
   persistMember(joinState.state, local);
 }
 
-/* 同会话重复接受＝幂等成功（不产生第二席）；记录已被接受后 matchPending 不再冒泡，这里补回判据。 */
-function alreadyAcceptedInviteOf(books, { collabId, inviteId, sessionId }) {
+/* 同会话重复接受：记录已被接受后 matchPending 不再冒泡，这里补回判据。
+ * 已真正成席（席位 member 且 unverified 已清）＝幂等成功；尚未成席（approve/grant 丢帧）时
+ * 必须重发 approve——只回「已接受」会让用户在没有席位的情况下无从恢复（C-3）。 */
+async function alreadyAcceptedInviteOf(joinState, books, { collabId, inviteId, sessionId }) {
   const record = books.pending.store.get({ collabId, inviteId });
-  return record !== null && record.acceptedSessions.includes(sessionId)
+  if (record === null || !record.acceptedSessions.includes(sessionId)) {
+    return failureMessage('邀请不存在、已过期或不属于本会话');
+  }
+  const local = joinState.state.collabs.get(collabId);
+  const seat = local === undefined ? null : localSeatOfLocal(local, sessionId);
+  return seatIsVerifiedMemberOf(seat)
     ? { ok: true, accepted: true, idempotent: true, inviteId }
-    : failureMessage('邀请不存在、已过期或不属于本会话');
+    : resendAcceptOf(joinState, record, { collabId, inviteId, sessionId });
+}
+
+function seatIsVerifiedMemberOf(seat) {
+  return seat !== null && seat.state === 'member' && seat.unverified !== true && !isSeatArchived(seat);
+}
+
+/* 未成席的重复接受：重发 approve，让站长重签 grant（或对已提交的 confirm 回快照）。 */
+async function resendAcceptOf(joinState, record, { collabId, inviteId, sessionId }) {
+  if (joinState.now() >= record.expiresAt) {
+    return failureMessage('邀请已过期——需要新的邀请才能再次接受', { reason: 'expired', inviteId });
+  }
+  const manager = record.fromManager;
+  if (idOf(manager.sessionId) === null) {
+    return failureMessage('挂起邀请缺少邀请者会话标识——approve 无法重发（请重新邀请）', { reason: 'unknown-manager', inviteId });
+  }
+  const sent = await sendSeatFrame(joinState, {
+    collabId, instanceId: manager.instanceId, sessionId: manager.sessionId, type: 'approve',
+    payload: { inviteId }, fromSessionId: sessionId,
+  });
+  if (sent.ok !== true) {
+    return failureMessage(`邀请接受帧重发失败：${sent.reason}——邀请记录仍在，可重试`, { reason: 'send-failed', inviteId });
+  }
+  return { ok: true, accepted: true, pending: true, idempotent: true, inviteId, resent: true, delivery: sent };
 }
 
 /* 拒绝席位邀请（0.2.0 邀请簿记）：本地拒绝先生效（挂起邀请消费 ＋ 本会话记入拒绝），再向邀请者
@@ -1977,18 +2010,26 @@ function forgetInviteAcceptanceOf(joinState, collabId, sessionId) {
   }
 }
 
+/* 同机接受：两段式成功后才消费挂起邀请——先消费再批准会让 grant 发送/名单提交的瞬态失败
+ * 把邀请一次烧掉（重试只剩「已接受（幂等）」）。失败保留 pending 供重试（C-3）。 */
 async function acceptLocalInviteOf(joinState, { collabId, inviteId, sessionId, manager, books }) {
-  const consumed = books.pending.store.consumeForSession({ collabId, inviteId, sessionId, declined: false, now: joinState.now() });
-  if (consumed.ok !== true) {
-    return failureMessage(`邀请已不可接受：${consumed.reason}`, { reason: consumed.reason });
-  }
-  books.pending.save();
   rememberInviteAcceptanceOf(joinState, { collabId, sessionId, managerInstanceId: joinState.state.self.instanceId });
   const approved = await approveInviteForSeat(joinState, {
     collabId, inviteId, instanceId: joinState.state.self.instanceId, sessionId, managerSessionId: manager.sessionId,
     identityName: joinState.state.self.identityName,
   });
-  return approved.ok === true ? { ...approved, accepted: true, inviteId } : approved;
+  if (approved.ok !== true) {
+    forgetInviteAcceptanceOf(joinState, collabId, sessionId);
+    return approved;
+  }
+  const consumed = books.pending.store.consumeForSession({ collabId, inviteId, sessionId, declined: false, now: joinState.now() });
+  if (consumed.ok !== true) {
+    /* 席位已成立才是权威事实；挂起记录若已被上次尝试消费（或已过期），只如实标注、不撤销入席。 */
+    joinState.log.warn('邀请已入席但挂起记录消费失败（按已接受处置）', { collabId, inviteId, reason: consumed.reason });
+    return { ...approved, accepted: true, inviteId, note: `席位已成立；挂起邀请状态未更新：${consumed.reason}` };
+  }
+  books.pending.save();
+  return { ...approved, accepted: true, inviteId };
 }
 
 async function approveInviteForSeat(joinState, input) {
@@ -2007,7 +2048,7 @@ async function approveInviteForSeat(joinState, input) {
   if (matched.ok !== true) {
     return failureMessage(`邀请不可用：${matched.reason}`, { reason: matched.reason });
   }
-  if (isRosterMember(joinState, local, input.instanceId, input.sessionId)) {
+  if (isRosterMember(local, input.instanceId, input.sessionId)) {
     return { ok: true, member: true, alreadyMember: true, inviteId: input.inviteId };
   }
   const existing = books.joining.registry.find(input.collabId, input.sessionId);
@@ -2096,7 +2137,7 @@ async function grantSeatOf(joinState, local, books, record, managerSessionId, in
   }
   /* 同机旁路的发送返回时，grant → confirm → 名单提交整链已同步跑完：结果如实报「已入席」，
    * 调用方不必再自行 confirm（记录已按设计在确认后出表）。远端仍是「已签发、待确认」。 */
-  return isRosterMember(joinState, local, record.instanceId, record.sessionId)
+  return isRosterMember(local, record.instanceId, record.sessionId)
     ? { ok: true, member: true, alreadyMember: true, joinId: record.joinId, inviteId: inviteId ?? null, delivery: sent }
     : { ok: true, joining: true, joinId: record.joinId, inviteId: inviteId ?? null, delivery: sent };
 }
@@ -2138,7 +2179,7 @@ async function approveJoinOf(joinState, input) {
     return failureMessage('申请人会话标识存在歧义——请给完整会话标识');
   }
   if (found.record === null) {
-    return isRosterMember(joinState, local, joinState.state.self.instanceId, wanted)
+    return isRosterMember(local, joinState.state.self.instanceId, wanted)
       ? { ok: true, member: true, alreadyMember: true, sessionId: wanted }
       : failureMessage('该会话没有待批准的加入申请（可能已过期、已处置，或会话标识不符）');
   }
@@ -2189,7 +2230,7 @@ async function grantPendingRequestOf(joinState, local, request, managerSessionId
  * 由对方的事件面建立本地记录），再签发 grant；已在名单的申请人跳过这一步。 */
 async function beginAndGrantPendingOf(joinState, local, request, managerSessionId) {
   const books = booksOf(joinState, local.collabId);
-  if (isRosterMember(joinState, local, request.instanceId, request.sessionId)) {
+  if (isRosterMember(local, request.instanceId, request.sessionId)) {
     return { ok: true, member: true, alreadyMember: true, sessionId: request.sessionId };
   }
   const existing = books.joining.registry.find(local.collabId, request.sessionId);
@@ -2400,7 +2441,7 @@ function confirmPreparedOf(joinState, found, sessionId, input) {
   if (instanceId === null || idOf(sessionId) === null) {
     return failureMessage('参数非法：需要 instanceId 与会话标识', { reason: 'invalid' });
   }
-  const alreadyMember = input.alreadyMember === true || isRosterMember(joinState, local, instanceId, sessionId);
+  const alreadyMember = input.alreadyMember === true || isRosterMember(local, instanceId, sessionId);
   const activeSeats = alreadyMember ? undefined : activeSeatsCount(joinState, local, { instanceId, sessionId });
   return {
     ok: true,
@@ -2597,7 +2638,7 @@ async function applyJoinConfirmOf(joinState, context, found) {
   }
   const result = confirmJoiningOf(joinState, joinId, seat.sessionId, {
     instanceId: seat.instanceId, managerTerm: context.managerTerm,
-    alreadyMember: isRosterMember(joinState, local, seat.instanceId, seat.sessionId),
+    alreadyMember: isRosterMember(local, seat.instanceId, seat.sessionId),
   });
   if (result.ok !== true) {
     return confirmDeniedOf(joinState, local, found, joinId, seat, result);
@@ -2607,7 +2648,7 @@ async function applyJoinConfirmOf(joinState, context, found) {
 }
 
 async function confirmUnknownJoinOf(joinState, local, joinId, seat) {
-  if (isRosterMember(joinState, local, seat.instanceId, seat.sessionId)) {
+  if (isRosterMember(local, seat.instanceId, seat.sessionId)) {
     await sendSnapshotToSeatOf(joinState, local, seat);
     return { ok: true, action: 'join-confirmed', joinId, alreadyMember: true };
   }
@@ -2784,6 +2825,12 @@ async function resendConfirmForGrantOf(joinState, local, context, frame) {
     joinState.log.warn('join-grant 与本机申请台账不匹配（忽略）', { collabId: context.collabId, msgId: frame.msgId });
     return null;
   }
+  armConfirmRetryOf(joinState, local, seat.sessionId, context.joinId, {
+    managerInstanceId: context.managerInstanceId,
+    managerSessionId: context.managerSessionId,
+    managerTerm: frame.payload.managerTerm,
+    grantVersion: frame.payload.version,
+  });
   const sent = await sendSeatFrame(joinState, {
     collabId: context.collabId, instanceId: context.managerInstanceId, sessionId: context.managerSessionId,
     type: 'join-confirm', payload: { joinId: context.joinId, managerTerm: frame.payload.managerTerm, version: frame.payload.version },
@@ -2829,6 +2876,14 @@ async function beginLocalJoiningOf(joinState, local, application, joinId, payloa
     state: 'member',
     unverified: true,
   }, seatOptions);
+  /* 首帧发出即挂重发轮：confirm 是幂等帧，单帧丢失/瞬态拒收不得让席位永久停在 unverified
+   * （设计 §4.4.6/§4.4.8）。回执失败也保留席位与重发轮，由有界重发与超时回滚收口。 */
+  armConfirmRetryOf(joinState, local, application.sessionId, joinId, {
+    managerInstanceId: application.managerInstanceId,
+    managerSessionId: payload.manager.sessionId,
+    managerTerm: payload.managerTerm,
+    grantVersion: payload.version,
+  });
   const sent = await sendSeatFrame(joinState, {
     collabId: application.collabId,
     instanceId: application.managerInstanceId,
@@ -2838,10 +2893,241 @@ async function beginLocalJoiningOf(joinState, local, application, joinId, payloa
     fromSessionId: application.sessionId,
   });
   if (sent.ok !== true) {
-    removeLocalSeat(local, application.sessionId, { persist: true, dataDir: joinState.state.dataDir });
-    return { ok: false, action: 'join-failed', reason: sent.reason };
+    return { ok: false, action: 'join-failed', reason: sent.reason, retrying: true };
   }
   return { ok: true, action: 'joining', joinId, sessionId: application.sessionId, unverified: true };
+}
+
+/* —— 入席确认重发轮（设计 §4.4.6/§4.4.8） ——
+ * 清除 unverified（收到含本席快照）前每 joinConfirmTtlMs/3 重发 join-confirm；grant 过期后停止
+ * 重发，再等 sessionSeatTimeoutMs 宽限仍未见快照才回滚本机席位并提示——「站长已提交、快照丢帧」
+ * 的窗口由重发取快照兜住，不因本地定时器到期就静默回滚（防幽灵席位）。 */
+
+function confirmRetryKeyOf(collabId, sessionId) {
+  return `${collabId}\u0000${sessionId}`;
+}
+
+/* 挂轮（幂等）：同一会话同一 joinId 已有轮次时不重开；换 joinId（站长重签）即替换。 */
+function armConfirmRetryOf(joinState, local, sessionId, joinId, grant) {
+  const collabId = local?.collabId;
+  if (typeof collabId !== 'string' || idOf(sessionId) === null || idOf(joinId) === null) {
+    return;
+  }
+  const key = confirmRetryKeyOf(collabId, sessionId);
+  if (confirmRetryAlreadyHeldOf(joinState, key, joinId)) {
+    return;
+  }
+  const entry = confirmRetryEntryOf(joinState, local, { collabId, sessionId, joinId }, grant);
+  joinState.confirmRetries.set(key, entry);
+  scheduleConfirmRetryOf(joinState, entry);
+}
+
+/* 已有轮次：同 joinId 视为已挂上；换 joinId（站长重签）即清掉旧轮次重新挂。 */
+function confirmRetryAlreadyHeldOf(joinState, key, joinId) {
+  const held = joinState.confirmRetries.get(key);
+  if (held === undefined) {
+    return false;
+  }
+  if (held.joinId === joinId) {
+    return true;
+  }
+  clearTimeout(held.timer);
+  joinState.confirmRetries.delete(key);
+  return false;
+}
+
+function confirmRetryEntryOf(joinState, local, ids, grant) {
+  const ttl = joiningTtlOf(joinState);
+  const seat = localSeatOfLocal(local, ids.sessionId);
+  return {
+    timer: null,
+    ...ids,
+    managerInstanceId: idOf(grant?.managerInstanceId),
+    managerSessionId: idOf(grant?.managerSessionId),
+    managerTerm: positiveIntOrNull(grant?.managerTerm),
+    grantVersion: positiveIntOrNull(grant?.grantVersion),
+    delayMs: Math.max(1, Math.floor(ttl / 3)),
+    expiresAt: seatStartedAtOf(seat, joinState.now()) + ttl,
+    graceMs: seatTimeoutOf(joinState),
+  };
+}
+
+function positiveIntOrNull(value) {
+  return Number.isInteger(value) && value >= 1 ? value : null;
+}
+
+function seatStartedAtOf(seat, fallback) {
+  const at = typeof seat?.joinedAt === 'string' ? Date.parse(seat.joinedAt) : Number.NaN;
+  return Number.isFinite(at) ? at : fallback;
+}
+
+function seatTimeoutOf(joinState) {
+  const timeout = joinState.state.config?.sessionSeatTimeoutMs;
+  return Number.isFinite(timeout) && timeout > 0 ? timeout : SEAT_TIMEOUT_FALLBACK_MS;
+}
+
+function scheduleConfirmRetryOf(joinState, entry) {
+  entry.timer = setTimeout(() => {
+    void runConfirmRetryOf(joinState, entry);
+  }, entry.delayMs);
+  unrefTimer(entry.timer);
+}
+
+function clearConfirmRetryOf(joinState, collabId, sessionId) {
+  const key = confirmRetryKeyOf(collabId, sessionId);
+  const held = joinState.confirmRetries.get(key);
+  if (held === undefined) {
+    return false;
+  }
+  if (held.timer !== null) {
+    clearTimeout(held.timer);
+  }
+  joinState.confirmRetries.delete(key);
+  return true;
+}
+
+/* 一次推进：未确认且未过期 → 重发并续排；过期 → 只等宽限不再发帧；宽限过 → 回滚席位。
+ * at 可显式给（测试确定性推进），缺省取注入时钟。 */
+async function runConfirmRetryOf(joinState, entry, at = undefined) {
+  clearEntryTimerOf(entry);
+  const key = confirmRetryKeyOf(entry.collabId, entry.sessionId);
+  if (joinState.confirmRetries.get(key) !== entry) {
+    return CONFIRM_RETRY_IDLE;
+  }
+  const now = Number.isFinite(at) ? at : joinState.now();
+  const local = joinState.state.collabs.get(entry.collabId);
+  const seat = local === undefined ? null : localSeatOfLocal(local, entry.sessionId);
+  if (!isUnverifiedSeatOf(seat, entry.joinId)) {
+    joinState.confirmRetries.delete(key);
+    return CONFIRM_RETRY_IDLE;
+  }
+  if (now >= entry.expiresAt + entry.graceMs) {
+    rollbackUnverifiedSeatOf(joinState, local, seat);
+    joinState.confirmRetries.delete(key);
+    return { retried: false, rolledBack: true };
+  }
+  const retried = await confirmRetrySendOf(joinState, entry, seat.sessionId, now);
+  if (joinState.confirmRetries.get(key) === entry) {
+    scheduleConfirmRetryOf(joinState, entry);
+  }
+  return { retried, rolledBack: false };
+}
+
+const CONFIRM_RETRY_IDLE = { retried: false, rolledBack: false };
+
+function clearEntryTimerOf(entry) {
+  if (entry.timer !== null) {
+    clearTimeout(entry.timer);
+    entry.timer = null;
+  }
+}
+
+/* grant 过期后只等宽限、不再发帧（设计 §4.4.8）；未过期则重发一次。 */
+async function confirmRetrySendOf(joinState, entry, sessionId, now) {
+  if (now >= entry.expiresAt) {
+    return false;
+  }
+  const sent = await sendJoinConfirmOf(joinState, entry, sessionId);
+  if (sent.ok !== true) {
+    joinState.log.warn('join-confirm 重发失败（席位保留，按轮续试）', {
+      collabId: entry.collabId, sessionId: entry.sessionId, reason: sent.reason,
+    });
+  }
+  return true;
+}
+
+function isUnverifiedSeatOf(seat, joinId) {
+  return seat !== null
+    && seat.state === 'member'
+    && seat.unverified === true
+    && seat.joinId === joinId
+    && !isSeatArchived(seat);
+}
+
+async function sendJoinConfirmOf(joinState, entry, sessionId) {
+  if (entry.managerInstanceId === null || entry.managerSessionId === null || entry.managerTerm === null) {
+    return { ok: false, reason: '站长席位信息未知（grant 记录不完整）' };
+  }
+  return sendSeatFrame(joinState, {
+    collabId: entry.collabId,
+    instanceId: entry.managerInstanceId,
+    sessionId: entry.managerSessionId,
+    type: 'join-confirm',
+    payload: {
+      joinId: entry.joinId,
+      managerTerm: entry.managerTerm,
+      ...(entry.grantVersion === null ? {} : { version: entry.grantVersion }),
+    },
+    fromSessionId: sessionId,
+  });
+}
+
+/* 超时回滚（申请人侧）：删本机席位并留一行定向提示——可见的失败路径，不是静默消失。 */
+function rollbackUnverifiedSeatOf(joinState, local, seat) {
+  const name = localNameOf(local) ?? local.collabId;
+  removeLocalSeat(local, seat.sessionId, { persist: true, dataDir: joinState.state.dataDir });
+  joinState.log.info('入席确认超时：未确认席位已回滚', { collabId: local.collabId, sessionId: seat.sessionId, joinId: seat.joinId });
+  notifySession(joinState, local, seat.sessionId,
+    `入席未确认：协作「${name}」的站长在时限内未确认本会话（${shortSessionId(seat.sessionId)}）的入席——本机席位已回滚，请重新申请或联系站长`);
+}
+
+/* 重启恢复：按持久席位重建重发轮（joinId/grantVersion 在席位文件里；站长会话取自载体/快照）。 */
+function resumeConfirmRetriesOfLocal(joinState, local) {
+  if (local === undefined) {
+    return;
+  }
+  for (const seat of seatsOfLocal(local).values()) {
+    if (idOf(seat.joinId) === null || !isUnverifiedSeatOf(seat, seat.joinId)) {
+      continue;
+    }
+    if (joinState.confirmRetries.has(confirmRetryKeyOf(local.collabId, seat.sessionId))) {
+      continue;
+    }
+    const grant = resumeGrantOf(joinState, local);
+    armConfirmRetryOf(joinState, local, seat.sessionId, seat.joinId, {
+      managerInstanceId: grant?.instanceId,
+      managerSessionId: grant?.sessionId,
+      managerTerm: grant?.term,
+      grantVersion: seat.grantVersion,
+    });
+  }
+}
+
+function resumeGrantOf(joinState, local) {
+  const manager = readCarrier(collabDir(joinState.state.dataDir, local.collabId)).carrier?.manager;
+  const instanceId = idOf(manager?.instanceId) ?? idOf(currentManagerIdOf(local));
+  const sessionId = idOf(manager?.sessionId) ?? resumeManagerSessionIdOf(local);
+  return instanceId === null || sessionId === null
+    ? null
+    : { instanceId, sessionId, term: resumeManagerTermOf(local, manager) };
+}
+
+function resumeManagerSessionIdOf(local) {
+  return idOf(local.snapshot?.ledger?.manager?.sessionId) ?? idOf(local.ledger?.manager?.sessionId);
+}
+
+function resumeManagerTermOf(local, manager) {
+  const carrierTerm = positiveIntOrNull(manager?.term);
+  return carrierTerm ?? positiveIntOrNull(local.ledger?.manager?.term);
+}
+
+/* 显式推进面：重启后尚未被任何加入域操作触达的协作也能恢复轮次；定时器与测试共用。 */
+async function retryPendingConfirmsOf(joinState, at = undefined) {
+  for (const local of joinState.state.collabs.values()) {
+    resumeConfirmRetriesOfLocal(joinState, local);
+  }
+  let retried = 0;
+  let rolledBack = 0;
+  for (const entry of [...joinState.confirmRetries.values()]) {
+    const result = await runConfirmRetryOf(joinState, entry, at);
+    if (result.retried) {
+      retried++;
+    }
+    if (result.rolledBack) {
+      rolledBack++;
+    }
+  }
+  return { retried, rolledBack };
 }
 
 function handleJoinDenyOf(joinState, frame) {
@@ -2880,6 +3166,9 @@ function rollbackLocalJoiningOf(joinState, local, joinId, explicitSessionId) {
   const pendingSeat = seat !== null && (seat.state === 'joining' || (seat.state === 'member' && seat.unverified === true));
   if (pendingSeat && seat.joinId === joinId) {
     removeLocalSeat(local, seat.sessionId, { persist: true, dataDir: joinState.state.dataDir });
+  }
+  if (sessionId !== null) {
+    clearConfirmRetryOf(joinState, local.collabId, sessionId);
   }
   return sessionId;
 }
@@ -3206,15 +3495,21 @@ function replayInviteFrameOf(joinState, collabId, record) {
     return null;
   }
   const manager = record.fromManager;
-  const identityName = carrier.manager?.instanceId === manager.instanceId && isIdentityName(carrier.manager.identityName)
-    ? carrier.manager.identityName
-    : manager.instanceId;
+  const carrierManager = carrier.manager?.instanceId === manager.instanceId ? carrier.manager : null;
+  /* 协作域帧的 from 必携 sessionId、members 为席位条目（协议层校验面）：旧挂起记录没有
+   * manager.sessionId 时从载体补——都拿不到就不组残缺帧，留给下一轮（不为投递伪造来源）。 */
+  const managerSessionId = idOf(manager.sessionId) ?? idOf(carrierManager?.sessionId);
+  if (managerSessionId === null) {
+    joinState.log.warn('挂起邀请缺少邀请者会话标识——补投帧无法组出合法 from.sessionId', { collabId, inviteId: record.inviteId });
+    return null;
+  }
+  const identityName = isIdentityName(carrierManager?.identityName) ? carrierManager.identityName : manager.instanceId;
   return withCollabCapability({
     v: PROTOCOL_VERSION,
     msgId: newMsgId(),
     type: 'invite',
     collabId,
-    from: { instanceId: manager.instanceId, identityName },
+    from: { instanceId: manager.instanceId, identityName, sessionId: managerSessionId },
     ts: new Date(joinState.now()).toISOString(),
     payload: {
       name: carrier.name,
@@ -3225,7 +3520,7 @@ function replayInviteFrameOf(joinState, collabId, record) {
         instanceId: joinState.state.self.instanceId,
         ...(typeof record.targetSessionId === 'string' ? { targetSessionId: record.targetSessionId } : {}),
       }],
-      members: [{ instanceId: manager.instanceId, identityName }],
+      members: [{ instanceId: manager.instanceId, identityName, sessionId: managerSessionId }],
     },
   });
 }
