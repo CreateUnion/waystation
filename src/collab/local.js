@@ -20,16 +20,26 @@ export const SEAT_STATES = ['joining', 'member'];
 /* 席位文件形态：字段语义与本地参与记录分开——席位只回答「本机会话在这个协作里是谁、到哪一步」。
  * 形态不符一律跳过（不删除、不清洗，随协作目录保留为排查证据）。 */
 export function isSeatShape(record) {
-  if (!isPlainObject(record) || !isIdLike(record.sessionId)) {
-    return false;
-  }
-  if (!Number.isInteger(record.version) || record.version < 1) {
-    return false;
-  }
-  if (!SEAT_ROLES.includes(record.role) || !SEAT_STATES.includes(record.state)) {
-    return false;
-  }
-  return isSeatTimeShape(record) && isSeatFlagsShape(record) && isSeatIdsShape(record);
+  return isSeatHeadShape(record)
+    && isSeatRoleStateShape(record)
+    && isSeatTimeShape(record)
+    && isSeatFlagsShape(record)
+    && isSeatIdsShape(record)
+    && isSeatMemberComplete(record);
+}
+
+function isSeatHeadShape(record) {
+  return isPlainObject(record) && isIdLike(record.sessionId) && record.version === SEAT_FILE_VERSION;
+}
+
+function isSeatRoleStateShape(record) {
+  return SEAT_ROLES.includes(record.role) && SEAT_STATES.includes(record.state);
+}
+
+/* 已入席的席位必须能回答「第几位、何时入席」；joining 阶段的席位由加入域先落记录，
+ * 序号与入席时刻要等站长名单确认后才补——两段式期间允许缺省。 */
+function isSeatMemberComplete(record) {
+  return record.state !== 'member' || (isSeatSeqValue(record.joinSeq) && isTimestamp(record.joinedAt));
 }
 
 function isSeatTimeShape(record) {
@@ -47,7 +57,11 @@ function isSeatIdsShape(record) {
 }
 
 function isOptionalSeatSeq(value) {
-  return value === undefined || (Number.isInteger(value) && value >= 1);
+  return value === undefined || isSeatSeqValue(value);
+}
+
+function isSeatSeqValue(value) {
+  return Number.isInteger(value) && value >= 1;
 }
 
 function isOptionalTimestamp(value) {
@@ -98,6 +112,8 @@ function runtimeSeatOf(record) {
     staged: [],
     inbox: [],
     seen: new Set(),
+    deliveryOutcomes: new Map(),
+    flushing: false,
     stagedDropped: 0,
   };
 }
@@ -258,39 +274,99 @@ export function syncLocalRole(local) {
   local.role = deriveLocalRole(local);
 }
 
-export function upsertLocalSeat(local, seat, { persist = false, dataDir = null } = {}) {
-  const runtime = seatsOfLocal(local).get(seat.sessionId);
-  const next = runtime === null ? runtimeSeatOf(seat) : { ...runtime, ...seat };
+/* 席位插入/合并：不存在时按运行态完整形态新建（Map.get 未命中是 undefined——用 null 判定会让
+ * 新席位缺 seen/staged/inbox/bridgeId，首次注入即抛异常）。新席位同时绑定该会话当前桥。 */
+export function upsertLocalSeat(local, seat, { persist = false, dataDir = null, bridgeId = null } = {}) {
+  const existing = seatsOfLocal(local).get(seat.sessionId);
+  const next = nextSeatOf(existing, seat, bridgeId);
   seatsOfLocal(local).set(seat.sessionId, next);
   syncLocalRole(local);
   if (persist && dataDir !== null) {
-    try {
-      saveSeat(dataDir, local.collabId, next);
-    } catch (error) {
-      local.seatPersistFailures = (local.seatPersistFailures ?? 0) + 1;
-      local.lastSeatPersistError = error.message;
-    }
+    saveSeatQuietly(local, dataDir, next);
   }
   return next;
 }
 
-export function removeLocalSeat(local, sessionId, { persist = false, dataDir = null } = {}) {
-  const existed = seatsOfLocal(local).delete(sessionId);
-  syncLocalRole(local);
-  if (existed && persist && dataDir !== null) {
-    removeSeatFile(dataDir, local.collabId, sessionId);
+function nextSeatOf(existing, seat, bridgeId) {
+  if (existing !== undefined) {
+    return { ...existing, ...seat };
   }
-  return existed;
+  const next = runtimeSeatOf(seat);
+  if (typeof bridgeId === 'string' && bridgeId !== '') {
+    next.bridgeId = bridgeId;
+  }
+  return next;
+}
+
+function saveSeatQuietly(local, dataDir, seat) {
+  try {
+    saveSeat(dataDir, local.collabId, seat);
+  } catch (error) {
+    local.seatPersistFailures = (local.seatPersistFailures ?? 0) + 1;
+    local.lastSeatPersistError = error.message;
+  }
+}
+
+/* 席位角色迁移原语（站长转移）：角色只认席位，转移必须同时改席位与派生缓存，
+ * 否则后续 syncLocalRole 会把 local.role 改回旧值。 */
+export function setLocalSeatRole(local, sessionId, role) {
+  if (!SEAT_ROLES.includes(role)) {
+    return null;
+  }
+  const seat = localSeatOfLocal(local, sessionId);
+  if (seat === null) {
+    return null;
+  }
+  seat.role = role;
+  syncLocalRole(local);
+  return seat;
+}
+
+/* 席位移除：返回是否曾存在与该席丢弃的暂存帧数（判离席丢弃要计数）与文件删除结果
+ * （删不掉时重启会「复活」席位——调用方必须留痕）。 */
+export function removeLocalSeat(local, sessionId, { persist = false, dataDir = null } = {}) {
+  const seat = seatsOfLocal(local).get(sessionId);
+  const existed = seatsOfLocal(local).delete(sessionId);
+  const stagedDropped = seat === undefined ? 0 : seat.staged.length;
+  syncLocalRole(local);
+  let fileRemoved = true;
+  if (existed && persist && dataDir !== null) {
+    fileRemoved = removeSeatFile(dataDir, local.collabId, sessionId);
+  }
+  const outcome = { existed, stagedDropped, fileRemoved };
+  /* 移除钩子（服务层挂接）：判离席计数、删除失败留痕、未确认入席记录释放——所有移除路径
+   * （离席/结束/心跳超时）都走本函数，钩子保证这些收尾不因调用方不同而漏做。 */
+  try {
+    local.onSeatRemoved?.(sessionId, outcome);
+  } catch {
+    // 钩子是附属收尾：失败不得反向影响已完成的移除
+  }
+  return outcome;
 }
 
 /* 状态读法：manager 记录（协作＝站长、讨论＝发起人）以台账为权威；「已退出」是成员记录的本地终态，
- * 对**讨论的发起人**同样可达（发起人可退出——退出即放弃结束权，设计 §6），故 manager 记录
- * 以 member.state 的 left 标记优先。 */
+ * 对**讨论的发起人**同样可达（发起人可退出——退出即放弃结束权，设计 §6）。
+ * 有席位表时按席位看待：同机一席退出不得把另一席归档——成员记录是整机兼容面，
+ * 只在没有任何活跃席位时才把它当作本机状态。 */
 export function localStateOf(local) {
+  const seats = seatsOfLocal(local);
+  if (seats.size > 0) {
+    return seatBackedStateOf(local);
+  }
   if (local.role === 'manager' && local.member?.state !== 'left') {
     return local.ledger?.status ?? 'proposed';
   }
   return local.member?.state ?? 'member';
+}
+
+function seatBackedStateOf(local) {
+  if (managerSeatOfLocal(local) !== null && local.ledger !== null) {
+    return local.ledger.status;
+  }
+  if (!hasActiveSeat(local)) {
+    return local.member?.state ?? 'member';
+  }
+  return local.member?.state === 'left' ? 'active' : (local.member?.state ?? 'member');
 }
 
 /* 模式读法（两侧视角统一）：manager 记录取台账、成员取本地记录；缺省 managed（旧数据兼容，

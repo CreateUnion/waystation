@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { collabDir, carrierFilePath, runDir } from '../src/paths.js';
 import { makeTempDir } from './helpers.js';
@@ -28,15 +28,18 @@ function makeService(t, overrides = {}) {
     self: { instanceId: 'inst-self', identityName: '本机', port: 17321 },
     send: () => ({ ok: true, msgId: 'q-1' }),
     sendDirect: () => ({ ok: true, msgId: 'd-1' }),
-    knownHosts: { remember: () => {} },
+    knownHosts: overrides.knownHosts ?? { remember: () => {} },
     notify: () => true,
-    deliverSeat: (frame, seat) => {
+    probeCapability: overrides.probeCapability ?? null,
+    deliverSeat: overrides.deliverSeat ?? ((frame, seat) => {
       if (!controller.online) {
         return false;
       }
       delivered.push({ sessionId: seat.sessionId, msgId: frame?.msgId ?? null, type: frame?.type ?? null });
       return true;
-    },
+    }),
+    deliveryStatusOf: overrides.deliveryStatusOf ?? null,
+    localSeatDeliveryOf: overrides.localSeatDeliveryOf ?? null,
     log: quietLog(),
     syncPeerPicker: () => [],
   });
@@ -446,6 +449,264 @@ test('新形态台账损坏：重建模板为新形态（managerTerm/joinSeqNext
   service.close();
 });
 
+/* —— M2 审查修复的判别用例 —— */
+
+function frameFor(collabId, msgId, fromSessionId = 'sess-peer', type = 'notice', payload = { text: '内容' }) {
+  return {
+    v: 1,
+    type,
+    msgId,
+    collabId,
+    from: { instanceId: 'inst-peer', sessionId: fromSessionId, identityName: '对端', port: 17322 },
+    payload,
+  };
+}
+
+test('C-1 新建席位带完整运行态：创建后首次注入不崩溃', async (t) => {
+  const { service, delivered } = makeService(t);
+  const created = service.create({ name: '新协作', topic: '主题', targets: [{ instanceId: 'inst-peer', identityName: '对端', address: '127.0.0.1', port: 17322 }], sessionId: 'sess-creator' });
+  assert.equal(created.ok, true, created.message);
+  await service.registerBridgeEntry('sess-creator', 'bridge-creator');
+  const injected = await service.injectLocalSeat(created.collabId, 'sess-creator', frameFor(created.collabId, 'm-new-1'));
+  assert.deepEqual(injected, { ok: true, delivered: true });
+  assert.deepEqual(delivered.map((item) => item.msgId), ['m-new-1']);
+  service.close();
+});
+
+test('I-2 先注册桥后创建：新席位绑定当前桥，首帧直接交付而非暂存', async (t) => {
+  const { service, delivered } = makeService(t);
+  await service.registerBridgeEntry('sess-creator', 'bridge-creator');
+  const created = service.create({ name: '新协作', topic: '主题', targets: [{ instanceId: 'inst-peer', identityName: '对端', address: '127.0.0.1', port: 17322 }], sessionId: 'sess-creator' });
+  assert.equal(created.ok, true);
+  assert.equal(service.seatsForRouting(created.collabId)[0].bridgeId, 'bridge-creator');
+  assert.deepEqual(await service.injectLocalSeat(created.collabId, 'sess-creator', frameFor(created.collabId, 'm-bind-1')), { ok: true, delivered: true });
+  assert.equal(delivered.length, 1);
+  service.close();
+});
+
+test('I-8 暂存被上限丢弃后释放 msgId：发送方重试不被永久判重', async (t) => {
+  const { service, dir, delivered, controller } = makeService(t, { config: { stagedMaxPerSeat: 1 } });
+  const collabId = seedTwoSeats(dir);
+  const live = reopen(t, dir, delivered, { config: { stagedMaxPerSeat: 1 }, controller });
+  controller.online = false;
+  assert.deepEqual(await live.injectLocalSeat(collabId, 'sess-dev', frameFor(collabId, 'drop-1')), { ok: true, staged: true });
+  assert.deepEqual(await live.injectLocalSeat(collabId, 'sess-dev', frameFor(collabId, 'drop-2')), { ok: true, staged: true });
+  assert.equal(live.stats().seatStagedDropped, 1, 'drop-1 被丢弃');
+  const retried = await live.injectLocalSeat(collabId, 'sess-dev', frameFor(collabId, 'drop-1'));
+  assert.deepEqual(retried, { ok: true, staged: true }, '重试不得命中 duplicate（否则消息永久丢失）');
+  assert.equal(live.stats().seatDuplicates, 0);
+  controller.online = true;
+  await live.registerBridgeEntry('sess-dev', 'bridge-dev');
+  assert.deepEqual(delivered.map((item) => item.msgId), ['drop-1'], '重试帧最终补投成功');
+  live.close();
+  service.close();
+});
+
+test('I-7 补投进行中新帧入队尾：交付顺序不越队', async (t) => {
+  let release = null;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const delivered = [];
+  const deliverSeat = async (frame, seat) => {
+    if (frame?.msgId === 'order-1') {
+      await gate;
+    }
+    delivered.push({ sessionId: seat.sessionId, msgId: frame?.msgId ?? null });
+    return true;
+  };
+  const { dir } = makeService(t);
+  const collabId = seedTwoSeats(dir);
+  const live = reopen(t, dir, delivered, { deliverSeat });
+  const offline = { ...live };
+  assert.equal(offline !== null, true);
+  /* 先离线暂存 order-1，再上线开始补投；补投被闸住时注入 order-2。 */
+  const staged = await live.injectLocalSeat(collabId, 'sess-dev', frameFor(collabId, 'order-1'));
+  assert.deepEqual(staged, { ok: true, staged: true });
+  const flushing = live.registerBridgeEntry('sess-dev', 'bridge-dev');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const during = await live.injectLocalSeat(collabId, 'sess-dev', frameFor(collabId, 'order-2'));
+  assert.deepEqual(during, { ok: true, staged: true }, '补投期间新帧先暂存');
+  release();
+  await flushing;
+  assert.deepEqual(delivered.map((item) => item.msgId), ['order-1', 'order-2'], '补投按到达序，新帧不得超车');
+  live.close();
+});
+
+test('I-6 离席按席位：同机一席退出不归档另一席', async (t) => {
+  const { dir, delivered } = makeService(t);
+  const collabId = seedTwoSeats(dir);
+  writeSeat(dir, collabId, seatOf('sess-dev2', { joinSeq: 3 }));
+  const service = reopen(t, dir, delivered);
+  const left = service.leave({ collabId, sessionId: 'sess-dev' });
+  assert.equal(left.ok, true, left.message);
+  assert.deepEqual(sessionIds(service.listLocalSeats(collabId)), ['sess-dev2', 'sess-mgr'], '只移除退出者席位');
+  assert.equal(service.list().collabs[0].state, 'active', '同机仍有站长/成员席：整机不得归档');
+  service.close();
+});
+
+test('C-7 治理写按席位授权：同机成员席不得 end/invite，可退出', async (t) => {
+  const { dir, delivered } = makeService(t);
+  const collabId = seedTwoSeats(dir);
+  const service = reopen(t, dir, delivered);
+  const target = { instanceId: 'inst-peer', identityName: '对端', address: '127.0.0.1', port: 17322 };
+  const memberEnd = service.end({ collabId, sessionId: 'sess-dev' });
+  assert.equal(memberEnd.ok, false);
+  assert.match(memberEnd.message, /站长席位/);
+  const memberInvite = service.invite({ collabId, targets: [target], sessionId: 'sess-dev' });
+  assert.equal(memberInvite.ok, false);
+  assert.match(memberInvite.message, /站长席位/);
+  const memberLeave = service.leave({ collabId, sessionId: 'sess-dev' });
+  assert.equal(memberLeave.ok, true, memberLeave.message);
+  const managerInvite = service.invite({ collabId, targets: [target], sessionId: 'sess-mgr' });
+  assert.equal(managerInvite.ok, true, managerInvite.message);
+  const managerEnd = service.end({ collabId, sessionId: 'sess-mgr' });
+  assert.equal(managerEnd.ok, true, managerEnd.message);
+  service.close();
+});
+
+test('C-8 受邀未入席会话按桥注册可注入；指名邀请不投非目标会话', async (t) => {
+  const { service, dir, delivered } = makeService(t);
+  const collabId = seedTwoSeats(dir);
+  const live = reopen(t, dir, delivered);
+  await live.registerBridgeEntry('sess-invitee', 'bridge-invitee');
+  await live.registerBridgeEntry('sess-bystander', 'bridge-bystander');
+  const targets = live.listInjectableTargets(collabId).map((seat) => seat.sessionId);
+  assert.ok(targets.includes('sess-invitee'), '未入席会话进入可注入目标');
+  const invite = frameFor(collabId, 'inv-1', 'sess-manager-peer', 'invite', { name: '项目', topic: '主题', members: [{ instanceId: 'inst-peer', sessionId: 'sess-manager-peer', identityName: '对端' }] });
+  assert.deepEqual(await live.injectLocalSeat(collabId, 'sess-invitee', invite), { ok: true, delivered: true });
+  const bystander = await live.injectLocalSeat(collabId, 'sess-bystander', { ...invite, msgId: 'inv-2', payload: { ...invite.payload, targetSessionId: 'sess-invitee' } });
+  assert.deepEqual(bystander, { ok: false, reason: 'not-invite-target' }, '指名邀请只投目标会话');
+  const nonInvite = await live.injectLocalSeat(collabId, 'sess-bystander', frameFor(collabId, 'n-1', 'sess-peer', 'notice'));
+  assert.deepEqual(nonInvite, { ok: false, reason: 'no-seat' }, '非邀请帧不得投未入席会话');
+  assert.deepEqual(await live.injectLocalSeat(collabId, 'sess-invitee', { ...invite, msgId: 'inv-3', payload: { name: '项目', topic: '主题', members: [] } }), { ok: true, delivered: true });
+  assert.deepEqual(delivered.filter((item) => item.sessionId === 'sess-invitee').map((item) => item.msgId), ['inv-1', 'inv-3']);
+  live.close();
+  service.close();
+});
+
+test('I-3/I-4 本机旁路落盘投递账并可查明细', async (t) => {
+  const { service, dir, delivered } = makeService(t, {
+    deliveryStatusOf: () => ({ msgId: 'm-ledger', tier: 'delivered' }),
+    localSeatDeliveryOf: () => ({ collabId: 'from-inbound', msgId: 'm-unknown', sessionId: 'sess-x', status: 'staged', complete: false }),
+  });
+  const collabId = seedTwoSeats(dir);
+  const live = reopen(t, dir, delivered, {
+    deliveryStatusOf: () => ({ msgId: 'm-ledger', tier: 'delivered' }),
+    localSeatDeliveryOf: () => ({ collabId: 'from-inbound', msgId: 'm-unknown', sessionId: 'sess-x', status: 'staged', complete: false }),
+  });
+  await live.registerBridgeEntry('sess-dev', 'bridge-dev');
+  await live.injectLocalSeat(collabId, 'sess-dev', frameFor(collabId, 'm-ledger'));
+  const detail = live.localSeatDeliveryOf('m-ledger', 'sess-dev');
+  assert.equal(detail.status, 'injected');
+  assert.equal(detail.complete, true);
+  const lines = readFileSync(join(collabDir(dir, collabId), 'inbox.jsonl'), 'utf8').split('\n').filter((line) => line.trim() !== '');
+  const record = JSON.parse(lines.at(-1));
+  assert.equal(record.local, true);
+  assert.deepEqual(record.fanout.outcomes, { 'sess-dev': 'injected' });
+  assert.deepEqual(live.deliveryStatusOf('m-ledger'), { msgId: 'm-ledger', tier: 'delivered' });
+  assert.equal(live.localSeatDeliveryOf('m-unknown', 'sess-x').status, 'staged', '未命中内存事实时委托接收管线账');
+  live.close();
+  service.close();
+});
+
+test('M8 I-1 写门不缓存正判定：运行中目录变 recovery 立即 fail-closed', async (t) => {
+  const { dir, delivered } = makeService(t);
+  const collabId = seedTwoSeats(dir);
+  const service = reopen(t, dir, delivered);
+  assert.equal(service.isWritable(collabId), true);
+  rmSync(join(collabDir(dir, collabId), 'ledger.jsonl'));
+  assert.equal(service.isWritable(collabId), false, '台账删除后重判为半写只读，不得沿用旧正判定');
+  assert.equal(service.send({ collabId, text: 'x' }).ok, false);
+  service.close();
+});
+
+test('I-10 站长席位文件缺失：按 carrier.manager 恢复席位并加载台账，不伪造 sessionId', async (t) => {
+  const { dir, delivered } = makeService(t);
+  const collabId = 'collab-recover-manager';
+  mkdirSync(collabDir(dir, collabId), { recursive: true });
+  const carrier = carrierOf(collabId);
+  carrier.manager = { instanceId: 'inst-self', sessionId: 'sess-mgr', identityName: '本机', term: 1 };
+  writeJson(carrierFilePath(dir, collabId), carrier);
+  writeFileSync(join(collabDir(dir, collabId), 'ledger.jsonl'), `${JSON.stringify(ledgerOf(collabId))}\n`, 'utf8');
+  const service = reopen(t, dir, delivered);
+  assert.equal(service.managerSeatOf(collabId)?.sessionId, 'sess-mgr');
+  assert.deepEqual(sessionIds(service.listLocalSeats(collabId)), ['sess-mgr']);
+  assert.equal(service.list().collabs[0].role, 'manager');
+  assert.equal(service.list().collabs[0].version, 2, '台账按 carrier 站长身份正常加载');
+  assert.equal(service.stats().seatRecoveredFromCarrier, 1);
+  service.close();
+});
+
+test('I-11 无会话标识拒绝创建：不落任何持久化', async (t) => {
+  const { service, dir } = makeService(t);
+  const result = service.create({ name: '无标识', topic: '主题', targets: [] });
+  assert.equal(result.ok, false);
+  assert.match(result.message, /会话标识/);
+  const collabs = join(dir, 'collabs');
+  assert.deepEqual(existsSync(collabs) ? readdirSync(collabs) : [], [], '拒绝路径不建协作目录');
+  service.close();
+});
+
+test('C-6 席位角色迁移原语：改席位角色后站长派生随之切换', async (t) => {
+  const { dir, delivered } = makeService(t);
+  const collabId = seedTwoSeats(dir);
+  const service = reopen(t, dir, delivered);
+  assert.equal(service.setSeatRole(collabId, 'sess-mgr', 'member').ok, true);
+  assert.equal(service.setSeatRole(collabId, 'sess-dev', 'manager').ok, true);
+  assert.equal(service.managerSeatOf(collabId).sessionId, 'sess-dev');
+  assert.equal(service.list().collabs[0].role, 'manager', '派生缓存随席位同步');
+  service.close();
+});
+
+test('能力闸门：未知先探测、不支持明确拒绝、已知支持不探测', async (t) => {
+  const target = { instanceId: 'inst-b', identityName: '对端', address: '127.0.0.1', port: 17322 };
+  let probes = 0;
+  const unsupported = makeService(t, {
+    probeCapability: async () => {
+      probes++;
+      return { ok: true, capability: 'unsupported' };
+    },
+    knownHosts: { remember: () => {}, participantsOf: () => undefined },
+  });
+  const refused = await unsupported.service.create({ name: '闸门', topic: '主题', targets: [target], sessionId: 'sess-gate-a' });
+  assert.equal(refused.ok, false);
+  assert.match(refused.message, /不支持会话级协作/);
+  assert.equal(probes, 1, '未知能力：先探测一次再拒绝');
+
+  const supported = makeService(t, {
+    probeCapability: async () => ({ ok: true, capability: 'supported' }),
+    knownHosts: { remember: () => {}, participantsOf: () => undefined },
+  });
+  const created = await supported.service.create({ name: '闸门', topic: '主题', targets: [target], sessionId: 'sess-gate-b' });
+  assert.equal(created.ok, true, created.message);
+
+  let skipped = 0;
+  const known = makeService(t, {
+    probeCapability: async () => {
+      skipped++;
+      return { ok: true, capability: 'unknown' };
+    },
+    knownHosts: { remember: () => {}, participantsOf: () => 2 },
+  });
+  const knownCreated = await known.service.create({ name: '闸门', topic: '主题', targets: [target], sessionId: 'sess-gate-c' });
+  assert.equal(knownCreated.ok, true, knownCreated.message);
+  assert.equal(skipped, 0, '已知支持不重复探测');
+  unsupported.service.close();
+  supported.service.close();
+  known.service.close();
+});
+
+test('接管授权：成员席可发起（不再被 managerOnly 拦下）', async (t) => {
+  const { dir, delivered } = makeService(t);
+  const collabId = seedTwoSeats(dir);
+  const service = reopen(t, dir, delivered);
+  const result = await service.takeOver({ collabId, sessionId: 'sess-dev' });
+  assert.equal(result.ok, false, '本机有站长席时接管会被业务门拒绝');
+  assert.doesNotMatch(result.message ?? '', /只有站长席位/, '不得在席位授权层拦成员会话');
+  service.close();
+});
+
 /* 重新以同一目录构造服务（模拟核心重启），沿用同一交付记录数组。 */
 function reopen(t, dir, delivered, overrides = {}) {
   return createCollabService({
@@ -454,15 +715,18 @@ function reopen(t, dir, delivered, overrides = {}) {
     self: { instanceId: 'inst-self', identityName: '本机', port: 17321 },
     send: () => ({ ok: true, msgId: 'q-1' }),
     sendDirect: () => ({ ok: true, msgId: 'd-1' }),
-    knownHosts: { remember: () => {} },
+    knownHosts: overrides.knownHosts ?? { remember: () => {} },
     notify: () => true,
-    deliverSeat: (frame, seat) => {
+    probeCapability: overrides.probeCapability ?? null,
+    deliverSeat: overrides.deliverSeat ?? ((frame, seat) => {
       if (overrides.controller !== undefined && !overrides.controller.online) {
         return false;
       }
       delivered.push({ sessionId: seat.sessionId, msgId: frame?.msgId ?? null, type: frame?.type ?? null });
       return true;
-    },
+    }),
+    deliveryStatusOf: overrides.deliveryStatusOf ?? null,
+    localSeatDeliveryOf: overrides.localSeatDeliveryOf ?? null,
     log: quietLog(),
     syncPeerPicker: () => [],
   });

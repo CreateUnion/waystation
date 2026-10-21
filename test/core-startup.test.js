@@ -1,21 +1,24 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { resolveCoreRoot, startCore } from '../src/core/main.js';
+import { carrierFilePath, collabDir, seatFilePath } from '../src/paths.js';
+import { expireCoreWhenSeatsAllow, inboundHooksOf, noteBridgeCount, resolveCoreRoot, startCore } from '../src/core/main.js';
 import { createIpcClient } from '../src/core/ipc.js';
+import { createCollabService } from '../src/collab/service.js';
+import { createInbound } from '../src/net/inbound.js';
 import { ANCHOR_PORT } from '../src/site.js';
 import { makeTempDir, pickFreePort, repoRoot, waitFor, waitForRebindable } from './helpers.js';
 
 const CORE_ENTRY = join(repoRoot, 'bin', 'waystation-core.js');
 const CORE_FILE = join('run', 'core.json');
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-/* 工具名清单（注册面冻结口径）：与既有会话组合根注册的 21 个工具逐字一致——核心持有注册表，
- * 本用例把「21 个 handler 全数注册」钉成断言。 */
-const TOOL_NAMES = ['ws_status', 'ws_list_hosts', 'ws_ping', 'ws_delivery_status', 'ws_check_inbox', 'ws_list_collabs', 'ws_create_collab', 'ws_approve_invite', 'ws_withdraw_invite', 'ws_view_ledger', 'ws_send_message', 'ws_set_mute', 'ws_leave_collab', 'ws_end_collab', 'ws_invite', 'ws_request_join', 'ws_join', 'ws_approve_join', 'ws_decide', 'ws_handover', 'ws_take_over'];
+/* 工具名清单（注册面冻结口径）：与既有会话组合根注册的 22 个工具逐字一致——核心持有注册表，
+ * 本用例把「22 个 handler 全数注册」钉成断言。 */
+const TOOL_NAMES = ['ws_status', 'ws_list_hosts', 'ws_ping', 'ws_delivery_status', 'ws_check_inbox', 'ws_list_collabs', 'ws_create_collab', 'ws_approve_invite', 'ws_allow_next_invite', 'ws_withdraw_invite', 'ws_view_ledger', 'ws_send_message', 'ws_set_mute', 'ws_leave_collab', 'ws_end_collab', 'ws_invite', 'ws_request_join', 'ws_join', 'ws_approve_join', 'ws_decide', 'ws_handover', 'ws_take_over'];
 const PORT_SETUP_ATTEMPTS = 3;
 
 /* 核心进程收尾（与 server.test.js 同一模式）：收尾钩子必须先于 makeTempDir 的删除钩子注册——
@@ -346,7 +349,7 @@ test('core.json 创建与正常退出删除（进程内）＋令牌轮换＋失�
   const first = await startCoreReady(t, prepare);
   const corePath = join(home, CORE_FILE);
   assertReadyRecord(readCoreJson(home), { home, port: first.core.port, pid: process.pid });
-  assert.deepEqual(first.core.registry.list().map((tool) => tool.name), TOOL_NAMES, '21 个处理器全数注册');
+  assert.deepEqual(first.core.registry.list().map((tool) => tool.name), TOOL_NAMES, '22 个处理器全数注册');
   const firstHeartbeat = readCoreJson(home).heartbeatAt;
   await waitFor(() => Date.parse(readCoreJson(home).heartbeatAt) > Date.parse(firstHeartbeat), { timeoutMs: 5000 });
   const firstToken = readCoreJson(home).token;
@@ -448,3 +451,166 @@ test('换代窗口（进程级）：并发第二个 replace 回 replacing；新�
   const exited = await waitExit(child);
   assert.deepEqual(exited, { code: 0, signal: null });
 });
+
+/* —— 席位存续（设计 §3.2）：有活跃席位时，核心空闲退出不得早于 max(核心宽限, 席位宽限+10s) —— */
+
+test('核心存续（进程内）：有活跃席位时空闲退出被延后；无席位按核心宽限退出', { timeout: 30000 }, async (t) => {
+  const withSeats = await startSeatHome(t);
+  assert.equal(await raceExit(withSeats, 500), false, '席位宽限（5s+10s）未到，核心不得退出');
+  await withSeats.stop();
+
+  const empty = await startEmptyHome(t);
+  assert.equal(await raceExit(empty, 5000), 0, '无席位：核心宽限到期正常退出 0');
+});
+
+async function seatInboundHarnessOf(home) {
+  const collabId = 'collab-seats';
+  seedSeatCollab(home);
+  writeFileSync(seatFilePath(home, collabId, 'sess-dev'), JSON.stringify({
+    version: 1, sessionId: 'sess-dev', role: 'member', state: 'member', joinSeq: 2, joinedAt: new Date().toISOString(), muted: false,
+  }));
+  const delivered = [];
+  const service = createCollabService({
+    dataDir: home,
+    config: { sessionSeatGraceMs: 5000 },
+    self: { instanceId: 'inst-seat', identityName: '本机', port: 17321 },
+    send: () => ({ ok: true, msgId: 'q-1' }),
+    sendDirect: () => ({ ok: true, msgId: 'd-1' }),
+    knownHosts: { remember: () => {} },
+    deliverSeat: (frame, seat) => {
+      delivered.push(seat.sessionId);
+      return true;
+    },
+    log: { info: () => {}, warn: () => {}, error: () => {} },
+    syncPeerPicker: () => [],
+  });
+  const state = {
+    dataDir: home,
+    config: { autoDeliver: true },
+    self: { instanceId: 'inst-seat', identityName: '本机', port: 17321 },
+    collab: service,
+    routing: { deliverToSession: async () => false },
+    log: { info: () => {}, warn: () => {}, error: () => {} },
+  };
+  await service.registerBridgeEntry('sess-mgr', 'bridge-mgr');
+  await service.registerBridgeEntry('sess-dev', 'bridge-dev');
+  return { collabId, delivered, service, state };
+}
+
+test('C-2 主核接线：sessionGate 逐席透传 meta——多席一静音一未静音各按收件席判定', async (t) => {
+  const home = makeCoreHome(t);
+  const { collabId, delivered, service, state } = await seatInboundHarnessOf(home);
+  const inbound = createInbound({
+    dataDir: home,
+    config: { messageTtlMs: 24 * 60 * 60 * 1000 },
+    self: state.self,
+    dispatch: { resolvePong: () => true, onAck: () => {}, onDeliveryReport: () => {}, send: () => ({ ok: true }) },
+    hooks: inboundHooksOf(state),
+    log: state.log,
+  });
+  const frame = {
+    v: 1,
+    cap: 2,
+    type: 'reply',
+    msgId: 'msg-mute-1',
+    collabId,
+    from: { instanceId: 'inst-peer', sessionId: 'sess-peer', identityName: '对端', port: 17322 },
+    toSessions: ['sess-mgr', 'sess-dev'],
+    payload: { text: '内容' },
+  };
+  inbound.onFrame({ remoteAddress: '127.0.0.1', send: () => {} }, frame);
+  await waitFor(() => delivered.length > 0);
+  assert.deepEqual(delivered, ['sess-dev'], '站长席静音不投；成员席未静音照常投（meta 不得被主核吞掉）');
+  inbound.stop();
+  service.close();
+});
+
+test('C-5 空闲续拍与桥重连竞争：桥数恢复后任何续拍都不得退出核心', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let exited = false;
+  const state = {
+    idleSince: Date.now(),
+    seatGraceTimer: null,
+    collab: { ensureCoreLifetimeForSeats: () => 15000 },
+    grace: { noteBridgeCount: () => {} },
+    exit: { settle: () => { exited = true; } },
+    log: { info: () => {}, warn: () => {} },
+    stopped: false,
+  };
+  await expireCoreWhenSeatsAllow(state);
+  assert.notEqual(state.seatGraceTimer, null, '席位下界未到：排一次续拍');
+  noteBridgeCount(state, 1);
+  assert.equal(state.idleSince, null, '桥已重连：不再处于空闲态');
+  assert.equal(state.seatGraceTimer, null, '重连同时撤销续拍');
+  t.mock.timers.tick(20000);
+  await Promise.resolve();
+  assert.equal(exited, false, '越过原续拍点仍存活');
+});
+
+test('I-9 核心退出写 core-stop.json：席位快照落盘供重启对账', async (t) => {
+  const home = makeCoreHome(t);
+  writeCoreConfig(home, { port: await pickFreePort(), sessionSeatGraceMs: 5000 });
+  seedSeatCollab(home);
+  const result = await startCore({ env: { ...coreEnv(home), WAYSTATION_TEST_GRACE_MS: '200' } });
+  assert.equal(result.ok, true);
+  await result.core.stop();
+  const marker = JSON.parse(readFileSync(join(home, 'run', 'core-stop.json'), 'utf8'));
+  assert.equal(typeof marker.at, 'string');
+  assert.equal(marker.pendingLeave, false);
+  assert.deepEqual(
+    marker.seats.map((seat) => [seat.collabId, seat.sessionId, seat.role]),
+    [['collab-seats', 'sess-mgr', 'manager']],
+  );
+});
+
+/* 有席位的核心数据根：一个活跃站长席位（新形态 carrier + 台账 + seats/）。 */
+async function startSeatHome(t) {
+  const home = makeCoreHome(t);
+  writeCoreConfig(home, { port: await pickFreePort(), sessionSeatGraceMs: 5000 });
+  seedSeatCollab(home);
+  const result = await startCore({ env: { ...coreEnv(home), WAYSTATION_TEST_GRACE_MS: '200' } });
+  assert.equal(result.ok, true);
+  cleanupOf(t).stops.push(() => result.core.stop());
+  return result.core;
+}
+
+async function startEmptyHome(t) {
+  const home = makeCoreHome(t);
+  writeCoreConfig(home, { port: await pickFreePort() });
+  const result = await startCore({ env: { ...coreEnv(home), WAYSTATION_TEST_GRACE_MS: '200' } });
+  assert.equal(result.ok, true);
+  cleanupOf(t).stops.push(() => result.core.stop());
+  return result.core;
+}
+
+/* 竞赛：核心在给定时间内退出则返回退出码，否则返回 false。 */
+function raceExit(core, ms) {
+  const timer = new Promise((resolve) => setTimeout(() => resolve(false), ms));
+  return Promise.race([core.whenExited().then((code) => code ?? 0), timer]);
+}
+
+function seedSeatCollab(home) {
+  const collabId = 'collab-seats';
+  const now = new Date().toISOString();
+  mkdirSync(collabDir(home, collabId), { recursive: true });
+  writeFileSync(carrierFilePath(home, collabId), JSON.stringify({
+    format: 'session-seats', version: 1, collabId, name: '存续用例', topic: '主题',
+    mode: 'managed', endpoints: {}, snapshotVersion: 1, createdAt: now,
+  }));
+  writeFileSync(join(collabDir(home, collabId), 'ledger.jsonl'), `${JSON.stringify(seatLedgerOf(collabId, now))}
+`);
+  mkdirSync(join(collabDir(home, collabId), 'seats'), { recursive: true });
+  writeFileSync(seatFilePath(home, collabId, 'sess-mgr'), JSON.stringify({
+    version: 1, sessionId: 'sess-mgr', role: 'manager', state: 'member', joinSeq: 1, joinedAt: now, muted: true,
+  }));
+}
+
+function seatLedgerOf(collabId, now) {
+  return {
+    version: 1, managerTerm: 1, joinSeqNext: 2, collabId, name: '存续用例', topic: '主题',
+    mode: 'managed', status: 'active',
+    manager: { instanceId: 'inst-seat', sessionId: 'sess-mgr', identityName: '本机', term: 1 },
+    members: [{ instanceId: 'inst-seat', sessionId: 'sess-mgr', identityName: '本机', role: 'manager', state: 'member', joinSeq: 1, joinedAt: now }],
+    board: [], createdAt: now, updatedAt: now,
+  };
+}

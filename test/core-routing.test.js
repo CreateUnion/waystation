@@ -8,13 +8,13 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { makeTempDir, pickFreePort, repoRoot, waitFor } from './helpers.js';
-import { coreJsonPath } from '../src/paths.js';
+import { carrierFilePath, collabDir, collabFilePath, coreJsonPath, seatFilePath } from '../src/paths.js';
 import { createIpcClient } from '../src/core/ipc.js';
 import { startCore } from '../src/core/main.js';
 import { bindingsFilePath } from '../src/paths.js';
 import {
   ADOPT_GUIDANCE_NOTICE, ADOPT_HELD_NOTICE, ATTRIBUTION_NOTICE, CALL_DEADLINE_MARGIN_MS, CALL_SAFETY_DEADLINE_MS, PUSH_RECEIPT_TIMEOUT_MS,
-  SESSIONLESS_NOTICE, attachNotice, bindingIsActive, classifyTool, createBindingStore, createInjectionRouter,
+  attachNotice, bindingIsActive, classifyTool, createBindingStore, createInjectionRouter,
 } from '../src/core/routing.js';
 import { MAX_TAKEOVER_WINDOW_MS, buildDefaults, loadConfig } from '../src/config.js';
 import { createCollabService } from '../src/collab/service.js';
@@ -91,11 +91,6 @@ function pushFramesOf(out, bridgeId = null) {
   return out.filter((entry) => entry.frame.type === 'push' && (bridgeId === null || entry.record.bridgeId === bridgeId));
 }
 
-function bindingOf(dir, collabId) {
-  const parsed = JSON.parse(readFileSync(bindingsFilePath(dir), 'utf8'));
-  return parsed[collabId];
-}
-
 function sampleFrame(collabId, overrides = {}) {
   return {
     v: 1,
@@ -132,22 +127,22 @@ function readInboxText(dir, collabId) {
 
 /* —— A. 绑定表（store） —— */
 
-test('绑定表：写入即落盘（原子替换）、读回、删条目、新实例加载恢复', (t) => {
+test('绑定表（兼容面）：内存读写与删除；不再落盘', (t) => {
   const dir = makeTempDir(t);
   const store = createBindingStore({ dataDir: dir, log: quietLog() });
   store.load();
   assert.equal(store.get('collab-x'), null, '空表读回 null');
   store.set('collab-x', { sessionId: 'session-a', bridgeId: 'bridge-a', boundAt: '2026-10-15T00:00:00.000Z', origin: 'create' });
-  assert.deepEqual(bindingOf(dir, 'collab-x'), { sessionId: 'session-a', bridgeId: 'bridge-a', boundAt: '2026-10-15T00:00:00.000Z', origin: 'create' }, '落盘形态 = 表结构本身');
+  assert.equal(store.get('collab-x').sessionId, 'session-a');
+  assert.equal(existsSync(bindingsFilePath(dir)), false, '退役后不写 run/bindings.json');
   const reloaded = createBindingStore({ dataDir: dir, log: quietLog() });
   reloaded.load();
-  assert.equal(reloaded.get('collab-x').sessionId, 'session-a', '重启恢复：新实例读回同绑定');
+  assert.equal(reloaded.get('collab-x'), null, '新实例不读旧文件（注入来源已改席位表）');
   reloaded.remove('collab-x');
   assert.equal(reloaded.get('collab-x'), null);
-  assert.deepEqual(JSON.parse(readFileSync(bindingsFilePath(dir), 'utf8')), {}, '删条目已落盘');
 });
 
-test('绑定表：坏文件（不可解析 / 非对象 / 坏条目）→ 空表继续并留痕，不抛错', (t) => {
+test('绑定表：旧文件（可解析 / 坏档 / 坏条目）一律忽略，不抛错', (t) => {
   const dir = makeTempDir(t);
   mkdirSync(join(dir, 'run'), { recursive: true });
   writeFileSync(bindingsFilePath(dir), '{ 坏的 JSON', 'utf8');
@@ -155,25 +150,21 @@ test('绑定表：坏文件（不可解析 / 非对象 / 坏条目）→ 空表�
   const store = createBindingStore({ dataDir: dir, log: quietLog(lines) });
   store.load();
   assert.deepEqual(store.entries(), [], '坏文件按空表继续');
-  assert.ok(lines.some((line) => line.level === 'warn'), '留痕');
-  assert.equal(store.stats().corruptLoads, 1);
+  assert.equal(store.stats().corruptLoads, 0, '退役后不再解析旧文件（无损坏计数）');
 
-  writeFileSync(bindingsFilePath(dir), JSON.stringify({ 'collab-a': { sessionId: 'session-a' }, 'collab-ok': { sessionId: 'session-b', bridgeId: 'bridge-b', boundAt: 'x', origin: 'join' } }), 'utf8');
+  writeFileSync(bindingsFilePath(dir), JSON.stringify({ 'collab-ok': { sessionId: 'session-b', bridgeId: 'bridge-b', boundAt: 'x', origin: 'join' } }), 'utf8');
   const second = createBindingStore({ dataDir: dir, log: quietLog(lines) });
   second.load();
-  assert.equal(second.get('collab-a'), null, '形态不符的条目被丢弃');
-  assert.equal(second.get('collab-ok').sessionId, 'session-b', '合法条目照常载入');
-  assert.equal(second.stats().droppedEntries, 1);
+  assert.equal(second.get('collab-ok'), null, '合法旧条目也不再载入');
 });
 
-test('绑定表：origin grant 条目照常载入（离线获准的持久映射——重开即活）', (t) => {
+test('绑定表：origin grant 条目不再恢复为注入映射（退役）', (t) => {
   const dir = makeTempDir(t);
   mkdirSync(join(dir, 'run'), { recursive: true });
   writeFileSync(bindingsFilePath(dir), JSON.stringify({ 'collab-g': { sessionId: 'session-g', bridgeId: 'session-g', boundAt: '2026-10-16T00:00:00.000Z', origin: 'grant' } }), 'utf8');
   const store = createBindingStore({ dataDir: dir, log: quietLog() });
   store.load();
-  assert.equal(store.get('collab-g').origin, 'grant', 'grant 入词表：加载面不再丢弃（重开即活）');
-  assert.equal(store.stats().droppedEntries, 0, '无丢弃条目');
+  assert.equal(store.get('collab-g'), null, 'grant 映射不再从盘上恢复（席位表是唯一来源）');
 });
 
 test('活跃判定：绑定会话有在线桥 → 活跃；桥退场 → 休眠（不写盘，派生自注册表）', () => {
@@ -190,13 +181,14 @@ test('活跃判定：绑定会话有在线桥 → 活跃；桥退场 → 休眠�
 
 /* —— B. adopt 判定（仅休眠可夺；活跃不夺席＋notice） —— */
 
-test('adopt：空绑定 + 写类调用 → 夺席（origin adopt，落盘）', (t) => {
+test('adopt：空绑定 + 写类调用 → 记录内存绑定（不落盘）', (t) => {
   const { router, registry, dir } = makeRouter(t);
   registry.register(bridgeRecord('bridge-b', 'session-b'));
   const outcome = router.applyAdopt({ tool: 'ws_send_message', args: { collabId: 'collab-x' }, caller: { bridgeId: 'bridge-b', sessionId: 'session-b' }, now: Date.parse('2026-10-15T01:02:03.000Z') });
   assert.equal(outcome.adopted, true);
   assert.equal(outcome.notice, null);
-  assert.deepEqual(bindingOf(dir, 'collab-x'), { sessionId: 'session-b', bridgeId: 'bridge-b', boundAt: new Date(Date.parse('2026-10-15T01:02:03.000Z')).toISOString(), origin: 'adopt' });
+  assert.equal(router.bindings.get('collab-x').origin, 'adopt');
+  assert.equal(existsSync(bindingsFilePath(dir)), false, '绑定表退役：夺席不写盘');
 });
 
 test('adopt：休眠绑定 + 写类调用 → 夺席；绑定活跃 → 不夺席＋notice 指引', (t) => {
@@ -454,25 +446,23 @@ test('链一·无绑定邀请：渲染失败按未投处置（不投、留痕、
   assert.ok(lines.some((line) => line.level === 'warn' && line.message.includes('渲染失败')), '留痕');
 });
 
-test('链一·邀请分投不误伤：活跃绑定单投其桥（不广播）；休眠条目、非 invite 无绑定仍不投', async (t) => {
+test('链一·邀请不看绑定（0.2.0）：有绑定也广播全部活跃桥；非 invite 无席位不投', async (t) => {
   const { router, registry, out } = makeRouter(t);
   registry.register(bridgeRecord('bridge-a', 'session-a'));
   registry.register(bridgeRecord('bridge-b', 'session-b'));
   router.bindings.set('collab-x', { sessionId: 'session-a', bridgeId: 'bridge-a', boundAt: 'x', origin: 'create' });
-  const bound = router.deliverToSession(inviteFrameOf('collab-x'));
-  await settleFirstPush(router, out);
-  assert.equal(await bound, true);
-  assert.equal(pushFramesOf(out, 'bridge-a').length, 1, '绑定活跃：单投绑定桥');
-  assert.equal(pushFramesOf(out, 'bridge-b').length, 0, '不广播给其他桥');
+  const invited = router.deliverToSession(inviteFrameOf('collab-x'));
+  await waitFor(() => pushFramesOf(out).length >= 2);
+  for (const push of pushFramesOf(out)) {
+    router.settleDelivered({ type: 'delivered', pushId: push.frame.pushId, ok: true });
+  }
+  assert.equal(await invited, true);
+  assert.equal(pushFramesOf(out, 'bridge-a').length, 1, '邀请投全部活跃桥（不再受绑定限制）');
+  assert.equal(pushFramesOf(out, 'bridge-b').length, 1, '同机其他活跃会话也收到邀请');
 
-  router.bindings.set('collab-sleep', { sessionId: 'session-ghost', bridgeId: 'bridge-ghost', boundAt: 'x', origin: 'create' });
-  assert.equal(await router.deliverToSession(inviteFrameOf('collab-sleep')), false, '休眠条目：邀请同样不投（该协作已有席位）');
-  assert.equal(pushFramesOf(out).length, 1, '休眠条目不作广播兜底');
+  assert.equal(await router.deliverToSession(sampleFrame('collab-y')), false, '非 invite 的无席位帧不投');
+  assert.equal(pushFramesOf(out).length, 2);
   assert.equal(router.stats().inboundUnrouted, 1);
-
-  assert.equal(await router.deliverToSession(sampleFrame('collab-y')), false, '非 invite 的无绑定帧不投');
-  assert.equal(pushFramesOf(out).length, 1);
-  assert.equal(router.stats().inboundUnrouted, 2);
 });
 
 test('链一·无绑定邀请多桥：单桥悬挂不阻断其余；全败 → false 计未投', async (t) => {
@@ -579,12 +569,12 @@ function namedInviteFrameOf(collabId, targetSessionId, overrides = {}) {
   return frame;
 }
 
-test('链一·指名邀请：只投目标会话的桥（全标识与短码前缀都算命中），其余活跃桥一条不投', async (t) => {
-  const { router, registry, out } = makeRouter(t);
-  registry.register(bridgeRecord('bridge-a', 'session-alpha'));
-  registry.register(bridgeRecord('bridge-b', 'session-beta'));
-  registry.register(bridgeRecord('bridge-c', 'session-gamma-full'));
-  const byPrefix = router.deliverToSession(namedInviteFrameOf('collab-new', 'session-b'));
+test('链一·指名邀请：只投目标会话的桥（完整标识／短码精确命中），其余活跃桥一条不投', async (t) => {
+  const { router, registry, out } = makeRouter(t, { receiptTimeoutMs: 60 });
+  registry.register(bridgeRecord('bridge-a', 'alpha-0001'));
+  registry.register(bridgeRecord('bridge-b', 'beta-0001'));
+  registry.register(bridgeRecord('bridge-c', 'gamma-0001'));
+  const byShort = router.deliverToSession(namedInviteFrameOf('collab-new', 'beta-000'));
   await waitFor(() => pushFramesOf(out, 'bridge-b').length >= 1);
   assert.equal(pushFramesOf(out, 'bridge-a').length, 0, '非目标会话不投（不广播）');
   assert.equal(pushFramesOf(out, 'bridge-c').length, 0, '非目标会话不投');
@@ -592,10 +582,10 @@ test('链一·指名邀请：只投目标会话的桥（全标识与短码前缀
   assert.equal(pushFramesOf(out, 'bridge-b')[0].frame.frameType, 'invite', '推送面 frameType 带原帧类型');
   assert.ok(pushFramesOf(out, 'bridge-b')[0].frame.text.includes('回信：ws_send_message'), '文本沿用链一核心渲染');
   await settleFirstPush(router, out);
-  assert.equal(await byPrefix, true, '目标在场合一：投出成立');
+  assert.equal(await byShort, true, '短码精确命中：投出成立');
   assert.equal(router.stats().inboundPushed, 1);
 
-  const byFullId = router.deliverToSession(namedInviteFrameOf('collab-new', 'session-gamma-full'));
+  const byFullId = router.deliverToSession(namedInviteFrameOf('collab-new', 'gamma-0001'));
   await waitFor(() => pushFramesOf(out, 'bridge-c').length >= 1);
   assert.equal(pushFramesOf(out, 'bridge-c').length, 1, '全标识直接命中');
   await settleFirstPush(router, out);
@@ -603,15 +593,15 @@ test('链一·指名邀请：只投目标会话的桥（全标识与短码前缀
   assert.equal(router.bindings.get('collab-new'), null, '指名投递同样不写绑定');
 });
 
-test('链一·指名邀请：目标不在场 / 前缀歧义 → 不投（不猜接收者）；未投计数与失败面互斥', async (t) => {
+test('链一·指名邀请：目标不在场 / 短码歧义 → 不投（不猜接收者）；未投计数与失败面互斥', async (t) => {
   const { router, registry, out } = makeRouter(t);
-  registry.register(bridgeRecord('bridge-a', 'session-alpha'));
-  registry.register(bridgeRecord('bridge-b1', 'session-beta-one'));
-  registry.register(bridgeRecord('bridge-b2', 'session-beta-two'));
-  assert.equal(await router.deliverToSession(namedInviteFrameOf('collab-new', 'session-b')), false, '前缀歧义：按指定会话不在场处置');
-  assert.equal(await router.deliverToSession(namedInviteFrameOf('collab-new', 'session-zzz')), false, '目标不在场：不投');
+  registry.register(bridgeRecord('bridge-a', 'shared-aa'));
+  registry.register(bridgeRecord('bridge-b1', 'shared-ab'));
+  registry.register(bridgeRecord('bridge-b2', 'shared-ac'));
+  assert.equal(await router.deliverToSession(namedInviteFrameOf('collab-new', 'shared-a')), false, '短码歧义：按指定会话不在场处置');
+  assert.equal(await router.deliverToSession(namedInviteFrameOf('collab-new', 'zzz-0000')), false, '目标不在场：不投');
   assert.equal(await router.deliverToSession(namedInviteFrameOf('collab-new', '非法 目标')), false, '形态坏的目标：落回未投');
-  const broken = namedInviteFrameOf('collab-new', 'session-alpha');
+  const broken = namedInviteFrameOf('collab-new', 'shared-aa');
   delete broken.from;
   assert.equal(await router.deliverToSession(broken), false, '渲染失败：只丢该条（不投、不登记）');
   assert.equal(pushFramesOf(out).length, 0, '零推送（数据已落盘，工具与观察窗照常可拉）');
@@ -669,13 +659,13 @@ test('链二②：定时器/入站类提示按绑定路由；休眠/无绑定 �
 test('链二·按会话寻址提示：携 targetSessionId → 投该会话的桥（不按绑定）；目标不在场即丢弃留痕', async (t) => {
   const lines = [];
   const { router, registry, out } = makeRouter(t, { log: quietLog(lines) });
-  registry.register(bridgeRecord('bridge-a', 'session-alpha'));
-  registry.register(bridgeRecord('bridge-b', 'session-beta'));
+  registry.register(bridgeRecord('bridge-a', 'alpha-0001'));
+  registry.register(bridgeRecord('bridge-b', 'beta-0001'));
   router.bindings.set('collab-x', { sessionId: 'session-alpha', bridgeId: 'bridge-a', boundAt: 'x', origin: 'create' });
-  const targeted = noticeFrameOf('collab-x', '加入申请被拒绝：协作「甲」的站长拒绝了本会话（session-b）的加入申请');
-  targeted.payload.targetSessionId = 'session-b';
+  const targeted = noticeFrameOf('collab-x', '加入申请被拒绝：协作「甲」的站长拒绝了本会话（session-beta）的加入申请');
+  targeted.payload.targetSessionId = 'beta-000';
   assert.equal(router.notify(targeted), true, '定向提示：投达');
-  assert.equal(pushFramesOf(out, 'bridge-b').length, 1, '投目标会话的桥（短码前缀命中）');
+  assert.equal(pushFramesOf(out, 'bridge-b').length, 1, '投目标会话的桥（短码精确命中）');
   assert.equal(pushFramesOf(out, 'bridge-a').length, 0, '不按绑定投持席会话');
   assert.equal(router.stats().notifySession, 1);
 
@@ -808,11 +798,20 @@ function createWiringTools() {
 
 /* 会话获准（真链路）：本机即站长 → 申请直落待批准面 → 本机自批（写获准台账 ＋ 接线）；
  * 随即解绑——构造「已获准、绑定空」的前态，夺席判据（获准判据）由此就位。 */
+/* 两段式入席（0.2.0）：申请 → 站长批准（join-grant）→ 申请人 confirm 才成席。 */
 async function grantSessionFor(w, collabId, sessionId) {
   const requested = await w.service.join.request({ collabId, sessionId });
   assert.equal(requested.ok, true, requested.message ?? '加入申请受理');
-  const approved = w.service.join.approve({ collabId, sessionId, approve: true, approvedBy: 'session-a' });
+  const approved = await w.service.join.approve({ collabId, sessionId, approve: true, approvedBy: 'session-a', managerSessionId: 'session-a' });
   assert.equal(approved.ok, true, approved.message ?? '本机自批受理');
+  if (approved.joining === true) {
+    const confirmed = w.service.join.confirmJoining(approved.joinId, sessionId, {
+      instanceId: w.self.instanceId,
+      managerTerm: 1,
+      activeSeats: 1,
+    });
+    assert.equal(confirmed.ok, true, confirmed.message ?? '确认入席');
+  }
   w.router.bindings.remove(collabId);
 }
 
@@ -829,7 +828,7 @@ async function makeKnockScenario(t) {
   const recordA = bridgeRecord('bridge-a', 'session-a');
   registry.register(recordA);
   registry.register(bridgeRecord('bridge-b', 'session-b'));
-  const created = await service.create({ name: '讨论甲', topic: '议题', targets: [TARGET_PEER], mode: 'forum' });
+  const created = await service.create({ name: '讨论甲', topic: '议题', targets: [TARGET_PEER], mode: 'forum', sessionId: 'session-a' });
   router.bindings.set(created.collabId, { sessionId: 'session-a', bridgeId: 'bridge-a', boundAt: 'x', origin: 'create' });
   return { harness, lines, service, registry, router, out, recordA, collabId: created.collabId };
 }
@@ -872,16 +871,16 @@ function bareService(t, notify) {
 
 test('join-ack：通知面缺省（无 notify 注入）或返回非显式 false 时维持旧行为（兼容面）', async (t) => {
   const service = bareService(t);
-  const created = await service.create({ name: '讨论甲', topic: '议题', targets: [TARGET_PEER], mode: 'forum' });
+  const created = await service.create({ name: '讨论甲', topic: '议题', targets: [TARGET_PEER], mode: 'forum', sessionId: 'session-a' });
   assert.equal(created.ok, true);
   assert.equal(service.joinKnock(knockOf('讨论甲')).length, 1, '无 notify 注入：按旧行为应答');
 
   const legacy = bareService(t, (frame) => [{ frame }].length);
-  assert.equal((await legacy.create({ name: '讨论甲', topic: '议题', targets: [TARGET_PEER], mode: 'forum' })).ok, true);
+  assert.equal((await legacy.create({ name: '讨论甲', topic: '议题', targets: [TARGET_PEER], mode: 'forum', sessionId: 'session-a' })).ok, true);
   assert.equal(legacy.joinKnock(knockOf('讨论甲')).length, 1, 'notify 返回真值（旧式注入面）：照旧应答');
 
   const refused = bareService(t, () => false);
-  assert.equal((await refused.create({ name: '讨论甲', topic: '议题', targets: [TARGET_PEER], mode: 'forum' })).ok, true);
+  assert.equal((await refused.create({ name: '讨论甲', topic: '议题', targets: [TARGET_PEER], mode: 'forum', sessionId: 'session-a' })).ok, true);
   assert.deepEqual(refused.joinKnock(knockOf('讨论甲')), [], 'notify 显式 false（无接收者）：不回应答');
 });
 
@@ -904,7 +903,13 @@ async function callRaw(harness, tool, args, record) {
 
 async function callTool(harness, tool, args, record) {
   const result = await callRaw(harness, tool, args, record);
-  return JSON.parse(result.content[0].text);
+  const text = result.content[0].text;
+  try {
+    return JSON.parse(text);
+  } catch {
+    /* 工具层拒绝（errorResult）是纯文案：按统一形状返回，断言读 ok/message。 */
+    return { ok: false, message: text };
+  }
 }
 
 test('wiring·call 执行面：call 帧 → handler（per-request context 带 bridgeId/sessionId）→ result 帧', async (t) => {
@@ -988,79 +993,62 @@ test('wiring·链一全链：准入→落盘→消费→投递→第三档（回
   assert.equal(harness.reports.length, 1, '未注入不发第三档');
 });
 
-test('wiring·静音抑制不 push（内容类被 sessionGate 拦下）；adopt 不写默认静音（夺席后消息照投）', async (t) => {
+test('wiring·席位级静音：入席默认静音抑制内容类推送；取消后照常注入', async (t) => {
   const harness = makeWiring(t);
-  const { service, registry, router, out, inbound, dir } = harness;
+  const { service, registry, out, inbound } = harness;
   const recordA = bridgeRecord('bridge-a', 'session-a');
   registry.register(recordA);
   const created = await callTool(harness, 'ws_create_collab', { name: '项目甲', topic: '主题', targets: [TARGET_PEER] }, recordA);
   const collabId = created.collabId;
-  assert.ok(existsSync(join(dir, 'collabs', collabId, 'mute.json')), '入席默认静音（create 写点）');
+  assert.equal(service.localSeatOf(collabId, 'session-a').muted, true, '创建会话席位默认静音');
 
   const connection = connectionStub();
   inbound.onFrame(connection, sampleFrame(collabId));
   await waitFor(() => connection.acks.length >= 1);
   await new Promise((resolve) => setTimeout(resolve, 30));
-  assert.equal(pushFramesOf(out).length, 0, '静音抑制内容类不 push（判定在核心，判定不变）');
+  assert.equal(pushFramesOf(out).length, 0, '静音抑制内容类不 push');
 
   await callTool(harness, 'ws_set_mute', { collabId, muted: false }, recordA);
-  registry.remove(recordA);
-  const recordB = bridgeRecord('bridge-b', 'session-b');
-  registry.register(recordB);
-  await grantSessionFor(harness, collabId, 'session-b');
-  const mutedWrites = service.stats().notificationsSent + service.stats().notificationsDropped;
-  await callTool(harness, 'ws_send_message', { collabId, text: '接手' }, recordB);
-  assert.equal(router.bindings.get(collabId).sessionId, 'session-b', '已获准：休眠/空绑定下写类调用夺席');
-  assert.equal(JSON.parse(readFileSync(join(dir, 'collabs', collabId, 'mute.json'), 'utf8')).muted, false, 'adopt 不写默认静音');
-  assert.equal(service.stats().notificationsSent + service.stats().notificationsDropped, mutedWrites, '夺席本身不产生提示');
-  const pushesBefore = pushFramesOf(out).length;
-  inbound.onFrame(connection, sampleFrame(collabId, { payload: { text: '夺席后' } }));
-  await waitFor(() => pushFramesOf(out).length > pushesBefore);
-  assert.equal(pushFramesOf(out).at(-1).record.bridgeId, 'bridge-b', '夺席后 push 投新绑定会话');
+  assert.equal(service.localSeatOf(collabId, 'session-a').muted, false, '静音只改本席位');
+  const before = pushFramesOf(out).length;
+  inbound.onFrame(connection, sampleFrame(collabId, { payload: { text: '取消静音后' } }));
+  await waitFor(() => pushFramesOf(out).length > before);
+  assert.equal(pushFramesOf(out).at(-1).record.bridgeId, 'bridge-a');
 });
 
-test('wiring·取消静音摘要恰一条＋adopt 先于 handler：夺席后摘要投调用者，响应无归属 notice', async (t) => {
+test('wiring·取消静音摘要恰一条：座位级开关切换向调用者桥投一行', async (t) => {
   const harness = makeWiring(t);
-  const { registry, router, out } = harness;
+  const { registry, out } = harness;
   const recordA = bridgeRecord('bridge-a', 'session-a');
   registry.register(recordA);
   const created = await callTool(harness, 'ws_create_collab', { name: '项目甲', topic: '主题', targets: [TARGET_PEER] }, recordA);
   const collabId = created.collabId;
-  await callTool(harness, 'ws_set_mute', { collabId, muted: true }, recordA);
-  registry.remove(recordA);
 
-  const recordB = bridgeRecord('bridge-b', 'session-b');
-  registry.register(recordB);
-  await grantSessionFor(harness, collabId, 'session-b');
-  const payload = await callTool(harness, 'ws_set_mute', { collabId, muted: false }, recordB);
+  const payload = await callTool(harness, 'ws_set_mute', { collabId, muted: false }, recordA);
   assert.equal(payload.ok, true);
-  assert.equal('notice' in payload, false, '夺席后调用者即绑定：无归属/指引 notice');
-  const pushes = pushFramesOf(out, 'bridge-b');
-  assert.equal(pushes.length, 1, '取消静音摘要恰一条（adopt 判定先于 handler——摘要不因休眠丢失）');
-  assert.ok(pushes[0].frame.text.includes('静音期间本协作新增'), '摘要文案');
-  assert.equal(pushFramesOf(out, 'bridge-a').length, 0, '不投 A');
-  assert.equal(router.bindings.get(collabId).sessionId, 'session-b');
+  assert.equal('notice' in payload, false, '同席调用：无归属/指引 notice');
+  const pushes = pushFramesOf(out, 'bridge-a');
+  assert.equal(pushes.length, 1, '取消静音摘要恰一条');
+  assert.ok(pushes[0].frame.text.includes('静音期间本协作'), '摘要文案');
 });
 
-test('wiring·活跃绑定下的跨会话写类调用：不夺席＋工具响应附 notice 指引（摘要投调用者）', async (t) => {
+test('wiring·写类调用不再夺席：席位表是唯一来源（无席位会话不产生席位/绑定变更）', async (t) => {
   const harness = makeWiring(t);
-  const { registry, router, out } = harness;
+  const { service, registry, router, out } = harness;
   const recordA = bridgeRecord('bridge-a', 'session-a');
   registry.register(recordA);
   const created = await callTool(harness, 'ws_create_collab', { name: '项目甲', topic: '主题', targets: [TARGET_PEER] }, recordA);
   const collabId = created.collabId;
-  await callTool(harness, 'ws_set_mute', { collabId, muted: true }, recordA);
   const recordB = bridgeRecord('bridge-b', 'session-b');
   registry.register(recordB);
 
-  const payload = await callTool(harness, 'ws_set_mute', { collabId, muted: false }, recordB);
-  assert.equal(payload.ok, true);
-  assert.equal(router.bindings.get(collabId).sessionId, 'session-a', '绑定活跃：不夺席');
-  assert.ok(payload.notice.includes(ADOPT_HELD_NOTICE), 'notice 指引（席位被持有文案）');
-  assert.ok(payload.notice.includes(ATTRIBUTION_NOTICE), '归属说明（链二① 非绑定会话）');
-  const pushesB = pushFramesOf(out, 'bridge-b');
-  assert.equal(pushesB.length, 1, '调用者相关提示投调用者桥');
-  assert.ok(pushesB[0].frame.text.includes('静音期间本协作新增'));
+  const refused = await callTool(harness, 'ws_set_mute', { collabId, muted: false }, recordB);
+  assert.equal(refused.ok, false, '静音按席位：无席位会话不得改他人席位');
+  assert.match(refused.message, /没有席位/);
+  assert.equal(service.localSeatOf(collabId, 'session-b'), null, '写类调用不创建席位');
+  assert.equal(service.localSeatOf(collabId, 'session-a').muted, true, '站长席静音不被他人改动');
+  assert.equal(router.bindings.get(collabId).sessionId, 'session-a', '绑定仍是创建会话（不因他人写类调用转移）');
+  assert.equal(pushFramesOf(out, 'bridge-b').length, 0, '拒绝路径不产生注入');
 });
 
 test('wiring·adopt 收紧：未获准会话的写类调用不夺席＋未获准指引（判据面经真服务注入）；获准后夺席', async (t) => {
@@ -1074,15 +1062,18 @@ test('wiring·adopt 收紧：未获准会话的写类调用不夺席＋未获准
   const recordB = bridgeRecord('bridge-b', 'session-b');
   registry.register(recordB);
   const refused = await callTool(harness, 'ws_set_mute', { collabId, muted: false }, recordB);
-  assert.equal(refused.ok, true, '写类调用照常执行（不夺席＋指引——不是阻断）');
-  assert.ok(refused.notice.includes(ADOPT_GUIDANCE_NOTICE), '未获准指引（获准台账判据生效）');
-  assert.equal(router.bindings.get(collabId).sessionId, 'session-a', '未获准：绑定原样（不夺席）');
-  assert.equal(router.stats().adoptGrantRefusals, 1);
+  assert.equal(refused.ok, false, '无席位会话：写类调用被席位面拒绝（不夺席、不改他人）');
+  assert.match(refused.message, /没有席位/);
+  assert.equal(router.bindings.get(collabId).sessionId, 'session-a', '绑定仍是创建会话（不因他人写类调用转移）');
 
   await grantSessionFor(harness, collabId, 'session-b');
-  const adopted = await callTool(harness, 'ws_set_mute', { collabId, muted: true }, recordB);
-  assert.equal(adopted.ok, true);
-  assert.equal(router.bindings.get(collabId).sessionId, 'session-b', '获准后：休眠/空绑定下夺席');
+  /* 获准＝成为席位：静音按会话直接生效；绑定表只留兼容记录，不再是注入来源。 */
+  const seated = harness.service.setMute({ collabId, muted: true, sessionId: 'session-b' });
+  assert.equal(seated.ok, true, seated.message);
+  assert.equal(harness.service.localSeatOf(collabId, 'session-b').muted, true);
+  const adopted = await callTool(harness, 'ws_set_mute', { collabId, muted: false }, recordB);
+  assert.equal(adopted.ok, true, adopted.message ?? '获准入席后按本会话席位生效');
+  assert.equal(harness.service.localSeatOf(collabId, 'session-b').muted, false);
 });
 
 test('wiring·join-deny 呈现按申请会话寻址：拒绝提示投被拒会话的桥（未接线也投得到），其余桥不投', async (t) => {
@@ -1205,33 +1196,103 @@ function sendPeerFrame(port, frame) {
   });
 }
 
-function peerMessageFrame(collabId, text, peerPort) {
+function peerMessageFrame(collabId, text, peerPort, overrides = {}) {
   return {
     v: 1,
+    cap: 2,
     type: 'reply',
     msgId: randomUUID(),
-    from: { instanceId: 'inst-peer', identityName: '对端', port: peerPort },
+    from: { instanceId: 'inst-peer', sessionId: 'session-peer-1', identityName: '对端', port: peerPort },
     collabId,
     ts: new Date().toISOString(),
     payload: { text },
+    ...overrides,
   };
 }
 
-function toolPayloadOf(result) {
-  assert.equal(result.isError ?? false, false, `工具不应报错：${result.content?.[0]?.text?.slice(0, 160)}`);
-  return JSON.parse(result.content[0].text);
+/* 会话级种子（0.2.0）：核心启动前落 carrier + 新形态台账 + 席位文件，使 e2e 从真实加载路径
+ * 进入「本机席位表驱动注入」的新语义（create 的落盘形态与运行时席位由 M3/M2 负责）。 */
+function seedSessionCollab(root, collabId, { name = '路由环', topic = '主题', managerSessionId = 'session-e2e-a', seats = [] } = {}) {
+  const now = new Date().toISOString();
+  const manager = { instanceId: 'inst-e2e', sessionId: managerSessionId, identityName: '本机', term: 1 };
+  const members = seats.map((seat) => ({
+    instanceId: 'inst-e2e',
+    sessionId: seat.sessionId,
+    identityName: '本机',
+    role: seat.role,
+    state: 'member',
+    joinSeq: seat.joinSeq,
+    joinedAt: now,
+  }));
+  mkdirSync(collabDir(root, collabId), { recursive: true });
+  writeFileSync(carrierFilePath(root, collabId), JSON.stringify({
+    format: 'session-seats',
+    version: 1,
+    collabId,
+    name,
+    topic,
+    mode: 'managed',
+    endpoints: {},
+    snapshotVersion: 1,
+    createdAt: now,
+    manager,
+  }, null, 2));
+  writeSessionSeedLedger(root, { collabId, name, topic, manager, members, now });
+  mkdirSync(join(collabDir(root, collabId), 'seats'), { recursive: true });
+  for (const seat of seats) {
+    writeFileSync(seatFilePath(root, collabId, seat.sessionId), JSON.stringify({
+      version: 1,
+      sessionId: seat.sessionId,
+      role: seat.role,
+      state: 'member',
+      joinSeq: seat.joinSeq,
+      joinedAt: now,
+      muted: seat.muted === true,
+    }));
+  }
 }
 
-/* e2e 场景搭建：临时根（显式端口）＋2 个注入桩＋2 个真桥进程；收尾杀核与子进程。 */
+function writeSessionSeedLedger(root, { collabId, name, topic, manager, members, now }) {
+  writeFileSync(collabFilePath(root, collabId, 'ledger.jsonl'), `${JSON.stringify({
+    version: 1,
+    collabId,
+    name,
+    topic,
+    mode: 'managed',
+    status: 'active',
+    managerTerm: 1,
+    joinSeqNext: members.length + 1,
+    manager,
+    members,
+    board: [],
+    createdAt: now,
+    updatedAt: now,
+  })}\n`);
+}
+
+/* e2e 场景搭建：临时根（显式端口）＋种子协作（两条本机席位）＋2 个注入桩＋2 个真桥进程；
+ * 收尾杀核与子进程。 */
 async function startE2eScene(t) {
   const root = makeTempDir(t);
   const port = await pickFreePort();
   const peerPort = await pickFreePort();
   writeFileSync(join(root, 'config.json'), JSON.stringify({ port, identityName: '本机' }, null, 2));
+  const collabId = 'collab-e2e-seats';
+  seedSessionCollab(root, collabId, {
+    seats: [
+      { sessionId: 'session-e2e-a', role: 'manager', joinSeq: 1 },
+      { sessionId: 'session-e2e-b', role: 'member', joinSeq: 2 },
+    ],
+  });
   const inboxA = await startFakeInbox(t);
   const inboxB = await startFakeInbox(t);
   const bridgeA = await startBridgeProcess(t, { root, sessionId: 'session-e2e-a', inbox: inboxA });
   const bridgeB = await startBridgeProcess(t, { root, sessionId: 'session-e2e-b', inbox: inboxB });
+  await waitFor(() => readCoreRecordOrNull(root)?.status === 'ready', { timeoutMs: 10000 });
+  /* 各桥发一次工具调用：首次调用才等待 IPC 握手完成——不先握手，核心的 push 会在桥的
+   * 握手期被判「拒帧」而丢失（回执超时的真实成因）。 */
+  await bridgeA.client.callTool({ name: 'ws_status', arguments: {} });
+  await bridgeB.client.callTool({ name: 'ws_status', arguments: {} });
   t.after(() => {
     const record = readCoreRecordOrNull(root);
     if (record !== null) {
@@ -1242,70 +1303,33 @@ async function startE2eScene(t) {
       }
     }
   });
-  return { root, port, peerPort, inboxA, inboxB, bridgeA, bridgeB };
+  return { root, port, peerPort, collabId, inboxA, inboxB, bridgeA, bridgeB };
 }
 
-/* 桥 A 建协（首个调用触发核心冷启与 call/result 往返——桥 e2e 的解锁面）并取消默认静音。 */
-async function e2eCreateCollab(scene) {
-  const created = toolPayloadOf(await scene.bridgeA.client.callTool({
-    name: 'ws_create_collab',
-    arguments: { name: '路由环', topic: '主题', targets: [{ instanceId: 'inst-peer', identityName: '对端', address: '127.0.0.1', port: scene.peerPort }] },
-  }));
-  assert.equal(created.ok, true, '经桥转发：call/result 载荷等价（核心应答）');
-  const status = toolPayloadOf(await scene.bridgeB.client.callTool({ name: 'ws_status', arguments: {} }));
-  assert.equal(typeof status.version, 'string', 'ws_status 经 IPC 应答（桥冒烟的历史超时点已解锁）');
-  const unmuted = toolPayloadOf(await scene.bridgeA.client.callTool({ name: 'ws_set_mute', arguments: { collabId: created.collabId, muted: false } }));
-  assert.equal(unmuted.ok, true, '取消默认静音（create 写点）');
-  return created.collabId;
-}
-
-/* 获准台账（joins.json）直落：批准工具面由工具面收口批次补，e2e 以台账面就位模拟「此前已获
- * 批准」——核心判据读的就是这份文件（获准台账判据全量会话标识精确匹配）。 */
-function grantInLedger(root, collabId, instanceId, sessionId) {
-  const file = join(root, 'collabs', collabId, 'joins.json');
-  writeFileSync(file, JSON.stringify({
-    v: 1,
-    pendingJoins: [],
-    approvals: [{ instanceId, sessionId, origin: 'grant', grantedAt: Date.now(), approvedBy: 'session-e2e-a' }],
-  }, null, 2), 'utf8');
-}
-
-test('e2e：1 核＋2 桥——create 绑定 A、入站消息 push 到 A 注入桩且 B 不注入；A 退场绑定休眠；未获准不夺席（指引）、获准后写类夺席并 push 到 B', { timeout: 120000 }, async (t) => {
+test('e2e：1 核＋2 桥——无 toSessions 扇出本机全部活跃席位、toSessions 只投目标席；桥退场后其余席照收', { timeout: 120000 }, async (t) => {
   const scene = await startE2eScene(t);
-  const collabId = await e2eCreateCollab(scene);
+  const { collabId } = scene;
 
-  /* 消息入站（本地回环夹具）：push 到 A 注入桩、B 不注入。 */
-  await sendPeerFrame(scene.port, peerMessageFrame(collabId, '你好，甲', scene.peerPort));
-  await waitFor(() => scene.inboxA.receivedText().includes('你好，甲'));
-  assert.equal(scene.inboxB.receivedText(), '', 'B 无 push（绑定唯一：不广播、不投最近活跃桥）');
+  /* 无 toSessions：本机两席（同机双席）各收一条（席位驱动扇出，机器级绑定已退役）。 */
+  await sendPeerFrame(scene.port, peerMessageFrame(collabId, '你好，全体', scene.peerPort));
+  await waitFor(() => scene.inboxA.receivedText().includes('你好，全体') && scene.inboxB.receivedText().includes('你好，全体'));
   assert.match(scene.inboxA.receivedText(), /【路由环】对端 /, '核心渲染三行头（桥不渲染不解析）');
+  assert.match(scene.inboxB.receivedText(), /【路由环】对端 /);
 
-  /* 桥 A 退场 → 绑定休眠：再入站一条不投任何桥。 */
+  /* toSessions 定向：只投目标席位，另一席不收。 */
+  await sendPeerFrame(scene.port, peerMessageFrame(collabId, '只给乙席', scene.peerPort, { toSessions: ['session-e2e-b'] }));
+  await waitFor(() => scene.inboxB.receivedText().includes('只给乙席'));
+  assert.equal(scene.inboxA.receivedText().includes('只给乙席'), false, '定向帧不投非目标席位');
+
+  /* 桥 A 退场：席位仍在宽限内，但无在线桥——该席不进暂存之外的任何桥；B 照收。 */
   const beforeA = scene.inboxA.receivedText();
-  const beforeB = scene.inboxB.receivedText();
   await scene.bridgeA.stop();
   await waitFor(() => !isAlive(scene.bridgeA.pid), { timeoutMs: 10000 });
   await new Promise((resolve) => setTimeout(resolve, 150));
-  await sendPeerFrame(scene.port, peerMessageFrame(collabId, '休眠期的消息', scene.peerPort));
-  await new Promise((resolve) => setTimeout(resolve, 400));
-  assert.equal(scene.inboxB.receivedText(), beforeB, 'A 退场（绑定休眠）：不转投 B');
-  assert.equal(scene.inboxA.receivedText(), beforeA, 'A 侧无新 push');
-
-  /* B 写类调用 → 未获准：不夺席＋指引（获准判据经组合根注入，真核链路）→ 后续帧仍不投 B。 */
-  const refused = toolPayloadOf(await scene.bridgeB.client.callTool({ name: 'ws_send_message', arguments: { collabId, text: '接手' } }));
-  assert.equal(refused.ok, true, '写类调用照常执行（不夺席＋指引，不阻断）');
-  assert.match(refused.notice, /本会话未获准跟进该协作/, '未获准指引（真核链路）');
-  await sendPeerFrame(scene.port, peerMessageFrame(collabId, '未获准期的消息', scene.peerPort));
+  await sendPeerFrame(scene.port, peerMessageFrame(collabId, '甲席退场后的消息', scene.peerPort));
+  await waitFor(() => scene.inboxB.receivedText().includes('甲席退场后的消息'));
   await new Promise((resolve) => setTimeout(resolve, 300));
-  assert.equal(scene.inboxB.receivedText(), beforeB, '未获准不夺席：仍不投 B');
-
-  /* 会话 B 获准台账就位 → 再写 → 夺席 → 后续 push 到 B。 */
-  grantInLedger(scene.root, collabId, readCoreRecordOrNull(scene.root)?.identity?.instanceId ?? '', 'session-e2e-b');
-  const sent = toolPayloadOf(await scene.bridgeB.client.callTool({ name: 'ws_send_message', arguments: { collabId, text: '接手' } }));
-  assert.equal(sent.ok, true, '写类调用成功（休眠绑定由已获准的 B 夺席）');
-  await sendPeerFrame(scene.port, peerMessageFrame(collabId, '夺席后的消息', scene.peerPort));
-  await waitFor(() => scene.inboxB.receivedText().includes('夺席后的消息'));
-  assert.equal(scene.inboxA.receivedText(), beforeA, 'A 侧始终无新 push');
+  assert.equal(scene.inboxA.receivedText(), beforeA, 'A 桥已退场：不转投也不新建注入');
 });
 
 function readCoreRecordOrNull(root) {
@@ -1319,24 +1343,23 @@ function readCoreRecordOrNull(root) {
 
 /* —— I. 边界与故障面（防御分支：损坏/写失败/未 attach/渲染失败等——逐支可断言） —— */
 
-test('绑定表·故障面：remove 未命中、读路径非 ENOENT、写路径不可用——一律不抛错并留痕', (t) => {
+test('绑定表·退役故障面：不读写盘，异常路径一律不抛', (t) => {
   const lines = [];
   const dir = makeTempDir(t);
   const store = createBindingStore({ dataDir: dir, log: quietLog(lines) });
   store.load();
   assert.equal(store.remove('collab-none'), false, 'remove 未命中返回 false（无写点）');
 
-  mkdirSync(bindingsFilePath(dir), { recursive: true });
+  mkdirSync(bindingsFilePath(dir), { recursive: true });   // 旧路径是目录：退役后不再读，自然不报
   const second = createBindingStore({ dataDir: dir, log: quietLog(lines) });
   second.load();
-  assert.equal(second.stats().corruptLoads, 1, '读路径故障（EISDIR 等非 ENOENT）按损坏留痕');
+  assert.equal(second.stats().corruptLoads, 0, '不再读盘：无损坏计数');
 
   const brokenDir = makeTempDir(t);
-  writeFileSync(join(brokenDir, 'run'), '占位文件（run 不是目录——写路径必然失败）', 'utf8');
+  writeFileSync(join(brokenDir, 'run'), '占位文件（run 不是目录）', 'utf8');
   const broken = createBindingStore({ dataDir: brokenDir, log: quietLog(lines) });
-  assert.equal(broken.set('collab-x', { sessionId: 'session-a', bridgeId: 'bridge-a', boundAt: 'x', origin: 'adopt' }), false, '写失败如实返回 false');
-  assert.equal(broken.stats().persistFailures, 1, '写失败计数留痕（内存态继续）');
-  assert.equal(broken.get('collab-x').sessionId, 'session-a', '内存态仍可用');
+  assert.equal(broken.set('collab-x', { sessionId: 'session-a', bridgeId: 'bridge-a', boundAt: 'x', origin: 'adopt' }), true, '内存写入不做盘：恒成功');
+  assert.equal(broken.get('collab-x').sessionId, 'session-a');
 });
 
 test('路由·未 attach（核心监听未起）与渲染失败面：一律不投、留痕、不抛错', async (t) => {
@@ -1458,13 +1481,18 @@ test('进程内核心：真 IPC 客户端 → call 帧 → dispatchCoreFrame 接
   assert.equal(bad.isError, true, '未知工具：isError 结果照常回帧');
 });
 
-/* 进程内全链：真核心＋真 IPC＋真 TCP 入站——call 建协（绑定）→ 事件驱动 push 到客户端 →
+/* 进程内全链：真核心＋真 IPC＋真 TCP 入站——种子协作/席位 → 事件驱动 push 到客户端 →
  * delivered 回执 → 第三档报告入出站队列（不注入则不报告——同链由 e2e 另测）。 */
 test('进程内核心：入站帧 → push 经真 IPC 到桥 → delivered 回执 → 第三档报告入队', { timeout: 60000 }, async (t) => {
   const home = makeTempDir(t);
   const port = await pickFreePort();
   const peerPort = await pickFreePort();
   writeFileSync(join(home, 'config.json'), JSON.stringify({ port, identityName: '本机' }, null, 2));
+  const collabId = 'collab-inproc';
+  seedSessionCollab(home, collabId, {
+    name: '进程内环',
+    seats: [{ sessionId: 'session-inproc-2', role: 'manager', joinSeq: 1 }],
+  });
   const started = await startCore({ env: { ...process.env, WAYSTATION_HOME: home } });
   assert.equal(started.ok, true, started.message ?? '核心启动');
   t.after(() => started.core.stop());
@@ -1479,46 +1507,33 @@ test('进程内核心：入站帧 → push 经真 IPC 到桥 → delivered 回�
   t.after(() => client.close());
   await client.connect();
 
-  const callAndWait = async (tool, args) => {
-    const id = randomUUID();
-    client.send({ type: 'call', id, tool, args });
-    await waitFor(() => frames.some((frame) => frame.type === 'result' && frame.id === id));
-    return JSON.parse(frames.find((frame) => frame.type === 'result' && frame.id === id).content[0].text);
-  };
-  const created = await callAndWait('ws_create_collab', {
-    name: '进程内环', topic: '主题', targets: [{ instanceId: 'inst-peer', identityName: '对端', address: '127.0.0.1', port: peerPort }],
-  });
-  assert.equal(created.ok, true);
-  await callAndWait('ws_set_mute', { collabId: created.collabId, muted: false });
-
-  const peerFrame = peerMessageFrame(created.collabId, '进程内你好', peerPort);
+  const peerFrame = peerMessageFrame(collabId, '进程内你好', peerPort);
   const baseline = frames.length;
   await sendPeerFrame(port, peerFrame);
   await waitFor(() => frames.slice(baseline).some((frame) => frame.type === 'push'));
   const push = frames.slice(baseline).find((frame) => frame.type === 'push');
-  assert.equal(push.collabId, created.collabId);
+  assert.equal(push.collabId, collabId);
   assert.match(push.text, /进程内你好/, '核心渲染后经真 IPC 送达（桥不渲染不解析）');
   client.send({ type: 'delivered', pushId: push.pushId, ok: true });
 
-  const outbox = join(home, 'collabs', created.collabId, 'outbox.jsonl');
+  const outbox = join(home, 'collabs', collabId, 'outbox.jsonl');
   await waitFor(() => (existsSync(outbox) ? readFileSync(outbox, 'utf8') : '').includes(peerFrame.msgId));
   assert.ok(readFileSync(outbox, 'utf8').includes('delivery-status'), '回执经等待面收口 → 第三档报告入队（delivered 分支接线达成）');
 });
 
 /* —— K. 审查裁定落实（I-1 期限口径 / I-2 链二分类判据 / Minor 顺手项） —— */
 
-test('I-1：期限自上界具名常量派生；上界被 config 钉死（上界+1／显著超上界一律拒绝）', (t) => {
+test('I-1：期限自上界具名常量派生；退役 takeoverWindowMs 不再参与配置', (t) => {
   assert.equal(MAX_TAKEOVER_WINDOW_MS, 600000, '上界常量被钉死（调整即红，交人复核期限随之变化）');
   assert.equal(CALL_SAFETY_DEADLINE_MS, MAX_TAKEOVER_WINDOW_MS + CALL_DEADLINE_MARGIN_MS, '期限＝上界＋余量（写死脱钩即红）');
+  const defaults = buildDefaults('主机');
+  assert.equal(defaults.takeoverWindowMs, undefined, '退役键不再出现在默认配置');
+  assert.equal(defaults.sessionTakeoverWindowMs, 60000, '自动移交后的接管窗口是新键');
   const dir = makeTempDir(t);
-  const defaultWindowMs = buildDefaults('主机').takeoverWindowMs;
-  const loadedWindowMs = (value) => {
-    writeFileSync(join(dir, 'config.json'), JSON.stringify({ takeoverWindowMs: value }, null, 2));
-    return loadConfig(dir, { defaults: buildDefaults('主机') }).config.takeoverWindowMs;
-  };
-  assert.equal(loadedWindowMs(MAX_TAKEOVER_WINDOW_MS), MAX_TAKEOVER_WINDOW_MS, '上界本身合法（collect 形态 ws_take_over 阻塞全窗的上限）');
-  assert.equal(loadedWindowMs(MAX_TAKEOVER_WINDOW_MS + 1), defaultWindowMs, '上界+1 被 config 拒绝（回落缺省）');
-  assert.equal(loadedWindowMs(MAX_TAKEOVER_WINDOW_MS * 10), defaultWindowMs, '显著超上界被 config 拒绝（回落缺省）');
+  writeFileSync(join(dir, 'config.json'), JSON.stringify({ takeoverWindowMs: 1000, sessionTakeoverWindowMs: 10000 }, null, 2));
+  const loaded = loadConfig(dir, { defaults }).config;
+  assert.equal(loaded.sessionTakeoverWindowMs, 10000, '新键按范围受理');
+  assert.equal(loaded.takeoverWindowMs, undefined, '退役键被忽略（不参与运行语义）');
 });
 
 test('I-1 行为面：合法长等待在期限之内收口不提前触发（期限不误伤正常结论帧）', async (t) => {
@@ -1558,18 +1573,19 @@ test('无会话标识的桥：写类/入席类调用响应附说明 notice（不
   const recordX = bridgeRecord('bridge-x', null);
   harness.registry.register(recordX);
   const created = await callTool(harness, 'ws_create_collab', { name: '项目甲', topic: '主题', targets: [TARGET_PEER] }, recordX);
-  assert.equal(created.ok, true);
-  assert.ok(created.notice.includes(SESSIONLESS_NOTICE), 'create：如实说明无会话标识');
-  assert.equal(harness.router.bindings.get(created.collabId), null, '无会话标识：不写绑定');
+  assert.equal(created.ok, false, '0.2.0：无会话标识不得创建（设计 §1.1）');
+  assert.match(created.message, /无会话标识/);
+  assert.equal(harness.registry.list().length, 1, '拒绝路径不建协作');
   const listed = await callTool(harness, 'ws_list_collabs', {}, recordX);
   assert.equal('notice' in listed, false, '只读类不附（避免每次调用噪声）');
 
   const recordA = bridgeRecord('bridge-a', 'session-a');
   harness.registry.register(recordA);
   const createdA = await callTool(harness, 'ws_create_collab', { name: '项目乙', topic: '主题', targets: [TARGET_PEER] }, recordA);
+  assert.equal(createdA.ok, true);
   const written = await callTool(harness, 'ws_send_message', { collabId: createdA.collabId, text: '接手' }, recordX);
-  assert.ok(written.notice.includes(SESSIONLESS_NOTICE), '活跃异会话 + 无会话标识：说明 notice');
-  assert.equal(written.notice.includes(ADOPT_GUIDANCE_NOTICE), false, '指引文案对无会话标识桥不成立：不给');
+  assert.equal(written.ok, false, '无会话标识：写类调用没有可授权的本机会话席位');
+  assert.match(written.message, /没有席位|无会话标识|缺少发送会话标识|没有其他活跃席位/);
 });
 
 test('观测面·不健康计数有界（插入序淘汰）：长驻核心不随 bridgeId 数量增长', async (t) => {

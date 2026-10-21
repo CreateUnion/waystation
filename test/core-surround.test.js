@@ -526,6 +526,55 @@ test('整链·per-session 过滤（真核＋真工具调用）：绑定随会话
   assert.equal(collabsOf(fileB).find((entry) => entry.collabId === created.collabId).muted, true, '静音切换即刷新会话文件（状态栏 🔇 的数据源）');
 });
 
+/* 双席同机建协作：A 建、B 申请、A 批准、B 确认（M6 工具面走 confirmJoining；同机不走网络回执轮次）。 */
+async function establishTwoSeatCollab(core, a, b, record, peerPort, memberSessionId) {
+  const created = await callAndWait(a, 'ws_create_collab', {
+    name: '双席项目', topic: '主题', targets: [{ instanceId: 'inst-peer', identityName: '对端', address: '127.0.0.1', port: peerPort }],
+  });
+  assert.equal(created.ok, true, created.message);
+  const requested = await callAndWait(b, 'ws_join', { collabId: created.collabId });
+  assert.equal(requested.ok, true, requested.message);
+  const approved = await callAndWait(a, 'ws_approve_join', { collabId: created.collabId, sessionId: memberSessionId, approve: true });
+  assert.equal(approved.ok, true, approved.message);
+  assert.equal(typeof approved.joinId, 'string', '两段式：批准返回 joinId');
+  const confirmed = core.context.collab.join.confirmJoining(approved.joinId, memberSessionId, {
+    instanceId: record.identity.instanceId,
+    managerTerm: 1,
+    activeSeats: 1,
+  });
+  assert.equal(confirmed.ok, true, confirmed.message);
+  return created.collabId;
+}
+
+test('整链·状态栏同机双席：会话文件按本会话席位呈现角色与静音（真核＋真工具调用）', { timeout: 90000 }, async (t) => {
+  const home = makeTempDir(t);
+  const { record, core } = await startCoreOnTempRoot(t, home);
+  const a = bridgeClientFor(home, record, { bridgeId: 'bridge-seat-a', sessionId: 'seat-a-0001' });
+  const b = bridgeClientFor(home, record, { bridgeId: 'bridge-seat-b', sessionId: 'seat-b-0002' });
+  t.after(async () => {
+    await a.client.close().catch(() => {});
+    await b.client.close().catch(() => {});
+  });
+  await a.client.connect();
+  await b.client.connect();
+  const fileA = sessionFilePath(home, 'seat-a-0001');
+  const fileB = sessionFilePath(home, 'seat-b-0002');
+  await waitFor(() => (existsSync(fileA) && existsSync(fileB) ? true : null), { timeoutMs: 10000 });
+  const entryOf = (file, collabId) => JSON.parse(readFileSync(file, 'utf8')).collabs.find((item) => item.collabId === collabId);
+  const collabId = await establishTwoSeatCollab(core, a, b, record, await pickFreePort(), 'seat-b-0002');
+  await waitFor(() => (entryOf(fileB, collabId) !== undefined ? true : null), { timeoutMs: 15000 });
+  const entryA = entryOf(fileA, collabId);
+  const entryB = entryOf(fileB, collabId);
+  assert.equal(entryA.role, 'manager', '状态栏取本会话（站长）席位角色');
+  assert.equal(entryB.role, 'member', '同机另一会话取自己的成员席位角色');
+  /* 席位级静音：站长席取消静音后，本会话文件不再带 🔇，成员席仍静音。 */
+  const unmuted = core.context.collab.setMute({ collabId, muted: false, sessionId: 'seat-a-0001' });
+  assert.equal(unmuted.ok, true, unmuted.message);
+  await waitFor(() => (entryOf(fileA, collabId).muted !== true ? true : null), { timeoutMs: 15000 });
+  assert.equal(entryOf(fileA, collabId).muted === true, false, '站长席已取消静音');
+  assert.equal(entryOf(fileB, collabId).muted, true, '成员席静音不受影响（不得按整机聚合）');
+});
+
 /* —— 整链·ws_list_hosts 本机段（真核＋真 IPC） —— */
 
 test('整链·本机段会话数据源：上下文取值器随桥注册/退场实时变化（零桥边界如实为空集合）', { timeout: 60000 }, async (t) => {

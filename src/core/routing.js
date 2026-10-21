@@ -182,16 +182,36 @@ function entryForCollab(state, collabId) {
   return state.registry.find(binding.sessionId) ?? null;
 }
 
-/* 收件目标集合：席位驱动优先；未注入席位提供器时退回单绑定。 */
+/* 收件目标集合：席位驱动优先；未注入席位提供器时退回单绑定。
+ * toSessions 是**帧顶层**字段（M3 契约）：字段存在但形态非法时不回落广播——坏目标只隔离自身，
+ * 绝不放大为「投给本机全部席位」。 */
 function targetEntriesOf(state, frame) {
   if (seatProviderOf(state) === null) {
     return bindingEntriesOf(state, frame?.collabId);
   }
-  const toSessions = Array.isArray(frame?.payload?.toSessions) ? frame.payload.toSessions : null;
-  if (toSessions !== null) {
-    return entriesOfSessions(state, frame.collabId, toSessions);
+  const raw = frame?.toSessions;
+  if (raw !== undefined) {
+    const requested = validToSessionsOf(state, raw);
+    return requested.length === 0 ? [] : entriesOfSessions(state, frame.collabId, requested);
   }
   return seatEntriesOf(state, frame?.collabId);
+}
+
+/* toSessions 校验：非数组整体作废；数组内非标识项逐个丢弃并计数，合法项照常定向。 */
+function validToSessionsOf(state, raw) {
+  if (!Array.isArray(raw)) {
+    state.counters.invalidToSessions++;
+    return [];
+  }
+  const valid = [];
+  for (const value of raw) {
+    if (isCollabId(value)) {
+      valid.push(value);
+    } else {
+      state.counters.invalidToSessions++;
+    }
+  }
+  return valid;
 }
 
 function bindingEntriesOf(state, collabId) {
@@ -362,7 +382,7 @@ export function createInjectionRouter({ dataDir, log, describeCollab = null, isG
     callContext: new AsyncLocalStorage(),
     droppedNotices: 0,
     counters: {
-      adoptions: 0, adoptGrantRefusals: 0, inboundPushed: 0, inboundUnrouted: 0, inboundFailed: 0,
+      adoptions: 0, adoptGrantRefusals: 0, inboundPushed: 0, inboundUnrouted: 0, inboundFailed: 0, invalidToSessions: 0,
       notifyCaller: 0, notifyBound: 0, notifySession: 0, notifyDropped: 0, renderFailures: 0,
       callFailures: 0, callTimeouts: 0, callLateResults: 0,
       pushesSent: 0, pushSendFailures: 0, receiptTimeouts: 0,

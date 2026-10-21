@@ -108,9 +108,30 @@ test('toSessions 定向：只投列表内席位；不在本机席位表的坏目
     seats: [seatOf('sess-a'), seatOf('sess-b'), seatOf('sess-c')],
   });
   registerAll(registry, ['sess-a', 'sess-b', 'sess-c']);
-  const frame = frameOf('collab-x', { payload: { text: '定向', toSessions: ['sess-a', 'sess-ghost', 'sess-c'] } });
+  const frame = frameOf('collab-x', { toSessions: ['sess-a', 'sess-ghost', 'sess-c'] });
   assert.equal(await deliver(router, out, frame), true);
   assert.deepEqual(pushedSessions(out).sort(), ['sess-a', 'sess-c']);
+});
+
+test('toSessions 坏值隔离：非数组/空数组不回落广播；数组内坏项只丢自身', async (t) => {
+  const { router, registry, out } = makeRouter(t, {
+    seats: [seatOf('sess-a'), seatOf('sess-b')],
+  });
+  registerAll(registry, ['sess-a', 'sess-b']);
+  const malformed = frameOf('collab-x', { toSessions: 'sess-a' });
+  assert.equal(await deliver(router, out, malformed), false, '非数组：按无目标处理（绝不广播）');
+  assert.deepEqual(pushedSessions(out), []);
+  const empty = frameOf('collab-x', { toSessions: [] });
+  assert.equal(await deliver(router, out, empty), false, '空数组：无目标');
+  assert.deepEqual(pushedSessions(out), []);
+  const mixed = frameOf('collab-x', { toSessions: ['sess-a', 42, null, 'sess-b'] });
+  assert.equal(await deliver(router, out, mixed), true);
+  assert.deepEqual(pushedSessions(out).sort(), ['sess-a', 'sess-b'], '坏项丢弃，合法项照常定向');
+  /* 顶层字段才是契约位置：payload 里的同名键不再被读取（不得据此放大或收窄扇出）。 */
+  out.length = 0;
+  const legacyPosition = frameOf('collab-x', { payload: { text: '旧位置', toSessions: ['sess-a'] } });
+  assert.equal(await deliver(router, out, legacyPosition), true);
+  assert.deepEqual(pushedSessions(out).sort(), ['sess-a', 'sess-b'], 'payload.toSessions 不参与判定（缺省＝全席扇出）');
 });
 
 test('邀请不受席位过滤：无席位时未指名邀请投全部活跃桥；指名按完整标识／短码精确命中', async (t) => {

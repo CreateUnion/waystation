@@ -1,8 +1,8 @@
 import { readFileSync } from 'node:fs';
-import { hostname } from 'node:os';
+import { hostname, networkInterfaces } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { COLLABS_DIR_NAME, CONFIG_FILE_NAME, DATA_DIR_ENV, coreJsonPath, ensureDir, resolveDataDir, resolveLogDir } from '../paths.js';
+import { COLLABS_DIR_NAME, CONFIG_FILE_NAME, DATA_DIR_ENV, coreJsonPath, ensureDir, resolveDataDir, resolveLogDir, runDir } from '../paths.js';
 import { checkWritableDir } from '../selfcheck.js';
 import { buildDefaults, loadConfig, saveConfig } from '../config.js';
 import { createLogger } from '../log.js';
@@ -95,6 +95,8 @@ const VIEWER_SCRIPT_PATH = fileURLToPath(new URL('../../scripts/ws-viewer.js', i
  * @property {any} self
  * @property {any} collab
  * @property {any} net
+ * @property {any} dispatch
+ * @property {any} inbound
  * @property {any} registry
  * @property {any} context
  * @property {any} routing
@@ -513,7 +515,9 @@ function collabsBoundTo(state, sessionId) {
   const seatIds = new Set(boundCollabIdsOf(state, sessionId));
   const listed = state.collab?.list().collabs ?? [];
   const bound = listed.filter((entry) => isIndicatedCollab(entry) && seatIds.has(entry.collabId));
-  return indicatedEntriesOf(bound, state.collab?.indicators());
+  /* 传本会话标识：状态栏条目按席位表命中「本会话的席位」（角色/静音/序号），
+   * 同机多席时不得退回整机聚合字段。 */
+  return indicatedEntriesOf(bound, state.collab?.indicators(), sessionId);
 }
 
 /* 桥断开清理（设计 §3.3 桥崩行）：删该桥注册并清该会话的席位桥绑定（席位本身保留到离席宽限，
@@ -591,17 +595,33 @@ function welcomeFrameOf(state, bridges) {
   };
 }
 
-/* 宽限电平：记空闲起点（席位存续判据的计时基准）并驱动宽限窗。 */
-function noteBridgeCount(state, count) {
+/* 宽限电平：记空闲起点（席位存续判据的计时基准）并驱动宽限窗。
+ * 重新有桥连接时同时撤销席位续拍：否则到点的续拍会把「桥已重连（idleSince=null）」算成无限空闲
+ * 并直接退出核心，斩断正在使用的会话。 */
+export function noteBridgeCount(state, count) {
   state.idleSince = count > 0 ? null : Date.now();
+  if (count > 0) {
+    clearSeatGraceTimer(state);
+  }
   state.grace.noteBridgeCount(count);
 }
 
+function clearSeatGraceTimer(state) {
+  if (state.seatGraceTimer !== null) {
+    clearTimeout(state.seatGraceTimer);
+    state.seatGraceTimer = null;
+  }
+}
+
 /* 宽限到期处置（设计 §3.2）：存在活跃席位时，空闲退出不得早于
- * max(核心空闲宽限, 席位宽限 + 10s)——先完成离席广播/标记再退出。未到席位下界就再续一拍。 */
-async function expireCoreWhenSeatsAllow(state) {
+ * max(核心空闲宽限, 席位宽限 + 10s)——先完成离席广播/标记再退出。未到席位下界就再续一拍。
+ * 桥已重连（idleSince=null）＝不处于空闲态，任何续拍都不得退出核心。 */
+export async function expireCoreWhenSeatsAllow(state) {
+  if (state.idleSince === null) {
+    return;
+  }
   const requiredMs = state.collab?.ensureCoreLifetimeForSeats?.() ?? 0;
-  const idleMs = state.idleSince === null ? Number.POSITIVE_INFINITY : Date.now() - state.idleSince;
+  const idleMs = Date.now() - state.idleSince;
   if (requiredMs > idleMs) {
     scheduleSeatGraceRecheck(state, requiredMs - idleMs);
     return;
@@ -611,9 +631,7 @@ async function expireCoreWhenSeatsAllow(state) {
 
 /* 续拍（单实例；不阻止进程退出——空闲计时是运行期行为，不构成存活依赖）。 */
 function scheduleSeatGraceRecheck(state, delayMs) {
-  if (state.seatGraceTimer !== null) {
-    clearTimeout(state.seatGraceTimer);
-  }
+  clearSeatGraceTimer(state);
   state.seatGraceTimer = setTimeout(() => {
     state.seatGraceTimer = null;
     void expireCoreWhenSeatsAllow(state);
@@ -781,15 +799,9 @@ function buildComponents(state) {
   state.self = { instanceId: state.instanceId, identityName: config.identityName, port: config.port };
   const knownHosts = createKnownHosts({ dataDir: state.dataDir, log: state.log });
   const transport = createTransport({ port: config.port, log: state.log });
-  const dispatch = createDispatch({
-    dataDir: state.dataDir,
-    config,
-    transport,
-    self: state.self,
-    log: state.log,
-    /* 转达副本达第三档 → 聚合捎回译回原作者：回调只在运行期触发（声明顺序无碍）。 */
-    onRelayedReport: (payload) => state.collab.relayReport(payload),
-  });
+  const dispatch = createCoreDispatch(state, transport);
+  state.dispatch = dispatch;
+  state.inbound = null;
   state.routing = createInjectionRouter({
     dataDir: state.dataDir,
     log: state.log,
@@ -802,6 +814,9 @@ function buildComponents(state) {
     dataDir: state.dataDir,
     config,
     self: state.self,
+    /* 治理帧自报端点与单调钟（M5）：移交/接管的 endpoint 与超时判定不得用墙钟。 */
+    selfEndpoint: { address: primaryLanAddressOf(), port: config.port },
+    monoClock: () => performance.now(),
     send: (message) => dispatch.send(message),
     sendDirect: (message) => dispatch.sendDirect(message),
     probe: (address, port) => dispatch.ping({ address, port }),
@@ -822,6 +837,30 @@ function buildComponents(state) {
   state.context = buildContext(state);
 }
 
+/* 本机对外 IPv4（治理帧 selfEndpoint）：优先非回环地址；没有可用接口时回环兜底（同机测试/接管）。 */
+function primaryLanAddressOf() {
+  for (const entries of Object.values(networkInterfaces())) {
+    for (const entry of entries ?? []) {
+      if (entry.family === 'IPv4' && entry.internal !== true) {
+        return entry.address;
+      }
+    }
+  }
+  return '127.0.0.1';
+}
+
+function createCoreDispatch(state, transport) {
+  return createDispatch({
+    dataDir: state.dataDir,
+    config: state.config,
+    transport,
+    self: state.self,
+    log: state.log,
+    /* 转达副本达第三档 → 聚合捎回译回原作者：回调只在运行期触发（声明顺序无碍）。 */
+    onRelayedReport: (payload) => state.collab.relayReport(payload),
+  });
+}
+
 /* 注入来源（设计 §5.2）：本机席位表；绑定表不再参与路由。闭包运行期取服务（构造序在前）。 */
 function injectionSeatWiringOf(state) {
   return {
@@ -830,11 +869,15 @@ function injectionSeatWiringOf(state) {
   };
 }
 
-/* 服务侧两条投递出口：机器级提示走注入路由；本机席位旁路经路由的每席 push（不经过 dispatch.send）。 */
+/* 服务侧投递出口：机器级提示走注入路由；本机席位旁路经路由的每席 push（不经过 dispatch.send）。
+ * 查询面也在此接上——M6 的「机器级状态＋本机席位明细」不得私接 net 内部结构（契约 M3 → M6）。 */
 function deliveryWiringOf(state) {
   return {
     notify: (frame) => state.routing.notify(frame),
     deliverSeat: (frame, seat) => state.routing.deliverToSeat(seat.sessionId, frame),
+    deliveryStatusOf: (msgId) => state.dispatch?.deliveryStatusOf?.(msgId) ?? null,
+    localSeatDeliveryOf: (msgId, sessionId) => state.inbound?.localSeatDeliveryOf?.(msgId, sessionId)
+      ?? { collabId: null, msgId, sessionId, status: 'unknown', complete: false },
   };
 }
 
@@ -855,12 +898,41 @@ function joinWiringOf(state) {
     bridgeIdOf: (sessionId) => state.bridges?.find(sessionId)?.bridgeId ?? null,
     requestJoinResolve: (options) => state.net.requestJoinResolve(options),
     requestJoin: (options) => state.net.requestJoin(options),
+    probeCapability: (options) => state.net.probeCapability(options),
+  };
+}
+
+/* 入站钩子装配（单一权威）：静音栅栏的逐席上下文必须原样透传——主核若只传 frame，
+ * 多席时服务找不到收件席位，静音退化为「永不抑制」（设计 §5.4 要求逐席判定）。 */
+export function inboundHooksOf(state) {
+  const config = state.config;
+  return {
+    admit: (frame, meta) => state.collab.hooks.admit(frame, meta),
+    consume: (frame, meta) => state.collab.hooks.consume(frame, meta),
+    sessionGate: (frame, meta) => state.collab.hooks.sessionGate(frame, meta),
+    sessionDelivered: (frame) => state.collab.hooks.sessionDelivered(frame),
+    /* 链一投递（渲染在核心、桥不渲染不解析）：autoDeliver 关闭＝不注入钩子——
+     * 消息停留第二档，由会话经 ws_check_inbox 拉取（既有降级语义零变）。 */
+    ...(config.autoDeliver ? { deliverToSession: (frame) => state.routing.deliverToSession(frame) } : {}),
+    /* 席位扇出面（M2 运行时）：两件齐备即启用逐席 toSessions 扇出与本机旁路暂存/补投。
+     * listSeats 含邀请目标（受邀未入席会话按桥注册面直投），注入面自行按帧类型隔离。 */
+    listSeats: (collabId) => state.collab?.listInjectableTargets?.(collabId) ?? state.collab?.listLocalSeats?.(collabId) ?? [],
+    injectSeat: (collabId, sessionId, frame) => state.collab?.injectLocalSeat?.(collabId, sessionId, frame) ?? { ok: false, reason: 'collab-service-missing' },
   };
 }
 
 // 网络装配：把构造好的四组件与钩子接线（注入面经闭包取协作服务——运行期才触达）
 function buildNetStack(state, { knownHosts, transport, dispatch }) {
   const config = state.config;
+  const inbound = createInbound({
+    dataDir: state.dataDir,
+    config,
+    self: state.self,
+    dispatch,
+    log: state.log,
+    hooks: inboundHooksOf(state),
+  });
+  state.inbound = inbound;   // 查询面（localSeatDeliveryOf）经 state 运行期触达
   return createNetStack({
     discovery: createDiscovery({
       port: config.port,
@@ -880,25 +952,7 @@ function buildNetStack(state, { knownHosts, transport, dispatch }) {
     }),
     transport,
     dispatch,
-    inbound: createInbound({
-      dataDir: state.dataDir,
-      config,
-      self: state.self,
-      dispatch,
-      log: state.log,
-      hooks: {
-        admit: (frame, meta) => state.collab.hooks.admit(frame, meta),
-        consume: (frame, meta) => state.collab.hooks.consume(frame, meta),
-        sessionGate: (frame) => state.collab.hooks.sessionGate(frame),
-        sessionDelivered: (frame) => state.collab.hooks.sessionDelivered(frame),
-        /* 链一投递（渲染在核心、桥不渲染不解析）：autoDeliver 关闭＝不注入钩子——
-         * 消息停留第二档，由会话经 ws_check_inbox 拉取（既有降级语义零变）。 */
-        ...(config.autoDeliver ? { deliverToSession: (frame) => state.routing.deliverToSession(frame) } : {}),
-        /* 席位扇出面（M2 运行时）：两件齐备即启用逐席 toSessions 扇出与本机旁路暂存/补投。 */
-        listSeats: (collabId) => state.collab?.listLocalSeats?.(collabId) ?? [],
-        injectSeat: (collabId, sessionId, frame) => state.collab?.injectLocalSeat?.(collabId, sessionId, frame) ?? { ok: false, reason: 'collab-service-missing' },
-      },
-    }),
+    inbound,
     port: config.port,
     self: state.self,
     scanWindowMs: config.scanWindowMs,
@@ -1001,6 +1055,44 @@ function markReady(state) {
   });
 }
 
+/* 核心退出标记（设计 §3.3）：记下退出时本机席位快照，供重启对账补发未完成的 leave。
+ * 标记写失败只告警——不得阻断退出（退出优先于留痕）。 */
+const CORE_STOP_FILE_NAME = 'core-stop.json';
+
+function writeCoreStopMarker(state) {
+  if (state.collab === null) {
+    return;
+  }
+  try {
+    writeJsonAtomic(join(runDir(state.dataDir), CORE_STOP_FILE_NAME), {
+      at: new Date().toISOString(),
+      seats: seatSnapshotForStopOf(state),
+      pendingLeave: false,
+    });
+  } catch (error) {
+    state.log?.warn?.('核心退出标记写入失败（重启对账缺少依据）', { reason: error.message });
+  }
+}
+
+function seatSnapshotForStopOf(state) {
+  const seats = [];
+  for (const entry of state.collab?.list?.().collabs ?? []) {
+    if (entry.legacy !== true) {
+      seats.push(...seatsOfCollab(state, entry.collabId));
+    }
+  }
+  return seats;
+}
+
+function seatsOfCollab(state, collabId) {
+  return (state.collab?.listLocalSeats?.(collabId) ?? []).map((seat) => ({
+    collabId,
+    sessionId: seat.sessionId,
+    role: seat.role,
+    state: seat.state,
+  }));
+}
+
 /* 有序收尾（正常退出路径）：停宽限计时 → 停心跳 → 收协作等待面 → 关网络栈 → 关 IPC →
  * 删运行描述符（对证锁仍为自己）。本函数不退出进程：退出码由调用方决定（宽限到期走 exit 闩锁，
  * 入口据此以约定码退出）。 */
@@ -1010,10 +1102,8 @@ async function stopCore(state) {
   }
   state.stopped = true;
   state.grace?.cancel();
-  if (state.seatGraceTimer !== null) {
-    clearTimeout(state.seatGraceTimer);
-    state.seatGraceTimer = null;
-  }
+  clearSeatGraceTimer(state);
+  writeCoreStopMarker(state);
   state.heartbeat?.stop();
   stopWaitingMachinery(state);
   state.detector?.close();
@@ -1100,6 +1190,8 @@ function createCoreState(env, root) {
     self: null,
     collab: null,
     net: null,
+    dispatch: null,
+    inbound: null,
     registry: null,
     context: null,
     routing: null,
