@@ -103,6 +103,15 @@ test('send：协作域帧盖章 cap=2 与 from.sessionId，toSessions 随帧上�
   assert.equal(frame.msgId, sent.msgId);
 });
 
+test('拨号连接携带目标实例身份：入站 meta 的传输对端来自连接层而非帧内自报', { timeout: 15000 }, async (t) => {
+  const { dispatch, transport } = makeDispatch(t);
+  dispatch.send(target());
+  dispatch.start();
+  t.after(() => dispatch.stop());
+  await waitFor(() => transport.connections[0]?.frames.length === 1);
+  assert.equal(transport.connections[0].peerInstanceId, 'inst-b', '拨号连接按目标实例盖章');
+});
+
 test('send：协作域帧缺少 from.sessionId 受理面拒绝（不建队头）', { timeout: 15000 }, async (t) => {
   const { dispatch } = makeDispatch(t);
   const rejected = dispatch.send(target({ fromSessionId: undefined }));

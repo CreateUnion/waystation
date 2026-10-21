@@ -11,16 +11,11 @@ const repoRoot = fileURLToPath(new URL('..', import.meta.url));
  * 只扫 src/ 与 bin/（同 stdout 纪律扫描口径）：测试夹具会刻意构造违规样本串。 */
 const PLAN_REFERENCE_PATTERN = /批次\s*\d|WP-\d+|\bG\d+\b|\bT\d+\b|\bM[1-9]\b/;
 
-/* 迁移期存量基线（跨模块欠账）：下列行是提交树（HEAD 9a2c66b）中实际存在的编号引用，由各属主清理
+/* 迁移期存量基线（跨模块欠账）：下列行是提交树（HEAD 01b4e34）中实际存在的编号引用，由各属主清理
  * （M2 的 service.js/main.js 条目待 M2 清理）。基线按「相对路径 + 整行文本」精确匹配——同文件
  * 新增或改写出的违规不会命中，仍会被拦截；清理后可逐条删除。
  * 新增违规一律不得加入本表（本表只减不增）——未提交工作树里新写入的编号不属于存量。 */
 const LEGACY_OFFENDERS = new Set([
-  'src/collab/events.js||/* 解除冻结/裁定执行后清除 M5 侧的冻结原因（载体与成员记录）：冻结态已不在 → 观察窗不得继续显示。',
-  'src/collab/events.js||/* 目标机挂起邀请登记（M4 域）：未入席会话据此在注册时收到补投；forum 无邀请簿记（D18）。 */',
-  'src/collab/events.js||/* 同意帧携 inviteId（M4 会话级邀请）：转加入域的批准面签发 join-grant；无 inviteId 的旧形态',
-  'src/collab/events.js||* invites/pending-invites（M4 域）。入席由两段式 join-confirm 完成（M2/M4 接线），本函数',
-  'src/collab/handover.js||/* 旧台账（M2 未迁移）缺 managerTerm/joinSeqNext 时补齐只读字段：offer 台账是接收侧的基准副本。 */',
   'src/collab/join.js||/* participants 是 0.2.0 的加法能力字段（三态判定归 M12/M6）：这里只透传，不在名字解析面丢弃。 */',
   'src/collab/local.js||/* 契约面（M2 → 全体）：只给席位事实，不暴露暂存/inbox 运行态。 */',
   'src/collab/local.js||/** 席位变化后同步派生缓存（旧模块仍读 local.role；M3/M5 迁完后它只作兼容读面）。 */',
@@ -50,14 +45,6 @@ const LEGACY_OFFENDERS = new Set([
   'src/collab/service.js||/* 邀请的无席位直投：受邀会话的桥在线即交付；离线不暂存（没有席位可挂），由 M4 的挂起邀请',
   'src/collab/service.js||* 丢帧必须同时释放 msgId 去重：否则发送方重试同一 msgId 会被判 duplicate（M3 计为成功），消息永久丢失。 */',
   'src/collab/service.js||/* 桥断开＝席位会话结束起点（M5 的宽限计时/自动移交判据）。 */',
-  'src/collab/takeover.js||/* 接线期运行时容器（惰性挂载在服务 state 上；M2 的 state 构造不感知本模块）。 */',
-  'src/collab/takeover.js||/* —— 台账任期面归一（兼容 M2 尚未迁移的旧台账；不改写数据面） —— */',
-  'src/collab/takeover.js||/* —— 离席留痕与冻结原因持久化（设计 §6/§6.2；M2 启动/装配处调用） —— */',
-  'src/collab/takeover.js||/* 冻结原因落载体（M7 只读展示面）；展示字段不改台账形态，故不写台账行。',
-  'src/collab/takeover.js||/* 解除冻结/恢复/接管成功时清除冻结原因（载体与成员记录两侧；台账字段由 M7 读侧兜底）。 */',
-  'src/collab/takeover.js||/* 传输对端实例：优先注入的 meta.peerInstanceId（M3 后续提供）；否则按已知端点地址反查。',
-  'src/collab/takeover.js||/* —— 会话宽限与离席（M2 在桥注销时调用 noteSeatClosed） —— */',
-  'src/collab/takeover.js||/* 自报端点：M2/M6 可在 state.selfEndpoint 注入真实对外地址；缺省用回环地址（同机测试/手动接管兜底）。 */',
   'src/core/main.js||/* 治理帧自报端点与单调钟（M5）：移交/接管的 endpoint 与超时判定不得用墙钟。 */',
   'src/core/main.js||* 查询面也在此接上——M6 的「机器级状态＋本机席位明细」不得私接 net 内部结构（契约 M3 → M6）。 */',
   'src/core/main.js||/* 席位扇出面（M2 运行时）：两件齐备即启用逐席 toSessions 扇出与本机旁路暂存/补投。',

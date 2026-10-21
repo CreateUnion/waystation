@@ -349,7 +349,7 @@ function admitJoinFamily(state, frame, meta) {
     return admitJoinRequest(state, frame, meta);
   }
   if (frame.type === 'join-grant' || frame.type === 'join-deny') {
-    return admitJoinDecision(state, frame);
+    return admitJoinDecision(state, frame, meta);
   }
   return null;
 }
@@ -388,10 +388,10 @@ function admitJoinRequest(state, frame, meta) {
  *    grant 时才生成，申请人无从预先校验，故以「本机确实在等这家站长的回执」为受理证据。
  * 无匹配 / 已过期一律拒并计数；副作用（建目录 / ack / 落盘 / 注入）必须晚于本判定。
  * 申请记录不在此移除：回执后的收尾（删记录、接线）归加入域。 */
-function admitJoinDecision(state, frame) {
+function admitJoinDecision(state, frame, meta) {
   const reqMsgId = frame.payload?.reqMsgId;
   if (typeof reqMsgId !== 'string') {
-    return admitJoinDecisionByRecord(state, frame);
+    return admitJoinDecisionByRecord(state, frame, meta);
   }
   const record = state.joinApplications.list().find((application) =>
     application.collabId === frame.collabId
@@ -409,7 +409,7 @@ function admitJoinDecision(state, frame) {
 
 /* 无申请帧标识的回执：本地证据二选一（待处理申请 / 已签发的入席记录），缺一即拒。
  * 未知 collabId 也在本层拒绝——不得因「加入域稍后会判」而先建目录、ack、落盘、注入。 */
-function admitJoinDecisionByRecord(state, frame) {
+function admitJoinDecisionByRecord(state, frame, meta) {
   const local = state.collabs?.get(frame.collabId);
   const refusal = joinDecisionRecordRefusalOf(frame, local);
   if (refusal !== null) {
@@ -417,16 +417,17 @@ function admitJoinDecisionByRecord(state, frame) {
   }
   const matched = pendingApplicationOf(state, frame, local) !== null
     || joiningSeatOf(local, frame) !== null
-    || localPendingJoinOf(state, frame) !== null;
+    || localPendingJoinOf(state, frame, meta) !== null;
   return matched
     ? { ok: true }
     : rejectedJoinDecision(state, '与本机待处理申请 / 已签发入席记录不匹配——拒绝');
 }
 
 /* 同机两段式（本机既是站长又是申请人）：站长侧待批准记录就是「本机确实在等这条 grant」的证据。
- * 仅限来源为本机的核内旁路——远端帧不得借用站长侧台账（那会绕过申请人侧申请记录）。 */
-function localPendingJoinOf(state, frame) {
-  if (frame.from?.instanceId !== state.self?.instanceId || typeof frame.payload?.sessionId !== 'string') {
+ * 只认核内接收面（remoteAddress='local'，见服务的同机协议帧旁路）——远端帧即使自报
+ * from.instanceId=本机也不得借用站长侧台账（那会绕过申请人侧申请记录）。 */
+function localPendingJoinOf(state, frame, meta) {
+  if (meta?.remoteAddress !== 'local' || typeof frame.payload?.sessionId !== 'string') {
     return null;
   }
   return state.pendingJoinsOf(frame.collabId).find((record) => record.sessionId === frame.payload.sessionId) ?? null;

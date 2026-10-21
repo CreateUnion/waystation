@@ -10,6 +10,10 @@ export const INBOX_FILE_NAME = 'inbox.jsonl';
  * 与发送队列同一口径——长驻进程里没有「终态事件」可等，靠行数触发才能保证文件增长有界。 */
 const COMPACT_LINE_FACTOR = 2;
 
+/* 坏目标净化的标识长度上限：与协议标识判据（ID_PATTERN，1–64）同一上界——超长值只可能是
+ * 被截断的错误输入，按同一上限保留可诊断前缀。 */
+const MAX_TARGET_ID_CHARS = 64;
+
 /* 可注入钩子的形状（全部可选，缺省即安全默认）：类型注解为类型检查服务——缺省值 {} 与属性访问需要明确形状。
  * sessionGate = 投递前的静音栅栏（返回 { suppress: true } 即本帧不进会话）；sessionDelivered = 投递成功后的
  * 事实通知（已注入标记的记真挂点——本层不掌握标记归属，只报「这帧进了会话」）。 */
@@ -195,7 +199,7 @@ async function handleCollabMessage(state, connection, frame) {
   if (!await acceptWritable(state, frame)) {
     return;
   }
-  const meta = metaOf(connection, frame);
+  const meta = metaOf(connection);
   if (!await acceptAdmission(state, frame, meta)) {
     return;
   }
@@ -489,7 +493,7 @@ function safeListInjectableTargets(state, collabId) {
  * 调用方绕过；长度按标识上限截断），条数在调用侧按席位上限裁剪。 */
 function sanitizeTargetOf(value) {
   if (typeof value === 'string') {
-    return value.slice(0, 64);
+    return value.slice(0, MAX_TARGET_ID_CHARS);
   }
   return `<${typeof value}>`;
 }
@@ -703,7 +707,9 @@ function isAbsorbedDuplicate(frame, consumed) {
  *    照旧注入（需处置的治理帧）；
  * ④ 静音栅栏（runDeliver 内的独立分支）：由服务钩子 sessionGate 声明——本层不掌握模式与
  *    静音态，只认 { suppress: true }；被抑制帧不进会话也不回报（维持第二档，会话主动查兜底）。 */
-const SESSION_GATED_TYPES = new Set(['post', 'join']);
+/* seat-presence 是机器级心跳：consume 声明不投会话时必须采信，否则每个席位都会收到心跳帧
+ * （治理「待办」价值为零，且会让会话收件箱被心跳噪声淹没）。 */
+const SESSION_GATED_TYPES = new Set(['post', 'join', 'seat-presence']);
 const CHANNEL_ROUTED_TYPES = new Set(['history-request', 'history-bundle']);
 
 function isSessionSuppressed(frame, consumed) {
@@ -1072,13 +1078,14 @@ function inboxRecordsOf(state, collabId) {
   }
 }
 
-/* 钩子 meta（来源地址 + 传输对端实例）：协作层用它学习成员端点、做邀请限频与判定治理帧来源；
- * peerInstanceId 取帧自报的 from.instanceId（局域网信任模型下的传输对端标识，与准入/consume
- * 使用的来源身份同源）。测试假连接可能不带 remoteAddress，缺失按空串（下游以空串为「未知来源」）。
- * 帧无 from（传输帧不进本函数）时 peerInstanceId 省略——下游按未知处理。 */
-function metaOf(connection, frame) {
+/* 钩子 meta（来源地址 + 传输对端实例）：协作层用它学习成员端点、做邀请限频与判定治理帧来源。
+ * peerInstanceId 必须来自连接层（拨号方按目标实例在连接上盖章，见 dispatch 的拨号登记）——
+ * 绝不取帧内 from.instanceId：那是发送方自报字段，用它会把 presence 的「传输对端」校验
+ * 退化为自证（伪造 from 即可刷新他人席位）。连接未携带时省略，下游按未知 fail-closed。
+ * 测试假连接可能不带 remoteAddress，缺失按空串（下游以空串为「未知来源」）。 */
+function metaOf(connection) {
   const meta = { remoteAddress: typeof connection?.remoteAddress === 'string' ? connection.remoteAddress : '' };
-  const peerInstanceId = frame?.from?.instanceId;
+  const peerInstanceId = connection?.peerInstanceId;
   if (typeof peerInstanceId === 'string' && peerInstanceId !== '') {
     meta.peerInstanceId = peerInstanceId;
   }

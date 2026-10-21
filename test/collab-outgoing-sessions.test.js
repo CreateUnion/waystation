@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { createCollab, deliveryStatusOf, endCollab, localSeatDeliveryOf, pushSnapshot, requestCurrentView, sendGovernance, sendMessage, sendToRoster, sendToSeats } from '../src/collab/outgoing.js';
+import { createCollab, deliveryStatusOf, endCollab, leaveCollab, localSeatDeliveryOf, memberIdsOf, pushSnapshot, requestCurrentView, sendGovernance, sendMessage, sendToRoster, sendToSeats } from '../src/collab/outgoing.js';
 import { isLedgerShape } from '../src/collab/model.js';
 import { loadLedger } from '../src/collab/store.js';
 import { seatFilePath } from '../src/paths.js';
@@ -41,7 +41,7 @@ function makeState({ role = 'manager', seats, roster, endpoints = {}, counters =
     self: SELF,
     collabs: new Map([['collab-1', local]]),
     joinReplays: new Map(),
-    counters: { messagesSent: 0, sendFailures: 0, ended: 0, ...counters },
+    counters: { messagesSent: 0, sendFailures: 0, ended: 0, snapshotSent: 0, snapshotSkipped: 0, ...counters },
     log: { info: () => {}, warn: () => {}, error: () => {} },
     send: (message) => {
       sent.push(message);
@@ -191,7 +191,7 @@ test('deliveryStatusOf：委托发送调度器的机器级行；未接线返回 
   assert.deepEqual(deliveryStatusOf(state, 'msg-1'), { msgId: 'msg-1', tier: 'session' });
 });
 
-test('sendMessage：同机多席缺 sessionId 拒绝（不再兜底站长）；单席位可无歧义签名', async () => {
+test('sendMessage：有席位表即强制显式 sessionId——单席也不猜签名（设计 §1.2）', async () => {
   const multi = makeState({ seats: [seat('sess-self', { role: 'manager' }), seat('sess-other')], roster: ROSTER, endpoints: ENDPOINTS });
   const rejected = await sendMessage(multi.state, { collabId: 'collab-1', text: '冒名' });
   assert.equal(rejected.ok, false);
@@ -200,8 +200,13 @@ test('sendMessage：同机多席缺 sessionId 拒绝（不再兜底站长）；�
   assert.deepEqual(multi.injected, []);
 
   const single = makeState({ seats: [seat('sess-self', { role: 'manager' })], roster: ROSTER, endpoints: ENDPOINTS });
-  const sent = await sendMessage(single.state, { collabId: 'collab-1', text: '单席' });
-  assert.equal(sent.ok, true);
+  const singleRejected = await sendMessage(single.state, { collabId: 'collab-1', text: '单席' });
+  assert.equal(singleRejected.ok, false, '单席位无歧义也不得兜底签名');
+  assert.deepEqual(single.sent, []);
+  assert.deepEqual(single.injected, []);
+
+  const explicit = await sendMessage(single.state, { collabId: 'collab-1', text: '单席', sessionId: 'sess-self' });
+  assert.equal(explicit.ok, true);
   assert.equal(single.sent[0].fromSessionId, 'sess-self');
 });
 
@@ -282,11 +287,62 @@ test('sendToRoster：本机其他席位走旁路注入，远端一帧一机', as
     endpoints: ENDPOINTS,
   });
   const count = sendToRoster(state, local, 'freeze', { name: '项目', members: [] });
-  assert.equal(count, 2, '本机组 + 远端组');
+  assert.equal(count, 1, '只计远端已受理组；本机旁路不计为远端触达');
   await waitFor(() => injected.length === 1);
   assert.deepEqual(injected.map((entry) => entry.sessionId), ['sess-local2']);
   assert.deepEqual(sent.map((message) => message.to.instanceId), ['inst-b']);
   assert.equal(sent[0].fromSessionId, 'sess-self');
+});
+
+test('leaveCollab：站长不可达且最后一人离席 → 写本地只读终态副本（设计 §3.4）', () => {
+  const { state, local } = makeState({ role: 'member', seats: [seat('sess-mem')], roster: ROSTER, endpoints: {} });
+  local.snapshot = { ledger: ledgerOf({ version: 3 }), version: 3 };
+  local.member.manager = { instanceId: 'inst-a', sessionId: 'sess-mgr' };
+  const result = leaveCollab(state, { collabId: 'collab-1', sessionId: 'sess-mem' });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.delivered, false, '无站长端点即未投出');
+  assert.equal(local.snapshot.ledger.localTerminal, true, '本地只读终态副本');
+  assert.equal(local.snapshot.ledger.status, 'completed');
+  assert.deepEqual(local.snapshot.ledger.members, []);
+  assert.equal(local.snapshot.ledger.manager, null);
+  assert.equal(local.snapshot.ledger.version, 4, '版本仍递增一次');
+  assert.equal(local.member.state, 'completed');
+});
+
+test('leaveCollab：仍有其他本机席位时不写终态副本；站长可达时照常投离席帧', () => {
+  const multi = makeState({ role: 'member', seats: [seat('sess-mem'), seat('sess-mem2')], roster: ROSTER, endpoints: {} });
+  multi.local.snapshot = { ledger: ledgerOf({ version: 3 }), version: 3 };
+  multi.local.member.manager = { instanceId: 'inst-a', sessionId: 'sess-mgr' };
+  leaveCollab(multi.state, { collabId: 'collab-1', sessionId: 'sess-mem' });
+  assert.equal(multi.local.snapshot.ledger.localTerminal, undefined, '同机仍有席位：本机未退出协作');
+
+  const reachable = makeState({ role: 'member', seats: [seat('sess-mem')], roster: ROSTER, endpoints: { 'inst-a': { address: '127.0.0.10', port: 7321 } } });
+  reachable.local.snapshot = { ledger: ledgerOf({ version: 3 }), version: 3 };
+  reachable.local.member.manager = { instanceId: 'inst-a', sessionId: 'sess-mgr' };
+  const result = leaveCollab(reachable.state, { collabId: 'collab-1', sessionId: 'sess-mem' });
+  assert.equal(result.delivered, true);
+  assert.equal(reachable.local.snapshot.ledger.localTerminal, undefined, '站长可达：权威台账归站长机');
+  assert.deepEqual(reachable.sent.map((message) => message.type), ['leave']);
+});
+
+test('memberIdsOf：同机多席按机器去重（治理广播一机一帧的收件面）', () => {
+  const { state, local } = makeState({
+    seats: [seat('sess-self', { role: 'manager' })],
+    roster: [rosterRow('inst-self', 'sess-self', 'manager'), rosterRow('inst-b', 'sess-b1'), rosterRow('inst-b', 'sess-b2'), rosterRow('inst-c', 'sess-c1')],
+  });
+  assert.deepEqual(memberIdsOf(state, local).sort(), ['inst-b', 'inst-c']);
+});
+
+test('sendToRoster：本机旁路注入失败计数留痕（fire-and-forget 不吞失败）', async () => {
+  const { state, local } = makeState({
+    seats: [seat('sess-self', { role: 'manager' }), seat('sess-local2')],
+    roster: [rosterRow('inst-self', 'sess-self', 'manager'), rosterRow('inst-self', 'sess-local2')],
+  });
+  state.injectLocalSeat = async () => ({ ok: false, reason: '桥不可用' });
+  const count = sendToRoster(state, local, 'freeze', { name: '项目', members: [] });
+  assert.equal(count, 0, '只有本机成员＝无远端触达（握手按 0 触发 unresolved）');
+  await waitFor(() => state.counters.rosterLocalFailures === 1);
 });
 
 test('建协：创建者席位先落盘；新台账通过形态校验并可重载；首邀携 sessionId 与席位名单', async (t) => {
@@ -357,6 +413,22 @@ test('快照出站：data 帧携 managerTerm/managerWindow；request 帧携请�
   const request = sent.filter((message) => message.type === 'snapshot').at(-1);
   assert.deepEqual(request.payload, { kind: 'request', managerTerm: 1, version: 3 });
   assert.equal(validateMessage(snapshotWire('collab-1', 'sess-self', request.payload)).ok, true);
+});
+
+test('快照推送：同机两席一机一帧并携 toSessions（D11 机器级记账）', () => {
+  const ledger = ledgerOf({ version: 4 });
+  ledger.members.push({ instanceId: 'inst-b', sessionId: 'sess-b2', identityName: '主机乙', role: 'member', state: 'member', joinSeq: 3, joinedAt: '2026-10-21T00:00:00.000Z' });
+  const { state, local, sent } = makeState({
+    seats: [seat('sess-self', { role: 'manager' })],
+    roster: ledger.members,
+    endpoints: ENDPOINTS,
+  });
+  local.ledger = ledger;
+  pushSnapshot(state, local);
+  const toB = sent.filter((message) => message.type === 'snapshot' && message.to.instanceId === 'inst-b');
+  assert.equal(toB.length, 1, '同机多席只发一帧（一个 msgId）');
+  assert.deepEqual(toB[0].toSessions, ['sess-b1', 'sess-b2']);
+  assert.equal(state.counters.snapshotSent, 1, '按机器计一次');
 });
 
 test('end：终态台账 manager:null、无站长行/窗口；终态快照与 end 通告仍发原成员', () => {

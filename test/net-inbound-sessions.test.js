@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { COLLABS_DIR_NAME } from '../src/paths.js';
-import { COLLAB_CAPABILITY, MAX_ACTIVE_SEATS, newMsgId } from '../src/net/protocol.js';
+import { COLLAB_CAPABILITY, MAX_ACTIVE_SEATS, newMsgId, validateMessage } from '../src/net/protocol.js';
 import { INBOX_FILE_NAME, createInbound } from '../src/net/inbound.js';
 import { decideAdmission } from '../src/collab/gate.js';
 import { makeTempDir, waitFor } from './helpers.js';
@@ -318,6 +318,65 @@ test('指名邀请只投目标会话：同机其他席位不注入；未入席�
   assert.deepEqual(pending.calls.map((call) => call.sessionId), ['sess-new'], '受邀未入席会话仍可注入');
 });
 
+test('邀请准入：members 只含发起人、targets 含目标机 → 受理并只投指名会话', async (t) => {
+  const gateState = gateStateOf();
+  const { inbound, dispatch, inject } = makeInbound(t, {
+    hooks: { admit: (gateFrame) => decideAdmission(gateState, gateFrame, { remoteAddress: '127.0.0.2' }) },
+  });
+  const invitation = frame({
+    type: 'invite',
+    payload: {
+      name: '联调项目',
+      topic: '发布联调',
+      members: [{ instanceId: 'inst-peer', sessionId: 'sess-peer', identityName: '主机乙' }],
+      targets: [{ instanceId: SELF.instanceId, targetSessionId: 'sess-b1' }],
+      targetSessionId: 'sess-b1',
+    },
+  });
+  assert.equal(validateMessage(invitation).ok, true, '真实邀请帧须过协议校验');
+  inbound.onFrame(createFakeConnection(), invitation);
+  await waitFor(() => reportsOf(dispatch).length === 1);
+  assert.equal(inbound.stats().rejected.admission, 0, 'targets 含本机即准入，不要求 members 含本机');
+  assert.deepEqual(inject.calls.map((call) => call.sessionId), ['sess-b1'], '指名邀请只投目标会话');
+});
+
+test('邀请准入：无 targets 的旧版邀请按 members 含本机受理；members 不含本机则拒', async (t) => {
+  const gateState = gateStateOf();
+  const { inbound, dispatch, inject } = makeInbound(t, {
+    hooks: { admit: (gateFrame) => decideAdmission(gateState, gateFrame, { remoteAddress: '127.0.0.3' }) },
+  });
+  const legacy = frame({
+    type: 'invite',
+    payload: {
+      name: '联调项目',
+      topic: '发布联调',
+      members: [
+        { instanceId: 'inst-peer', sessionId: 'sess-peer', identityName: '主机乙' },
+        { instanceId: SELF.instanceId, sessionId: 'sess-b1', identityName: SELF.identityName },
+      ],
+    },
+  });
+  inbound.onFrame(createFakeConnection(), legacy);
+  await waitFor(() => reportsOf(dispatch).length === 1);
+  assert.equal(inbound.stats().rejected.admission, 0, '旧版名单判据：members 含本机即受理');
+  assert.deepEqual(inject.calls.map((call) => call.sessionId), ['sess-b1', 'sess-b2']);
+
+  const missingSelf = frame({
+    type: 'invite',
+    msgId: newMsgId(),
+    payload: {
+      name: '联调项目',
+      topic: '发布联调',
+      members: [{ instanceId: 'inst-peer', sessionId: 'sess-peer', identityName: '主机乙' }],
+    },
+  });
+  const connection = createFakeConnection();
+  inbound.onFrame(connection, missingSelf);
+  await waitFor(() => gateState.counters.invitesRejected === 1);
+  assert.deepEqual(connection.sent, [], '无 targets 且名单不含本机：不确认');
+  assert.equal(inject.calls.length, 2, '拒绝帧不注入任何席位');
+});
+
 test('无名邀请且无任何可注入目标：fail-closed 丢弃并计数，不广播', async (t) => {
   const { inbound, dispatch, inject } = makeInbound(t, { seats: [] });
   const sent = frame({ type: 'invite', payload: { targets: [{ instanceId: 'inst-self' }] } });
@@ -369,6 +428,28 @@ test('仅暂存（无实际注入）时回报签发席位取原帧发件席位�
   assert.equal(reportsOf(mixed.dispatch)[0].from.sessionId, 'sess-b1', '有实际注入时用首个注入席位签发');
 });
 
+test('seat-presence：consume 声明不投会话即抑制注入（机器级心跳不进会话）', async (t) => {
+  const { inbound, dispatch, inject } = makeInbound(t, {
+    hooks: { consume: () => ({ sessionDeliver: false }) },
+  });
+  const connection = createFakeConnection();
+  const presence = frame({ type: 'seat-presence', payload: { instanceId: 'inst-peer', at: Date.now(), sessions: ['sess-peer'] } });
+  inbound.onFrame(connection, presence);
+  await waitFor(() => inbound.stats().accepted === 1);
+
+  assert.equal(connection.sent.filter((entry) => entry.type === 'ack').length, 1, '心跳照常确认');
+  assert.deepEqual(inject.calls, [], '不得把心跳注入任何会话');
+  assert.equal(inbound.stats().sessionSuppressed >= 1, true);
+  await waitFor(() => reportsOf(dispatch).length === 1);
+});
+
+test('seat-presence：forum 准入白名单放行（讨论心跳不被类型语义拒）', () => {
+  const local = { collabId: 'collab-1', role: 'member', member: { state: 'active', mode: 'forum' } };
+  const state = gateStateOf({ collabs: new Map([['collab-1', local]]) });
+  const decision = decideAdmission(state, frame({ type: 'seat-presence', payload: { instanceId: 'inst-peer' } }), {});
+  assert.equal(decision.ok, true, decision.reason);
+});
+
 test('吸收重复（帖去重命中）同样发零成功终态回报，携原帧签发席位', async (t) => {
   const { inbound, dispatch } = makeInbound(t, {
     hooks: { consume: () => ({ sessionDeliver: false, wasInjected: true }) },
@@ -409,37 +490,147 @@ test('重复帧载荷不一致：拒绝补扇出并计数；一致的重放复�
   assert.equal(inbound.localSeatDeliveryOf(original.msgId, 'sess-b2').status, 'injected');
 });
 
-test('钩子 meta：携带来源地址与传输对端实例标识（frame.from.instanceId）', async (t) => {
+test('钩子 meta：peerInstanceId 只取连接层盖章，帧内伪造 from 不自证', async (t) => {
   const seen = [];
   const { inbound } = makeInbound(t, {
     hooks: { consume: (_frame, meta) => { seen.push(meta); } },
   });
-  inbound.onFrame(createFakeConnection('127.0.0.9'), frame());
+  const stamped = createFakeConnection('127.0.0.9');
+  stamped.peerInstanceId = 'inst-b';
+  inbound.onFrame(stamped, frame());
   await waitFor(() => seen.length === 1);
   assert.equal(seen[0].remoteAddress, '127.0.0.9');
-  assert.equal(seen[0].peerInstanceId, 'inst-peer');
+  assert.equal(seen[0].peerInstanceId, 'inst-b', '连接层身份优先，不采信帧内 inst-peer');
+
+  const unstamped = createFakeConnection('127.0.0.10');
+  inbound.onFrame(unstamped, frame({ msgId: newMsgId(), from: { instanceId: 'inst-impostor', identityName: '冒名者', port: 7321, sessionId: 'sess-x' } }));
+  await waitFor(() => seen.length === 2);
+  assert.equal(seen[1].remoteAddress, '127.0.0.10');
+  assert.equal('peerInstanceId' in seen[1], false, '连接层未给身份时省略（下游 fail-closed），不得用帧内 from 补');
 });
 
-test('入站分派：joinId 式 join-grant/join-deny 通过准入并落盘投递；缺 joinId/reqMsgId 拒绝', async (t) => {
-  const gateState = { counters: { joinDecisionsRejected: 0 } };
+/* 准入门夹具：只摆本族判定读取的字段（申请台账 / 本机协作 / 各计数与时限）。 */
+function gateStateOf({ applications = [], collabs = new Map(), pendingJoins = [], ttlMs = 60000 } = {}) {
+  return {
+    self: SELF,
+    log: { info: () => {}, warn: () => {}, error: () => {} },
+    counters: { joinDecisionsRejected: 0, joinRequestsRejected: 0, unknownCollab: 0, invitesRejected: 0 },
+    collabs,
+    joinRequestWindow: new Map(),
+    inviteWindow: new Map(),
+    inviteMinIntervalMs: 0,
+    joinRequestTtlMs: ttlMs,
+    joinApplications: { list: () => applications },
+    pendingJoinsOf: () => pendingJoins,
+  };
+}
+
+function applicationOf(overrides = {}) {
+  return {
+    collabId: 'collab-1',
+    sessionId: 'sess-b1',
+    managerInstanceId: 'inst-peer',
+    msgId: 'invite-accept-1',
+    sentAt: Date.now(),
+    ...overrides,
+  };
+}
+
+function joinGrantOf(overrides = {}) {
+  return frame({
+    type: 'join-grant',
+    payload: {
+      joinId: 'join-1',
+      sessionId: 'sess-b1',
+      manager: { instanceId: 'inst-peer', sessionId: 'sess-peer', identityName: '主机乙' },
+      managerTerm: 1,
+      version: 2,
+    },
+    ...overrides,
+  });
+}
+
+function joiningLocalOf({ joinId = 'join-1', managerInstanceId = 'inst-peer', sessionId = 'sess-b1' } = {}) {
+  const local = {
+    collabId: 'collab-1',
+    role: 'member',
+    member: { state: 'active', manager: { instanceId: managerInstanceId, identityName: '主机乙' } },
+    seats: new Map([[sessionId, { sessionId, role: 'member', state: 'member', unverified: true, joinId }]]),
+  };
+  return new Map([['collab-1', local]]);
+}
+
+test('joinId 式 grant：无本机申请 / 无入席记录一律拒——未知 collab 不建目录、不 ack、不落盘、不注入', async (t) => {
+  const gateState = gateStateOf();
   const { inbound, dir, dispatch, inject } = makeInbound(t, {
-    hooks: { admit: (frame) => decideAdmission(gateState, frame, {}) },
+    hooks: { admit: (gateFrame) => decideAdmission(gateState, gateFrame, {}) },
   });
   const connection = createFakeConnection();
-  const grant = frame({
-    type: 'join-grant',
-    payload: { joinId: 'join-1', sessionId: 'sess-b1', manager: { instanceId: 'inst-peer', sessionId: 'sess-peer', identityName: '主机乙' }, managerTerm: 1, version: 2 },
+  inbound.onFrame(connection, joinGrantOf());
+  await waitFor(() => gateState.counters.joinDecisionsRejected === 1);
+
+  assert.deepEqual(connection.sent, [], '无本地权威证据的回执不确认');
+  assert.deepEqual(inject.calls, [], '不得注入任何席位（不得把未知 collab 注入两席）');
+  assert.equal(reportsOf(dispatch).length, 0, '不得产生终态回报');
+  assert.equal(inbound.stats().accepted, 0);
+  assert.throws(() => readInbox(dir), '不得为未知 collabId 建目录落盘');
+
+  const deny = frame({ type: 'join-deny', payload: { joinId: 'join-1', reason: 'expired' } });
+  inbound.onFrame(connection, deny);
+  await waitFor(() => gateState.counters.joinDecisionsRejected === 2);
+  assert.deepEqual(connection.sent, [], '未知 collab 的 join-deny 同样不确认');
+  assert.throws(() => readInbox(dir));
+});
+
+test('joinId 式 grant：本机待处理申请匹配（collab+站长实例+申请人会话）才受理并落盘投递', async (t) => {
+  const gateState = gateStateOf({ applications: [applicationOf()] });
+  const { inbound, dir, dispatch, inject } = makeInbound(t, {
+    hooks: { admit: (gateFrame) => decideAdmission(gateState, gateFrame, {}) },
   });
+  const connection = createFakeConnection();
+  const grant = joinGrantOf();
   inbound.onFrame(connection, grant);
   await waitFor(() => reportsOf(dispatch).length === 1);
-  assert.equal(connection.sent.filter((entry) => entry.type === 'ack').length, 1, 'joinId 式回执被受理并确认');
+
+  assert.equal(connection.sent.filter((entry) => entry.type === 'ack').length, 1, '匹配申请的回执确认');
   assert.deepEqual(inject.calls.map((call) => call.sessionId), ['sess-b1', 'sess-b2']);
   assert.equal(readInbox(dir).at(-1).payload.joinId, 'join-1');
+  assert.equal(gateState.counters.joinDecisionsRejected, 0);
+});
 
-  const invalid = frame({ type: 'join-deny', payload: { reason: 'expired' } });
-  inbound.onFrame(connection, invalid);
-  await waitFor(() => gateState.counters.joinDecisionsRejected === 1);
-  assert.equal(connection.sent.filter((entry) => entry.type === 'ack').length, 1, '缺凭据的回执不确认');
+test('joinId 式 grant：已签发的入席记录（同 joinId）是重复副本的本地凭据', async (t) => {
+  const gateState = gateStateOf({ collabs: joiningLocalOf() });
+  const { inbound, dispatch } = makeInbound(t, {
+    hooks: { admit: (gateFrame) => decideAdmission(gateState, gateFrame, {}) },
+  });
+  inbound.onFrame(createFakeConnection(), joinGrantOf());
+  await waitFor(() => reportsOf(dispatch).length === 1);
+  assert.equal(gateState.counters.joinDecisionsRejected, 0);
+});
+
+test('joinId 式 grant：自报本机来源的远端帧不得借用站长侧待批准台账（仅核内旁路认）', () => {
+  const state = gateStateOf({ pendingJoins: [{ instanceId: SELF.instanceId, sessionId: 'sess-b1', requestedAt: Date.now() }] });
+  const grant = joinGrantOf({
+    from: { instanceId: SELF.instanceId, identityName: SELF.identityName, port: 7321, sessionId: 'sess-local' },
+  });
+  assert.equal(decideAdmission(state, grant, { remoteAddress: '10.0.0.9' }).ok, false, '远端自报 from=本机不得借用站长侧台账');
+  assert.equal(state.counters.joinDecisionsRejected, 1);
+  assert.equal(decideAdmission(state, grant, { remoteAddress: 'local' }).ok, true, '核内旁路（remoteAddress=local）才认待批准台账');
+});
+
+test('joinId 式回执：冒名站长 / 过期申请 / 会话不符 / 异 joinId 入席记录一律拒并计数', () => {
+  const cases = [
+    { name: '冒名站长（申请指向 inst-peer）', state: gateStateOf({ applications: [applicationOf()] }), grant: joinGrantOf({ from: { instanceId: 'inst-impostor', identityName: '冒名者', port: 7321, sessionId: 'sess-x' } }) },
+    { name: '申请已过期', state: gateStateOf({ applications: [applicationOf({ sentAt: Date.now() - 60001 })] }), grant: joinGrantOf() },
+    { name: '申请人会话不符', state: gateStateOf({ applications: [applicationOf({ sessionId: 'sess-other' })] }), grant: joinGrantOf() },
+    { name: '入席记录 joinId 不符', state: gateStateOf({ collabs: joiningLocalOf({ joinId: 'join-other' }) }), grant: joinGrantOf() },
+    { name: '入席记录的站长不符', state: gateStateOf({ collabs: joiningLocalOf({ managerInstanceId: 'inst-other' }) }), grant: joinGrantOf() },
+  ];
+  for (const { name, state, grant } of cases) {
+    const rejected = decideAdmission(state, grant, {});
+    assert.equal(rejected.ok, false, name);
+    assert.equal(state.counters.joinDecisionsRejected, 1, name);
+  }
 });
 
 test('指名邀请的 targetSessionId 非法：整帧拒绝并计数（不得退化为不指名邀请）', async (t) => {

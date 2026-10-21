@@ -10,6 +10,7 @@ import { consumeInviteChallenge, consumeInviteWaiver, issueInviteChallenge } fro
 import { ledgerDigest, removeLedgerFile } from './store.js';
 import { currentManagerIdOf, emitOwnMemberEvent, foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, localTopicOf, memberStateFor, persistLedger, persistMember, persistSnapshot, relayDepartedOf, relayPeerOf, rememberKnownHost, selfJoinedOf, upsertLocalSeat } from './local.js';
 import { matchConflictCollabs } from './gate.js';
+import { writeLocalTerminalCopy } from './takeover.js';
 import { matchSessionByToken } from '../util/short-id.js';
 
 /* 对外操作与协作态变更实现（服务公共 API 的落点）：请求来自本机会话（工具面）——
@@ -581,9 +582,10 @@ async function sendManagedMessage(state, local, { text, type, to, toSessionId, f
   if (textRejection !== null) {
     return { ok: false, message: textRejection };
   }
-  /* 同机多席时必须显式指定发送会话——缺省兜底会把成员消息署成站长（发送身份可被顶替）。
-   * 单席机器无歧义，可按该唯一席位签名（旧单席记录同样兼容）。 */
-  const sender = resolveSenderSeat(local, fromSessionId, { requireExplicit: localSeatsOf(local).length > 1 });
+  /* 有运行时席位表时必须显式指定发送会话（设计 §1.2「无 sessionId 的调用拒绝」）：
+   * 缺省兜底会把成员消息署成站长或替调用方猜席位，发送身份可被顶替。无席位表的旧单席记录
+   * （会话级运行时尚未接线的历史数据）仍按成员记录兼容签名。 */
+  const sender = resolveSenderSeat(local, fromSessionId, { requireExplicit: localSeatsOf(local).length > 0 });
   if (sender.ok !== true) {
     return { ok: false, message: sender.reason };
   }
@@ -1048,15 +1050,29 @@ export function leaveCollab(state, { collabId, sessionId }) {
   }
   const managerId = local.member.manager.instanceId;
   const endpoint = local.endpoints.get(managerId);
-  if (endpoint !== undefined) {
-    sendTo(state, collabId, managerId, endpoint, 'leave', {}, { fromSessionId: sessionId ?? firstActiveSessionIdOf(local) ?? undefined });
-  }
+  const fromSessionId = sessionId ?? firstActiveSessionIdOf(local) ?? undefined;
+  const delivered = endpoint !== undefined
+    && sendTo(state, collabId, managerId, endpoint, 'leave', {}, { fromSessionId }).ok === true;
   local.member.state = 'left';
   local.member.archivedAt = new Date().toISOString();
   persistMember(state, local);
   local.mute.clear();
   state.counters.left++;
-  return { ok: true, delivered: endpoint !== undefined };
+  /* 站长不可达（无端点或发送失败）且本机最后一人离席：写本地只读终态副本（设计 §3.4），
+   * 不冒充权威台账——权威台账仍归站长机，恢复接触后由更高版本快照覆盖。 */
+  if (!delivered && isLastLocalSeatLeaving(local, fromSessionId)) {
+    writeLocalTerminalCopy(state, local);
+  }
+  return { ok: true, delivered };
+}
+
+/* 本次离席后本机是否再无席位：会话级席位表是权威；无席位表的旧单席记录按整机唯一成员处理。 */
+function isLastLocalSeatLeaving(local, leavingSessionId) {
+  const seats = localSeatsOf(local);
+  if (seats.length === 0) {
+    return true;
+  }
+  return seats.length === 1 && seats[0].sessionId === leavingSessionId;
 }
 
 /* 讨论退出（设计 §5.4/§6/§9.1）：leave 事件照走（自播广播、豁免 TTL/上限）；**发起人同普通成员**
@@ -1183,7 +1199,8 @@ export function mutateLedger(state, local, apply, options = {}) {
   return local.ledger;
 }
 
-/* 快照推送（设计 §8）：每次台账变更推全体成员（除本机）——端点已知者入可靠队列；
+/* 快照推送（设计 §8）：每次台账变更推全体成员（除本机）——按机器分组，一机一帧并携 toSessions
+ * （D11 机器级记账：同机多席不得各收一帧、不得产生多个 msgId）。端点已知者入可靠队列；
  * 端点未知者计数跳过（成员从未联系过站长席位的窗口）。站长席位同步留存自身最近快照。
  * 载荷冻结：帧在调度侧才序列化（入队落盘与上线各一次），活引用会让「摘要 ↔ 内容」分叉——
  * 台账被后续变更改写后，先入队的帧会以「摘要不符」被接收侧丢弃（本函数先深拷贝再入队）。 */
@@ -1198,18 +1215,36 @@ export function pushSnapshot(state, local) {
   };
   persistSnapshot(state, local);
   const fromSessionId = managerSessionIdOf(local) ?? undefined;
-  for (const member of local.ledger.members) {
-    if (member.instanceId === state.self.instanceId) {
-      continue;
-    }
-    const endpoint = local.endpoints.get(member.instanceId);
+  const payload = snapshotDataPayloadOf(frozen, local.snapshot.digest);
+  for (const [instanceId, sessionIds] of snapshotGroupsOf(state, local)) {
+    const endpoint = local.endpoints.get(instanceId);
     if (endpoint === undefined) {
       state.counters.snapshotSkipped++;
       continue;
     }
-    sendTo(state, local.collabId, member.instanceId, endpoint, 'snapshot', snapshotDataPayloadOf(frozen, local.snapshot.digest), { fromSessionId });
+    sendTo(state, local.collabId, instanceId, endpoint, 'snapshot', payload, {
+      fromSessionId,
+      ...(sessionIds.length > 0 ? { toSessions: sessionIds } : {}),
+    });
     state.counters.snapshotSent++;
   }
+}
+
+/* 名单按机器分组（D11「一机一帧」）：同机多席合成一帧并携 toSessions；本机行跳过。
+ * 旧行缺 sessionId 时该机器仍收一帧但不收窄目标（接收核按活跃席位扇出）。 */
+function snapshotGroupsOf(state, local) {
+  const groups = new Map();
+  for (const member of local.ledger.members) {
+    if (member.instanceId === state.self.instanceId) {
+      continue;
+    }
+    const sessions = groups.get(member.instanceId) ?? [];
+    if (typeof member.sessionId === 'string' && !sessions.includes(member.sessionId)) {
+      sessions.push(member.sessionId);
+    }
+    groups.set(member.instanceId, sessions);
+  }
+  return groups;
 }
 
 /* 快照数据帧（协议形态）：managerTerm / version / digest / ledger 必填；managerWindow 与台账
@@ -1606,7 +1641,9 @@ export function endpointFor(state, local, instanceId) {
 }
 
 /* 发给协作名册中全部已知端点的参与者（除本机与被排除者）：治理广播（抢接 / 裁定 / 握手 /
- * 席位变更通告）的统一出口；端点未知者跳过——可见性由转达与对等回执机制兜底（设计 §9 步骤 1/5）。 */
+ * 席位变更通告）的统一出口；端点未知者跳过——可见性由转达与对等回执机制兜底（设计 §9 步骤 1/5）。
+ * 返回值＝**远端**已受理的机器组数：本机旁路只是已排入注入（结果异步落 rosterLocalFailures），
+ * 不计为「已触达远端」——否则只有本机成员时握手会被误判为已发出而漏掉 unresolved 收敛。 */
 export function sendToRoster(state, local, type, payload, options = {}) {
   const sender = resolveSenderSeat(local, options.fromSessionId);
   if (sender.ok !== true || typeof sender.sessionId !== 'string') {
@@ -1626,15 +1663,18 @@ export function sendToRoster(state, local, type, payload, options = {}) {
   return sent;
 }
 
-/* 单个机器组的治理广播：本机组走逐席旁路注入（异步尽力而为），远端组一帧一机。 */
+/* 单个机器组的治理广播：本机组走逐席旁路注入（异步尽力而为），远端组一帧一机。
+ * 本机注入不阻塞主链，但结果必须计数留痕——否则返回值把「未注入」也算成已发送。 */
 function sendRosterGroup(state, local, fromSessionId, { type, payload, instanceId, sessionIds }) {
   if (instanceId === state.self.instanceId) {
     injectLocalTargets(state, local, fromSessionId, { type, payload, instanceId, sessionIds })
+      .then((result) => noteRosterLocalOutcome(state, local, type, result))
       .catch((error) => {
         state.counters.sendFailures++;
+        state.counters.rosterLocalFailures = (state.counters.rosterLocalFailures ?? 0) + 1;
         state.log.warn('本机治理广播注入异常（已隔离）', { collabId: local.collabId, type, reason: error?.message });
       });
-    return true;
+    return false;   // 本机旁路不是远端触达：调用方（握手）据 0 进入 unresolved 收敛
   }
   const endpoint = endpointFor(state, local, instanceId);
   if (endpoint === undefined) {
@@ -1646,6 +1686,19 @@ function sendRosterGroup(state, local, fromSessionId, { type, payload, instanceI
     ...(sessionIds.length > 0 ? { toSessions: sessionIds } : {}),
   });
   return result.ok === true;
+}
+
+/* 本机治理广播的异步收尾：成功（含静音抑制）不计数；否则记失败并保留逐席原因供排查。 */
+function noteRosterLocalOutcome(state, local, type, result) {
+  if (result?.ok === true) {
+    return;
+  }
+  state.counters.rosterLocalFailures = (state.counters.rosterLocalFailures ?? 0) + 1;
+  state.log.warn('本机治理广播注入未成功（已计数）', {
+    collabId: local.collabId,
+    type,
+    results: result?.results ?? [],
+  });
 }
 
 /* 名册按机器分组（含本机组；排除被点名排除者）：同机多席只发一帧并携 toSessions。
@@ -1872,14 +1925,19 @@ export function applyFreezeLocally(state, local, reason) {
 }
 
 /* manager 记录视角的可投递成员标识（除本机；终态成员——被拒 / 被撤回 / 已退出——不投消息）：
- * 消息广播与通告的收件人集合；提议中协作的「未回应」成员也在集内（提议中亦可沟通）。 */
+ * 消息广播与通告的收件人集合；提议中协作的「未回应」成员也在集内（提议中亦可沟通）。
+ * 按机器去重（D11）：同机多席在名单里各占一行，但不能因此向同一台机器发多帧。 */
 export function memberIdsOf(state, local) {
   if (local.role !== 'manager') {
     return [];
   }
-  return local.ledger.members
-    .filter((entry) => entry.instanceId !== state.self.instanceId && MESSAGING_MEMBER_STATES.includes(entry.state))
-    .map((entry) => entry.instanceId);
+  const ids = new Set();
+  for (const entry of local.ledger.members) {
+    if (entry.instanceId !== state.self.instanceId && MESSAGING_MEMBER_STATES.includes(entry.state)) {
+      ids.add(entry.instanceId);
+    }
+  }
+  return [...ids];
 }
 
 /* 非归档协作数（发现层 getCollabCount 的计数口径：提议中 / 进行中 / 冻结）。 */

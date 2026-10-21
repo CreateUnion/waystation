@@ -709,7 +709,7 @@ test('checkInbox：读失败（路径为目录）抛错并计数留痕（不得�
   assert.ok(logs.some((entry) => entry.message.includes('收件流水读取失败')));
 });
 
-test('钩子 meta：admit 与 consume 均收到连接来源地址', { timeout: 15000 }, async (t) => {
+test('钩子 meta：admit 与 consume 均收到连接来源地址与连接层对端身份', { timeout: 15000 }, async (t) => {
   const metas = { admit: [], consume: [] };
   const { inbound } = makeInbound(t, {
     hooks: {
@@ -724,13 +724,14 @@ test('钩子 meta：admit 与 consume 均收到连接来源地址', { timeout: 1
     },
   });
   const connection = createFakeConnection('127.0.0.7');
+  connection.peerInstanceId = 'inst-transport';
   inbound.onFrame(connection, messageFrame());
   await waitFor(() => inbound.stats().accepted === 1);
-  assert.deepEqual(metas.admit, [{ remoteAddress: '127.0.0.7', peerInstanceId: PEER.instanceId }]);
-  assert.deepEqual(metas.consume, [{ remoteAddress: '127.0.0.7', peerInstanceId: PEER.instanceId }]);
+  assert.deepEqual(metas.admit, [{ remoteAddress: '127.0.0.7', peerInstanceId: 'inst-transport' }], '取连接层身份而非帧内 from');
+  assert.deepEqual(metas.consume, [{ remoteAddress: '127.0.0.7', peerInstanceId: 'inst-transport' }]);
 });
 
-test('钩子 meta：连接无来源地址时为空串（不抛出）', { timeout: 15000 }, async (t) => {
+test('钩子 meta：连接无来源地址 / 无对端身份时按空处理（不采信帧内 from）', { timeout: 15000 }, async (t) => {
   const metas = [];
   const { inbound } = makeInbound(t, {
     hooks: {
@@ -745,7 +746,7 @@ test('钩子 meta：连接无来源地址时为空串（不抛出）', { timeout
   delete connection.remoteAddress;
   inbound.onFrame(connection, messageFrame());
   await waitFor(() => inbound.stats().accepted === 1);
-  assert.deepEqual(metas, [{ remoteAddress: '', peerInstanceId: PEER.instanceId }]);
+  assert.deepEqual(metas, [{ remoteAddress: '' }], '帧内 from.instanceId 不得补成 peerInstanceId');
 });
 
 test('查询路径：收件流水残缺记录留痕（warn，与载入路径同口径）', (t) => {

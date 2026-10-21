@@ -827,6 +827,9 @@ async function performDial(state, key, collabId, entry) {
   if (connection === null) {
     return null;   // 停止收口后才完成的拨号：连接已被收口关闭，不得登记、不得发帧
   }
+  /* 传输对端实例：本连接是按该条目的目标实例拨出的——这是连接层事实，入站 meta.peerInstanceId
+   * 据此盖章（不得由帧内 from 自报）。入站接受的连接来源身份未知，保持省略（下游 fail-closed）。 */
+  connection.peerInstanceId = entry.to.instanceId;
   adopt(state, connection);
   connection.onClose(() => {
     const current = state.connections.get(key);
