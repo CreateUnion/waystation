@@ -183,7 +183,7 @@ function lastNoticeTextOf(made) {
   return made.notices.at(-1)?.payload?.text ?? '';
 }
 
-test('取消静音摘要：静音期新增 N 条；无新增 0 条；重启后基线仍有效', async (t) => {
+test('取消静音摘要：静音期新增 N 条；无新增 0 条；重启后基线缺失按降级文案', async (t) => {
   const made = makeService(t);
   const collabId = createCollabOf(made, '静音摘要', 'forum');
   made.service.setMute({ collabId, sessionId: MANAGER_SESSION, muted: false });
@@ -208,12 +208,13 @@ test('取消静音摘要：静音期新增 N 条；无新增 0 条；重启后�
   made.service.setMute({ collabId, sessionId: MANAGER_SESSION, muted: false });
   assert.equal(lastNoticeTextOf(made), `${FORUM_SUMMARY_HEAD} 2 条——静音期与回填内容不进注入，经查看器/ws_view_ledger 补看`);
 
-  /* 基线随静音状态文件持久：重启后取消仍按差值给 N。 */
+  /* 基线只在进程内有效：重启后席位仍静音，但摘要按降级文案（不带 N），不再读写退役的 mute.json。 */
   made.service.setMute({ collabId, sessionId: MANAGER_SESSION, muted: true });
   const restarted = reload(made, t);
+  assert.equal(restarted.service.localSeatOf(collabId, MANAGER_SESSION)?.muted, true, '重启后席位静音仍在');
   await postToForumOf(restarted, collabId, '重启后静音期内容');
   restarted.service.setMute({ collabId, sessionId: MANAGER_SESSION, muted: false });
-  assert.equal(lastNoticeTextOf(restarted), `${FORUM_SUMMARY_HEAD} 1 条——静音期与回填内容不进注入，经查看器/ws_view_ledger 补看`);
+  assert.equal(lastNoticeTextOf(restarted), FORUM_DEGRADE_TEXT, '基线缺失：摘要降级不带 N');
 });
 
 test('取消静音摘要：基线缺失（旧文件）时明确降级为不带 N 的文案', async (t) => {
