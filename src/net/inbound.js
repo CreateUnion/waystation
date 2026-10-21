@@ -69,12 +69,18 @@ export function createInbound({ dataDir, config, self, dispatch, hooks = {}, log
     /* 扇出在途面（record → Promise）：同一 msgId 的逐席扇出必须单飞——重复帧可能经另一条连接并发到达，
      * 两个循环交错推进共享的 pending/outcomes 会把未注入的席位记成已注入（静默漏投）。 */
     fanoutFlights: new WeakMap(),
+    /* 受理段在途面（record → Promise）：consume 与首轮扇出也必须单飞——ack 先于 consume 发出，
+     * 重复帧可能在 consume 裁定抑制前到达；抢先扇出的席位既不该注入，注入结果也无处归账。 */
+    acceptFlights: new WeakMap(),
     counters: emptyCounters(),
   };
   return {
     start,
     stop,
     onFrame: (connection, frame) => onFrame(state, connection, frame),
+    /* 本机旁路投递账的写面：与入站受理共用同一收件盒（append 与 seen 同步），
+     * 查询与压实因此看到同一份记录。 */
+    noteLocalDelivery: (entry) => noteLocalDelivery(state, entry),
     checkInbox: (query) => checkInbox(state, query),
     localSeatDeliveryOf: (msgId, sessionId) => localSeatDeliveryOf(state, msgId, sessionId),
     stats: () => statsOf(state),
@@ -380,6 +386,19 @@ async function acceptSeatFanoutFrame(state, box, frame, connection, meta) {
   connection.send(ackFrame(state, frame.msgId));
   state.counters.acksSent++;
   compactIfDue(state, box);
+  /* 登记发生在第一个 await 之前（落盘与 seen 已就位）：重复帧一旦看到该记录，必然也能看到在途受理段。 */
+  const acceptance = acceptAndFanout(state, box, frame, record, connection, meta, targets);
+  state.acceptFlights.set(record, acceptance);
+  try {
+    await acceptance;
+  } finally {
+    state.acceptFlights.delete(record);
+  }
+}
+
+/* 受理段（consume → 抑制裁定 → 首轮扇出）：与落盘/ack 分开，但作为同一 record 的单飞临界段执行。
+ * 抑制路径不得在扇出进行中改写 pending——那会让在途注入的结果落在已被清空的账外。 */
+async function acceptAndFanout(state, box, frame, record, connection, meta, targets) {
   const consumed = await runHook(state, state.consume, frame, meta);
   if (isSessionSuppressed(frame, consumed)) {
     state.counters.sessionSuppressed += targets.seats.length;
@@ -680,6 +699,12 @@ async function resumeDuplicate(state, box, frame, connection, meta) {
     });
     return;
   }
+  /* 首份副本的受理段尚未落地（consume 未返回）：先等它完成再复查 pending。
+   * 抢先扇出会绕过随后的抑制裁定——本应被抑制的帧被注入，且注入结果因 pending 被清空而无处归账。 */
+  const acceptance = state.acceptFlights.get(record);
+  if (acceptance !== undefined) {
+    await acceptance;
+  }
   const stored = storedFrameOf(record);
   if (record.fanout.pending.length > 0) {
     state.counters.fanoutResumed++;
@@ -959,6 +984,57 @@ function compactInbox(state, box) {
 function persistInbound(state, box, frame) {
   const record = { ...frame, receivedAt: new Date().toISOString() };
   return persistRecord(state, box, record) ? record : null;
+}
+
+/* 本机旁路投递账（服务直投的逐席交付事实）经收件盒写入：与入站受理共用同一 seen 窗口与压实来源。
+ * 直接 append 文件会绕过 box.seen——已载入的收件盒看不到该行，压实按内存投影重写时还会删掉它，
+ * 重启前后的查询结果因此不一致。
+ * 同一 msgId 已有入站受理记录时不写第二份账：扇出循环会随注入结果更新该记录，另写快照会在载入时
+ * 覆盖它的扇出进度。本机旁路是服务直投、不经过受理，两者不会对同一帧同时发生。 */
+function noteLocalDelivery(state, entry) {
+  const { collabId, sessionId, frame, outcome } = entry ?? {};
+  if (!isLocalDeliveryEntryValid(collabId, sessionId, frame)) {
+    return false;
+  }
+  const box = boxFor(state, collabId);
+  const existing = box.seen.get(frame.msgId)?.record;
+  if (existing !== undefined && existing.fanout !== undefined && existing.local !== true) {
+    return true;
+  }
+  const record = localDeliveryRecordOf(frame, sessionId, outcome, existing);
+  if (!persistRecord(state, box, record)) {
+    return false;
+  }
+  box.seen.set(frame.msgId, { receivedAtMs: Date.now(), record });
+  box.appendsSinceCompact++;
+  compactIfDue(state, box);
+  return true;
+}
+
+/* 本机投递账的入参校验：形态与接收核查询面的标识判据同口径，坏值不落盘（服务侧已有同一判据，
+ * 这里防未来调用方绕过）。 */
+function isLocalDeliveryEntryValid(collabId, sessionId, frame) {
+  return typeof collabId === 'string' && ID_PATTERN.test(collabId)
+    && typeof sessionId === 'string' && ID_PATTERN.test(sessionId)
+    && typeof frame === 'object' && frame !== null && typeof frame.msgId === 'string' && frame.msgId !== '';
+}
+
+/* 本机投递记录：同一 msgId 的多次本机交付（不同收件席）合并成一份扇出快照——后写胜的载入口径下，
+ * 只保留最后一次写入也必须携带此前各席的结果。 */
+function localDeliveryRecordOf(frame, sessionId, outcome, existing) {
+  const prior = existing?.local === true ? existing.fanout : undefined;
+  return {
+    ...frame,
+    receivedAt: new Date().toISOString(),
+    fanout: {
+      pending: [],
+      done: [...new Set([...(prior?.done ?? []), sessionId])],
+      dropped: prior?.dropped ?? [],
+      outcomes: { ...(prior?.outcomes ?? {}), [sessionId]: outcome },
+      complete: true,
+    },
+    local: true,
+  };
 }
 
 /* 记录追加写（inbox 是状态快照流：同一 msgId 的后续行携带更新的扇出进度，载入时后写胜）。 */

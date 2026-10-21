@@ -2514,6 +2514,7 @@ function buildWiredService(t, dir, { delivered, offline = false } = {}) {
     },
     deliveryStatusOf: (msgId) => wired.dispatch.deliveryStatusOf(msgId),
     localSeatDeliveryOf: (msgId, sessionId) => wired.inbound.localSeatDeliveryOf(msgId, sessionId),
+    noteLocalDelivery: (entry) => wired.inbound.noteLocalDelivery(entry),
     log: quietLog(),
     syncPeerPicker: () => [],
   });
@@ -2526,6 +2527,13 @@ test('同机双席：发送省略 to → 本机旁路机器级终态与收件席
   const collabId = seedSameMachineCollab(made.dir);
   const delivered = [];
   const first = buildWiredService(t, made.dir, { delivered });
+  /* 先经接收核写面载入收件盒（模拟长运行核已有入站流量）：此后服务直投若绕过盒子，运行期查询就看不到。 */
+  first.inbound.noteLocalDelivery({
+    collabId,
+    sessionId: 'sess-local-2',
+    frame: { msgId: 'msg-inbox-warmup', type: 'reply', collabId, payload: { text: '预热' } },
+    outcome: 'injected',
+  });
   await first.service.registerBridgeEntry('sess-local-2', 'bridge-local-2');
   const sent = await first.service.send({ collabId, text: '同机双席', sessionId: 'sess-self' });
   assert.equal(sent.ok, true, sent.message);
@@ -2538,11 +2546,17 @@ test('同机双席：发送省略 to → 本机旁路机器级终态与收件席
   assert.equal(row?.toInstanceId, 'inst-self');
   assert.deepEqual(row?.toSessions, ['sess-local-2']);
   assert.equal(first.service.localSeatDeliveryOf(sent.msgId, 'sess-local-2').status, 'injected');
+  const inboxBefore = first.inbound.checkInbox({ collabId, sessionId: 'sess-local-2' });
+  assert.equal(inboxBefore.total, 2, '本机投递行写进已载入的收件盒：checkInbox 立即可见');
+  assert.deepEqual(inboxBefore.messages.map((record) => record.msgId), ['msg-inbox-warmup', sent.msgId]);
+  assert.equal(inboxBefore.messages[1].local, true);
 
   const restarted = buildWiredService(t, made.dir, {});
   const afterRestart = restarted.service.localSeatDeliveryOf(sent.msgId, 'sess-local-2');
   assert.equal(afterRestart.status, 'injected', '重启后按需折叠载入收件流水，收件席明细仍可查');
   assert.equal(afterRestart.collabId, collabId);
+  assert.deepEqual(restarted.inbound.checkInbox({ collabId, sessionId: 'sess-local-2' }), inboxBefore,
+    'checkInbox 在本机投递行上进程内与重启后逐字段一致');
   assert.throws(() => restarted.service.localSeatDeliveryOf(sent.msgId, 'bad id!'), TypeError);
 });
 

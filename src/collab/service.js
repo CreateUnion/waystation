@@ -88,6 +88,7 @@ const SEAT_INBOX_MAX = 200;
  *   joinRequestRetryMs?: number, joinRequestRetryMaxMs?: number, now?: () => number,
  *   deliveryStatusOf?: ((msgId: string) => any) | null,
  *   localSeatDeliveryOf?: ((msgId: string, sessionId: string) => any) | null,
+ *   noteLocalDelivery?: ((entry: { collabId: string, sessionId: string, frame: object, outcome: string }) => unknown) | null,
  *   selfEndpoint?: { address: string, port?: number } | null,
  *   monoClock?: (() => number) | null }} options
  */
@@ -102,6 +103,8 @@ export function createCollabService(options) {
   /* 投递查询面（出站/入站层 → 工具面）：本机旁路的席位明细优先取内存事实，未命中再委托接收管线的落盘账；
    * 组合根以闭包注入（IPC 监听步才构造），运行期再触达。 */
   state.inboundLocalSeatDeliveryOf = pickOption(options, 'localSeatDeliveryOf', null);
+  /* 本机投递账的写面（接收核收件盒）：查询面与写面必须落在同一个盒子里，否则运行期写入对本进程不可见。 */
+  state.inboundNoteLocalDelivery = pickOption(options, 'noteLocalDelivery', null);
   state.deliveryStatusOf = pickOption(options, 'deliveryStatusOf', null);
   state.localSeatDeliveryOf = (msgId, sessionId) => localSeatDeliveryOfOf(state, msgId, sessionId);
   state.join = createJoinDomain({
@@ -2799,9 +2802,20 @@ async function flushStagedOf(state, local, seat) {
 }
 
 /* 本机旁路的落盘投递账（设计 §5.3 第 4 条）：与接收核同一 inbox.jsonl 形态，键 (msgId,sessionId)。
- * 幂等重试/重启后查询都以此为准；写失败只计数留痕，不改变注入已成功的事实。 */
+ * 写入必须经接收核的收件盒（append 与 seen 同步）：直接 append 会绕过已载入的盒子，
+ * 运行期查询看不到该行，压实按内存投影重写时还会把它删掉。
+ * 写面未注入（不构造接收核的单测装配）时退回直写，保持既有行为；写失败只计数留痕，不改变注入事实。 */
 function noteLocalDelivery(state, collabId, sessionId, frame, outcome) {
   if (!validCollabId(collabId) || frame === null || typeof frame?.msgId !== 'string') {
+    return;
+  }
+  if (typeof state.inboundNoteLocalDelivery === 'function') {
+    try {
+      state.inboundNoteLocalDelivery({ collabId, sessionId, frame, outcome });
+    } catch (error) {
+      state.counters.localDeliveryLedgerFailures++;
+      state.log.warn('本机投递账写入失败（注入事实仍成立）', { collabId, msgId: frame.msgId, sessionId, reason: error?.message });
+    }
     return;
   }
   const record = {

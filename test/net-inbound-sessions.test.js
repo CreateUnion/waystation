@@ -694,6 +694,80 @@ test('并发重复帧：同一 msgId 经两条连接同时到达时扇出单飞�
   assert.equal(record.fanout.complete, true);
 });
 
+/* 可控的异步闸门与微任务排空：并发窗口由用例显式放行，不靠 sleep 赌时序。 */
+function deferredOf() {
+  let resolve;
+  const promise = new Promise((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+async function drainMicrotasks(turns = 60) {
+  for (let index = 0; index < turns; index++) {
+    await Promise.resolve();
+  }
+}
+
+test('并发重复帧：consume 未返回前到达的重复帧不得抢先扇出（抑制在途窗口）', { timeout: 15000 }, async (t) => {
+  const consumeGate = deferredOf();
+  const { inbound, dir, dispatch, inject, gateCalls } = makeInbound(t, {
+    hooks: {
+      consume: async () => {
+        await consumeGate.promise;
+        return { sessionDeliver: false, wasInjected: true };
+      },
+    },
+  });
+  const sent = frame({ type: 'post', payload: { postId: 'post-dedup-window', kind: 'text', text: '去重帖' }, toSessions: ['sess-b1', 'sess-b2'] });
+  inbound.onFrame(createFakeConnection('127.0.0.2'), sent);
+  inbound.onFrame(createFakeConnection('127.0.0.3'), sent);
+  await waitFor(() => inbound.stats().duplicates === 1);
+  await drainMicrotasks();
+
+  assert.deepEqual(gateCalls, [], '首份副本 consume 未返回时，重复帧不得进入扇出（静音栅栏也不得触达）');
+  assert.deepEqual(inject.calls, [], '抑制裁定前不得注入任何席位');
+
+  consumeGate.resolve();
+  await waitFor(() => reportsOf(dispatch).length >= 2);
+  assert.deepEqual(inject.calls, [], 'consume 声明抑制后整帧不注入');
+  const record = readInbox(dir).filter((entry) => entry.msgId === sent.msgId).at(-1);
+  assert.deepEqual(record.fanout.pending, []);
+  assert.deepEqual(record.fanout.done, []);
+  assert.deepEqual(record.fanout.outcomes, {}, '抑制帧不留下任何注入结果');
+  assert.equal(record.fanout.complete, true);
+});
+
+test('并发重复帧：consume 返回后只扇出一轮，注入结果全部落账', { timeout: 15000 }, async (t) => {
+  const consumeGate = deferredOf();
+  const { inbound, dir, dispatch, inject, gateCalls } = makeInbound(t, {
+    hooks: {
+      consume: async () => {
+        await consumeGate.promise;
+        return {};
+      },
+    },
+  });
+  const sent = frame({ toSessions: ['sess-b1', 'sess-b2'] });
+  inbound.onFrame(createFakeConnection('127.0.0.2'), sent);
+  inbound.onFrame(createFakeConnection('127.0.0.3'), sent);
+  await waitFor(() => inbound.stats().duplicates === 1);
+  await drainMicrotasks();
+  assert.deepEqual(gateCalls, [], 'consume 未返回前不得开始扇出');
+  assert.deepEqual(inject.calls, [], 'consume 未返回前不得注入');
+
+  consumeGate.resolve();
+  await waitFor(() => reportsOf(dispatch).length >= 1);
+  await waitFor(() => inbound.localSeatDeliveryOf(sent.msgId, 'sess-b1').status === 'injected'
+    && inbound.localSeatDeliveryOf(sent.msgId, 'sess-b2').status === 'injected');
+  await drainMicrotasks();
+  assert.deepEqual(inject.calls.map((call) => call.sessionId).sort(), ['sess-b1', 'sess-b2'], '每席只注入一次');
+  const record = readInbox(dir).filter((entry) => entry.msgId === sent.msgId).at(-1);
+  assert.deepEqual(Object.keys(record.fanout.outcomes).sort(), ['sess-b1', 'sess-b2'], '注入结果全部落账');
+  assert.deepEqual(record.fanout.pending, []);
+  assert.equal(record.fanout.complete, true);
+});
+
 test('checkInbox 重启一致性：seatMode 扇出多行折叠为每 msgId 一条，进程内与重启后逐字段相等', { timeout: 15000 }, async (t) => {
   const dir = makeTempDir(t);
   const first = makeInbound(t, { dataDir: dir, seats: [seat('sess-b1'), seat('sess-b2')] });
@@ -727,4 +801,88 @@ test('localSeatDeliveryOf 重启后按需载盘：未载入的收件流水也给
     collabId: null, msgId: 'msg-unknown-1', sessionId: 'sess-b1', status: 'unknown', complete: false,
   });
   assert.throws(() => restarted.inbound.localSeatDeliveryOf('', 'sess-b1'), TypeError);
+});
+
+/* —— 本机投递账必须经收件盒写入（append 与 seen 一致） —— */
+
+test('本机投递账：已载入的收件盒立即看到写入行，重启前后 checkInbox 逐字段一致', { timeout: 15000 }, async (t) => {
+  const dir = makeTempDir(t);
+  const first = makeInbound(t, { dataDir: dir, seats: [seat('sess-b1'), seat('sess-b2')] });
+  first.inbound.onFrame(createFakeConnection(), frame({ toSessions: ['sess-b1', 'sess-b2'] }));
+  await waitFor(() => reportsOf(first.dispatch).length === 1);
+
+  const local = frame({ msgId: 'msg-local-visible', payload: { text: '本机旁路' } });
+  assert.equal(first.inbound.noteLocalDelivery({ collabId: 'collab-1', sessionId: 'sess-b1', frame: local, outcome: 'injected' }), true);
+  const before = first.inbound.checkInbox({ collabId: 'collab-1' });
+  assert.equal(before.total, 2, '已载入的收件盒必须包含本机投递行');
+  assert.equal(before.messages.some((record) => record.msgId === 'msg-local-visible'), true);
+  const visible = first.inbound.checkInbox({ collabId: 'collab-1', sessionId: 'sess-b1' });
+  assert.equal(visible.messages.some((record) => record.msgId === 'msg-local-visible'), true, '目标席位可见');
+  const hidden = first.inbound.checkInbox({ collabId: 'collab-1', sessionId: 'sess-b2' });
+  assert.equal(hidden.messages.some((record) => record.msgId === 'msg-local-visible'), false, '非目标席位不可见');
+  assert.equal(first.inbound.localSeatDeliveryOf('msg-local-visible', 'sess-b1').status, 'injected');
+
+  const restarted = makeInbound(t, { dataDir: dir });
+  assert.deepEqual(restarted.inbound.checkInbox({ collabId: 'collab-1' }), before, '进程内与重启后逐字段一致');
+});
+
+test('本机投递账：同一 msgId 的多席写入合并为一份快照，后写胜口径不丢前席结果', async (t) => {
+  const dir = makeTempDir(t);
+  const first = makeInbound(t, { dataDir: dir, seats: [] });
+  const local = frame({ msgId: 'msg-local-two-seats', payload: { text: '双席' } });
+  assert.equal(first.inbound.noteLocalDelivery({ collabId: 'collab-1', sessionId: 'sess-b1', frame: local, outcome: 'injected' }), true);
+  assert.equal(first.inbound.noteLocalDelivery({ collabId: 'collab-1', sessionId: 'sess-b2', frame: local, outcome: 'staged' }), true);
+  const inbox = first.inbound.checkInbox({ collabId: 'collab-1' });
+  assert.equal(inbox.total, 1);
+  assert.deepEqual(Object.keys(inbox.messages[0].fanout.outcomes).sort(), ['sess-b1', 'sess-b2']);
+  assert.equal(inbox.messages[0].fanout.complete, true);
+
+  const restarted = makeInbound(t, { dataDir: dir });
+  assert.equal(restarted.inbound.localSeatDeliveryOf('msg-local-two-seats', 'sess-b1').status, 'injected');
+  assert.equal(restarted.inbound.localSeatDeliveryOf('msg-local-two-seats', 'sess-b2').status, 'staged');
+  assert.deepEqual(restarted.inbound.checkInbox({ collabId: 'collab-1' }), inbox, '折叠后与进程内一致');
+});
+
+test('本机投递账：入站扇出注入不另写本机账（受理记录已由扇出循环维护）', { timeout: 15000 }, async (t) => {
+  let made = null;
+  const injector = {
+    async inject(collabId, sessionId, frame) {
+      /* 模拟服务注入口：每次注入都会回调本机投递账写面。 */
+      made.inbound.noteLocalDelivery({ collabId, sessionId, frame, outcome: 'injected' });
+      return { ok: true, delivered: true };
+    },
+  };
+  made = makeInbound(t, { injector });
+  const sent = frame({ toSessions: ['sess-b1', 'sess-b2'] });
+  made.inbound.onFrame(createFakeConnection(), sent);
+  await waitFor(() => reportsOf(made.dispatch).length === 1);
+  assert.equal(made.inbound.localSeatDeliveryOf(sent.msgId, 'sess-b2').status, 'injected');
+
+  const lines = readInbox(made.dir).filter((entry) => entry.msgId === sent.msgId);
+  assert.equal(lines.some((entry) => entry.local === true), false, '不得为入站受理记录另写本机账快照');
+  assert.deepEqual(Object.keys(lines.at(-1).fanout.outcomes).sort(), ['sess-b1', 'sess-b2']);
+  assert.deepEqual(lines.at(-1).fanout.pending, []);
+  assert.equal(lines.at(-1).fanout.complete, true);
+});
+
+test('本机投递账：入站记录老化触发压实后仍在，重启后收件席明细仍 injected', { timeout: 15000 }, async (t) => {
+  const dir = makeTempDir(t);
+  const config = { messageTtlMs: 1000 };
+  const first = makeInbound(t, { dataDir: dir, config, seats: [seat('sess-b1')] });
+  first.inbound.onFrame(createFakeConnection(), frame({ toSessions: ['sess-b1'] }));
+  first.inbound.onFrame(createFakeConnection('127.0.0.3'), frame({ toSessions: ['sess-b1'] }));
+  await waitFor(() => reportsOf(first.dispatch).length === 2);
+  /* 时效语义本身依赖真实时间：等过保留期，让下一次受理的剪枝把这些入站记录移出窗口。 */
+  await new Promise((resolve) => setTimeout(resolve, config.messageTtlMs + 100));
+
+  const local = frame({ msgId: 'msg-local-compacted', payload: { text: '压实前写入' } });
+  assert.equal(first.inbound.noteLocalDelivery({ collabId: 'collab-1', sessionId: 'sess-b1', frame: local, outcome: 'injected' }), true);
+  assert.equal(readInbox(dir).some((line) => line.msgId === 'msg-local-compacted'), true, '写入即落盘');
+  first.inbound.onFrame(createFakeConnection('127.0.0.4'), frame({ toSessions: ['sess-b1'] }));
+  await waitFor(() => reportsOf(first.dispatch).length === 3);
+
+  assert.equal(readInbox(dir).some((line) => line.msgId === 'msg-local-compacted'), true, '压实重写不得删除本机投递行');
+  const restarted = makeInbound(t, { dataDir: dir, config });
+  assert.equal(restarted.inbound.localSeatDeliveryOf('msg-local-compacted', 'sess-b1').status, 'injected', '重启后明细仍可查');
+  assert.equal(restarted.inbound.checkInbox({ collabId: 'collab-1' }).messages.some((record) => record.msgId === 'msg-local-compacted'), true);
 });

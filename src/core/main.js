@@ -885,6 +885,8 @@ function deliveryWiringOf(state) {
     deliveryStatusOf: (msgId) => state.dispatch?.deliveryStatusOf?.(msgId) ?? null,
     localSeatDeliveryOf: (msgId, sessionId) => state.inbound?.localSeatDeliveryOf?.(msgId, sessionId)
       ?? { collabId: null, msgId, sessionId, status: 'unknown', complete: false },
+    /* 本机投递账必须经接收核的收件盒写入（append 与 seen 同步）；直写会绕过已载入的盒子。 */
+    noteLocalDelivery: (entry) => state.inbound?.noteLocalDelivery?.(entry),
   };
 }
 

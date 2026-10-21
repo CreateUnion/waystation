@@ -17,6 +17,7 @@ import {
   fitProbeAckDatagram,
 } from '../src/net/discovery.js';
 import { createKnownHosts, participantsStateOf } from '../src/net/known-hosts.js';
+import { SLOT_COUNT } from '../src/site.js';
 import { MAX_COLLAB_COUNT, PROTOCOL_VERSION, fitJoinResolveAck, validateProbe, validateProbeAck } from '../src/net/protocol.js';
 import { makeTempDir, pickFreePort, testDiscoveryOffEnv, waitFor } from './helpers.js';
 
@@ -334,20 +335,42 @@ test('同地址同端口二次绑定：EADDRINUSE（独占绑定是端口占用�
 
 /* —— 模型 A：段扫 / 自介 / 端口回带 / 节流键 / 洪泛边界 —— */
 
-test('段扫 + 同机多站点互扫（广播投递实测）：base+1 的非默认端口站点被 base 上的扫描发现', { timeout: 20000 }, async (t) => {
+test('段扫目标构造（0.0.0.0 绑定）：定向广播 × 槽位段逐端口全入集，注入桩不触真实网卡', { timeout: 15000 }, async (t) => {
+  /* 真实的 0.0.0.0 广播投递必然向真实网卡发送数据报（测试硬约束禁止）；回环绑定又算不出定向广播地址，
+   * 段扫的「投递」侧无法在隔离条件下实测。这里以出站注入桩断言生产绑定下构造出的目标集，
+   * 「非默认端口经清单单播互见」由下一条回环双地址用例覆盖。 */
   const broadcasts = broadcastTargets(networkInterfaces());
   if (broadcasts.length === 0) {
-    t.skip('本机无可用定向广播接口——同机广播投递无法在本环境实测');
+    t.skip('本机无可用定向广播接口——段扫目标无法在本环境构造');
     return;
   }
   const base = await pickFreePort();
-  const a = await startNode(t, { self: SELF_A, bindAddress: '0.0.0.0', port: base, segmentBase: base });
-  const b = await startNode(t, { self: SELF_B, bindAddress: '0.0.0.0', port: base + 1, segmentBase: base });
-  const hosts = await a.node.scan({ windowMs: 600 });
-  const peer = hosts.find((entry) => entry.instanceId === SELF_B.instanceId);
-  assert.ok(peer, `同机广播（段内 base+1）互扫应可见，实际：${JSON.stringify(hosts)}`);
-  assert.equal(peer.endpoints[0].port, base + 1, '端点端口来自应答 port 字段（非扫描方端口）');
-  assert.ok(b.knownHosts.targets().some((entry) => entry.port === base), '乙记录了甲的探测来源（地址:端口）');
+  const knownHosts = createKnownHosts({ dataDir: makeTempDir(t), log: quietLog() });
+  knownHosts.remember({ address: '127.0.0.2', port: base + 1 });
+  const sent = [];
+  const node = createDiscovery({
+    port: base,
+    bindAddress: '0.0.0.0',
+    instanceId: SELF_A.instanceId,
+    identityName: SELF_A.identityName,
+    getCollabCount: () => 0,
+    knownHosts,
+    log: quietLog(),
+    segmentBase: base,
+    deliverDatagram: (datagram) => sent.push(datagram),
+  });
+  t.after(() => node.close());
+  node.announce();
+  await node.scan({ windowMs: 5 });
+
+  const targets = new Set(sent.map((datagram) => `${datagram.address}:${datagram.port}`));
+  for (const broadcast of broadcasts) {
+    for (let offset = 0; offset < SLOT_COUNT; offset++) {
+      assert.ok(targets.has(`${broadcast}:${base + offset}`), `段扫目标缺 ${broadcast}:${base + offset}`);
+    }
+  }
+  assert.ok(targets.has(`127.0.0.2:${base + 1}`), '已知主机清单单播目标照常入集');
+  assert.equal(node.stats().datagramsIn, 0, '注入桩只记录出站目标，未接收任何真实报文');
 });
 
 test('跨机非默认端口互见（回环双地址）：单播学习 + 段扫探测双向收敛', { timeout: 20000 }, async (t) => {

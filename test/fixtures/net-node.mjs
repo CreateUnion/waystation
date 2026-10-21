@@ -63,6 +63,7 @@ const collab = createCollabService({
   deliveryStatusOf: (msgId) => dispatch.deliveryStatusOf(msgId),
   localSeatDeliveryOf: (msgId, sessionId) => net.inbound?.localSeatDeliveryOf(msgId, sessionId)
     ?? { collabId: null, msgId, sessionId, status: 'unknown', complete: false },
+  noteLocalDelivery: (entry) => net.inbound?.noteLocalDelivery(entry),
   probe: (address, port) => dispatch.ping({ address, port }),
   reassign: (payload) => dispatch.reassignPeer(payload),
   notify: adapter !== null ? (frame) => adapter.deliverFrame(frame) : null,
