@@ -535,7 +535,7 @@ export function isLegacyLedgerRow(ledger) {
   return isLegacyLedger(ledger);
 }
 
-/* 旧版对端帧与旧协作写路径的拒绝计数（函数级，接线归 M2/M3）：设计 §6.4 的 legacyInboundRejected
+/* 旧版对端帧与旧协作写路径的拒绝计数（函数级，接线归运行时与出站投递层）：设计 §6.4 的 legacyInboundRejected
  * 与写门拒绝共用同一累计面，便于诊断「对端旧版仍在发帧」与「写被门挡下」。 */
 export function createLegacyRejectionCounter() {
   let inbound = 0;

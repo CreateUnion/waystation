@@ -67,7 +67,7 @@ export function indicatedEntriesOf(entries, indicators, sessionId = null) {
 
 /* 本会话在条目席位表中的席位：undefined＝无席位表/无会话标识（走旧字段兜底）；
  * null＝席位表在场但没有本会话席位（条目不属于本会话）；对象＝命中席位。
- * 席位来源可能是 M2 的完整 sessionId 或观察窗的短码：统一按短码精确匹配，歧义即拒。 */
+ * 席位来源可能是运行时写入的完整 sessionId 或观察窗的短码：统一按短码精确匹配，歧义即拒。 */
 function seatOfEntry(entry, sessionId) {
   const seats = entry?.sessions?.localSeats;
   if (!Array.isArray(seats) || typeof sessionId !== 'string' || sessionId === '') {

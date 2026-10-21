@@ -13,7 +13,7 @@ import { writeJsonAtomic } from '../storage.js';
  * manager/originator/forumMeta/syncCursor/name/topic/mode/endpoints → 本文件；
  * roster → 共享快照/peerView；pendingInvites/targetSessionId → pending-invites.json。 */
 
-/* 文件名权威在路径层；这里只转出给 M8 的消费方，避免与 paths.js 的常量漂移。 */
+/* 文件名权威在路径层；这里只转出给 legacy 只读读取器的消费方，避免与 paths.js 的常量漂移。 */
 export { CARRIER_FILE_NAME };
 export const CARRIER_FORMAT_SESSION_SEATS = 'session-seats';
 export const CARRIER_FORMAT_INVITE_STUB = 'invite-stub';

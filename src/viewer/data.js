@@ -12,7 +12,7 @@
  * 单一权威由测试兜底：夹具以各模块导出的规范常量为准，与这里不同步即红。
  *
  * 会话席位视图（设计 §10）纯读席位表与共享态：本机会员席位来自注入的 listLocalSeats
- * （M2 运行时接口；观察窗独立进程未注入时回退 seats/<sessionId>.json），远端成员来自
+ * （运行时席位接口；观察窗独立进程未注入时回退 seats/<sessionId>.json），远端成员来自
  * 台账/快照名单，离席历史来自本地派生索引 departed.jsonl。旧协作（旧 member.json、无 carrier
  * 标记）与 migration/recovery 标记只读呈现；协作目录的数据文件清单见 READ_FILE_NAMES。
  *
@@ -69,7 +69,7 @@ const OUTBOX_FILE_NAME = 'outbox.jsonl';
  * 不引其符号；漂移由测试兜底（夹具以该模块导出的 KNOWN_HOSTS_FILE_NAME 规范常量建立）。 */
 const KNOWN_HOSTS_FILE_NAME = 'known-hosts.json';
 /* 0.2.0 本地文件形态（设计 §6.2/§10）：路径常量与文件名取自 paths.js 的唯一权威；旧形态判定
- * 与摘要由 M8 的 readLegacyCollab 单点提供（本层不自建旧形态判据）。清单是本层允许触碰的只读
+ * 与摘要由 legacy 只读读取器的 readLegacyCollab 单点提供（本层不自建旧形态判据）。清单是本层允许触碰的只读
  * 文件面；handover-offers.json 与 run/core-stop.json 为设计列出的相邻展示面，本层暂不渲染但
  * 保留在允许清单内。 */
 /* seats/ 是目录；其余为协作目录内文件。清单精确覆盖本层只读面（不含状态栏 session 文件）。 */
@@ -499,10 +499,10 @@ function textFieldOf(value) {
 }
 
 /* 目录形态标记（设计 §6.2/§8）：carrier 是新形态标记；recovery 是半写目录标记。旧形态判定
- * 与只读摘要一律走 M8 的 readLegacyCollab（单点判据，本层不重复实现）。 */
+ * 与只读摘要一律走 legacy 只读读取器的 readLegacyCollab（单点判据，本层不重复实现）。 */
 function carrierOf(state, base, collabId) {
   const parsed = readJsonOrNull(state, carrierFilePath(base, collabId));
-  /* 只有合规 format 标记才按新形态处理；半写/异形 carrier 与 M8 的 legacy 判据保持一致
+  /* 只有合规 format 标记才按新形态处理；半写/异形 carrier 与 legacy 只读读取器的判据保持一致
    * （readLegacyCollab 只看 format 标记），避免 meta 与 sessions 各说一套。 */
   return isPlainObject(parsed) && CARRIER_FORMATS.includes(parsed.format) ? parsed : null;
 }
@@ -511,7 +511,7 @@ function recoveryOf(state, base, collabId) {
   return readRecovery(collabDir(base, collabId));
 }
 
-/* M8 只读摘要（旧 member.json 档案，含已迁移归档）：非旧形态目录返回 null；本层只消费摘要，
+/* legacy 只读摘要（旧 member.json 档案，含已迁移归档）：非旧形态目录返回 null；本层只消费摘要，
  * 不自行判断旧形态，也不做任何旧台账改写。读取器异常按「非 legacy」降级，单目录故障不得
  * 把整页列表打成 500。 */
 function legacySummaryOf(state, base, collabId) {
@@ -540,7 +540,7 @@ function logLegacyWarnings(state, collabId, summary) {
   }
 }
 
-/* 本机席位（设计 §1.2）：M2 运行时接口 listLocalSeats 优先；观察窗独立进程未注入时回退
+/* 本机席位（设计 §1.2）：运行时席位接口 listLocalSeats 优先；观察窗独立进程未注入时回退
  * seats/<sessionId>.json。两来源同一视图形态；席位文件逐条校验、坏条跳过（不清洗不删除）。 */
 function localSeatsOf(state, base, collabId) {
   const injected = injectedSeatsOf(state, collabId);
@@ -600,7 +600,7 @@ function readSeatFiles(state, base, collabId) {
   return { seats, corrupt };
 }
 
-/* 与 M2 落盘形态对齐（版本、可选序号、时间戳、布尔与 joinId）：观察窗与运行时不得各判一套。 */
+/* 与运行时落盘形态对齐（版本、可选序号、时间戳、布尔与 joinId）：观察窗与运行时不得各判一套。 */
 function isSeatFileShape(record) {
   if (!isPlainObject(record) || !isVersionedSeat(record)) {
     return false;
@@ -773,7 +773,7 @@ function localInstanceIdOf(member) {
   return isPlainObject(manager) && hasInstanceId(manager) ? manager.instanceId : null;
 }
 
-/* 旧协作的成员视图取自 M8 摘要 roster（旧台账/快照的名单，或旧 member.json 的定格名单）：
+/* 旧协作的成员视图取自 legacy 摘要 roster（旧台账/快照的名单，或旧 member.json 的定格名单）：
  * 字段缺失时只呈现机器与短码，不伪造角色/状态。 */
 function legacyRosterSeatsOf(legacy, localSeats, localInstanceId) {
   const localSessionIds = new Set(localSeats.map((seat) => seat.sessionId));
@@ -1084,7 +1084,7 @@ function sessionsOf(state, base, collabId, context) {
   return sessions;
 }
 
-/* 远端成员来源：旧协作取 M8 摘要 roster；讨论取成员事件折叠；managed 取共享台账/快照。 */
+/* 远端成员来源：旧协作取 legacy 摘要 roster；讨论取成员事件折叠；managed 取共享台账/快照。 */
 function remoteSeatsFor(mode, state, base, collabId, { ledger, localSeats, legacy, localInstanceId }) {
   if (legacy !== null) {
     return legacyRosterSeatsOf(legacy, localSeats, localInstanceId);
@@ -1128,7 +1128,7 @@ function identityNameOf(state, base) {
   return FALLBACK_IDENTITY_NAME;
 }
 
-/* 元状态口径：新形态以 carrier 名为准、状态取共享台账；旧形态完全以 M8 摘要为权威
+/* 元状态口径：新形态以 carrier 名为准、状态取共享台账；旧形态完全以 legacy 摘要为权威
  * （state 固定 completed，摘要名来自旧台账/快照/成员记录）。两者都缺＝未就绪。 */
 function metaViewFor(carrier, member, ledger, legacy) {
   if (legacy !== null && carrier === null) {
@@ -1172,7 +1172,7 @@ function topicOf(carrier, ledger, member, legacy) {
   return member !== null && typeof member.topic === 'string' ? member.topic : null;
 }
 
-/* 模式判定：carrier.mode 为准；旧协作取 M8 摘要的 mode；其后再看 member.json.mode（缺 mode 按
+/* 模式判定：carrier.mode 为准；旧协作取 legacy 摘要的 mode；其后再看 member.json.mode（缺 mode 按
  * managed 解释）；参与记录缺失/损坏且帖文件在时才按讨论兜底——单一权威在 model.js 的缺省口径。 */
 function modeOf(carrier, member, postsPresent, legacy) {
   if (carrier !== null && isModeValue(carrier.mode)) {
@@ -1308,7 +1308,7 @@ function readMeta(state, root, collabId, after) {
   const localSeats = localSeatView.seats;
   const role = roleOf(member, localSeats);
   /* 台账来源在分支前取好一并下发（会话席位视图同取这份，不再重读）。旧协作的旧台账不经
-   * 新形态校验（否则旧行会被计成坏行），其摘要、名单与状态全部由 M8 的 legacy 读取器提供。 */
+   * 新形态校验（否则旧行会被计成坏行），其摘要、名单与状态全部由 legacy 只读读取器提供。 */
   const source = mode === 'forum' || legacy !== null
     ? { ledgerRows: [], skipped: 0 }
     : ledgerSourceOf(state, base, collabId, role);
@@ -1325,10 +1325,10 @@ function readMeta(state, root, collabId, after) {
   return sessions === null ? meta : { ...meta, sessions };
 }
 
-/* 讨论元状态：名/态取 carrier（新形态）或 M8 旧协作摘要/参与记录；成员数＝事件折叠；
+/* 讨论元状态：名/态取 carrier（新形态）或 legacy 旧协作摘要/参与记录；成员数＝事件折叠；
  * 计数＝合法完整帖行数（本观察窗所见）。 */
 function forumMetaOf(state, base, collabId, carrier, member, legacy, posts, after) {
-  /* 旧协作的成员事件由 M8 旧判据读取（摘要已折叠人数）；本层不再用新形态校验器解析旧事件。
+  /* 旧协作的成员事件由 legacy 旧判据读取（摘要已折叠人数）；本层不再用新形态校验器解析旧事件。
    * 本层暂不展示旧事件轨，避免把旧行计成坏行。 */
   const members = legacy === null
     ? readParsedFile(state, collabFilePath(base, collabId, MEMBERS_FILE_NAME), classifyMemberLine)
@@ -1347,7 +1347,7 @@ function forumMetaOf(state, base, collabId, carrier, member, legacy, posts, afte
   };
 }
 
-/* 协作元状态：名/态取 carrier、M8 旧协作摘要或新形态台账；人数＝台账/快照 members 名单长度
+/* 协作元状态：名/态取 carrier、legacy 旧协作摘要或新形态台账；人数＝台账/快照 members 名单长度
  * （成员席位下是邀请定格名单，非实时人数——如实呈现），旧协作无新形态台账时取摘要人数；
  * 计数＝累计收到（与会话流不同源：不含发出、且随文件现行内容走）。台账来源由调用方取好传入
  * （会话席位视图同取一份，台账文件不重读）。 */
@@ -1423,7 +1423,7 @@ function managedSummaryOf(state, base, collabId, role) {
   return { ledger, memberCount: ledger === null ? 0 : ledger.members.length, count: counterOf(state, base, collabId) };
 }
 
-/* 旧协作摘要只取 M8 摘要与观察面计数：不读新形态台账，避免把旧行误计为坏行。 */
+/* 旧协作摘要只取 legacy 摘要与观察面计数：不读新形态台账，避免把旧行误计为坏行。 */
 function legacySummaryValue(state, base, collabId, legacy, mode, posts) {
   return {
     ledger: null,
@@ -1499,7 +1499,7 @@ function listCollabs(state) {
 
 /**
  * 只读数据层工厂（同步 API、纯读；工厂闭包持微缓存）。
- * listLocalSeats 是 M2 运行时席位的注入点：核心进程内接线时传入，独立观察窗进程不传则
+ * listLocalSeats 是运行时席位的注入点：核心进程内接线时传入，独立观察窗进程不传则
  * 回退读取 seats/<sessionId>.json——两种来源产出的视图形态一致。
  * @param {{ dataDir: string, log?: any, listLocalSeats?: ((collabId: string) => any[]) | null }} options
  *   log 仅用于读故障留痕（log?.warn）
