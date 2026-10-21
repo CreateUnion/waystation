@@ -2,7 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { collabDir, collabFilePath } from '../src/paths.js';
+import { join } from 'node:path';
+import { carrierFilePath, collabDir, collabFilePath, seatFilePath } from '../src/paths.js';
 import { makeTempDir, waitFor } from './helpers.js';
 import { createCollabService } from '../src/collab/service.js';
 import { MEMBERS_FILE_NAME } from '../src/collab/members.js';
@@ -15,6 +16,8 @@ import { createInbound } from '../src/net/inbound.js';
  * ⑥与水位拉取正交（离线者照常追平）；⑦降级期直投副本不再转达（设计两可项的选定行为）；
  * ⑧发起人标识传递（邀请载荷 / bundle 元状态两路）；生命周期（发起人退出 → 直投兜底）；
  * 聚合捎回（成员会话回报译回原作者——真 dispatch + 真 inbound 三节点接缝）。
+ * 0.2.0 席位形态（设计 §1.1/§4.5/§5.1）：协作帧携 cap=2 与 from.sessionId；建协、同意与离席
+ * 都带调用会话标识，成员事件与折叠成员表按 (instanceId, sessionId) 席位键收敛。
  * 多数用例经注入缝（假发送 / 虚拟直投线（节点可达性可配）/ 可控探测面）+ 临时目录，不触真实网络。 */
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -23,6 +26,22 @@ const SELF_B = { instanceId: 'inst-b', identityName: '主机乙', port: 17322 };
 const SELF_C = { instanceId: 'inst-c', identityName: '主机丙', port: 17323 };
 const SELF_E = { instanceId: 'inst-e', identityName: '主机戊', port: 17324 };
 const SEATS = [SELF_A, SELF_B, SELF_C, SELF_E];
+const SESSION_A = 'relay-seat-a';
+const SESSION_B = 'relay-seat-b';
+const SESSION_C = 'relay-seat-c';
+const SESSION_E = 'relay-seat-e';
+const SESSION_OF = new Map([
+  [SELF_A.instanceId, SESSION_A],
+  [SELF_B.instanceId, SESSION_B],
+  [SELF_C.instanceId, SESSION_C],
+  [SELF_E.instanceId, SESSION_E],
+]);
+
+/* 席位会话标识（设计 §1.1）：每台机器一个活跃会话；未登记的实例按后缀派生，供幽灵成员等构造帧使用。 */
+function sessionIdOf(seat) {
+  const known = SESSION_OF.get(seat.instanceId);
+  return known ?? `relay-seat-${String(seat.instanceId).replace(/^inst-/, '')}`;
+}
 
 function quietLog() {
   return { info: () => {}, warn: () => {}, error: () => {} };
@@ -85,15 +104,28 @@ function sentOf(sent, type, collabId = null) {
   return sent.filter((entry) => entry.type === type && (collabId === null || entry.collabId === collabId));
 }
 
+/* 同意邀请（0.2.0 同意门）：首次只签发一次性挑战，携 confirmToken 重试才落地（设计 §4.3）。 */
+async function approveInviteWithConsentOf(service, collabId, sessionId) {
+  const challenge = await service.approve({ collabId, approve: true, sessionId });
+  assert.equal(challenge.needsUserConfirmation, true, '同意须经用户确认（挑战 → 令牌）');
+  return service.approve({ collabId, approve: true, sessionId, confirmToken: challenge.confirmToken });
+}
+
 let seq = 0;
 
 function collabFrame(type, collabId, from, payload) {
   seq++;
   return {
     v: 1,
+    cap: 2,
     type,
     msgId: `msg-${type}-${seq}`,
-    from: { instanceId: from.instanceId, identityName: from.identityName, port: from.port },
+    from: {
+      instanceId: from.instanceId,
+      sessionId: from.sessionId ?? sessionIdOf(from),
+      identityName: from.identityName,
+      port: from.port,
+    },
     collabId,
     ts: new Date().toISOString(),
     payload,
@@ -109,13 +141,21 @@ function forumPostFrame(collabId, from, { postId, seq: postSeq, kind = 'reply', 
 }
 
 /* 直投帧成形（与 dispatch.frameOf 同口径：message.from 透传——转达帧 from 保原作者；
+ * 无显式 from 时以发送席位盖章：from.sessionId 取 message.fromSessionId，缺省按本机唯一席位派生；
  * ts 取 createdAt（帖的落盘 ts 随帧携带）、缺省当前时刻）。 */
 function wireFrameOf(message, fromSelf, serial) {
+  const identity = message.from ?? {
+    instanceId: fromSelf.instanceId,
+    sessionId: message.fromSessionId ?? sessionIdOf(fromSelf),
+    identityName: fromSelf.identityName,
+    port: fromSelf.port,
+  };
   return {
     v: 1,
+    cap: 2,
     type: message.type,
     msgId: `wire-${serial}`,
-    from: message.from ?? { instanceId: fromSelf.instanceId, identityName: fromSelf.identityName, port: fromSelf.port },
+    from: { ...identity, sessionId: identity.sessionId ?? message.fromSessionId ?? sessionIdOf(fromSelf) },
     collabId: message.collabId,
     ts: typeof message.createdAt === 'string' ? message.createdAt : new Date().toISOString(),
     payload: message.payload,
@@ -211,18 +251,23 @@ async function makeStudio(t, options = {}) {
   wire.register(SELF_A, madeA.service);
   wire.register(SELF_B, madeB.service);
   wire.register(SELF_C, madeC.service);
-  const collabId = madeA.service.create({
+  const created = madeA.service.create({
     name: '讨论三',
     topic: '三节点议题',
     mode: 'forum',
+    sessionId: SESSION_A,
     targets: [targetOf(SELF_B), targetOf(SELF_C)],
-  }).collabId;
+  });
+  assert.equal(created.ok, true, created.message);
+  const collabId = created.collabId;
   await deliverInvite(wire, madeA, madeB, collabId);
-  await madeB.service.approve({ collabId, approve: true });
+  await approveInviteWithConsentOf(madeB.service, collabId, SESSION_B);
   await deliverInvite(wire, madeA, madeC, collabId);
-  await madeC.service.approve({ collabId, approve: true });
+  await approveInviteWithConsentOf(madeC.service, collabId, SESSION_C);
   const joinB = sentOf(madeB.sent, 'join', collabId)[0];
   const joinC = sentOf(madeC.sent, 'join', collabId)[0];
+  assert.equal(joinB.fromSessionId, SESSION_B, '乙的 join 自播按本会话席位签发');
+  assert.equal(joinC.fromSessionId, SESSION_C, '丙的 join 自播按本会话席位签发');
   await wire.hop(joinB, SELF_B, madeA.service);
   await wire.hop(joinC, SELF_C, madeA.service);
   /* 成员之间的 join 也直接投递一份：折叠成员表三人齐不依赖对表应答（无直投面的降级面用例
@@ -231,6 +276,9 @@ async function makeStudio(t, options = {}) {
   await wire.hop(joinB, SELF_B, madeC.service);
   await syncWhenIdle(madeB.service, collabId);
   await syncWhenIdle(madeC.service, collabId);
+  /* 装配判据：中继侧的折叠成员表按席位键（instanceId/sessionId）含三方——join 事件不得退化成实例行。 */
+  const seatKeys = (await madeA.service.view({ collabId })).members.map((entry) => `${entry.instanceId}/${entry.sessionId ?? '-'}`).sort();
+  assert.deepEqual(seatKeys, [`${SELF_A.instanceId}/${SESSION_A}`, `${SELF_B.instanceId}/${SESSION_B}`, `${SELF_C.instanceId}/${SESSION_C}`].sort(), '折叠成员表按席位键含三方');
   return { wire, up, probe, probeStats, collabId, a: madeA, b: madeB, c: madeC };
 }
 
@@ -247,7 +295,7 @@ function postsOf(view) {
 
 test('①三节点中继路径：成员发帖发中继（投稿标记）、中继扇出转达（from 保原作者）→ 全员收敛一致', async (t) => {
   const { wire, collabId, a, b, c } = await makeStudio(t);
-  const posted = await b.service.send({ collabId, text: '乙的第一帖', type: 'issue' });
+  const posted = await b.service.send({ collabId, sessionId: SESSION_B, text: '乙的第一帖', type: 'issue' });
   assert.equal(posted.ok, true, posted.message);
   assert.equal(posted.route, 'relay', '默认经中继分发');
   assert.deepEqual(posted.to, [SELF_A.instanceId], '投稿只发中继（不逐成员直投）');
@@ -277,7 +325,7 @@ test('①三节点中继路径：成员发帖发中继（投稿标记）、中�
   assert.equal(b.service.stats().postsDuplicated, 0, '投稿不回流作者（无重复副本）');
 
   /* 中继自帖：直接扇出（它就是分发器）——不产生投稿标记帧。 */
-  const postedA = await a.service.send({ collabId, text: '甲的帖' });
+  const postedA = await a.service.send({ collabId, sessionId: SESSION_A, text: '甲的帖' });
   assert.equal(postedA.route, 'fanout');
   assert.deepEqual(postedA.to.sort(), [SELF_B.instanceId, SELF_C.instanceId]);
   assert.equal(wire.postsTo(SELF_B.instanceId).filter((frame) => frame.from.instanceId === SELF_A.instanceId).length, 1);
@@ -288,7 +336,7 @@ test('①三节点中继路径：成员发帖发中继（投稿标记）、中�
 test('②降级：中继不可达（探测失败）→ 当场降级直投、本次即走直投；③恢复：检测通过后切回中继并计数', async (t) => {
   const { up, collabId, a, b, c } = await makeStudio(t);
   up.delete(SELF_A.instanceId);   // 发起人会话关闭 = 中继消失（非错误）
-  const degraded = await b.service.send({ collabId, text: '降级期的帖' });
+  const degraded = await b.service.send({ collabId, sessionId: SESSION_B, text: '降级期的帖' });
   assert.equal(degraded.ok, true);
   assert.equal(degraded.route, 'degraded', '探测不可达 → 当场降级');
   assert.deepEqual(degraded.to.sort(), [SELF_A.instanceId, SELF_C.instanceId], '降级 = 对全成员直投');
@@ -310,7 +358,7 @@ test('②降级：中继不可达（探测失败）→ 当场降级直投、本�
   const beforeRecovery = b.service.stats().relayRecoveries;
   await syncWhenIdle(b.service, collabId);
   assert.equal(b.service.stats().relayRecoveries, beforeRecovery + 1, '恢复检测通过（可观测计数）');
-  const back = await b.service.send({ collabId, text: '恢复后的帖' });
+  const back = await b.service.send({ collabId, sessionId: SESSION_B, text: '恢复后的帖' });
   assert.equal(back.route, 'relay', '路径切回中继');
   assert.deepEqual(back.to, [SELF_A.instanceId]);
   assert.equal(b.service.stats().relayPostsSent, 1);
@@ -323,11 +371,11 @@ test('②降级：中继不可达（探测失败）→ 当场降级直投、本�
 test('降级持续期：降级态下发帖不重复探测（直投照走），计数不重复累积', async (t) => {
   const { up, probeStats, collabId, b, c } = await makeStudio(t);
   up.delete(SELF_A.instanceId);
-  const first = await b.service.send({ collabId, text: '降级一' });
+  const first = await b.service.send({ collabId, sessionId: SESSION_B, text: '降级一' });
   assert.equal(first.route, 'degraded');
   const probesAfterFirst = probeStats.calls;
   assert.equal(probesAfterFirst > 0, true, '首帖探测中继（不可达判定）');
-  const second = await b.service.send({ collabId, text: '降级二' });
+  const second = await b.service.send({ collabId, sessionId: SESSION_B, text: '降级二' });
   assert.equal(second.route, 'degraded');
   assert.ok(second.note.includes('降级中'), second.note);
   assert.equal(probeStats.calls, probesAfterFirst, '降级中不重复探测（恢复检测归周期对表 tick）');
@@ -340,7 +388,7 @@ test('探测异常一律归「不可达」（不穿出调用链）：当场降�
   const { collabId, b, c } = await makeStudio(t, {
     probes: { [SELF_B.instanceId]: async () => { throw new Error('探测面故障'); } },
   });
-  const posted = await b.service.send({ collabId, text: '探测异常帖' });
+  const posted = await b.service.send({ collabId, sessionId: SESSION_B, text: '探测异常帖' });
   assert.equal(posted.route, 'degraded');
   assert.ok(posted.note.includes('探测异常'), posted.note);
   assert.equal(b.service.stats().relayDegrades, 1);
@@ -349,7 +397,7 @@ test('探测异常一律归「不可达」（不穿出调用链）：当场降�
 
 test('直投面不可用（注入缺失）：投稿面与直投面各自如实标注、帖仍落本机列表', async (t) => {
   const memberSide = await makeStudio(t, { noDirect: new Set([SELF_B.instanceId]) });
-  const posted = await memberSide.b.service.send({ collabId: memberSide.collabId, text: '无直投面的帖' });
+  const posted = await memberSide.b.service.send({ collabId: memberSide.collabId, sessionId: SESSION_B, text: '无直投面的帖' });
   assert.equal(posted.route, 'degraded', '投稿未受理 → 本次直投（同样无直投面）');
   assert.ok(posted.note.includes('投稿未受理'), posted.note);
   assert.ok(posted.results.every((entry) => entry.reason.includes('直投面不可用')), JSON.stringify(posted.results));
@@ -358,7 +406,7 @@ test('直投面不可用（注入缺失）：投稿面与直投面各自如实�
 
 test('中继侧直投面不可用：转达跳过并计数，其余副本不受影响（对方经对表追平）', async (t) => {
   const { wire, collabId, a, b, c } = await makeStudio(t, { noDirect: new Set([SELF_A.instanceId]) });
-  const posted = await b.service.send({ collabId, text: '中继无直投面' });
+  const posted = await b.service.send({ collabId, sessionId: SESSION_B, text: '中继无直投面' });
   assert.equal(posted.route, 'relay', '投稿本身经作者侧直投面送达中继');
   await waitFor(async () => ((await a.service.view({ collabId })).posts.length === 1 ? true : null));
   assert.equal(a.service.stats().postFanoutSkipped, 1, '转达面缺失计数留痕');
@@ -371,7 +419,7 @@ test('中继侧直投面不可用：转达跳过并计数，其余副本不受�
 
 test('④重复分发幂等：同一投稿重复到达不重复转达；多路副本按（作者, postId）吸收无害', async (t) => {
   const { wire, collabId, a, b, c } = await makeStudio(t);
-  await b.service.send({ collabId, text: '幂等帖' });
+  await b.service.send({ collabId, sessionId: SESSION_B, text: '幂等帖' });
   const submission = wire.postsTo(SELF_A.instanceId)[0];
   assert.ok(submission !== undefined);
   await waitFor(async () => ((await c.service.view({ collabId })).posts.length === 1 ? true : null));
@@ -399,7 +447,7 @@ test('⑤端点未知跳过并计数：转达不因个别成员端点未知而�
   const { collabId, a, b, c } = await makeStudio(t);
   /* 幽灵成员丁：join 事件到达（入折叠表）但来源地址缺失（端点学不到）。 */
   await receive(a.service, joinFrameOf(collabId, { instanceId: 'inst-d', identityName: '主机丁', port: 17325 }), '');
-  const posted = await b.service.send({ collabId, text: '端点未知场景' });
+  const posted = await b.service.send({ collabId, sessionId: SESSION_B, text: '端点未知场景' });
   assert.equal(posted.route, 'relay');
   await waitFor(async () => ((await c.service.view({ collabId })).posts.length === 1 ? true : null));
   assert.equal(a.service.stats().relayFanoutSkipped, 1, '端点未知目标跳过并计数');
@@ -410,7 +458,7 @@ test('⑤端点未知跳过并计数：转达不因个别成员端点未知而�
 test('⑥与水位拉取正交：中继路径下离线成员回归仍经对表追平（实时通道与拉取通道各计各的）', async (t) => {
   const { up, collabId, b, c } = await makeStudio(t);
   up.delete(SELF_C.instanceId);   // 丙离线：中继转达送不到
-  await b.service.send({ collabId, text: '离线期的帖' });
+  await b.service.send({ collabId, sessionId: SESSION_B, text: '离线期的帖' });
   assert.equal(c.service.stats().postsIn, 0, '离线成员未收到实时副本');
   up.add(SELF_C.instanceId);
   await syncWhenIdle(c.service, collabId);
@@ -440,12 +488,12 @@ test('⑧发起人标识传递：邀请载荷（被邀者）与 bundle 元状态
   assert.deepEqual(inviteToB.payload.originator, { instanceId: SELF_A.instanceId, identityName: SELF_A.identityName }, '邀请载荷携发起人实例标识');
   const memberB = JSON.parse(readFileSync(collabFilePath(b.dir, collabId, 'member.json'), 'utf8'));
   assert.deepEqual(memberB.originator, { instanceId: SELF_A.instanceId, identityName: SELF_A.identityName }, '被邀者记录持久发起人标识');
-  const posted = await b.service.send({ collabId, text: '被邀者发帖' });
+  const posted = await b.service.send({ collabId, sessionId: SESSION_B, text: '被邀者发帖' });
   assert.equal(posted.route, 'relay', '被邀者据邀请即可定位中继端点');
   assert.deepEqual(posted.to, [SELF_A.instanceId]);
 
   /* 成员再邀请他人：载荷的发起人标识仍是发起人（不是邀请者——归属不得由邀请者推断）。 */
-  await b.service.invite({ collabId, targets: [targetOf(SELF_E)] });
+  await b.service.invite({ collabId, sessionId: SESSION_B, targets: [targetOf(SELF_E)] });
   const inviteToE = sentOf(b.sent, 'invite', collabId).find((message) => message.to.instanceId === SELF_E.instanceId);
   assert.deepEqual(inviteToE.payload.originator, { instanceId: SELF_A.instanceId, identityName: SELF_A.identityName }, '增邀同款：携发起人标识');
 
@@ -453,16 +501,16 @@ test('⑧发起人标识传递：邀请载荷（被邀者）与 bundle 元状态
   const madeE = makeService(t, { self: SELF_E, sendDirect: wire.sendDirectFor(SELF_E), probe, syncPeerPicker: () => [SELF_B.instanceId] });
   wire.register(SELF_E, madeE.service);
   await receive(madeE.service, collabFrame('invite', collabId, SELF_B, legacyInvitePayload()), addressOf(SELF_B));
-  await madeE.service.approve({ collabId, approve: true });
+  await approveInviteWithConsentOf(madeE.service, collabId, SESSION_E);
   await wire.hop(sentOf(madeE.sent, 'join', collabId)[0], SELF_E, b.service);
-  const blind = await madeE.service.send({ collabId, text: '戊的帖（中继未知）' });
+  const blind = await madeE.service.send({ collabId, sessionId: SESSION_E, text: '戊的帖（中继未知）' });
   assert.equal(blind.route, 'degraded', '中继未知时先直投（不臆断归属）');
   assert.ok(blind.note.includes('中继未知'), blind.note);
   assert.equal(madeE.service.stats().relayDegradedPosts, 1);
   await syncWhenIdle(madeE.service, collabId);
   const memberE = JSON.parse(readFileSync(collabFilePath(madeE.dir, collabId, 'member.json'), 'utf8'));
   assert.deepEqual(memberE.originator, { instanceId: SELF_A.instanceId, identityName: SELF_A.identityName }, '经 bundle 元状态学到发起人标识（迟到成员路径）');
-  const located = await madeE.service.send({ collabId, text: '戊的帖（已定位中继）' });
+  const located = await madeE.service.send({ collabId, sessionId: SESSION_E, text: '戊的帖（已定位中继）' });
   assert.equal(located.route, 'relay', '后经对表者定位到中继端点（标识与端点均经对表学到）');
   assert.deepEqual(located.to, [SELF_A.instanceId]);
   assert.equal(up.has(SELF_A.instanceId), true);
@@ -492,8 +540,8 @@ test('⑧端点就绪检查：发起人标识已学、端点未知 → 降级直
     ...legacyInvitePayload(),
     originator: { instanceId: SELF_A.instanceId, identityName: SELF_A.identityName },
   }), '');
-  await madeE.service.approve({ collabId: lonelyId, approve: true });
-  const noEndpoint = await madeE.service.send({ collabId: lonelyId, text: '端点未知' });
+  await approveInviteWithConsentOf(madeE.service, lonelyId, SESSION_E);
+  const noEndpoint = await madeE.service.send({ collabId: lonelyId, sessionId: SESSION_E, text: '端点未知' });
   assert.equal(noEndpoint.route, 'degraded');
   assert.ok(noEndpoint.note.includes('中继端点未知'), noEndpoint.note);
   assert.equal(madeE.service.stats().relayEndpointUnknown, 1);
@@ -517,9 +565,9 @@ test('⑧邀请载荷自指发起人：拒绝学入并计数——不学入 / �
   assert.equal(made.service.stats().forumMetaRejected, 1, '自指发起人标识拒绝并计数');
   const memberOf = () => JSON.parse(readFileSync(collabFilePath(made.dir, collabId, 'member.json'), 'utf8'));
   assert.equal(memberOf().originator, undefined, '自指发起人标识不学入（不落盘）');
-  const approved = await made.service.approve({ collabId, approve: true });
+  const approved = await approveInviteWithConsentOf(made.service, collabId, SESSION_B);
   assert.equal(approved.ok, true, approved.message);
-  const posted = await made.service.send({ collabId, text: '乙的帖（中继未知）' });
+  const posted = await made.service.send({ collabId, sessionId: SESSION_B, text: '乙的帖（中继未知）' });
   assert.equal(posted.route, 'degraded', '自指未被学入：本机不把自己当中继（降级直投）');
   assert.ok(posted.note.includes('中继未知'), posted.note);
 
@@ -541,12 +589,12 @@ test('⑧邀请载荷自指发起人：拒绝学入并计数——不学入 / �
 
 test('生命周期：发起人退出（leave）= 永久放弃中继职责——成员转常态直投兜底（非探测失败）', async (t) => {
   const { wire, collabId, a, b, c } = await makeStudio(t);
-  await a.service.leave({ collabId });   // 自播 leave（入队广播）
+  await a.service.leave({ collabId, sessionId: SESSION_A });   // 自播 leave（按发起会话席位，入队广播）
   const leaveMessage = sentOf(a.sent, 'leave', collabId)[0];
   assert.ok(leaveMessage !== undefined, '发起人退出自播 leave');
   await wire.hop(leaveMessage, SELF_A, b.service);
   await wire.hop(leaveMessage, SELF_A, c.service);
-  const posted = await b.service.send({ collabId, text: '发起人退出后的帖' });
+  const posted = await b.service.send({ collabId, sessionId: SESSION_B, text: '发起人退出后的帖' });
   assert.equal(posted.route, 'degraded', '退出 = 放弃中继职责 → 直投兜底');
   assert.ok(posted.note.includes('退出'), posted.note);
   assert.equal(b.service.stats().relayDegrades, 0, '退出判据不走探测（不置降级态计数）');
@@ -576,7 +624,7 @@ test('恢复检测窗口内并发第二轮对表：already-running（在途置�
   ), 40));
   const studio = await makeStudio(t, { probes: { [SELF_B.instanceId]: slowProbe } });
   studio.up.delete(SELF_A.instanceId);
-  const degraded = await studio.b.service.send({ collabId: studio.collabId, text: '降级帖' });
+  const degraded = await studio.b.service.send({ collabId: studio.collabId, sessionId: SESSION_B, text: '降级帖' });
   assert.equal(degraded.route, 'degraded', '探测不可达 → 降级（同时置降级态）');
   probeReachable = true;
   const first = studio.b.service.sync({ collabId: studio.collabId });   // 不等待：首轮进入恢复检测（40ms 桩）
@@ -590,32 +638,53 @@ test('恢复检测窗口内并发第二轮对表：already-running（在途置�
   assert.notEqual(third.reason, 'already-running', '置位已释放（下一轮不再 already-running）');
 });
 
-test('发起人标识入 member.json 形态校验：坏形态按既有加载语义跳过并计数，合法记录照常加载', (t) => {
+test('发起人标识形态校验（0.2.0 权威在 carrier）：坏形态按加载语义拒绝并计数，合法记录照常加载', (t) => {
   const dir = makeTempDir(t);
-  const memberFile = collabFilePath(dir, 'collab-origin', 'member.json');
-  const member = {
-    collabId: 'collab-origin',
-    role: 'member',
-    state: 'active',
-    name: '讨论甲',
-    mode: 'forum',
-    manager: { instanceId: 'inst-a', identityName: '主机甲' },
-    roster: [{ instanceId: 'inst-a', identityName: '主机甲' }, { instanceId: 'inst-b', identityName: '主机乙' }],
-    endpoints: {},
-    decision: 'approved',
-    originator: { instanceId: 'bad id!', identityName: '主机甲' },
-  };
-  mkdirSync(collabDir(dir, 'collab-origin'), { recursive: true });
-  writeFileSync(memberFile, JSON.stringify(member));
+  const collabId = 'collab-origin';
+  /* 0.2.0 起发起人标识随载体持久化（member.json 只是兼容读面）：坏值由载体形态校验拒绝，
+   * 目录按损坏只读登记、不进列表；席位文件是「已入席」证据（目录形态判据）。 */
+  writeOriginCarrier(dir, collabId, { instanceId: 'bad id!', identityName: '主机甲' });
+  writeSeatOf(dir, collabId, SESSION_B);
   const rejected = makeLoadService(dir);
-  assert.deepEqual(rejected.list(), { collabs: [] }, '坏 originator 记录按坏数据跳过');
-  assert.equal(rejected.stats().loadFailures, 1);
-  member.originator = { instanceId: 'inst-a', identityName: '主机甲' };
-  writeFileSync(memberFile, JSON.stringify(member));
+  assert.deepEqual(rejected.list(), { collabs: [] }, '坏 originator 载体按坏数据拒绝（不进列表）');
+  assert.equal(rejected.stats().corruptCollabs, 1, '损坏目录计数留痕');
+  assert.equal(rejected.stats().loadFailures, 0, '载体损坏走只读登记，不混入加载失败计数');
+  writeOriginCarrier(dir, collabId, { instanceId: SELF_A.instanceId, sessionId: SESSION_A, identityName: SELF_A.identityName });
   const loaded = makeLoadService(dir);
   assert.equal(loaded.list().collabs.length, 1, '合法记录照常加载');
-  assert.equal(loaded.list().collabs[0].collabId, 'collab-origin');
+  assert.equal(loaded.list().collabs[0].collabId, collabId);
 });
+
+/* 讨论成员目录种子（设计 §4.2）：载体为权威形态，席位文件证明「已入席」，member.json 只作
+ * 兼容读面（此处故意不带 topic/originator/forumMeta——元状态学习用例要判别「只补不覆」）。 */
+function writeOriginCarrier(dir, collabId, originator) {
+  mkdirSync(collabDir(dir, collabId), { recursive: true });
+  writeFileSync(carrierFilePath(dir, collabId), JSON.stringify({
+    format: 'session-seats',
+    version: 1,
+    collabId,
+    name: '讨论甲',
+    topic: '议题',
+    mode: 'forum',
+    endpoints: {},
+    snapshotVersion: 0,
+    createdAt: '2026-10-13T00:00:00.000Z',
+    originator,
+  }));
+}
+
+function writeSeatOf(dir, collabId, sessionId) {
+  mkdirSync(join(collabDir(dir, collabId), 'seats'), { recursive: true });
+  writeFileSync(seatFilePath(dir, collabId, sessionId), JSON.stringify({
+    version: 1,
+    sessionId,
+    role: 'member',
+    state: 'member',
+    joinSeq: 2,
+    joinedAt: '2026-10-13T00:00:00.000Z',
+    muted: false,
+  }));
+}
 
 /* 加载面最小装配（只关心注册表恢复与计数）。 */
 function makeLoadService(dir) {
@@ -754,14 +823,22 @@ async function makeNetStudio(t, { relaySessionReports = true } = {}) {
   net.register(SELF_A, nodes.a.inbound);
   net.register(SELF_B, nodes.b.inbound);
   net.register(SELF_C, nodes.c.inbound);
-  const collabId = nodes.a.service.create({ name: '讨论三', topic: '议题', mode: 'forum', targets: [targetOf(SELF_B), targetOf(SELF_C)] }).collabId;
+  const created = nodes.a.service.create({
+    name: '讨论三',
+    topic: '议题',
+    mode: 'forum',
+    sessionId: SESSION_A,
+    targets: [targetOf(SELF_B), targetOf(SELF_C)],
+  });
+  assert.equal(created.ok, true, created.message);
+  const collabId = created.collabId;
   await waitFor(() => (
     nodes.b.service.list().collabs.some((entry) => entry.collabId === collabId)
     && nodes.c.service.list().collabs.some((entry) => entry.collabId === collabId)
       ? true : null
   ), { timeoutMs: 8000 });
-  await nodes.b.service.approve({ collabId, approve: true });
-  await nodes.c.service.approve({ collabId, approve: true });
+  await approveInviteWithConsentOf(nodes.b.service, collabId, SESSION_B);
+  await approveInviteWithConsentOf(nodes.c.service, collabId, SESSION_C);
   await waitFor(() => (nodes.a.service.stats().forumJoinsIn >= 2 ? true : null), { timeoutMs: 8000 });
   return { net, nodes, collabId };
 }
@@ -770,10 +847,10 @@ test('聚合捎回：中继把成员会话回报译回原作者（既有 deliver
   /* 中继侧会话不回报（适配器不可用态）：作者侧档位只能由成员会话的回报经聚合捎回升级——
    * 该配置下「译回帧」不含歧义（既有投稿回报帧不存在）。 */
   const { net, nodes, collabId } = await makeNetStudio(t, { relaySessionReports: false });
-  const own = await nodes.a.service.send({ collabId, text: '甲的帖' });
+  const own = await nodes.a.service.send({ collabId, sessionId: SESSION_A, text: '甲的帖' });
   assert.equal(own.route, 'fanout', '中继自帖直接扇出（同时备下原生直投记录）');
-  const posted = await nodes.b.service.send({ collabId, text: '乙的帖' });
-  assert.equal(posted.route, 'relay');
+  const posted = await nodes.b.service.send({ collabId, sessionId: SESSION_B, text: '乙的帖' });
+  assert.equal(posted.route, 'relay', posted.note);
   const rowOf = (owner, target) => owner.dispatch.deliveryStatus({ collabId }).find((row) => row.type === 'post' && row.toInstanceId === target);
   const submissionRow = rowOf(nodes.b, SELF_A.instanceId);
   assert.ok(submissionRow !== undefined, '投稿直投记录在作者侧');
@@ -835,7 +912,7 @@ test('元状态学习面：坏 originator/stamps 不学入不落盘——重启�
     name: '讨论学', topic: '议题', mode: 'forum',
     members: [SELF_A, SELF_B].map((seat) => ({ instanceId: seat.instanceId, identityName: seat.identityName })),
   }));
-  await made.service.approve({ collabId, approve: true });
+  await approveInviteWithConsentOf(made.service, collabId, SESSION_B);
   const admitted = await receive(made.service, bundleFrameOfNet(collabId, SELF_A, {
     name: '讨论学', state: 'active', topic: '坏\u0007主题',
     originator: { instanceId: 'bad id!', identityName: '主机甲' },
@@ -855,7 +932,7 @@ test('元状态学习面：坏 originator/stamps 不学入不落盘——重启�
 test('元状态学习面：坏 topic（记录缺省）不学入；自指 originator 拒绝；三者逐一计数', async (t) => {
   const dir = makeTempDir(t);
   const collabId = 'collab-legacy';
-  writeLegacyMemberRecord(dir, collabId);
+  writeMemberSeatsRecord(dir, collabId);
   const service = createCollabService({
     dataDir: dir,
     config: { inviteTtlMs: DAY },
@@ -881,7 +958,7 @@ test('元状态学习面：坏 topic（记录缺省）不学入；自指 origina
 test('元状态学习面：合法值照旧学入（只补不覆回归）；重启加载完整', async (t) => {
   const dir = makeTempDir(t);
   const collabId = 'collab-legacy';
-  writeLegacyMemberRecord(dir, collabId);
+  writeMemberSeatsRecord(dir, collabId);
   const service = createCollabService({
     dataDir: dir,
     config: { inviteTtlMs: DAY },
@@ -914,9 +991,21 @@ test('元状态学习面：合法值照旧学入（只补不覆回归）；重�
   assert.equal(reloaded.list().collabs.length, 1);
 });
 
-/* 旧形态成员记录（缺 topic/originator/forumMeta；本机已在折叠表内——写一条自己的 join 事件）。 */
-function writeLegacyMemberRecord(dir, collabId) {
+/* 0.2.0 成员目录（载体与席位齐备——目录按 session-seats 加载；兼容成员记录故意缺
+ * topic/originator/forumMeta，供「只补不覆」的学习面判别；本机已在折叠表内——写一条自己的 join 事件）。 */
+function writeMemberSeatsRecord(dir, collabId) {
   mkdirSync(collabDir(dir, collabId), { recursive: true });
+  writeFileSync(carrierFilePath(dir, collabId), JSON.stringify({
+    format: 'session-seats',
+    version: 1,
+    collabId,
+    name: '讨论旧',
+    topic: '议题',
+    mode: 'forum',
+    endpoints: {},
+    snapshotVersion: 0,
+    createdAt: '2026-10-13T00:00:00.000Z',
+  }));
   writeFileSync(collabFilePath(dir, collabId, 'member.json'), JSON.stringify({
     collabId,
     role: 'member',
@@ -931,10 +1020,12 @@ function writeLegacyMemberRecord(dir, collabId) {
     endpoints: {},
     decision: 'approved',
   }));
+  writeSeatOf(dir, collabId, SESSION_B);
   writeFileSync(collabFilePath(dir, collabId, MEMBERS_FILE_NAME), `${JSON.stringify({
     eventId: randomUUID(),
     kind: 'join',
     instanceId: SELF_B.instanceId,
+    sessionId: SESSION_B,
     identityName: SELF_B.identityName,
     ts: '2026-10-13T00:00:00.000Z',
   })}\n`);
@@ -956,9 +1047,9 @@ test('三节点并发发帖去重：三端同时发帖互不阻塞、重复副�
   const { wire, collabId, a, b, c } = await makeStudio(t);
   /* 并发工况：发起人与两名成员同一时刻各自发帖（成员投稿到中继、中继当场扇出自己那份）。 */
   const [byB, byC, byA] = await Promise.all([
-    b.service.send({ collabId, text: '乙的并发帖' }),
-    c.service.send({ collabId, text: '丙的并发帖' }),
-    a.service.send({ collabId, text: '甲的并发帖' }),
+    b.service.send({ collabId, sessionId: SESSION_B, text: '乙的并发帖' }),
+    c.service.send({ collabId, sessionId: SESSION_C, text: '丙的并发帖' }),
+    a.service.send({ collabId, sessionId: SESSION_A, text: '甲的并发帖' }),
   ]);
   assert.equal(byB.route, 'relay', byB.message);
   assert.equal(byC.route, 'relay', byC.message);
@@ -993,15 +1084,15 @@ test('跨机收敛连续链：邀请 → join → 发帖 → 离线 → 回填 �
     assert.deepEqual(view.members.map((entry) => entry.instanceId).sort(), allIds, '邀请 → join：三方成员表齐');
   }
   /* ② 发帖：成员投稿（经中继）与发起人扇出——三端收敛到同一帖集合。 */
-  const byB = await b.service.send({ collabId, text: '乙的第一帖' });
+  const byB = await b.service.send({ collabId, sessionId: SESSION_B, text: '乙的第一帖' });
   assert.equal(byB.ok, true, byB.message);
   assert.equal(byB.results[0].ok, true, '投稿达中继');
-  const byA = await a.service.send({ collabId, text: '甲的第一帖' });
+  const byA = await a.service.send({ collabId, sessionId: SESSION_A, text: '甲的第一帖' });
   assert.equal(byA.ok, true, byA.message);
   await waitFor(() => viewsConverged(a, b, c, collabId, 2));
   /* ③ 离线：丙掉线（实时通道不可达）——离线期乙再发一帖，丙停在 2 帖。 */
   up.delete(SELF_C.instanceId);
-  const whileOffline = await b.service.send({ collabId, text: '离线期的帖' });
+  const whileOffline = await b.service.send({ collabId, sessionId: SESSION_B, text: '离线期的帖' });
   assert.equal(whileOffline.ok, true, whileOffline.message);
   await waitFor(async () => ((await a.service.view({ collabId })).posts.length === 3 ? true : null));
   assert.equal((await b.service.view({ collabId })).posts.length, 3, '在线者照常收到');
