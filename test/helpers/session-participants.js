@@ -1,12 +1,23 @@
-import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { ID_PATTERN, isIdentityName } from '../../src/net/protocol.js';
-import { repoRoot } from '../helpers.js';
+import { createCollabService } from '../../src/collab/service.js';
+import { ledgerDigest } from '../../src/collab/store.js';
+import { carrierFilePath, collabDir, collabFilePath, seatFilePath } from '../../src/paths.js';
+import { createDiscovery } from '../../src/net/discovery.js';
+import { createDispatch } from '../../src/net/dispatch.js';
+import { createInbound } from '../../src/net/inbound.js';
+import { createKnownHosts } from '../../src/net/known-hosts.js';
+import { createTransport } from '../../src/net/transport.js';
+import { pickFreePort, repoRoot, waitFor } from '../helpers.js';
 
 /* 会话级参与者场景（席位名单 / 台账 / 时钟 / 旧版安装包）的测试夹具：
  * 只产出纯数据与可注入时钟，不 import 协作运行时模块——e2e 与模块测试共用同一组形态，
- * 避免各用例自行拼装 §2.1 名单条目时出现字段漂移。 */
+ * 避免各用例自行拼装 §2.1 名单条目时出现字段漂移。
+ * 第二部分提供进程内双节点装配：真实 service / dispatch / transport / inbound，
+ * 只把会话桥投递替换为记录面（桥 IPC 属组合根，e2e 断言的是本机旁路与网络链路）。 */
 
 /* 固定基准时刻与名单加入步长：夹具必须可复现——取 Date.now() 会让快照/digest 类断言
  * 每次运行都不同，失败也无法重放。 */
@@ -281,4 +292,358 @@ function toIsoTimestamp(value) {
     throw new TypeError(`joinedAt 须为可解析时间或毫秒数：${String(value)}`);
   }
   return new Date(ms).toISOString();
+}
+
+/* —— 进程内双节点场景（e2e 共用） ——
+ * 真 service ＋ 真 dispatch/transport/inbound（真实回环 TCP 帧链路），只把「桥投递」替换为
+ * 记录面：e2e 断言本机旁路注入、扇出、outbox/ack 与跨机收发的真实语义，不拉起子进程。 */
+
+const NODE_IDENTITY = '测试站点';
+const NODE_JOIN_STEP_MS = 1000;
+
+export function sessionNodeConfig(overrides = {}) {
+  return {
+    identityName: NODE_IDENTITY,
+    scanWindowMs: 100,
+    dialTimeoutMs: 1500,
+    dispatchTickMs: 50,
+    retryIntervalMs: 200,
+    retrySlowIntervalMs: 400,
+    retryFastCount: 5,
+    queueMaxPerCollab: 200,
+    messageTtlMs: 120000,
+    inviteTtlMs: 120000,
+    joinRequestTtlMs: 120000,
+    managerProbeIntervalMs: 100,
+    managerLossTimeoutMs: 30000,
+    sessionSeatGraceMs: 60000,
+    sessionSeatTimeoutMs: 30000,
+    seatPresenceIntervalMs: 5000,
+    sessionTakeoverWindowMs: 60000,
+    handoverConfirmTimeoutMs: 10000,
+    joinConfirmTtlMs: 10000,
+    pendingInvitesMax: 64,
+    stagedMaxPerSeat: 100,
+    stagedMaxPerCollab: 500,
+    forumSyncIntervalMs: 3600000,
+    freezeUnresolvedMs: 60000,
+    autoDeliver: true,
+    ...overrides,
+  };
+}
+
+/* 节点装配：临时根先建、清理钩子先注册——任何构造中途失败都不会遗留目录或定时器。 */
+export async function startSessionNode(t, spec = {}) {
+  const home = mkdtempSync(join(tmpdir(), 'waystation-session-e2e-'));
+  const port = spec.port ?? await pickFreePort();
+  const identityName = spec.identityName ?? NODE_IDENTITY;
+  const node = {
+    home,
+    port,
+    config: sessionNodeConfig({ ...(spec.config ?? {}), port, identityName }),
+    self: { instanceId: spec.instanceId ?? `inst-${randomUUID().slice(0, 8)}`, identityName, port },
+    online: new Set(spec.online ?? []),
+    deliveries: new Map(),
+    sentFrames: [],
+    notices: [],
+    discoveryEnabled: spec.discovery === true,
+    log: quietLog(),
+  };
+  t.after(() => closeSessionNode(node));
+  if (typeof spec.seed === 'function') {
+    spec.seed(home);
+  }
+  await buildSessionNode(node);
+  return node;
+}
+
+async function buildSessionNode(node) {
+  node.knownHosts = createKnownHosts({ dataDir: node.home, log: node.log });
+  node.transport = createTransport({ port: node.port, log: node.log });
+  node.dispatch = createDispatch({ dataDir: node.home, config: node.config, transport: node.transport, self: node.self, log: node.log });
+  captureOutgoing(node);
+  node.service = createNodeService(node);
+  node.inbound = createNodeInbound(node);
+  node.transport.setFrameHandler(node.inbound.onFrame);
+  node.dispatch.setClientFrameRouter(node.inbound.onFrame);
+  node.dispatch.start();
+  await node.transport.listen();
+  if (node.discoveryEnabled) {
+    node.discovery = createDiscovery({
+      port: node.port,
+      instanceId: node.self.instanceId,
+      identityName: node.self.identityName,
+      getCollabCount: () => node.service.count(),
+      knownHosts: node.knownHosts,
+      log: node.log,
+      activeSessions: () => [],
+    });
+    await node.discovery.start();
+  }
+}
+
+/* 出站帧留证：报告帧（零成功带原 fromSessionId）不经 service 发送面，必须从 dispatch 层截获。 */
+function captureOutgoing(node) {
+  const rawSend = node.dispatch.send.bind(node.dispatch);
+  const rawSendDirect = node.dispatch.sendDirect.bind(node.dispatch);
+  node.dispatch.send = (message) => {
+    node.sentFrames.push(message);
+    return rawSend(message);
+  };
+  node.dispatch.sendDirect = (message) => {
+    node.sentFrames.push(message);
+    return rawSendDirect(message);
+  };
+}
+
+function createNodeService(node) {
+  return createCollabService({
+    dataDir: node.home,
+    config: node.config,
+    self: node.self,
+    send: (message) => node.dispatch.send(message),
+    sendDirect: (message) => node.dispatch.sendDirect(message),
+    knownHosts: node.knownHosts,
+    notify: (frame) => {
+      node.notices.push(frame);
+      return true;
+    },
+    deliverSeat: (frame, seat) => deliverToSeat(node, frame, seat),
+    log: node.log,
+    syncPeerPicker: () => [],
+    inviteMinIntervalMs: 0,
+    ledgerFetchTimeoutMs: 1500,
+    handshakeReplyTimeoutMs: 300,
+    takeoverProbeIntervalMs: 100,
+  });
+}
+
+function createNodeInbound(node) {
+  return createInbound({
+    dataDir: node.home,
+    config: node.config,
+    self: node.self,
+    dispatch: node.dispatch,
+    log: node.log,
+    hooks: {
+      admit: (frame, meta) => node.service.hooks.admit(frame, meta),
+      consume: (frame, meta) => node.service.hooks.consume(frame, meta),
+      sessionGate: (frame, meta) => node.service.hooks.sessionGate(frame, meta),
+      sessionDelivered: (frame) => node.service.hooks.sessionDelivered(frame),
+      deliverToSession: (frame) => deliverToEverySeat(node, frame),
+      listSeats: (collabId) => node.service.listInjectableTargets(collabId),
+      injectSeat: (collabId, sessionId, frame) => node.service.injectLocalSeat(collabId, sessionId, frame),
+    },
+  });
+}
+
+function deliverToSeat(node, frame, seat) {
+  if (!node.online.has(seat.sessionId)) {
+    return false;
+  }
+  const list = node.deliveries.get(seat.sessionId) ?? [];
+  list.push({ type: frame.type, msgId: frame.msgId, payload: frame.payload, frame });
+  node.deliveries.set(seat.sessionId, list);
+  return true;
+}
+
+function deliverToEverySeat(node, frame) {
+  let delivered = false;
+  for (const seat of node.service.listLocalSeats(frame.collabId)) {
+    delivered = deliverToSeat(node, frame, seat) || delivered;
+  }
+  return delivered;
+}
+
+async function closeSessionNode(node) {
+  await quietClose(() => node.discovery?.close());
+  await quietClose(() => node.service?.close());
+  await quietClose(() => node.dispatch?.stop());
+  await quietClose(() => node.transport?.close());
+  try {
+    rmSync(node.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (error) {
+    if (!['EBUSY', 'EPERM', 'ENOTEMPTY'].includes(error.code)) {
+      throw error;
+    }
+    console.error(`[测试收尾] 临时数据根删除失败（环境性占用，已重试）：${node.home}（${error.code}）`);
+  }
+}
+
+/* 收尾逐件独立：构造中途失败的组件可能根本不存在，单件异常不得阻断其余收尾。 */
+async function quietClose(close) {
+  try {
+    await close();
+  } catch {
+    // 未构造/未启动：无需关闭
+  }
+}
+
+/* 两节点互通：已知主机清单是端点与能力的来源（真实扫描在进程内的等价写入面）。 */
+export function linkSessionNodes(left, right, { leftParticipants = 2, rightParticipants = 2 } = {}) {
+  rememberSessionPeer(left, right, leftParticipants);
+  rememberSessionPeer(right, left, rightParticipants);
+}
+
+function rememberSessionPeer(node, peer, participants) {
+  node.knownHosts.remember({
+    address: '127.0.0.1',
+    port: peer.port,
+    instanceId: peer.self.instanceId,
+    identityName: peer.self.identityName,
+    participants,
+    source: participants === 0 ? 'probe' : 'scan',
+  });
+}
+
+/* 目标描述符：建协作 targets、邀请与移交的目标字段共用。 */
+export function targetOf(node, extra = {}) {
+  return {
+    instanceId: node.self.instanceId,
+    identityName: node.self.identityName,
+    address: '127.0.0.1',
+    port: node.port,
+    ...extra,
+  };
+}
+
+export function injectionsOf(node, sessionId) {
+  return node.deliveries.get(sessionId) ?? [];
+}
+
+export function injectionTextsOf(node, sessionId) {
+  return injectionsOf(node, sessionId).map((entry) => entry.payload?.text ?? '');
+}
+
+export function waitForInjection(node, sessionId, predicate, options = {}) {
+  return waitFor(() => predicate(injectionsOf(node, sessionId)) || null, { timeoutMs: 10000, ...options });
+}
+
+/* 本机会话上线/离线：桥注册面与投递面同点（与组合根的桥注册/断开同形）。 */
+export async function bringSessionOnline(node, sessionId) {
+  node.online.add(sessionId);
+  return node.service.registerBridgeEntry(sessionId, `bridge-${sessionId}`);
+}
+
+export async function bringSessionOffline(node, sessionId) {
+  node.online.delete(sessionId);
+  return node.service.unregisterBridgeEntry(sessionId, `bridge-${sessionId}`);
+}
+
+/* 直接喂帧（模拟对端直连）：走真实接收管线（准入 → 落盘 → 消费 → 扇出）。 */
+export async function feedSessionFrame(node, frame, { remoteAddress = '127.0.0.1' } = {}) {
+  const acks = [];
+  await node.inbound.onFrame({ remoteAddress, send: (out) => acks.push(out) }, frame);
+  return acks;
+}
+
+/* 种子协作：新形态 carrier + 台账 + 快照 + 席位文件（真实加载路径；不写旧形态字段）。 */
+export function seedSessionCollab(home, collabId, spec = {}) {
+  const ledger = makeLedger({
+    collabId,
+    name: spec.name ?? '种子协作',
+    status: spec.status ?? 'active',
+    managerTerm: spec.managerTerm ?? 1,
+    version: spec.version ?? 2,
+    manager: spec.manager,
+    members: spec.members,
+    managerWindow: spec.managerWindow,
+  });
+  const dir = collabDir(home, collabId);
+  mkdirSync(join(dir, 'seats'), { recursive: true });
+  writeSeedCarrier(home, collabId, ledger, spec);
+  writeFileSync(collabFilePath(home, collabId, 'ledger.jsonl'), `${JSON.stringify(ledger)}\n`, 'utf8');
+  writeSeedSnapshot(home, collabId, ledger, spec);
+  writeSeedSeats(home, collabId, spec.seats ?? []);
+  if (spec.member !== undefined) {
+    writeJsonFile(join(dir, 'member.json'), spec.member);
+  }
+  return ledger;
+}
+
+function writeSeedCarrier(home, collabId, ledger, spec) {
+  const carrier = {
+    format: 'session-seats',
+    version: 1,
+    collabId,
+    name: ledger.name,
+    topic: ledger.topic,
+    mode: ledger.mode,
+    endpoints: spec.endpoints ?? {},
+    snapshotVersion: ledger.version,
+    createdAt: ledger.createdAt,
+  };
+  if (ledger.manager !== null) {
+    carrier.manager = ledger.manager;
+  }
+  writeJsonFile(carrierFilePath(home, collabId), carrier);
+}
+
+function writeSeedSnapshot(home, collabId, ledger, spec) {
+  writeJsonFile(join(collabDir(home, collabId), 'snapshot.json'), {
+    version: ledger.version,
+    digest: ledgerDigest(ledger),
+    receivedAt: new Date(FIXTURE_EPOCH_MS).toISOString(),
+    from: { instanceId: spec.snapshotFrom ?? 'inst-peer', identityName: '对端' },
+    ledger,
+  });
+}
+
+function writeSeedSeats(home, collabId, seats) {
+  seats.forEach((seat, index) => {
+    writeJsonFile(seatFilePath(home, collabId, seat.sessionId), {
+      version: 1,
+      sessionId: seat.sessionId,
+      role: seat.role ?? 'member',
+      state: 'member',
+      joinSeq: seat.joinSeq ?? index + 1,
+      joinedAt: new Date(FIXTURE_EPOCH_MS + index * NODE_JOIN_STEP_MS).toISOString(),
+      muted: seat.muted === true,
+    });
+  });
+}
+
+/* 旧形态协作：member.json ＋ 旧台账（只用于 legacy 只读判定，不参与新形态加载）。 */
+export function seedLegacyCollab(home, collabId, spec = {}) {
+  const dir = collabDir(home, collabId);
+  mkdirSync(dir, { recursive: true });
+  const instanceId = spec.instanceId ?? 'inst-old';
+  const identityName = spec.identityName ?? '旧机';
+  const name = spec.name ?? '旧协作';
+  const topic = spec.topic ?? '旧主题';
+  writeJsonFile(join(dir, 'member.json'), {
+    collabId,
+    name,
+    topic,
+    role: 'manager',
+    state: 'active',
+    manager: { instanceId, identityName },
+    endpoints: {},
+    roster: [{ instanceId, identityName }],
+    mode: 'managed',
+    decision: 'approved',
+  });
+  const ledger = {
+    version: 3,
+    collabId,
+    name,
+    topic,
+    status: 'active',
+    manager: { instanceId, identityName },
+    members: [{ instanceId, identityName, role: 'manager', state: 'member', joinedAt: new Date(FIXTURE_EPOCH_MS).toISOString() }],
+    board: [],
+    createdAt: new Date(FIXTURE_EPOCH_MS).toISOString(),
+    updatedAt: new Date(FIXTURE_EPOCH_MS).toISOString(),
+  };
+  writeFileSync(join(dir, 'ledger.jsonl'), `${JSON.stringify(ledger)}\n`, 'utf8');
+  return ledger;
+}
+
+function writeJsonFile(file, value) {
+  mkdirSync(join(file, '..'), { recursive: true });
+  writeFileSync(file, JSON.stringify(value, null, 2), 'utf8');
+}
+
+function quietLog() {
+  return { info: () => {}, warn: () => {}, error: () => {} };
 }
