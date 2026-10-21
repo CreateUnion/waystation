@@ -195,7 +195,7 @@ function writeForumFixture(dataDir, collabId = 'c-forum') {
     [MEMBERS_FILE_NAME]: jsonl(memberEvent()),
     [CARRIER_FILE_NAME]: JSON.stringify(carrierOf(collabId, { name: '甲机', topic: '讨论主题', mode: 'forum' })),
     [LEDGER_FILE_NAME]: jsonl(forumLedgerOf(collabId)),
-    /* 兼容参与记录（新形态目录仍可能携带，M2 create 写点）：提供本机视角状态；
+    /* 兼容参与记录（新形态目录仍可能携带，创建写点会写）：提供本机视角状态；
      * 席位/名单权威仍是 carrier + 台账 + 成员事件。 */
     [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ mode: 'forum', collabId, topic: '讨论主题' })),
   });
@@ -473,6 +473,37 @@ test('meta（讨论）：字段与事件轨纯文本原样透传、skipped 计�
   const anchored = JSON.parse((await fetchText(viewer.origin, '/api/collab/main/c-forum/meta?after=ev-1')).body);
   assert.deepEqual(anchored.events.rows, []);
   assert.equal(anchored.events.reset, false);
+});
+
+test('meta（讨论）：远端席位按真实成员事件折叠——本机实例排除、leave 移出、活跃数与人数同源', async (t) => {
+  const dataDir = makeTempDir(t);
+  writeConfigAt(dataDir, '甲机');
+  writeFileSync(join(dataDir, 'instance-id'), 'inst-a\n');
+  const dir = collabDirIn(dataDir, 'main', 'c-forum-live');
+  writeFiles(dir, {
+    [POSTS_FILE_NAME]: jsonl(postEntry()),
+    [MEMBERS_FILE_NAME]: jsonl(
+      memberEvent({ eventId: 'ev-a', instanceId: 'inst-a', identityName: '甲机', ts: T0 }),
+      memberEvent({ eventId: 'ev-b', instanceId: 'inst-b', identityName: '乙机', ts: tsPlus(1000) }),
+      memberEvent({ eventId: 'ev-b-leave', kind: 'leave', instanceId: 'inst-b', identityName: '乙机', ts: tsPlus(2000) }),
+    ),
+    [CARRIER_FILE_NAME]: JSON.stringify(carrierOf('c-forum-live', { name: '讨论甲', topic: '讨论主题', mode: 'forum' })),
+  });
+  writeSeatAt(dir, 'sess-local', { role: 'member', state: 'member', joinSeq: 1 });
+  const viewer = await startTestViewer(t, { dataDir });
+  const meta = JSON.parse((await fetchText(viewer.origin, '/api/collab/main/c-forum-live/meta')).body);
+  assert.deepEqual(meta.sessions, {
+    localSeats: [{ identityName: '甲机', sessionId: 'sess-loc', role: 'member', state: 'member', muted: false, joinSeq: 1 }],
+    remoteSeats: [],
+    departed: [],
+    pendingInvites: [],
+    pendingJoins: [],
+    activeSeatCount: 1,
+    localSeatCount: 1,
+    mutedSeatCount: 0,
+  });
+  assert.equal(meta.memberCount, 1);
+  assert.equal(meta.sessions.activeSeatCount, meta.memberCount, '讨论人数与活跃席位同源');
 });
 
 test('meta（协作）：台账口径、迁移行、累计收到计数与 muted 原样透传', async (t) => {

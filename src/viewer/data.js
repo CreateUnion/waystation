@@ -12,9 +12,10 @@
  * 单一权威由测试兜底：夹具以各模块导出的规范常量为准，与这里不同步即红。
  *
  * 会话席位视图（设计 §10）纯读席位表与共享态：本机会员席位来自注入的 listLocalSeats
- * （运行时席位接口；观察窗独立进程未注入时回退 seats/<sessionId>.json），远端成员来自
- * 台账/快照名单，离席历史来自本地派生索引 departed.jsonl。旧协作（旧 member.json、无 carrier
- * 标记）与 migration/recovery 标记只读呈现；协作目录的数据文件清单见 READ_FILE_NAMES。
+ * （运行时席位接口；观察窗独立进程未注入时回退 seats/<sessionId>.json），协作远端成员来自
+ * 台账/快照名单、讨论远端成员来自成员事件折叠（本机实例按根目录 instance-id 排除），
+ * 离席历史来自本地派生索引 departed.jsonl。旧协作（旧 member.json、无 carrier 标记）与
+ * migration/recovery 标记只读呈现；协作目录的数据文件清单见 READ_FILE_NAMES。
  *
  * 微缓存只覆盖追加型 JSONL（posts/members/ledger/inbox/outbox）的解析结果，键 = (绝对路径,
  * size, mtimeMs)：append 必改 size；压实重写会改 size 或 mtime，键失配即重析。缺失态不入缓存
@@ -44,7 +45,7 @@ import { isLedgerShape, isTimestamp } from '../collab/model.js';
 import { loadMember } from '../collab/store.js';
 import { readLegacyCollab } from '../collab/legacy.js';
 import { CARRIER_FORMATS } from '../collab/carrier.js';
-import { readRecovery } from '../collab/migration.js';
+import { loadRecovery } from '../collab/migration.js';
 import { shortSessionId } from '../util/short-id.js';
 import { displayText } from './text.js';
 import { metaViewOf } from './meta.js';
@@ -69,12 +70,15 @@ const OUTBOX_FILE_NAME = 'outbox.jsonl';
  * 不引其符号；漂移由测试兜底（夹具以该模块导出的 KNOWN_HOSTS_FILE_NAME 规范常量建立）。 */
 const KNOWN_HOSTS_FILE_NAME = 'known-hosts.json';
 /* 0.2.0 本地文件形态（设计 §6.2/§10）：路径常量与文件名取自 paths.js 的唯一权威；旧形态判定
- * 与摘要由 legacy 只读读取器的 readLegacyCollab 单点提供（本层不自建旧形态判据）。清单是本层允许触碰的只读
- * 文件面；handover-offers.json 与 run/core-stop.json 为设计列出的相邻展示面，本层暂不渲染但
- * 保留在允许清单内。 */
-/* seats/ 是目录；其余为协作目录内文件。清单精确覆盖本层只读面（不含状态栏 session 文件）。 */
+ * 与摘要由 legacy 只读读取器的 readLegacyCollab 单点提供（本层不自建旧形态判据）。
+ * 清单精确覆盖本层实际读取的只读文件面：不在读取路径上的候选（handover-offers.json、
+ * run/core-stop.json）不进清单，避免「声明保留但永不读取」的漂移；instance-id 用于把本机
+ * 实例从讨论远端成员里排除。 */
+/* seats/ 是目录；其余为协作目录或数据根内的文件。sessions/<sessionId>.json 是状态栏的派生
+ * 指示面，由状态栏读取端消费，本层不读。 */
 export const READ_FILE_NAMES = Object.freeze([
   'config.json',
+  'instance-id',
   'posts.jsonl',
   'members.jsonl',
   'inbox.jsonl',
@@ -87,14 +91,19 @@ export const READ_FILE_NAMES = Object.freeze([
   'invites.json',
   'pending-invites.json',
   'joins.json',
-  'handover-offers.json',
   'departed.jsonl',
   'known-hosts.json',
-  'run/core-stop.json',
   'recovery.json',
   'member.json',
   'migration.json',
 ]);
+
+/* 席位文件形态版本：与运行时落盘形态一致（观察窗与运行时不得各判一套，差异由静态一致性
+ * 用例锁定）。 */
+const SEAT_FILE_VERSION = 1;
+/* 机器实例标识文件名（数据根下）：本层只读，不触发创建；名字与 instance-id 模块的常量由
+ * 测试锁定。 */
+const INSTANCE_ID_FILE_NAME = 'instance-id';
 
 /* 本机身份名回退（config.json 缺失/损坏时，发出行作者无从得知——如实标「本机」）。 */
 const FALLBACK_IDENTITY_NAME = '本机';
@@ -161,6 +170,31 @@ function readJsonOrNull(state, file) {
   try {
     return JSON.parse(text);
   } catch {
+    return null;
+  }
+}
+
+/* 坏 JSON 必须留痕（坏 carrier/recovery 不得静默按「无标记」处理）；观察窗轮询密集，
+ * 同一文件只告警一次，避免刷屏。 */
+function warnOnce(state, warnedSet, key, message, fields) {
+  if (warnedSet.has(key)) {
+    return;
+  }
+  warnedSet.add(key);
+  state.log?.warn?.(message, fields);
+}
+
+/* carrier 的 JSON 解析：缺失合法（未创建）；解析失败留痕后按缺失降级——坏 carrier 与
+ * legacy 读取器的「无合规 format」判据一致，不在这里造第二套形态判定。 */
+function readCarrierJson(state, file) {
+  const text = readTextOrNull(state, file);
+  if (text === null) {
+    return null;
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    warnOnce(state, state.carrierWarned, file, '查看器 carrier JSON 解析失败（按缺失处理）', { file });
     return null;
   }
 }
@@ -501,30 +535,39 @@ function textFieldOf(value) {
 /* 目录形态标记（设计 §6.2/§8）：carrier 是新形态标记；recovery 是半写目录标记。旧形态判定
  * 与只读摘要一律走 legacy 只读读取器的 readLegacyCollab（单点判据，本层不重复实现）。 */
 function carrierOf(state, base, collabId) {
-  const parsed = readJsonOrNull(state, carrierFilePath(base, collabId));
+  const parsed = readCarrierJson(state, carrierFilePath(base, collabId));
   /* 只有合规 format 标记才按新形态处理；半写/异形 carrier 与 legacy 只读读取器的判据保持一致
    * （readLegacyCollab 只看 format 标记），避免 meta 与 sessions 各说一套。 */
   return isPlainObject(parsed) && CARRIER_FORMATS.includes(parsed.format) ? parsed : null;
 }
 
+/* 坏标记（解析失败/形态不符/读故障）比「无标记」更值得告警：写门会按损坏处理，观察窗
+ * 至少不得静默当作普通协作。记录仍按无标记降级（本层不重复实现写门判定）。 */
 function recoveryOf(state, base, collabId) {
-  return readRecovery(collabDir(base, collabId));
+  const loaded = loadRecovery(collabDir(base, collabId));
+  if (loaded.status === 'corrupt' || loaded.status === 'unreadable') {
+    warnOnce(state, state.recoveryWarned, collabId, '查看器恢复标记不可用（按无标记降级）', {
+      collabId,
+      status: loaded.status,
+      reason: loaded.error?.message ?? null,
+    });
+    return null;
+  }
+  return loaded.record;
 }
 
 /* legacy 只读摘要（旧 member.json 档案，含已迁移归档）：非旧形态目录返回 null；本层只消费摘要，
  * 不自行判断旧形态，也不做任何旧台账改写。读取器异常按「非 legacy」降级，单目录故障不得
  * 把整页列表打成 500。 */
 function legacySummaryOf(state, base, collabId) {
-  /** @type {any} */
-  let summary;
   try {
-    summary = readLegacyCollab(collabDir(base, collabId));
+    const summary = readLegacyCollab(collabDir(base, collabId));
+    logLegacyWarnings(state, collabId, summary);
+    return summary;
   } catch (error) {
     state.log?.warn?.('查看器旧协作读取失败（按非旧形态降级）', { collabId, reason: error?.message });
     return null;
   }
-  logLegacyWarnings(state, collabId, summary);
-  return summary;
 }
 
 function logLegacyWarnings(state, collabId, summary) {
@@ -559,7 +602,7 @@ function injectedSeatsOf(state, collabId) {
   try {
     const seats = state.listLocalSeats(collabId);
     if (Array.isArray(seats)) {
-      return seats.map((seat) => seatViewOf(seat, null)).filter((seat) => seat !== null);
+      return seats.map((seat) => seatViewOf(seat)).filter((seat) => seat !== null);
     }
   } catch (error) {
     state.log?.warn?.('查看器本机席位读取失败（回退席位文件）', { collabId, reason: error?.message });
@@ -589,7 +632,7 @@ function readSeatFiles(state, base, collabId) {
     }
     const file = join(dir, entry.name);
     const record = readJsonOrNull(state, file);
-    const seat = isSeatFileShape(record) ? seatViewOf(record, sessionId) : null;
+    const seat = isSeatFileShape(record, sessionId) ? seatViewOf(record) : null;
     if (seat === null) {
       corrupt++;
       warnSeatCorrupt(state, collabId, file);
@@ -600,30 +643,31 @@ function readSeatFiles(state, base, collabId) {
   return { seats, corrupt };
 }
 
-/* 与运行时落盘形态对齐（版本、可选序号、时间戳、布尔与 joinId）：观察窗与运行时不得各判一套。 */
-function isSeatFileShape(record) {
-  if (!isPlainObject(record) || !isVersionedSeat(record)) {
+/* 席位文件形态与运行时落盘判据逐项对齐（版本精确、会话标识必填且与文件名一致、member 状态
+ * 必须能回答 joinSeq/joinedAt）：观察窗显示而运行时判损坏的分叉由静态一致性用例锁定。 */
+function isSeatFileShape(record, expectedSessionId) {
+  if (!isPlainObject(record) || record.version !== SEAT_FILE_VERSION || record.sessionId !== expectedSessionId) {
     return false;
   }
   if (!isSeatRole(record.role) || !isSeatState(record.state)) {
     return false;
   }
-  if (!isOptionalSeatSeq(record.joinSeq) || !isOptionalSeatSeq(record.grantVersion)) {
-    return false;
-  }
-  return isSeatFileExtras(record);
+  return isSeatMemberComplete(record) && isSeatOptionalFieldsShape(record);
 }
 
-function isVersionedSeat(record) {
-  return Number.isInteger(record.version) && record.version >= 1;
+/* 已入席席位必须有入席序号与时刻；joining 阶段二者可缺省。 */
+function isSeatMemberComplete(record) {
+  return record.state !== 'member' || (isSeatSeq(record.joinSeq) && isTimestamp(record.joinedAt));
 }
 
-function isSeatFileExtras(record) {
-  return isOptionalTimestamp(record.joinedAt)
+function isSeatOptionalFieldsShape(record) {
+  return isOptionalSeatSeq(record.joinSeq)
+    && isOptionalSeatSeq(record.grantVersion)
+    && isOptionalTimestamp(record.joinedAt)
+    && isOptionalTimestamp(record.archivedAt)
     && isOptionalBoolean(record.muted)
     && isOptionalBoolean(record.unverified)
-    && isOptionalJoinId(record.joinId)
-    && isOptionalTimestamp(record.archivedAt);
+    && isOptionalJoinId(record.joinId);
 }
 
 function isOptionalTimestamp(value) {
@@ -639,7 +683,11 @@ function isOptionalJoinId(value) {
 }
 
 function isOptionalSeatSeq(value) {
-  return value === undefined || (Number.isInteger(value) && value >= 1);
+  return value === undefined || isSeatSeq(value);
+}
+
+function isSeatSeq(value) {
+  return Number.isInteger(value) && value >= 1;
 }
 
 function warnSeatCorrupt(state, collabId, file) {
@@ -650,33 +698,24 @@ function warnSeatCorrupt(state, collabId, file) {
   state.log?.warn?.('查看器席位文件损坏（按不存在处理）', { collabId, file });
 }
 
-/* 席位视图：会话标识短码＋角色＋状态＋入席序号；文件键给定时内容与会话标识必须一致
- * （防改名/复制残骸把两席混作一席）。 */
-function seatViewOf(record, expectedSessionId) {
-  const sessionId = seatIdentityOf(record, expectedSessionId);
-  if (sessionId === null) {
+/* 席位视图：会话标识短码＋角色＋状态＋入席序号。文件来源已由 isSeatFileShape 校验
+ * （会话标识与文件名一致）；注入来源按运行时契约再验一次标识形态。 */
+function seatViewOf(seat) {
+  if (!isPlainObject(seat) || !isSeatRole(seat.role) || !isSeatState(seat.state)) {
     return null;
   }
-  const view = { sessionId: shortSessionId(sessionId), role: record.role, state: record.state, muted: record.muted === true };
-  if (Number.isInteger(record.joinSeq) && record.joinSeq > 0) {
-    view.joinSeq = record.joinSeq;
-  }
-  if (record.unverified === true) {
-    view.unverified = true;
-  }
-  return view;
-}
-
-/* 席位身份校验：形态、角色、状态、标识与文件键一致——任一不符即整条跳过。 */
-function seatIdentityOf(record, expectedSessionId) {
-  if (!isPlainObject(record) || !isSeatRole(record.role) || !isSeatState(record.state)) {
-    return null;
-  }
-  const sessionId = textFieldOf(record.sessionId) ?? expectedSessionId;
+  const sessionId = textFieldOf(seat.sessionId);
   if (sessionId === null || !ID_PATTERN.test(sessionId)) {
     return null;
   }
-  return seatKeyMatches(record, expectedSessionId) ? sessionId : null;
+  const view = { sessionId: shortSessionId(sessionId), role: seat.role, state: seat.state, muted: seat.muted === true };
+  if (isSeatSeq(seat.joinSeq)) {
+    view.joinSeq = seat.joinSeq;
+  }
+  if (seat.unverified === true) {
+    view.unverified = true;
+  }
+  return view;
 }
 
 function isSeatRole(role) {
@@ -685,10 +724,6 @@ function isSeatRole(role) {
 
 function isSeatState(state) {
   return state === 'member' || state === 'joining';
-}
-
-function seatKeyMatches(record, expectedSessionId) {
-  return expectedSessionId === null || record.sessionId === undefined || record.sessionId === expectedSessionId;
 }
 
 function compareSeatViews(left, right) {
@@ -765,12 +800,27 @@ function isRemoteSeatCandidate(member, localSessionIds, localInstanceId) {
   return sessionId === null || !localSessionIds.has(shortSessionId(sessionId));
 }
 
-function localInstanceIdOf(member) {
+/* 本机实例标识：数据根 instance-id 是权威（观察窗独立进程也能读）；缺失时退回旧参与记录里的
+ * 站长实例（仅站长机可推导）。两边都没有＝无法按实例排除本机行，只能按会话短码排除。 */
+function localInstanceIdOf(state, base, member) {
+  const fromFile = instanceIdOfRoot(state, base);
+  if (fromFile !== null) {
+    return fromFile;
+  }
   if (member === null || member.role !== 'manager') {
     return null;
   }
   const manager = member.manager;
   return isPlainObject(manager) && hasInstanceId(manager) ? manager.instanceId : null;
+}
+
+function instanceIdOfRoot(state, base) {
+  const text = readTextOrNull(state, join(base, INSTANCE_ID_FILE_NAME));
+  if (text === null) {
+    return null;
+  }
+  const instanceId = text.trim();
+  return ID_PATTERN.test(instanceId) ? instanceId : null;
 }
 
 /* 旧协作的成员视图取自 legacy 摘要 roster（旧台账/快照的名单，或旧 member.json 的定格名单）：
@@ -820,37 +870,52 @@ function isLegacyRosterCandidate(entry, localSessionIds, localInstanceId) {
   return sessionId === null || !localSessionIds.has(shortSessionId(sessionId));
 }
 
-/* 讨论的远端成员取自成员事件折叠（forum 无共享台账）：每个实例取最新 join 事件；事件若携
- * sessionId 则按短码排除本机席位，否则只能按机器展示（旧事件无会话标识）。角色/状态由
- * 「当前仍在 join 态」这一折叠事实派生。 */
-function forumRemoteSeatsOf(state, base, collabId, localSeats) {
+/* 讨论的远端成员取自成员事件折叠（forum 无共享台账）：按席位键取每个键的最新事件，
+ * 只有最新仍是 join 者才在席——leave 之后不得残留，也不得只看最新 join。
+ * 生产事件只写 instanceId（一台机器一个会话），事件若携 sessionId 则按会话分席。
+ * 本机实例按数据根 instance-id 排除（本机会话已在本机席位段，不能重复计入远端）；
+ * 事件携会话标识时再按短码排除一次。讨论人数与本折叠同源。 */
+function forumActiveMemberEventsOf(state, base, collabId) {
   const members = readParsedFile(state, collabFilePath(base, collabId, MEMBERS_FILE_NAME), classifyMemberLine);
-  if (members === null) {
-    return [];
+  return members === null ? [] : foldForumMemberEvents(dedupeMemberEvents(members.rows));
+}
+
+function foldForumMemberEvents(events) {
+  const latest = new Map();
+  for (const event of events) {
+    const key = forumSeatKeyOf(event);
+    const held = latest.get(key);
+    if (held === undefined || compareMemberEvents(event, held) > 0) {
+      latest.set(key, event);
+    }
   }
+  const active = [];
+  for (const event of latest.values()) {
+    if (event.kind === 'join') {
+      active.push(event);
+    }
+  }
+  return active;
+}
+
+function forumSeatKeyOf(event) {
+  const sessionId = textFieldOf(event.sessionId);
+  return sessionId === null ? event.instanceId : `${event.instanceId}/${sessionId}`;
+}
+
+function forumRemoteSeatsOf(state, base, collabId, localSeats, localInstanceId) {
   const localSessionIds = new Set(localSeats.map((seat) => seat.sessionId));
   const remote = [];
-  for (const event of latestJoinEventsOf(dedupeMemberEvents(members.rows)).values()) {
+  for (const event of forumActiveMemberEventsOf(state, base, collabId)) {
+    if (localInstanceId !== null && event.instanceId === localInstanceId) {
+      continue;
+    }
     const view = forumRemoteSeatViewOf(event, localSessionIds);
     if (view !== null) {
       remote.push(view);
     }
   }
   return remote.sort(compareSeatViews);
-}
-
-function latestJoinEventsOf(events) {
-  const latest = new Map();
-  for (const event of events) {
-    if (event.kind !== 'join') {
-      continue;
-    }
-    const held = latest.get(event.instanceId);
-    if (held === undefined || compareMemberEvents(event, held) > 0) {
-      latest.set(event.instanceId, event);
-    }
-  }
-  return latest;
 }
 
 function compareMemberEvents(left, right) {
@@ -1054,7 +1119,7 @@ function sessionsOf(state, base, collabId, context) {
   if (!hasSessionSource({ carrier, member, ledger, localSeats, departed, pendingInvites, pendingJoins, recovery, legacy, corruptSeatCount })) {
     return null;
   }
-  const localInstanceId = localInstanceIdOf(member);
+  const localInstanceId = localInstanceIdOf(state, base, member);
   const remoteSeats = remoteSeatsFor(mode, state, base, collabId, { ledger, localSeats, legacy, localInstanceId });
   const sessions = {
     localSeats,
@@ -1062,7 +1127,9 @@ function sessionsOf(state, base, collabId, context) {
     departed,
     pendingInvites,
     pendingJoins,
-    activeSeatCount: mode === 'forum' && legacy === null ? localSeats.length + remoteSeats.length : activeSeatCount,
+    /* 活跃席位与元状态人数同源：讨论不得一边按成员事件折叠出「1 人」、一边把本机/离席者
+     * 重复计入「3 席」。 */
+    activeSeatCount,
     localSeatCount: localSeats.length,
     mutedSeatCount: localSeats.filter((seat) => seat.muted === true).length,
   };
@@ -1090,7 +1157,7 @@ function remoteSeatsFor(mode, state, base, collabId, { ledger, localSeats, legac
     return legacyRosterSeatsOf(legacy, localSeats, localInstanceId);
   }
   if (mode === 'forum') {
-    return forumRemoteSeatsOf(state, base, collabId, localSeats);
+    return forumRemoteSeatsOf(state, base, collabId, localSeats, localInstanceId);
   }
   return remoteSeatsOf(ledger, localSeats, localInstanceId);
 }
@@ -1103,12 +1170,14 @@ function hasSessionSource({ carrier, member, ledger, localSeats, departed, pendi
   return localSeats.length > 0 || departed.length > 0 || pendingInvites.length > 0 || pendingJoins.length > 0 || corruptSeatCount > 0;
 }
 
-/* 冻结原因只读共享态已有字段（台账优先、carrier 兜底）；缺失即省略，不在观察窗自造。 */
+/* 冻结原因只读共享态已有字段（台账非空值优先、carrier 兜底）；空串/null 不得遮蔽 carrier 的
+ * 有效原因，解除冻结后写入方把值清空即不再显示；缺失即省略，不在观察窗自造。 */
 function freezeReasonOf(ledger, carrier) {
-  const reason = ledger !== null && ledger.freezeReason !== undefined
-    ? ledger.freezeReason
-    : (carrier === null ? undefined : carrier.freezeReason);
-  return typeof reason === 'string' && reason !== '' ? reason : null;
+  return nonEmptyReasonOf(ledger?.freezeReason) ?? nonEmptyReasonOf(carrier?.freezeReason);
+}
+
+function nonEmptyReasonOf(value) {
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : null;
 }
 
 function activeSeatCountOf(ledger) {
@@ -1339,7 +1408,7 @@ function forumMetaOf(state, base, collabId, carrier, member, legacy, posts, afte
     name: view === null ? null : view.name,
     state: view === null ? null : view.state,
     mode: 'forum',
-    memberCount: legacy !== null ? legacy.memberCount : foldMemberEvents(events).length,
+    memberCount: legacy !== null ? legacy.memberCount : foldForumMemberEvents(events).length,
     count: posts === null ? 0 : posts.rows.length,
     topic: topicOf(carrier, null, member, legacy),
     events: anchorOf(forumEventRows(events), after),
@@ -1414,7 +1483,7 @@ function updatedAtMsOf(state, base, collabId) {
 function forumSummaryOf(state, base, collabId, posts) {
   const members = readParsedFile(state, collabFilePath(base, collabId, MEMBERS_FILE_NAME), classifyMemberLine);
   const events = dedupeMemberEvents(members === null ? [] : members.rows);
-  return { ledger: null, memberCount: foldMemberEvents(events).length, count: posts === null ? 0 : posts.rows.length };
+  return { ledger: null, memberCount: foldForumMemberEvents(events).length, count: posts === null ? 0 : posts.rows.length };
 }
 
 function managedSummaryOf(state, base, collabId, role) {
@@ -1514,6 +1583,8 @@ export function createViewerData({ dataDir, log, listLocalSeats = null }) {
     parsedCache: new Map(),
     legacyWarned: new Set(),
     seatWarned: new Set(),
+    carrierWarned: new Set(),
+    recoveryWarned: new Set(),
     cacheHits: 0,
     cacheMisses: 0,
   };

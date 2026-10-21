@@ -316,25 +316,29 @@ after(() => {
   assert.equal(leakedPids.length, 0, `站点进程未被用例收尾（收尾钩子被跳过？）：${leakedPids.join(',')}——已兜底强制杀灭，检查用例清理`);
 });
 
-/* 0.2.0 席位夹具：carrier + seats/<sessionId>.json + 台账（状态栏条目由本会话席位表驱动）。 */
-function writeSeatCollab(home, { collabId, sessionId, name, role = 'member', muted = false }) {
+/* 0.2.0 席位夹具：carrier + seats/<sessionId>.json（可多席）+ 台账（状态栏条目由本会话席位表驱动）。
+ * seats = [{ sessionId, role, muted }]；manager 行取其中的站长席。 */
+function writeSeatCollab(home, { collabId, name, seats }) {
   const now = new Date().toISOString();
   const dir = join(home, 'collabs', collabId);
   mkdirSync(join(dir, 'seats'), { recursive: true });
-  writeFileSync(join(dir, 'carrier.json'), JSON.stringify(carrierFixtureOf({ collabId, name, now })));
-  writeFileSync(join(dir, 'ledger.jsonl'), `${JSON.stringify(ledgerFixtureOf({ collabId, sessionId, name, role, now }))}\n`);
-  writeFileSync(join(dir, 'seats', `${sessionId}.json`), JSON.stringify({
-    version: 1,
-    sessionId,
-    role,
-    state: 'member',
-    joinSeq: 2,
-    joinedAt: now,
-    muted,
-  }));
+  const manager = seats.find((seat) => seat.role === 'manager') ?? seats[0];
+  writeFileSync(join(dir, 'carrier.json'), JSON.stringify(carrierFixtureOf({ collabId, name, now, managerSessionId: manager.sessionId })));
+  writeFileSync(join(dir, 'ledger.jsonl'), `${JSON.stringify(ledgerFixtureOf({ collabId, name, now, seats, managerSessionId: manager.sessionId }))}\n`);
+  seats.forEach((seat, index) => {
+    writeFileSync(join(dir, 'seats', `${seat.sessionId}.json`), JSON.stringify({
+      version: 1,
+      sessionId: seat.sessionId,
+      role: seat.role,
+      state: 'member',
+      joinSeq: index + 1,
+      joinedAt: now,
+      muted: seat.muted,
+    }));
+  });
 }
 
-function carrierFixtureOf({ collabId, name, now }) {
+function carrierFixtureOf({ collabId, name, now, managerSessionId }) {
   return {
     format: 'session-seats',
     version: 1,
@@ -343,13 +347,13 @@ function carrierFixtureOf({ collabId, name, now }) {
     topic: '主题',
     mode: 'managed',
     endpoints: {},
-    manager: { instanceId: 'inst-a', sessionId: 'session-manager-fx', identityName: '主机甲', term: 1 },
+    manager: { instanceId: 'inst-a', sessionId: managerSessionId, identityName: '主机甲', term: 1 },
     snapshotVersion: 1,
     createdAt: now,
   };
 }
 
-function ledgerFixtureOf({ collabId, sessionId, name, role, now }) {
+function ledgerFixtureOf({ collabId, name, now, seats, managerSessionId }) {
   return {
     version: 1,
     collabId,
@@ -357,27 +361,70 @@ function ledgerFixtureOf({ collabId, sessionId, name, role, now }) {
     topic: '主题',
     status: 'active',
     managerTerm: 1,
-    joinSeqNext: 3,
-    manager: { instanceId: 'inst-a', sessionId: 'session-manager-fx', identityName: '主机甲', term: 1 },
-    members: [
-      { instanceId: 'inst-a', sessionId: 'session-manager-fx', identityName: '主机甲', role: 'manager', state: 'member', joinSeq: 1, joinedAt: now },
-      { instanceId: 'inst-self', sessionId, identityName: '本机', role, state: 'member', joinSeq: 2, joinedAt: now },
-    ],
+    joinSeqNext: seats.length + 1,
+    manager: { instanceId: 'inst-a', sessionId: managerSessionId, identityName: '主机甲', term: 1 },
+    members: seats.map((seat, index) => ({
+      instanceId: 'inst-a',
+      sessionId: seat.sessionId,
+      identityName: seat.role === 'manager' ? '主机甲' : '本机',
+      role: seat.role,
+      state: 'member',
+      joinSeq: index + 1,
+      joinedAt: now,
+    })),
     board: [],
     createdAt: now,
     updatedAt: now,
   };
 }
 
-/* M2 接线前标记：状态栏 collabs 仍由 main.js 的旧绑定表过滤（bindings 已退役为注入来源），
- * 席位表驱动的进程级断言待 M2 把 collabsBoundTo 切到 listLocalSeats/席位表后启用。 */
-test('进程级：会话状态文件按席位表过滤（本会话席位所在协作进入；无席位协作不进入）', { timeout: 30000 }, async (t) => {
+/* 读到期望条目数的状态文件快照：文件出现与首轮投影可能不同拍，按内容等待而不是只等文件。 */
+function readProjectedPayload(file, expectedCount) {
+  if (!existsSync(file)) {
+    return null;
+  }
+  try {
+    const payload = JSON.parse(readFileSync(file, 'utf8'));
+    return Array.isArray(payload.collabs) && payload.collabs.length === expectedCount ? payload : null;
+  } catch {
+    return null;
+  }
+}
+
+/* 同机双席夹具：两个协作各自让本会话处在一个角色、另一席处在相反角色且静音相反——
+ * 整机聚合会把两维都算错，按席位命中才得到期望值。 */
+function writeDualSeatStatusFixtures(home, sessionId, otherSessionId) {
+  writeSeatCollab(home, {
+    collabId: 'collab-manager-seat',
+    name: '本会话站长席',
+    seats: [
+      { sessionId, role: 'manager', muted: false },
+      { sessionId: otherSessionId, role: 'member', muted: true },
+    ],
+  });
+  writeSeatCollab(home, {
+    collabId: 'collab-member-seat',
+    name: '本会话成员席',
+    seats: [
+      { sessionId, role: 'member', muted: true },
+      { sessionId: otherSessionId, role: 'manager', muted: false },
+    ],
+  });
+  writeSeatCollab(home, {
+    collabId: 'collab-other-fx',
+    name: '别会话协作',
+    seats: [{ sessionId: otherSessionId, role: 'manager', muted: false }],
+  });
+}
+
+/* 进程级：同机双席时，状态栏按「本会话的席位」取角色与静音——不得退回整机聚合
+ * （整机会把任一站长席算成 manager、任一静音席算成静音，单席夹具与整机回退同值时测不出）。 */
+test('进程级：会话状态文件按席位表过滤并按本会话席位取角色/静音（同机双席不串味）', { timeout: 30000 }, async (t) => {
   const home = makeStationDir(t);
   const port = await pickFreePort();
   writeFileSync(join(home, 'config.json'), JSON.stringify({ port, scanWindowMs: 300, dialTimeoutMs: 1500, viewerAutoOpen: false }));
   const sessionId = 'session-seat-fx';
-  writeSeatCollab(home, { collabId: 'collab-seat-fx', sessionId, name: '本会话协作', muted: true });
-  writeSeatCollab(home, { collabId: 'collab-other-fx', sessionId: 'session-other-fx', name: '别会话协作' });
+  writeDualSeatStatusFixtures(home, sessionId, 'session-other-fx');
   const child = spawn(process.execPath, [join(repoRoot, 'src', 'index.js')], {
     cwd: repoRoot,
     env: { ...process.env, WAYSTATION_HOME: home, CLAUDE_CODE_SESSION_ID: sessionId, WAYSTATION_TEST_GRACE_MS: '1500' },
@@ -385,14 +432,16 @@ test('进程级：会话状态文件按席位表过滤（本会话席位所在�
   });
   registerChild(t, child);
   const file = sessionFilePath(home, sessionId);
-  await waitFor(() => (existsSync(file) ? true : null), { timeoutMs: 15000 });
-  const payload = JSON.parse(readFileSync(file, 'utf8'));
+  const payload = await waitFor(() => readProjectedPayload(file, 2), { timeoutMs: 15000 });
   const byId = Object.fromEntries(payload.collabs.map((entry) => [entry.collabId, entry]));
-  assert.equal(payload.collabs.length, 1, '仅本会话席位所在协作进入文件');
+  assert.equal(payload.collabs.length, 2, '仅本会话席位所在协作进入文件');
   assert.equal(byId['collab-other-fx'], undefined, '无本会话席位的协作被过滤（负例）');
-  assert.equal(byId['collab-seat-fx'].role, 'member', 'role 取本席位角色');
-  assert.equal(byId['collab-seat-fx'].muted, true, 'muted 取本席位');
-  assert.equal(byId['collab-seat-fx'].state, 'active');
+  assert.equal(byId['collab-manager-seat'].role, 'manager', 'role 取本会话席位（不因同机另一席是成员而降级）');
+  assert.equal('muted' in byId['collab-manager-seat'], false, '同机另一席静音不得聚合到本会话');
+  assert.equal(byId['collab-manager-seat'].state, 'active');
+  assert.equal(byId['collab-member-seat'].role, 'member', 'role 取本会话席位（不因同机另一席是站长而升级）');
+  assert.equal(byId['collab-member-seat'].muted, true, 'muted 取本会话席位');
+  assert.equal(byId['collab-member-seat'].state, 'active');
   child.stdin.end();
   const exit = await new Promise((resolve) => {
     const timer = setTimeout(() => resolve(null), 15000);

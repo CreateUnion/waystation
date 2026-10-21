@@ -317,7 +317,7 @@ function writeForumFixture(home, collabId, { posts = 3, tailWithoutNewline = fal
     [MEMBERS_FILE_NAME]: jsonl(memberEvent()),
     [CARRIER_FILE_NAME]: JSON.stringify(carrierOf(collabId, { name: '讨论甲', topic: '讨论主题', mode: 'forum' })),
     [LEDGER_FILE_NAME]: jsonl(forumLedgerOf(collabId)),
-    /* 兼容参与记录：本机视角状态（新形态目录由 M2 create 写点携带）。 */
+    /* 兼容参与记录：本机视角状态（新形态目录由创建写点携带）。 */
     [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ mode: 'forum', collabId })),
   });
 }

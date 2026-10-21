@@ -306,6 +306,34 @@ test('详情成员区：本机会员席位/远端成员/离席历史三段（机
   assert.equal(findAll(bare.byId['banner'], 'banner-sessions').length, 0, '无 sessions 字段＝整区不出');
 });
 
+test('讨论（forum）会话渲染：列表摘要人数与活跃席位同源，详情三段按本机/远端折叠结果展示', async () => {
+  const sessions = {
+    activeSeatCount: 2,
+    localSeats: [{ identityName: '甲机', sessionId: 'aaaa1111', role: 'member', state: 'member', joinSeq: 1, muted: false }],
+    remoteSeats: [{ instanceId: 'inst-c', identityName: '丙机', sessionId: 'cccc3333', role: 'member', state: 'member', joinSeq: 2 }],
+    departed: [],
+    pendingInvites: [],
+    pendingJoins: [],
+    freezeReason: null,
+  };
+  const listEnv = createEnv();
+  await bootList(listEnv, [{
+    root: 'main', id: 'demo', name: '讨论甲', mode: 'forum', state: 'active', memberCount: 2, count: 1, updatedAt: 1760000000000,
+    sessions,
+  }]);
+  const row = findAll(listEnv.byId['list-view'], 'collab-row')[0];
+  assert.ok(textOf(row).includes('2 人'), textOf(row));
+  assert.ok(textOf(row).includes('会话：活跃 2 席｜本机 1 席｜远端 1 席'), textOf(row));
+
+  const env = createEnv();
+  await bootDetail(env, { rows: [], reset: true, skipped: 0 }, metaBody({ mode: 'forum', memberCount: 2, sessions }));
+  assert.deepEqual(textLines(env.byId['banner'], 'session-line'), [
+    '本机会员席位：甲机 aaaa1111（成员·在席·入席 1）',
+    '远端成员：丙机 cccc3333（成员·在席·入席 2）',
+    '离席历史：0 条',
+  ]);
+});
+
 test('详情成员区：旧版只读标记与三段如实零（0 席/0 席/0 条）', async () => {
   const env = createEnv();
   await bootDetail(env, { rows: [], reset: true, skipped: 0 }, metaBody({
