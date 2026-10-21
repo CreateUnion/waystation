@@ -129,7 +129,7 @@ export function collabRunDir(dataDir, collabId) {
   return join(collabDir(dataDir, collabId), RUN_DIR_NAME);
 }
 
-/** 原站长核的 auto-offer 副本（离线成员追赶与重启恢复）。 */
+/** 原站长核的 auto-offer 副本（重启恢复；离线追赶只认本机已收的 offer，快照台账事件不作证据）。 */
 export function autoOfferFilePath(dataDir, collabId) {
   return join(collabRunDir(dataDir, collabId), AUTO_OFFER_FILE_NAME);
 }
