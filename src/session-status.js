@@ -3,7 +3,7 @@ import { dirname } from 'node:path';
 import { writeJsonAtomic } from './storage.js';
 import { sessionFilePath } from './paths.js';
 import { ID_PATTERN } from './net/protocol.js';
-import { shortSessionId } from './util/short-id.js';
+import { matchSessionByShort, shortSessionId } from './util/short-id.js';
 
 /* 会话级状态文件写入端（状态栏「协作中」指示的机制载体）：把会话参与协作的快照写进
  * <主数据目录>/sessions/<sessionId>.json，读取端（scripts/statusline.js）按会话标识直接命中。
@@ -66,14 +66,18 @@ export function indicatedEntriesOf(entries, indicators, sessionId = null) {
 }
 
 /* 本会话在条目席位表中的席位：undefined＝无席位表/无会话标识（走旧字段兜底）；
- * null＝席位表在场但没有本会话席位（条目不属于本会话）；对象＝命中席位。 */
+ * null＝席位表在场但没有本会话席位（条目不属于本会话）；对象＝命中席位。
+ * 席位来源可能是 M2 的完整 sessionId 或观察窗的短码：统一按短码精确匹配，歧义即拒。 */
 function seatOfEntry(entry, sessionId) {
   const seats = entry?.sessions?.localSeats;
   if (!Array.isArray(seats) || typeof sessionId !== 'string' || sessionId === '') {
     return undefined;
   }
-  const shortId = shortSessionId(sessionId);
-  return seats.find((seat) => seat !== null && typeof seat === 'object' && seat.sessionId === shortId) ?? null;
+  const matchedId = matchSessionByShort(seats, shortSessionId(sessionId));
+  if (matchedId === null) {
+    return null;
+  }
+  return seats.find((seat) => seat !== null && typeof seat === 'object' && seat.sessionId === matchedId) ?? null;
 }
 
 /**

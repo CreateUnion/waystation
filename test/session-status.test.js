@@ -76,14 +76,14 @@ test('指示条目席位来源：按本会话命中 localSeats 取 role/muted；
       collabId: 'collab-1', name: '双席协作', state: 'active', role: 'manager', mode: 'managed', memberCount: 3, muted: false,
       sessions: {
         localSeats: [
-          { sessionId: '11112222', role: 'manager', state: 'member', joinSeq: 1, muted: false },
-          { sessionId: '33334444', role: 'member', state: 'member', joinSeq: 2, muted: true },
+          { sessionId: '11112222-aaaa-bbbb-cccc-111122223333', role: 'manager', state: 'member', joinSeq: 1, muted: false },
+          { sessionId: '33334444-aaaa-bbbb-cccc-333344445555', role: 'member', state: 'member', joinSeq: 2, muted: true },
         ],
       },
     },
     {
       collabId: 'collab-2', name: '别会话', state: 'active', role: 'manager', mode: 'managed', memberCount: 2,
-      sessions: { localSeats: [{ sessionId: '55556666', role: 'manager', state: 'member', joinSeq: 1, muted: false }] },
+      sessions: { localSeats: [{ sessionId: '55556666-aaaa-bbbb-cccc-555566667777', role: 'manager', state: 'member', joinSeq: 1, muted: false }] },
     },
     { collabId: 'collab-3', name: '旧来源', state: 'frozen', role: 'member', mode: 'managed', memberCount: 2, muted: true },
   ];
@@ -96,6 +96,27 @@ test('指示条目席位来源：按本会话命中 localSeats 取 role/muted；
   assert.equal(managerSeat[0].role, 'manager');
   assert.equal('muted' in managerSeat[0], false);
   assert.deepEqual(managerSeat.map((entry) => entry.collabId), ['collab-1', 'collab-3'], '席位表在场但无本会话席位＝不出条目；无席位表的旧来源保留兜底');
+});
+
+test('指示条目席位来源：同机多席按全 ID 与短码分别命中各自席位（role/muted 不串味）', () => {
+  const entries = [{
+    collabId: 'collab-dual', name: '同机双席', state: 'active', mode: 'managed', memberCount: 2,
+    sessions: {
+      localSeats: [
+        { sessionId: 'aaaa1111-2222-3333-4444-aaaa11112222', role: 'manager', state: 'member', joinSeq: 1, muted: false },
+        { sessionId: 'bbbb3333-4444-5555-6666-bbbb33334444', role: 'member', state: 'member', joinSeq: 2, muted: true },
+      ],
+    },
+  }];
+  const manager = indicatedEntriesOf(entries, [], 'aaaa1111-2222-3333-4444-aaaa11112222');
+  assert.equal(manager[0].role, 'manager');
+  assert.equal('muted' in manager[0], false);
+  const member = indicatedEntriesOf(entries, [], 'bbbb3333-4444-5555-6666-bbbb33334444');
+  assert.equal(member[0].role, 'member');
+  assert.equal(member[0].muted, true);
+  const byShort = indicatedEntriesOf(entries, [], 'bbbb3333');
+  assert.equal(byShort[0].role, 'member');
+  assert.equal(byShort[0].muted, true);
 });
 
 test('归档条目不进指示面：归档与非归档混合清单 → 文件 collabs 仅保留非归档', (t) => {

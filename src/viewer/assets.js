@@ -441,6 +441,9 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     if (Array.isArray(sessions.pendingJoins) && sessions.pendingJoins.length > 0) {
       lines.push('待确认入席：' + sessions.pendingJoins.length + ' 条');
     }
+    if (Number.isInteger(sessions.corruptSeatCount) && sessions.corruptSeatCount > 0) {
+      lines.push('损坏席位：' + sessions.corruptSeatCount + ' 个（按不存在处理）');
+    }
     if (lines.length === 0) {
       return null;
     }

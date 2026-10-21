@@ -290,6 +290,7 @@ test('详情成员区：本机会员席位/远端成员/离席历史三段（机
       pendingInvites: [{ inviteId: 'inv-1' }],
       pendingJoins: [],
       freezeReason: 'manager-fork',
+      corruptSeatCount: 1,
     },
   }));
   assert.deepEqual(textLines(env.byId['banner'], 'session-line'), [
@@ -298,6 +299,7 @@ test('详情成员区：本机会员席位/远端成员/离席历史三段（机
     '远端成员：乙机 cccc3333（成员·在席·入席 2）、inst-x dddd4444（成员·入席中）',
     '离席历史：丙机 eeee5555（manager-lost·' + TS_MORNING + '）',
     '待回应邀请：1 条',
+    '损坏席位：1 个（按不存在处理）',
   ]);
   const bare = createEnv();
   await bootDetail(bare, { rows: [], reset: true, skipped: 0 }, metaBody());   // 数据面无该字段
