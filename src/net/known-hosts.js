@@ -1,7 +1,7 @@
 import { readFileSync, renameSync } from 'node:fs';
 import { isIP } from 'node:net';
 import { join } from 'node:path';
-import { isPort } from './protocol.js';
+import { PARTICIPANTS_CAPABILITY, isParticipantsCapability, isPort } from './protocol.js';
 import { shortSessionId } from '../util/short-id.js';
 import { ANCHOR_PORT } from '../site.js';
 import { writeJsonAtomic } from '../storage.js';
@@ -12,10 +12,27 @@ export const MAX_KNOWN_HOSTS = 64;
  * 超限截断保证条目与整文件体积皆有界。 */
 export const MAX_KNOWN_SESSIONS = 32;
 
+/* 能力三态的呈现口径（设计 §7.2；`ws_list_hosts` 的「支持 / 不支持 / 未知」由此单一权威产出）：
+ * 2＝对端声明支持；0＝对端应答存在但缺字段（旧版）；字段缺席＝从未观测到（未知）。 */
+/**
+ * @param {unknown} entry
+ * @returns {'supported' | 'unsupported' | 'unknown'}
+ */
+export function participantsStateOf(entry) {
+  if (entry === null || typeof entry !== 'object') {
+    return 'unknown';
+  }
+  const record = /** @type {Record<string, unknown>} */ (entry);
+  if (isParticipantsCapability(record.participants)) {
+    return 'supported';
+  }
+  return record.participants === 0 ? 'unsupported' : 'unknown';
+}
+
 /* 本文件的字符串字段只做「本地文件不荒唐」的存储级底线校验；
  * 线上协议的严格校验在 protocol.js——两层目的不同，边界可以不同。 */
 const MAX_TEXT_CHARS = 128;
-const STORAGE_VERSION = 3;
+const STORAGE_VERSION = 4;
 
 /* 落盘节流窗口（模块私有）：协作域逐帧的端点学习会走到 remember——同键的 lastSeenAt 刷新
  * 按窗口合并写盘（内存态仍逐帧新鲜、择新排序不受影响）；新键（新站点）立即落盘，
@@ -28,6 +45,8 @@ const PERSIST_MIN_INTERVAL_MS = 5000;
  * 存储 1→2 版：旧条目（键=地址、无 port）按锚点端口解释——旧版站点全部取默认端口，默认配置下语义等价。
  * 存储 2→3 版：条目增可选 `sessions`（对端活跃会话短码，见会话级管理设计 §1）——旧条目缺字段＝未知，
  * 与「对端报了零会话」（空数组）是两个语义，不混同；不引入文件级迁移（下一次写入即 v3 形态）。
+ * 存储 3→4 版：条目增可选 `participants`（会话级参与者能力，2＝支持、0＝不支持、缺席＝未知，见设计 §7.2）；
+ * 旧条目缺字段同样按未知读取，下一次写入即 v4 形态。
  * 写入失败只告警不抛出：清单是发现辅助，丢失不得影响主流程（健壮性硬性要求）。 */
 export function createKnownHosts({ dataDir, log, persistMinIntervalMs = PERSIST_MIN_INTERVAL_MS }) {
   const state = {
@@ -44,6 +63,7 @@ export function createKnownHosts({ dataDir, log, persistMinIntervalMs = PERSIST_
     targets: () => targetsOf(state),
     remember: (entry) => remember(state, entry),
     lookup: (instanceId) => lookup(state, instanceId),
+    participantsOf: (instanceId) => participantsOf(state, instanceId),
     stats: () => ({ ...state.counters, entries: state.hosts.size }),
   };
 }
@@ -61,6 +81,29 @@ function lookup(state, instanceId) {
   }
   const entry = listOf(state).find((candidate) => candidate.instanceId === instanceId);
   return entry === undefined ? null : { address: entry.address, port: entry.port };
+}
+
+/* 按实例标识取能力（扫描合并的继承来源）：同一实例多地址时支持态优先——
+ * 能力是「这台机器装了什么版本」的属性，一处确认支持即整机支持；未知与不支持都不覆盖它。
+ * 未见过 / 未知返回 undefined。 */
+function participantsOf(state, instanceId) {
+  if (typeof instanceId !== 'string' || instanceId === '') {
+    return undefined;
+  }
+  /** @type {number | undefined} */
+  let known = undefined;
+  for (const entry of state.hosts.values()) {
+    if (entry.instanceId !== instanceId) {
+      continue;
+    }
+    if (entry.participants === PARTICIPANTS_CAPABILITY) {
+      return PARTICIPANTS_CAPABILITY;
+    }
+    if (entry.participants === 0) {
+      known = 0;
+    }
+  }
+  return known;
 }
 
 /* 单播兜底的目标解析（择新口径）：按实例标识去重、取 lastSeenAt 最新条目——
@@ -124,14 +167,14 @@ function quarantine(state) {
 }
 
 function remember(state, entry) {
-  const { address, port, instanceId, identityName, sessions: sessionInput } = entry;
+  const { address, port, instanceId, identityName, sessions: sessionInput, participants: participantsInput } = entry;
   if (typeof address !== 'string' || isIP(address) === 0 || !isPort(port)) {
     state.counters.invalidEntries++;
     state.log.warn('忽略非法来源地址或端口（不入清单）', { address: String(address), port: String(port) });
     return;
   }
   state.counters.remembered++;
-  /** @type {{ address: string, port: number, instanceId: string, identityName: string, lastSeenAt: string, sessions?: string[] }} */
+  /** @type {{ address: string, port: number, instanceId: string, identityName: string, lastSeenAt: string, sessions?: string[], participants?: number }} */
   const stored = {
     address,
     port,
@@ -139,12 +182,23 @@ function remember(state, entry) {
     identityName: boundedText(identityName),
     lastSeenAt: new Date().toISOString(),
   };
-  /* 会话段的合并口径（与扫描结果面同一纪律）：明确申报（数组——空数组＝「零会话」也是申报）即覆盖；
-   * 未报或这份无法整形＝这份没有可用的会话情报 → 继承同键既有值。探测与启动自介都不带该字段，
-   * 且远比 250ms 写节流稀疏——不继承就会「对端每扫一次 / 重启自介一次，本机清单里它的会话短码
-   * 就消失一次」。探测只证明「这台机器在此」，不是「它没有会话」（与「没报 ≠ 零会话」同一判据）。 */
   const key = keyOf(stored);
   const held = state.hosts.get(key);
+  mergeOptionalFields(held, stored, sessionInput, participantsInput);
+  const isNewKey = held === undefined;
+  state.hosts.delete(key);
+  state.hosts.set(key, stored);
+  evictOverflow(state);
+  if (isNewKey || Date.now() - state.lastPersistMs >= state.persistMinIntervalMs) {
+    persist(state);
+  }
+}
+
+/* 会话段与能力段的合并口径（与扫描结果面同一纪律）：明确申报即覆盖，未报或无法整形＝
+ * 这份没有可用的情报 → 继承同键既有值（限同实例）。探测与启动自介既不携 sessions 也不携
+ * participants，且远比 250ms 写节流稀疏——不继承就会「对端每扫一次 / 重启自介一次，本机清单里
+ * 它的会话短码与能力就消失一次」。探测只证明「这台机器在此」，不是「它没有会话 / 不支持协作」。 */
+function mergeOptionalFields(held, stored, sessionInput, participantsInput) {
   const sessions = boundedSessions(sessionInput);
   if (sessions !== null) {
     stored.sessions = sessions;
@@ -153,12 +207,9 @@ function remember(state, entry) {
      * 这一台的情报——键碰撞下不继承（宁缺勿错认）。 */
     stored.sessions = held.sessions;
   }
-  const isNewKey = held === undefined;
-  state.hosts.delete(key);
-  state.hosts.set(key, stored);
-  evictOverflow(state);
-  if (isNewKey || Date.now() - state.lastPersistMs >= state.persistMinIntervalMs) {
-    persist(state);
+  const participants = mergedParticipants(held, stored, participantsInput);
+  if (participants !== undefined) {
+    stored.participants = participants;
   }
 }
 
@@ -199,7 +250,7 @@ function validateEntry(entry) {
   if (!isPort(port)) {
     return null;
   }
-  /** @type {{ address: string, port: number, instanceId: string, identityName: string, lastSeenAt: string, sessions?: string[] }} */
+  /** @type {{ address: string, port: number, instanceId: string, identityName: string, lastSeenAt: string, sessions?: string[], participants?: number }} */
   const checked = {
     address: entry.address,
     port,
@@ -211,12 +262,40 @@ function validateEntry(entry) {
   if (sessions !== null) {
     checked.sessions = sessions;
   }
+  const participants = storedParticipants(entry.participants);
+  if (participants !== null) {
+    checked.participants = participants;
+  }
   return checked;
 }
 
 /* 时间戳读取：认不出即归零时刻（条目仍有效——时间只影响排序与淘汰，不值得为一枚坏时间戳丢掉整条地址） */
 function storedLastSeenAt(value) {
   return typeof value === 'string' && !Number.isNaN(Date.parse(value)) ? value : new Date(0).toISOString();
+}
+
+/* 能力段的形态底线：只认 2（支持）与 0（不支持），其余一律按未知（返回 null，调用方不落字段）。
+ * 未知与「不支持」是两个语义：前者是没观测到，后者是观测到旧版应答。 */
+function storedParticipants(value) {
+  if (isParticipantsCapability(value)) {
+    return PARTICIPANTS_CAPABILITY;
+  }
+  return value === 0 ? 0 : null;
+}
+
+/* 能力合并：未报（undefined / 非法形态）继承同实例旧值——探测与启动自介不携能力，不能把已知态抹成未知；
+ * 已确立的支持态不被缺字段的旧版应答降级（一次丢失/旧版应答不足以推翻整机的版本事实，设计 §7.2「不覆盖已知」）。
+ * 继承限同实例：同键换主时上一台的能力不是这一台的情报。 */
+function mergedParticipants(held, stored, input) {
+  const observed = storedParticipants(input);
+  const known = held !== undefined && held.instanceId === stored.instanceId ? held.participants : undefined;
+  if (observed === null) {
+    return known;
+  }
+  if (observed === 0 && known === PARTICIPANTS_CAPABILITY) {
+    return known;
+  }
+  return observed;
 }
 
 /* 会话段的形态底线：数组即短码化并截断（对外一律短码——短码化是唯一权威的呈现加工）；

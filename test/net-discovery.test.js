@@ -13,12 +13,13 @@ import {
   fitJoinAckDatagram,
   fitProbeAckDatagram,
 } from '../src/net/discovery.js';
-import { createKnownHosts } from '../src/net/known-hosts.js';
-import { MAX_COLLAB_COUNT } from '../src/net/protocol.js';
+import { createKnownHosts, participantsStateOf } from '../src/net/known-hosts.js';
+import { MAX_COLLAB_COUNT, fitJoinResolveAck } from '../src/net/protocol.js';
 import { makeTempDir, pickFreePort, waitFor } from './helpers.js';
 
 const SELF_A = { instanceId: 'aaaaaaaa-0000-4000-8000-000000000001', identityName: '主机甲' };
 const SELF_B = { instanceId: 'bbbbbbbb-0000-4000-8000-000000000002', identityName: '主机乙' };
+const SELF_C = { instanceId: 'cccccccc-0000-4000-8000-000000000003', identityName: '主机丙' };
 
 function quietLog() {
   return { info: () => {}, warn: () => {}, error: () => {} };
@@ -49,8 +50,9 @@ async function startNode(t, { self, bindAddress, collabCount = 0, port, segmentB
 /* 伪对端：绑定到指定回环地址与发现端口，收到探测后以固定实例标识回发应答（delayMs 模拟稍晚应答）。
  * 两个真实节点写不出同一实例标识——「同实例多地址合并」只能靠伪对端构造。
  * ackPort 缺省 = 绑定端口（今版站点自报端口形态）；null = 应答不带端口字段（旧实现形态）。
+ * participants 缺省 = 应答不带能力字段（旧版对端形态）；2 = 今版对端。
  * probesReceived 暴露收到的探测计数，供启动自介用例断言。 */
-function startFakePeer(t, { port, address, delayMs = 0, ackPort }) {
+function startFakePeer(t, { port, address, delayMs = 0, ackPort, participants, instanceId = SELF_B.instanceId, identityName = '主机乙' }) {
   const socket = dgram.createSocket({ type: 'udp4', reuseAddr: false });
   t.after(() => socket.close());
   const peer = { probesReceived: 0 };
@@ -62,9 +64,10 @@ function startFakePeer(t, { port, address, delayMs = 0, ackPort }) {
     const ack = Buffer.from(JSON.stringify({
       v: 1,
       type: 'probe-ack',
-      instanceId: SELF_B.instanceId,
-      identityName: '主机乙',
+      instanceId,
+      identityName,
       collabCount: 2,
+      ...(participants === undefined ? {} : { participants }),
       ...(ackPort === null ? {} : { port: ackPort ?? port }),
     }));
     setTimeout(() => socket.send(ack, rinfo.port, rinfo.address), delayMs);
@@ -525,6 +528,7 @@ test('敲门与应答（单播兜底实测）：成员命中自动应答、应�
   assert.equal(knocksSeen[0].name, '联调讨论');
   assert.equal(knocksSeen[0].address, '127.0.0.1', '命中回调携申请人来源端点（放行时作 ws_invite 目标）');
   assert.equal(knocksSeen[0].port, portA);
+  assert.equal(knocksSeen[0].participants, 2, '命中回调携申请人的会话级能力（成员侧放行前即可判定）');
   assert.match(knocksSeen[0].knockId, /^[0-9a-f-]{32,40}$/);
   assert.deepEqual(replies, [{
     collabId: 'collab-1',
@@ -534,6 +538,7 @@ test('敲门与应答（单播兜底实测）：成员命中自动应答、应�
     originator: { instanceId: 'inst-org', identityName: '发起人' },
     topicTruncated: false,
     nameTruncated: false,
+    participants: 2,
     responder: { instanceId: SELF_B.instanceId, identityName: '主机乙', address: '127.0.0.2', port: portB },
     replies: 1,
   }]);
@@ -887,6 +892,7 @@ test('解析命中：单播请求→注入面按名匹配→应答带回讨论�
     found: true,
     collabId: 'collab-9',
     name: '联调讨论',
+    participants: 2,
     responder: { instanceId: SELF_A.instanceId, identityName: '主机甲', address: '127.0.0.1', port: portA },
     replies: 2,
   });
@@ -938,7 +944,8 @@ test('解析未命中：极简应答（不得携讨论面字段）、同源窗�
     port: portB,
     resolveId: 'resolve-1',
     found: false,
-  }, '未命中：极简形态（未命中却点名是自相矛盾的断言，协议层拒收）');
+    participants: 2,
+  }, '未命中：极简形态保留能力字段（未命中却点名讨论面是自相矛盾的断言，协议层拒收）');
   raw.send(request, portB, '127.0.0.2');
   await new Promise((resolve) => setTimeout(resolve, DISCOVERY_REPLY_MIN_INTERVAL_MS + 100));
   assert.equal(received.length, 1, '同源窗口内的第二发不被应答（伪造请求不放大为应答风暴）');
@@ -967,6 +974,7 @@ test('解析命中应答：collabId 必携、名称可省（注入面没给就�
     resolveId: 'resolve-2',
     found: true,
     collabId: 'collab-7',
+    participants: 2,
   }, '命中必携 collabId（申请人据此拨入加入）；注入面没给名称则不带（可省）');
   assert.equal(b.node.stats().joinResolveRepliesAnswered, 1);
 });
@@ -1061,4 +1069,153 @@ test('解析参数：非法讨论名 / 地址 / 端口 / 窗口抛 TypeError（�
   await assert.rejects(a.node.requestJoinResolve({ ...target, port: 0 }), TypeError);
   await assert.rejects(a.node.requestJoinResolve({ ...target, timeoutMs: 0 }), TypeError);
   assert.equal(JOIN_RESOLVE_TIMEOUT_MS, 1500, '缺省收答窗口：对端可达时的一次问答足够从容');
+});
+
+/* —— 发现面能力（会话级参与者 0.2.0，设计 §7.2）：participants:2 加法字段与三态判定 —— */
+
+test('发现面加法字段：probe-ack / join-knock / join-ack / join-resolve-ack 携 participants:2，probe 不携', { timeout: 20000 }, async (t) => {
+  const portA = await pickFreePort();
+  const portB = await pickFreePort();
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port: portA, knockOptions: KNOCK_TIMINGS });
+  const knockTarget = await startRawPeer(t);
+  a.knownHosts.remember({ address: '127.0.0.1', port: knockTarget.raw.address().port });
+  a.node.announce();
+  await waitFor(() => knockTarget.received.some((item) => item.type === 'probe'));
+  assert.equal(knockTarget.received.find((item) => item.type === 'probe').participants, undefined, '探测请求不携能力（只有应答判定三态）');
+  await a.node.requestJoin({ name: '联调讨论' });
+  const knock = knockTarget.received.find((item) => item.type === 'join-knock');
+  assert.equal(knock.participants, 2, '敲门携能力（申请侧自报）');
+
+  const b = await startNode(t, {
+    self: SELF_B,
+    bindAddress: '127.0.0.2',
+    port: portB,
+    onJoinKnock: () => [JOIN_REPLY],
+    onJoinResolve: () => ({ found: false }),
+    knockOptions: KNOCK_TIMINGS,
+  });
+  const { raw, received } = await startRawPeer(t);
+  raw.send(Buffer.from(JSON.stringify({ v: 1, type: 'probe', instanceId: SELF_A.instanceId, identityName: '主机甲' })), portB, '127.0.0.2');
+  await waitFor(() => received.length >= 1);
+  assert.equal(received[0].type, 'probe-ack');
+  assert.equal(received[0].participants, 2, '扫描应答携能力');
+  raw.send(Buffer.from(JSON.stringify({ v: 1, type: 'join-knock', instanceId: SELF_A.instanceId, identityName: '主机甲', knockId: 'knock-cap', name: '联调讨论' })), portB, '127.0.0.2');
+  await waitFor(() => received.some((item) => item.type === 'join-ack'));
+  assert.equal(received.find((item) => item.type === 'join-ack').participants, 2, '加入应答携能力');
+  raw.send(Buffer.from(JSON.stringify({ v: 1, type: 'join-resolve', resolveId: 'resolve-cap', name: '联调讨论' })), portB, '127.0.0.2');
+  await waitFor(() => received.some((item) => item.type === 'join-resolve-ack'));
+  assert.equal(received.find((item) => item.type === 'join-resolve-ack').participants, 2, '解析应答（含未命中极简形态）携能力');
+  assert.equal(b.node.stats().probesAnswered, 1);
+});
+
+test('扫描能力三态：participants:2＝支持、旧版缺字段＝不支持；扫描结果与清单同口径', { timeout: 15000 }, async (t) => {
+  const port = await pickFreePort();
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port });
+  await startFakePeer(t, { port, address: '127.0.0.2', participants: 2 });
+  await startFakePeer(t, { port, address: '127.0.0.3', instanceId: SELF_C.instanceId, identityName: '主机丙' });
+  a.knownHosts.remember({ address: '127.0.0.2', port });
+  a.knownHosts.remember({ address: '127.0.0.3', port });
+  const hosts = await a.node.scan({ windowMs: 300 });
+  const supported = hosts.find((entry) => entry.instanceId === SELF_B.instanceId);
+  const legacy = hosts.find((entry) => entry.instanceId === SELF_C.instanceId);
+  assert.equal(supported.participants, 2, '今版对端＝支持');
+  assert.equal(legacy.participants, 0, '响应存在但缺字段＝旧版/不支持');
+  const storedSupported = a.knownHosts.list().find((entry) => entry.address === '127.0.0.2');
+  const storedLegacy = a.knownHosts.list().find((entry) => entry.address === '127.0.0.3');
+  assert.equal(storedSupported.participants, 2, '清单记录支持态');
+  assert.equal(storedLegacy.participants, 0, '清单记录不支持态（不留作未知）');
+  assert.equal(participantsStateOf(storedSupported), 'supported');
+  assert.equal(participantsStateOf(storedLegacy), 'unsupported');
+});
+
+test('扫描合并继承：同实例后到的缺字段应答不抹掉本窗口已学到的支持态', { timeout: 15000 }, async (t) => {
+  const port = await pickFreePort();
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port });
+  a.knownHosts.remember({ address: '127.0.0.2', port });
+  a.knownHosts.remember({ address: '127.0.0.3', port });
+  await startFakePeer(t, { port, address: '127.0.0.2', participants: 2 });
+  await startFakePeer(t, { port, address: '127.0.0.3', delayMs: 120 });
+  const hosts = await a.node.scan({ windowMs: 400 });
+  assert.equal(hosts.length, 1, '同实例多地址合并为一条');
+  assert.equal(hosts[0].participants, 2, '实时扫描结果不覆盖已知（后到的缺字段应答按继承）');
+});
+
+test('单播能力探测：支持 / 不支持 / 无响应＝未知；结果收敛进清单并计数', { timeout: 20000 }, async (t) => {
+  const portA = await pickFreePort();
+  const portB = await pickFreePort();
+  const portC = await pickFreePort();
+  const portD = await pickFreePort();
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port: portA });
+  await startFakePeer(t, { port: portB, address: '127.0.0.2', participants: 2 });
+  await startFakePeer(t, { port: portC, address: '127.0.0.3', instanceId: SELF_C.instanceId, identityName: '主机丙' });
+  const silent = dgram.createSocket({ type: 'udp4', reuseAddr: false });
+  t.after(() => silent.close());
+  await new Promise((resolve, reject) => {
+    silent.once('error', reject);
+    silent.bind({ port: portD, address: '127.0.0.4', exclusive: true }, resolve);
+  });
+  const supported = await a.node.probeCapability({ address: '127.0.0.2', port: portB });
+  assert.equal(supported.capability, 'supported');
+  assert.equal(supported.responder.instanceId, SELF_B.instanceId);
+  const unsupported = await a.node.probeCapability({ address: '127.0.0.3', port: portC });
+  assert.equal(unsupported.capability, 'unsupported');
+  assert.equal(unsupported.responder.instanceId, SELF_C.instanceId);
+  const unknown = await a.node.probeCapability({ address: '127.0.0.4', port: portD, timeoutMs: 150 });
+  assert.equal(unknown.capability, 'unknown');
+  assert.equal(unknown.responder, null);
+  assert.equal(a.node.stats().capabilityProbesSent, 3);
+  assert.equal(a.knownHosts.list().find((entry) => entry.address === '127.0.0.2').participants, 2, '探测把未知收敛为支持并写入清单');
+  assert.equal(a.knownHosts.list().find((entry) => entry.address === '127.0.0.3').participants, 0, '探测把未知收敛为不支持并写入清单');
+});
+
+test('单播能力探测参数：非法地址 / 端口 / 窗口 / 实例标识抛 TypeError（编程错误快速暴露）', { timeout: 15000 }, async (t) => {
+  const port = await pickFreePort();
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port });
+  const target = { address: '127.0.0.1', port: 17321 };
+  await assert.rejects(a.node.probeCapability({ ...target, address: 'localhost' }), TypeError);
+  await assert.rejects(a.node.probeCapability({ address: target.address }), TypeError);
+  await assert.rejects(a.node.probeCapability({ ...target, port: 0 }), TypeError);
+  await assert.rejects(a.node.probeCapability({ ...target, timeoutMs: 0 }), TypeError);
+  await assert.rejects(a.node.probeCapability({ ...target, instanceId: 42 }), TypeError);
+});
+
+test('旧版对端缺能力字段：join-ack 与按名解析结果记 0（不支持）', { timeout: 15000 }, async (t) => {
+  const portA = await pickFreePort();
+  const portB = await pickFreePort();
+  const portC = await pickFreePort();
+  const timings = { joinKnockRetryCount: 0, joinKnockRetryIntervalMs: 10, joinKnockWindowMs: 250, joinKnockReplyMinIntervalMs: 600 };
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port: portA, knockOptions: timings });
+  await startKnockPeer(t, { port: portB, address: '127.0.0.2' });
+  a.knownHosts.remember({ address: '127.0.0.2', port: portB });
+  const replies = await a.node.requestJoin({ name: '联调讨论' });
+  assert.equal(replies[0].participants, 0, '旧版敲门应答缺字段＝不支持（工具层据此拒绝进入邀请流程）');
+  await startResolvePeer(t, { port: portC, address: '127.0.0.4', replies: [{ found: false }] });
+  const result = await a.node.requestJoinResolve({ name: '联调讨论', address: '127.0.0.4', port: portC, timeoutMs: 300 });
+  assert.equal(result.participants, 0, '旧版解析应答缺字段＝不支持');
+});
+
+test('体积整形保留能力字段：probe-ack 先弃会话、join-ack 先截主题、resolve-ack 先弃名称', () => {
+  const probeAck = {
+    v: 1, type: 'probe-ack', instanceId: 'inst-b', identityName: '主机乙', collabCount: 2, port: 7321, participants: 2,
+    sessions: Array.from({ length: 64 }, (_, index) => `s${String(index).padStart(7, '0')}`),
+  };
+  const probeFit = fitProbeAckDatagram(probeAck);
+  assert.equal(probeFit.participants, 2, '能力字段不随会话段一起被弃');
+  assert.equal(Object.hasOwn(probeFit, 'sessions'), false);
+  const joinAck = {
+    v: 1, type: 'join-ack', instanceId: 'inst-b', identityName: '主机乙', knockId: 'knock-1', port: 7321,
+    collabId: 'collab-1', name: '联调讨论', topic: '题'.repeat(200), memberCount: 3,
+    originator: { instanceId: 'inst-org', identityName: '发起人' }, participants: 2,
+  };
+  const joinFit = fitJoinAckDatagram(joinAck);
+  assert.equal(joinFit.participants, 2, '主题截断不影响能力字段');
+  assert.equal(joinFit.topicTruncated, true);
+  const resolveAck = {
+    v: 1, type: 'join-resolve-ack', instanceId: 'i'.repeat(64), identityName: '甲'.repeat(64), port: 7321,
+    resolveId: 'resolve-001', found: true, collabId: 'c'.repeat(64), name: '名'.repeat(64), participants: 2,
+  };
+  const resolveFit = fitJoinResolveAck(resolveAck);
+  assert.equal(resolveFit.participants, 2, '弃名保能力字段');
+  assert.equal(Object.hasOwn(resolveFit, 'name'), false);
+  assert.ok(Buffer.byteLength(JSON.stringify(resolveFit)) <= 512);
 });

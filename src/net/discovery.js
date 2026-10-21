@@ -3,7 +3,7 @@ import { isIP } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { ANCHOR_PORT, SLOT_COUNT } from '../site.js';
 import { shortSessionId } from '../util/short-id.js';
-import { MAX_COLLAB_COUNT, MAX_DATAGRAM_BYTES, PROTOCOL_VERSION, fitJoinResolveAck, isIdentityName, isPort, newMsgId, validateJoinAck, validateJoinKnock, validateJoinResolve, validateJoinResolveAck, validateProbe, validateProbeAck } from './protocol.js';
+import { MAX_COLLAB_COUNT, MAX_DATAGRAM_BYTES, PARTICIPANTS_CAPABILITY, PROTOCOL_VERSION, fitJoinResolveAck, isIdentityName, isPort, newMsgId, supportsParticipants, validateJoinAck, validateJoinKnock, validateJoinResolve, validateJoinResolveAck, validateProbe, validateProbeAck, withParticipantsCapability } from './protocol.js';
 
 export const DISCOVERY_REPLY_MIN_INTERVAL_MS = 250;
 const MAX_THROTTLED_SOURCES = 64;
@@ -21,6 +21,10 @@ export const JOIN_KNOCK_REPLY_MIN_INTERVAL_MS = 2500;
 /* 按名解析（单播问答，会话级管理设计 §2）的缺省收答窗口：单播直达而非广播扫描，一次问答即足；
  * 窗口内少量重发覆盖单包丢失，发程落在窗口内。 */
 export const JOIN_RESOLVE_TIMEOUT_MS = 1500;
+
+/* 单播能力探测（会话级参与者设计 §7.2）的缺省收答窗口：只发一条单播、不重发——
+ * 窗口内无应答即「未知」，由调用方决定是否再试；探测不进协作队列。 */
+export const CAPABILITY_PROBE_TIMEOUT_MS = 800;
 
 /* 定向广播地址计算：按接口逐卡收发，不依赖全局广播路由（设计 §5）。
  * 取 ip | ~netmask；无广播意义的场合（/32、缺掩码、IPv6、内网接口）跳过；同网段多网卡自动去重。 */
@@ -66,6 +70,7 @@ export function createDiscovery(options) {
     announce: () => announce(state),
     requestJoin: (options) => requestJoin(state, options),
     requestJoinResolve: (options) => requestJoinResolve(state, options),
+    probeCapability: (options) => probeCapability(state, options),
     stats: () => statsOf(state),
   };
 }
@@ -93,6 +98,7 @@ function initialCounters() {
     joinResolveRepliesSkipped: 0,
     joinResolveRequestsThrottled: 0,
     joinResolveRepliesIn: 0,
+    capabilityProbesSent: 0,
     rejected: { oversize: 0, malformed: 0, invalid: 0 },
   };
 }
@@ -116,6 +122,7 @@ function discoveryStateOf({
     collectors: new Set(),
     joinCollectors: new Set(),
     resolveCollectors: new Set(),
+    capabilityCollectors: new Set(),
     /* 四张限流表（各管一路的风暴，键 = 来源「地址:端口」）：
      * probeReplyAt 只管「探测应答的风暴」——仅由收到的探测记账，收 ack 不得抑制本应发出的探测应答；
      * joinReplyAt 只管「敲门应答的风暴」——仅由收到的敲门记账；伪造敲门不放大为应答与本机会话提示；
@@ -260,7 +267,8 @@ function handleProbe(state, datagram, rinfo) {
   }
   // 探测来源也是「历史见过地址」：广播单向盲区里对方能广播过来、我们回不去——记下它，下次扫描单播补上。
   // 端口取数据报来源端口（站点数据报恒出自其监听套接字——探测报文本身不带端口字段）。
-  rememberThrottled(state, datagram, rinfo, { address: rinfo.address, port: rinfo.port });
+  // 探测不带 participants：这是「没有情报」而不是「不支持」，交 known-hosts 继承旧值。
+  rememberThrottled(state, datagram, rinfo, { address: rinfo.address, port: rinfo.port }, undefined);
   answerProbe(state, rinfo);
 }
 
@@ -302,8 +310,9 @@ function withinMinInterval(table, rinfo, minIntervalMs = DISCOVERY_REPLY_MIN_INT
 }
 
 /* 清单写入的唯一入口（防「整文件原子写」风暴）：探测与应答两路共用同一张节流表——同源 250ms 内最多落盘一次；
- * 被节流的写入同样计入 rateLimited（入站校验基线的「忽略必须留痕」）。 */
-function rememberThrottled(state, datagram, rinfo, endpoint) {
+ * 被节流的写入同样计入 rateLimited（入站校验基线的「忽略必须留痕」）。
+ * participants 由调用方按数据报语义给出：应答缺字段＝0（旧版/不支持）；探测请求＝undefined（无情报，继承旧值）。 */
+function rememberThrottled(state, datagram, rinfo, endpoint, participants) {
   if (!withinMinInterval(state.writeThrottleAt, rinfo)) {
     state.counters.rateLimited++;
     return;
@@ -316,7 +325,13 @@ function rememberThrottled(state, datagram, rinfo, endpoint) {
     /* 会话段是探测应答的加法字段：探测自身不带该字段（否则 undefined）＝清单记「未知」——
      * 探测请求与探测应答的会话真相不混同（探测来源只证明「这台机器在此」）。 */
     sessions: datagram.sessions,
+    participants,
   });
+}
+
+/* 应答类数据报的能力观测：带 2＝支持；缺字段＝旧版/不支持（响应存在即证据，区别于「没有响应」）。 */
+function participantsOfResponse(datagram) {
+  return supportsParticipants(datagram) ? PARTICIPANTS_CAPABILITY : 0;
 }
 
 function handleResponse(state, datagram, rinfo) {
@@ -335,13 +350,16 @@ function handleResponse(state, datagram, rinfo) {
   const endpoint = { address: rinfo.address, port: datagram.port ?? rinfo.port };
   /* 清单写节流（与探测路径共用同一张表）：伪造应答洪泛不放大为整文件原子写的风暴。
    * 扫描合并不受限（内存态）：同一实例多地址的合并依赖逐应答处理。 */
-  rememberThrottled(state, datagram, rinfo, endpoint);
+  rememberThrottled(state, datagram, rinfo, endpoint, participantsOfResponse(datagram));
   for (const collector of state.collectors) {
-    mergeResponse(collector, datagram, endpoint);
+    mergeResponse(collector, datagram, endpoint, state);
+  }
+  for (const collector of state.capabilityCollectors) {
+    mergeCapabilityResponse(collector, datagram, endpoint);
   }
 }
 
-function mergeResponse(collector, datagram, endpoint) {
+function mergeResponse(collector, datagram, endpoint, state) {
   const entry = collector.get(datagram.instanceId) ?? {
     instanceId: datagram.instanceId,
     identityName: datagram.identityName,
@@ -356,6 +374,7 @@ function mergeResponse(collector, datagram, endpoint) {
   entry.collabCount = datagram.collabCount;
   entry.lastSeenAt = new Date().toISOString();
   mergeSessions(entry, datagram);
+  mergeParticipants(entry, datagram, state);
   collector.set(datagram.instanceId, entry);
 }
 
@@ -369,6 +388,19 @@ function mergeSessions(entry, datagram) {
   entry.sessions = datagram.sessions
     .filter((code) => typeof code === 'string' && code !== '')
     .map((code) => shortSessionId(code));
+}
+
+/* 能力段合并（扫描结果面，会话级协作设计 §7.2）：响应带 2＝支持；缺字段＝旧版/不支持。
+ * 与 sessions 同一继承纪律：本窗口已学到的支持态、或清单里已知的支持态不被后到的缺字段应答抹掉
+ * （「不覆盖已知」）；两处都没有可继承的值，才把「响应存在但缺字段」记为不支持。
+ * 不支持不继承反向：对端升级后重新申报 2 即覆盖。 */
+function mergeParticipants(entry, datagram, state) {
+  if (supportsParticipants(datagram)) {
+    entry.participants = PARTICIPANTS_CAPABILITY;
+    return;
+  }
+  const known = entry.participants ?? state.knownHosts.participantsOf(datagram.instanceId);
+  entry.participants = known === PARTICIPANTS_CAPABILITY ? known : 0;
 }
 
 /* —— 主动加入（设计 §5.6）：成员侧敲门处理与申请人侧应答收集 —— */
@@ -412,7 +444,8 @@ function resolveJoinKnock(state, datagram, rinfo) {
   }
 }
 
-/* 命中入参移交面：申请人身份、来源端点（放行时作 ws_invite 目标）与报送标识。 */
+/* 命中入参移交面：申请人身份、来源端点（放行时作 ws_invite 目标）、报送标识与能力。
+ * 能力随敲门移交：成员侧在放行/应答前即可判断申请人是否支持会话级协作（旧版敲门缺字段＝不支持）。 */
 function knockOf(datagram, rinfo) {
   return {
     instanceId: datagram.instanceId,
@@ -421,13 +454,14 @@ function knockOf(datagram, rinfo) {
     port: rinfo.port,
     knockId: datagram.knockId,
     name: datagram.name,
+    participants: participantsOfResponse(datagram),
   };
 }
 
 /* 应答回发（按来源地址与数据报来源端口寻址——同 probe-ack 的端口口径）：应答体先过体积整形
  * （设计 §5.6 硬规则）；整形到无可截则放弃该份并计数留痕（绝不发超限数据报）。 */
 function sendJoinAck(state, knock, rinfo, reply) {
-  const datagram = fitJoinAckDatagram({
+  const datagram = fitJoinAckDatagram(withParticipantsCapability({
     v: PROTOCOL_VERSION,
     type: 'join-ack',
     instanceId: state.instanceId,
@@ -439,7 +473,7 @@ function sendJoinAck(state, knock, rinfo, reply) {
     topic: reply.topic,
     memberCount: reply.memberCount,
     originator: { instanceId: reply.originator.instanceId, identityName: reply.originator.identityName },
-  });
+  }));
   if (datagram === null) {
     state.counters.joinRepliesSkipped++;
     state.log.warn('加入应答超体积预算且不可再截，放弃该份', { collabId: String(reply.collabId) });
@@ -533,6 +567,7 @@ function mergeJoinAck(collector, datagram, rinfo) {
     originator: { instanceId: datagram.originator.instanceId, identityName: datagram.originator.identityName },
     topicTruncated: datagram.topicTruncated === true,
     nameTruncated: datagram.nameTruncated === true,
+    participants: participantsOfResponse(datagram),
     responder: { instanceId: datagram.instanceId, identityName: datagram.identityName, address: rinfo.address, port: datagram.port ?? rinfo.port },
     replies: 1,
   });
@@ -594,7 +629,7 @@ function sendJoinResolveAck(state, request, rinfo, reply) {
 }
 
 function buildJoinResolveAck(state, request, reply) {
-  const ack = {
+  const ack = withParticipantsCapability({
     v: PROTOCOL_VERSION,
     type: 'join-resolve-ack',
     instanceId: state.instanceId,
@@ -602,7 +637,7 @@ function buildJoinResolveAck(state, request, reply) {
     port: state.port,
     resolveId: request.resolveId,
     found: reply.found === true,
-  };
+  });
   if (!ack.found) {
     return ack;   // 未命中极简：不带讨论面字段（未命中却点名是自相矛盾的断言）
   }
@@ -641,6 +676,7 @@ function mergeJoinResolveAck(collector, datagram, rinfo) {
   collector.replies++;
   const reply = {
     found: datagram.found === true,
+    participants: participantsOfResponse(datagram),
     responder: { instanceId: datagram.instanceId, identityName: datagram.identityName, address: rinfo.address, port: datagram.port ?? rinfo.port },
   };
   if (reply.found) {
@@ -709,11 +745,89 @@ async function sendResolveRequests(state, resolveId, target, timeoutMs) {
   }
 }
 
+/* —— 单播能力探测（会话级参与者设计 §7.2）：复用 probe/probe-ack 数据报族 —— */
+
+/* 对一台已知主机发一次单播探测、窗口内收应答，把能力的「未知」收敛为支持 / 不支持。
+ * 不新增数据报类型：旧版对端不认识新类型会静默丢弃，「不支持」就永远观测不到；旧版对端照常应答
+ * probe，只是缺 participants——缺失本身就是「旧版」的证据（三态判定的入口在此）。
+ * 应答同时走常规入站路径（清单写入与扫描合并口径一致），本函数只负责收集与判定；
+ * 单发不重发，窗口内无应答＝未知，是否再试由调用方决定。探测不进协作队列。 */
+async function probeCapability(state, input = {}) {
+  const target = capabilityTargetOf(input);
+  const timeoutMs = capabilityTimeoutOf(input);
+  /** @type {{ target: { address: string, port: number, instanceId: string | null }, reply: Record<string, unknown> | null, wake: (() => void) | null }} */
+  const collector = { target, reply: null, wake: null };
+  state.capabilityCollectors.add(collector);
+  try {
+    sendDatagram(state, probeDatagram(state), target.port, target.address, 'capability-probe');
+    state.counters.capabilityProbesSent++;
+    await waitForCapabilityReply(collector, timeoutMs);
+  } finally {
+    state.capabilityCollectors.delete(collector);
+  }
+  return collector.reply ?? { capability: 'unknown', responder: null };
+}
+
+function waitForCapabilityReply(collector, timeoutMs) {
+  if (collector.reply !== null) {
+    return Promise.resolve();
+  }
+  // JSDoc 提示：显式 Promise<void> 让类型检查接受无参 resolve（同 close 的写法）
+  return /** @type {Promise<void>} */ (new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    collector.wake = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+  }));
+}
+
+/* 应答与探测目标的匹配：单播只送达被问的那一台，按来源地址即可归户；调用方给了实例标识则再核一遍
+ * （地址复用/同机多站点下防止把别的实例的能力记到目标头上）。端口不参与匹配——站点自报端口可能
+ * 与清单里的历史端口不同，应答字段已由常规路径并入端点。 */
+function mergeCapabilityResponse(collector, datagram, endpoint) {
+  if (collector.reply !== null || endpoint.address !== collector.target.address) {
+    return;
+  }
+  if (collector.target.instanceId !== null && datagram.instanceId !== collector.target.instanceId) {
+    return;
+  }
+  collector.reply = {
+    capability: supportsParticipants(datagram) ? 'supported' : 'unsupported',
+    responder: { instanceId: datagram.instanceId, identityName: datagram.identityName, address: endpoint.address, port: endpoint.port },
+  };
+  collector.wake?.();
+}
+
+/* 目标与窗口形态在启程前把关（同按名解析口径）：非法即抛 TypeError，不发畸形载荷、不做无谓收答等待。 */
+function capabilityTargetOf(input) {
+  if (typeof input?.address !== 'string' || isIP(input.address) === 0) {
+    throw new TypeError(`probeCapability 需要 IP 字面量目标地址（不做域名解析），实际：${JSON.stringify(input?.address)}`);
+  }
+  if (!isPort(input.port)) {
+    throw new TypeError(`probeCapability 需要 1–65535 的整数目标端口，实际：${JSON.stringify(input.port)}`);
+  }
+  const instanceId = input.instanceId;
+  if (instanceId !== undefined && (typeof instanceId !== 'string' || instanceId === '')) {
+    throw new TypeError(`probeCapability 的 instanceId 须为非空字符串，实际：${JSON.stringify(instanceId)}`);
+  }
+  return { address: input.address, port: input.port, instanceId: instanceId ?? null };
+}
+
+function capabilityTimeoutOf(input) {
+  const timeoutMs = input.timeoutMs === undefined ? CAPABILITY_PROBE_TIMEOUT_MS : input.timeoutMs;
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60000) {
+    throw new TypeError(`probeCapability 需要合法的 timeoutMs（1–60000 毫秒），实际：${JSON.stringify(input.timeoutMs)}`);
+  }
+  return timeoutMs;
+}
+
 /* 扫描应答体（会话级可见性，设计 §1）：恒携 `sessions`（本机活跃终端短码列表——零会话如实报空数组，
- * 「报了零」与「没报」对接收侧是两回事）；其余字段与旧实现逐字一致（旧对端按加法字段忽略）。
- * 体积整形交 answerProbe（超限弃该字段保整包）。 */
+ * 「报了零」与「没报」对接收侧是两回事）与 `participants:2`（会话级参与者能力，设计 §7.2）；
+ * 其余字段与旧实现逐字一致（旧对端按加法字段忽略）。
+ * 体积整形交 answerProbe（超限先弃会话段，能力字段保留）。 */
 function buildProbeAck(state) {
-  return {
+  return withParticipantsCapability({
     v: PROTOCOL_VERSION,
     type: 'probe-ack',
     instanceId: state.instanceId,
@@ -721,7 +835,7 @@ function buildProbeAck(state) {
     collabCount: currentCollabCount(state),
     port: state.port,
     sessions: currentSessions(state),
-  };
+  });
 }
 
 /* 本机活跃终端短码（注册桥经注入的取值器现取——发现层不 import 注册表）。
@@ -816,14 +930,14 @@ async function requestJoin(state, input = {}) {
 }
 
 async function sendKnocks(state, name, knockId) {
-  const knock = Buffer.from(JSON.stringify({
+  const knock = Buffer.from(JSON.stringify(withParticipantsCapability({
     v: PROTOCOL_VERSION,
     type: 'join-knock',
     instanceId: state.instanceId,
     identityName: state.identityName,
     knockId,
     name,
-  }));
+  })));
   const rounds = state.joinKnockRetryCount + 1;
   for (let round = 0; round < rounds; round++) {
     for (const target of outboundTargets(state)) {
