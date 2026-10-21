@@ -1,5 +1,5 @@
 import { isIP } from 'node:net';
-import { COLLAB_MODES, DEFAULT_COLLAB_MODE, ID_PATTERN, MAX_COLLAB_MEMBERS, MAX_MESSAGE_TEXT_CHARS, MAX_REASON_CHARS, MAX_TOPIC_CHARS, POST_KINDS, PROTOCOL_VERSION, isCollabMode, isIdentityName, isPort, isPresentationText, newMsgId } from '../net/protocol.js';
+import { COLLAB_CAPABILITY, COLLAB_MODES, DEFAULT_COLLAB_MODE, ID_PATTERN, MAX_COLLAB_MEMBERS, MAX_MESSAGE_TEXT_CHARS, MAX_REASON_CHARS, MAX_TOPIC_CHARS, POST_KINDS, PROTOCOL_VERSION, isCollabMode, isIdentityName, isPort, isPresentationText, newMsgId } from '../net/protocol.js';
 import { MAX_FORUM_MEMBERS, MAX_LOCAL_COLLABS, canTransition, isArchived, newCollabId } from './model.js';
 import { createPostsStore, displayOrderOf, newPostId } from './posts.js';
 import { createMembersStore } from './members.js';
@@ -11,6 +11,7 @@ import { consumeInviteChallenge, consumeInviteWaiver, issueInviteChallenge } fro
 import { ledgerDigest, removeLedgerFile } from './store.js';
 import { currentManagerIdOf, emitOwnMemberEvent, foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, localTopicOf, memberStateFor, persistLedger, persistMember, persistSnapshot, relayDepartedOf, relayPeerOf, rememberKnownHost, selfJoinedOf } from './local.js';
 import { matchConflictCollabs } from './gate.js';
+import { matchSessionByToken } from '../util/short-id.js';
 
 /* 对外操作与协作态变更实现（服务公共 API 的落点）：请求来自本机会话（工具面）——
  * 参数不符合即返回 { ok:false, message }（由工具层呈现为 isError）；发送一律经注入的
@@ -547,7 +548,7 @@ export function withdrawInvite(state, { collabId, target }) {
   return withdrawOne(state, local, targetId);
 }
 
-export async function sendMessage(state, { collabId, text, type, to }) {
+export async function sendMessage(state, { collabId, text, type, to, toSessionId, sessionId }) {
   const local = state.collabs.get(collabId);
   if (local === undefined) {
     return { ok: false, message: '本机没有该协作（先 ws_list_collabs）' };
@@ -556,13 +557,16 @@ export async function sendMessage(state, { collabId, text, type, to }) {
     return { ok: false, message: '协作对外写已暂停（在途抢接或未能对表）——收敛后恢复' };
   }
   if (localModeOf(local) === 'forum') {
-    return await sendForumPost(state, local, { text, type, to });
+    if (typeof toSessionId === 'string' && toSessionId !== '') {
+      return { ok: false, message: '讨论不设定向消息（toSessionId 仅协作模式可用）' };
+    }
+    return await sendForumPost(state, local, { text, type, to, sessionId });
   }
-  return sendManagedMessage(state, local, { text, type, to });
+  return sendManagedMessage(state, local, { text, type, to, toSessionId, fromSessionId: sessionId });
 }
 
 /* 协作模式的发送路径（星型路由与状态门控；讨论模式的发帖路径见 sendForumPost）。 */
-function sendManagedMessage(state, local, { text, type, to }) {
+async function sendManagedMessage(state, local, { text, type, to, toSessionId, fromSessionId }) {
   const messageType = type ?? 'reply';
   const stateName = localStateOf(local);
   if (stateName === 'frozen') {
@@ -575,7 +579,11 @@ function sendManagedMessage(state, local, { text, type, to }) {
   if (textRejection !== null) {
     return { ok: false, message: textRejection };
   }
-  const routed = recipientsOf(state, local, to);
+  const sender = resolveSenderSeat(local, fromSessionId);
+  if (sender.ok !== true) {
+    return { ok: false, message: sender.reason };
+  }
+  const routed = recipientsOf(state, local, to, toSessionId, sender.sessionId);
   if (routed.error !== undefined) {
     return { ok: false, message: routed.error };
   }
@@ -584,7 +592,7 @@ function sendManagedMessage(state, local, { text, type, to }) {
       ledger.topic = text;
     });
   }
-  return deliverMessage(state, local, messageType, text, routed.targets);
+  return deliverMessage(state, local, messageType, text, routed.targets, sender.sessionId);
 }
 
 /* 消息文本的服务层预校验（与协议校验器同一权威）：本机入口先行拒绝——绝不让「发送会被拒」
@@ -604,31 +612,35 @@ function textRejectionOf(type, text) {
   return null;
 }
 
-/* 逐目标入队与结果归并（部分成功按成功返回；全部失败给出逐目标原因）。 */
-function deliverMessage(state, local, type, text, targets) {
+/* 按机器分组的发送与结果归并（部分成功按成功返回；全部失败给出逐机器原因）。
+ * 本机目标走旁路注入（不经 dispatch.send），远端每机器一帧、帧携 toSessions（D11）。 */
+async function deliverMessage(state, local, type, text, targets, fromSessionId) {
   const payload = payloadOf(type, text);
-  const results = targets.map((targetId) => sendToTarget(state, local, type, payload, targetId));
-  const delivered = results.filter((entry) => entry.ok === true);
-  if (delivered.length === 0) {
-    return { ok: false, message: `消息未入队（${results.map((entry) => entry.reason ?? '未知原因').join('；')}）` };
+  const sent = await sendToSeats(state, { collabId: local.collabId, fromSessionId, type, payload, targets });
+  if (sent.ok !== true) {
+    return { ok: false, message: `消息未入队（${failuresTextOf(sent)}）` };
   }
+  const delivered = sent.results.filter((entry) => entry.ok === true);
   return {
     ok: true,
-    msgId: delivered[0].msgId,
+    msgId: delivered.find((entry) => typeof entry.msgId === 'string')?.msgId,
     tier: 'queued',
-    to: results.map((entry) => entry.instanceId),
-    results,
+    to: delivered.map((entry) => entry.instanceId),
+    results: delivered.map((entry) => ({
+      instanceId: entry.instanceId,
+      sessionIds: entry.sessionIds,
+      msgId: entry.msgId,
+      local: entry.local === true,
+      results: entry.results,
+    })),
     note: '已排队（对方离线时后台重试、对方重开后送达；档位可用 ws_delivery_status 查询）',
   };
 }
 
-function sendToTarget(state, local, type, payload, targetId) {
-  const endpoint = local.endpoints.get(targetId);
-  if (endpoint === undefined) {
-    return { instanceId: targetId, ok: false, reason: '端点未知（先扫描或等对方联系）' };
-  }
-  const sent = sendTo(state, local.collabId, targetId, endpoint, type, payload);
-  return { instanceId: targetId, ok: sent.ok === true, msgId: sent.msgId, reason: sent.reason };
+/* 失败原因归并（逐机器）：全部失败时给调用方可读的拒绝原因。 */
+function failuresTextOf(sent) {
+  const reasons = sent.results.filter((entry) => entry.ok !== true).map((entry) => entry.reason ?? '未知原因');
+  return reasons.length === 0 ? sent.reason ?? '未知原因' : reasons.join('；');
 }
 
 /* 讨论模式发帖（设计 §5.2）：to 一律拒绝（讨论不设定向）；kind 按徽标词表、text 沿消息文本
@@ -636,7 +648,7 @@ function sendToTarget(state, local, type, payload, targetId) {
  * ts 分配即定）再按路由投递——帖的事务点在本机列表，投递失败不回滚（收敛由拉取兜底）。
  * 帖不进会话注入以外的任何元状态面：topic 帖亦按普通帖处理（主题创建时定死）。
  * 路由 = 中继分发（默认）/ 直接扇出（中继本机）/ 降级直投（中继不可达或未知，见 routeForumPost）。 */
-async function sendForumPost(state, local, { text, type, to }) {
+async function sendForumPost(state, local, { text, type, to, sessionId }) {
   const routedTo = typeof to === 'string' ? to.trim() : to ?? '';
   if (routedTo !== '') {
     return { ok: false, message: '讨论不设定向消息（to 参数一律拒绝）——发言即广播，移除 to 后重试' };
@@ -657,7 +669,7 @@ async function sendForumPost(state, local, { text, type, to }) {
     return { ok: false, message: textRejection };
   }
   const post = allocateOwnPost(state, local, kind, text);
-  const routed = await routeForumPost(state, local, post);
+  const routed = await routeForumPost(state, local, post, sessionId);
   state.counters.postsSent++;
   return {
     ok: true,
@@ -691,30 +703,30 @@ export function selfIsRelay(state, local) {
  * 档位口径（设计 §5.2「面向最终成员」）：作者→中继段走既有直投回执（「已到对方驿站」=
  * 投稿达中继；「已投进对方会话」= 中继侧会话收到），成员级送达结果留在中继侧投递记录里——
  * 作者侧不把「达中继」当成「达成员」，未达者如实呈现「待对表收敛」；到会话 ≠ 已读。 */
-async function routeForumPost(state, local, post) {
+async function routeForumPost(state, local, post, fromSessionId) {
   const relay = relayPeerOf(local, state.self);
   if (relay === null) {
-    return degradedRoute(state, local, post, '中继未知（发起人标识尚未学到）——先直投，待邀请/对表补学后自动回中继');
+    return degradedRoute(state, local, post, '中继未知（发起人标识尚未学到）——先直投，待邀请/对表补学后自动回中继', fromSessionId);
   }
   if (relay.instanceId === state.self.instanceId) {
     return {
       route: 'fanout',
-      results: fanOutPost(state, local, post),
+      results: fanOutPost(state, local, post, fromSessionId),
       note: '已直接扇出（本机即中继）——在线尽力 + 短重试，不落持久队列；未达者由对方周期对表拉取收敛',
     };
   }
   const fallback = relayFallbackReason(state, local, relay);
   if (fallback !== null) {
-    return degradedRoute(state, local, post, fallback);
+    return degradedRoute(state, local, post, fallback, fromSessionId);
   }
   const endpoint = endpointFor(state, local, relay.instanceId);
   const verdict = await relayVerdict(state, endpoint);
   if (verdict.ok !== true) {
     state.relayDown.add(local.collabId);
     state.counters.relayDegrades++;
-    return degradedRoute(state, local, post, `${verdict.reason}——已当场降级直投`);
+    return degradedRoute(state, local, post, `${verdict.reason}——已当场降级直投`, fromSessionId);
   }
-  const submitted = submitToRelay(state, local, relay, endpoint, post);
+  const submitted = submitToRelay(state, local, relay, endpoint, post, fromSessionId);
   if (submitted.ok === true) {
     state.counters.relayPostsSent++;
     return {
@@ -723,7 +735,7 @@ async function routeForumPost(state, local, post) {
       note: `已发中继（发起人 ${relay.identityName}）——成员级投递结果由中继聚合捎回（尽力而为）；离线成员待对表收敛；「已投进对方会话」≠ 已读`,
     };
   }
-  return degradedRoute(state, local, post, `投稿未受理（${submitted.reason}）`);
+  return degradedRoute(state, local, post, `投稿未受理（${submitted.reason}）`, fromSessionId);
 }
 
 /* 不走中继的常态判据（返回原因文案；null = 走中继路径）：发起人已退出（永久放弃中继职责，
@@ -767,7 +779,7 @@ async function probeRelay(state, endpoint) {
 
 /* 投稿提交（成员 → 中继）：payload.relay 标记即「投稿转发」的识别形态（中继据此扇出转达；
  * 接收端既有（作者, postId）去重与显示不受影响——帖形态四字段原样）。 */
-function submitToRelay(state, local, relay, endpoint, post) {
+function submitToRelay(state, local, relay, endpoint, post, fromSessionId) {
   if (typeof state.sendDirect !== 'function') {
     state.counters.postFanoutSkipped++;
     return { instanceId: relay.instanceId, ok: false, reason: '直投面不可用（发送注入缺失）——待对表收敛' };
@@ -778,17 +790,18 @@ function submitToRelay(state, local, relay, endpoint, post) {
     type: 'post',
     payload: { ...postPayloadOf(post), relay: true },
     createdAt: post.ts,   // 帧 ts 随帖携带（接收端显示序与作者内序的依据）
+    fromSessionId,
   });
   return { instanceId: relay.instanceId, ok: sent.ok === true, msgId: sent.msgId, reason: sent.reason };
 }
 
 /* 降级直投一帖（设计 §5.2「当场降级=对全成员直投」，复用既有直投通道）：帖已落本机列表，
  * 直投对端点已知成员逐份发出；未达者由对表收敛。两态可观测：降级帖计数 + 结果逐目标标注。 */
-function degradedRoute(state, local, post, reason) {
+function degradedRoute(state, local, post, reason, fromSessionId) {
   state.counters.relayDegradedPosts++;
   return {
     route: 'degraded',
-    results: fanOutPost(state, local, post),
+    results: fanOutPost(state, local, post, fromSessionId),
     note: `中继未用（${reason}）——已直投全体成员（在线尽力 + 短重试）；未达者由对方周期对表拉取收敛`,
   };
 }
@@ -807,6 +820,9 @@ export function relayRedistribute(state, local, frame) {
     return 0;
   }
   const origin = { instanceId: frame.from.instanceId, identityName: frame.from.identityName, port: frame.from.port };
+  if (typeof frame.from.sessionId === 'string') {
+    origin.sessionId = frame.from.sessionId;
+  }
   let relayed = 0;
   for (const entry of forumRecipientsOf(state, local)) {
     if (entry.instanceId === frame.from.instanceId) {
@@ -906,10 +922,10 @@ function allocateOwnPost(state, local, kind, text) {
 
 /* 直投扇出：对折叠成员表逐成员直发一份（除本机）——不走持久队列、无逐帖排队；
  * 端点未知者如实记「待对表收敛」，由对方周期拉取兜底。 */
-function fanOutPost(state, local, post) {
+function fanOutPost(state, local, post, fromSessionId) {
   const results = [];
   for (const entry of forumRecipientsOf(state, local)) {
-    results.push(deliverPostTo(state, local, entry.instanceId, post));
+    results.push(deliverPostTo(state, local, entry.instanceId, post, fromSessionId));
   }
   return results;
 }
@@ -920,7 +936,7 @@ function forumRecipientsOf(state, local) {
   return foldedMembersOf(local).filter((entry) => entry.instanceId !== state.self.instanceId);
 }
 
-function deliverPostTo(state, local, instanceId, post) {
+function deliverPostTo(state, local, instanceId, post, fromSessionId) {
   if (typeof state.sendDirect !== 'function') {
     state.counters.postFanoutSkipped++;
     return { instanceId, ok: false, reason: '直投面不可用（发送注入缺失）——待对表收敛' };
@@ -935,6 +951,7 @@ function deliverPostTo(state, local, instanceId, post) {
     type: 'post',
     payload: { post: { postId: post.postId, seq: post.seq, kind: post.kind, text: post.text } },
     createdAt: post.ts,   // 帧 ts 随帖携带（作者侧强制单调的落盘 ts，接收端显示序与作者内序的依据）
+    fromSessionId,
   });
   return { instanceId, ok: sent.ok === true, msgId: sent.msgId, reason: sent.reason };
 }
@@ -1181,6 +1198,15 @@ export function sendTo(state, collabId, instanceId, endpoint, type, payload, opt
   if (options.from !== undefined) {
     message.from = options.from;
   }
+  /* 发送席位：显式优先；未穿参的治理发送面按本机站长/最早席位兜底（0.2.0 帧必须携 from.sessionId）。 */
+  const local = state.collabs?.get(collabId);
+  const fromSessionId = options.fromSessionId ?? (local === undefined ? undefined : defaultSenderSeat(local, localSeatsOf(local)).sessionId);
+  if (fromSessionId !== undefined) {
+    message.fromSessionId = fromSessionId;
+  }
+  if (options.toSessions !== undefined) {
+    message.toSessions = options.toSessions;
+  }
   const result = state.send(message);
   if (result.ok === true) {
     state.counters.messagesSent++;
@@ -1189,6 +1215,156 @@ export function sendTo(state, collabId, instanceId, endpoint, type, payload, opt
   state.counters.sendFailures++;
   state.log.warn('协作消息入队失败', { collabId, type, to: instanceId, reason: result.reason });
   return result;
+}
+
+/* 席位定向发送（M3 → M4/M5/M6 契约）：targets = [{instanceId, sessionId}]。
+ * 按机器分组：本机目标逐席走旁路注入（不调用 dispatch.send），远端每机器一帧并携 toSessions。
+ * 返回逐机器结果（msgId 逐机器；本机结果带 local:true）；任一机器受理即 ok。
+ * 发送会话必须是本机活跃席位（member 且未标记 unverified）——非成员/未收敛一律拒绝。 */
+export async function sendToSeats(state, { collabId, fromSessionId, type, payload, targets }) {
+  const local = state.collabs?.get(collabId);
+  if (local === undefined) {
+    return { ok: false, reason: '本机没有该协作（未知 collabId）', results: [] };
+  }
+  /* 有席位表（M2 运行时）时必须显式给 fromSessionId；无席位表的历史调用链按兼容席位兜底，
+   * 避免把「会话级运行时尚未接线」误判成发送会话非法。 */
+  const sender = resolveSenderSeat(local, fromSessionId, { requireExplicit: localSeatsOf(local).length > 0 });
+  if (sender.ok !== true) {
+    return { ok: false, reason: sender.reason, results: [] };
+  }
+  const groups = groupTargetsOf(targets);
+  if (groups === null) {
+    return { ok: false, reason: `targets 非法（须为 1–${MAX_COLLAB_MEMBERS} 项 {instanceId, sessionId?} 的目标列表）`, results: [] };
+  }
+  const results = [];
+  for (const [instanceId, sessionIds] of groups) {
+    if (instanceId === state.self.instanceId) {
+      results.push(await injectLocalTargets(state, local, sender.sessionId, { type, payload, instanceId, sessionIds }));
+      continue;
+    }
+    const endpoint = endpointFor(state, local, instanceId);
+    if (endpoint === undefined) {
+      results.push({ instanceId, sessionIds, ok: false, reason: '端点未知（先扫描或等对方联系）' });
+      continue;
+    }
+    const sent = sendTo(state, collabId, instanceId, endpoint, type, payload, {
+      fromSessionId: sender.sessionId,
+      ...(sessionIds.length > 0 ? { toSessions: sessionIds } : {}),
+    });
+    results.push({ instanceId, sessionIds, ok: sent.ok === true, msgId: sent.msgId, reason: sent.reason });
+  }
+  const ok = results.some((entry) => entry.ok === true);
+  return { ok, fromSessionId: sender.sessionId, results, ...(ok ? {} : { reason: failuresTextOf({ results }) }) };
+}
+
+/* 治理帧发送（同一分组/旁路语义，供 M5 的站长变更、快照、握手等使用）：全部目标同属机器级。 */
+export async function sendGovernance(state, input) {
+  return sendToSeats(state, input);
+}
+
+/* 机器级投递状态（按 msgId）：委托发送调度器的队列行；未接线返回 null。 */
+export function deliveryStatusOf(state, msgId) {
+  if (typeof state.deliveryStatusOf === 'function') {
+    return state.deliveryStatusOf(msgId);
+  }
+  if (typeof state.dispatch?.deliveryStatusOf === 'function') {
+    return state.dispatch.deliveryStatusOf(msgId);
+  }
+  return null;
+}
+
+/* 本机席位投递明细：委托接收管线的 fanout 事实（M2 接线注入）；未接线返回 unknown。 */
+export function localSeatDeliveryOf(state, msgId, sessionId) {
+  if (typeof state.localSeatDeliveryOf === 'function') {
+    return state.localSeatDeliveryOf(msgId, sessionId);
+  }
+  return { collabId: null, msgId, sessionId, status: 'unknown', complete: false };
+}
+
+/* 目标分组：instanceId → sessionId 列表（去重保持顺序）；同机器多目标不拆帧。
+ * 条目的 sessionId 缺省 = 该机器级目标（帧不带 toSessions，由接收核按活跃席位扇出）。 */
+function groupTargetsOf(targets) {
+  if (!Array.isArray(targets) || targets.length < 1 || targets.length > MAX_COLLAB_MEMBERS) {
+    return null;
+  }
+  const groups = new Map();
+  for (const target of targets) {
+    if (!isTargetShape(target)) {
+      return null;
+    }
+    const sessions = groups.get(target.instanceId) ?? [];
+    if (typeof target.sessionId === 'string' && !sessions.includes(target.sessionId)) {
+      sessions.push(target.sessionId);
+    }
+    groups.set(target.instanceId, sessions);
+  }
+  return groups;
+}
+
+function isTargetShape(target) {
+  if (target === null || typeof target !== 'object') {
+    return false;
+  }
+  if (typeof target.instanceId !== 'string' || !ID_PATTERN.test(target.instanceId)) {
+    return false;
+  }
+  return target.sessionId === undefined || (typeof target.sessionId === 'string' && ID_PATTERN.test(target.sessionId));
+}
+
+/* 本机旁路（设计 §1.2/§5.2）：逐席注入，不经过 dispatch.send（跨机发送拒绝本机目标）。
+ * 注入面由 M2 运行时提供（injectLocalSeat）；未接线时如实失败并计数，不退化成网络投递。 */
+async function injectLocalTargets(state, local, fromSessionId, { type, payload, instanceId, sessionIds }) {
+  const inject = localInjectorOf(state, local, type);
+  if (inject === null) {
+    return { instanceId, sessionIds, ok: false, reason: '本机旁路注入面未接线（M2 injectLocalSeat 缺失）', local: true };
+  }
+  const sessions = sessionIds.length > 0 ? sessionIds : localActiveSeatIds(local);
+  const frame = localFrameOf(state, local, fromSessionId, { type, payload });
+  const results = [];
+  for (const sessionId of sessions) {
+    results.push(await injectOneSeat(inject, local.collabId, sessionId, fromSessionId, frame));
+  }
+  const ok = results.some((entry) => entry.ok === true && entry.skipped !== 'self');
+  return { instanceId, sessionIds: sessions, ok, local: true, msgId: frame.msgId, results };
+}
+
+function localInjectorOf(state, local, type) {
+  if (typeof state.injectLocalSeat === 'function') {
+    return state.injectLocalSeat;
+  }
+  state.counters.sendFailures++;
+  state.log.warn('本机旁路注入面未接线（injectLocalSeat 缺失）', { collabId: local.collabId, type });
+  return null;
+}
+
+function localFrameOf(state, local, fromSessionId, { type, payload }) {
+  return {
+    v: PROTOCOL_VERSION,
+    cap: COLLAB_CAPABILITY,
+    msgId: newMsgId(),
+    type,
+    collabId: local.collabId,
+    from: { instanceId: state.self.instanceId, identityName: state.self.identityName, port: state.self.port, sessionId: fromSessionId },
+    ts: new Date().toISOString(),
+    payload,
+  };
+}
+
+async function injectOneSeat(inject, collabId, sessionId, fromSessionId, frame) {
+  if (sessionId === fromSessionId) {
+    return { sessionId, ok: true, skipped: 'self' };
+  }
+  try {
+    const result = await inject(collabId, sessionId, frame);
+    return { sessionId, ok: result?.ok === true, delivered: result?.delivered === true, staged: result?.staged === true, reason: result?.reason };
+  } catch (error) {
+    return { sessionId, ok: false, reason: `本机注入异常：${error?.message ?? '未知原因'}` };
+  }
+}
+
+/* 本机活跃席位（旁路缺省目标）：M2 的 local.seats 是席位运行态权威；无席位表时退回单个兼容席位。 */
+function localActiveSeatIds(local) {
+  return localSeatsOf(local).filter((seat) => seat.state === 'member').map((seat) => seat.sessionId);
 }
 
 /* 治理寻址（跨协作回退）：协作内端点表优先；未学到时回退站点级已知主机清单（含其他协作与
@@ -1209,24 +1385,40 @@ export function endpointFor(state, local, instanceId) {
 /* 发给协作名册中全部已知端点的参与者（除本机与被排除者）：治理广播（抢接 / 裁定 / 握手 /
  * 席位变更通告）的统一出口；端点未知者跳过——可见性由转达与对等回执机制兜底（设计 §9 步骤 1/5）。 */
 export function sendToRoster(state, local, type, payload, options = {}) {
-  const exclude = options.exclude ?? new Set();
+  const sender = resolveSenderSeat(local, options.fromSessionId);
+  const fromSessionId = sender.ok === true ? sender.sessionId : undefined;
   let sent = 0;
-  for (const entry of localRosterOf(local)) {
-    const instanceId = entry.instanceId;
-    if (instanceId === state.self.instanceId || exclude.has(instanceId)) {
-      continue;
-    }
+  for (const [instanceId, sessionIds] of rosterGroupsOf(state, local, options.exclude ?? new Set())) {
     const endpoint = endpointFor(state, local, instanceId);
     if (endpoint === undefined) {
       state.counters.rosterSkipped++;   // 治理触达不可及的观测面（跳过不静默）
       continue;
     }
-    const result = sendTo(state, local.collabId, instanceId, endpoint, type, payload);
+    const result = sendTo(state, local.collabId, instanceId, endpoint, type, payload, {
+      fromSessionId,
+      ...(sessionIds.length > 0 ? { toSessions: sessionIds } : {}),
+    });
     if (result.ok === true) {
       sent++;
     }
   }
   return sent;
+}
+
+/* 名册按机器分组（排除本机与被排除者）：同机多席只发一帧并携 toSessions。 */
+function rosterGroupsOf(state, local, exclude) {
+  const groups = new Map();
+  for (const entry of localRosterOf(local)) {
+    if (entry.instanceId === state.self.instanceId || exclude.has(entry.instanceId)) {
+      continue;
+    }
+    const sessions = groups.get(entry.instanceId) ?? [];
+    if (typeof entry.sessionId === 'string' && !sessions.includes(entry.sessionId)) {
+      sessions.push(entry.sessionId);
+    }
+    groups.set(entry.instanceId, sessions);
+  }
+  return groups;
 }
 
 /* —— 讨论的成员事件广播与 join 未收敛重播 —— */
@@ -1341,8 +1533,12 @@ export function relayGovernance(state, frame, targets) {
   }
   rememberRelayedOrigin(state, origin);
   /* 转达原样携带原发身份（设计 §9）：帧的 from 是候选人 / 站长的权威身份——改写为转达者会让
-   * 接收方把转达者当作新站长（身份归因错位）；只取协议定义的三字段，不夹带来源帧其它字段。 */
+   * 接收方把转达者当作新站长（身份归因错位）；只取协议定义的身份字段（含发送会话），
+   * 不夹带来源帧其它字段——否则经转达的治理帧无法按来源席位校验。 */
   const originFrom = { instanceId: frame.from.instanceId, identityName: frame.from.identityName, port: frame.from.port };
+  if (typeof frame.from.sessionId === 'string') {
+    originFrom.sessionId = frame.from.sessionId;
+  }
   let relayed = 0;
   for (const [instanceId, target] of targets) {
     if (instanceId === state.self.instanceId || instanceId === frame.from.instanceId) {
@@ -1650,22 +1846,211 @@ export function notifyLocal(state, local, text) {
   }
 }
 
-/* 星型路由（设计 §10）：成员只发给站长（省略 to 或显式 = 站长）；站长发给任一人、
- * 省略 to = 全体已建立成员（不含本机）。 */
-function recipientsOf(state, local, to) {
-  const managerId = local.member.manager.instanceId;
+/* 星型路由（设计 §5.2）：成员只发给站长所在机器（省略 to 或显式 = 站长机器）；
+ * 站长省略 to = 全体其他活跃席位（同机多席也在内，本机走旁路），显式 to = 该机器上的席位。
+ * toSessionId（短码/完整标识，精确匹配）必须与 to 同时给出（D7）；歧义/无匹配一律拒绝。 */
+function recipientsOf(state, local, to, toSessionId, fromSessionId) {
+  const route = routingParamsOf(to, toSessionId);
+  if (route.error !== undefined) {
+    return route;
+  }
+  const manager = managerTargetOf(state, local);
+  if (manager === null) {
+    return { error: '站长席位未知（等待对表）' };
+  }
+  if (local.role !== 'manager') {
+    return memberTargetsOf(state, local, route, manager);
+  }
+  if (route.explicit !== null) {
+    return resolveTargetOnMachine(state, local, route.explicit, route.directed, null);
+  }
+  const targets = otherActiveSeatsOf(state, local, fromSessionId);
+  return targets.length === 0 ? { error: '协作内没有其他活跃席位' } : { targets };
+}
+
+/* 定向参数形态（D7）：toSessionId 必须与 to 同时给出；两者都可缺省。 */
+function routingParamsOf(to, toSessionId) {
   const explicit = typeof to === 'string' && to.trim() !== '' ? to.trim() : null;
-  if (local.role === 'member') {
-    if (explicit !== null && explicit !== managerId) {
-      return { error: '成员只能发给站长（星型路由）' };
+  const directed = typeof toSessionId === 'string' && toSessionId.trim() !== '' ? toSessionId.trim() : null;
+  if (directed !== null && explicit === null) {
+    return { error: 'toSessionId 必须与 to 同时给出（先指定目标机器，再指定会话）' };
+  }
+  if (explicit !== null && !ID_PATTERN.test(explicit)) {
+    return { error: 'to 非法（1–64 位字母数字与连字符的实例标识）' };
+  }
+  return { explicit, directed };
+}
+
+/* 成员的发件目标：只能到站长所在机器；给了会话参数时在该机器内精确匹配。 */
+function memberTargetsOf(state, local, route, manager) {
+  if (route.explicit !== null && route.explicit !== manager.instanceId) {
+    return { error: '成员只能发给站长所在机器（星型路由）' };
+  }
+  return resolveTargetOnMachine(state, local, manager.instanceId, route.directed, manager);
+}
+
+/* 机器内定向：未给会话参数 = 该机器全部活跃席位（接收核按 toSessions 扇出）；
+ * 给了会话参数 = 精确匹配一个席位（短码歧义 / 无匹配拒绝）。 */
+function resolveTargetOnMachine(state, local, instanceId, directed, preferred) {
+  const candidates = activeSeatsOn(state, local, instanceId);
+  if (directed === null) {
+    if (preferred !== null) {
+      return { targets: [preferred] };
     }
-    return { targets: [managerId] };
+    return candidates.length === 0
+      ? { error: '目标不在协作名单中（或不在活跃席位内）' }
+      : { targets: candidates };
   }
+  const matched = matchSessionByToken(candidates, directed);
+  if (matched === null) {
+    return { error: '会话短码无匹配或存在歧义（改用完整会话标识，或不指定会话）' };
+  }
+  return { targets: [{ instanceId, sessionId: matched }] };
+}
+
+/* 某机器上的活跃席位（名单行 ∪ 本机席位表；同机多会话各自成席）。 */
+function activeSeatsOn(state, local, instanceId) {
+  const targets = [];
+  const seen = new Set();
+  for (const target of allActiveSeatTargets(state, local)) {
+    if (target.instanceId !== instanceId) {
+      continue;
+    }
+    const key = target.sessionId ?? '';
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    targets.push(target);
+  }
+  return targets;
+}
+
+/* 站长席位目标：本机席位表优先（运行态权威），其次名单 manager 行，最后兼容成员记录。 */
+function managerTargetOf(state, local) {
+  const managerSeat = localSeatsOf(local).find((seat) => seat.role === 'manager' && seat.state === 'member');
+  if (managerSeat !== undefined) {
+    return { instanceId: state.self.instanceId, sessionId: managerSeat.sessionId };
+  }
+  const roster = localRosterOf(local);
+  const managerRow = roster.find((row) => row?.role === 'manager' && isMessagingState(row.state));
+  if (managerRow !== undefined) {
+    return { instanceId: managerRow.instanceId, ...(typeof managerRow.sessionId === 'string' ? { sessionId: managerRow.sessionId } : {}) };
+  }
+  const legacy = local.member?.manager;
+  if (legacy !== undefined && typeof legacy.instanceId === 'string') {
+    return { instanceId: legacy.instanceId, ...(typeof legacy.sessionId === 'string' ? { sessionId: legacy.sessionId } : {}) };
+  }
+  return null;
+}
+
+/* 除发送会话自身外的全部活跃席位（同机其他会话也在内）。 */
+function otherActiveSeatsOf(state, local, fromSessionId) {
+  return allActiveSeatTargets(state, local).filter((target) => {
+    if (target.instanceId !== state.self.instanceId) {
+      return true;
+    }
+    return typeof target.sessionId === 'string' && target.sessionId !== fromSessionId;
+  });
+}
+
+/* 活跃席位目标全集：名单行（active-only）∪ 本机席位表（成员态）。 */
+function allActiveSeatTargets(state, local) {
+  const targets = [];
+  const seen = new Set();
+  const add = (target) => {
+    if (typeof target?.instanceId !== 'string') {
+      return;
+    }
+    const key = `${target.instanceId}\u0000${target.sessionId ?? ''}`;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    targets.push(target);
+  };
+  for (const row of localRosterOf(local)) {
+    if (!isMessagingState(row?.state)) {
+      continue;
+    }
+    add({ instanceId: row.instanceId, ...(typeof row.sessionId === 'string' ? { sessionId: row.sessionId } : {}) });
+  }
+  for (const seat of localSeatsOf(local)) {
+    if (seat.state !== 'member') {
+      continue;
+    }
+    add({ instanceId: state.self.instanceId, sessionId: seat.sessionId });
+  }
+  return targets;
+}
+
+function isMessagingState(stateName) {
+  return stateName === undefined || MESSAGING_MEMBER_STATES.includes(stateName);
+}
+
+/* 本机席位表（M2 运行态）：无席位表返回空——调用方按兼容成员记录处理。 */
+function localSeatsOf(local) {
+  return local?.seats instanceof Map ? [...local.seats.values()] : [];
+}
+
+function compareSeatJoinSeq(left, right) {
+  const leftSeq = Number.isInteger(left.joinSeq) ? left.joinSeq : Number.MAX_SAFE_INTEGER;
+  const rightSeq = Number.isInteger(right.joinSeq) ? right.joinSeq : Number.MAX_SAFE_INTEGER;
+  return leftSeq - rightSeq;
+}
+
+/* 发送席位解析：显式 fromSessionId 必须是本机活跃成员席位（unverified/joining 不得发）；
+ * 缺省时取本机站长席位、否则最早加入的活动席位（兼容未穿参的治理发送面）。
+ * 无席位表且无显式会话＝旧单席模式（回退成员记录，不阻断既有调用链）。 */
+function resolveSenderSeat(local, fromSessionId, { requireExplicit = false } = {}) {
+  const seats = localSeatsOf(local);
+  const explicit = typeof fromSessionId === 'string' && fromSessionId.trim() !== '' ? fromSessionId.trim() : null;
   if (explicit !== null) {
-    const exists = local.ledger.members.some((entry) => entry.instanceId === explicit);
-    return exists ? { targets: [explicit] } : { error: '目标不在协作名单中' };
+    return explicitSenderSeat(local, seats, explicit);
   }
-  return { targets: memberIdsOf(state, local) };
+  if (requireExplicit) {
+    return { ok: false, reason: '缺少发送会话标识（fromSessionId）' };
+  }
+  return defaultSenderSeat(local, seats);
+}
+
+function explicitSenderSeat(local, seats, explicit) {
+  if (!ID_PATTERN.test(explicit)) {
+    return { ok: false, reason: '发送会话标识非法（1–64 位字母数字与连字符）' };
+  }
+  if (seats.length === 0) {
+    return legacySenderSeatOf(local, explicit);
+  }
+  const seat = seats.find((candidate) => candidate.sessionId === explicit);
+  if (seat === undefined) {
+    return { ok: false, reason: '发送会话不在本机席位表中（非本机成员）' };
+  }
+  if (seat.state !== 'member' || seat.unverified === true) {
+    return { ok: false, reason: '发送会话尚未收敛（joining / unverified）——收敛后再发送' };
+  }
+  return { ok: true, sessionId: explicit };
+}
+
+/* 无席位表的兼容路径：旧单席记录能对上的放行，否则拒绝（不臆断成员资格）。 */
+function legacySenderSeatOf(local, explicit) {
+  const legacySession = local?.member?.sessionId;
+  if (typeof legacySession === 'string' && legacySession !== explicit) {
+    return { ok: false, reason: '发送会话不在本机席位表中（非本机成员）' };
+  }
+  return { ok: true, sessionId: explicit };
+}
+
+/* 未穿参的发送面（治理广播等）：站长席位优先，其次最早加入的活动席位；旧单席记录兜底。 */
+function defaultSenderSeat(local, seats) {
+  const memberSeats = seats.filter((seat) => seat.state === 'member' && seat.unverified !== true).sort(compareSeatJoinSeq);
+  const preferred = memberSeats.find((seat) => seat.role === 'manager') ?? memberSeats[0];
+  if (preferred !== undefined) {
+    return { ok: true, sessionId: preferred.sessionId };
+  }
+  const legacySession = local?.member?.sessionId;
+  return typeof legacySession === 'string'
+    ? { ok: true, sessionId: legacySession }
+    : { ok: true, sessionId: undefined };
 }
 
 /* 协作类载荷构造：topic 走呈现文本、task 生成任务标识、stop 的正文即原因、其余为正文 text。 */

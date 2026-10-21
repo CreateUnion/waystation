@@ -136,7 +136,7 @@ function makeDispatch(t, { transport, config, self, direct } = {}) {
 }
 
 function target(overrides = {}) {
-  return { collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 }, type: 'reply', payload: { text: '你好' }, ...overrides };
+  return { collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 }, type: 'reply', payload: { text: '你好' }, fromSessionId: 'sess-self', ...overrides };
 }
 
 test('send：当场返回「已排队」，调度 tick 后帧写出（信封字段齐全）', { timeout: 15000 }, async (t) => {
@@ -153,7 +153,7 @@ test('send：当场返回「已排队」，调度 tick 后帧写出（信封字�
   assert.equal(frame.msgId, sent.msgId);
   assert.equal(frame.type, 'reply');
   assert.equal(frame.collabId, 'collab-1');
-  assert.deepEqual(frame.from, { instanceId: 'inst-self', identityName: '本机', port: 7321 });
+  assert.deepEqual(frame.from, { instanceId: 'inst-self', identityName: '本机', port: 7321, sessionId: 'sess-self' });
   assert.equal(frame.payload.text, '你好');
 });
 
@@ -554,7 +554,7 @@ test('索引回收：条目被队列回收后不再出现在状态查询，重�
   dispatch.start();
   await waitFor(() => dispatch.deliveryStatus({ msgId: first.msgId })[0]?.expired, { timeoutMs: 4000 });
   // 治理类条目豁免过期：回收事件发生时它仍存活，用于验证重建后的归属查找
-  const second = dispatch.send(target({ type: 'freeze', payload: { name: '项目', members: [{ instanceId: 'inst-a', identityName: '主机甲' }, { instanceId: 'inst-b', identityName: '主机乙' }] } }));
+  const second = dispatch.send(target({ type: 'freeze', payload: { name: '项目', members: [{ instanceId: 'inst-a', sessionId: 'sess-a', identityName: '主机甲' }, { instanceId: 'inst-b', sessionId: 'sess-b', identityName: '主机乙' }] } }));
   assert.equal(second.ok, true);
   await waitFor(() => dispatch.deliveryStatus({ msgId: first.msgId }).length === 0, { timeoutMs: 5000 });
   dispatch.onAck(second.msgId);
@@ -566,7 +566,7 @@ test('send：to.port 缺失 / 非法 → 统一参数拒绝、不入队', { time
   t.after(() => dispatch.stop());
   const variants = [undefined, 0, 65536, '7321', 1.5];
   for (const port of variants) {
-    const sent = dispatch.send({ collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2', port }, type: 'reply', payload: { text: 'x' } });
+    const sent = dispatch.send({ collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2', port }, type: 'reply', payload: { text: 'x' }, fromSessionId: 'sess-self' });
     assert.equal(sent.ok, false, String(port));
     assert.ok(sent.reason.includes('to.port'), sent.reason);
   }
@@ -582,6 +582,7 @@ test('终帧预检：类型专属字段不符（delivery-status 的 refMsgId 形
     to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 },
     type: 'delivery-status',
     payload: { refMsgId: 'not a valid id!', tier: 'session' },
+    fromSessionId: 'sess-self',
   });
   assert.equal(bad.ok, false);
   assert.ok(bad.reason.includes('对端必拒收'), bad.reason);
@@ -590,6 +591,7 @@ test('终帧预检：类型专属字段不符（delivery-status 的 refMsgId 形
     to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 },
     type: 'delivery-status',
     payload: { refMsgId: 'msg-1', tier: 'session' },
+    fromSessionId: 'sess-self',
   });
   assert.equal(good.ok, true, '合法形态不被误杀');
 });
@@ -598,7 +600,7 @@ test('拨号端口 = 条目 to.port（多站点下拨错端口即投递失败）
   const transport = createFakeTransport();
   const { dispatch } = makeDispatch(t, { transport });
   t.after(() => dispatch.stop());
-  dispatch.send({ collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2', port: 17321 }, type: 'reply', payload: { text: 'x' } });
+  dispatch.send({ collabId: 'collab-1', to: { instanceId: 'inst-b', address: '127.0.0.2', port: 17321 }, type: 'reply', payload: { text: 'x' }, fromSessionId: 'sess-self' });
   dispatch.start();
   await waitFor(() => transport.dials.length >= 1);
   assert.deepEqual(transport.dials[0], { address: '127.0.0.2', port: 17321 });
@@ -675,7 +677,7 @@ test('reassignPeer：参数形态逐拒；无该协作队列按零条成功', { 
 test('send：携带原发身份（治理转达）时投递帧 from 为原发者，且原发身份随队列重启续投保留', { timeout: 15000 }, async (t) => {
   const transport = createFakeTransport();
   const { dispatch, dataDir } = makeDispatch(t, { transport });
-  const originFrom = { instanceId: 'inst-c', identityName: '主机丙', port: 7321 };
+  const originFrom = { instanceId: 'inst-c', identityName: '主机丙', port: 7321, sessionId: 'sess-c' };
   const sent = dispatch.send(target({ type: 'takeover-init', payload: { kind: 'cancel', reason: '让位' }, from: originFrom }));
   assert.equal(sent.ok, true, sent.reason);
   dispatch.stop();   // 未投递即中止：原发身份须随队列条目持久化，重启续投不改写
@@ -696,6 +698,7 @@ function directTarget(overrides = {}) {
     to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 },
     type: 'post',
     payload: { post: { postId: 'post-1', seq: 1, kind: 'reply', text: '你好' } },
+    fromSessionId: 'sess-self',
     ...overrides,
   };
 }
@@ -722,7 +725,7 @@ test('sendDirect：即时投出（不落队列）、帧 ts 随帖携带、ack �
   assert.equal(frame.collabId, 'collab-f');
   assert.equal(frame.ts, ts, '帧 ts 随帖携带（作者侧强制单调的落盘 ts）');
   assert.equal(frame.payload.post.text, '你好');
-  assert.deepEqual(frame.from, { instanceId: 'inst-self', identityName: '本机', port: 7321 });
+  assert.deepEqual(frame.from, { instanceId: 'inst-self', identityName: '本机', port: 7321, sessionId: 'sess-self' });
   assert.equal(existsSync(collabFilePath(dataDir, 'collab-f', OUTBOX_FILE_NAME)), false, '直投不落持久队列');
   dispatch.onAck(sent.msgId);
   const acked = dispatch.deliveryStatus({ msgId: sent.msgId })[0];
@@ -891,7 +894,7 @@ test('sendDirect：同对端两条并发——连接复用、活动计数正确�
   const second = dispatch.sendDirect(directTarget({ payload: { post: { postId: 'post-2', seq: 2, kind: 'reply', text: '第二条' } } }));
   await waitFor(() => transport.connections.length === 1 && transport.connections[0].frames.length === 2);
   assert.equal(transport.dials.length, 1, '并发同单元共享同一次拨号（不双拨）');
-  const queued = dispatch.send({ collabId: 'collab-f', to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 }, type: 'reply', payload: { text: '排队消息' } });
+  const queued = dispatch.send({ collabId: 'collab-f', to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 }, type: 'reply', payload: { text: '排队消息' }, fromSessionId: 'sess-self' });
   await waitFor(() => transport.connections[0].frames.length === 3);
   dispatch.onAck(queued.msgId);   // 队列 ack 触发的空闲回收：同对端仍有在途直投 → 连接保留
   assert.equal(transport.connections[0].closed, false);

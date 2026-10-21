@@ -1,7 +1,7 @@
 import { collabDir, collabFilePath, ensureDir } from '../paths.js';
 import { ANCHOR_PORT } from '../site.js';
 import { appendLine, loadLines, replaceFile } from '../storage.js';
-import { DELIVERY_EXEMPT_TYPES, isPort } from './protocol.js';
+import { DELIVERY_EXEMPT_TYPES, ID_PATTERN, MAX_ACTIVE_SEATS, isPort } from './protocol.js';
 
 export const OUTBOX_FILE_NAME = 'outbox.jsonl';
 const STATES = ['queued', 'acked', 'session', 'expired'];
@@ -111,9 +111,13 @@ function headFor(state, peerInstanceId) {
   return head;
 }
 
-function enqueue(state, { msgId, to, type, payload, ts, from }) {
+function enqueue(state, { msgId, to, type, payload, ts, from, fromSessionId, toSessions }) {
   /* governance = 投递豁免标记（持久化字段名沿用）：治理类 + 讨论的 end/join/leave（设计 §5.5）。 */
   const governance = DELIVERY_EXEMPT_TYPES.includes(type);
+  const sessions = normalizeToSessions(toSessions);
+  if (sessions === null) {
+    return { ok: false, reason: `toSessions 非法（须为 1–${MAX_ACTIVE_SEATS} 个会话标识的数组）` };
+  }
   // 配额只统计非豁免类未完成条目：豁免类积压不得挤占普通消息的名额（豁免类任何时刻可入队）
   if (!governance && unfinishedOf(state).filter((entry) => !entry.governance).length >= state.config.queueMaxPerCollab) {
     return { ok: false, reason: `该协作待投队列已满（上限 ${state.config.queueMaxPerCollab} 条），等待送达或过期后再试` };
@@ -132,6 +136,16 @@ function enqueue(state, { msgId, to, type, payload, ts, from }) {
   };
   if (from !== undefined) {
     entry.from = { instanceId: from.instanceId, identityName: from.identityName, port: from.port };
+    if (typeof from.sessionId === 'string') {
+      entry.from.sessionId = from.sessionId;
+    }
+  }
+  /* 机器级条目：toSessions 是同一帧上的席位目标集合；不按席位拆条、不改 msgId 折叠键（D11）。 */
+  if (sessions !== undefined) {
+    entry.toSessions = sessions;
+  }
+  if (typeof fromSessionId === 'string') {
+    entry.fromSessionId = fromSessionId;
   }
   state.entries.set(msgId, entry);
   if (!writeRecord(state, entry)) {
@@ -264,7 +278,8 @@ function compact(state) {
 }
 
 function validateRecord(record) {
-  if (!isRecordShape(record)) {
+  const sessions = normalizeToSessions(record?.toSessions);
+  if (sessions === null || !isRecordShape(record)) {
     return null;
   }
   return {
@@ -281,8 +296,46 @@ function validateRecord(record) {
     ackedAt: typeof record.ackedAt === 'string' ? record.ackedAt : undefined,
     deliveredAt: typeof record.deliveredAt === 'string' ? record.deliveredAt : undefined,
     expiredAt: typeof record.expiredAt === 'string' ? record.expiredAt : undefined,
-    from: record.from === undefined ? undefined : { instanceId: record.from.instanceId, identityName: record.from.identityName, port: record.from.port },
+    from: normalizedFromOf(record),
+    fromSessionId: fromSessionIdOf(record),
+    toSessions: sessions,
   };
+}
+
+function normalizedFromOf(record) {
+  if (record.from === undefined) {
+    return undefined;
+  }
+  const from = { instanceId: record.from.instanceId, identityName: record.from.identityName, port: record.from.port };
+  if (typeof record.from.sessionId === 'string') {
+    from.sessionId = record.from.sessionId;
+  }
+  return from;
+}
+
+function fromSessionIdOf(record) {
+  return typeof record.fromSessionId === 'string' ? record.fromSessionId : record.from?.sessionId;
+}
+
+/* 席位目标集合归一：缺省（无 toSessions）＝接收核按本机全部活跃席位扇出；非法即拒绝/按损坏跳过。
+ * 去重保持首次出现顺序——一机一帧只带一份目标列表。 */
+function normalizeToSessions(value) {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_ACTIVE_SEATS) {
+    return null;
+  }
+  const sessions = [];
+  for (const sessionId of value) {
+    if (typeof sessionId !== 'string' || !ID_PATTERN.test(sessionId)) {
+      return null;
+    }
+    if (!sessions.includes(sessionId)) {
+      sessions.push(sessionId);
+    }
+  }
+  return sessions;
 }
 
 /* 结构底线（字段形态）：不合形态的记录一律视同损坏，跳过并计数——内容语义不在此层裁定。
@@ -301,6 +354,9 @@ function isOptionalFromShape(from) {
     return false;
   }
   if (typeof from.instanceId !== 'string' || typeof from.identityName !== 'string') {
+    return false;
+  }
+  if (from.sessionId !== undefined && (typeof from.sessionId !== 'string' || !ID_PATTERN.test(from.sessionId))) {
     return false;
   }
   return from.port === undefined || isPort(from.port);

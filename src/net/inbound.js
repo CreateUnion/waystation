@@ -1,6 +1,6 @@
 import { collabDir, collabFilePath, ensureDir } from '../paths.js';
 import { appendLine, loadLines, replaceFile } from '../storage.js';
-import { ID_PATTERN, PROTOCOL_VERSION, isPort, newMsgId } from './protocol.js';
+import { COLLAB_CAPABILITY, GOVERNANCE_TYPES, ID_PATTERN, PROTOCOL_VERSION, isPort, newMsgId } from './protocol.js';
 import { CONFLICT_FRAME_TYPES } from '../collab/gate.js';
 
 export const INBOX_FILE_NAME = 'inbox.jsonl';
@@ -12,7 +12,7 @@ const COMPACT_LINE_FACTOR = 2;
 /* 可注入钩子的形状（全部可选，缺省即安全默认）：类型注解为类型检查服务——缺省值 {} 与属性访问需要明确形状。
  * sessionGate = 投递前的静音栅栏（返回 { suppress: true } 即本帧不进会话）；sessionDelivered = 投递成功后的
  * 事实通知（已注入标记的记真挂点——本层不掌握标记归属，只报「这帧进了会话」）。 */
-/** @typedef {{ admit?: (frame: object, meta: { remoteAddress: string }) => { ok: boolean, reason?: string } | null | undefined | Promise<{ ok: boolean, reason?: string } | null | undefined>, consume?: (frame: object, meta: { remoteAddress: string }) => unknown, deliverToSession?: (frame: object) => unknown, sessionGate?: (frame: object, meta: { remoteAddress: string }) => { suppress?: boolean } | null | undefined | Promise<{ suppress?: boolean } | null | undefined>, sessionDelivered?: (frame: object, meta: { remoteAddress: string }) => unknown }} InboundHooks */
+/** @typedef {{ admit?: (frame: object, meta: { remoteAddress: string }) => { ok: boolean, reason?: string } | null | undefined | Promise<{ ok: boolean, reason?: string } | null | undefined>, consume?: (frame: object, meta: { remoteAddress: string }) => unknown, deliverToSession?: (frame: object) => unknown, sessionGate?: (frame: object, meta: { remoteAddress: string, sessionId?: string }) => { suppress?: boolean } | null | undefined | Promise<{ suppress?: boolean } | null | undefined>, sessionDelivered?: (frame: object, meta: { remoteAddress: string }) => unknown, assertWritable?: (collabId: string) => { ok: boolean, reason?: string } | null | undefined | Promise<{ ok: boolean, reason?: string } | null | undefined>, listSeats?: (collabId: string) => Array<{ sessionId: string, state?: string, role?: string, unverified?: boolean }>, injectSeat?: (collabId: string, sessionId: string, frame: object) => { ok: boolean, delivered?: boolean, staged?: boolean, duplicate?: boolean, skipped?: string, reason?: string } | null | undefined | Promise<{ ok: boolean, delivered?: boolean, staged?: boolean, duplicate?: boolean, skipped?: string, reason?: string } | null | undefined> }} InboundHooks */
 
 /* 接收管线（设计 §10）：帧的类型路由（四类）——
  * ① 协作域（含治理类）：准入 → 幂等去重 → 落盘 → ack → 钩子 → 投递成功后回报
@@ -45,6 +45,14 @@ export function createInbound({ dataDir, config, self, dispatch, hooks = {}, log
     deliverToSession: hooks.deliverToSession ?? defaultDeliver,
     sessionGate: hooks.sessionGate ?? noop,
     sessionDelivered: hooks.sessionDelivered ?? noop,
+    /* 写门（M8 assertWritable 的接入口）：legacy / recovery / corrupt 一律只读——协作域帧整帧拒绝。
+     * 缺省放行（独立观察窗/单测不接写门时行为零变）。 */
+    assertWritable: optionalHook(hooks, 'assertWritable'),
+    /* 席位扇出面（M2 运行时接口）：两件都注入才启用——缺任一按旧单投路径处理（降级零变）。
+     * listSeats 绑定 listLocalSeats；injectSeat 绑定 injectLocalSeat（本机旁路，含暂存/补投）。 */
+    listSeats: optionalHook(hooks, 'listSeats'),
+    injectSeat: optionalHook(hooks, 'injectSeat'),
+    seatMode: optionalHook(hooks, 'listSeats') !== null && optionalHook(hooks, 'injectSeat') !== null,
     log,
     boxes: new Map(),       // collabId → { path, seen: Map, appendsSinceCompact }（懒加载：首个消息到达时才建）
     chains: new WeakMap(),  // connection → Promise（同连接串行）
@@ -55,8 +63,14 @@ export function createInbound({ dataDir, config, self, dispatch, hooks = {}, log
     stop,
     onFrame: (connection, frame) => onFrame(state, connection, frame),
     checkInbox: (query) => checkInbox(state, query),
+    localSeatDeliveryOf: (msgId, sessionId) => localSeatDeliveryOf(state, msgId, sessionId),
     stats: () => statsOf(state),
   };
+}
+
+/* 可选钩子取面：非函数一律视为未注入（安全默认由调用方负责）。 */
+function optionalHook(hooks, key) {
+  return typeof hooks[key] === 'function' ? hooks[key] : null;
 }
 
 function emptyCounters() {
@@ -77,6 +91,15 @@ function emptyCounters() {
     hookFailures: 0,
     frameFailures: 0,
     reportFailures: 0,
+    fromSessionRejected: 0,
+    readonlyInboundRejected: 0,
+    fanoutSeats: 0,
+    fanoutInjected: 0,
+    fanoutStaged: 0,
+    fanoutGated: 0,
+    fanoutDropped: 0,
+    fanoutResumed: 0,
+    reportsResent: 0,
     rejected: { admission: 0 },
   };
 }
@@ -158,27 +181,97 @@ function applyReport(state, connection, frame) {
 }
 
 async function handleCollabMessage(state, connection, frame) {
+  if (!acceptIdentity(state, frame)) {
+    return;
+  }
+  if (!await acceptWritable(state, frame)) {
+    return;
+  }
   const meta = metaOf(connection);
-  const admitted = await runAdmit(state, frame, meta);
-  if (admitted === null || admitted === undefined || admitted.ok !== true) {
-    state.counters.rejected.admission++;
-    const reason = admitted?.reason ?? '未说明';
-    /* 原因随消息文本一并输出（不止 fields）：准入拒绝是消息被整体丢弃的路径，
-     * 只把原因放进字段会让「按消息文本订阅/检索日志」的通道看不到丢弃原因。 */
-    state.log.warn(`协作域消息未通过准入，拒绝（不确认）：${reason}`, {
-      msgId: frame.msgId,
-      collabId: frame.collabId,
-      reason,
-    });
+  if (!await acceptAdmission(state, frame, meta)) {
     return;
   }
   const box = boxFor(state, frame.collabId);
   if (isDuplicate(state, box, frame)) {
-    state.counters.duplicates++;
-    connection.send(ackFrame(state, frame.msgId));   // 重复 = 上次 ack 可能丢失：重确认、不重投
-    state.counters.acksSent++;
+    await handleDuplicateFrame(state, box, frame, connection, meta);
     return;
   }
+  if (state.seatMode) {
+    await acceptSeatFanoutFrame(state, box, frame, connection, meta);
+    return;
+  }
+  await acceptLegacyFrame(state, box, frame, connection, meta);
+}
+
+/* 帧身份（协作域帧须带发送会话）：不合规即整帧丢弃、不确认（不落盘、不计数为已受理）。 */
+function acceptIdentity(state, frame) {
+  const rejection = fromSessionRejection(frame);
+  if (rejection === null) {
+    return true;
+  }
+  state.counters.fromSessionRejected++;
+  state.log.warn(`协作域帧发送席位不合规，拒绝（不确认）：${rejection}`, {
+    msgId: frame.msgId,
+    collabId: frame.collabId,
+    type: frame.type,
+  });
+  return false;
+}
+
+/* 写门（M8）：legacy / recovery / corrupt 目录只读——不落盘、不 ack、不注入，计数留痕。
+ * 写门异常按只读处理（失败安全：读不出的可写判定不能当成可写）。 */
+async function acceptWritable(state, frame) {
+  if (state.assertWritable === null) {
+    return true;
+  }
+  const verdict = await writableVerdictOf(state, frame);
+  if (verdict?.ok === true) {
+    return true;
+  }
+  state.counters.readonlyInboundRejected++;
+  state.log.warn('协作目录只读（legacy / recovery / corrupt），入站帧拒绝并计数', {
+    collabId: frame.collabId,
+    msgId: frame.msgId,
+    reason: verdict?.reason ?? '未说明',
+  });
+  return false;
+}
+
+/* 写门判定（异常归只读：读不出的可写判定不能当成可写）。 */
+async function writableVerdictOf(state, frame) {
+  try {
+    return await state.assertWritable(frame.collabId);
+  } catch (error) {
+    return { ok: false, reason: `写门判定异常：${error?.message ?? '未知原因'}` };
+  }
+}
+
+/* 准入钩子：拒绝即整帧丢弃、不确认；原因随消息文本输出（日志订阅通道可见）。 */
+async function acceptAdmission(state, frame, meta) {
+  const admitted = await runAdmit(state, frame, meta);
+  if (admitted !== null && admitted !== undefined && admitted.ok === true) {
+    return true;
+  }
+  state.counters.rejected.admission++;
+  const reason = admitted?.reason ?? '未说明';
+  state.log.warn(`协作域消息未通过准入，拒绝（不确认）：${reason}`, {
+    msgId: frame.msgId,
+    collabId: frame.collabId,
+    reason,
+  });
+  return false;
+}
+
+/* 重复帧：重确认（上次 ack 可能丢失）→ 按 inbox 扇出进度补投并重发机器级回报。 */
+async function handleDuplicateFrame(state, box, frame, connection, meta) {
+  state.counters.duplicates++;
+  connection.send(ackFrame(state, frame.msgId));
+  state.counters.acksSent++;
+  await resumeDuplicate(state, box, frame, connection, meta);
+}
+
+/* 旧单投路径（未接席位注入面）：落盘 → ack → 消费 → 单次投递 → 回报。 */
+async function acceptLegacyFrame(state, box, frame, connection, meta) {
   const stored = persistInbound(state, box, frame);
   if (stored === null) {
     return;   // 未落盘不承诺：发送侧按重试 / 过期处理
@@ -200,6 +293,226 @@ async function handleCollabMessage(state, connection, frame) {
      * （join）不参与过期回收，条目随重播轮次在出站队列里累积（慢泄漏）。 */
     sendDeliveryReport(state, frame, connection);
   }
+}
+
+/* 帧身份（设计 §5.1）：协作域帧必须携带发送会话 sessionId；transport（ping/pong/ack）与
+ * delivery-status 不走本函数（前者即时通道、后者接收核机器级签发）。0.2.0 之前的帧已在传输入口
+ * 被 cap 闸门拒收，这里只对声明 cap=2 的帧裁定，避免历史单测夹具与旧存档被本层误判。 */
+function fromSessionRejection(frame) {
+  if (frame.cap !== COLLAB_CAPABILITY) {
+    return null;
+  }
+  const sessionId = frame.from?.sessionId;
+  if (typeof sessionId === 'string' && ID_PATTERN.test(sessionId)) {
+    return null;
+  }
+  return 'from.sessionId 缺失或非法（协作帧须携带发送会话）';
+}
+
+/* 席位扇出受理（D11）：先落机器级 inbox（含目标席位与扇出进度）→ ack → 消费 → 逐席注入。
+ * 落盘先于 ack、扇出晚于 ack：崩溃在二者之间时，重复帧按 inbox 里的进度补扇出（见 resumeDuplicate）。 */
+async function acceptSeatFanoutFrame(state, box, frame, connection, meta) {
+  const targets = seatTargetsOf(state, frame);
+  state.counters.fanoutDropped += targets.dropped.length;   // 坏目标隔离：丢弃并计数，不投给其他席位
+  const record = {
+    ...frame,
+    receivedAt: new Date().toISOString(),
+    fanout: { pending: targets.seats, done: [], dropped: targets.dropped, outcomes: {}, complete: false },
+  };
+  if (!persistRecord(state, box, record)) {
+    return;   // 未落盘不承诺：发送侧按重试 / 过期处理
+  }
+  box.seen.set(frame.msgId, { receivedAtMs: Date.now(), record });
+  box.appendsSinceCompact++;
+  state.counters.accepted++;
+  connection.send(ackFrame(state, frame.msgId));
+  state.counters.acksSent++;
+  compactIfDue(state, box);
+  const consumed = await runHook(state, state.consume, frame, meta);
+  if (isSessionSuppressed(frame, consumed)) {
+    state.counters.sessionSuppressed += targets.seats.length;
+    record.fanout.pending = [];
+    record.fanout.complete = true;
+    persistRecord(state, box, record);
+    if (isAbsorbedDuplicate(frame, consumed)) {
+      sendDeliveryReport(state, frame, connection, firstSuccessOf(record));
+    }
+    return;
+  }
+  const firstSeat = await runSeatFanout(state, box, frame, record, meta);
+  const successSeat = firstSeat ?? firstSuccessOf(record);
+  if (successSeat !== null) {
+    state.counters.sessionDelivered++;
+    await runHook(state, state.sessionDelivered, frame, meta);
+    sendDeliveryReport(state, frame, connection, successSeat);
+  }
+}
+
+/* 本帧的目标席位（本机可注入面）：toSessions 给出时只取列表内席位——其他目标按坏目标隔离丢弃
+ * 并计数，不把整帧投给别的席位；缺省时按本机活跃席位（member）扇出，邀请帧例外（不受活跃过滤，
+ * 因为受邀会话可能仍在 joining / 未入席）。发送会话自己的席位不投（本机旁路不给自己投递）。 */
+function seatTargetsOf(state, frame) {
+  const seats = safeListSeats(state, frame.collabId);
+  const injectable = seats.filter((seat) => typeof seat?.sessionId === 'string' && isInjectableSeat(seat));
+  const byId = new Map(injectable.map((seat) => [seat.sessionId, seat]));
+  const requested = Array.isArray(frame.toSessions) ? frame.toSessions : null;
+  let desired = requested;
+  if (desired === null) {
+    desired = frame.type === 'invite'
+      ? injectable.map((seat) => seat.sessionId)
+      : seats.filter((seat) => seat?.state === 'member').map((seat) => seat.sessionId);
+  }
+  const selected = [];
+  const dropped = [];
+  for (const sessionId of desired) {
+    if (!byId.has(sessionId)) {
+      dropped.push(sessionId);
+    } else if (!selected.includes(sessionId)) {
+      selected.push(sessionId);   // 重复目标只注入一次（坏帧不得放大投递）
+    }
+  }
+  return { seats: senderSeatExcluded(state, frame, selected), dropped };
+}
+
+function isInjectableSeat(seat) {
+  return seat.state === 'member' || seat.state === 'joining';
+}
+
+function senderSeatExcluded(state, frame, sessionIds) {
+  if (frame.from?.instanceId !== state.self.instanceId) {
+    return sessionIds;
+  }
+  return sessionIds.filter((sessionId) => sessionId !== frame.from.sessionId);
+}
+
+function safeListSeats(state, collabId) {
+  try {
+    const seats = state.listSeats(collabId);
+    return Array.isArray(seats) ? seats : [];
+  } catch (error) {
+    state.counters.hookFailures++;
+    state.log.warn('席位表读取异常（按空席位处理）', { collabId, reason: error?.message });
+    return [];
+  }
+}
+
+/* 逐席扇出：每席独立走静音栅栏（治理事件豁免）→ 注入面。注入面异常时保留该席在 pending，
+ * 本轮停止并等待重复帧补扇出（不得把未完成当成已投递）。 */
+async function runSeatFanout(state, box, frame, record, meta) {
+  let firstSuccess = null;
+  while (record.fanout.pending.length > 0) {
+    const sessionId = record.fanout.pending[0];
+    const outcome = await fanoutOneSeat(state, frame, sessionId, meta);
+    if (outcome === null) {
+      break;
+    }
+    record.fanout.pending.shift();
+    record.fanout.done.push(sessionId);
+    record.fanout.outcomes[sessionId] = outcome;
+    if (firstSuccess === null && isSuccessOutcome(outcome)) {
+      firstSuccess = sessionId;
+    }
+    persistRecord(state, box, record);
+  }
+  record.fanout.complete = record.fanout.pending.length === 0;
+  persistRecord(state, box, record);
+  return firstSuccess;
+}
+
+async function fanoutOneSeat(state, frame, sessionId, meta) {
+  if (await seatMutedOf(state, frame, sessionId, meta)) {
+    state.counters.fanoutGated++;
+    return 'gated';
+  }
+  state.counters.fanoutSeats++;
+  const result = await safeInjectSeat(state, frame, sessionId);
+  if (result === null) {
+    return null;   // 注入面异常：保留该席在 pending，等重复帧补扇出
+  }
+  return outcomeOf(state, result);
+}
+
+async function seatMutedOf(state, frame, sessionId, meta) {
+  if (isMuteExempt(frame)) {
+    return false;
+  }
+  const gate = await runHook(state, state.sessionGate, frame, { ...meta, sessionId });
+  return gate?.suppress === true;
+}
+
+async function safeInjectSeat(state, frame, sessionId) {
+  try {
+    return await state.injectSeat(frame.collabId, sessionId, frame);
+  } catch (error) {
+    state.counters.hookFailures++;
+    state.log.error('席位注入异常（保留待补，等待重复帧）', { msgId: frame.msgId, sessionId, reason: error?.message });
+    return null;
+  }
+}
+
+function outcomeOf(state, result) {
+  if (result?.ok !== true) {
+    state.counters.fanoutDropped++;
+    return 'dropped';
+  }
+  if (result.skipped === 'self') {
+    return 'skipped';
+  }
+  if (result.duplicate === true) {
+    state.counters.fanoutInjected++;
+    return 'duplicate';
+  }
+  if (result.staged === true) {
+    state.counters.fanoutStaged++;
+    return 'staged';
+  }
+  state.counters.fanoutInjected++;
+  return 'injected';
+}
+
+function isSuccessOutcome(outcome) {
+  return outcome === 'injected' || outcome === 'staged' || outcome === 'duplicate';
+}
+
+function firstSuccessOf(record) {
+  for (const [sessionId, outcome] of Object.entries(record.fanout?.outcomes ?? {})) {
+    if (isSuccessOutcome(outcome)) {
+      return sessionId;
+    }
+  }
+  return null;
+}
+
+/* 重复帧补扇出（D11/H-C6）：已完成的席位跳过，pending 里的席位补投；随后重发机器级回报（幂等）。
+ * 旧单投路径（无席位注入面）维持原语义：重复只重确认、不重发回报。 */
+async function resumeDuplicate(state, box, frame, connection, meta) {
+  if (!state.seatMode) {
+    return;
+  }
+  const record = box.seen.get(frame.msgId)?.record;
+  if (record === undefined || record.fanout === undefined) {
+    return;
+  }
+  if (record.fanout.pending.length > 0) {
+    state.counters.fanoutResumed++;
+    await runSeatFanout(state, box, frame, record, meta);
+  }
+  const successSeat = firstSuccessOf(record);
+  if (successSeat !== null) {
+    state.counters.reportsResent++;
+    sendDeliveryReport(state, frame, connection, successSeat);
+  }
+}
+
+/* 静音豁免（设计 §5.4）：邀请、离席、结束、治理族与站长变更/自动移交通告不受静音抑制；
+ * 逐席判定在扇出循环内做，同机不同席位的静音态互不影响。 */
+const MUTE_EXEMPT_TYPES = new Set([...GOVERNANCE_TYPES, 'invite', 'leave', 'end']);
+
+function isMuteExempt(frame) {
+  if (MUTE_EXEMPT_TYPES.has(frame.type)) {
+    return true;
+  }
+  return frame.type === 'notice' && (frame.payload?.event === 'manager-changed' || frame.payload?.event === 'auto-offer');
 }
 
 /* 投递成功分支的收尾：计数 → 记真通知 → 终态回报。顺序即语义——已注入标记必须落定在终态
@@ -284,14 +597,16 @@ function ackFrame(state, ackFor) {
  * 必然错位（目标 = 转达者地址 × 原发者端口），错位条目还会随队列重试至 TTL；回报仅沿原连接
  * 原路（归属键 = 本跳 msgId，连接对端即本跳接收者）。写失败或连接已断只告警计数
  * （维持第二档；链接确认已在先，不受影响）。 */
-function sendDeliveryReport(state, frame, connection) {
+function sendDeliveryReport(state, frame, connection, sessionId) {
   const port = frame.from.port;
+  const identity = typeof sessionId === 'string' ? { ...state.self, sessionId } : undefined;
   if (isPort(port) && !isRelayedCopy(frame)) {
     const result = state.dispatch.send({
       collabId: frame.collabId,
       to: { instanceId: frame.from.instanceId, address: connection.remoteAddress, port },
       type: 'delivery-status',
       payload: { refMsgId: frame.msgId, tier: 'session' },
+      ...(identity === undefined ? {} : { from: identity }),
     });
     if (result.ok) {
       state.counters.reportsSent++;
@@ -305,7 +620,7 @@ function sendDeliveryReport(state, frame, connection) {
       v: PROTOCOL_VERSION,
       type: 'delivery-status',
       msgId: newMsgId(),
-      from: state.self,
+      from: identity ?? state.self,
       collabId: frame.collabId,
       ts: new Date().toISOString(),
       payload: { refMsgId: frame.msgId, tier: 'session' },
@@ -417,13 +732,18 @@ function compactInbox(state, box) {
 /* 落盘并返回写入的记录（判重窗口与压缩重写都以它为权威副本）；失败计数留痕并返回 null。 */
 function persistInbound(state, box, frame) {
   const record = { ...frame, receivedAt: new Date().toISOString() };
+  return persistRecord(state, box, record) ? record : null;
+}
+
+/* 记录追加写（inbox 是状态快照流：同一 msgId 的后续行携带更新的扇出进度，载入时后写胜）。 */
+function persistRecord(state, box, record) {
   try {
     appendLine(box.path, record);
-    return record;
+    return true;
   } catch (error) {
     state.counters.persistFailures++;
-    state.log.error('入站消息落盘失败（不确认，等待重投）', { msgId: frame.msgId, reason: error.message });
-    return null;
+    state.log.error('入站消息落盘失败（不确认，等待重投）', { msgId: record?.msgId, reason: error.message });
+    return false;
   }
 }
 
@@ -480,16 +800,79 @@ export const CHECK_INBOX_MAX_LIMIT = 500;
  * 返回最近 limit 条（按到达序）；total = 窗口内总数——截断是显式信息，不是静默丢弃。
  * 含已投递与未投递两类（去重按 msgId 由调用方自理）：不引入第二份投递账（单一权威源）。 */
 function checkInbox(state, query = {}) {
-  const { collabId, limit = CHECK_INBOX_DEFAULT_LIMIT } = query;
+  const { collabId, limit, sessionId } = inboxQueryOf(query);
+  const records = inboxRecordsOf(state, collabId);
+  const visible = sessionId === undefined ? records : records.filter((record) => recordVisibleTo(record, sessionId));
+  const messages = visible.slice(Math.max(0, visible.length - limit));
+  return { collabId, total: visible.length, returned: messages.length, messages };
+}
+
+function inboxQueryOf(query) {
+  const { collabId, limit = CHECK_INBOX_DEFAULT_LIMIT, sessionId } = query;
   if (typeof collabId !== 'string' || !ID_PATTERN.test(collabId)) {
     throw new TypeError('checkInbox 需要合法的 collabId（1–64 位字母数字与连字符）');
   }
   if (!Number.isInteger(limit) || limit < 1 || limit > CHECK_INBOX_MAX_LIMIT) {
     throw new TypeError(`checkInbox 的 limit 需为 1–${CHECK_INBOX_MAX_LIMIT} 的整数`);
   }
-  const records = inboxRecordsOf(state, collabId);
-  const messages = records.slice(Math.max(0, records.length - limit));
-  return { collabId, total: records.length, returned: messages.length, messages };
+  if (sessionId !== undefined && (typeof sessionId !== 'string' || !ID_PATTERN.test(sessionId))) {
+    throw new TypeError('checkInbox 的 sessionId 非法（1–64 位字母数字与连字符）');
+  }
+  return { collabId, limit, sessionId };
+}
+
+/* 会话视角的可见性（设计 §5.3 D11）：扇出记录只对目标席位可见；没有席位目标的机器级记录
+ * （治理提示 / 旧单投记录）对全本机会话可见。 */
+function recordVisibleTo(record, sessionId) {
+  if (record?.fanout !== undefined) {
+    return record.fanout.done?.includes(sessionId) === true
+      || record.fanout.pending?.includes(sessionId) === true
+      || record.fanout.dropped?.includes(sessionId) === true;
+  }
+  if (Array.isArray(record?.toSessions)) {
+    return record.toSessions.includes(sessionId);
+  }
+  return true;
+}
+
+/* 本机席位投递明细（M3 → M4/M5/M6 契约）：按 (msgId, sessionId) 取扇出结果。
+ * 只查已载入的协作收件盒——msgId 是全局唯一标识，运行期查询足够；未知返回 unknown 不抛错。 */
+function localSeatDeliveryOf(state, msgId, sessionId) {
+  if (typeof msgId !== 'string' || msgId === '' || typeof sessionId !== 'string' || !ID_PATTERN.test(sessionId)) {
+    throw new TypeError('localSeatDeliveryOf 需要合法的 msgId 与 sessionId');
+  }
+  for (const [collabId, box] of state.boxes) {
+    const record = box.seen.get(msgId)?.record;
+    if (record === undefined) {
+      continue;
+    }
+    return { collabId, msgId, sessionId, ...seatStatusOf(record, sessionId) };
+  }
+  return { collabId: null, msgId, sessionId, status: 'unknown', complete: false };
+}
+
+function seatStatusOf(record, sessionId) {
+  const fanout = record.fanout;
+  if (fanout === undefined) {
+    const delivered = record.toSessions === undefined || record.toSessions.includes(sessionId);
+    return { status: delivered ? 'pending' : 'unknown', complete: false };
+  }
+  const complete = fanout.complete === true;
+  const outcome = fanout.outcomes?.[sessionId];
+  if (outcome !== undefined) {
+    return { status: outcome === 'duplicate' ? 'injected' : outcome, complete };
+  }
+  return fanoutStatusOf(fanout, sessionId, complete);
+}
+
+function fanoutStatusOf(fanout, sessionId, complete) {
+  if (fanout.pending?.includes(sessionId)) {
+    return { status: 'pending', complete: false };
+  }
+  if (fanout.dropped?.includes(sessionId)) {
+    return { status: 'dropped', complete };
+  }
+  return { status: 'unknown', complete };
 }
 
 /* 窗口投影来源：已懒载入的 box 用内存态并按同一窗口过滤（box.seen 只在受理与载入时剪枝，

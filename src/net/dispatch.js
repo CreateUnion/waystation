@@ -2,7 +2,7 @@ import { readdirSync } from 'node:fs';
 import { isIP } from 'node:net';
 import { join } from 'node:path';
 import { COLLABS_DIR_NAME } from '../paths.js';
-import { ID_PATTERN, MAX_FRAME_BYTES, MESSAGE_TYPES, PROTOCOL_VERSION, TRANSPORT_TYPES, isPort, newMsgId, validateMessage } from './protocol.js';
+import { ID_PATTERN, MAX_FRAME_BYTES, MESSAGE_TYPES, PROTOCOL_VERSION, TRANSPORT_TYPES, isPort, newMsgId, validateMessage, withCollabCapability } from './protocol.js';
 import { createOutbox } from './outbox.js';
 
 /* 直投（讨论模式帖通道，设计 §5.2「在线直投 + 短重试」）：逐帖直发、不落持久逐帖队列——
@@ -38,6 +38,7 @@ export function createDispatch(options) {
     sendDirect: (message) => sendDirect(state, message),
     onAck: (msgId) => onAck(state, msgId),
     onDeliveryReport: (payload) => onDeliveryReport(state, payload),
+    deliveryStatusOf: (msgId) => deliveryStatusOf(state, msgId),
     resolvePong: (frame) => resolvePong(state, frame),
     ping: (options) => ping(state, options),
     deliveryStatus: (query) => deliveryStatus(state, query),
@@ -150,8 +151,10 @@ function settleDirectWaiters(state) {
 }
 
 /* message.from（可选）：转达帧的原发身份——治理转达保留发起者身份（身份语义定义在 from 上），
- * 缺省以本机身份盖章；预检、入队与投递（frameOf）三处同用这一份 from。 */
-function send(state, { collabId, to, type, payload, from }) {
+ * 缺省以本机身份盖章；fromSessionId 为发送会话——写入 from.sessionId（协作域帧的发送席位）。
+ * toSessions 为同一帧上的本机目标席位集合（机器级一帧一机，D11）；缺省＝接收核按全部活跃席位扇出。
+ * 预检、入队与投递（frameOf）三处同用这一份身份。 */
+function send(state, { collabId, to, type, payload, from, fromSessionId, toSessions }) {
   const rejection = sendRejection(collabId, to, type);
   if (rejection !== null) {
     state.counters.sendsRejected++;
@@ -173,19 +176,31 @@ function send(state, { collabId, to, type, payload, from }) {
   }
   const msgId = newMsgId();
   const ts = new Date().toISOString();
-  const payloadRejection = frameRejectionOf(frameOf(state, collabId, { msgId, type, payload, createdAt: ts, from }));
+  const identity = identityOf(state, from, fromSessionId);
+  const payloadRejection = frameRejectionOf(frameOf(state, collabId, { msgId, type, payload, createdAt: ts, from: identity, toSessions }));
   if (payloadRejection !== null) {
     state.counters.sendsRejected++;
     return { ok: false, reason: payloadRejection };
   }
   const outbox = outboxFor(state, collabId);
-  const result = outbox.enqueue({ msgId, to: { instanceId: to.instanceId, address: to.address, port: to.port }, type, payload, ts, from });
+  const result = outbox.enqueue({ msgId, to: { instanceId: to.instanceId, address: to.address, port: to.port }, type, payload, ts, from: identity, fromSessionId, toSessions });
   if (!result.ok) {
     state.counters.sendsRejected++;
     return result;
   }
   state.entryIndex.set(msgId, collabId);
   return { ok: true, msgId, tier: 'queued' };
+}
+
+/* 帧身份：显式 from（转达原发者）优先；否则带上发送会话的 fromSessionId；都没有则本机身份。 */
+function identityOf(state, from, fromSessionId) {
+  if (from !== undefined) {
+    return from;
+  }
+  if (typeof fromSessionId === 'string') {
+    return { ...state.self, sessionId: fromSessionId };
+  }
+  return undefined;
 }
 
 /* 终帧预检（受理面）：体积与协议两关都以「对端入站校验」为准——体积超限的帧会被对端直接销毁；
@@ -265,13 +280,13 @@ function isKnownType(value) {
  * 不共用：落盘（无 outbox 写入）、节律（固定短重试、失败即止）。
  * createdAt 缺省取当前时刻；调用方可给帖的落盘 ts——帧 ts 随帖携带（接收端显示序与作者内序依据）。
  * from（可选）＝转达帧的原发身份（中继扇出保原作者；与队列路径同一语义）——缺省以本机身份盖章。 */
-function sendDirect(state, { collabId, to, type, payload, createdAt, from }) {
+function sendDirect(state, { collabId, to, type, payload, createdAt, from, fromSessionId, toSessions }) {
   const rejection = directRejection(state, collabId, to, type);
   if (rejection !== null) {
     state.counters.directRejected++;
     return { ok: false, reason: rejection };
   }
-  const record = directRecordOf(collabId, to, { type, payload, createdAt, from });
+  const record = directRecordOf(collabId, to, { type, payload, createdAt, from: identityOf(state, from, fromSessionId), toSessions });
   const payloadRejection = frameRejectionOf(frameOf(state, collabId, record));
   if (payloadRejection !== null) {
     state.counters.directRejected++;
@@ -304,7 +319,7 @@ function directRejection(state, collabId, to, type) {
   return null;
 }
 
-function directRecordOf(collabId, to, { type, payload, createdAt, from }) {
+function directRecordOf(collabId, to, { type, payload, createdAt, from, toSessions }) {
   return {
     msgId: newMsgId(),
     collabId,
@@ -312,6 +327,7 @@ function directRecordOf(collabId, to, { type, payload, createdAt, from }) {
     type,
     payload,
     from,
+    toSessions,
     state: 'inflight',
     attempts: 0,
     createdAt: typeof createdAt === 'string' ? createdAt : new Date().toISOString(),
@@ -644,6 +660,8 @@ function directStatusRow(record) {
     collabId: record.collabId,
     type: record.type,
     toInstanceId: record.to.instanceId,
+    fromSessionId: record.from?.sessionId ?? null,
+    toSessions: record.toSessions ?? null,
     tier: record.state,
     expired: false,
     attempts: record.attempts,
@@ -912,10 +930,13 @@ function frameOf(state, collabId, entry) {
     collabId,
     ts: entry.createdAt,
   };
+  if (Array.isArray(entry.toSessions) && entry.toSessions.length > 0) {
+    frame.toSessions = entry.toSessions;
+  }
   if (entry.payload !== undefined) {
     frame.payload = entry.payload;
   }
-  return frame;
+  return withCollabCapability(frame);   // 0.2.0 硬断裂：协作域帧统一声明能力（与校验器同源）
 }
 
 function outboxFor(state, collabId) {
@@ -974,6 +995,8 @@ function statusRow(collabId, entry) {
     collabId,
     type: entry.type,
     toInstanceId: entry.to.instanceId,
+    fromSessionId: entry.from?.sessionId ?? entry.fromSessionId ?? null,
+    toSessions: entry.toSessions ?? null,
     tier,
     expired: entry.state === 'expired',
     attempts: entry.attempts,
@@ -982,4 +1005,20 @@ function statusRow(collabId, entry) {
     ackedAt: entry.ackedAt ?? null,
     deliveredAt: entry.deliveredAt ?? null,
   };
+}
+
+/* 机器级状态查询（M3 → M4/M5/M6 契约）：按 msgId 取唯一一条队列行；未知返回 null。
+ * 只加载协作目录、不启调度（与 deliveryStatus 查询同口径）。 */
+function deliveryStatusOf(state, msgId) {
+  if (!isIdLike(msgId)) {
+    return null;
+  }
+  ensureLoadedCollabs(state);
+  for (const [collabId, outbox] of state.outboxes) {
+    const entry = outbox.entries().find((candidate) => candidate.msgId === msgId);
+    if (entry !== undefined) {
+      return statusRow(collabId, entry);
+    }
+  }
+  return null;
 }
