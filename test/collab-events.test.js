@@ -731,6 +731,81 @@ test('C5 同机显式移交拒绝：rejectHandover 作废记录并解挂', async
   assert.equal(local.suspended, null, '拒绝后恢复写');
 });
 
+/* 远端站长经真实事件管线送达的 offer（空 endpoints 表示端点尚未学习）。 */
+function handoverOfferFrameOf(ledger, endpoints = {}) {
+  return frameOf('handover', {
+    kind: 'offer',
+    offerId: 'offer-remote',
+    baseTerm: ledger.managerTerm,
+    version: ledger.version,
+    digest: ledgerDigest(ledger),
+    ledger,
+    endpoints,
+    expiresAt: iso(NOW + 60000),
+  }, { instanceId: 'inst-a', sessionId: 'sess-a', identityName: '甲' });
+}
+
+test('C5 远端显式移交拒绝：移交方端点未知 → 明确失败并计数，记录保留可重试', async (t) => {
+  const local = localOf({ seats: [seatOf('sess-self')] });
+  const harness = stateOf(t, local);
+  const offer = handoverOfferFrameOf(ledgerOf());
+  await handleEvent(harness.state, offer);
+  const rejected = rejectHandover(harness.state, { collabId: COLLAB, sessionId: 'sess-self', offerId: offer.payload.offerId, reason: 'rejected' });
+  assert.equal(rejected.ok, false, '未送达的回执不得报成功');
+  assert.equal(rejected.reason, 'endpoint-unknown');
+  assert.match(rejected.message, /端点未知/);
+  assert.equal(harness.state.counters.handoverRejectFailures, 1);
+  assert.equal(harness.sent.length, 0, '端点未知时不得发帧');
+  const record = m5RuntimeOf(harness.state).handoverOffers.get(COLLAB).get(offer.payload.offerId);
+  assert.equal(record.state, 'open', '回执未送达时保留 offer 以便重试');
+  local.endpoints.set('inst-a', { address: '10.0.0.1', port: 17321 });
+  const retried = rejectHandover(harness.state, { collabId: COLLAB, sessionId: 'sess-self', offerId: offer.payload.offerId, reason: 'rejected' });
+  assert.equal(retried.ok, true, retried.message);
+  assert.equal(harness.sent.length, 1, '端点可知后重试回执成功');
+});
+
+test('C5 远端显式移交拒绝：回执入队失败 → 明确失败并计数', async (t) => {
+  const local = localOf({ seats: [seatOf('sess-self')] });
+  local.endpoints.set('inst-a', { address: '10.0.0.1', port: 17321 });
+  const attempts = [];
+  const harness = stateOf(t, local, {
+    state: {
+      send: (message) => {
+        attempts.push(message);
+        return { ok: false, reason: '发送队列已满' };
+      },
+    },
+  });
+  const offer = handoverOfferFrameOf(ledgerOf());
+  await handleEvent(harness.state, offer);
+  const rejected = rejectHandover(harness.state, { collabId: COLLAB, sessionId: 'sess-self', offerId: offer.payload.offerId, reason: 'rejected' });
+  assert.equal(rejected.ok, false, '入队失败不得报成功');
+  assert.equal(rejected.reason, 'send-failed');
+  assert.match(rejected.message, /发送队列已满/);
+  assert.equal(harness.state.counters.handoverRejectFailures, 1);
+  assert.equal(attempts.length, 1);
+  const record = m5RuntimeOf(harness.state).handoverOffers.get(COLLAB).get(offer.payload.offerId);
+  assert.equal(record.state, 'open', '入队失败时保留 offer 以便重试');
+});
+
+test('C5 远端显式移交拒绝：回执入队成功 → 成功并作废记录', async (t) => {
+  const local = localOf({ seats: [seatOf('sess-self')], endpoints: [['inst-a', { address: '10.0.0.1', port: 17321 }]] });
+  const harness = stateOf(t, local);
+  const offer = handoverOfferFrameOf(ledgerOf());
+  await handleEvent(harness.state, offer);
+  const rejected = rejectHandover(harness.state, { collabId: COLLAB, sessionId: 'sess-self', offerId: offer.payload.offerId, reason: 'rejected' });
+  assert.equal(rejected.ok, true, rejected.message);
+  const record = m5RuntimeOf(harness.state).handoverOffers.get(COLLAB).get(offer.payload.offerId);
+  assert.equal(record.state, 'rejected');
+  const frame = harness.sent.find((entry) => entry.type === 'handover');
+  assert.equal(frame.payload.kind, 'reject');
+  assert.equal(frame.payload.reason, 'rejected');
+  assert.equal(frame.to.instanceId, 'inst-a');
+  assert.equal(frame.fromSessionId, 'sess-self');
+  assert.equal(harness.state.counters.handoverRejectedOut, 1);
+  assert.equal(harness.state.counters.handoverRejectFailures ?? 0, 0);
+});
+
 test('I1 采纳 auto 后清理 autoPending/定时器；迟到定时器不再抛异常', async (t) => {
   const member = { instanceId: 'inst-b', sessionId: 'sess-b', identityName: '乙' };
   const ledger = ledgerOf({ members: [member] });

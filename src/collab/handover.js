@@ -1124,19 +1124,35 @@ export function rejectHandover(state, input = {}) {
     return { ok: false, message: rejection };
   }
   const normalized = REJECT_REASONS.has(reason) ? reason : 'rejected';
-  record.state = 'rejected';
-  persistOfferRecords(state, local);
-  bump(state, 'handoverRejectedOut');
   const payload = { kind: 'reject', offerId: record.offerId, reason: normalized };
   if (record.from.instanceId === state.self.instanceId) {
     handleReject(state, local, acceptFrameOf(state, record, sessionId, payload));
   } else {
-    const endpoint = endpointFor(state, local, record.from.instanceId);
-    if (endpoint !== undefined) {
-      sendTo(state, local.collabId, record.from.instanceId, endpoint, 'handover', payload, { fromSessionId: sessionId });
+    const failure = deliverHandoverRejection(state, local, record, payload, sessionId);
+    if (failure !== null) {
+      return failure;
     }
   }
+  record.state = 'rejected';
+  persistOfferRecords(state, local);
+  bump(state, 'handoverRejectedOut');
   return { ok: true, offerId: record.offerId, reason: normalized, message: '已拒绝移交提议。' };
+}
+
+/* 远端回执与本地记录同生共死：回执没送出去就不能把记录作废——否则对方继续等满确认超时，
+ * 本机也无法再用同一条 offer 重试（用户看到失败却无从补救）。返回 null 表示已入队。 */
+function deliverHandoverRejection(state, local, record, payload, sessionId) {
+  const endpoint = endpointFor(state, local, record.from.instanceId);
+  if (endpoint === undefined) {
+    bump(state, 'handoverRejectFailures');
+    return { ok: false, reason: 'endpoint-unknown', message: '移交方端点未知——拒绝未回执（对方将等待确认超时）；请等对方联系或扫描后再试' };
+  }
+  const sent = sendTo(state, local.collabId, record.from.instanceId, endpoint, 'handover', payload, { fromSessionId: sessionId });
+  if (sent.ok !== true) {
+    bump(state, 'handoverRejectFailures');
+    return { ok: false, reason: 'send-failed', message: `拒绝回执入队失败：${sent.reason ?? '未知原因'}——对方将等待确认超时，请稍后重试` };
+  }
+  return null;
 }
 
 function rejectHandoverRejection(state, local, record, sessionId) {
