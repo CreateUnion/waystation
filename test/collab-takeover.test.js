@@ -7,7 +7,8 @@ import { makeTempDir, waitFor } from './helpers.js';
 import { makeLedger, seedSessionCollab } from './helpers/session-participants.js';
 import { createCollabService } from '../src/collab/service.js';
 import { ledgerDigest } from '../src/collab/store.js';
-import { handleHandshake, takeOver } from '../src/collab/takeover.js';
+import { acceptManagerChange } from '../src/collab/term.js';
+import { handleHandshake, m5RuntimeOf, takeOver } from '../src/collab/takeover.js';
 
 /* 站长交接（设计 §2A）：握手对表、失联判定、手动接管（A4）与窗口内接管（A3）、同 term 分叉（A8）、
  * 终态快照与 presence 超时离席。
@@ -567,6 +568,154 @@ test('A3/A4 接管基准：应答给出更高 term/version 时按最高 pair 判
   assert.equal(windowed.local.ledger.managerWindow, undefined, '接管后清除窗口');
   assert.equal(windowed.local.ledger.manager.sessionId, MEM.sessionId);
   assert.equal(windowed.local.ledger.members.find((entry) => entry.instanceId === MGR.instanceId)?.role, 'member', '窗口接管保留旧站长席位并降级');
+});
+
+/* —— catch-up 快照（设计 A11/A12 步骤③）：冻结态版本落后时向握手最高 pair 持有者取快照 ——
+ * 末位入席成员的本地名单可能缺后入席成员：来源资格只能由「本机刚请求过 + 握手最高 pair」限定，
+ * 不得放宽成任意来源的同 term 快照。 */
+
+/* 陈旧基线：本地快照名单缺 RIVAL，版本落后。 */
+function staleLedgerOf({ version = 3 } = {}) {
+  const ledger = ledgerForTakeover({ version });
+  ledger.members = ledger.members.filter((member) => member.instanceId !== RIVAL.instanceId);
+  return ledger;
+}
+
+function termStateFor(ledger) {
+  return {
+    managerTerm: ledger.managerTerm,
+    manager: { instanceId: MGR.instanceId, sessionId: MGR.sessionId, identityName: MGR.identityName },
+    version: ledger.version,
+  };
+}
+
+function staleMemberSeats() {
+  return membersOf().filter((seat) => seat.role !== 'manager' && seat.instanceId !== RIVAL.instanceId);
+}
+
+function snapshotFrameOf(ledger, from) {
+  return {
+    kind: 'data',
+    managerTerm: ledger.managerTerm,
+    version: ledger.version,
+    digest: ledgerDigest(ledger),
+    ledger,
+    from: { ...from },
+  };
+}
+
+const CATCHUP_HIGHEST = { term: 1, version: 9, manager: { instanceId: MGR.instanceId, sessionId: MGR.sessionId, identityName: MGR.identityName } };
+
+test('catch-up：同 term 版本落后 → 向最高应答者请求快照，携 purpose:catchup 并登记选中来源', async (t) => {
+  const { state, local, sent } = takeoverStateOf(t, {
+    ledger: staleLedgerOf(),
+    endpoints: [[RIVAL.instanceId, RIVAL_ENDPOINT]],
+    replies: { [RIVAL.instanceId]: { seat: RIVAL, managerTerm: 1, version: 9, manager: MGR } },
+  });
+  const verdict = await takeOver(state, { collabId: COLLAB, sessionId: MEM.sessionId });
+  assert.equal(verdict.ok, false);
+  assert.ok(verdict.message.includes('版本'), verdict.message);
+  const requests = sent.filter((frame) => frame.type === 'snapshot' && frame.payload.kind === 'request');
+  const selected = requests.filter((frame) => frame.to?.instanceId === RIVAL.instanceId);
+  assert.equal(selected.length >= 1, true, '向最高应答者请求快照');
+  assert.equal(selected.every((frame) => frame.payload.purpose === 'catchup'), true, '冻结态成员只应答携 purpose 的请求');
+  const runtime = m5RuntimeOf(state);
+  assert.equal(runtime.acceptedManagers.get(COLLAB)?.catchupSource?.instanceId, RIVAL.instanceId, '登记本请求选中的来源');
+  assert.equal(local.role, 'member', '未按旧台账提升');
+});
+
+test('catch-up：同 term 版本落后的握手应答 → 向应答者请求快照并携 purpose:catchup', async (t) => {
+  const { state, sent } = takeoverStateOf(t, { ledger: ledgerForTakeover(), endpoints: [[RIVAL.instanceId, RIVAL_ENDPOINT]] });
+  await handleHandshake(state, frameOf('notice', RIVAL, handshakePayloadOf({ reply: true, version: 9 })));
+  const requests = sent.filter((frame) => frame.type === 'snapshot' && frame.payload.kind === 'request');
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].to.instanceId, RIVAL.instanceId);
+  assert.equal(requests[0].payload.purpose, 'catchup', '同 term 版本落后同样是追赶');
+  assert.equal(m5RuntimeOf(state).acceptedManagers.get(COLLAB)?.catchupSource?.instanceId, RIVAL.instanceId);
+});
+
+test('catch-up 受理：陈旧名单缺来源，但本机请求过且内容＝握手最高 pair → 同 term 采纳', () => {
+  const stale = staleLedgerOf();
+  const next = staleLedgerOf({ version: 9 });
+  const state = termStateFor(stale);
+  const frame = snapshotFrameOf(next, RIVAL);
+  const baseCtx = {
+    now: NOW,
+    localFrozen: 'manager-offline',
+    memberSeats: staleMemberSeats(),
+    handshakeHighest: CATCHUP_HIGHEST,
+    ledgerDigestOf: ledgerDigest,
+  };
+  const direct = acceptManagerChange(state, frame, { ...baseCtx, catchupSource: { instanceId: RIVAL.instanceId } });
+  assert.equal(direct.accepted, true, `期望受理，实际 ${direct.reason}`);
+  assert.equal(direct.reason, 'snapshot-version-accepted');
+  assert.equal(direct.nextState.version, 9);
+  assert.equal(direct.actions.includes('clear-freeze'), false, '同 term 名单刷新不解除 manager-offline');
+  /* 接线层实际送达的形状：选择结果经 acceptedManager 透传。 */
+  const wired = acceptManagerChange(state, frame, { ...baseCtx, acceptedManager: { catchupSource: { instanceId: RIVAL.instanceId } } });
+  assert.equal(wired.accepted, true, `期望受理，实际 ${wired.reason}`);
+});
+
+test('catch-up 受理：未经请求 / 来源非选中者 / 内容≠握手最高 pair → 一律拒收', () => {
+  const stale = staleLedgerOf();
+  const next = staleLedgerOf({ version: 9 });
+  const state = termStateFor(stale);
+  const frame = snapshotFrameOf(next, RIVAL);
+  const baseCtx = {
+    now: NOW,
+    localFrozen: 'manager-offline',
+    memberSeats: staleMemberSeats(),
+    handshakeHighest: CATCHUP_HIGHEST,
+    ledgerDigestOf: ledgerDigest,
+  };
+  const unrequested = acceptManagerChange(state, frame, baseCtx);
+  assert.equal(unrequested.accepted, false, '未请求过的来源不得凭握手最高 pair 转正');
+  assert.equal(unrequested.reason, 'snapshot-source-not-manager');
+  const otherSource = acceptManagerChange(state, frame, { ...baseCtx, catchupSource: { instanceId: 'inst-outsider' } });
+  assert.equal(otherSource.accepted, false, '选中来源之外的应答仍拒收');
+  const stalePair = acceptManagerChange(state, frame, {
+    ...baseCtx,
+    catchupSource: { instanceId: RIVAL.instanceId },
+    handshakeHighest: { ...CATCHUP_HIGHEST, version: 8 },
+  });
+  assert.equal(stalePair.accepted, false, '快照必须与握手最高 pair 完全一致');
+  /* 同 term 不同 manager 仍按 A12 冻结，来源放宽不改变任期判据。 */
+  const conflicting = staleLedgerOf({ version: 9 });
+  conflicting.manager = { ...RIVAL, term: 1 };
+  conflicting.members = membersOf().map((seat) => ({ ...seat, role: seat.instanceId === RIVAL.instanceId ? 'manager' : 'member' }));
+  const conflict = acceptManagerChange(state, snapshotFrameOf(conflicting, RIVAL), { ...baseCtx, catchupSource: { instanceId: RIVAL.instanceId } });
+  assert.equal(conflict.accepted, false);
+  assert.equal(conflict.freezeReason, 'manager-fork');
+});
+
+test('catch-up 受理：更高 term 的冻结态追赶同样只认本机请求过的来源', () => {
+  const stale = staleLedgerOf();
+  const higher = makeLedger({
+    collabId: COLLAB,
+    name: '交接协作',
+    status: 'active',
+    managerTerm: 2,
+    version: 10,
+    manager: RIVAL,
+    members: membersOf().map((seat) => ({ ...seat, role: seat.instanceId === RIVAL.instanceId ? 'manager' : 'member' })),
+  });
+  const state = termStateFor(stale);
+  const frame = snapshotFrameOf(higher, RIVAL);
+  const ctx = {
+    now: NOW,
+    localFrozen: 'manager-offline',
+    memberSeats: staleMemberSeats(),
+    handshakeHighest: { term: 2, version: 10, manager: { instanceId: RIVAL.instanceId, sessionId: RIVAL.sessionId, identityName: RIVAL.identityName } },
+    ledgerDigestOf: ledgerDigest,
+  };
+  const accepted = acceptManagerChange(state, frame, { ...ctx, catchupSource: { instanceId: RIVAL.instanceId } });
+  assert.equal(accepted.accepted, true, `期望受理，实际 ${accepted.reason}`);
+  assert.equal(accepted.reason, 'snapshot-catchup-accepted');
+  assert.equal(accepted.nextState.managerTerm, 2);
+  assert.equal(accepted.actions.includes('clear-freeze'), true, '采纳更高 term 台账即解除 manager-offline');
+  const unrequested = acceptManagerChange(state, frame, ctx);
+  assert.equal(unrequested.accepted, false);
+  assert.equal(unrequested.reason, 'source-not-member');
 });
 
 /* —— 握手目标面（设计 §2A.6②/§2A.7①）：名单成员靠 known-hosts 寻址、不泛扫 —— */

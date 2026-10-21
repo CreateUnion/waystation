@@ -1955,7 +1955,7 @@ function evaluateSameTermHandshake(state, local, frame, remote) {
     return;
   }
   if (Number.isInteger(remote.version) && remote.version > (localVersionOf(local) ?? 0)) {
-    requestSnapshotFrom(state, local, frame.from.instanceId);
+    requestSnapshotFrom(state, local, frame.from.instanceId, 'catchup');
     return;
   }
   if (local.role !== 'manager' && remote.role === 'manager' && remote.manager !== null) {
@@ -1971,8 +1971,11 @@ function adoptKnownManager(state, local, remote) {
   bump(state, 'managerAdoptedByHandshake');
 }
 
+/* 快照请求一律是台账追赶：缺省携 purpose:'catchup'（§7.1 据此放行冻结态成员应答）；
+ * 接线层（events 的 request-snapshot 动作）不传 purpose，也必须落到 catchup 上。
+ * 请求成功即登记选中来源，供受理侧在本请求上下文内放宽「名单成员」判据（名单陈旧面）。 */
 /** @param {string|null} [purpose] */
-export function requestSnapshotFrom(state, local, instanceId, purpose = null) {
+export function requestSnapshotFrom(state, local, instanceId, purpose = 'catchup') {
   const endpoint = endpointFor(state, local, instanceId);
   if (endpoint === undefined) {
     return false;
@@ -1985,7 +1988,29 @@ export function requestSnapshotFrom(state, local, instanceId, purpose = null) {
     ...(purpose === null ? {} : { purpose }),
   };
   const signer = presenceSignerOf(local);
-  return sendTo(state, local.collabId, instanceId, endpoint, 'snapshot', payload, { fromSessionId: signer?.sessionId }).ok === true;
+  const sent = sendTo(state, local.collabId, instanceId, endpoint, 'snapshot', payload, { fromSessionId: signer?.sessionId }).ok === true;
+  if (sent && purpose === 'catchup') {
+    rememberCatchupSource(state, local, instanceId);
+  }
+  return sent;
+}
+
+/* 追赶来源登记：termCtxOf 目前只把 acceptedManager 透传给任期判决，故选择结果挂在该记录上
+ * （合并已有字段，不覆盖更高 term 的受理记录）。选择按机器实例——应答会话可与握手会话不同。 */
+function rememberCatchupSource(state, local, instanceId) {
+  const runtime = m5RuntimeOf(state);
+  const seat = runtime.handshakeResponses.get(local.collabId)?.get(instanceId)?.seat;
+  const selection = { instanceId };
+  if (isPlainObject(seat) && typeof seat.sessionId === 'string' && seat.sessionId !== '') {
+    selection.sessionId = seat.sessionId;
+  }
+  for (const map of [runtime.acceptedManagers, runtime.acceptedManagerMap]) {
+    if (!(map instanceof Map)) {
+      continue;
+    }
+    const existing = map.get(local.collabId);
+    map.set(local.collabId, { ...(isPlainObject(existing) ? existing : {}), catchupSource: selection });
+  }
 }
 
 /* —— 接管（窗口内 takeover / 站长不可达 takeover-manual，设计 §2A.6/§2A.7） —— */
@@ -2085,7 +2110,8 @@ async function beginTakeOver(state, local, sessionId) {
     return { ok: false, message: `可达成员的任期为 ${highest.term}（高于本机 ${localTerm}）——已请求快照，请采纳后再发起接管` };
   }
   if (highest.term === localTerm && highest.version > localVersion) {
-    requestSnapshotFrom(state, local, highest.seat.instanceId);
+    /* 同 term 版本落后同样是追赶：必须携 purpose，否则冻结态成员按 §7.1 不应答。 */
+    requestSnapshotFrom(state, local, highest.seat.instanceId, 'catchup');
     return { ok: false, message: `可达成员的台账版本 ${highest.version} 高于本机——已请求快照，请采纳后再发起接管` };
   }
   const token = randomUUID();
@@ -2225,10 +2251,19 @@ function managerAnsweredHandshake(state, local) {
   return monoNow(state) - answered.at <= managerLossMs(state);
 }
 
+/* 本地已有的失联判定：冻结三态之外，探测结论（state.probes.offline）在冻结被快照受理清除后
+ * 仍然有效，直到一次成功探测——否则名单刷新解除 manager-offline 会让「完全没见过站长 presence」
+ * 被误判成可达。 */
+function managerKnownOffline(state, local) {
+  const runtime = m5RuntimeOf(state);
+  return runtime.frozen.get(local.collabId) === 'manager-offline'
+    || state.probes?.get?.(local.collabId)?.offline === true;
+}
+
 /* 站长可达性：本地冻结/失联超时为不可达；否则以 endpoint + presence 新鲜度为证据。 */
 export function managerUnreachable(state, local) {
   const runtime = m5RuntimeOf(state);
-  if (runtime.frozen.get(local.collabId) === 'manager-offline') {
+  if (managerKnownOffline(state, local)) {
     return true;
   }
   const manager = managerSeatOfLedger(state, local);

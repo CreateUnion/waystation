@@ -22,6 +22,9 @@
  *   ① 已受理但本地状态尚未推进（落盘/重启间隙）；② 本地已进入终态后，经受理的新站长恢复权威台账。
  * - handshakeHighest：{term,version,manager}——本轮 handshake 最高 pair；只服务 offline catch-up，
  *   不构成终态恢复/覆盖授权（终态 pair 的 manager 为 null）。
+ * - catchupSource（或 acceptedManager.catchupSource）：{instanceId}——本机刚发过 catch-up 快照请求的
+ *   目标机器，只在该请求上下文内把「名单陈旧、缺后入席成员」的来源放行给冻结态追赶；缺省 → 只认名单成员。
+ *   接线层 termCtxOf 目前只透传 acceptedManager，选择结果挂在该记录上（见 takeover.requestSnapshotFrom）。
  * - authorizedEvidence：{via,authorizedAt,term,manager}——fork 收敛证据，必须绑定快照；缺省/不匹配 → 保持冻结。
  * - suspended / handoverTarget：显式移交等待中的目标席位；终态恢复的 handover 证据另需 handoverBaseTerm
  *   且 baseTerm < 快照 term；缺省 → 不按 handover-pending 受理。
@@ -542,6 +545,32 @@ function isMemberSource(ctx, source) {
   return false;
 }
 
+/* 追赶来源：本机刚请求过快照的目标机器（requestSnapshotFrom 在发请求时登记）。
+ * 选择按机器实例比对而非席位——握手选中的是机器，应答快照的签发会话可能与握手会话不同；
+ * 只用于冻结态 catch-up，名单成员判据（isMemberSource）的其他调用路径不受影响。 */
+function isRequestedCatchupSource(ctx, source) {
+  const selection = catchupSelectionOf(ctx);
+  return selection !== null && isPlainObject(source) && selection.instanceId === source.instanceId;
+}
+
+function catchupSelectionOf(ctx) {
+  if (isPlainObject(ctx.catchupSource) && typeof ctx.catchupSource.instanceId === 'string' && ctx.catchupSource.instanceId !== '') {
+    return ctx.catchupSource;
+  }
+  const accepted = ctx.acceptedManager;
+  if (isPlainObject(accepted) && isPlainObject(accepted.catchupSource)
+    && typeof accepted.catchupSource.instanceId === 'string' && accepted.catchupSource.instanceId !== '') {
+    return accepted.catchupSource;
+  }
+  return null;
+}
+
+/* 名单陈旧导致的来源资格放宽必须同时满足：本机请求过该来源 + 快照恰为该轮握手最高 pair。
+ * 快照的 term/manager/version 判定仍走 A11/A12，不因来源放宽而改变。 */
+function isRequestedCatchupAnswer(ctx, source, snapshot) {
+  return isRequestedCatchupSource(ctx, source) && matchesHandshakeHighest(snapshot, ctx.handshakeHighest);
+}
+
 /* §2A.6：窗口以签发时长为本，偏移按事件时刻收敛；回拨/远期窗口都不得延长纠错窗。
  * baseAt 由接线层取自签发帧 effectiveAt（或本地开窗时刻）；缺失时退回绝对 endsAt 并封顶。 */
 function windowAcceptsTakeover(window, authorizedAt, ctx) {
@@ -773,7 +802,7 @@ function acceptSameTermSnapshot(state, snapshot, frame, ctx) {
   if (!sameSeat(snapshot.manager, state.manager)) {
     return frozen(state, 'snapshot-same-term-conflict');
   }
-  if (!sameTermSnapshotSourceAllowed(state, frame, ctx)) {
+  if (!sameTermSnapshotSourceAllowed(state, snapshot, frame, ctx)) {
     return rejected(state, 'snapshot-source-not-manager');
   }
   const windowResult = sameTermWindowOf(state, snapshot);
@@ -799,15 +828,16 @@ function sameTermSnapshotFrozen(state, ctx) {
   return null;
 }
 
-/* 同 term 名单快照只认现任站长席位（offline 冻结时按 §7.1 放行名单成员做 catch-up）；
- * 不接受 acceptedManager 之类的历史授权——同 term 的高 version 必须由当前站长自己签发。 */
-function sameTermSnapshotSourceAllowed(state, frame, ctx) {
+/* 同 term 名单快照只认现任站长席位（offline 冻结时按 §7.1 放行名单成员做 catch-up；
+ * 本地名单陈旧、缺后入席成员时，放行本机刚请求过且内容＝握手最高 pair 的应答者）。
+ * 不接受 acceptedManager 的历史授权——同 term 的高 version 必须由当前站长或本轮选中来源签发。 */
+function sameTermSnapshotSourceAllowed(state, snapshot, frame, ctx) {
   const source = sourceOf(frame, ctx);
   if (sameSeat(source, state.manager)) {
     return true;
   }
   if (ctx.localFrozen === 'manager-offline') {
-    return isMemberSource(ctx, source);
+    return isMemberSource(ctx, source) || isRequestedCatchupAnswer(ctx, source, snapshot);
   }
   return false;
 }
@@ -853,7 +883,9 @@ function snapshotFrozenResult(state, snapshot, frame, ctx) {
 }
 
 function acceptOfflineCatchup(state, snapshot, frame, ctx) {
-  if (!isMemberSource(ctx, sourceOf(frame, ctx))) {
+  const source = sourceOf(frame, ctx);
+  /* 名单成员之外，只放行本机刚请求过的追赶来源；其快照仍须与握手最高 pair 完全一致（下一判据）。 */
+  if (!isMemberSource(ctx, source) && !isRequestedCatchupSource(ctx, source)) {
     return rejected(state, 'source-not-member');
   }
   if (matchesHandshakeHighest(snapshot, ctx.handshakeHighest)) {
