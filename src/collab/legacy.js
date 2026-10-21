@@ -115,7 +115,17 @@ function memberRoleOf(dir) {
 }
 
 function participationEvidenceOf(dir) {
-  return seatsWritten(dir) || snapshotWritten(dir);
+  /* 主动离席后的本地副本：成员记录 state=left 是明确的退出事实，不是半写；不按 recovery 只读，
+   * 否则最后一名本机会话退出讨论后目录会被判死，重新受邀也写不进来。 */
+  return memberStateOf(dir) === LOCAL_LEFT_STATE || seatsWritten(dir) || snapshotWritten(dir);
+}
+
+function memberStateOf(dir) {
+  try {
+    return JSON.parse(readFileSync(join(dir, MEMBER_FILE_NAME), 'utf8'))?.state ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /* 快照证据要求可解析且带名单：半截/坏快照不能单独证明「已入席」。 */

@@ -17,7 +17,7 @@ import {
   recoveryPath,
   writeRecovery,
 } from '../src/collab/migration.js';
-import { assertWritable, markLegacyCompleted } from '../src/collab/legacy.js';
+import { assertWritable, classifyCollabDir, markLegacyCompleted } from '../src/collab/legacy.js';
 import { writeCarrier } from '../src/collab/carrier.js';
 
 const TS = '2026-10-21T08:00:00.000Z';
@@ -55,6 +55,24 @@ function legacyMemberRecord() {
     decision: null,
   };
 }
+
+test('判档：成员记录 state=left 是有效离席副本；未离席且无参与证据仍判恢复', (t) => {
+  const leftDir = collabDirOf(t);
+  writeCarrier(leftDir, sessionSeatsCarrier());
+  writeFileSync(join(leftDir, 'member.json'), JSON.stringify({
+    collabId: 'collab-1', role: 'member', state: 'left', name: '联调项目', topic: '主题', mode: 'managed',
+    manager: { instanceId: 'inst-a', identityName: '主机甲' }, roster: [], endpoints: {}, decision: 'approved',
+  }));
+  assert.equal(classifyCollabDir(leftDir).kind, 'session-seats', '主动离席的本地副本不是半写');
+
+  const pendingDir = collabDirOf(t);
+  writeCarrier(pendingDir, sessionSeatsCarrier());
+  writeFileSync(join(pendingDir, 'member.json'), JSON.stringify({
+    collabId: 'collab-1', role: 'member', state: 'proposed', name: '联调项目', topic: '主题', mode: 'managed',
+    manager: { instanceId: 'inst-a', identityName: '主机甲' }, roster: [], endpoints: {}, decision: null,
+  }));
+  assert.equal(classifyCollabDir(pendingDir).kind, 'recovery', '无席位/快照/离席证据仍按半写');
+});
 
 test('migration/recovery 形态：字段齐备才通过，半写不得冒充 legacy', () => {
   assert.equal(isMigrationShape({ legacy: true, archivedAt: TS, reason: 'legacy-format' }), true);
