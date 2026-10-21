@@ -21,7 +21,7 @@ const FORUM_CHANNEL_TYPES = new Set(['join', 'history-request', 'history-bundle'
  * 一律拒绝并计数——六类在 managed 有处理器且以 role=manager 分派，讨论发起人恰是 manager：
  * 受理即让台账主题 / 任务板被域外帧改写（设计 §3「主题创建时定死」，本白名单的由来）。
  * notice 按事件再分（见 forumTypeAllowed）。 */
-const FORUM_ALLOWED_TYPES = new Set(['post', 'approve', 'decline', 'withdraw', 'leave', 'end']);
+const FORUM_ALLOWED_TYPES = new Set(['post', 'approve', 'decline', 'withdraw', 'leave', 'end', 'seat-presence']);
 
 /* notice 的讨论侧受理面：仅名单通告（roster）。它是讨论加入链在用的事件——发起人收齐
  * 新成员回应后广播名单变更（afterInviteResponse 的 active 分支对讨论同样生效），既有链路按

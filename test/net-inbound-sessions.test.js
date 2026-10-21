@@ -347,6 +347,28 @@ test('零成功扇出仍发机器级终态回报：from.sessionId 取原帧发�
   assert.equal(inbound.stats().fanoutDropped, 2);
 });
 
+test('仅暂存（无实际注入）时回报签发席位取原帧发件席位；有注入时取注入席位', async (t) => {
+  const stagedOnly = makeInbound(t, {
+    seats: [seat('sess-b1')],
+    injector: makeInjector({ 'sess-b1': { ok: true, staged: true } }),
+  });
+  const stagedFrame = frame({ toSessions: ['sess-b1'] });
+  stagedOnly.inbound.onFrame(createFakeConnection(), stagedFrame);
+  await waitFor(() => reportsOf(stagedOnly.dispatch).length === 1);
+  const stagedReport = reportsOf(stagedOnly.dispatch)[0];
+  assert.equal(stagedOnly.inbound.localSeatDeliveryOf(stagedFrame.msgId, 'sess-b1').status, 'staged');
+  assert.equal(stagedReport.from.sessionId, stagedFrame.from.sessionId, '仅暂存不得用暂存席签发回报');
+
+  const mixed = makeInbound(t, {
+    seats: [seat('sess-b1'), seat('sess-b2')],
+    injector: makeInjector({ 'sess-b2': { ok: true, staged: true } }),
+  });
+  const mixedFrame = frame({ toSessions: ['sess-b1', 'sess-b2'] });
+  mixed.inbound.onFrame(createFakeConnection(), mixedFrame);
+  await waitFor(() => reportsOf(mixed.dispatch).length === 1);
+  assert.equal(reportsOf(mixed.dispatch)[0].from.sessionId, 'sess-b1', '有实际注入时用首个注入席位签发');
+});
+
 test('吸收重复（帖去重命中）同样发零成功终态回报，携原帧签发席位', async (t) => {
   const { inbound, dispatch } = makeInbound(t, {
     hooks: { consume: () => ({ sessionDeliver: false, wasInjected: true }) },

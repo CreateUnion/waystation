@@ -378,7 +378,7 @@ async function acceptSeatFanoutFrame(state, box, frame, connection, meta) {
     record.fanout.complete = true;
     persistRecord(state, box, record);
     if (isAbsorbedDuplicate(frame, consumed)) {
-      sendDeliveryReport(state, frame, connection, firstSuccessOf(record));
+      sendDeliveryReport(state, frame, connection, firstInjectedSeatOf(record));
     }
     return;
   }
@@ -388,9 +388,9 @@ async function acceptSeatFanoutFrame(state, box, frame, connection, meta) {
     state.counters.sessionDelivered++;
     await runHook(state, state.sessionDelivered, frame, meta);
   }
-  /* 零成功也必须回报机器级终态（设计 §5.3/D11）：回报签发席位取原帧的 from.sessionId
-   * （历史发件身份，不要求仍活跃）；发送侧由此不必等到 TTL 才收敛。 */
-  sendDeliveryReport(state, frame, connection, successSeat);
+  /* 零注入（含仅暂存）也必须回报机器级终态（设计 §5.3/D11）：签发席位取原帧的 from.sessionId
+   * （历史发件身份，不要求仍活跃）；有实际注入时才用首个注入席位。发送侧由此不必等 TTL 收敛。 */
+  sendDeliveryReport(state, frame, connection, firstInjectedSeatOf(record));
 }
 
 /* 本帧的目标席位（本机可注入面）：toSessions 给出时只取列表内席位——其他目标按坏目标隔离丢弃
@@ -603,6 +603,17 @@ function firstSuccessOf(record) {
   return null;
 }
 
+/* 回报签发席位只认「实际注入」的席位（injected / duplicate）；暂存不算——仅暂存时按零成功处置，
+ * 回报用原帧的 from.sessionId（历史发件身份）。 */
+function firstInjectedSeatOf(record) {
+  for (const [sessionId, outcome] of Object.entries(record.fanout?.outcomes ?? {})) {
+    if (outcome === 'injected' || outcome === 'duplicate') {
+      return sessionId;
+    }
+  }
+  return null;
+}
+
 /* 重复帧补扇出（D11/H-C6）：已完成的席位跳过，pending 里的席位补投；随后重发机器级回报（幂等）。
  * 补扇出一律复用 inbox 已存的原帧（剥离 receivedAt / fanout）：同 msgId 的重复帧若换了 type/payload
  * 即为内容与账不一致，拒绝补扇出并计数（仍保留 ack——链路确认与内容裁定是两件事）。
@@ -634,7 +645,7 @@ async function resumeDuplicate(state, box, frame, connection, meta) {
     return;   // 拉取两件套是请求-应答：不给终态回报（与首份副本同一口径）
   }
   state.counters.reportsResent++;
-  sendDeliveryReport(state, stored, connection, firstSuccessOf(record));
+  sendDeliveryReport(state, stored, connection, firstInjectedSeatOf(record));
 }
 
 /* 同 msgId 的内容一致性：类型与载荷（重复帧是同一发送的重放，内容必须逐字等价）。 */
@@ -778,9 +789,10 @@ function sendDeliveryReport(state, frame, connection, sessionId) {
   }
 }
 
-/* 回报签发席位（设计 §7.1）：首个成功注入 / 暂存的本机席位；零成功时用原帧的 from.sessionId
- * （历史发件身份，不要求该席位仍活跃）。不得生成缺 from.sessionId 的 cap=2 帧——对端协议层会拒收，
- * 发送侧只能等 TTL。旧版无 sessionId 的帧维持无 from 的兼容回执（假 dispatch/旧测试面）。 */
+/* 回报签发席位（设计 §7.1 与 2026-10-21 裁定）：只在实际注入（injected / duplicate）时用该本机
+ * 席位；仅暂存或零成功一律用原帧的 from.sessionId（历史发件身份，不要求该席位仍活跃）。
+ * 不得生成缺 from.sessionId 的 cap=2 帧——对端协议层会拒收，发送侧只能等 TTL。
+ * 旧版无 sessionId 的帧维持无 from 的兼容回执（假 dispatch/旧测试面）。 */
 function reportIdentityOf(state, frame, sessionId) {
   const signer = validSessionIdOf(sessionId) ?? validSessionIdOf(frame.from?.sessionId);
   return signer === null ? undefined : { ...state.self, sessionId: signer };

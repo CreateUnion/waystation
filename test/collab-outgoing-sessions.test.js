@@ -5,7 +5,7 @@ import { createCollab, deliveryStatusOf, endCollab, localSeatDeliveryOf, pushSna
 import { isLedgerShape } from '../src/collab/model.js';
 import { loadLedger } from '../src/collab/store.js';
 import { seatFilePath } from '../src/paths.js';
-import { PROTOCOL_VERSION, newMsgId, validateMessage, withCollabCapability } from '../src/net/protocol.js';
+import { COLLAB_CAPABILITY, PROTOCOL_VERSION, newMsgId, validateMessage, withCollabCapability } from '../src/net/protocol.js';
 import { makeTempDir, waitFor } from './helpers.js';
 
 const SELF = { instanceId: 'inst-self', identityName: '本机', port: 7321 };
@@ -98,6 +98,7 @@ test('本机旁路：目标全在本机时不调用 dispatch.send，逐席调用
   assert.equal(result.ok, true);
   assert.deepEqual(sent, [], '本机目标不得走网络发送');
   assert.deepEqual(injected.map((entry) => entry.sessionId), ['sess-local2']);
+  assert.equal(injected[0].frame.cap, COLLAB_CAPABILITY, '本机注入帧同样经 withCollabCapability 盖 cap=2');
   assert.equal(result.results[0].local, true);
   assert.equal(typeof result.results[0].msgId, 'string');
 });

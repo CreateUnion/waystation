@@ -1,5 +1,5 @@
 import { isIP } from 'node:net';
-import { COLLAB_CAPABILITY, COLLAB_MODES, DEFAULT_COLLAB_MODE, ID_PATTERN, MAX_COLLAB_MEMBERS, MAX_MESSAGE_TEXT_CHARS, MAX_REASON_CHARS, MAX_TOPIC_CHARS, POST_KINDS, PROTOCOL_VERSION, isCollabMode, isIdentityName, isPort, isPresentationText, newMsgId } from '../net/protocol.js';
+import { COLLAB_MODES, DEFAULT_COLLAB_MODE, ID_PATTERN, MAX_COLLAB_MEMBERS, MAX_MESSAGE_TEXT_CHARS, MAX_REASON_CHARS, MAX_TOPIC_CHARS, POST_KINDS, PROTOCOL_VERSION, isCollabMode, isIdentityName, isPort, isPresentationText, newMsgId, withCollabCapability } from '../net/protocol.js';
 import { MAX_FORUM_MEMBERS, MAX_LOCAL_COLLABS, canTransition, isArchived, newCollabId } from './model.js';
 import { createPostsStore, displayOrderOf, newPostId } from './posts.js';
 import { createMembersStore } from './members.js';
@@ -1547,16 +1547,15 @@ function localInjectorOf(state, local, type) {
 }
 
 function localFrameOf(state, local, fromSessionId, { type, payload }) {
-  return {
+  return withCollabCapability({
     v: PROTOCOL_VERSION,
-    cap: COLLAB_CAPABILITY,
     msgId: newMsgId(),
     type,
     collabId: local.collabId,
     from: { instanceId: state.self.instanceId, identityName: state.self.identityName, port: state.self.port, sessionId: fromSessionId },
     ts: new Date().toISOString(),
     payload,
-  };
+  });
 }
 
 async function injectOneSeat(inject, collabId, sessionId, frame) {
