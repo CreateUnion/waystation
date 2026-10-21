@@ -1,12 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { appendLine, writeJsonAtomic } from '../storage.js';
-import { autoOfferFilePath, collabDir, departedFilePath, ensureDir, managerPendingFilePath } from '../paths.js';
+import { autoOfferFilePath, collabDir, collabRunDir, departedFilePath, ensureDir, managerPendingFilePath } from '../paths.js';
 import { newMsgId } from '../net/protocol.js';
 import { isArchived } from './model.js';
 import {
-  currentManagerIdOf, isLocalArchivedState, localModeOf, localRosterOf, localStateOf, localVersionOf, persistMember, removeLocalSeat,
+  currentManagerIdOf, isLocalArchivedState, localModeOf, localRosterOf, localStateOf, localVersionOf, persistMember, persistSnapshot, removeLocalSeat,
 } from './local.js';
 import { checkFrozenDeadlines } from './freeze.js';
 import { adoptNewManager, endpointFor, governanceTargets, notifyLocal, promoteToManager, relayGovernance, sendTo, sendToRoster } from './outgoing.js';
@@ -59,7 +59,7 @@ function positiveMs(value, fallback) {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
-/* 接线期运行时容器（惰性挂载在服务 state 上；M2 的 state 构造不感知本模块）。 */
+/* 接线期运行时容器（惰性挂载在服务 state 上；服务装配不感知本模块）。 */
 export function m5RuntimeOf(state) {
   if (state.m5Runtime === undefined) {
     const runtime = {
@@ -89,7 +89,7 @@ export function m5RuntimeOf(state) {
   return state.m5Runtime;
 }
 
-/* —— 台账任期面归一（兼容 M2 尚未迁移的旧台账；不改写数据面） —— */
+/* —— 台账任期面归一（兼容尚未迁移的旧台账；不改写数据面） —— */
 
 export function ledgerTermOf(ledger) {
   return Number.isInteger(ledger?.managerTerm) && ledger.managerTerm >= 1 ? ledger.managerTerm : 1;
@@ -173,7 +173,7 @@ export function presenceSignerOf(local) {
   return [...seats].sort((left, right) => (left.sessionId < right.sessionId ? -1 : 1))[0];
 }
 
-/* —— 离席留痕与冻结原因持久化（设计 §6/§6.2；M2 启动/装配处调用） —— */
+/* —— 离席留痕与冻结原因持久化（设计 §6/§6.2；服务启动/装配处调用） —— */
 
 export function appendDeparted(state, collabId, record) {
   try {
@@ -195,7 +195,7 @@ export function appendDeparted(state, collabId, record) {
   }
 }
 
-/* 冻结原因落载体（M7 只读展示面）；展示字段不改台账形态，故不写台账行。
+/* 冻结原因落载体（观察窗只读展示面）；展示字段不改台账形态，故不写台账行。
  * 空值/非字符串按「清除」处理——不得把 null/'' 写进任意一侧（否则会遮蔽另一侧的有效值）。 */
 export function persistFreezeReason(state, collabId, reason) {
   const local = state.collabs.get(collabId);
@@ -213,7 +213,7 @@ export function persistFreezeReason(state, collabId, reason) {
   return writeCarrierFreezeReason(state, collabId, reason);
 }
 
-/* 解除冻结/恢复/接管成功时清除冻结原因（载体与成员记录两侧；台账字段由 M7 读侧兜底）。 */
+/* 解除冻结/恢复/接管成功时清除冻结原因（载体与成员记录两侧；台账字段由观察窗读侧兜底）。 */
 export function clearFreezeReason(state, collabId) {
   const local = state.collabs.get(collabId);
   if (local === undefined) {
@@ -265,6 +265,11 @@ export function applyManagerFreeze(state, collabId, reason) {
   freezeMemberState(local, runtime, collabId);
   persistFreezeReason(state, collabId, reason);
   suspendLocal(state, local, reason, null);
+  /* 冻结是「保持只读直到收敛」：既有停写截止时间（显式/自动移交的 expiresAt+拨号）不得在
+   * 冻结期间到期解挂——manager-pending 尤其只能等签发帧或更高任期。 */
+  if (local.suspended !== null) {
+    local.suspended.deadline = null;
+  }
   bump(state, 'managerFreezes');
   state.log.warn('站长任期冻结——停写并等待收敛', { collabId, reason });
   notifyLocal(state, local, freezeNoticeOf(reason));
@@ -340,9 +345,13 @@ export function resumeLocal(state, local, reason) {
 }
 
 function checkSuspensionDeadlines(state, now) {
+  const frozen = m5RuntimeOf(state).frozen;
   for (const local of state.collabs.values()) {
     if (local.suspended === null || local.suspended.deadline === null) {
       continue;
+    }
+    if (frozen.has(local.collabId)) {
+      continue;   // 冻结态只读是收敛前提：不得因停写计时到期而提前恢复
     }
     if (now >= local.suspended.deadline) {
       bump(state, 'suspensionExpired');
@@ -380,11 +389,46 @@ export function startPresenceTicker(state) {
   if (runtime.presenceTimer !== null) {
     return;
   }
+  runLifecycleRestore(state);
   runtime.presenceTimer = setInterval(() => {
     runPresenceTick(state);
   }, positiveMs(state.config.seatPresenceIntervalMs, DEFAULT_PRESENCE_INTERVAL_MS));
   if (typeof runtime.presenceTimer.unref === 'function') {
     runtime.presenceTimer.unref();
+  }
+}
+
+/* 启动恢复（契约 §2A.1/§6.2）：本模块恢复 auto-offer/manager-pending；目标侧 offer 与
+ * handover-pending 由 handover 注册的恢复面处理——避免 takeover→handover 的模块环。 */
+const lifecycleRestorers = [];
+
+export function registerLifecycleRestorer(restorer) {
+  if (typeof restorer === 'function' && !lifecycleRestorers.includes(restorer)) {
+    lifecycleRestorers.push(restorer);
+  }
+}
+
+function runLifecycleRestore(state) {
+  const runtime = m5RuntimeOf(state);
+  if (runtime.lifecycleRestored === true) {
+    return;
+  }
+  runtime.lifecycleRestored = true;
+  for (const collabId of state.collabs.keys()) {
+    try {
+      restoreAutoTransferState(state, collabId);
+    } catch (error) {
+      bump(state, 'eventFailures');
+      state.log.warn('生命周期恢复异常（已隔离）', { collabId, reason: error?.message });
+    }
+  }
+  for (const restorer of lifecycleRestorers) {
+    try {
+      restorer(state);
+    } catch (error) {
+      bump(state, 'eventFailures');
+      state.log.warn('交接恢复异常（已隔离）', { reason: error?.message });
+    }
   }
 }
 
@@ -398,6 +442,10 @@ export function stopPresenceTicker(state) {
     clearTimeout(timer);
   }
   runtime.autoAcceptTimers.clear();
+  for (const timer of runtime.syncWatch?.values?.() ?? []) {
+    clearTimeout(timer);
+  }
+  runtime.syncWatch?.clear?.();
 }
 
 export function runProbeTick(state) {
@@ -487,8 +535,15 @@ function applyProbeResult(state, local, probeState, result) {
   }
 }
 
-function managerLossMs(state) {
+export function managerLossTimeoutMsOf(state) {
   return positiveMs(state.config.managerLossTimeoutMs ?? state.config.managerOfflineMs, DEFAULT_MANAGER_LOSS_MS);
+}
+function managerLossMs(state) {
+  return managerLossTimeoutMsOf(state);
+}
+
+function dialTimeoutMs(state) {
+  return positiveMs(state.config.dialTimeoutMs, DEFAULT_DIAL_MS);
 }
 
 function seatTimeoutMs(state) {
@@ -511,12 +566,13 @@ function handoverConfirmMs(state) {
 
 export function runPresenceTick(state) {
   try {
-    const now = nowMs(state);
-    sendPresenceSweep(state, now);
-    sweepPresenceExpiry(state, monoNow(state));
-    sweepSeatGrace(state, now);
-    checkManagerLoss(state, now);
-    resendPendingChanges(state, now);
+    const wallNow = nowMs(state);
+    const mono = monoNow(state);
+    sendPresenceSweep(state, wallNow);
+    sweepPresenceExpiry(state, mono);
+    sweepSeatGrace(state, wallNow);
+    checkManagerLoss(state, mono);
+    resendPendingChanges(state, wallNow);
   } catch (error) {
     state.log.error('席位心跳定时器异常（已隔离）', { reason: error.message });
   }
@@ -548,11 +604,26 @@ function sendPresenceFor(state, local, signer, now) {
       bump(state, 'presenceSkippedNoEndpoint');
       continue;
     }
-    const sent = sendTo(state, local.collabId, instanceId, endpoint, 'seat-presence', payload, { fromSessionId: signer.sessionId });
-    if (sent.ok === true) {
+    /* 心跳即发即弃（设计 §5.6）：不走可靠出箱，失败只计数不重试排队。 */
+    const sent = sendPresenceOnce(state, local, instanceId, endpoint, payload, signer);
+    if (sent === true) {
       bump(state, 'presenceSent');
     }
   }
+}
+
+function sendPresenceOnce(state, local, instanceId, endpoint, payload, signer) {
+  if (typeof state.sendDirect === 'function') {
+    const result = state.sendDirect({
+      collabId: local.collabId,
+      to: { instanceId, address: endpoint.address, port: endpoint.port },
+      type: 'seat-presence',
+      payload,
+      fromSessionId: signer.sessionId,
+    });
+    return result.ok === true;
+  }
+  return sendTo(state, local.collabId, instanceId, endpoint, 'seat-presence', payload, { fromSessionId: signer.sessionId }).ok === true;
 }
 
 function presenceTargetsOf(state, local) {
@@ -597,7 +668,7 @@ export function handleSeatPresenceFrame(state, frame, meta) {
     bump(state, 'presenceUnknownCollab');
     return;
   }
-  const peer = transportPeerOf(state, local, meta);
+  const peer = transportPeerOf(meta);
   const notice = frame.payload;
   const now = monoNow(state);
   const result = applySeatPresence(m5RuntimeOf(state).presence, notice, now, {
@@ -612,6 +683,55 @@ export function handleSeatPresenceFrame(state, frame, meta) {
   }
   bump(state, 'presenceListsIn');
   noteManagerEvidenceFromList(state, local, notice, now);
+  relayForumPresence(state, local, frame, notice);
+}
+
+/* forum：中继把成员的原始心跳转发给其余成员（from 保持原发机器），接收侧按 originMsgId +
+ * 当前中继连接放行（设计 §2A.9）。转达副本不再二次转发（防环）。 */
+function relayForumPresence(state, local, frame, notice) {
+  if (!isPresenceRelayable(state, local, notice)) {
+    return;
+  }
+  const originMsgId = typeof frame.msgId === 'string' ? frame.msgId : '';
+  if (originMsgId === '') {
+    return;
+  }
+  const relayed = forwardPresenceToPeers(state, local, frame, notice, originMsgId);
+  if (relayed > 0) {
+    bump(state, 'presenceRelayed');
+  }
+}
+
+function isPresenceRelayable(state, local, notice) {
+  if (localModeOf(local) !== 'forum' || relayInstanceOf(state, local) !== state.self.instanceId) {
+    return false;
+  }
+  return typeof notice.originMsgId !== 'string' || notice.originMsgId === '';
+}
+
+function forwardPresenceToPeers(state, local, frame, notice, originMsgId) {
+  let relayed = 0;
+  for (const entry of localRosterOf(local)) {
+    if (!isPresenceForwardTarget(state, frame, entry)) {
+      continue;
+    }
+    const endpoint = endpointFor(state, local, entry.instanceId);
+    if (endpoint === undefined) {
+      continue;
+    }
+    const sent = sendTo(state, local.collabId, entry.instanceId, endpoint, 'seat-presence', { ...notice, originMsgId }, {
+      from: frame.from,
+      fromSessionId: frame.from.sessionId,
+    });
+    if (sent.ok === true) {
+      relayed++;
+    }
+  }
+  return relayed;
+}
+
+function isPresenceForwardTarget(state, frame, entry) {
+  return entry.instanceId !== state.self.instanceId && entry.instanceId !== frame.from.instanceId;
 }
 
 /* 直连协作帧刷新（转达副本不刷新由 presence 表判定）；只刷新该帧的发送席位。 */
@@ -620,31 +740,19 @@ export function noteDirectFramePresence(state, frame, meta) {
   if (local === undefined || frame.type === 'seat-presence') {
     return;
   }
-  const peer = transportPeerOf(state, local, meta);
+  const peer = transportPeerOf(meta);
   const now = monoNow(state);
   const result = applyDirectFrame(m5RuntimeOf(state).presence, frame, now, { peerInstanceId: peer });
   if (result.refreshed === true) {
     bump(state, 'presenceDirectRefreshed');
+    noteManagerEvidence(state, local, frame.from?.instanceId, now);
   }
-  noteManagerEvidence(state, local, frame.from?.instanceId, now);
 }
 
-/* 传输对端实例：优先注入的 meta.peerInstanceId（M3 后续提供）；否则按已知端点地址反查。
- * 查不到即 null——presence 侧按 fail-closed 拒收（不拿帧内 from 自证）。 */
-function transportPeerOf(state, local, meta) {
-  if (typeof meta?.peerInstanceId === 'string' && meta.peerInstanceId !== '') {
-    return meta.peerInstanceId;
-  }
-  const address = typeof meta?.remoteAddress === 'string' ? meta.remoteAddress : '';
-  if (address === '') {
-    return null;
-  }
-  for (const [instanceId, endpoint] of local.endpoints) {
-    if (instanceId !== state.self.instanceId && endpoint.address === address) {
-      return instanceId;
-    }
-  }
-  return null;
+/* 传输对端实例必须由连接层给出（meta.peerInstanceId，设计 §2A.9「只信直连」）；
+ * 不得取帧内 from，也不得按地址反查——两者都会让发送方自证身份（fail-closed）。 */
+function transportPeerOf(meta) {
+  return typeof meta?.peerInstanceId === 'string' && meta.peerInstanceId !== '' ? meta.peerInstanceId : null;
 }
 
 function noteManagerEvidence(state, local, instanceId, now) {
@@ -713,7 +821,21 @@ function removeExpiredRemoteSeat(state, local, entry) {
     ledger.events = appendEvent(ledger, rosterLeaveEventOf(row, 'presence-timeout', ledger));
   });
   if (applied !== null) {
+    releaseJoiningOf(state, local.collabId, row.sessionId);
     bump(state, 'seatsRemovedRemote');
+  }
+}
+
+/* 席位移除生命周期收尾：未确认的两段式 joining 记录不得跨离席残留。 */
+function releaseJoiningOf(state, collabId, sessionId) {
+  if (typeof sessionId !== 'string' || sessionId === '') {
+    return;
+  }
+  try {
+    state.join?.releaseJoining?.(collabId, sessionId);
+  } catch (error) {
+    bump(state, 'eventFailures');
+    state.log.warn('未确认入席记录释放失败（已隔离）', { collabId, sessionId, reason: error?.message });
   }
 }
 
@@ -770,7 +892,8 @@ function checkManagerLoss(state, now) {
   }
 }
 
-/* 进程刚启动/从未收到站长直连帧：以启动时刻起算，避免重启即冻结。 */
+/* 进程刚启动/从未收到站长直连帧：以启动时刻（单调钟）起算，避免重启即冻结。
+ * managerEvidenceAt 只存单调钟读数——presence 与直连帧写入同一域，墙钟读数绝不混入。 */
 function lastManagerEvidence(state, local, now) {
   const runtime = m5RuntimeOf(state);
   const seen = runtime.managerEvidenceAt.get(local.collabId);
@@ -781,7 +904,7 @@ function lastManagerEvidence(state, local, now) {
   return now;
 }
 
-/* —— 会话宽限与离席（M2 在桥注销时调用 noteSeatClosed） —— */
+/* —— 会话宽限与离席（桥注销时由服务层调用 noteSeatClosed） —— */
 
 export function noteSeatClosed(state, collabId, sessionId, at = null) {
   const local = state.collabs.get(collabId);
@@ -830,10 +953,6 @@ function closeSeatAfterGrace(state, local, sessionId, now) {
 
 /* 站长会话关闭（机器在线）：宽限到期后按 joinSeq 选可达成员自动移交；无成员则写终态。 */
 function closeManagerSeat(state, local, seat, now) {
-  removeLocalSeat(local, seat.sessionId, { persist: true, dataDir: state.dataDir });
-  /* 台账仍在本机时角色以台账为准：席位缓存退出不得让本机提前变成员，
-   * 否则自动移交与签发路径会读不到本地台账（席位态只是缓存）。 */
-  local.role = 'manager';
   appendDeparted(state, local.collabId, {
     instanceId: state.self.instanceId,
     sessionId: seat.sessionId,
@@ -842,11 +961,17 @@ function closeManagerSeat(state, local, seat, now) {
     at: new Date(now).toISOString(),
   });
   const others = local.ledger.members.filter((member) => member.role !== 'manager');
+  /* 席位保留到移交发帧之后：闭塞的站长席位仍是本机唯一可签发的身份（fromSessionId），
+   * 先移除会让 auto-offer/变更广播因无席位署名而被发送面拒绝。 */
+  if (others.length > 0) {
+    autoTransfer(state, { collabId: local.collabId, managerSessionId: seat.sessionId });
+  }
+  removeLocalSeat(local, seat.sessionId, { persist: true, dataDir: state.dataDir });
+  /* 台账仍在本机时角色以台账为准：席位缓存退出不得让本机提前变成员。 */
+  local.role = 'manager';
   if (others.length === 0) {
     completeTerminalCollab(state, local);
-    return;
   }
-  autoTransfer(state, { collabId: local.collabId, managerSessionId: seat.sessionId });
 }
 
 /* 成员会话关闭：作者广播 leave；managed 站长核移除名单行并刷新快照。 */
@@ -869,6 +994,11 @@ function closeMemberSeat(state, local, seat, now) {
 function leaveClosedManagedSeat(state, local, seat) {
   if (local.role !== 'manager') {
     informManagerOfLeave(state, local, seat);
+    if (localSeatsOf(local).length === 0 && managerUnreachable(state, local)) {
+      /* 站长离线且本机最后一人离席：写本地只读终态副本（设计 §3.4），不冒充权威台账。 */
+      writeLocalTerminalCopy(state, local);
+      return;
+    }
     clearLocalParticipation(state, local);
     return;
   }
@@ -879,6 +1009,7 @@ function leaveClosedManagedSeat(state, local, seat) {
       ledger.members = ledger.members.filter((member) => member !== row);
       ledger.events = appendEvent(ledger, rosterLeaveEventOf(row, 'session-closed', ledger));
     });
+    releaseJoiningOf(state, local.collabId, seat.sessionId);
   }
   broadcastRosterRefresh(state, local);
   if (localSeatsOf(local).length === 0 && !hasManagerRow(local.ledger)) {
@@ -954,6 +1085,42 @@ function broadcastRosterRefresh(state, local) {
 
 function hasManagerRow(ledger) {
   return ledger.members.some((member) => member.role === 'manager');
+}
+
+/* 成员核的本地只读终态副本（设计 §3.4）：站长已离线、最后一人离席时写 snapshot.json，
+ * 名单清空、manager:null、managerTerm 保留、version+1、localTerminal:true；不写共享权威台账。
+ * 更高 term 的权威台账到达时由快照受理面覆盖。 */
+export function writeLocalTerminalCopy(state, local) {
+  const source = local.snapshot?.ledger ?? local.ledger;
+  if (!isPlainObject(source)) {
+    return false;
+  }
+  const terminal = structuredClone(source);
+  terminal.status = 'completed';
+  terminal.members = [];
+  terminal.manager = null;
+  terminal.version = (Number.isInteger(terminal.version) ? terminal.version : 1) + 1;
+  terminal.updatedAt = new Date().toISOString();
+  terminal.endedAt = terminal.updatedAt;
+  terminal.localTerminal = true;
+  delete terminal.managerWindow;
+  local.snapshot = {
+    version: terminal.version,
+    digest: ledgerDigest(terminal),
+    receivedAt: terminal.updatedAt,
+    from: { instanceId: state.self.instanceId, identityName: state.self.identityName },
+    ledger: terminal,
+  };
+  persistSnapshot(state, local);
+  if (local.member !== null && typeof local.member === 'object') {
+    local.member.state = 'completed';
+    local.member.archivedAt = terminal.updatedAt;
+    persistMember(state, local);
+  }
+  local.mute?.clear?.();
+  bump(state, 'localTerminalCopies');
+  state.log.info('站长离线且最后一人离席——已写本地只读终态副本', { collabId: local.collabId });
+  return true;
 }
 
 /* 最后一人离席：终态空名单、manager:null、managerTerm 保留、version+1（D17）。 */
@@ -1042,17 +1209,21 @@ function candidateSeatsOf(state, local, runtime, prevManager, excluded) {
   return autoSuccessorCandidates(runtime.presence, seats, {
     collabId: local.collabId,
     prevManager,
-    now: nowMs(state),
+    now: monoNow(state),
     timeoutMs: seatTimeoutMs(state),
-    hasEndpoint: (seat) => endpointFor(state, local, seat.instanceId) !== undefined,
+    /* 同机席位不需要网络端点：自动移交走核内旁路（设计 §2A.5 的「机器仍在线」含同机多会话）。 */
+    hasEndpoint: (seat) => seat.instanceId === state.self.instanceId || endpointFor(state, local, seat.instanceId) !== undefined,
     departed: (seat) => runtime.departed(local.collabId, seat),
   }).filter((seat) => excluded === null || !sameSeat(seat, excluded));
 }
 
 function dispatchAutoOffer(state, local, prevManager, target) {
   const runtime = m5RuntimeOf(state);
-  const endpoint = endpointFor(state, local, target.instanceId);
-  if (endpoint === undefined) {
+  if (local.role !== 'manager' || local.ledger === null) {
+    return { ok: false, reason: 'not-manager' };
+  }
+  const endpoint = target.instanceId === state.self.instanceId ? undefined : endpointFor(state, local, target.instanceId);
+  if (target.instanceId !== state.self.instanceId && endpoint === undefined) {
     return { ok: false, reason: 'target-unreachable' };
   }
   const ledger = structuredClone(local.ledger);
@@ -1067,17 +1238,40 @@ function dispatchAutoOffer(state, local, prevManager, target) {
     version: ledger.version,
     digest: ledgerDigest(ledger),
     ledger,
+    endpoints: Object.fromEntries(local.endpoints),
     expiresAt,
     expiresAtMs: Date.parse(expiresAt),
   };
   runtime.autoPending.set(local.collabId, offer);
   broadcastAutoOffer(state, local, offer);
   persistAutoOffer(state, local, offer);
-  sendAutoOfferFrame(state, local, offer, target, endpoint);
-  suspendLocal(state, local, 'handover-pending', offer.expiresAtMs + positiveMs(state.config.dialTimeoutMs, DEFAULT_DIAL_MS));
+  suspendLocal(state, local, 'handover-pending', offer.expiresAtMs + dialTimeoutMs(state));
   armAutoAcceptDeadline(state, local, offer);
+  if (target.instanceId === state.self.instanceId) {
+    deliverAutoOfferLocally(state, local, offer, target);
+  } else {
+    sendAutoOfferFrame(state, local, offer, target, endpoint);
+  }
   bump(state, 'autoOffersSent');
   return { ok: true, offerId, expiresAt, target, message: '自动移交提议已发出，等待目标接受' };
+}
+
+/* 同机目标：把 offer 直接交给本核的目标侧自动接受（不经过网络与用户消息注入）。
+ * handover.js 在加载时注册该处理面——避免 takeover→handover 的模块环。 */
+/** @type {null | ((state: any, local: any, offer: any, target: any) => void)} */
+let localAutoOfferHandler = null;
+
+export function registerLocalAutoOfferHandler(handler) {
+  localAutoOfferHandler = typeof handler === 'function' ? handler : null;
+}
+
+function deliverAutoOfferLocally(state, local, offer, target) {
+  if (localAutoOfferHandler === null) {
+    /* 目标侧处理面未接线：保留 autoPending 与停写，等超时顺延。 */
+    bump(state, 'autoLocalDeliverySkipped');
+    return;
+  }
+  localAutoOfferHandler(state, local, offer, target);
 }
 
 function broadcastAutoOffer(state, local, offer) {
@@ -1095,7 +1289,7 @@ function broadcastAutoOffer(state, local, offer) {
 
 function persistAutoOffer(state, local, offer) {
   try {
-    ensureDir(collabDir(state.dataDir, local.collabId));
+    ensureDir(collabRunDir(state.dataDir, local.collabId));
     writeJsonAtomic(autoOfferFilePath(state.dataDir, local.collabId), {
       offerId: offer.offerId,
       collabId: local.collabId,
@@ -1139,10 +1333,15 @@ function armAutoAcceptDeadline(state, local, offer) {
   if (prior !== undefined) {
     clearTimeout(prior);
   }
-  const wait = Math.min(positiveMs(state.config.dialTimeoutMs, DEFAULT_DIAL_MS), Math.max(0, offer.expiresAtMs - nowMs(state)));
+  const wait = Math.min(dialTimeoutMs(state), Math.max(0, offer.expiresAtMs - nowMs(state)));
   const timer = setTimeout(() => {
     runtime.autoAcceptTimers.delete(local.collabId);
-    onAutoAcceptTimeout(state, local);
+    try {
+      onAutoAcceptTimeout(state, local);
+    } catch (error) {
+      bump(state, 'eventFailures');
+      state.log.error('自动接受超时处理异常（已隔离）', { collabId: local.collabId, reason: error.message });
+    }
   }, wait);
   if (typeof timer.unref === 'function') {
     timer.unref();
@@ -1158,14 +1357,19 @@ function onAutoAcceptTimeout(state, local) {
   }
   runtime.autoPending.delete(local.collabId);
   bump(state, 'autoAcceptTimeouts');
-  resumeLocal(state, local, 'auto-accept-timeout');
   runtime.autoOffers.get(local.collabId)?.delete?.(pending.offerId);
+  /* 已降级/被更高任期取代的核不得再顺延：只清理残留并保持只读。 */
+  if (local.role !== 'manager' || local.ledger === null) {
+    runtime.autoOffers.delete(local.collabId);
+    return;
+  }
+  resumeLocal(state, local, 'auto-accept-timeout');
   retryAutoTransfer(state, local, pending.target);
 }
 
 function retryAutoTransfer(state, local, failedTarget) {
   const prevManager = managerSeatOfLedger(state, local);
-  if (prevManager === null) {
+  if (prevManager === null || local.role !== 'manager' || local.ledger === null) {
     return;
   }
   const candidates = candidateSeatsOf(state, local, m5RuntimeOf(state), prevManager, failedTarget);
@@ -1199,7 +1403,7 @@ export function markManagerPending(state, local, offer) {
 
 function persistManagerPending(state, local, offer) {
   try {
-    ensureDir(collabDir(state.dataDir, local.collabId));
+    ensureDir(collabRunDir(state.dataDir, local.collabId));
     writeJsonAtomic(managerPendingFilePath(state.dataDir, local.collabId), {
       offerId: offer.offerId,
       collabId: local.collabId,
@@ -1214,6 +1418,110 @@ function persistManagerPending(state, local, offer) {
     bump(state, 'managerPendingPersistFailures');
     state.log.warn('manager-pending 标记写入失败（已忽略）', { collabId: local.collabId, reason: error.message });
   }
+}
+
+/* 采纳新任期时的自动移交收尾：残留的 autoPending/定时器/auto-offer 记录必须一并清掉，
+ * 否则降级核上的 5s 定时器会对空台账重试（旧实现直接抛 TypeError），或 autoInFlight 永久阻塞手动接管。 */
+export function clearAutoTransferState(state, collabId) {
+  const runtime = m5RuntimeOf(state);
+  runtime.autoPending.delete(collabId);
+  runtime.managerPending.delete(collabId);
+  runtime.autoOffers.delete(collabId);
+  const timer = runtime.autoAcceptTimers.get(collabId);
+  if (timer !== undefined) {
+    clearTimeout(timer);
+    runtime.autoAcceptTimers.delete(collabId);
+  }
+  removeLifecycleFile(autoOfferFilePath(state.dataDir, collabId), state, 'autoOfferRecoveryCleanup');
+  removeLifecycleFile(managerPendingFilePath(state.dataDir, collabId), state, 'managerPendingRecoveryCleanup');
+}
+
+function removeLifecycleFile(path, state, counter) {
+  try {
+    rmSync(path, { force: true });
+  } catch (error) {
+    bump(state, counter);
+    state.log.warn('生命周期文件清理失败（已忽略）', { path, reason: error.message });
+  }
+}
+
+function readLifecycleFile(path, state, counter) {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    bump(state, counter);
+    return null;
+  }
+}
+
+/* 启动恢复（契约 §2A.1/§6.2）：原站长核的 manager-pending 与 auto-offer 副本在重启后继续生效；
+ * 过期/形态不符/任期已推进的记录删除并计数。冻结与只读等待必须一并恢复，否则重启即双主。 */
+export function restoreAutoTransferState(state, collabId) {
+  const local = state.collabs.get(collabId);
+  if (local === undefined || local.role !== 'manager' || local.ledger === null) {
+    return;
+  }
+  restoreManagerPendingOf(state, local);
+  if (m5RuntimeOf(state).managerPending.has(collabId)) {
+    return;   // 已接受未签发：只读等待，不再重发 offer
+  }
+  restoreAutoOfferOf(state, local);
+}
+
+function restoreManagerPendingOf(state, local) {
+  const collabId = local.collabId;
+  const raw = readLifecycleFile(managerPendingFilePath(state.dataDir, collabId), state, 'managerPendingRecovery');
+  if (!isPlainObject(raw) || raw.collabId !== collabId || typeof raw.offerId !== 'string') {
+    return;
+  }
+  const valid = Date.parse(raw.expiresAt) > nowMs(state)
+    && raw.baseTerm === ledgerTermOf(local.ledger)
+    && isPlainObject(raw.target);
+  if (!valid) {
+    removeLifecycleFile(managerPendingFilePath(state.dataDir, collabId), state, 'managerPendingRecoveryExpired');
+    return;
+  }
+  m5RuntimeOf(state).managerPending.set(collabId, { ...raw, at: nowMs(state) });
+  applyManagerFreeze(state, collabId, 'manager-pending');
+  bump(state, 'managerPendingRestored');
+}
+
+function restoreAutoOfferOf(state, local) {
+  const collabId = local.collabId;
+  const raw = readLifecycleFile(autoOfferFilePath(state.dataDir, collabId), state, 'autoOfferRecovery');
+  if (!isPlainObject(raw) || raw.collabId !== collabId) {
+    return;
+  }
+  const offer = restorableAutoOfferOf(state, local, raw);
+  if (offer === null) {
+    removeLifecycleFile(autoOfferFilePath(state.dataDir, collabId), state, 'autoOfferRecoveryExpired');
+    return;
+  }
+  m5RuntimeOf(state).autoPending.set(collabId, offer);
+  suspendLocal(state, local, 'handover-pending', offer.expiresAtMs + dialTimeoutMs(state));
+  armAutoAcceptDeadline(state, local, offer);
+  bump(state, 'autoOfferRestored');
+}
+
+function restorableAutoOfferOf(state, local, raw) {
+  if (typeof raw.offerId !== 'string' || !isPlainObject(raw.target)) {
+    return null;
+  }
+  const offer = {
+    offerId: raw.offerId,
+    prevManager: managerSeatOfLedger(state, local),
+    target: raw.target,
+    baseTerm: raw.baseTerm,
+    version: raw.version,
+    digest: raw.digest,
+    ledger: local.ledger,
+    expiresAt: raw.expiresAt,
+    expiresAtMs: Date.parse(raw.expiresAt),
+  };
+  if (offer.prevManager === null || offer.baseTerm !== ledgerTermOf(local.ledger) || !(offer.expiresAtMs > nowMs(state))) {
+    return null;
+  }
+  return offer;
 }
 
 /* —— D15 重发：站长变更未 ack 前按 presence 节律重发（定向 prevManager + 已端点成员）。 —— */
@@ -1287,6 +1595,11 @@ function handshakeOne(state, local) {
   if (local.role === 'manager') {
     const sent = sendToRoster(state, local, 'notice', payload);
     state.counters.handshakesSent = (state.counters.handshakesSent ?? 0) + sent;
+    /* 本机旁路也计入 sendToRoster 的 sent；没有任何远端端点时对表无从发生，直接按未解析处理。 */
+    if (!hasRemoteHandshakeTarget(state, local)) {
+      markHandshakeUnresolved(state, local);
+      return;
+    }
     armHandshakeWatch(state, local, sent > 0);
     return;
   }
@@ -1303,6 +1616,11 @@ function handshakeOne(state, local) {
     state.counters.handshakesSent = (state.counters.handshakesSent ?? 0) + 1;
   }
   armHandshakeWatch(state, local, result.ok === true);
+}
+
+function hasRemoteHandshakeTarget(state, local) {
+  return (local.ledger?.members ?? []).some((member) => member.instanceId !== state.self.instanceId
+    && endpointFor(state, local, member.instanceId) !== undefined);
 }
 
 function handshakePayload(state, local, reply) {
@@ -1524,7 +1842,7 @@ function takeoverRejection(state, local, sessionId) {
   return null;
 }
 
-function unexpiredAutoInFlight(state, local) {
+export function unexpiredAutoInFlight(state, local) {
   const runtime = m5RuntimeOf(state);
   const now = nowMs(state);
   const pending = runtime.autoPending.get(local.collabId) ?? runtime.managerPending.get(local.collabId);
@@ -1584,12 +1902,27 @@ async function collectHighest(state, local) {
   sendHandshakeSweep(state, local);
   await waitMs(positiveMs(state.handshakeReplyTimeoutMs, HANDSHAKE_REPLY_TIMEOUT_MS));
   const responses = runtime.handshakeResponses.get(local.collabId) ?? new Map();
+  const external = [...responses.values()].filter((entry) => entry.seat?.instanceId !== state.self.instanceId);
+  /* 设计 §2A.7③：名单里还有其他成员却全部无应答 → 拒绝接管并上报，不得用本机旧台账宣告
+   * term+1（会与真实更高任期分叉）。名单只剩本机与失联站长时，本机快照即最高已知 pair，
+   * 允许以它为基准接管——否则「站长整机断电、只剩一名成员」的核心场景永远无法恢复。 */
+  if (external.length === 0 && hasOtherMemberSeats(local, state)) {
+    return {
+      ok: false,
+      message: '与其他可达成员对表失败（零应答）——按设计不得以本机旧台账接管；请先恢复联系或改用显式移交',
+    };
+  }
   const own = ownHighestOf(state, local);
-  const highest = [...responses.values()].reduce((best, entry) => (compareHighest(best, entry) >= 0 ? best : entry), own);
+  const highest = external.reduce((best, entry) => (compareHighest(best, entry) >= 0 ? best : entry), own);
   if (!Number.isInteger(highest.term)) {
     return { ok: false, message: '无法与可达成员对表（无应答）——接管不可行' };
   }
   return { ok: true, highest };
+}
+
+function hasOtherMemberSeats(local, state) {
+  const ledger = local.snapshot?.ledger ?? local.ledger;
+  return (ledger?.members ?? []).some((member) => member.role !== 'manager' && member.instanceId !== state.self.instanceId);
 }
 
 function ownHighestOf(state, local) {
@@ -1643,7 +1976,7 @@ export function managerUnreachable(state, local) {
   if (endpoint === undefined) {
     return true;
   }
-  const now = nowMs(state);
+  const now = monoNow(state);
   const seen = runtime.managerEvidenceAt.get(local.collabId);
   if (Number.isFinite(seen) && now - seen >= managerLossMs(state)) {
     return true;
@@ -1702,7 +2035,8 @@ function viaOf(state, local) {
 }
 
 function windowRemainingOf(state, local) {
-  const window = local.snapshot?.ledger?.managerWindow;
+  /* 快照未到时以已采纳的任期状态为窗口基准（否则窗口接管会被误当成手动接管）。 */
+  const window = m5RuntimeOf(state).termState?.get(local.collabId)?.managerWindow ?? local.snapshot?.ledger?.managerWindow;
   if (window === undefined) {
     return 0;
   }
@@ -1728,24 +2062,22 @@ function buildTakeOverLedger(state, local, base, sessionId, via, authorizedAt) {
   ledger.managerTerm = ledgerTermOf(ledger) + 1;
   ledger.version = (ledger.version ?? 1) + 1;
   ledger.updatedAt = new Date().toISOString();
-  ledger.members = ledger.members.filter((member) => !isSameManagerRow(member, manager));
-  const selfRow = ledger.members.find((member) => member.instanceId === state.self.instanceId
-    && (member.sessionId === undefined || member.sessionId === sessionId));
-  if (selfRow === undefined) {
+  /* 窗口接管只降级旧站长、保留其席位；手动接管移除失联站长席位（设计 §2A.6⑤/§2A.7⑤）。 */
+  if (via === 'takeover') {
+    demoteManagerRowIn(ledger, manager);
+  } else {
+    ledger.members = ledger.members.filter((member) => !isSameManagerRow(member, manager));
+    ledger.events = appendEvent(ledger, {
+      type: 'leave',
+      seat: manager,
+      reason: 'manager-lost',
+      term: ledger.managerTerm,
+      at: authorizedAt,
+    });
+  }
+  if (!promoteSelfRowIn(ledger, state, sessionId)) {
     return null;
   }
-  selfRow.role = 'manager';
-  selfRow.sessionId = sessionId;
-  selfRow.identityName = state.self.identityName;
-  selfRow.state = 'member';
-  ledger.manager = { instanceId: state.self.instanceId, sessionId, identityName: state.self.identityName, term: ledger.managerTerm };
-  ledger.events = appendEvent(ledger, {
-    type: 'leave',
-    seat: manager,
-    reason: via === 'takeover' ? 'takeover' : 'manager-lost',
-    term: ledger.managerTerm,
-    at: authorizedAt,
-  });
   ledger.events = appendEvent(ledger, {
     type: 'manager-changed',
     via,
@@ -1756,6 +2088,28 @@ function buildTakeOverLedger(state, local, base, sessionId, via, authorizedAt) {
     authorizedAt,
   });
   return clearManagerWindow(ledger);
+}
+
+function promoteSelfRowIn(ledger, state, sessionId) {
+  const selfRow = ledger.members.find((member) => member.instanceId === state.self.instanceId
+    && (member.sessionId === undefined || member.sessionId === sessionId));
+  if (selfRow === undefined) {
+    return false;
+  }
+  selfRow.role = 'manager';
+  selfRow.sessionId = sessionId;
+  selfRow.identityName = state.self.identityName;
+  selfRow.state = 'member';
+  ledger.manager = { instanceId: state.self.instanceId, sessionId, identityName: state.self.identityName, term: ledger.managerTerm };
+  return true;
+}
+
+function demoteManagerRowIn(ledger, manager) {
+  const row = ledger.members.find((member) => isSameManagerRow(member, manager));
+  if (row !== undefined) {
+    row.role = 'member';
+    row.state = 'member';
+  }
 }
 
 function isSameManagerRow(member, manager) {
@@ -1796,7 +2150,7 @@ function managerChangedPayloadOf(state, ledger, via, authorizedAt, prevManager) 
   };
 }
 
-/* 自报端点：M2/M6 可在 state.selfEndpoint 注入真实对外地址；缺省用回环地址（同机测试/手动接管兜底）。 */
+/* 自报端点：服务/工具层可在 state.selfEndpoint 注入真实对外地址；缺省用回环地址（同机测试/手动接管兜底）。 */
 function selfEndpointOf(state) {
   if (isPlainObject(state.selfEndpoint) && typeof state.selfEndpoint.address === 'string') {
     return { address: state.selfEndpoint.address, port: state.selfEndpoint.port ?? state.self.port };

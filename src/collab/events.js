@@ -5,18 +5,19 @@ import { createMembersStore } from './members.js';
 import { createCounterStore, notifyIndicatorChange } from './counter.js';
 import { createMuteStore } from './mute.js';
 import { createInjectedStore } from './injected.js';
-import { ledgerDigest } from './store.js';
+import { appendLedger, ledgerDigest } from './store.js';
+import { collabDir, ensureDir } from '../paths.js';
 import { isLocalArchivedState, localModeOf, localStateOf, persistMember, persistSnapshot, rememberKnownHost, selfJoinedOf, upsertLocalSeat } from './local.js';
 import { matchConflictCollabs, noteForumGovernanceIgnored } from './gate.js';
 import { applyEndpoint, applyFreezeLocally, broadcastFreeze, downgradeToMember, endpointFor, governanceTargets, memberIdsOf, mutateLedger, notifyLocal, relayGovernance, relayRedistribute, selfIsRelay, sendTo, stopJoinReplay } from './outgoing.js';
 import { applyIncomingJoin, applyIncomingLeave, handleHistoryBundle, handleHistoryRequest } from './sync.js';
 import {
-  appendDeparted, applyManagerFreeze, clearFreezeReason, clearManagerFreeze, handleHandshake, handleSeatPresenceFrame, handleTakeover, handleTakeoverInit,
-  ledgerTermOf, m5RuntimeOf, managerSeatOfLedger, managerUnreachable, noteDirectFramePresence, presenceSignerOf,
-  requestSnapshotFrom, resumeLocal,
+  appendDeparted, applyManagerFreeze, clearAutoTransferState, clearFreezeReason, clearManagerFreeze, handleHandshake, handleSeatPresenceFrame,
+  handleTakeover, handleTakeoverInit, ledgerTermOf, m5RuntimeOf, managerLossTimeoutMsOf, managerSeatOfLedger, managerUnreachable,
+  noteDirectFramePresence, presenceSignerOf, requestSnapshotFrom, resumeLocal, runHandshake, unexpiredAutoInFlight,
 } from './takeover.js';
 import { handleDecision, handleMergeOutcome, handleMergeRequest, handleUnfreeze } from './freeze.js';
-import { adoptHandoverAsTarget, handleAutoOffer, handleHandover } from './handover.js';
+import { adoptHandoverAsTarget, dropHandoverInFlight, handleAutoOffer, handleHandover } from './handover.js';
 import { acceptManagerChange } from './term.js';
 
 /* 接收事件处理（consume 的落点）：端点学习、邀请建记录与冲突检测、回应与建立、撤回 / 退出 / 结束、
@@ -79,7 +80,7 @@ function refreshPresenceBeforeLearn(state, frame, meta) {
   noteDirectFramePresence(state, frame, meta);
 }
 
-/* 解除冻结/裁定执行后清除 M5 侧的冻结原因（载体与成员记录）：冻结态已不在 → 观察窗不得继续显示。
+/* 解除冻结/裁定执行后清除冻结原因（载体与成员记录）：冻结态已不在 → 观察窗不得继续显示。
  * 台账 status 由 legacy 冻结族维护；本函数只清展示原因，不改状态机。 */
 function handleUnfreezeEvent(state, frame) {
   const result = handleUnfreeze(state, frame);
@@ -188,7 +189,7 @@ function handleInvite(state, frame, meta) {
   persistMember(state, local);
 }
 
-/* 目标机挂起邀请登记（M4 域）：未入席会话据此在注册时收到补投；forum 无邀请簿记（D18）。 */
+/* 目标机挂起邀请登记（邀请/加入域）：未入席会话据此在注册时收到补投；forum 无邀请簿记（D18）。 */
 function recordPendingInvite(state, frame) {
   if (typeof state.join?.handleInviteFrame !== 'function') {
     return;
@@ -353,7 +354,7 @@ function freezeOnInviteConflict(state, frame, local, conflict) {
   broadcastFreeze(state, local, '同名冲突：与本机既有协作参与者有交集');
 }
 
-/* 同意帧携 inviteId（M4 会话级邀请）：转加入域的批准面签发 join-grant；无 inviteId 的旧形态
+/* 同意帧携 inviteId（会话级邀请）：转加入域的批准面签发 join-grant；无 inviteId 的旧形态
  * 或讨论实例仍走本地回应记账。 */
 function handleApproveResponse(state, frame) {
   if (typeof frame.payload?.inviteId === 'string' && typeof state.join?.handleInviteApproval === 'function') {
@@ -370,7 +371,7 @@ function handleDeclineResponse(state, frame) {
 }
 
 /* 站长席位侧：邀请回应只记账与提示——共享名单是 active-only 席位表，邀请在途态只存在于
- * invites/pending-invites（M4 域）。入席由两段式 join-confirm 完成（M2/M4 接线），本函数
+ * invites/pending-invites（邀请/加入域）。入席由两段式 join-confirm 完成（运行时/加入接线），本函数
  * 不再把 invited/approved 写进共享名单。 */
 function applyInviteResponse(state, frame, wanted) {
   const local = state.collabs.get(frame.collabId);
@@ -606,7 +607,12 @@ function handleFreeze(state, frame) {
     if (local.collabId !== frame.collabId) {
       local.conflictRival = {
         name: payload.name,
-        members: payload.members.map((entry) => ({ instanceId: entry.instanceId, identityName: entry.identityName })),
+        /* 席位键透传：合流邀请要能指名到会话（只留 instanceId 会退化成整机不指名邀请）。 */
+        members: payload.members.map((entry) => ({
+          instanceId: entry.instanceId,
+          ...(typeof entry.sessionId === 'string' && entry.sessionId !== '' ? { sessionId: entry.sessionId } : {}),
+          identityName: entry.identityName,
+        })),
         createdAt: payload.createdAt,
         managerInstanceId: payload.manager?.instanceId,
       };
@@ -650,10 +656,8 @@ function acceptSnapshotFrame(state, frame) {
     bump(state, 'snapshotCorrupt');
     return;
   }
-  const termState = termStateOf(state, local);
   const record = snapshotRecordOf(frame);
-  if (termState === null || !isSnapshotShape(record) || record.version !== record.ledger.version
-    || record.ledger.collabId !== frame.collabId) {
+  if (!snapshotFrameConsistent(frame, record)) {
     bump(state, 'snapshotCorrupt');
     state.log.warn('快照载荷不合形态或与帧不自洽（已忽略）', { collabId: frame.collabId });
     return;
@@ -661,6 +665,15 @@ function acceptSnapshotFrame(state, frame) {
   if (ledgerDigest(record.ledger) !== record.digest) {
     bump(state, 'snapshotCorrupt');
     state.log.warn('快照摘要不符（已忽略）', { collabId: frame.collabId, version: record.version });
+    return;
+  }
+  const termState = termStateOf(state, local);
+  if (termState === null) {
+    if (adoptFirstSnapshot(state, local, frame, record)) {
+      return;
+    }
+    bump(state, 'snapshotCorrupt');
+    state.log.warn('无本地任期基线的首个快照来源不成立（已忽略）', { collabId: frame.collabId });
     return;
   }
   const ctx = termCtxOf(state, local, frame);
@@ -672,6 +685,84 @@ function acceptSnapshotFrame(state, frame) {
     sendSnapshotReceipt(state, local, frame);
     resolvePendingView(state, local.collabId, local.snapshot);
   }
+}
+
+function snapshotFrameConsistent(frame, record) {
+  return isSnapshotShape(record) && record.version === record.ledger.version
+    && record.ledger.collabId === frame.collabId;
+}
+
+/* 首份快照基线（设计 §4.4④/§13.1 邀请 e2e）：受邀/两段式入席的成员没有本地台账，termStateOf
+ * 返回 null。此时只接受来源＝本地邀请/批准记录中的站长、且台账含本席位的自洽快照，按新基线采纳；
+ * 其余来源仍 fail-closed（不得凭「第一份」绕过来源校验）。 */
+function adoptFirstSnapshot(state, local, frame, record) {
+  const nextState = firstSnapshotBaselineOf(state, local, frame, record);
+  if (nextState === null) {
+    return false;
+  }
+  local.snapshot = record;
+  persistSnapshot(state, local);
+  termMapsOf(state).termState.set(local.collabId, nextState);
+  applyMemberManagerRef(state, local, nextState);
+  clearUnverifiedSeats(state, local, record.ledger);
+  bump(state, 'snapshotBaselineAdopted');
+  bump(state, 'snapshotStored');
+  sendSnapshotReceipt(state, local, frame);
+  resolvePendingView(state, local.collabId, local.snapshot);
+  return true;
+}
+
+function firstSnapshotBaselineOf(state, local, frame, record) {
+  if (local.role === 'manager' || local.snapshot !== null) {
+    return null;
+  }
+  const source = { instanceId: frame.from?.instanceId, sessionId: frame.from?.sessionId };
+  if (!firstSnapshotSourceAllowed(local, source, record.ledger.manager)) {
+    return null;
+  }
+  if (!ownSeatListed(local, record.ledger, state)) {
+    return null;
+  }
+  return termStateOfLedger(record.ledger);
+}
+
+/* 来源＝邀请/批准记录中的站长（member.manager），且必须是快照台账里的 manager。 */
+function firstSnapshotSourceAllowed(local, source, manager) {
+  const known = local.member?.manager;
+  if (!isPlainObject(known) || !isPlainObject(manager)) {
+    return false;
+  }
+  if (typeof source.instanceId !== 'string' || typeof source.sessionId !== 'string') {
+    return false;
+  }
+  if (source.instanceId !== known.instanceId || !sameSeat(source, manager)) {
+    return false;
+  }
+  return typeof known.sessionId !== 'string' || known.sessionId === '' || known.sessionId === source.sessionId;
+}
+
+function termStateOfLedger(ledger) {
+  const manager = ledger.manager;
+  return {
+    managerTerm: ledgerTermOf(ledger),
+    manager: {
+      instanceId: manager.instanceId,
+      sessionId: manager.sessionId,
+      identityName: typeof manager.identityName === 'string' && manager.identityName !== '' ? manager.identityName : manager.instanceId,
+    },
+    version: ledger.version,
+    ...(isPlainObject(ledger.managerWindow) ? { managerWindow: { ...ledger.managerWindow } } : {}),
+  };
+}
+
+function ownSeatListed(local, ledger, state) {
+  const members = Array.isArray(ledger?.members) ? ledger.members : [];
+  for (const seat of local.seats?.values?.() ?? []) {
+    if (isSelfSeatIn(members, state.self.instanceId, seat.sessionId)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /* 接收记录成形：与本地快照文件同一形态（同一份数据在接收侧与加载侧过同一校验）。 */
@@ -902,7 +993,21 @@ function removeLeaveRow(state, local, row, frame) {
       at: new Date().toISOString(),
     }];
   });
+  releaseJoiningOf(state, local.collabId, row.sessionId);
   broadcastRosterNotice(state, local);
+}
+
+/* 席位移除的生命周期收尾：未确认的两段式记录不得跨离席残留。 */
+function releaseJoiningOf(state, collabId, sessionId) {
+  if (typeof sessionId !== 'string' || sessionId === '') {
+    return;
+  }
+  try {
+    state.join?.releaseJoining?.(collabId, sessionId);
+  } catch (error) {
+    bump(state, 'eventFailures');
+    state.log.warn('未确认入席记录释放失败（已隔离）', { collabId, sessionId, reason: error?.message });
+  }
 }
 
 /* —— 任期接线（设计 §2A.2 受理表）：term.js 只做判决，本层组 ctx、落台账与执行 actions。 —— */
@@ -913,6 +1018,15 @@ function isPlainObject(value) {
 
 function bump(state, key) {
   state.counters[key] = (state.counters[key] ?? 0) + 1;
+}
+
+/* 时钟域（设计 §2A/D3）：任期窗口按墙钟；presence/失联证据按单调钟。两者不得共用同一变量。 */
+function wallNow(state) {
+  return typeof state.clock === 'function' ? state.clock() : Date.now();
+}
+
+function monoNow(state) {
+  return typeof state.monoClock === 'function' ? state.monoClock() : performance.now();
 }
 
 function sameSeat(left, right) {
@@ -984,7 +1098,7 @@ function termCtxOf(state, local, frame) {
   const manager = managerSeatOfLedger(state, local);
   const pendingOffer = runtime.managerPending.get(local.collabId) ?? runtime.autoPending.get(local.collabId);
   return {
-    now: Date.now(),
+    now: wallNow(state),
     localFrozen: runtime.frozen.get(local.collabId) ?? null,
     memberSeats: memberSeatsOf(local),
     isMemberSeat: (seat) => memberSeatsOf(local).some((entry) => sameSeat(entry, seat)),
@@ -994,7 +1108,7 @@ function termCtxOf(state, local, frame) {
     autoInFlight: pendingOffer !== undefined,
     pendingOfferId: pendingOffer?.offerId,
     pendingTarget: pendingOffer?.target,
-    acceptedManager: maps.accepted.get(local.collabId),
+    acceptedManager: maps.accepted.get(local.collabId) ?? runtime.acceptedManagers.get(local.collabId),
     handshakeHighest: highestHandshakeOf(state, local.collabId),
     authorizedEvidence: maps.authorized.get(local.collabId),
     suspended: suspendCtxOf(state, local),
@@ -1005,7 +1119,7 @@ function termCtxOf(state, local, frame) {
     windowSkewMs: 10000,
     ledgerDigestOf: (value) => ledgerDigest(value),
     from: { instanceId: frame.from.instanceId, sessionId: frame.from.sessionId },
-    syncExpired: false,
+    syncExpired: runtime.syncExpired?.has(local.collabId) === true,
   };
 }
 
@@ -1093,19 +1207,7 @@ function handleManagerChanged(state, frame) {
 /* 旧站长仍在线时收到更高 term 的 takeover-manual：按 §2A.7⑥/§2A.8 降级采纳，
  * 不把「自己可达」当作拒收理由（那会制造两个同时写台账的站长核）。 */
 function oldManagerTakeoverBypass(state, local, termState, change) {
-  if (local.role !== 'manager' || change.via !== 'takeover-manual') {
-    return null;
-  }
-  if (change.term !== termState.managerTerm + 1 || change.version <= termState.version) {
-    return null;
-  }
-  if (!sameSeat(change.prevManager, termState.manager) || !sameSeat(change.from, change.manager)) {
-    return null;
-  }
-  if (typeof change.authorizedAt !== 'string' || Number.isNaN(Date.parse(change.authorizedAt))) {
-    return null;
-  }
-  if (!memberSeatsOf(local).some((seat) => sameSeat(seat, change.from))) {
+  if (!oldManagerBypassEligible(state, local, termState, change)) {
     return null;
   }
   return {
@@ -1120,7 +1222,32 @@ function oldManagerTakeoverBypass(state, local, termState, change) {
   };
 }
 
+function oldManagerBypassEligible(state, local, termState, change) {
+  if (local.role !== 'manager' || change.via !== 'takeover-manual') {
+    return false;
+  }
+  /* pending/fork 只读等待期间不得被第三方 takeover-manual 解除；未过期 auto 在途同理（J-N-05）。 */
+  if (m5RuntimeOf(state).frozen.has(local.collabId) || unexpiredAutoInFlight(state, local)) {
+    return false;
+  }
+  if (change.term !== termState.managerTerm + 1 || change.version <= termState.version) {
+    return false;
+  }
+  if (!sameSeat(change.prevManager, termState.manager) || !sameSeat(change.from, change.manager)) {
+    return false;
+  }
+  if (!isAuthorizedTimestamp(change.authorizedAt)) {
+    return false;
+  }
+  return memberSeatsOf(local).some((seat) => sameSeat(seat, change.from));
+}
+
+function isAuthorizedTimestamp(value) {
+  return typeof value === 'string' && !Number.isNaN(Date.parse(value));
+}
+
 function applyManagerResult(state, local, frame, result) {
+  noteAuthorizedEvidence(state, local, frame, result);
   if (result.freezeReason !== undefined) {
     applyManagerFreeze(state, local.collabId, result.freezeReason);
     return;
@@ -1131,16 +1258,89 @@ function applyManagerResult(state, local, frame, result) {
   applyManagerActions(state, local, frame, result);
 }
 
+/* fork 收敛证据（设计 §2A.3/§2A.10）：被拒/待同步的窗口内 takeover 授权可绑定到后续快照；
+ * 只记录「更高 term + authorizedAt 与 manager 齐备」的证据，同 term 冲突不产生授权。 */
+function noteAuthorizedEvidence(state, local, frame, result) {
+  const evidence = result.accepted === true ? null : authorizedEvidenceOf(state, local, frame.payload);
+  if (evidence === null) {
+    return;
+  }
+  termMapsOf(state).authorized.set(local.collabId, evidence);
+  bump(state, 'authorizedEvidenceRecorded');
+}
+
+function authorizedEvidenceOf(state, local, change) {
+  if (!isPlainObject(change) || !['takeover', 'takeover-manual'].includes(change.via)) {
+    return null;
+  }
+  if (!isAuthorizedTimestamp(change.authorizedAt)) {
+    return null;
+  }
+  if (!isPlainObject(change.manager) || typeof change.manager.sessionId !== 'string') {
+    return null;
+  }
+  const current = termStateOf(state, local);
+  if (current === null || !Number.isInteger(change.term) || change.term <= current.managerTerm) {
+    return null;
+  }
+  return {
+    via: change.via,
+    authorizedAt: change.authorizedAt,
+    term: change.term,
+    manager: { instanceId: change.manager.instanceId, sessionId: change.manager.sessionId, identityName: change.manager.identityName },
+  };
+}
+
 function applyManagerActions(state, local, frame, result) {
   const actions = Array.isArray(result.actions) ? result.actions : [];
   applyWindowActions(state, local, frame, actions, result);
   applyReplyActions(state, local, frame, actions);
+  if (actions.includes('handshake')) {
+    runHandshake(state, { collabId: local.collabId });
+    armSyncWatch(state, local.collabId);
+  }
   if (actions.includes('clear-freeze')) {
     clearManagerFreeze(state, local.collabId);
   }
   if (actions.includes('count-reject') || result.accepted !== true) {
     bump(state, 'termRejects');
   }
+}
+
+/* A6 对表超时（设计 §2A.2 A6）：term 跳跃只做有界同步，超时按 manager-fork 冻结上报。 */
+function armSyncWatch(state, collabId) {
+  const runtime = m5RuntimeOf(state);
+  if (!(runtime.syncWatch instanceof Map)) {
+    runtime.syncWatch = new Map();
+  }
+  if (!(runtime.syncExpired instanceof Set)) {
+    runtime.syncExpired = new Set();
+  }
+  const prior = runtime.syncWatch.get(collabId);
+  if (prior !== undefined) {
+    clearTimeout(prior);
+  }
+  runtime.syncExpired.delete(collabId);
+  const timer = setTimeout(() => {
+    runtime.syncWatch.delete(collabId);
+    runtime.syncExpired.add(collabId);
+    bump(state, 'termSyncTimeouts');
+    applyManagerFreeze(state, collabId, 'manager-fork');
+  }, managerLossTimeoutMsOf(state));
+  if (typeof timer.unref === 'function') {
+    timer.unref();
+  }
+  runtime.syncWatch.set(collabId, timer);
+}
+
+function clearSyncWatch(state, collabId) {
+  const runtime = m5RuntimeOf(state);
+  const timer = runtime.syncWatch?.get?.(collabId);
+  if (timer !== undefined) {
+    clearTimeout(timer);
+    runtime.syncWatch.delete(collabId);
+  }
+  runtime.syncExpired?.delete?.(collabId);
 }
 
 function applyWindowActions(state, local, frame, actions, result) {
@@ -1180,8 +1380,12 @@ function applyAcceptedNextState(state, local, frame, nextState) {
     source: { instanceId: frame.from.instanceId, sessionId: frame.from.sessionId },
   });
   maps.termState.set(local.collabId, nextState);
+  maps.authorized.delete(local.collabId);
   runtime.managerPending.delete(local.collabId);
-  runtime.managerEvidenceAt.set(local.collabId, Date.now());
+  runtime.managerEvidenceAt.set(local.collabId, monoNow(state));
+  clearAutoTransferState(state, local.collabId);
+  dropHandoverInFlight(state, local.collabId);
+  clearSyncWatch(state, local.collabId);
   if (isPlainObject(nextState.managerWindow) && frame.payload.effectiveAt !== undefined) {
     const at = Date.parse(frame.payload.effectiveAt);
     runtime.managerWindowBaseAt.set(local.collabId, Number.isFinite(at) ? at : Date.now());
@@ -1189,8 +1393,10 @@ function applyAcceptedNextState(state, local, frame, nextState) {
     runtime.managerWindowBaseAt.delete(local.collabId);
   }
   if (local.role === 'manager') {
+    const readonlyLedger = local.ledger === null ? null : structuredClone(local.ledger);
     keepReadonlySnapshot(state, local);
     downgradeToMember(state, local, { instanceId: nextState.manager.instanceId, identityName: nextState.manager.identityName }, nextState.version);
+    writeReadonlyLedgerCopy(state, local, readonlyLedger);
     bump(state, 'managerDowngrades');
   } else {
     applyMemberManagerRef(state, local, nextState);
@@ -1207,8 +1413,13 @@ function applyTerminalAdoption(state, local, nextState) {
   maps.termState.set(local.collabId, { managerTerm: nextState.managerTerm, manager: null, version: nextState.version });
   runtime.managerPending.delete(local.collabId);
   runtime.managerWindowBaseAt.delete(local.collabId);
+  clearAutoTransferState(state, local.collabId);
+  dropHandoverInFlight(state, local.collabId);
+  clearSyncWatch(state, local.collabId);
   if (local.role === 'manager') {
     keepReadonlySnapshot(state, local);
+    /* 席位缓存必须先降级：重启按席位派生 role，残留 manager 席位会让 recoverLedger 复活旧活跃台账。 */
+    demoteLocalSeatsOf(state, local);
     local.ledger = null;
     local.role = 'member';
   }
@@ -1233,6 +1444,30 @@ function applyMemberManagerRef(state, local, nextState) {
     delete local.member.archivedAt;
   }
   persistMember(state, local);
+}
+
+/* 降级后保留只读台账副本（设计 §2A.8③）：目录若无台账会被判 carrier-without-ledger/recovery 只读，
+ * 旧站长从此接不到入站帧、也交不回席位。降级核不再写权威台账（以快照为准），此行仅是本地副本。 */
+function writeReadonlyLedgerCopy(state, local, ledger) {
+  if (!isPlainObject(ledger)) {
+    return;
+  }
+  try {
+    ensureDir(collabDir(state.dataDir, local.collabId));
+    appendLedger(state.dataDir, { ...ledger, collabId: local.collabId });
+    bump(state, 'readonlyLedgerKept');
+  } catch (error) {
+    bump(state, 'readonlyLedgerFailures');
+    state.log.warn('降级后只读台账副本写入失败（已忽略）', { collabId: local.collabId, reason: error.message });
+  }
+}
+
+function demoteLocalSeatsOf(state, local) {
+  for (const seat of local.seats?.values?.() ?? []) {
+    if (seat.role !== 'member') {
+      upsertLocalSeat(local, { sessionId: seat.sessionId, role: 'member' }, { persist: true, dataDir: state.dataDir });
+    }
+  }
 }
 
 function keepReadonlySnapshot(state, local) {

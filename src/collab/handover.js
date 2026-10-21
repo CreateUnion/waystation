@@ -1,15 +1,18 @@
 import { randomUUID } from 'node:crypto';
-import { rmSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
 import { writeJsonAtomic } from '../storage.js';
-import { collabDir, ensureDir, handoverOffersFilePath, handoverPendingFilePath } from '../paths.js';
+import { collabDir, collabRunDir, ensureDir, handoverOffersFilePath, handoverPendingFilePath } from '../paths.js';
 import { isPort } from '../net/protocol.js';
 import { isLedgerShape } from './model.js';
 import { currentManagerIdOf, isLocalArchivedState, localRosterOf, localStateOf, persistSnapshot } from './local.js';
-import { ledgerDigest } from './store.js';
+import { appendLedger, ledgerDigest } from './store.js';
+import { matchSessionByToken } from '../util/short-id.js';
+import { makeAutoOffer } from './term.js';
 import { applyEndpoint, downgradeToMember, endpointFor, notifyLocal, promoteToManager, sendTo, sendToSeats } from './outgoing.js';
 import { probePeer } from './takeover.js';
 import {
-  clearManagerFreeze, ledgerTermOf, localSeatsOf, m5RuntimeOf, managerSeatOfLedger, markManagerPending, presenceSignerOf, rememberPendingChange,
+  clearManagerFreeze, ledgerTermOf, localSeatsOf, m5RuntimeOf, managerSeatOfLedger, markManagerPending, presenceSignerOf, registerLifecycleRestorer,
+  registerLocalAutoOfferHandler, rememberPendingChange, restoreAutoTransferState,
 } from './takeover.js';
 
 /* 显式移交（设计 §2A.4）与自动接受（§2A.5 目标侧）：
@@ -62,38 +65,56 @@ export async function handover(state, input = {}) {
   if (local === undefined) {
     return { ok: false, message: '本机没有该协作（先 ws_list_collabs）' };
   }
-  const rejection = handoverRejection(state, local, target);
+  const rejection = handoverRejection(state, local, target)
+    ?? await handoverTargetRejection(state, local, target, targetSessionId);
   if (rejection !== null) {
     return { ok: false, message: rejection };
   }
   const targetSeat = resolveTargetSeat(state, local, target, targetSessionId);
-  if (targetSeat === null) {
-    return { ok: false, message: '目标席位无法确定（需活跃成员；同机多席请给 targetSessionId）' };
-  }
-  const endpointRejection = await targetReachabilityRejection(state, local, targetSeat);
-  if (endpointRejection !== null) {
-    return { ok: false, message: endpointRejection };
-  }
-  const manager = managerSeatOfLedger(state, local);
-  const signerSessionId = manager?.sessionId ?? sessionId;
   const offer = buildOffer(state, local, targetSeat);
   storePendingHandover(state, local, offer, { auto: false });
-  const sent = await sendToSeats(state, {
-    collabId,
-    fromSessionId: signerSessionId,
-    type: 'handover',
-    payload: offerPayloadOf(state, local, offer),
-    targets: [{ instanceId: targetSeat.instanceId, sessionId: targetSeat.sessionId }],
-  });
-  if (sent.ok !== true) {
+  const signerSessionId = managerSeatOfLedger(state, local)?.sessionId ?? sessionId;
+  const delivered = await deliverHandoverOffer(state, local, offer, targetSeat, signerSessionId);
+  if (delivered.ok !== true) {
     clearPendingHandover(state, local);
-    return { ok: false, message: `移交提议入队失败：${sent.reason ?? '未知原因'}` };
+    return { ok: false, message: `移交提议入队失败：${delivered.reason ?? '未知原因'}` };
   }
   return {
     ok: true,
     offerId: offer.offerId,
     expiresAt: offer.expiresAt,
     message: `已发出移交提议，等待目标确认（offerId ${offer.offerId}，${handoverConfirmMs(state) / 1000}s 内有效）`,
+  };
+}
+
+/* 同机目标：offer 直接落核内记录（不依赖用户消息注入），目标会话随后用 confirmHandover 确认。
+ * 发送面的本机旁路当前只做会话注入，不交付核内事件——同机移交的核内交付由本模块承担。 */
+function deliverOfferLocally(state, local, offer, targetSeat) {
+  const record = localOfferRecordOf(offer, targetSeat);
+  if (storeOfferRecord(state, local, record) === null) {
+    return { ok: false, reason: 'offer 形态不符' };
+  }
+  notifyLocal(state, local, `收到站长移交提议（offerId ${record.offerId}）：如接受，请用 ws_handover 携 offerId 确认（先签发挑战令牌）。`);
+  return { ok: true };
+}
+
+function localOfferRecordOf(offer, targetSeat) {
+  return {
+    offerId: offer.offerId,
+    baseTerm: offer.baseTerm,
+    version: offer.version,
+    digest: offer.digest,
+    ledger: offer.ledger,
+    endpoints: offer.endpoints,
+    expiresAt: offer.expiresAt,
+    expiresAtMs: offer.expiresAtMs,
+    from: {
+      instanceId: offer.from.instanceId,
+      sessionId: offer.from.sessionId,
+      identityName: offer.from.identityName,
+    },
+    target: { instanceId: targetSeat.instanceId, sessionId: targetSeat.sessionId, identityName: targetSeat.identityName },
+    state: OFFER_STATE_OPEN,
   };
 }
 
@@ -113,10 +134,33 @@ function handoverRejection(state, local, target) {
   return null;
 }
 
+async function handoverTargetRejection(state, local, target, targetSessionId) {
+  const targetSeat = resolveTargetSeat(state, local, target, targetSessionId);
+  if (targetSeat === null) {
+    return '目标席位无法确定（需活跃成员；同机多席请给 targetSessionId）';
+  }
+  return targetReachabilityRejection(state, local, targetSeat);
+}
+
+function deliverHandoverOffer(state, local, offer, targetSeat, signerSessionId) {
+  if (targetSeat.instanceId === state.self.instanceId) {
+    return deliverOfferLocally(state, local, offer, targetSeat);
+  }
+  return sendToSeats(state, {
+    collabId: local.collabId,
+    fromSessionId: signerSessionId,
+    type: 'handover',
+    payload: offerPayloadOf(state, local, offer),
+    targets: [{ instanceId: targetSeat.instanceId, sessionId: targetSeat.sessionId }],
+  });
+}
+
+/* targetSessionId 接受完整标识或短码（精确匹配，不做前缀展开；歧义即拒绝）。 */
 function resolveTargetSeat(state, local, targetId, targetSessionId) {
   const rows = local.ledger.members.filter((member) => member.instanceId === targetId && member.role !== 'manager');
   if (typeof targetSessionId === 'string' && targetSessionId !== '') {
-    return rows.find((member) => member.sessionId === targetSessionId) ?? null;
+    const sessionId = matchSessionByToken(rows, targetSessionId);
+    return sessionId === null ? null : rows.find((member) => member.sessionId === sessionId) ?? null;
   }
   return rows.length === 1 ? rows[0] : null;
 }
@@ -157,7 +201,7 @@ function buildOffer(state, local, targetSeat) {
   };
 }
 
-/* 旧台账（M2 未迁移）缺 managerTerm/joinSeqNext 时补齐只读字段：offer 台账是接收侧的基准副本。 */
+/* 旧台账（尚未迁移）缺 managerTerm/joinSeqNext 时补齐只读字段：offer 台账是接收侧的基准副本。 */
 function ensureTermFields(ledger) {
   if (!Number.isInteger(ledger.managerTerm)) {
     ledger.managerTerm = 1;
@@ -206,7 +250,7 @@ function suspendForHandover(state, local, expiresAtMs) {
 
 function persistPendingHandover(state, local, pending) {
   try {
-    ensureDir(collabDir(state.dataDir, local.collabId));
+    ensureDir(collabRunDir(state.dataDir, local.collabId));
     writeJsonAtomic(handoverPendingFilePath(state.dataDir, local.collabId), {
       offerId: pending.offerId,
       collabId: local.collabId,
@@ -372,6 +416,7 @@ function offerRecordOf(frame) {
     expiresAt: payload.expiresAt,
     expiresAtMs: Date.parse(payload.expiresAt),
     from: { instanceId: frame.from.instanceId, sessionId: frame.from.sessionId, identityName: frame.from.identityName },
+    ...(isPlainObject(payload.target) ? { target: payload.target } : {}),
     state: OFFER_STATE_OPEN,
   };
 }
@@ -382,6 +427,7 @@ function storeOfferRecord(state, local, record) {
   }
   const runtime = m5RuntimeOf(state);
   const offers = runtime.handoverOffers.get(local.collabId) ?? new Map();
+  record.collabId = local.collabId;
   offers.set(record.offerId, record);
   runtime.handoverOffers.set(local.collabId, offers);
   learnOfferedEndpoints(state, local, record);
@@ -422,6 +468,7 @@ function persistOfferRecords(state, local) {
       ledger: record.ledger,
       endpoints: record.endpoints,
       from: record.from,
+      ...(record.target === undefined ? {} : { target: record.target }),
       expiresAt: record.expiresAt,
       state: record.state,
     }));
@@ -481,7 +528,13 @@ function confirmRejection(state, local, record, sessionId) {
   if (record.expiresAtMs <= nowMs(state)) {
     return '移交提议已过期（迟到确认一律拒绝）';
   }
-  return isLocalSeatId(local, sessionId) ? null : '确认会话不是本机在该协作的活跃席位';
+  if (!isLocalSeatId(local, sessionId)) {
+    return '确认会话不是本机在该协作的活跃席位';
+  }
+  if (isPlainObject(record.target) && record.target.instanceId === state.self.instanceId && record.target.sessionId !== sessionId) {
+    return '确认会话不是该移交提议的目标席位';
+  }
+  return null;
 }
 
 function confirmKey(collabId, offerId, sessionId) {
@@ -502,18 +555,27 @@ function isLocalSeatId(local, sessionId) {
 }
 
 function sendOfferAccept(state, local, record, sessionId) {
-  const endpoint = endpointFor(state, local, record.from.instanceId);
-  if (endpoint === undefined) {
-    return { ok: false, message: '移交方端点未知——无法回执' };
-  }
-  const sent = sendTo(state, local.collabId, record.from.instanceId, endpoint, 'handover', {
+  const payload = {
     kind: 'accept',
     offerId: record.offerId,
     baseTerm: record.baseTerm,
     version: record.version,
     digest: record.digest,
     confirm: true,
-  }, { fromSessionId: sessionId });
+  };
+  if (record.from.instanceId === state.self.instanceId) {
+    /* 同机：accept 直接交给本核的旧站长侧处理（不经过网络）。 */
+    record.state = OFFER_STATE_ACCEPTED;
+    persistOfferRecords(state, local);
+    bump(state, 'handoverAccepted');
+    handleAccept(state, local, acceptFrameOf(state, record, sessionId, payload));
+    return { ok: true, accepted: true, offerId: record.offerId, message: '已回执接受；等待现任站长签发站长变更。' };
+  }
+  const endpoint = endpointFor(state, local, record.from.instanceId);
+  if (endpoint === undefined) {
+    return { ok: false, message: '移交方端点未知——无法回执' };
+  }
+  const sent = sendTo(state, local.collabId, record.from.instanceId, endpoint, 'handover', payload, { fromSessionId: sessionId });
   if (sent.ok !== true) {
     return { ok: false, message: `接受回执入队失败：${sent.reason ?? '未知原因'}` };
   }
@@ -521,6 +583,20 @@ function sendOfferAccept(state, local, record, sessionId) {
   persistOfferRecords(state, local);
   bump(state, 'handoverAccepted');
   return { ok: true, accepted: true, offerId: record.offerId, message: '已回执接受；等待现任站长签发站长变更。' };
+}
+
+function acceptFrameOf(state, record, sessionId, payload) {
+  return {
+    type: 'handover',
+    collabId: record.collabId,
+    from: {
+      instanceId: state.self.instanceId,
+      sessionId,
+      identityName: state.self.identityName,
+      port: state.self.port,
+    },
+    payload,
+  };
 }
 
 /* —— auto-offer 广播接收与目标侧自动接受（设计 §2A.5） —— */
@@ -531,15 +607,37 @@ export function handleAutoOffer(state, frame) {
     return;
   }
   const runtime = m5RuntimeOf(state);
+  const offer = makeAutoOffer(frame.payload);
+  if (offer === null || !autoOfferSourceOk(state, local, frame, offer)) {
+    bump(state, 'autoOfferRejected');
+    state.log.warn('auto-offer 来源或形态不符（丢弃）', { collabId: local.collabId, from: frame.from?.instanceId });
+    return;
+  }
   const offers = runtime.autoOffers.get(local.collabId) ?? new Map();
-  offers.set(frame.payload.offerId, { ...frame.payload, receivedAt: nowMs(state) });
+  offers.set(offer.offerId, { ...offer, receivedAt: nowMs(state) });
   runtime.autoOffers.set(local.collabId, offers);
   pruneAutoOffers(state, local);
   bump(state, 'autoOffersIn');
-  const record = runtime.handoverOffers.get(local.collabId)?.get(frame.payload.offerId);
+  const record = runtime.handoverOffers.get(local.collabId)?.get(offer.offerId);
   if (record !== undefined && record.state === OFFER_STATE_OPEN) {
-    autoAcceptOffer(state, local, record, frame.payload);
+    autoAcceptOffer(state, local, record, offer);
   }
+}
+
+/* 权威表（设计 §7.1）：auto-offer 只能由本地当前站长签发，且 prevManager 必须就是该站长。
+ * 缺此校验时任意成员可先伪造 offer 再自签 via=auto（A2 的「本地 offer 证据」被自证）。 */
+function autoOfferSourceOk(state, local, frame, offer) {
+  if (local.role === 'manager' || offer === null) {
+    return false;
+  }
+  const from = { instanceId: frame.from?.instanceId, sessionId: frame.from?.sessionId };
+  const manager = managerSeatOfLedger(state, local);
+  if (manager === null) {
+    /* 本地已无站长（终态副本）：只认最后已知站长（prevManager）自己签发的 offer。 */
+    const last = local.member?.manager;
+    return isPlainObject(last) && from.instanceId === last.instanceId && sameSeat(from, offer.prevManager);
+  }
+  return sameSeat(from, manager) && sameSeat(offer.prevManager, manager);
 }
 
 function pruneAutoOffers(state, local) {
@@ -570,9 +668,10 @@ function autoAcceptOffer(state, local, record, autoOffer) {
     bump(state, 'autoAcceptRejected');
     return false;
   }
+  const seat = targetSeatOf(local, autoOffer);
   record.state = OFFER_STATE_ACCEPTED;
   persistOfferRecords(state, local);
-  sendAutoAcceptReceipt(state, local, record);
+  sendAutoAcceptReceipt(state, local, record, seat?.sessionId);
   signAutoChange(state, local, record, autoOffer);
   return true;
 }
@@ -598,12 +697,16 @@ function targetSeatOf(local, autoOffer) {
   return seats.length === 1 ? seats[0] : undefined;
 }
 
-function sendAutoAcceptReceipt(state, local, record) {
+function sendAutoAcceptReceipt(state, local, record, targetSessionId) {
   const endpoint = endpointFor(state, local, record.from.instanceId);
   if (endpoint === undefined) {
     return;
   }
-  const signer = presenceSignerOf(local);
+  /* 接受回执必须由目标席位签名：旧站长按 sameSeat(from, pending.target) 校验，
+   * 用本机其它席位代签会让 accept 被忽略并触发 5s 超时顺延。 */
+  const signerSessionId = typeof targetSessionId === 'string' && targetSessionId !== ''
+    ? targetSessionId
+    : presenceSignerOf(local)?.sessionId;
   sendTo(state, local.collabId, record.from.instanceId, endpoint, 'handover', {
     kind: 'accept',
     offerId: record.offerId,
@@ -611,7 +714,7 @@ function sendAutoAcceptReceipt(state, local, record) {
     version: record.version,
     digest: record.digest,
     confirm: true,
-  }, { fromSessionId: signer?.sessionId });
+  }, { fromSessionId: signerSessionId });
 }
 
 /* 新站长签发 via=auto：最终台账 = offer 台账 + auto-offer 事件 + 移除旧站长 + 提升自己 + 开窗。 */
@@ -665,8 +768,9 @@ function buildAutoLedger(state, local, record, autoOffer, sessionId) {
   ledger.version = baseVersion + 1;
   ledger.updatedAt = new Date().toISOString();
   ledger.manager = { instanceId: state.self.instanceId, sessionId, identityName: state.self.identityName, term: ledger.managerTerm };
-  const effectiveAt = new Date(nowMs(state)).toISOString();
-  const windowEndsAt = new Date(nowMs(state) + windowMs(state)).toISOString();
+  const signedAt = nowMs(state);
+  const effectiveAt = new Date(signedAt).toISOString();
+  const windowEndsAt = new Date(signedAt + windowMs(state)).toISOString();
   ledger.managerWindow = { windowBaseTerm: ledger.managerTerm, windowEndsAt };
   ledger.events = appendAutoEvents(ledger, autoOffer, record, prevManager, ledger.manager, effectiveAt);
   return ledger;
@@ -763,6 +867,12 @@ function handleAccept(state, local, frame) {
     bump(state, 'lateHandoverAccepts');
     return;
   }
+  /* 已被更高任期降级/归档的旧站长：迟到 accept 不得触碰空台账。 */
+  if (local.role !== 'manager' || local.ledger === null) {
+    bump(state, 'lateHandoverAccepts');
+    clearPendingHandover(state, local);
+    return;
+  }
   if (!sameSeat({ instanceId: frame.from.instanceId, sessionId: frame.from.sessionId }, pending.target)) {
     bump(state, 'eventMismatch');
     return;
@@ -803,9 +913,14 @@ function completeExplicitHandover(state, local, pending) {
   }
   const signer = managerSeatOfLedger(state, local);
   broadcastExplicitChange(state, local, built.payload, signer?.sessionId);
+  if (pending.target.instanceId === state.self.instanceId) {
+    completeSameMachineHandover(state, local, pending, built);
+    return;
+  }
   saveSnapshotCopy(state, local, built.ledger);
   clearPendingHandoverInPlace(state, local);
   downgradeToMember(state, local, { instanceId: pending.target.instanceId, identityName: pending.target.identityName }, built.ledger.version);
+  writeReadonlyLedgerCopy(state, local, built.ledger);
   rememberPendingChange(state, local.collabId, {
     payload: built.payload,
     prevManager: built.prevManager,
@@ -813,6 +928,26 @@ function completeExplicitHandover(state, local, pending) {
   });
   bump(state, 'handoverCompleted');
   notifyLocal(state, local, `移交完成：站长已变更为「${pending.target.identityName}」——本机已转协作者。`);
+}
+
+/* 同机移交完成：同一核心继续持有台账，只切换本机站长席位（旧站长会话降 member、目标升 manager）。 */
+function completeSameMachineHandover(state, local, pending, built) {
+  clearPendingHandoverInPlace(state, local);
+  promoteToManager(state, local, built.ledger);
+  const signer = managerSeatOfLedger(state, local);
+  rememberPendingChange(state, local.collabId, {
+    payload: built.payload,
+    prevManager: built.prevManager,
+    fromSessionId: signer?.sessionId,
+  });
+  m5RuntimeOf(state).acceptedManagers.set(local.collabId, {
+    term: built.ledger.managerTerm,
+    manager: built.ledger.manager,
+    source: { instanceId: state.self.instanceId, sessionId: signer?.sessionId },
+  });
+  m5RuntimeOf(state).managerWindowBaseAt.delete(local.collabId);
+  bump(state, 'handoverCompleted');
+  notifyLocal(state, local, `移交完成：本机站长席位已切换为「${pending.target.identityName}」。`);
 }
 
 function buildExplicitLedger(state, local, pending, effectiveAt) {
@@ -864,8 +999,11 @@ function explicitChangePayloadOf(state, local, ledger, pending, prevManager, eff
 }
 
 function targetEndpointOf(state, local, manager) {
+  if (manager.instanceId === state.self.instanceId) {
+    return selfEndpointOf(state);
+  }
   const endpoint = endpointFor(state, local, manager.instanceId);
-  return endpoint === undefined ? { address: '127.0.0.1', port: state.self.port } : { address: endpoint.address, port: endpoint.port };
+  return endpoint === undefined ? selfEndpointOf(state) : { address: endpoint.address, port: endpoint.port };
 }
 
 function broadcastExplicitChange(state, local, payload, sessionId) {
@@ -884,6 +1022,21 @@ function broadcastExplicitChange(state, local, payload, sessionId) {
 }
 
 /* 采纳前保留只读副本：降级会删除台账文件，快照文件即只读副本（设计 §2A.8③）。 */
+/* 降级后保留只读台账副本（设计 §2A.8③）：目录无台账会被判 recovery 只读，旧站长无法再接收入站帧。 */
+function writeReadonlyLedgerCopy(state, local, ledger) {
+  if (!isPlainObject(ledger)) {
+    return;
+  }
+  try {
+    ensureDir(collabDir(state.dataDir, local.collabId));
+    appendLedger(state.dataDir, { ...ledger, collabId: local.collabId });
+    bump(state, 'readonlyLedgerKept');
+  } catch (error) {
+    bump(state, 'readonlyLedgerFailures');
+    state.log.warn('降级后只读台账副本写入失败（已忽略）', { collabId: local.collabId, reason: error.message });
+  }
+}
+
 function saveSnapshotCopy(state, local, ledger) {
   local.snapshot = {
     version: ledger.version,
@@ -955,6 +1108,202 @@ export function completeHandover(state, local, accept) {
 export { handoverConfirmMs };
 export const HANDOVER_CONFIRM_TIMEOUT_MS = 120000;
 
+const REJECT_REASONS = new Set(['expired', 'version-changed', 'manager-changed', 'rejected']);
+
+/* 目标侧拒绝移交（设计 §2A.4③/§9；工具面）：回 reject 并作废本条记录。
+ * sessionId 必须是本机活跃席位；同机记录还必须命中 offer 的目标席位。 */
+export function rejectHandover(state, input = {}) {
+  const { collabId, sessionId, offerId, reason } = input;
+  const local = state.collabs.get(collabId);
+  if (local === undefined) {
+    return { ok: false, message: '本机没有该协作' };
+  }
+  const record = m5RuntimeOf(state).handoverOffers.get(collabId)?.get(offerId);
+  const rejection = rejectHandoverRejection(state, local, record, sessionId);
+  if (rejection !== null) {
+    return { ok: false, message: rejection };
+  }
+  const normalized = REJECT_REASONS.has(reason) ? reason : 'rejected';
+  record.state = 'rejected';
+  persistOfferRecords(state, local);
+  bump(state, 'handoverRejectedOut');
+  const payload = { kind: 'reject', offerId: record.offerId, reason: normalized };
+  if (record.from.instanceId === state.self.instanceId) {
+    handleReject(state, local, acceptFrameOf(state, record, sessionId, payload));
+  } else {
+    const endpoint = endpointFor(state, local, record.from.instanceId);
+    if (endpoint !== undefined) {
+      sendTo(state, local.collabId, record.from.instanceId, endpoint, 'handover', payload, { fromSessionId: sessionId });
+    }
+  }
+  return { ok: true, offerId: record.offerId, reason: normalized, message: '已拒绝移交提议。' };
+}
+
+function rejectHandoverRejection(state, local, record, sessionId) {
+  if (record === undefined || record.state !== OFFER_STATE_OPEN) {
+    return '没有该待确认的移交提议（可能已过期或已处置）';
+  }
+  if (!isLocalSeatId(local, sessionId)) {
+    return '拒绝会话不是本机在该协作的活跃席位';
+  }
+  if (isPlainObject(record.target) && record.target.instanceId === state.self.instanceId && record.target.sessionId !== sessionId) {
+    return '拒绝会话不是该移交提议的目标席位';
+  }
+  return null;
+}
+
+/* 更高任期证据到达时作废在途显式移交（设计 §2A.4「在途抑制」）。 */
+export function dropHandoverInFlight(state, collabId) {
+  const local = state.collabs.get(collabId);
+  if (local !== undefined) {
+    clearPendingHandover(state, local);
+    return;
+  }
+  const runtime = m5RuntimeOf(state);
+  runtime.pendingHandovers.delete(collabId);
+  runtime.handoverTargets.delete(collabId);
+  const timer = runtime.handoverTargets.get(`${collabId}\u0000timer`);
+  if (timer !== undefined) {
+    clearTimeout(timer);
+    runtime.handoverTargets.delete(`${collabId}\u0000timer`);
+  }
+}
+
+/* —— 同机自动移交目标侧（takeover 的本机旁路经注册回调落到这里） —— */
+
+function deliverLocalAutoOffer(state, local, offer, targetSeat) {
+  const record = localOfferRecordOf({ ...offer, from: offer.prevManager }, targetSeat);
+  if (storeOfferRecord(state, local, record) === null) {
+    bump(state, 'autoChangeBuildFailures');
+    return;
+  }
+  autoAcceptOffer(state, local, record, offer);
+}
+
+registerLocalAutoOfferHandler(deliverLocalAutoOffer);
+
+/* —— 重启恢复（契约 §2A.1/§6.2）：handover-pending 与目标侧 offer 记录 —— */
+
+export function restoreM5State(state) {
+  for (const collabId of state.collabs.keys()) {
+    restoreAutoTransferState(state, collabId);
+    restorePendingHandoverOf(state, collabId);
+    restoreOfferRecordsOf(state, collabId);
+  }
+}
+
+/* 启动恢复的注册面：核心启动（startLiveness）时由 takeover 统一调用。 */
+export function restoreHandoverLifecycle(state) {
+  for (const collabId of state.collabs.keys()) {
+    restorePendingHandoverOf(state, collabId);
+    restoreOfferRecordsOf(state, collabId);
+  }
+}
+
+registerLifecycleRestorer(restoreHandoverLifecycle);
+
+function readRecordFile(path, state, counter) {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    bump(state, counter);
+    return null;
+  }
+}
+
+function restorePendingHandoverOf(state, collabId) {
+  const local = state.collabs.get(collabId);
+  if (local === undefined || local.role !== 'manager' || local.ledger === null) {
+    return;
+  }
+  if (m5RuntimeOf(state).pendingHandovers.has(collabId)) {
+    return;
+  }
+  const raw = readRecordFile(handoverPendingFilePath(state.dataDir, collabId), state, 'handoverPendingRestoreFailures');
+  const pending = restorablePendingHandoverOf(state, local, raw, collabId);
+  if (pending === null) {
+    if (isPlainObject(raw)) {
+      rmPendingFile(state, local);
+    }
+    return;
+  }
+  const runtime = m5RuntimeOf(state);
+  runtime.pendingHandovers.set(collabId, pending);
+  runtime.handoverTargets.set(collabId, pending.target);
+  suspendForHandover(state, local, pending.expiresAtMs);
+  armHandoverExpiry(state, local, pending);
+  bump(state, 'handoverPendingRestored');
+}
+
+function restorablePendingHandoverOf(state, local, raw, collabId) {
+  if (!isPlainObject(raw) || raw.collabId !== collabId || typeof raw.offerId !== 'string') {
+    return null;
+  }
+  const expiresAtMs = Date.parse(raw.expiresAt);
+  if (!(expiresAtMs > nowMs(state)) || !isPlainObject(raw.target)) {
+    return null;
+  }
+  if (raw.baseTerm !== ledgerTermOf(local.ledger) || raw.version !== local.ledger.version) {
+    return null;
+  }
+  return {
+    offerId: raw.offerId,
+    baseTerm: raw.baseTerm,
+    version: raw.version,
+    digest: raw.digest,
+    expiresAt: raw.expiresAt,
+    expiresAtMs,
+    target: raw.target,
+    from: managerSeatOfLedger(state, local),
+    auto: false,
+  };
+}
+
+function restoreOfferRecordsOf(state, collabId) {
+  const local = state.collabs.get(collabId);
+  if (local === undefined) {
+    return;
+  }
+  const raw = readRecordFile(handoverOffersFilePath(state.dataDir, collabId), state, 'handoverOffersRestoreFailures');
+  if (!isPlainObject(raw) || !Array.isArray(raw.offers)) {
+    return;
+  }
+  const runtime = m5RuntimeOf(state);
+  const now = nowMs(state);
+  const offers = runtime.handoverOffers.get(collabId) ?? new Map();
+  let restored = 0;
+  for (const entry of raw.offers) {
+    const record = restoredOfferOf(entry, collabId, now);
+    if (record === null) {
+      bump(state, 'handoverOffersRestoreDropped');
+      continue;
+    }
+    offers.set(record.offerId, record);
+    restored++;
+  }
+  if (restored > 0) {
+    runtime.handoverOffers.set(collabId, offers);
+    bump(state, 'handoverOffersRestored');
+  }
+}
+
+function restoredOfferOf(entry, collabId, now) {
+  if (!isPlainObject(entry) || typeof entry.offerId !== 'string' || !isLedgerShape(entry.ledger)) {
+    return null;
+  }
+  if (!Number.isInteger(entry.baseTerm) || !Number.isInteger(entry.version) || Date.parse(entry.expiresAt) <= now) {
+    return null;
+  }
+  if (!isPlainObject(entry.from) || !['open', 'accepted'].includes(entry.state)) {
+    return null;
+  }
+  return {
+    ...entry,
+    collabId,
+    expiresAtMs: Date.parse(entry.expiresAt),
+  };
+}
+
 /* 目标侧收到 via=handover 的签发帧：用 offer 台账按同一确定性规则重算最终台账，校验 digest 一致后
  * 提升为站长（设计 §2A.4④）。返回 false = 本机不是该 offer 的目标，交任期受理表继续判定。 */
 export function adoptHandoverAsTarget(state, local, change) {
@@ -963,6 +1312,9 @@ export function adoptHandoverAsTarget(state, local, change) {
   }
   const record = m5RuntimeOf(state).handoverOffers.get(local.collabId)?.get(change.offerId);
   if (!handoverChangeMatches(record, change)) {
+    return false;
+  }
+  if (!handoverChangeAuthorized(state, local, record, change)) {
     return false;
   }
   const ledger = recomputeHandoverLedger(record, state, change);
@@ -991,6 +1343,42 @@ function handoverChangeMatches(record, change) {
     return false;
   }
   return change.term === record.baseTerm + 1 && change.version === record.version + 1;
+}
+
+/* 目标侧旁路不得绕过受理表（设计 §2A.2 A1）：来源必须是本地现任站长、本地任期未推进、
+ * 版本仍以 offer 为基准，且本机处于可收敛状态（fork/pending 不得被单一 +1 变更解除）。 */
+function handoverChangeAuthorized(state, local, record, change) {
+  const frozen = m5RuntimeOf(state).frozen.get(local.collabId);
+  if (frozen === 'manager-fork' || frozen === 'manager-pending') {
+    return false;
+  }
+  const current = managerSeatOfLedger(state, local);
+  if (current === null || !sameSeat(record.from, current) || !sameSeat(change.from, current)) {
+    return false;
+  }
+  return handoverTermBaselineOk(local, record, change, current) && handoverTargetSeatOk(state, local, record, change);
+}
+
+/* 本地任期仍以 offer 的 baseTerm 为基线、版本尚未推进（陈旧 offer 不得降回或直接提升）。 */
+function handoverTermBaselineOk(local, record, change, current) {
+  if (!sameSeat(change.prevManager, current) || local.snapshot === null || local.snapshot.ledger === null) {
+    return false;
+  }
+  const localTerm = ledgerTermOf(local.snapshot.ledger);
+  if (record.baseTerm !== localTerm || change.term !== localTerm + 1) {
+    return false;
+  }
+  return record.version >= local.snapshot.version && change.version > local.snapshot.version;
+}
+
+function handoverTargetSeatOk(state, local, record, change) {
+  if (change.manager.instanceId !== state.self.instanceId) {
+    return false;
+  }
+  if (!localSeatsOf(local).some((seat) => seat.sessionId === change.manager.sessionId)) {
+    return false;
+  }
+  return record.target === undefined || sameSeat(record.target, change.manager);
 }
 
 function recomputeHandoverLedger(record, state, change) {
