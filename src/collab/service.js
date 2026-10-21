@@ -579,7 +579,7 @@ function gateFrame(state, frame, meta) {
   }
 }
 
-/* 入站写门（设计 §6.4 H-I9）：legacy / 半写目录收到协作域帧一律拒绝并计数，不写 inbox/邀请。 */
+/* 入站写门（设计 §6.4）：legacy / 半写目录收到协作域帧一律拒绝并计数，不写 inbox/邀请。 */
 function readonlyInboundRefusal(state, collabId) {
   const verdict = writableVerdictOf(state, collabId);
   if (verdict.ok) {

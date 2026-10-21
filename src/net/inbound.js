@@ -677,7 +677,7 @@ function firstInjectedSeatOf(record) {
   return null;
 }
 
-/* 重复帧补扇出（D11/H-C6）：已完成的席位跳过，pending 里的席位补投；随后重发机器级回报（幂等）。
+/* 重复帧补扇出（D11）：已完成的席位跳过，pending 里的席位补投；随后重发机器级回报（幂等）。
  * 补扇出一律复用 inbox 已存的原帧（剥离 receivedAt / fanout）：同 msgId 的重复帧若换了 type/payload
  * 即为内容与账不一致，拒绝补扇出并计数（仍保留 ack——链路确认与内容裁定是两件事）。
  * 旧单投路径（无席位注入面）维持原语义：重复只重确认、不重发回报。 */

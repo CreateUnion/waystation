@@ -9,7 +9,7 @@ const repoRoot = fileURLToPath(new URL('..', import.meta.url));
 /* 开发过程编号不得进代码注释（CS-08）：溯源属于 commit 与文档，注释只讲「为什么」。
  * 技术文档出处（设计章节 / ADR / TRM 章节）是「为什么」的证据，不在拦截范围。
  * 只扫 src/ 与 bin/（同 stdout 纪律扫描口径）：测试夹具会刻意构造违规样本串。 */
-const PLAN_REFERENCE_PATTERN = /批次\s*\d|WP-\d+|\bG\d+\b|\bT\d+\b|\bM[1-9]\b|\b[NCI]-\d+\b|\bR\d+\b|\bM-\d+\b/;
+const PLAN_REFERENCE_PATTERN = /批次\s*\d|WP-\d+|\bG\d+\b|\bT\d+\b|\bM[1-9]\b|\b[NCI]-\d+\b|\bH-[A-Z]\d+\b|\bR\d+\b|\bM-\d+\b/;
 
 /* 迁移期存量基线（跨模块欠账）：下列行是提交树中实际存在的编号引用，由各属主清理。
  * 基线按「相对路径 + 整行文本」精确匹配——同文件新增或改写出的违规不会命中，仍会被拦截；
@@ -61,6 +61,8 @@ test('注释编号扫描 matcher 自检：语义正确（防止扫描本身失�
   assert.equal(PLAN_REFERENCE_PATTERN.test('（C-3）写点纪律'), true, 'C 系列编号命中');
   assert.equal(PLAN_REFERENCE_PATTERN.test('（I-2）注释纪律'), true, 'I 系列编号命中');
   assert.equal(PLAN_REFERENCE_PATTERN.test('R1 跨重启'), true, 'R 系列编号命中');
+  assert.equal(PLAN_REFERENCE_PATTERN.test('（H-C6）补扇出'), true, 'H 系列编号命中');
+  assert.equal(PLAN_REFERENCE_PATTERN.test('HTTP-2 协议'), false, '词内 H-数字不误报（词边界）');
   assert.equal(PLAN_REFERENCE_PATTERN.test('设计 §13 尾部半行截断'), false);
   assert.equal(PLAN_REFERENCE_PATTERN.test('端口 7321'), false);
   assert.equal(PLAN_REFERENCE_PATTERN.test('MAX_FRAME_BYTES'), false);
