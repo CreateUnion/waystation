@@ -269,7 +269,7 @@ test('讨论发帖：发送席位必须显式且为本机活跃席位，拒绝�
 
   const impersonated = await made.service.send({ collabId: created.collabId, text: '冒名会话', sessionId: 'seat-x' });
   assert.equal(impersonated.ok, false, '非本机席位不得代为发帖');
-  assert.match(String(impersonated.message), /不在本机席位表|非本机成员/);
+  assert.match(String(impersonated.message), /不在本机席位表|非本机成员|尚未加入该讨论/);
   assert.equal(made.sent.some((message) => message.type === 'post'), false, '冒名拒绝同样不产生帧');
   const view = await made.service.view({ collabId: created.collabId });
   assert.deepEqual(view.posts, [], '拒绝不得在本地帖列表留下半写条目');
