@@ -13,8 +13,8 @@ import { COLLABS_DIR_NAME, CONFIG_FILE_NAME, SITES_DIR_NAME } from '../src/paths
 import { POSTS_FILE_NAME } from '../src/collab/posts.js';
 import { MEMBERS_FILE_NAME } from '../src/collab/members.js';
 import { LEDGER_FILE_NAME, MEMBER_FILE_NAME } from '../src/collab/store.js';
+import { CARRIER_FILE_NAME } from '../src/collab/carrier.js';
 import { COUNTER_FILE_NAME } from '../src/collab/counter.js';
-import { MUTE_FILE_NAME } from '../src/collab/mute.js';
 import { INBOX_FILE_NAME } from '../src/net/inbound.js';
 import { OUTBOX_FILE_NAME } from '../src/net/outbox.js';
 
@@ -81,23 +81,76 @@ function memberEvent(over = {}) {
   return { eventId: 'ev-1', kind: 'join', instanceId: 'inst-a', identityName: '甲机', ts: T0, ...over };
 }
 
+/* 新形态共享台账（0.2.0）：managerTerm/joinSeqNext/manager.sessionId/席位 joinSeq 齐备；
+ * 名单只含活跃席位（state=member）。 */
 function ledgerOf(over = {}) {
   return {
     version: 1,
     collabId: 'c-1',
     name: '协作甲',
     topic: '主题甲',
+    mode: 'managed',
     status: 'active',
-    manager: { instanceId: 'mgr-1', identityName: '甲机' },
+    managerTerm: 1,
+    joinSeqNext: 3,
+    manager: { instanceId: 'mgr-1', sessionId: 'sess-mgr', identityName: '甲机', term: 1 },
     members: [
-      { instanceId: 'mgr-1', identityName: '甲机', role: 'manager', state: 'member', joinedAt: T0 },
-      { instanceId: 'inst-b', identityName: '乙机', role: 'member', state: 'member', joinedAt: T0 },
+      { instanceId: 'mgr-1', sessionId: 'sess-mgr', identityName: '甲机', role: 'manager', state: 'member', joinSeq: 1, joinedAt: T0 },
+      { instanceId: 'inst-b', sessionId: 'sess-b', identityName: '乙机', role: 'member', state: 'member', joinSeq: 2, joinedAt: T0 },
     ],
     board: [],
     createdAt: T0,
     updatedAt: T0,
     ...over,
   };
+}
+
+function forumLedgerOf(collabId) {
+  return {
+    version: 1,
+    collabId,
+    name: '甲机',
+    topic: '讨论主题',
+    mode: 'forum',
+    status: 'active',
+    managerTerm: 1,
+    members: [
+      { instanceId: 'inst-a', sessionId: 'sess-a', identityName: '甲机', role: 'member', state: 'member', joinedAt: T0 },
+    ],
+    board: [],
+    createdAt: T0,
+    updatedAt: T0,
+  };
+}
+
+function carrierOf(collabId, { name, topic, mode, manager = undefined }) {
+  const carrier = {
+    format: 'session-seats',
+    version: 1,
+    collabId,
+    name,
+    topic,
+    mode,
+    endpoints: {},
+    snapshotVersion: 1,
+    createdAt: T0,
+  };
+  if (manager !== undefined) {
+    carrier.manager = manager;
+  }
+  return carrier;
+}
+
+function writeSeatAt(dir, sessionId, record) {
+  mkdirSync(join(dir, 'seats'), { recursive: true });
+  writeFileSync(join(dir, 'seats', `${sessionId}.json`), JSON.stringify({
+    version: 1,
+    sessionId,
+    joinedAt: T0,
+    muted: false,
+    unverified: false,
+    ...record,
+  }));
 }
 
 function inboxRow(over = {}) {
@@ -131,7 +184,7 @@ function outboxRow(over = {}) {
 }
 
 /* 讨论夹具：三条合法帖（含 Markdown 标记与 HTML 注入尝试）＋一条坏行（skipped 透传用）＋
- * 一条成员事件＋参与记录（mode=forum，含主题）。 */
+ * 一条成员事件＋新形态载体与台账（mode=forum，含主题）。 */
 function writeForumFixture(dataDir, collabId = 'c-forum') {
   writeFiles(collabDirIn(dataDir, 'main', collabId), {
     [POSTS_FILE_NAME]: jsonl(
@@ -140,18 +193,28 @@ function writeForumFixture(dataDir, collabId = 'c-forum') {
       postEntry({ entryId: 'post-3', seq: 3, ts: tsPlus(2000), kind: 'issue', text: '<script>alert(1)</script>' }),
     ) + '{坏行\n',
     [MEMBERS_FILE_NAME]: jsonl(memberEvent()),
+    [CARRIER_FILE_NAME]: JSON.stringify(carrierOf(collabId, { name: '甲机', topic: '讨论主题', mode: 'forum' })),
+    [LEDGER_FILE_NAME]: jsonl(forumLedgerOf(collabId)),
+    /* 兼容参与记录（新形态目录仍可能携带，M2 create 写点）：提供本机视角状态；
+     * 席位/名单权威仍是 carrier + 台账 + 成员事件。 */
     [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ mode: 'forum', collabId, topic: '讨论主题' })),
   });
 }
 
-/* 协作夹具：站长席位（台账两行＝一条迁移）＋扇出合并对（错峰 ≤50ms 链式）＋收到一条＋
- * counter 累计收到＋根 config 本机身份名。 */
+/* 协作夹具：站长席位（新形态台账两行＝一条迁移）＋扇出合并对（错峰 ≤50ms 链式）＋收到一条＋
+ * counter 累计收到＋本机席位文件（静音聚合）＋根 config 本机身份名。 */
 function writeManagedFixture(dataDir, collabId = 'c-managed') {
-  writeFiles(collabDirIn(dataDir, 'main', collabId), {
-    [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ mode: 'managed', collabId })),
+  const dir = collabDirIn(dataDir, 'main', collabId);
+  writeFiles(dir, {
+    [CARRIER_FILE_NAME]: JSON.stringify(carrierOf(collabId, {
+      name: '协作甲',
+      topic: '主题甲',
+      mode: 'managed',
+      manager: { instanceId: 'mgr-1', sessionId: 'sess-mgr', identityName: '甲机', term: 1 },
+    })),
     [LEDGER_FILE_NAME]: jsonl(
       ledgerOf({ collabId }),
-      ledgerOf({ collabId, status: 'frozen', updatedAt: tsPlus(1000) }),
+      ledgerOf({ collabId, version: 2, status: 'frozen', updatedAt: tsPlus(1000) }),
     ),
     [COUNTER_FILE_NAME]: JSON.stringify({ v: 1, messageCount: 7 }),
     [INBOX_FILE_NAME]: jsonl(inboxRow({ ts: T0 })),
@@ -160,6 +223,7 @@ function writeManagedFixture(dataDir, collabId = 'c-managed') {
       outboxRow({ msgId: 'f-2', createdAt: tsPlus(507), payload: { text: '**同文**扇出' } }),
     ),
   });
+  writeSeatAt(dir, 'sess-mgr', { role: 'manager', state: 'member', joinSeq: 1, muted: true });
   writeConfigAt(dataDir, '甲机');
 }
 
@@ -302,11 +366,10 @@ test('health：形态与根摘要（8 hex、同目录两次一致、不同目录
   assert.notEqual(elsewhere.root, first.root);
 });
 
-test('collabs：列表原样透传（含 root 标记、mode 判定与 muted 字段）', async (t) => {
+test('collabs：列表原样透传（含 root 标记、mode 判定与席位静音聚合）', async (t) => {
   const dataDir = makeTempDir(t);
   writeForumFixture(dataDir);
   writeManagedFixture(dataDir);
-  writeFileSync(join(collabDirIn(dataDir, 'main', 'c-managed'), MUTE_FILE_NAME), JSON.stringify({ v: 1, muted: true, baseline: 0 }));
   const data = createViewerData({ dataDir });
   const viewer = await startTestViewer(t, { dataDir, data });
   const body = JSON.parse((await fetchText(viewer.origin, '/api/collabs')).body);
@@ -315,8 +378,10 @@ test('collabs：列表原样透传（含 root 标记、mode 判定与 muted 字�
   assert.equal(body.collabs.find((entry) => entry.id === 'c-forum').mode, 'forum');
   assert.equal(body.collabs.find((entry) => entry.id === 'c-managed').mode, 'managed');
   assert.ok(body.collabs.every((entry) => entry.root === 'main'));
-  assert.equal(body.collabs.find((entry) => entry.id === 'c-managed').muted, true);
-  assert.equal(body.collabs.find((entry) => entry.id === 'c-forum').muted, false);
+  /* 静音是席位级（0.2.0）：列表行不再有机器级 muted，聚合数在 sessions 段。 */
+  assert.equal(body.collabs.find((entry) => entry.id === 'c-managed').sessions.mutedSeatCount, 1);
+  assert.equal(body.collabs.find((entry) => entry.id === 'c-managed').sessions.localSeatCount, 1);
+  assert.equal(body.collabs.find((entry) => entry.id === 'c-forum').sessions.mutedSeatCount, 0);
 });
 
 /* —— feed —— */
@@ -394,7 +459,16 @@ test('meta（讨论）：字段与事件轨纯文本原样透传、skipped 计�
     topic: '讨论主题',
     events: { rows: [{ id: 'ev-1', ts: T0, text: '甲机 加入（现 1 人）' }], reset: true },
     skipped: 1,
-    muted: false,
+    sessions: {
+      localSeats: [],
+      remoteSeats: [{ instanceId: 'inst-a', role: 'member', state: 'member', identityName: '甲机' }],
+      departed: [],
+      pendingInvites: [],
+      pendingJoins: [],
+      activeSeatCount: 1,
+      localSeatCount: 0,
+      mutedSeatCount: 0,
+    },
   });
   const anchored = JSON.parse((await fetchText(viewer.origin, '/api/collab/main/c-forum/meta?after=ev-1')).body);
   assert.deepEqual(anchored.events.rows, []);
@@ -404,7 +478,6 @@ test('meta（讨论）：字段与事件轨纯文本原样透传、skipped 计�
 test('meta（协作）：台账口径、迁移行、累计收到计数与 muted 原样透传', async (t) => {
   const dataDir = makeTempDir(t);
   writeManagedFixture(dataDir);
-  writeFileSync(join(collabDirIn(dataDir, 'main', 'c-managed'), MUTE_FILE_NAME), JSON.stringify({ v: 1, muted: true, baseline: 0 }));
   const viewer = await startTestViewer(t, { dataDir });
   const meta = JSON.parse((await fetchText(viewer.origin, '/api/collab/main/c-managed/meta')).body);
   assert.deepEqual(meta, {
@@ -416,7 +489,16 @@ test('meta（协作）：台账口径、迁移行、累计收到计数与 muted 
     topic: '主题甲',
     events: { rows: [{ id: '1:0', ts: tsPlus(1000), text: '状态：active → frozen' }], reset: true },
     skipped: 0,
-    muted: true,
+    sessions: {
+      localSeats: [{ identityName: '甲机', sessionId: 'sess-mgr', role: 'manager', state: 'member', muted: true, joinSeq: 1 }],
+      remoteSeats: [{ instanceId: 'inst-b', sessionId: 'sess-b', identityName: '乙机', role: 'member', state: 'member', joinSeq: 2 }],
+      departed: [],
+      pendingInvites: [],
+      pendingJoins: [],
+      activeSeatCount: 2,
+      localSeatCount: 1,
+      mutedSeatCount: 1,
+    },
   });
 });
 
@@ -495,7 +577,6 @@ test('未就绪：目录在而数据未落盘 → 200 空数据（与目录缺�
     topic: null,
     events: { rows: [], reset: true },
     skipped: 0,
-    muted: false,
   });
 });
 

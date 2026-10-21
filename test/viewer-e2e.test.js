@@ -9,6 +9,7 @@ import { COLLABS_DIR_NAME, CONFIG_FILE_NAME } from '../src/paths.js';
 import { POSTS_FILE_NAME } from '../src/collab/posts.js';
 import { MEMBERS_FILE_NAME } from '../src/collab/members.js';
 import { LEDGER_FILE_NAME, MEMBER_FILE_NAME } from '../src/collab/store.js';
+import { CARRIER_FILE_NAME } from '../src/collab/carrier.js';
 import { COUNTER_FILE_NAME } from '../src/collab/counter.js';
 import { INBOX_FILE_NAME } from '../src/net/inbound.js';
 import { OUTBOX_FILE_NAME } from '../src/net/outbox.js';
@@ -213,23 +214,63 @@ function memberEvent(over = {}) {
   return { eventId: 'ev-1', kind: 'join', instanceId: 'inst-a', identityName: '甲机', ts: T0, ...over };
 }
 
+/* 新形态共享台账（0.2.0）：managerTerm/joinSeqNext/manager.sessionId/席位 joinSeq 齐备。 */
 function ledgerOf(over = {}) {
   return {
     version: 1,
     collabId: 'c-managed',
     name: '协作甲',
     topic: '主题甲',
+    mode: 'managed',
     status: 'active',
-    manager: { instanceId: 'mgr-1', identityName: '甲机' },
+    managerTerm: 1,
+    joinSeqNext: 3,
+    manager: { instanceId: 'mgr-1', sessionId: 'sess-mgr', identityName: '甲机', term: 1 },
     members: [
-      { instanceId: 'mgr-1', identityName: '甲机', role: 'manager', state: 'member', joinedAt: T0 },
-      { instanceId: 'inst-b', identityName: '乙机', role: 'member', state: 'member', joinedAt: T0 },
+      { instanceId: 'mgr-1', sessionId: 'sess-mgr', identityName: '甲机', role: 'manager', state: 'member', joinSeq: 1, joinedAt: T0 },
+      { instanceId: 'inst-b', sessionId: 'sess-b', identityName: '乙机', role: 'member', state: 'member', joinSeq: 2, joinedAt: T0 },
     ],
     board: [],
     createdAt: T0,
     updatedAt: T0,
     ...over,
   };
+}
+
+function forumLedgerOf(collabId) {
+  return {
+    version: 1,
+    collabId,
+    name: '讨论甲',
+    topic: '讨论主题',
+    mode: 'forum',
+    status: 'active',
+    managerTerm: 1,
+    members: [
+      { instanceId: 'inst-a', sessionId: 'sess-a', identityName: '甲机', role: 'member', state: 'member', joinedAt: T0 },
+    ],
+    board: [],
+    createdAt: T0,
+    updatedAt: T0,
+  };
+}
+
+function carrierOf(collabId, { name, topic, mode, manager = undefined }) {
+  const carrier = {
+    format: 'session-seats',
+    version: 1,
+    collabId,
+    name,
+    topic,
+    mode,
+    endpoints: {},
+    snapshotVersion: 1,
+    createdAt: T0,
+  };
+  if (manager !== undefined) {
+    carrier.manager = manager;
+  }
+  return carrier;
 }
 
 function inboxRow(over = {}) {
@@ -274,17 +315,25 @@ function writeForumFixture(home, collabId, { posts = 3, tailWithoutNewline = fal
   writeFiles(collabDirIn(home, collabId), {
     [POSTS_FILE_NAME]: postsText,
     [MEMBERS_FILE_NAME]: jsonl(memberEvent()),
+    [CARRIER_FILE_NAME]: JSON.stringify(carrierOf(collabId, { name: '讨论甲', topic: '讨论主题', mode: 'forum' })),
+    [LEDGER_FILE_NAME]: jsonl(forumLedgerOf(collabId)),
+    /* 兼容参与记录：本机视角状态（新形态目录由 M2 create 写点携带）。 */
     [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ mode: 'forum', collabId })),
   });
 }
 
-/* 协作夹具（站长席位）：台账两行（一条迁移）＋累计收到＋收/发各一条内容消息。 */
+/* 协作夹具（站长席位）：新形态载体/台账两行（一条迁移）＋累计收到＋收/发各一条内容消息。 */
 function writeManagedFixture(home, collabId) {
   writeFiles(collabDirIn(home, collabId), {
-    [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ mode: 'managed', collabId, name: '协作甲' })),
+    [CARRIER_FILE_NAME]: JSON.stringify(carrierOf(collabId, {
+      name: '协作甲',
+      topic: '主题甲',
+      mode: 'managed',
+      manager: { instanceId: 'mgr-1', sessionId: 'sess-mgr', identityName: '甲机', term: 1 },
+    })),
     [LEDGER_FILE_NAME]: jsonl(
       ledgerOf({ collabId }),
-      ledgerOf({ collabId, status: 'frozen', updatedAt: tsPlus(1000) }),
+      ledgerOf({ collabId, version: 2, status: 'frozen', updatedAt: tsPlus(1000) }),
     ),
     [COUNTER_FILE_NAME]: JSON.stringify({ v: 1, messageCount: 7 }),
     [INBOX_FILE_NAME]: jsonl(inboxRow({ collabId })),
