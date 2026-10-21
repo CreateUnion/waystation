@@ -6,12 +6,20 @@ import { ID_PATTERN, MAX_ACTIVE_SEATS } from '../net/protocol.js';
  * 站长侧 joining（已发 grant、待 confirm 的席位）。本模块只做状态判定与去重，不写盘、不发帧、不读服务层：
  * 持久化与网络投递由接线方按返回的 reason 决定，判定逻辑因此可在 PC 上单测。
  * 时间一律经注入时钟推进（调用参数可覆盖），过期判定与容量淘汰因此确定可复现。
- * reason 词表与 join-deny 的原因同一口径：expired / aborted / manager-changed / capacity 等。 */
+ * 返回的 reason 是模块内部词表；只有 JOIN_DENY_REASONS 可直接进 join-deny，其余按接线语义转成快照/本地错误
+ * （joinDenyReasonOf 只做兜底映射；already-member 须由接线按 H-I4 回快照，不得当 deny 投递）。 */
 
 export const PENDING_INVITE_CAPACITY = 64;
 export const JOINING_TTL_MS = 60000;
 /* 在途入席不超过活跃席位硬顶：joining 不占活跃席位，但未确认记录也不得无界堆积。 */
 export const MAX_JOINING = MAX_ACTIVE_SEATS;
+
+/* join-deny 的协议词表（协议层只收这四个）；内部失败原因经 joinDenyReasonOf 收敛。 */
+export const JOIN_DENY_REASONS = ['expired', 'aborted', 'manager-changed', 'capacity'];
+
+export function joinDenyReasonOf(reason) {
+  return JOIN_DENY_REASONS.includes(reason) ? reason : 'aborted';
+}
 
 /**
  * @typedef {{ instanceId: string, sessionId: string }} SeatRef
@@ -52,12 +60,23 @@ export const MAX_JOINING = MAX_ACTIVE_SEATS;
 
 /* —— 形态与时钟原语 —— */
 
+const INVITE_STATES = ['open', 'closed', 'withdrawn'];
+const PENDING_STATES = ['open', 'consumed', 'expired', 'withdrawn'];
+
 function failure(reason) {
   return { ok: false, reason };
 }
 
+function isPlainRecord(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 function asId(value) {
   return typeof value === 'string' && ID_PATTERN.test(value) ? value : null;
+}
+
+function isTimestamp(value) {
+  return Number.isInteger(value) && value >= 0;
 }
 
 /**
@@ -128,6 +147,7 @@ export function createInvitesBook({ now = Date.now } = {}) {
     declineInvite: (inviteId, input) => declineInvite(state, inviteId, input ?? {}),
     withdrawInvite: (inviteId) => withdrawInvite(state, inviteId),
     expireInvites: (at) => expireInvites(state, at),
+    restore: (records) => restoreInvites(state, records),
     get: (inviteId) => cloneInviteOrNull(recordOf(state, inviteId)),
     list: () => [...state.records.values()].map(cloneInvite),
   };
@@ -306,6 +326,81 @@ function cloneInvite(record) {
   };
 }
 
+/* 重启恢复：整表替换（先全部校验再落内存，坏档不留半份账）；重复 inviteId 视为坏条丢弃并计数。
+ * 会话级拒绝只存内存（冻结形态不含该字段），恢复后不恢复——指名邀请仍因 closed 不可再接受，
+ * 不指名邀请允许重投后由该会话重新决定。 */
+function restoreInvites(state, records) {
+  if (!Array.isArray(records)) {
+    return failure('invalid');
+  }
+  const restored = new Map();
+  let rejected = 0;
+  for (const raw of records) {
+    const record = restoredInviteOf(raw);
+    if (record === null || restored.has(record.inviteId)) {
+      rejected++;
+      continue;
+    }
+    restored.set(record.inviteId, record);
+  }
+  state.records = restored;
+  state.declines.clear();
+  return { ok: true, restored: restored.size, rejected };
+}
+
+function restoredInviteOf(raw) {
+  if (!isPlainRecord(raw)) {
+    return null;
+  }
+  const inviteId = asId(raw.inviteId);
+  const targets = restoredTargetsOf(raw.targets);
+  if (inviteId === null || targets === null) {
+    return null;
+  }
+  if (!isTimestamp(raw.createdAt) || !isTimestamp(raw.expiresAt) || raw.expiresAt < raw.createdAt) {
+    return null;
+  }
+  const acceptedSessions = restoredSeatListOf(raw.acceptedSessions);
+  if (acceptedSessions === null || !INVITE_STATES.includes(raw.state)) {
+    return null;
+  }
+  return { inviteId, targets, createdAt: raw.createdAt, expiresAt: raw.expiresAt, state: raw.state, acceptedSessions };
+}
+
+function restoredTargetsOf(raw) {
+  if (!Array.isArray(raw) || raw.length < 1 || raw.length > MAX_ACTIVE_SEATS) {
+    return null;
+  }
+  const targets = [];
+  for (const target of raw) {
+    if (!isPlainRecord(target)) {
+      return null;
+    }
+    const instanceId = asId(target.instanceId);
+    const session = optionalIdOf(target.targetSessionId);
+    if (instanceId === null || session.ok !== true) {
+      return null;
+    }
+    targets.push(session.value === null ? { instanceId } : { instanceId, targetSessionId: session.value });
+  }
+  return targets;
+}
+
+function restoredSeatListOf(raw) {
+  if (!Array.isArray(raw)) {
+    return null;
+  }
+  const seats = [];
+  for (const entry of raw) {
+    const seat = seatOf(entry);
+    if (seat === null) {
+      return null;
+    }
+    seats.push(seat);
+  }
+  return seats;
+}
+
 /* —— 目标机挂起邀请 —— */
 
 /**
@@ -314,22 +409,24 @@ function cloneInvite(record) {
 export function createPendingInvites({ now = Date.now, capacity = PENDING_INVITE_CAPACITY } = {}) {
   /**
    * @type {{ now: () => number, capacity: number, records: Map<string, PendingRecord>, declines: Map<string, Set<string>>,
-   *   counters: { applied: number, duplicates: number, dropped: number, expired: number, withdrawn: number, accepted: number, declined: number } }}
+   *   counters: { applied: number, duplicates: number, dropped: number, reclaimed: number, pruned: number, expired: number, withdrawn: number, accepted: number, declined: number } }}
    */
   const state = {
     now: typeof now === 'function' ? now : Date.now,
     capacity: isPositiveInt(capacity) ? capacity : PENDING_INVITE_CAPACITY,
     records: new Map(),
     declines: new Map(),
-    counters: { applied: 0, duplicates: 0, dropped: 0, expired: 0, withdrawn: 0, accepted: 0, declined: 0 },
+    counters: { applied: 0, duplicates: 0, dropped: 0, reclaimed: 0, pruned: 0, expired: 0, withdrawn: 0, accepted: 0, declined: 0 },
   };
   return {
     applyPendingInvite: (input) => applyPendingInvite(state, input ?? {}),
     matchPendingForSession: (input) => matchPendingForSession(state, input ?? {}),
     consumeForSession: (input) => consumeForSession(state, input ?? {}),
-    withdrawPending: (inviteId) => withdrawPending(state, inviteId),
+    withdrawPending: (input) => withdrawPending(state, input ?? {}),
     expirePending: (at) => expirePending(state, at),
-    get: (inviteId) => getPending(state, inviteId),
+    pruneTerminal: (at) => pruneTerminalPending(state, at),
+    restore: (records) => restorePending(state, records),
+    get: (input) => getPending(state, input ?? {}),
     list: () => [...state.records.values()].map(clonePending),
     stats: () => ({ ...state.counters, size: state.records.size }),
   };
@@ -353,7 +450,14 @@ function applyPendingInvite(state, input) {
   const evicted = evictIfFull(state);
   state.records.set(key, parsed);
   state.counters.applied++;
-  return { ok: true, inviteId: parsed.inviteId, duplicate: false, state: parsed.state, evicted };
+  return {
+    ok: true,
+    inviteId: parsed.inviteId,
+    duplicate: false,
+    state: parsed.state,
+    evicted: evicted === null ? null : evicted.inviteId,
+    evictedState: evicted === null ? null : evicted.state,
+  };
 }
 
 function pendingRecordOf(input, at) {
@@ -403,31 +507,59 @@ function keepDuplicate(state, incoming, existing) {
   if (existing.state === 'open' && incoming.expiresAt > existing.expiresAt) {
     existing.expiresAt = incoming.expiresAt;
   }
-  return { ok: true, inviteId: existing.inviteId, duplicate: true, state: existing.state, evicted: null };
+  return { ok: true, inviteId: existing.inviteId, duplicate: true, state: existing.state, evicted: null, evictedState: null };
 }
 
-/* 容量：淘汰最早过期者（不是最旧插入者），且先腾位再登记——最新一条永远进账，不静默丢新。 */
+/* 容量：先回收终态记录（expired/consumed/withdrawn），全部终态清空后才淘汰 open 中最早过期者。
+ * 这样死记录不会挤掉仍在 TTL 内的有效邀请；丢 open 邀请才计 dropped，回收终态只计 reclaimed。 */
 function evictIfFull(state) {
   if (state.records.size < state.capacity) {
     return null;
   }
-  /** @type {string | null} */
-  let victimKey = null;
-  /** @type {PendingRecord | null} */
-  let victim = null;
-  for (const [key, record] of state.records) {
-    if (victim === null || record.expiresAt < victim.expiresAt) {
-      victimKey = key;
-      victim = record;
-    }
-  }
-  if (victimKey === null || victim === null) {
+  const victim = evictionVictimOf(state);
+  if (victim === null) {
     return null;
   }
-  state.records.delete(victimKey);
-  state.declines.delete(victimKey);
-  state.counters.dropped++;
-  return victim.inviteId;
+  state.records.delete(victim.key);
+  state.declines.delete(victim.key);
+  if (victim.record.state === 'open') {
+    state.counters.dropped++;
+  } else {
+    state.counters.reclaimed++;
+  }
+  return { inviteId: victim.record.inviteId, state: victim.record.state };
+}
+
+/**
+ * @param {{ records: Map<string, PendingRecord> }} state
+ * @returns {{ key: string, record: PendingRecord } | null}
+ */
+function evictionVictimOf(state) {
+  /** @type {{ key: string, record: PendingRecord } | null} */
+  let terminal = null;
+  /** @type {{ key: string, record: PendingRecord } | null} */
+  let open = null;
+  for (const [key, record] of state.records) {
+    if (record.state === 'open') {
+      open = earlierExpiryOf(open, key, record);
+      continue;
+    }
+    terminal = earlierExpiryOf(terminal, key, record);
+  }
+  return terminal ?? open;
+}
+
+/**
+ * @param {{ key: string, record: PendingRecord } | null} held
+ * @param {string} key
+ * @param {PendingRecord} record
+ * @returns {{ key: string, record: PendingRecord }}
+ */
+function earlierExpiryOf(held, key, record) {
+  if (held === null || record.expiresAt < held.record.expiresAt) {
+    return { key, record };
+  }
+  return held;
 }
 
 /* 补投面：指名只看目标会话，不指名对本机全部会话可见；已接受/拒绝/过期/撤回均不再冒泡。 */
@@ -456,63 +588,76 @@ function pendingVisibleOf(record, sessionId, at, declines) {
   return !record.acceptedSessions.includes(sessionId) && !(declines?.has(sessionId) ?? false);
 }
 
-/* 消费：指名记录在接受/拒绝后整条 consumed；不指名记录首 accept 只追加本会话，记录保持 open。 */
+/* 消费：指名记录在接受/拒绝后整条 consumed；不指名记录首 accept 只追加本会话，记录保持 open。
+ * 消费必须同时给 collabId：同机一个 store 若跨协作复用，仅凭 inviteId 会串台。 */
 function consumeForSession(state, input) {
   const ids = consumeIdsOf(input);
   if (ids === null) {
     return failure('invalid');
   }
-  const found = pendingSeatOf(state, ids.inviteId, ids.sessionId);
+  const flagged = declinedFlagOf(input?.declined);
+  if (flagged.ok !== true) {
+    return failure('invalid');
+  }
+  const found = pendingSeatOf(state, ids.collabId, ids.inviteId, ids.sessionId);
   if (found.record === null) {
     return failure(found.reason);
   }
-  return consumeRecord(state, found.record, ids.sessionId, input);
+  return consumeRecord(state, found.record, ids.sessionId, flagged.value, input?.now);
 }
 
 function consumeIdsOf(input) {
+  const collabId = asId(input?.collabId);
   const inviteId = asId(input?.inviteId);
   const sessionId = asId(input?.sessionId);
-  if (inviteId === null || sessionId === null) {
+  if (collabId === null || inviteId === null || sessionId === null) {
     return null;
   }
-  return { inviteId, sessionId };
+  return { collabId, inviteId, sessionId };
 }
 
-function consumeRecord(state, record, sessionId, input) {
-  const declined = input?.declined === true;
+/* declined 只接受布尔或缺省；'yes' / 1 之类误传必须报错，不能落进 accept 分支。 */
+function declinedFlagOf(value) {
+  if (value === undefined) {
+    return { ok: true, value: false };
+  }
+  return typeof value === 'boolean' ? { ok: true, value } : { ok: false };
+}
+
+/* 过期优先于幂等返回：open 邀请过 TTL 后，即便该会话曾接受过，也按 expired 报（不得让接线误判仍可入席）。 */
+function consumeRecord(state, record, sessionId, declined, at) {
+  if (record.state === 'open' && clockOf(state, at) >= record.expiresAt) {
+    record.state = 'expired';
+    state.counters.expired++;
+    return failure('expired');
+  }
   const declines = state.declines.get(pendingKey(record.inviteId, record.targetSessionId));
   const decided = decidedOutcomeOf(record, sessionId, declined, declines);
   if (decided !== null) {
     return decided;
   }
-  const blocked = consumeBlockOf(state, record, input?.now);
-  if (blocked !== null) {
-    return blocked;
+  if (record.state !== 'open') {
+    return failure(record.state);
   }
   return declined ? declineRecord(state, record, sessionId) : acceptRecord(state, record, sessionId);
 }
 
-/* 未决定的记录只剩「可消费」与「已过期/非 open」两种去向；过期顺手推进状态，下一轮按 expired 报。 */
-function consumeBlockOf(state, record, at) {
-  if (record.state !== 'open') {
-    return failure(record.state);
-  }
-  if (clockOf(state, at) < record.expiresAt) {
-    return null;
-  }
-  record.state = 'expired';
-  state.counters.expired++;
-  return failure('expired');
-}
-
-/* 同一 inviteId 可能同时有指名与不指名两条（唯一键不同）：指名的优先，其余会话才落到不指名记录。 */
-function pendingSeatOf(state, inviteId, sessionId) {
+/* 同一 inviteId 可能同时有指名与不指名两条（唯一键不同）：指名的优先，其余会话才落到不指名记录。
+ * 只认请求协作名下的记录；同 inviteId 只在别的协作存在时回 collab-mismatch。 */
+function pendingSeatOf(state, collabId, inviteId, sessionId) {
   let unnamed = null;
   let namedElsewhere = false;
+  let seen = false;
+  let matchedCollab = false;
   for (const record of state.records.values()) {
     if (record.inviteId !== inviteId) {
       continue;
     }
+    seen = true;
+    if (record.collabId !== collabId) {
+      continue;
+    }
+    matchedCollab = true;
     if (record.targetSessionId === sessionId) {
       return { record, reason: 'unknown' };
     }
@@ -522,7 +667,14 @@ function pendingSeatOf(state, inviteId, sessionId) {
       namedElsewhere = true;
     }
   }
-  return { record: unnamed, reason: namedElsewhere ? 'target-mismatch' : 'unknown' };
+  return { record: unnamed, reason: seatMissReasonOf(namedElsewhere, matchedCollab, seen) };
+}
+
+function seatMissReasonOf(namedElsewhere, matchedCollab, seen) {
+  if (namedElsewhere) {
+    return 'target-mismatch';
+  }
+  return matchedCollab || !seen ? 'unknown' : 'collab-mismatch';
 }
 
 /* 已决定会话的重复请求：接受/拒绝都幂等返回，反向决定（先拒后接）如实拒绝。
@@ -572,15 +724,21 @@ function rememberPendingDecline(state, record, sessionId) {
   held.add(sessionId);
 }
 
-/* 撤回：open 记录全部置 withdrawn（同 inviteId 的指名/不指名条目一并停投）；未知记录按已撤回幂等处理。 */
-function withdrawPending(state, inviteId) {
-  const id = asId(inviteId);
-  if (id === null) {
+/* 撤回：open 记录全部置 withdrawn（同协作同 inviteId 的指名/不指名条目一并停投）。
+ * 必须同时给 collabId：同 inviteId 只在别的协作存在时回 collab-mismatch，不跨协作撤回。 */
+function withdrawPending(state, input) {
+  const collabId = asId(input?.collabId);
+  const inviteId = asId(input?.inviteId);
+  if (collabId === null || inviteId === null) {
     return failure('invalid');
   }
+  const matched = pendingRecordsOf(state, collabId, inviteId);
+  if (matched === null) {
+    return failure('collab-mismatch');
+  }
   let withdrawn = 0;
-  for (const record of state.records.values()) {
-    if (record.inviteId !== id || record.state !== 'open') {
+  for (const record of matched) {
+    if (record.state !== 'open') {
       continue;
     }
     record.state = 'withdrawn';
@@ -589,6 +747,22 @@ function withdrawPending(state, inviteId) {
   }
   state.counters.withdrawn += withdrawn;
   return { ok: true, withdrawn };
+}
+
+/* 按协作取同 inviteId 的记录；inviteId 完全不存在返回空数组，只在别的协作存在返回 null。 */
+function pendingRecordsOf(state, collabId, inviteId) {
+  const matched = [];
+  let seen = false;
+  for (const record of state.records.values()) {
+    if (record.inviteId !== inviteId) {
+      continue;
+    }
+    seen = true;
+    if (record.collabId === collabId) {
+      matched.push(record);
+    }
+  }
+  return matched.length === 0 && seen ? null : matched;
 }
 
 /* 过期：只推进 open 记录（已消费/已撤回保留原状态供观察窗解释去向）。 */
@@ -607,17 +781,105 @@ function expirePending(state, at) {
   return { expired: inviteIds.length, inviteIds };
 }
 
-function getPending(state, inviteId) {
-  const id = asId(inviteId);
-  if (id === null) {
+function getPending(state, input) {
+  const collabId = asId(input?.collabId);
+  const inviteId = asId(input?.inviteId);
+  if (collabId === null || inviteId === null) {
     return null;
   }
-  for (const record of state.records.values()) {
-    if (record.inviteId === id) {
-      return clonePending(record);
+  const matched = pendingRecordsOf(state, collabId, inviteId);
+  return matched === null || matched.length === 0 ? null : clonePending(matched[0]);
+}
+
+/* 终态清理：TTL 已过的终态记录（expired/consumed/withdrawn）可删，供接线按保留策略周期调用。
+ * 默认保留（expirePending 只改状态）是为了观察窗能解释「邀请去过哪」，容量面由 evictIfFull 优先回收终态。 */
+function pruneTerminalPending(state, at) {
+  const now = clockOf(state, at);
+  const inviteIds = [];
+  for (const [key, record] of state.records) {
+    if (record.state === 'open' || now < record.expiresAt) {
+      continue;
     }
+    state.records.delete(key);
+    state.declines.delete(key);
+    inviteIds.push(record.inviteId);
   }
-  return null;
+  state.counters.pruned += inviteIds.length;
+  return { pruned: inviteIds.length, inviteIds };
+}
+
+/* 重启恢复：整表替换；状态与 acceptedSessions 原样恢复，会话级拒绝不持久化（见 invites restore 说明）。 */
+function restorePending(state, records) {
+  if (!Array.isArray(records)) {
+    return failure('invalid');
+  }
+  const restored = new Map();
+  let rejected = 0;
+  for (const raw of records) {
+    const record = restoredPendingOf(raw);
+    const key = record === null ? null : pendingKey(record.inviteId, record.targetSessionId);
+    if (record === null || key === null || restored.has(key)) {
+      rejected++;
+      continue;
+    }
+    restored.set(key, record);
+  }
+  state.records = restored;
+  state.declines.clear();
+  return { ok: true, restored: restored.size, rejected };
+}
+
+function restoredPendingOf(raw) {
+  if (!isPlainRecord(raw)) {
+    return null;
+  }
+  const base = restoredPendingBaseOf(raw);
+  const acceptedSessions = restoredSessionListOf(raw.acceptedSessions);
+  if (base === null || acceptedSessions === null) {
+    return null;
+  }
+  if (!isTimestamp(raw.expiresAt) || !PENDING_STATES.includes(raw.state)) {
+    return null;
+  }
+  return { ...base, expiresAt: raw.expiresAt, state: raw.state, acceptedSessions };
+}
+
+function restoredPendingBaseOf(raw) {
+  const inviteId = asId(raw.inviteId);
+  const collabId = asId(raw.collabId);
+  const managerInstanceId = asId(raw.fromManager?.instanceId);
+  if (inviteId === null || collabId === null || managerInstanceId === null) {
+    return null;
+  }
+  const managerSession = optionalIdOf(raw.fromManager?.sessionId);
+  if (managerSession.ok !== true) {
+    return null;
+  }
+  const targetSession = optionalIdOf(raw.targetSessionId);
+  if (targetSession.ok !== true) {
+    return null;
+  }
+  return {
+    inviteId,
+    collabId,
+    fromManager: { instanceId: managerInstanceId, sessionId: managerSession.value },
+    targetSessionId: targetSession.value,
+  };
+}
+
+function restoredSessionListOf(raw) {
+  if (!Array.isArray(raw)) {
+    return null;
+  }
+  const sessions = [];
+  for (const sessionId of raw) {
+    const id = asId(sessionId);
+    if (id === null) {
+      return null;
+    }
+    sessions.push(id);
+  }
+  return sessions;
 }
 
 function clonePending(record) {
@@ -646,7 +908,7 @@ export function createJoiningRegistry({
   /**
    * @type {{ now: () => number, joiningTtlMs: number, maxJoining: number, maxActiveSeats: number,
    *   byJoinId: Map<string, JoiningRecord>, byKey: Map<string, string>,
-   *   counters: { begun: number, reused: number, confirmed: number, aborted: number, expired: number } }}
+   *   counters: { begun: number, reused: number, confirmed: number, unconfirmed: number, aborted: number, expired: number } }}
    */
   const state = {
     now: typeof now === 'function' ? now : Date.now,
@@ -655,14 +917,17 @@ export function createJoiningRegistry({
     maxActiveSeats: isPositiveInt(maxActiveSeats) ? maxActiveSeats : MAX_ACTIVE_SEATS,
     byJoinId: new Map(),
     byKey: new Map(),
-    counters: { begun: 0, reused: 0, confirmed: 0, aborted: 0, expired: 0 },
+    counters: { begun: 0, reused: 0, confirmed: 0, unconfirmed: 0, aborted: 0, expired: 0 },
   };
   return {
     beginJoining: (input) => beginJoining(state, input ?? {}),
     confirmJoining: (joinId, sessionId, input) => confirmJoining(state, joinId, sessionId, input ?? {}),
+    unconfirmJoining: (joinId) => unconfirmJoining(state, joinId),
     abortJoining: (joinId, reason) => abortJoining(state, joinId, reason),
+    releaseJoining: (collabId, sessionId) => releaseJoining(state, collabId, sessionId),
     expireJoining: (at) => expireJoining(state, at),
     invalidateForManagerChange: (managerTerm) => invalidateForManagerChange(state, managerTerm),
+    restore: (records) => restoreJoining(state, records),
     get: (joinId) => cloneJoiningOrNull(joiningOf(state, joinId)),
     find: (collabId, sessionId) => findJoining(state, collabId, sessionId),
     list: () => [...state.byJoinId.values()].map(cloneJoining),
@@ -681,6 +946,11 @@ function beginJoining(state, input) {
   if (joinId !== undefined) {
     return refreshJoining(state, joinId, prepared, at);
   }
+  return createWithinCapacity(state, prepared, at);
+}
+
+/* 新建 joining 的两处容量检查（begin 与 refresh 的失配兜底共用）：activeSeats 必填，缺省即 invalid。 */
+function createWithinCapacity(state, prepared, at) {
   if (prepared.activeSeats >= state.maxActiveSeats) {
     return failure('capacity');
   }
@@ -712,16 +982,16 @@ function beginIdsOf(input) {
   return { collabId, instanceId, sessionId };
 }
 
+/* activeSeats 是容量判定的唯一输入，必须由接线显式取当前活跃席位数；缺省即 invalid（fail-closed）。 */
 function activeSeatsOf(value) {
-  const activeSeats = value === undefined ? 0 : value;
-  return Number.isInteger(activeSeats) && activeSeats >= 0 ? activeSeats : null;
+  return Number.isInteger(value) && value >= 0 ? value : null;
 }
 
 function refreshJoining(state, joinId, prepared, at) {
   const held = state.byJoinId.get(joinId);
   if (held === undefined) {
     state.byKey.delete(joinKey(prepared.collabId, prepared.sessionId));
-    return createJoining(state, prepared, at);
+    return createWithinCapacity(state, prepared, at);
   }
   if (held.confirmed) {
     return failure('already-member');
@@ -756,18 +1026,19 @@ function createJoining(state, prepared, at) {
   return { ok: true, joinId, expiresAt: record.expiresAt, reused: false };
 }
 
-/* confirm：先幂等（已确认即 member），再验会话/过期/managerTerm；grantVersion 仅记录，version 推进不影响受理。 */
+/* confirm：校验席位键两半（instanceId+sessionId）与必填 managerTerm；已确认即幂等 member。
+ * grantVersion 仅记录、version 推进不影响受理（设计 §4.4.7/T19）；activeSeats 必填，缺省即 invalid。 */
 function confirmJoining(state, joinId, sessionId, input) {
   const record = joiningOf(state, joinId);
   if (record === undefined) {
     return failure('unknown');
   }
-  const session = asId(sessionId);
-  if (session === null) {
-    return failure('invalid');
+  const identity = confirmIdentityOf(record, sessionId, input?.instanceId);
+  if (identity.ok !== true) {
+    return identity;
   }
-  if (record.sessionId !== session) {
-    return failure('session-mismatch');
+  if (!isPositiveInt(input?.managerTerm)) {
+    return failure('invalid');
   }
   const settled = settledConfirmOf(record, joinId);
   if (settled !== null) {
@@ -777,13 +1048,29 @@ function confirmJoining(state, joinId, sessionId, input) {
   return blocked === null ? markConfirmed(state, record, input?.now) : blocked;
 }
 
+/* 席位键两半都要比：同 sessionId 跨机器不得确认他人的 grant。 */
+function confirmIdentityOf(record, sessionId, instanceId) {
+  const seat = seatOf({ instanceId, sessionId });
+  if (seat === null) {
+    return failure('invalid');
+  }
+  if (record.instanceId !== seat.instanceId) {
+    return failure('instance-mismatch');
+  }
+  if (record.sessionId !== seat.sessionId) {
+    return failure('session-mismatch');
+  }
+  return { ok: true };
+}
+
 function settledConfirmOf(record, joinId) {
   return record.confirmed
     ? { ok: true, member: true, joinId, idempotent: true, joinedAt: record.confirmedAt }
     : null;
 }
 
-/* confirm 的拒绝面：过期（顺手删记录）、managerTerm 不符、活跃席位容量不足；失败一律保留 joining。 */
+/* confirm 的拒绝面：过期（顺手删记录）、managerTerm 不符、活跃席位容量不足；除过期外失败保留 joining。
+ * 接线应在名单写入成功后再调用 markConfirmed；写名单失败时用 unconfirmJoining 回滚并重试。 */
 function confirmBlockOf(state, record, input) {
   const at = clockOf(state, input?.now);
   if (at >= record.expiresAt) {
@@ -791,11 +1078,10 @@ function confirmBlockOf(state, record, input) {
     state.counters.expired++;
     return failure('expired');
   }
-  const term = confirmTermOf(record, input?.managerTerm);
-  if (term !== null) {
-    return term;
+  if (input.managerTerm !== record.managerTerm) {
+    return failure('manager-changed');
   }
-  const activeSeats = activeSeatsOf(input?.activeSeats);
+  const activeSeats = activeSeatsOf(input.activeSeats);
   if (activeSeats === null) {
     return failure('invalid');
   }
@@ -810,17 +1096,24 @@ function markConfirmed(state, record, at) {
   return { ok: true, member: true, joinId: record.joinId, idempotent: false, joinedAt: now };
 }
 
-function confirmTermOf(record, managerTerm) {
-  if (managerTerm === undefined) {
-    return null;
+/* 名单写入失败的模块侧回滚：把已确认记录退回未确认，joinId 与 TTL 保留，confirm 可重试。
+ * 未确认记录按幂等成功返回（无状态可回滚）；未知 joinId 返回 unknown。 */
+function unconfirmJoining(state, joinId) {
+  const record = joiningOf(state, joinId);
+  if (record === undefined) {
+    return failure('unknown');
   }
-  if (!isPositiveInt(managerTerm)) {
-    return failure('invalid');
+  if (!record.confirmed) {
+    return { ok: true, joinId, unconfirmed: false, idempotent: true, record: cloneJoining(record) };
   }
-  return managerTerm === record.managerTerm ? null : failure('manager-changed');
+  record.confirmed = false;
+  record.confirmedAt = null;
+  state.counters.unconfirmed++;
+  return { ok: true, joinId, unconfirmed: true, idempotent: false, record: cloneJoining(record) };
 }
 
-/* abort：申请人收到 join-deny 后的回滚；已确认（已入名单）的席位不可由 abort 撤销。 */
+/* abort：申请人收到 join-deny 后的回滚；已确认（已入名单）的席位不可由 abort 撤销。
+ * 返回被删记录的身份，接线可直接按它投 join-deny。 */
 function abortJoining(state, joinId, reason = 'aborted') {
   const record = joiningOf(state, joinId);
   if (record === undefined) {
@@ -831,31 +1124,61 @@ function abortJoining(state, joinId, reason = 'aborted') {
   }
   removeJoining(state, joinId, record);
   state.counters.aborted++;
-  return { ok: true, joinId, reason: typeof reason === 'string' && reason !== '' ? reason : 'aborted', removed: true };
+  return {
+    ok: true,
+    joinId,
+    reason: typeof reason === 'string' && reason !== '' ? reason : 'aborted',
+    removed: true,
+    record: joiningIdentityOf(record),
+  };
 }
 
-/* 超时清理：只清未确认记录；已确认席位是成员事实，跨 TTL 保留。 */
+/* 离席释放：confirmed 记录是「本任期已入席」的缓存，不是永久席位；席位离席/被移除时必须释放，
+ * 否则同 (collabId,sessionId) 再入席会一直撞 already-member。未确认记录同样可释放（作废）。 */
+function releaseJoining(state, collabId, sessionId) {
+  const collab = asId(collabId);
+  const session = asId(sessionId);
+  if (collab === null || session === null) {
+    return failure('invalid');
+  }
+  const joinId = state.byKey.get(joinKey(collab, session));
+  const record = joinId === undefined ? undefined : state.byJoinId.get(joinId);
+  if (record === undefined || joinId === undefined) {
+    return { ok: true, released: false, record: null };
+  }
+  removeJoining(state, joinId, record);
+  if (!record.confirmed) {
+    state.counters.aborted++;
+  }
+  return { ok: true, released: true, record: joiningIdentityOf(record) };
+}
+
+/* 超时清理：只清未确认记录；已确认席位是成员事实，跨 TTL 保留。返回值含被删记录身份供投 deny。 */
 function expireJoining(state, at) {
   const now = clockOf(state, at);
   const joinIds = [];
+  const records = [];
   for (const [joinId, record] of state.byJoinId) {
     if (record.confirmed || now < record.expiresAt) {
       continue;
     }
     removeJoining(state, joinId, record);
     joinIds.push(joinId);
+    records.push(joiningIdentityOf(record));
   }
   state.counters.expired += joinIds.length;
-  return { expired: joinIds.length, joinIds };
+  return { expired: joinIds.length, joinIds, records };
 }
 
-/* 站长更替：未确认 grant 全部作废（给了新 term 时只清旧 term 的），已确认席位保留。 */
+/* 站长更替：未确认 grant 全部作废（给了新 term 时只清旧 term 的），已确认席位保留。
+ * abortedRecords 与 aborted 一一对应，接线据此投 join-deny(manager-changed/aborted)。 */
 function invalidateForManagerChange(state, managerTerm) {
   const term = managerTerm === undefined || managerTerm === null ? null : managerTerm;
   if (term !== null && !isPositiveInt(term)) {
     return failure('invalid');
   }
   const aborted = [];
+  const abortedRecords = [];
   const kept = [];
   for (const [joinId, record] of state.byJoinId) {
     if (record.confirmed) {
@@ -867,9 +1190,88 @@ function invalidateForManagerChange(state, managerTerm) {
     }
     removeJoining(state, joinId, record);
     aborted.push(joinId);
+    abortedRecords.push(joiningIdentityOf(record));
   }
   state.counters.aborted += aborted.length;
-  return { ok: true, aborted, kept };
+  return { ok: true, aborted, abortedRecords, kept };
+}
+
+/* deny 路由所需的最小身份：记录删除后仍可据此寻址申请会话与携带 joinId/term。 */
+function joiningIdentityOf(record) {
+  return {
+    joinId: record.joinId,
+    collabId: record.collabId,
+    instanceId: record.instanceId,
+    sessionId: record.sessionId,
+    managerTerm: record.managerTerm,
+  };
+}
+
+/* 重启恢复：整表替换并重建 (collabId,sessionId) → joinId 索引；重复 joinId/席位键视为坏条丢弃。
+ * 计数器不恢复（只作运行期观测）；已确认记录恢复后可继续幂等 confirm，也可由 releaseJoining 释放。 */
+function restoreJoining(state, records) {
+  if (!Array.isArray(records)) {
+    return failure('invalid');
+  }
+  const byJoinId = new Map();
+  const byKey = new Map();
+  let rejected = 0;
+  for (const raw of records) {
+    const record = restoredJoiningOf(raw);
+    const key = record === null ? null : joinKey(record.collabId, record.sessionId);
+    if (record === null || key === null || byJoinId.has(record.joinId) || byKey.has(key)) {
+      rejected++;
+      continue;
+    }
+    byJoinId.set(record.joinId, record);
+    byKey.set(key, record.joinId);
+  }
+  state.byJoinId = byJoinId;
+  state.byKey = byKey;
+  return { ok: true, restored: byJoinId.size, rejected };
+}
+
+function restoredJoiningOf(raw) {
+  if (!isPlainRecord(raw)) {
+    return null;
+  }
+  const ids = restoredJoiningIdsOf(raw);
+  if (ids === null || !restoredJoiningFieldsOk(raw)) {
+    return null;
+  }
+  return {
+    ...ids,
+    managerTerm: raw.managerTerm,
+    grantVersion: raw.grantVersion,
+    requestedAt: raw.requestedAt,
+    expiresAt: raw.expiresAt,
+    confirmed: raw.confirmed,
+    confirmedAt: raw.confirmedAt,
+  };
+}
+
+function restoredJoiningIdsOf(raw) {
+  const joinId = asId(raw.joinId);
+  const collabId = asId(raw.collabId);
+  const instanceId = asId(raw.instanceId);
+  const sessionId = asId(raw.sessionId);
+  if (joinId === null || collabId === null || instanceId === null || sessionId === null) {
+    return null;
+  }
+  return { joinId, collabId, instanceId, sessionId };
+}
+
+function restoredJoiningFieldsOk(raw) {
+  if (!isPositiveInt(raw.managerTerm) || !isPositiveInt(raw.grantVersion)) {
+    return false;
+  }
+  if (!isTimestamp(raw.requestedAt) || !isTimestamp(raw.expiresAt) || raw.expiresAt < raw.requestedAt) {
+    return false;
+  }
+  if (typeof raw.confirmed !== 'boolean') {
+    return false;
+  }
+  return raw.confirmed ? isTimestamp(raw.confirmedAt) : raw.confirmedAt === null;
 }
 
 function joiningOf(state, joinId) {
