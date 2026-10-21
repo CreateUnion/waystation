@@ -9,6 +9,9 @@ import { coreJsonPath, invitesFilePath, pendingInvitesFilePath } from '../src/pa
 import { createIpcClient } from '../src/core/ipc.js';
 import { startCore } from '../src/core/main.js';
 import { newCollabId } from '../src/collab/model.js';
+/* 真核在本进程内启动：发现层读 process.env，startCore({env}) 的局部环境不覆盖它；
+ * 进程级设置保证本文件起的核心不扫描/广播真实局域网（node:test 每个文件独立进程）。 */
+process.env.WAYSTATION_TEST_DISABLE_DISCOVERY = '1';
 import {
   bringSessionOffline,
   bringSessionOnline,
