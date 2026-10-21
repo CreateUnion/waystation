@@ -15,7 +15,11 @@ after(() => {
 
 /* 讨论对表引擎的补面（既有 collab-sync 用例集的续篇）：周期 tick 驱动（startSyncEngine 的
  * 定时回调）、收尾时未决等待面的即时了结、无对端注入时的候选轮换（rotateCandidates），以及
- * 旧数据缺成立时刻时按成员事件推导的兜底。全部真服务 + 假直投虚拟线装配，确定性驱动。 */
+ * 旧数据缺成立时刻时按成员事件推导的兜底。全部真服务 + 假直投虚拟线装配，确定性驱动。
+ *
+ * 0.2.0 夹具形态：协作域帧携 cap=2 与 from.sessionId；名单条目为席位形态
+ * {instanceId, sessionId, identityName}；创建须带调用会话标识（设计 §1.1/§2.1/§5.1）。
+ * 本文件无已删除用例：讨论对表的投票/成员/回填语义未被 v4 改动（D2/D10 保持既有中继语义）。 */
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -30,13 +34,18 @@ const AUTHOR_U = { instanceId: 'inst-u', identityName: '主机U', port: 17331 };
 
 let seq = 0;
 
+/* 会话标识按实例派生：同一实例的帧署名稳定，测试断言可复现。 */
+function sessionOf(instanceId) {
+  return `sess-${String(instanceId).replace(/^inst-/, '')}`;
+}
+
 function peer(instanceId, identityName, port = 17321) {
-  return { instanceId, identityName, port };
+  return { instanceId, identityName, port, sessionId: sessionOf(instanceId) };
 }
 
 function collabFrame(type, collabId, from, payload) {
   seq++;
-  return { v: 1, type, msgId: `msg-${type}-${seq}`, from: { ...from, port: from.port ?? 17321 }, collabId, ts: new Date().toISOString(), payload };
+  return { v: 1, cap: 2, type, msgId: `msg-${type}-${seq}`, from: { ...from, sessionId: from.sessionId ?? sessionOf(from.instanceId), port: from.port ?? 17321 }, collabId, ts: new Date().toISOString(), payload };
 }
 
 async function receive(service, f, remoteAddress = '127.0.0.1') {
@@ -47,19 +56,30 @@ async function receive(service, f, remoteAddress = '127.0.0.1') {
   return admitted;
 }
 
+/* 讨论邀请的同意（一次性确认豁免 + 会话标识）：join/approve 帧因此携 fromSessionId。 */
+async function approveForum(service, collabId, sessionId) {
+  service.allowNextInvite({ sessionId });
+  return service.approve({ collabId, approve: true, sessionId });
+}
+
 function inviteFrame({ collabId, manager = SELF_A, members, name = '讨论甲', topic = '议题', mode = 'forum', endpoints } = {}) {
   seq++;
   const roster = members ?? [manager, peer('inst-self', '本机', 17321)];
-  const payload = { name, topic, members: roster.map((entry) => ({ instanceId: entry.instanceId, identityName: entry.identityName })), mode };
+  const payload = {
+    name,
+    topic,
+    members: roster.map((entry) => ({ instanceId: entry.instanceId, sessionId: entry.sessionId ?? sessionOf(entry.instanceId), identityName: entry.identityName })),
+    mode,
+  };
   if (endpoints !== undefined) {
     payload.endpoints = endpoints;
   }
-  return { v: 1, type: 'invite', msgId: `msg-inv-${seq}`, from: { instanceId: manager.instanceId, identityName: manager.identityName, port: manager.port }, collabId, ts: new Date().toISOString(), payload };
+  return { v: 1, cap: 2, type: 'invite', msgId: `msg-inv-${seq}`, from: { instanceId: manager.instanceId, sessionId: manager.sessionId ?? sessionOf(manager.instanceId), identityName: manager.identityName, port: manager.port }, collabId, ts: new Date().toISOString(), payload };
 }
 
 function joinFrameOf(collabId, from, ts) {
   seq++;
-  return { v: 1, type: 'join', msgId: `msg-join-${seq}`, from: { instanceId: from.instanceId, identityName: from.identityName, port: from.port }, collabId, ts: ts ?? new Date().toISOString(), payload: { eventId: `evt-join-${seq}`, ts: ts ?? new Date().toISOString() } };
+  return { v: 1, cap: 2, type: 'join', msgId: `msg-join-${seq}`, from: { instanceId: from.instanceId, sessionId: from.sessionId ?? sessionOf(from.instanceId), identityName: from.identityName, port: from.port }, collabId, ts: ts ?? new Date().toISOString(), payload: { eventId: `evt-join-${seq}`, ts: ts ?? new Date().toISOString() } };
 }
 
 function forumPostFrame(collabId, from, { postId, seq: postSeq, text }, ts) {
@@ -172,6 +192,7 @@ async function makeForumPair(t, overrides = {}) {
     name: '讨论甲',
     topic: '议题',
     mode: 'forum',
+    sessionId: sessionOf(selfA.instanceId),
     targets: [{ instanceId: selfB.instanceId, identityName: selfB.identityName, address: '127.0.0.2', port: selfB.port }],
   });
   const collabId = made.collabId;
@@ -181,7 +202,7 @@ async function makeForumPair(t, overrides = {}) {
     topic: '议题',
     members: [peer(selfA.instanceId, selfA.identityName, selfA.port), peer(selfB.instanceId, selfB.identityName, selfB.port)],
   }));
-  await madeB.service.approve({ collabId, approve: true });
+  await approveForum(madeB.service, collabId, sessionOf(selfB.instanceId));
   const joinMessage = sentOf(madeB.sent, 'join', collabId)[0];
   await wire.hop(madeA.service, joinMessage, selfB);
   await awaitSync(madeB.service.sync({ collabId }));
@@ -213,7 +234,7 @@ test('周期 tick：对表单轮异常被隔离为计数与告警（引擎不因
     members: [peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port), peer(SELF_B.instanceId, SELF_B.identityName, SELF_B.port)],
     endpoints: { [SELF_A.instanceId]: { address: '127.0.0.2', port: SELF_A.port } },
   }));
-  await made.service.approve({ collabId, approve: true });
+  await approveForum(made.service, collabId, sessionOf(SELF_B.instanceId));
   const failuresBefore = made.service.stats().syncFailures;
   made.service.start();
   await waitFor(() => (made.service.stats().syncFailures > failuresBefore ? true : null), { timeoutMs: 5000 });
@@ -222,13 +243,19 @@ test('周期 tick：对表单轮异常被隔离为计数与告警（引擎不因
 });
 
 test('收尾：停止对表引擎时未决的拉取等待面即时了结（不等应答期限）', async (t) => {
-  /* 场景：成员侧已加入且对端端点已知（对端不宜线应答）——同数据根重开一实例后发起定向
-   * 对表，等待面挂起；此时收尾须即时了结等待面，而不是等满应答期限。重开实例不带自动轮，
-   * 轮次归属确定。 */
+  /* 场景：本机是讨论发起人（有新形态 carrier，可跨重启加载），对端端点已知但不应答——
+   * 同数据根重开一实例后发起对表，等待面挂起；收尾须即时了结等待面，而不是等满应答期限。
+   * 重开实例不带自动轮，轮次归属确定。 */
   const first = makeServiceOnDir(t, makeTempDir(t), SELF_B, { pullReplyTimeoutMs: 60 });
-  const collabId = 'collab-waitstop';
-  await receive(first.service, memberInviteFrame(collabId));
-  await first.service.approve({ collabId, approve: true });
+  const created = first.service.create({
+    name: '讨论甲',
+    topic: '议题',
+    mode: 'forum',
+    sessionId: sessionOf(SELF_B.instanceId),
+    targets: [{ instanceId: SELF_C.instanceId, identityName: SELF_C.identityName, address: '127.0.0.3', port: SELF_C.port }],
+  });
+  assert.equal(created.ok, true, String(created.message));
+  const collabId = created.collabId;
   await new Promise((resolve) => setTimeout(resolve, 200));   // 等首实例的自动轮收口（60ms 期限）
   await first.service.close();
 
@@ -254,6 +281,7 @@ async function makeRotationScene(t, wire) {
     name: '讨论甲',
     topic: '议题',
     mode: 'forum',
+    sessionId: sessionOf(SELF_A.instanceId),
     targets: [
       { instanceId: SELF_B.instanceId, identityName: SELF_B.identityName, address: '127.0.0.2', port: SELF_B.port },
       { instanceId: SELF_C.instanceId, identityName: SELF_C.identityName, address: '127.0.0.3', port: SELF_C.port },
@@ -275,7 +303,7 @@ async function makeRotationScene(t, wire) {
       [SELF_C.instanceId]: { address: '127.0.0.3', port: SELF_C.port },
     },
   }));
-  await madeB.service.approve({ collabId, approve: true });
+  await approveForum(madeB.service, collabId, sessionOf(SELF_B.instanceId));
   await wire.hop(madeA.service, sentOf(madeB.sent, 'join', collabId)[0], SELF_B);
   return { madeA, madeB, collabId };
 }
@@ -321,6 +349,7 @@ test('成立时刻兜底：台账缺 establishedAt（旧数据）时按最早他
     name: '讨论甲',
     topic: '议题',
     mode: 'forum',
+    sessionId: sessionOf(SELF_A.instanceId),
     targets: [{ instanceId: SELF_B.instanceId, identityName: SELF_B.identityName, address: '127.0.0.2', port: SELF_B.port }],
   });
   assert.equal(created.ok, true, String(created.message));
@@ -375,14 +404,4 @@ function makeServiceOnDir(t, dir, self, options = {}) {
   });
   t.after(() => service.close());
   return { service, sent, direct, notices, dir };
-}
-
-/* 成员侧邀请帧（带发起端点表）：成员据此学得对端端点，可发起定向对表。 */
-function memberInviteFrame(collabId) {
-  return inviteFrame({
-    collabId,
-    manager: peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port),
-    members: [peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port), peer(SELF_B.instanceId, SELF_B.identityName, SELF_B.port)],
-    endpoints: { [SELF_A.instanceId]: { address: '127.0.0.2', port: SELF_A.port } },
-  });
 }
