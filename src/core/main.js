@@ -103,6 +103,8 @@ const VIEWER_SCRIPT_PATH = fileURLToPath(new URL('../../scripts/ws-viewer.js', i
  * @property {any} sessionStatus
  * @property {any} grace
  * @property {any} changeover
+ * @property {number | null} idleSince
+ * @property {any} seatGraceTimer
  * @property {((record: any) => void) | null} onBridgeSessionFileDrop
  * @property {((record: any) => void) | null} onBridgeBindingsSleep
  * @property {boolean} persistent
@@ -384,13 +386,13 @@ async function listenIpc(state) {
   state.persistent = readPersistentCore({ dataDir: state.dataDir, warn: state.warn });
   state.changeover = createCoreChangeoverSeat(state);
   state.bridges = createBridgeRegistry({
-    onCountChange: (count) => state.grace.noteBridgeCount(count),
+    onCountChange: (count) => noteBridgeCount(state, count),
     log: state.log,
   });
   state.grace = createGraceWindow({
     graceMs: state.params.graceMs,
     persistent: state.persistent,
-    onExpire: () => expireCore(state),
+    onExpire: () => expireCoreWhenSeatsAllow(state),
     log: state.log,
   });
   /* 会话状态写面（设计 §4.5）：单核心生命周期一份——网络组件重建不重建本写面（已写文件与
@@ -435,14 +437,17 @@ function createCoreChangeoverSeat(state) {
   });
 }
 
-/* 桥注册（设计 §3.1-6 末位）：注册表记账 + 会话状态文件写面；该会话首次出现才按规则判一次
- * 观察窗触发 B——每 sessionId 一次记账（重连/顶替/重生重注册不重判，设计 §7）。
- * 记账后补投挂起的指名邀请（离线目标挂起、重开即活）：让出一拍再发起——注册回执（welcome）
+/* 桥注册（设计 §3.1-6 末位）：注册表记账 + 本机席位桥绑定（sessionId,bridgeId）+ 会话状态文件写面；
+ * 该会话首次出现才按规则判一次观察窗触发 B——每 sessionId 一次记账（重连/顶替/重生重注册不重判）。
+ * 席位绑定后按到达序补投暂存帧（宽限内断连的帧）；补投让出一拍再发起——注册回执（welcome）
  * 在本同步回合内才写出发送，先投的 push 会被桥侧按「握手期收到 push」拒帧（IPC 客户端契约）；
  * 让出后 welcome 已在途（同连接写序保持），投递异步进行、注册路径只发起不等候，失败只留痕。 */
 function registerBridgeEntry(state, record) {
   state.bridges.register(record);
   const noticed = state.sessionStatus.noteRegister(record);
+  state.collab?.registerBridgeEntry?.(record.sessionId, record.bridgeId)?.catch?.((error) => {
+    state.log?.warn?.('席位桥绑定失败（已隔离）', { sessionId: record.sessionId, reason: error?.message });
+  });
   queueMicrotask(() => {
     void state.routing?.flushPendingInvites?.(record.sessionId);
   });
@@ -485,11 +490,9 @@ function notifyViewerConsent(state, sessionId, collabs) {
   }
 }
 
-/* 本会话绑定集（绑定表逐条 [collabId, binding] 解构按 sessionId 筛——只取数、不判决）。 */
+/* 本会话参与的协作集（0.2.0：席位表是唯一来源；绑定表不再参与）。 */
 function boundCollabIdsOf(state, sessionId) {
-  return (state.routing?.bindings?.entries() ?? [])
-    .filter(([, binding]) => binding.sessionId === sessionId)
-    .map(([collabId]) => collabId);
+  return (state.collab?.seatsOfSession?.(sessionId) ?? []).map((seat) => seat.collabId);
 }
 
 /* 会话状态文件的快照面（核心身份与站点形态）：site 恒 single——null/旧形态会被下一核的数据面
@@ -504,22 +507,22 @@ function coreSessionSnapshot(state) {
   };
 }
 
-/* 会话文件的协作集（per-session 过滤）：绑定条目为唯一权威（create/join/adopt 写点）——
- * 受邀未同意（尚无绑定）不进任何会话文件；被 adopt 夺席后随查询实时转移；休眠绑定（其会话
- * 离线、无该会话文件）无处可见。绑定表经路由实时读取（网络组件重建后同址生效）。 */
+/* 会话文件的协作集（per-session 过滤）：本机席位为唯一权威——受邀未同意（尚无席位）不进任何
+ * 会话文件；席位删除后随查询实时消失。席位表经服务实时读取（网络组件重建后同址生效）。 */
 function collabsBoundTo(state, sessionId) {
+  const seatIds = new Set(boundCollabIdsOf(state, sessionId));
   const listed = state.collab?.list().collabs ?? [];
-  const bound = listed.filter((entry) => isIndicatedCollab(entry)
-    && state.routing?.bindings?.get(entry.collabId)?.sessionId === sessionId);
+  const bound = listed.filter((entry) => isIndicatedCollab(entry) && seatIds.has(entry.collabId));
   return indicatedEntriesOf(bound, state.collab?.indicators());
 }
 
-/* 桥断开清理（设计 §3.3 桥崩行）：删该桥注册——注册表移除即「绑定转休眠」（路由的活跃/休眠按
- * 注册表实时派生，见路由的判定口径）；其会话状态文件删除与绑定休眠的显式写面按两个挂点接入
- * （未接入＝空转，不改变连接与认证语义，同探测占位的先例）。在途 push 不追发：桥已死，消息仍在
- * 核心收件流水，会话重连后经拉取面补看。 */
+/* 桥断开清理（设计 §3.3 桥崩行）：删该桥注册并清该会话的席位桥绑定（席位本身保留到离席宽限，
+ * 期间投递进暂存、重连补投）；其会话状态文件删除与绑定休眠的显式写面按两个挂点接入
+ * （未接入＝空转，不改变连接与认证语义，同探测占位的先例）。在途 push 不追发：桥已死，
+ * 消息仍在核心收件流水，会话重连后经拉取面补看。 */
 function closeBridgeEntry(state, record) {
   state.bridges.remove(record);
+  state.collab?.unregisterBridgeEntry?.(record.sessionId, record.bridgeId);
   state.onBridgeSessionFileDrop?.(record);
   state.onBridgeBindingsSleep?.(record);
 }
@@ -586,6 +589,36 @@ function welcomeFrameOf(state, bridges) {
     persistent: state.persistent,
     bridges,
   };
+}
+
+/* 宽限电平：记空闲起点（席位存续判据的计时基准）并驱动宽限窗。 */
+function noteBridgeCount(state, count) {
+  state.idleSince = count > 0 ? null : Date.now();
+  state.grace.noteBridgeCount(count);
+}
+
+/* 宽限到期处置（设计 §3.2）：存在活跃席位时，空闲退出不得早于
+ * max(核心空闲宽限, 席位宽限 + 10s)——先完成离席广播/标记再退出。未到席位下界就再续一拍。 */
+async function expireCoreWhenSeatsAllow(state) {
+  const requiredMs = state.collab?.ensureCoreLifetimeForSeats?.() ?? 0;
+  const idleMs = state.idleSince === null ? Number.POSITIVE_INFINITY : Date.now() - state.idleSince;
+  if (requiredMs > idleMs) {
+    scheduleSeatGraceRecheck(state, requiredMs - idleMs);
+    return;
+  }
+  await expireCore(state);
+}
+
+/* 续拍（单实例；不阻止进程退出——空闲计时是运行期行为，不构成存活依赖）。 */
+function scheduleSeatGraceRecheck(state, delayMs) {
+  if (state.seatGraceTimer !== null) {
+    clearTimeout(state.seatGraceTimer);
+  }
+  state.seatGraceTimer = setTimeout(() => {
+    state.seatGraceTimer = null;
+    void expireCoreWhenSeatsAllow(state);
+  }, delayMs);
+  state.seatGraceTimer.unref?.();
 }
 
 /* 宽限到期：有序收尾（停心跳 → 等待面 → LAN → IPC → 删运行描述符）后请求退出 0。 */
@@ -761,9 +794,9 @@ function buildComponents(state) {
     dataDir: state.dataDir,
     log: state.log,
     describeCollab: (collabId) => state.collab?.describe(collabId) ?? null,
-    /* 本机获准台账判据（adopt 收紧：未获准不夺席）：闭包运行期取协作服务——判据面缺席（未作答）
-     * 时按无判据继续，写类调用不因附属面受阻。 */
+    /* 获准判据（adopt 收紧）：闭包运行期取服务；判据缺席时按无判据继续，不因附属面受阻。 */
     isGranted: (collabId, sessionId) => state.collab?.join?.isGranted?.(collabId, sessionId) ?? null,
+    ...injectionSeatWiringOf(state),
   });
   state.collab = createCollabService({
     dataDir: state.dataDir,
@@ -773,7 +806,7 @@ function buildComponents(state) {
     sendDirect: (message) => dispatch.sendDirect(message),
     probe: (address, port) => dispatch.ping({ address, port }),
     reassign: (payload) => dispatch.reassignPeer(payload),
-    notify: (frame) => state.routing.notify(frame),
+    ...deliveryWiringOf(state),
     knownHosts,
     log: state.log,
     /* 观察窗触发 A（建立协作即开该协作页）：单核根恒 main、站点形态 single。 */
@@ -787,6 +820,22 @@ function buildComponents(state) {
   state.net = buildNetStack(state, { knownHosts, transport, dispatch });
   state.registry = registerTools();
   state.context = buildContext(state);
+}
+
+/* 注入来源（设计 §5.2）：本机席位表；绑定表不再参与路由。闭包运行期取服务（构造序在前）。 */
+function injectionSeatWiringOf(state) {
+  return {
+    seatsOf: (collabId) => state.collab?.seatsForRouting?.(collabId) ?? [],
+    seatOf: (collabId, sessionId) => state.collab?.seatForRouting?.(collabId, sessionId) ?? null,
+  };
+}
+
+/* 服务侧两条投递出口：机器级提示走注入路由；本机席位旁路经路由的每席 push（不经过 dispatch.send）。 */
+function deliveryWiringOf(state) {
+  return {
+    notify: (frame) => state.routing.notify(frame),
+    deliverSeat: (frame, seat) => state.routing.deliverToSeat(seat.sessionId, frame),
+  };
 }
 
 /* 观察窗触发 A 的拉起出口（判定与出口零改，宿主由旧组合根移到核心）：ref 由服务侧给
@@ -845,6 +894,9 @@ function buildNetStack(state, { knownHosts, transport, dispatch }) {
         /* 链一投递（渲染在核心、桥不渲染不解析）：autoDeliver 关闭＝不注入钩子——
          * 消息停留第二档，由会话经 ws_check_inbox 拉取（既有降级语义零变）。 */
         ...(config.autoDeliver ? { deliverToSession: (frame) => state.routing.deliverToSession(frame) } : {}),
+        /* 席位扇出面（M2 运行时）：两件齐备即启用逐席 toSessions 扇出与本机旁路暂存/补投。 */
+        listSeats: (collabId) => state.collab?.listLocalSeats?.(collabId) ?? [],
+        injectSeat: (collabId, sessionId, frame) => state.collab?.injectLocalSeat?.(collabId, sessionId, frame) ?? { ok: false, reason: 'collab-service-missing' },
       },
     }),
     port: config.port,
@@ -938,7 +990,7 @@ async function lanRetryRound(state) {
 function markReady(state) {
   state.record.status = 'ready';
   writeCoreRecord(state);
-  state.grace.noteBridgeCount(state.bridges.count());
+  noteBridgeCount(state, state.bridges.count());
   state.log.info('核心启动完成', {
     version: APP_VERSION,
     dataDir: state.dataDir,
@@ -958,6 +1010,10 @@ async function stopCore(state) {
   }
   state.stopped = true;
   state.grace?.cancel();
+  if (state.seatGraceTimer !== null) {
+    clearTimeout(state.seatGraceTimer);
+    state.seatGraceTimer = null;
+  }
   state.heartbeat?.stop();
   stopWaitingMachinery(state);
   state.detector?.close();
@@ -1014,6 +1070,16 @@ function createExitLatch() {
   };
 }
 
+/* 生命周期运行态字段（单列以守编排函数的行数上限）。 */
+function coreRuntimeState() {
+  return { heartbeat: null, detector: null, lifetime: null, retry: null, stopped: false };
+}
+
+/* 席位存续的运行态字段（与生命周期组件同构）。 */
+function seatLifetimeState() {
+  return { idleSince: null, seatGraceTimer: null };
+}
+
 /** @param {Record<string, string | undefined>} env @param {RootOk} root @returns {CoreState} */
 function createCoreState(env, root) {
   return {
@@ -1026,11 +1092,7 @@ function createCoreState(env, root) {
     portSource: root.portSource,
     anchorPort: anchorPortOf(env),   // 同根探测的段基（与端口解析同一注入缝）
     corePath: coreJsonPath(root.dataDir),
-    heartbeat: null,
-    detector: null,
-    lifetime: null,
-    retry: null,
-    stopped: false,
+    ...coreRuntimeState(),
     config: null,
     logDir: '',
     log: null,
@@ -1046,9 +1108,8 @@ function createCoreState(env, root) {
     sessionStatus: null,
     changeover: null,
     grace: null,
-    /* 桥断开清理的两个触发挂点：会话状态文件删除——缺省接本核会话状态写面（下方 startCore 装配），
-     * 外部注入优先（测试观测/附加写面）；绑定休眠——活跃/休眠由路由按注册表实时派生（无显式写面，
-     * 保持空转＝无操作）。 */
+    ...seatLifetimeState(),
+    /* 桥断开清理的两个触发挂点：会话状态文件删除（缺省接本核写面）、绑定休眠（无显式写面＝空转）。 */
     onBridgeSessionFileDrop: null,
     onBridgeBindingsSleep: null,
     persistent: false,

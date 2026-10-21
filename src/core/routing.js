@@ -1,28 +1,23 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
 import { ID_PATTERN } from '../net/protocol.js';
 import { MAX_TAKEOVER_WINDOW_MS } from '../config.js';
-import { bindingsFilePath } from '../paths.js';
-import { writeJsonAtomic } from '../storage.js';
 import { renderSessionMessage } from '../adapters/claude-code.js';
 import { listLocalCollabIds, loadMember, saveMember } from '../collab/store.js';
-import { ensureRunDir } from './ipc.js';
+import { matchSessionByToken } from '../util/short-id.js';
 
-/* 注入路由（设计 §4 全要素）：绑定表（run/bindings.json）与两条注入决策链。
- * 链一（入站帧）：绑定查询 → 桥在线则 push（文本在核心渲染，桥不渲染不解析）→ 等待 delivered
- * 回执（期限 2s，超时按未注入处置）；绑定休眠到此为止、其余无绑定帧不投（数据已落盘、
- * 发送侧维持第二档）。无绑定邀请例外（首邀到达时绑定表尚无该条目，而其是本机待办——
- * 受邀请方据此走同意门）：指名（payload.targetSessionId）只投目标会话的桥、不在场即登记挂起
- * 于 member.json（该会话下次注册时补投）；未指名照旧投当前全部活跃桥。两者都不写绑定。
- * 链二（本机提示）：调用者相关（工具调用触发）投调用者桥——调用身份经 AsyncLocalStorage 随
- * 调用链外置，无需把 context 逐层穿过协作服务；携 targetSessionId 者按该会话寻址投桥
- * （被拒会话常未接线，绑定路由投不到它）；定时器/入站类按绑定路由，休眠/无绑定丢弃＋留痕。
- * 判定口径（写死）：活跃 = 绑定的 sessionId 在当前注册桥集合内；休眠是派生状态（不落盘）——
- * 桥退场即休眠、原会话重连即活跃；绑定里的 bridgeId 只作入席出处记录。
- * adopt：写类调用来自活跃会话而绑定休眠/空 → 夺席（判定先于工具 handler）；夺席前先过本机获准
- * 台账判据（managed 且未获准 → 不夺席＋响应附「先 ws_join 申请」指引；讨论豁免）；绑定活跃且
- * 异会话 → 不夺席＋席位持有指引；纯读类与敲门（ws_request_join）一律不改绑定。
+/* 注入路由（设计 §4/§5.2）：席位表驱动的两条注入决策链。
+ * 链一（入站帧）：按帧的 toSessions / 本机席位表解析目标 → 桥在线则逐席 push（文本在核心渲染，
+ * 桥不渲染不解析）→ 各自等待 delivered 回执（期限 2s，超时按未注入处置）。邀请例外（邀请是
+ * 本机待办、接收者不必已是席位）：指名只投目标会话的桥、不在场即登记挂起于 member.json
+ * （该会话下次注册时补投）；未指名投当前全部活跃桥。
+ * 链二（本机提示）：调用者相关投调用者桥——调用身份经 AsyncLocalStorage 随调用链外置；携
+ * targetSessionId 者按该会话寻址；其余（定时器/入站类）投本机该协作的全部席位，无席位丢弃＋留痕。
+ * 判定口径（写死）：活跃 = 会话的 bridgeId 在当前注册桥集合内；休眠/离线是派生状态——
+ * 桥退场即离线、原会话重连即活跃。绑定表（run/bindings.json）退出注入来源（0.2.0 硬断裂）：
+ * 本模块仍保留同形内存表供旧调用面（join 域的接线写点）使用，但不再落盘、不再参与路由。
+ * adopt：写类调用者已有席位 → 不夺席；尚无席位 → 先过本机获准台账（未获准＝附 ws_join 指引），
+ * 获准后记内存绑定（兼容面）不写盘。席位持有指引按席位表判定。
  * 本模块不 import 桥组件与网络收发面（注册表与 IPC 发送面由组合根 attach 注入），
  * 渲染复用适配器的 renderSessionMessage（核心渲染面单一权威）；collab/store 只取成员记录
  * 读写面（指名邀请的挂起登记与补投——过 loadMember 形态校验，不另造一份记录形态）。 */
@@ -69,9 +64,6 @@ export const ATTRIBUTION_NOTICE = '本协作的实时注入绑定于另一会话
  * 入席类调用（create/approve）的成功响应里如实说明（同一 notice 机制），不静默降级。 */
 export const SESSIONLESS_NOTICE = '本会话无会话标识（CLAUDE_CODE_SESSION_ID 缺失）——无法登记注入绑定，本会话收不到该协作的实时注入；请重开会话或检查客户端环境';
 
-/* 绑定条目的入席出处（写点枚举）。grant＝加入域「批准接线」（离线会话写持久映射——加载面收了
- * 才谈得上重开即活）。 */
-const BINDING_ORIGINS = ['create', 'join', 'adopt', 'grant'];
 /* 丢弃留痕的首行摘要截断（日志可读性；完整文案在帧里，日志只作定位）。 */
 const DROP_HEAD_MAX = 120;
 
@@ -84,7 +76,7 @@ function collabIdOf(args) {
   return isCollabId(value) ? value : null;
 }
 
-/* —— 绑定表（run/bindings.json；原子替换、核心单写者） —— */
+/* —— 绑定表兼容面（内存态；run/bindings.json 已退役为注入来源，旧文件留盘不删） —— */
 
 /**
  * @param {{ dataDir: string, log: any }} options
@@ -102,94 +94,25 @@ export function createBindingStore({ dataDir, log }) {
     entries: () => [...state.bindings.entries()],
     set(collabId, binding) {
       state.bindings.set(collabId, binding);
-      return persistBindings(state);
+      state.counters.persists++;
+      return true;
     },
     remove(collabId) {
       if (!state.bindings.has(collabId)) {
         return false;
       }
       state.bindings.delete(collabId);
-      persistBindings(state);
       return true;
     },
     stats: () => ({ ...state.counters, size: state.bindings.size }),
   };
 }
 
-/* 加载与恢复比对（设计 §4.1）：只做载入——「活跃/休眠」由注册表实时派生，不落盘不比对快照，
- * 故桥退场即休眠、原会话重连即活跃，无需恢复写回。损坏文件按空表继续（绑定是路由态，
- * 丢它只是不再注入；不阻塞启动、不抛错）。 */
+/* 0.2.0：绑定表不再参与注入路由，也不再从盘上恢复——旧文件（run/bindings.json）留盘不删，
+ * 但不读取、不写入；本表只承接运行期旧调用面（join 域的接线写点）的内存记录。 */
 function loadBindings(state) {
-  const text = readBindingsText(state);
-  if (text === null) {
-    return;
-  }
-  const parsed = parseJsonOrNull(text);
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    traceCorruptBindings(state, '形态不符');
-    return;
-  }
-  for (const [collabId, binding] of Object.entries(parsed)) {
-    if (!isCollabId(collabId) || !isBindingShape(binding)) {
-      state.counters.droppedEntries++;
-      state.log.warn('绑定条目形态不符（丢弃该条）', { collabId });
-      continue;
-    }
-    state.bindings.set(collabId, normalizeBinding(binding));
-    state.counters.loaded++;
-  }
-}
-
-function readBindingsText(state) {
-  try {
-    return readFileSync(bindingsFilePath(state.dataDir), 'utf8');
-  } catch (error) {
-    if (error.code !== 'ENOENT') {
-      traceCorruptBindings(state, error.message);
-    }
-    return null;
-  }
-}
-
-function parseJsonOrNull(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
-function traceCorruptBindings(state, reason) {
-  state.counters.corruptLoads++;
-  state.log.warn('绑定表不可用（按空表继续——仅影响注入路由，数据面不受影响）', { reason });
-}
-
-function isBindingShape(binding) {
-  return binding !== null
-    && typeof binding === 'object'
-    && !Array.isArray(binding)
-    && isCollabId(binding.sessionId)
-    && isCollabId(binding.bridgeId)
-    && typeof binding.boundAt === 'string'
-    && BINDING_ORIGINS.includes(binding.origin);
-}
-
-/* 只取契约四字段（额外字段不随内存态扩散；顺带剔除原型链上的杂项）。 */
-function normalizeBinding(binding) {
-  return { sessionId: binding.sessionId, bridgeId: binding.bridgeId, boundAt: binding.boundAt, origin: binding.origin };
-}
-
-function persistBindings(state) {
-  try {
-    ensureRunDir(state.dataDir, { log: state.log });
-    writeJsonAtomic(bindingsFilePath(state.dataDir), Object.fromEntries(state.bindings));
-    state.counters.persists++;
-    return true;
-  } catch (error) {
-    state.counters.persistFailures++;
-    state.log.warn('绑定表写入失败（内存态继续——重启后该次入席丢失）', { reason: error.message });
-    return false;
-  }
+  state.counters.loaded = 0;
+  state.log.info?.('绑定表已退役（0.2.0 起注入由席位表驱动）——不读取 run/bindings.json');
 }
 
 /* —— 活跃判定与目标解析 —— */
@@ -204,7 +127,50 @@ export function bindingIsActive(binding, registry) {
   return entry !== undefined && entry !== null;
 }
 
-/* 链一/链二②的目标解析：无绑定或绑定休眠 → null（不注入）。 */
+/* 席位提供器（组合根注入；未注入＝兼容旧单绑定路径，仅供未接席位的旧测试/嵌入使用）。 */
+function seatProviderOf(state) {
+  return typeof state.seatsOf === 'function' ? state.seatsOf : null;
+}
+
+function seatsOf(state, collabId) {
+  const provider = seatProviderOf(state);
+  return provider === null ? null : (provider(collabId) ?? []);
+}
+
+/* 本机可注入席位：member / joining / unverified 均可收（设计 §5.2）。 */
+function injectableSeatsOf(state, collabId) {
+  const seats = seatsOf(state, collabId);
+  if (seats === null) {
+    return null;
+  }
+  return seats.filter((seat) => seat.state === 'member' || seat.state === 'joining');
+}
+
+function entryOfSession(state, sessionId) {
+  if (state.registry === null || state.ipc === null || typeof sessionId !== 'string') {
+    return null;
+  }
+  return state.registry.find(sessionId) ?? null;
+}
+
+/* toSessions 定向（M3 携）：只投列表中的本机席位；坏目标隔离，不把整帧投给其他席位。 */
+function entriesOfSessions(state, collabId, sessionIds) {
+  const seats = injectableSeatsOf(state, collabId);
+  const allowed = seats === null ? null : new Set(seats.map((seat) => seat.sessionId));
+  const entries = [];
+  for (const sessionId of sessionIds) {
+    if (allowed !== null && !allowed.has(sessionId)) {
+      continue;
+    }
+    const entry = entryOfSession(state, sessionId);
+    if (entry !== null) {
+      entries.push(entry);
+    }
+  }
+  return entries;
+}
+
+/* 链一/链二②的目标解析（兼容旧单绑定路径；席位提供器注入后不再使用绑定）。 */
 function entryForCollab(state, collabId) {
   if (!isCollabId(collabId) || state.registry === null || state.ipc === null) {
     return null;
@@ -214,6 +180,28 @@ function entryForCollab(state, collabId) {
     return null;
   }
   return state.registry.find(binding.sessionId) ?? null;
+}
+
+/* 收件目标集合：席位驱动优先；未注入席位提供器时退回单绑定。 */
+function targetEntriesOf(state, frame) {
+  if (seatProviderOf(state) === null) {
+    return bindingEntriesOf(state, frame?.collabId);
+  }
+  const toSessions = Array.isArray(frame?.payload?.toSessions) ? frame.payload.toSessions : null;
+  if (toSessions !== null) {
+    return entriesOfSessions(state, frame.collabId, toSessions);
+  }
+  return seatEntriesOf(state, frame?.collabId);
+}
+
+function bindingEntriesOf(state, collabId) {
+  const entry = entryForCollab(state, collabId);
+  return entry === null ? [] : [entry];
+}
+
+function seatEntriesOf(state, collabId) {
+  const seats = injectableSeatsOf(state, collabId) ?? [];
+  return seats.map((seat) => entryOfSession(state, seat.sessionId)).filter((entry) => entry !== null);
 }
 
 /* 链二①的目标解析：调用者桥（按 bridgeId 精确命中——调用在途，调用者必在线）。 */
@@ -227,6 +215,14 @@ function entryForBridge(state, bridgeId) {
 /* JSON 对象判定（结果载荷与载荷解析共用）：null / 数组 / 非对象一律不合。 */
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function parseJsonOrNull(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
 }
 
 /* 结果载荷解析（写点判据：MCP 成功结果的第一段文本必为 JSON 对象；isError / 非 JSON 一律 null）。 */
@@ -343,14 +339,18 @@ function noteUnhealthy(state, bridgeId) {
 /**
  * @param {{ dataDir: string, log: any, describeCollab?: ((collabId: string) => any) | null,
  *   isGranted?: ((collabId: string, sessionId: string) => boolean | null | undefined) | null,
+ *   seatsOf?: ((collabId: string) => Array<any> | null) | null,
+ *   seatOf?: ((collabId: string, sessionId: string) => any) | null,
  *   receiptTimeoutMs?: number, callTimeoutMs?: number, now?: () => number }} options
  */
-export function createInjectionRouter({ dataDir, log, describeCollab = null, isGranted = null, receiptTimeoutMs = PUSH_RECEIPT_TIMEOUT_MS, callTimeoutMs = CALL_SAFETY_DEADLINE_MS, now = Date.now }) {
+export function createInjectionRouter({ dataDir, log, describeCollab = null, isGranted = null, seatsOf = null, seatOf = null, receiptTimeoutMs = PUSH_RECEIPT_TIMEOUT_MS, callTimeoutMs = CALL_SAFETY_DEADLINE_MS, now = Date.now }) {
   const state = {
     dataDir,
     log,
     describeCollab,
     isGranted,
+    seatsOf,
+    seatOf,
     timeoutMs: receiptTimeoutMs,
     callTimeoutMs,
     clock: now,
@@ -387,6 +387,7 @@ function routerApiOf(state, pusher) {
     runCall: (caller, fn) => runCallOf(state, caller, fn),
     handleCall: (frame, record, options) => handleCallOf(state, frame, record, options),
     deliverToSession: (frame) => deliverOf(state, frame, pusher),
+    deliverToSeat: (sessionId, frame) => deliverToSeatOf(state, frame, sessionId, pusher),
     notify: (frame) => notifyOf(state, frame, pusher),
     flushPendingInvites: (sessionId) => flushPendingInvitesOf(state, sessionId, pusher),
     settleDelivered: (frame) => pusher.settle(frame),
@@ -416,9 +417,21 @@ function applyAdoptOf(state, { tool, args, caller, now = null }) {
   if (!bindableCaller(sessionId, caller)) {
     return noAdopt();   // 无会话标识的桥本就不入席：指引文案对它不成立（另经 SESSIONLESS_NOTICE 说明）
   }
+  if (typeof state.seatOf === 'function') {
+    return adoptWithSeats(state, { collabId, sessionId, caller, now });
+  }
   const held = state.bindings.get(collabId);
   if (bindingIsActive(held, state.registry)) {
     return held.sessionId === sessionId ? noAdopt() : { adopted: false, notice: ADOPT_HELD_NOTICE };
+  }
+  return adoptFor(state, { collabId, sessionId, caller, now });
+}
+
+/* 席位语义下的 adopt：已有本机席位＝已是参与者（不改绑定）；无席位者走获准判据，
+ * 获准后只记内存绑定（兼容面）——席位的新增只由 create/join/approve 的写点产生。 */
+function adoptWithSeats(state, { collabId, sessionId, caller, now = null }) {
+  if (state.seatOf(collabId, sessionId) !== null) {
+    return noAdopt();
   }
   return adoptFor(state, { collabId, sessionId, caller, now });
 }
@@ -636,22 +649,10 @@ function sendResultOf(state, record, id, result) {
 
 /* —— 链一：入站帧 —— */
 
-/* 无绑定首邀判定（专属兜底分支的前件）：绑定表无该条目——「无条目」与「条目休眠」必须分开看，
- * 后者照旧不投（该协作已有席位，由持席会话处置）。未 attach（无注册表/发送面）不构成本支
- * 前件：落回原路径按未投处置。 */
-function isUnboundInvite(state, frame) {
-  return frame?.type === 'invite'
-    && isCollabId(frame.collabId)
-    && state.bindings.get(frame.collabId) === null
-    && state.registry !== null
-    && state.ipc !== null;
-}
-
-/* 无绑定邀请的机器级兜底：邀请是本机待办（受邀请方据此走同意门），首邀到达时绑定表却尚无该
- * 条目（写点只有 create/join/adopt/grant）——指名者只投目标会话的桥（不在场即登记挂起、等其
- * 注册补投），未指名者投给当前全部活跃注册桥（同机多窗口＝同一参与者，该由哪个窗口处理由人
- * 决定，故不猜接收者、全部投）；各桥并发推送、独立回执期限，单桥失败不阻断其余。
- * 不写绑定：席位仍只由 create/join/adopt/grant 写点建立（邀请到达不是入席）。
+/* 邀请的机器级投递：邀请是本机待办（受邀请方据此走同意门），不要求接收者已入席——
+ * 指名者只投目标会话的桥（不在场即登记挂起、等其注册补投），未指名者投给当前全部活跃注册桥
+ * （同机多窗口＝同一参与者，该由哪个窗口处理由人决定，故不猜接收者、全部投）；各桥并发推送、
+ * 独立回执期限，单桥失败不阻断其余。不写绑定：席位仍只由 create/join/approve 写点建立。
  * 零活跃桥＝挂起照旧（不投、计未投）——数据已落盘，工具与观察窗照常可拉。 */
 async function deliverInviteBroadcastOf(state, frame, pusher) {
   const target = inviteTargetOf(frame);
@@ -726,17 +727,14 @@ function inviteTargetOf(frame) {
   return isCollabId(token) ? token : null;
 }
 
-/* 活跃会话的唯一前缀命中（无匹配 / 多义 → null：不猜接收者）。 */
+/* 活跃会话命中（设计 §2.4）：完整标识全等或短码（前 8 字符）全等；无匹配/歧义 → null（不猜接收者）。 */
 function liveSessionEntryOf(state, token) {
   if (state.registry === null || state.ipc === null) {
     return null;
   }
-  const matched = state.registry.list().filter((entry) => typeof entry.sessionId === 'string' && sessionMatchesToken(entry.sessionId, token));
-  return matched.length === 1 ? matched[0] : null;
-}
-
-function sessionMatchesToken(sessionId, token) {
-  return sessionId === token || sessionId.startsWith(token);
+  const entries = state.registry.list();
+  const sessionId = matchSessionByToken(entries, token);
+  return sessionId === null ? null : (entries.find((entry) => entry.sessionId === sessionId) ?? null);
 }
 
 /* —— 指名邀请的登记面（member.json 的 targetSessionId ＋ pendingInvites）与补投 —— */
@@ -866,23 +864,61 @@ function settlePendingInvites(state, collabId, snapshot, cleared) {
   }
 }
 
+/* 邀请不走席位过滤（设计 §4.3/§5.2）：邀请是本机待办，接收者不必已入席；指名/广播两分支。 */
+function isInviteFrame(state, frame) {
+  return frame?.type === 'invite'
+    && isCollabId(frame.collabId)
+    && state.registry !== null
+    && state.ipc !== null;
+}
+
 async function deliverOf(state, frame, pusher) {
-  const entry = entryForCollab(state, frame?.collabId);
-  if (entry === null && isUnboundInvite(state, frame)) {
+  if (isInviteFrame(state, frame)) {
     return deliverInviteBroadcastOf(state, frame, pusher);
   }
-  const text = entry === null ? null : renderTextOf(state, frame);
-  if (entry === null || text === null) {
+  const targets = uniqueEntries(targetEntriesOf(state, frame));
+  const text = targets.length === 0 ? null : renderTextOf(state, frame);
+  if (text === null) {
     state.counters.inboundUnrouted++;
     return false;
   }
-  const ok = await pusher.push(entry.record, { text, collabId: frame.collabId, frameType: frame.type });
+  const outcomes = await Promise.all(targets.map((entry) => pusher.push(entry.record, { text, collabId: frame.collabId, frameType: frame.type })));
+  const ok = outcomes.includes(true);
+  countInboundOutcome(state, ok);
+  return ok;
+}
+
+function uniqueEntries(entries) {
+  const seen = new Set();
+  return entries.filter((entry) => {
+    if (seen.has(entry.bridgeId)) {
+      return false;
+    }
+    seen.add(entry.bridgeId);
+    return true;
+  });
+}
+
+function countInboundOutcome(state, ok) {
   if (ok) {
     state.counters.inboundPushed++;
   } else {
     state.counters.inboundFailed++;
   }
-  return ok;
+}
+
+/* 本机旁路的交付出口（服务层 injectLocalSeat → 本函数）：渲染并 push 到指定席位的桥；
+ * 桥不在线返回 false（由服务层转暂存）。 */
+async function deliverToSeatOf(state, frame, sessionId, pusher) {
+  const entry = entryOfSession(state, sessionId);
+  if (entry === null) {
+    return false;
+  }
+  const text = renderTextOf(state, frame);
+  if (text === null) {
+    return false;
+  }
+  return pusher.push(entry.record, { text, collabId: frame.collabId, frameType: frame.type });
 }
 
 /* —— 链二：本机提示 —— */
@@ -903,6 +939,23 @@ function notifyOf(state, frame, pusher) {
   const caller = state.callContext.getStore();
   if (caller?.active === true) {
     return notifyCallerOf(state, frame, text, caller, pusher);
+  }
+  return notifyMachineOf(state, frame, text, pusher);
+}
+
+/* 机器级提示（无调用者上下文）：投本机该协作的全部可注入席位；未注入席位提供器时退回旧单绑定。 */
+function notifyMachineOf(state, frame, text, pusher) {
+  const seats = injectableSeatsOf(state, frame.collabId);
+  if (seats !== null) {
+    const entries = uniqueEntries(seats.map((seat) => entryOfSession(state, seat.sessionId)).filter((entry) => entry !== null));
+    if (entries.length === 0) {
+      return dropNoticeOf(state, frame, text, '无活跃席位');
+    }
+    for (const entry of entries) {
+      void pusher.push(entry.record, { text, collabId: frame.collabId, frameType: frame.type });
+    }
+    state.counters.notifyBound++;
+    return true;
   }
   const entry = entryForCollab(state, frame.collabId);
   if (entry === null) {
@@ -942,13 +995,21 @@ function notifyCallerOf(state, frame, text, caller, pusher) {
   if (entry === null) {
     return dropNoticeOf(state, frame, text, '调用者桥不在线');
   }
-  const binding = state.bindings.get(frame.collabId);
-  if ((binding === null || binding.sessionId !== caller.sessionId) && !caller.notices.includes(ATTRIBUTION_NOTICE)) {
+  if (!callerHasSeatOf(state, frame.collabId, caller.sessionId) && !caller.notices.includes(ATTRIBUTION_NOTICE)) {
     caller.notices.push(ATTRIBUTION_NOTICE);
   }
   void pusher.push(entry.record, { text, collabId: frame.collabId, frameType: frame.type });
   state.counters.notifyCaller++;
   return true;
+}
+
+/* 归属说明的判据：席位提供器在场时看本机席位，否则沿用旧绑定（兼容面）。 */
+function callerHasSeatOf(state, collabId, sessionId) {
+  if (typeof state.seatOf === 'function') {
+    return state.seatOf(collabId, sessionId) !== null;
+  }
+  const binding = state.bindings.get(collabId);
+  return binding !== null && binding.sessionId === sessionId;
 }
 
 /* 休眠/无绑定丢弃必须留痕（设计 §4.2-b）：累计条数＋首行摘要——提示本就不落盘不上网络，

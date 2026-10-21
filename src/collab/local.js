@@ -1,26 +1,302 @@
-import { DEFAULT_COLLAB_MODE } from '../net/protocol.js';
+import { readFileSync, readdirSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { DEFAULT_COLLAB_MODE, ID_PATTERN, MAX_ACTIVE_SEATS } from '../net/protocol.js';
+import { SEATS_DIR_NAME, collabDir, ensureDir, seatFilePath } from '../paths.js';
+import { writeJsonAtomic } from '../storage.js';
 import { appendLedger, ensureCollabDir, loadMember, saveMember, saveSnapshot } from './store.js';
-import { isArchived } from './model.js';
+import { isArchived, isTimestamp } from './model.js';
 import { newMemberEventId } from './members.js';
 
 /* 本地协作态与持久化的共享原语（服务内多模块共用）：状态读法（manager 记录〔协作＝站长、讨论＝发起人〕
  * 以台账为权威、成员以本地记录为权威）与「只计数告警、绝不抛出」的写盘包装（健壮性硬性要求——
  * 写盘失败不得让协作事件处理或消息主链中断）。写包装统一先确保协作目录存在（写路径自足）。 */
 
+/* —— 本机席位（设计 §1.2/§6.2）：seats/<sessionId>.json 是席位态的持久面，seats Map 是运行面 —— */
+
+export const SEAT_FILE_VERSION = 1;
+export const SEAT_ROLES = ['manager', 'member'];
+export const SEAT_STATES = ['joining', 'member'];
+
+/* 席位文件形态：字段语义与本地参与记录分开——席位只回答「本机会话在这个协作里是谁、到哪一步」。
+ * 形态不符一律跳过（不删除、不清洗，随协作目录保留为排查证据）。 */
+export function isSeatShape(record) {
+  if (!isPlainObject(record) || !isIdLike(record.sessionId)) {
+    return false;
+  }
+  if (!Number.isInteger(record.version) || record.version < 1) {
+    return false;
+  }
+  if (!SEAT_ROLES.includes(record.role) || !SEAT_STATES.includes(record.state)) {
+    return false;
+  }
+  return isSeatTimeShape(record) && isSeatFlagsShape(record) && isSeatIdsShape(record);
+}
+
+function isSeatTimeShape(record) {
+  return isOptionalTimestamp(record.joinedAt) && isOptionalTimestamp(record.archivedAt);
+}
+
+function isSeatFlagsShape(record) {
+  return isOptionalBoolean(record.muted) && isOptionalBoolean(record.unverified);
+}
+
+function isSeatIdsShape(record) {
+  return isOptionalSeatSeq(record.joinSeq)
+    && isOptionalSeatSeq(record.grantVersion)
+    && (record.joinId === undefined || isIdLike(record.joinId));
+}
+
+function isOptionalSeatSeq(value) {
+  return value === undefined || (Number.isInteger(value) && value >= 1);
+}
+
+function isOptionalTimestamp(value) {
+  return value === undefined || isTimestamp(value);
+}
+
+function isOptionalBoolean(value) {
+  return value === undefined || typeof value === 'boolean';
+}
+
+/* 落盘形态只含席位事实：bridgeId/暂存/inbox 是核内运行态，不写入席位文件（设计 §1.2/§6.2）。 */
+function seatFileOf(seat) {
+  const record = {
+    version: SEAT_FILE_VERSION,
+    sessionId: seat.sessionId,
+    role: seat.role,
+    state: seat.state,
+    muted: seat.muted === true,
+  };
+  if (Number.isInteger(seat.joinSeq)) {
+    record.joinSeq = seat.joinSeq;
+  }
+  if (typeof seat.joinedAt === 'string') {
+    record.joinedAt = seat.joinedAt;
+  }
+  if (seat.unverified === true) {
+    record.unverified = true;
+  }
+  if (typeof seat.joinId === 'string') {
+    record.joinId = seat.joinId;
+  }
+  if (Number.isInteger(seat.grantVersion)) {
+    record.grantVersion = seat.grantVersion;
+  }
+  if (typeof seat.archivedAt === 'string') {
+    record.archivedAt = seat.archivedAt;
+  }
+  return record;
+}
+
+/* 运行态席位：文件字段 + 桥注册与投递面（暂存/inbox/去重集），后者不落盘。 */
+function runtimeSeatOf(record) {
+  return {
+    ...record,
+    muted: record.muted === true,
+    unverified: record.unverified === true,
+    bridgeId: null,
+    staged: [],
+    inbox: [],
+    seen: new Set(),
+    stagedDropped: 0,
+  };
+}
+
+/** 读一个协作目录下的全部席位文件：坏文件跳过并计数（不删除不清洗）。 */
+export function loadSeats(dataDir, collabId) {
+  const seats = new Map();
+  let corrupt = 0;
+  for (const entry of readSeatDirents(dataDir, collabId)) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) {
+      continue;
+    }
+    const sessionId = entry.name.slice(0, -'.json'.length);
+    if (!ID_PATTERN.test(sessionId)) {
+      corrupt++;
+      continue;
+    }
+    const record = readSeatFile(join(seatDirOf(dataDir, collabId), entry.name));
+    if (record === null || record.sessionId !== sessionId) {
+      corrupt++;
+      continue;
+    }
+    if (seats.size >= MAX_ACTIVE_SEATS) {
+      corrupt++;
+      continue;
+    }
+    seats.set(sessionId, runtimeSeatOf(record));
+  }
+  return { seats, corrupt };
+}
+
+function seatDirOf(dataDir, collabId) {
+  return join(collabDir(dataDir, collabId), SEATS_DIR_NAME);
+}
+
+/** @returns {import('node:fs').Dirent[]} */
+function readSeatDirents(dataDir, collabId) {
+  try {
+    return readdirSync(seatDirOf(dataDir, collabId), { withFileTypes: true });
+  } catch {
+    return [];
+  }
+}
+
+function isPlainObject(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isIdLike(value) {
+  return typeof value === 'string' && ID_PATTERN.test(value);
+}
+
+function readSeatFile(file) {
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'));
+    return isSeatShape(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 席位落盘（整档替换）：写失败向上抛，由服务层按「只计数不断链」处置。 */
+export function saveSeat(dataDir, collabId, seat) {
+  const record = seatFileOf(seat);
+  if (!isSeatShape(record)) {
+    throw new TypeError('席位文件形态非法，拒绝写入');
+  }
+  ensureDir(seatDirOf(dataDir, collabId));
+  writeJsonAtomic(seatFilePath(dataDir, collabId, seat.sessionId), record);
+}
+
+/** 席位文件删除（离席/结束的唯一删除面）：文件不存在不算失败。 */
+export function removeSeatFile(dataDir, collabId, sessionId) {
+  try {
+    rmSync(seatFilePath(dataDir, collabId, sessionId), { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/* 契约面（M2 → 全体）：只给席位事实，不暴露暂存/inbox 运行态。 */
+export function seatViewOf(seat) {
+  return {
+    sessionId: seat.sessionId,
+    role: seat.role,
+    state: seat.state,
+    joinSeq: Number.isInteger(seat.joinSeq) ? seat.joinSeq : null,
+    muted: seat.muted === true,
+    unverified: seat.unverified === true,
+  };
+}
+
+/* 席位容器（兼容面）：旧写点（createCollab 等尚未迁移的路径）构造的 local 不带 seats——按需初始化。 */
+export function seatsOfLocal(local) {
+  if (!(local.seats instanceof Map)) {
+    local.seats = new Map();
+  }
+  return local.seats;
+}
+
+export function listLocalSeatsOf(local) {
+  return [...seatsOfLocal(local).values()].map(seatViewOf);
+}
+
+export function localSeatOfLocal(local, sessionId) {
+  return typeof sessionId === 'string' ? (seatsOfLocal(local).get(sessionId) ?? null) : null;
+}
+
+/* 站长席位派生：角色只认席位（local.role 是派生缓存，不再是独立事实来源）。 */
+export function managerSeatOfLocal(local) {
+  for (const seat of seatsOfLocal(local).values()) {
+    if (seat.role === 'manager' && seat.state === 'member') {
+      return seat;
+    }
+  }
+  return null;
+}
+
+export function hasActiveSeat(local) {
+  for (const seat of seatsOfLocal(local).values()) {
+    if (seat.state === 'member') {
+      return true;
+    }
+  }
+  return false;
+}
+
+/* 主席位（兼容面用）：站长席位优先，其次按 joinSeq/sessionId 取最早者。 */
+export function primarySeatOf(local) {
+  const manager = managerSeatOfLocal(local);
+  if (manager !== null) {
+    return manager;
+  }
+  const ordered = [...seatsOfLocal(local).values()].sort(compareSeatOrder);
+  return ordered[0] ?? null;
+}
+
+function compareSeatOrder(left, right) {
+  const leftSeq = Number.isInteger(left.joinSeq) ? left.joinSeq : Number.MAX_SAFE_INTEGER;
+  const rightSeq = Number.isInteger(right.joinSeq) ? right.joinSeq : Number.MAX_SAFE_INTEGER;
+  if (leftSeq !== rightSeq) {
+    return leftSeq - rightSeq;
+  }
+  return left.sessionId < right.sessionId ? -1 : 1;
+}
+
+/** 角色派生：有席位即从席位派生（有站长席＝manager），无席位时退回兼容成员记录。 */
+export function deriveLocalRole(local) {
+  if (seatsOfLocal(local).size === 0) {
+    return local.member?.role ?? 'member';
+  }
+  return managerSeatOfLocal(local) !== null ? 'manager' : 'member';
+}
+
+/** 席位变化后同步派生缓存（旧模块仍读 local.role；M3/M5 迁完后它只作兼容读面）。 */
+export function syncLocalRole(local) {
+  local.role = deriveLocalRole(local);
+}
+
+export function upsertLocalSeat(local, seat, { persist = false, dataDir = null } = {}) {
+  const runtime = seatsOfLocal(local).get(seat.sessionId);
+  const next = runtime === null ? runtimeSeatOf(seat) : { ...runtime, ...seat };
+  seatsOfLocal(local).set(seat.sessionId, next);
+  syncLocalRole(local);
+  if (persist && dataDir !== null) {
+    try {
+      saveSeat(dataDir, local.collabId, next);
+    } catch (error) {
+      local.seatPersistFailures = (local.seatPersistFailures ?? 0) + 1;
+      local.lastSeatPersistError = error.message;
+    }
+  }
+  return next;
+}
+
+export function removeLocalSeat(local, sessionId, { persist = false, dataDir = null } = {}) {
+  const existed = seatsOfLocal(local).delete(sessionId);
+  syncLocalRole(local);
+  if (existed && persist && dataDir !== null) {
+    removeSeatFile(dataDir, local.collabId, sessionId);
+  }
+  return existed;
+}
+
 /* 状态读法：manager 记录（协作＝站长、讨论＝发起人）以台账为权威；「已退出」是成员记录的本地终态，
  * 对**讨论的发起人**同样可达（发起人可退出——退出即放弃结束权，设计 §6），故 manager 记录
  * 以 member.state 的 left 标记优先。 */
 export function localStateOf(local) {
-  if (local.role === 'manager' && local.member.state !== 'left') {
-    return local.ledger.status;
+  if (local.role === 'manager' && local.member?.state !== 'left') {
+    return local.ledger?.status ?? 'proposed';
   }
-  return local.member.state;
+  return local.member?.state ?? 'member';
 }
 
 /* 模式读法（两侧视角统一）：manager 记录取台账、成员取本地记录；缺省 managed（旧数据兼容，
  * 创建时定死不可变——本函数是全部模式判定的单一入口）。 */
 export function localModeOf(local) {
-  const raw = local.role === 'manager' ? local.ledger.mode : local.member.mode;
+  const raw = local.role === 'manager' ? local.ledger?.mode : local.member?.mode;
   return raw ?? DEFAULT_COLLAB_MODE;
 }
 
@@ -29,14 +305,14 @@ export function isLocalArchivedState(local) {
 }
 
 export function localNameOf(local) {
-  return local.role === 'manager' ? local.ledger.name : local.member.name;
+  return local.role === 'manager' ? local.ledger?.name : local.member?.name;
 }
 
 export function localRosterOf(local) {
   if (local.role === 'manager') {
-    return local.ledger.members;
+    return local.ledger?.members ?? [];
   }
-  return local.member.roster ?? [];
+  return local.member?.roster ?? [];
 }
 
 /* 讨论的当前成员表 = 成员事件日志按事件折叠（设计 §5.4；每成员取自身最新事件、join 者入表）。
@@ -96,7 +372,7 @@ export function relayDepartedOf(local, relayId) {
 
 /* 主题读法（两侧视角统一）：manager 记录取台账、成员取本地记录（邀请载荷/对表元状态写入）。 */
 export function localTopicOf(local) {
-  const raw = local.role === 'manager' ? local.ledger.topic : local.member.topic;
+  const raw = local.role === 'manager' ? local.ledger?.topic : local.member?.topic;
   return typeof raw === 'string' ? raw : null;
 }
 
@@ -130,7 +406,7 @@ function allocateOwnEventStamp(state, local) {
  * 抢接优先序与合流判定都以它为「本机版本」口径。 */
 export function localVersionOf(local) {
   if (local.role === 'manager') {
-    return local.ledger.version;
+    return local.ledger?.version ?? null;
   }
   return local.snapshot === null ? null : local.snapshot.version;
 }
@@ -138,9 +414,9 @@ export function localVersionOf(local) {
 /* 现任 manager 标识（两侧视角统一读法）。 */
 export function currentManagerIdOf(local) {
   if (local.role === 'manager') {
-    return local.ledger.manager.instanceId;
+    return local.ledger?.manager?.instanceId ?? null;
   }
-  return local.member.manager.instanceId;
+  return local.member?.manager?.instanceId ?? null;
 }
 
 /* 成员记录整写（服务侧唯一咽喉）：写前把**路由面字段**从盘上合并回来——指名邀请的
