@@ -130,6 +130,25 @@ test('toSessions：只投列表内席位；列表中的非本机目标丢弃并�
   assert.deepEqual(records.at(-1).fanout.dropped, ['sess-remote']);
 });
 
+test('toSessions/指名短码：唯一短码先解析为全量标识再扇出，歧义短码原样丢弃', async (t) => {
+  const seats = [seat('abcd1234-one'), seat('abcd1234-two'), seat('zzzz9999-solo')];
+  const unique = makeInbound(t, { seats });
+  unique.inbound.onFrame(createFakeConnection(), frame({ toSessions: ['zzzz9999'] }));
+  await waitFor(() => reportsOf(unique.dispatch).length === 1);
+  assert.deepEqual(unique.inject.calls.map((call) => call.sessionId), ['zzzz9999-solo']);
+
+  const ambiguous = makeInbound(t, { seats });
+  ambiguous.inbound.onFrame(createFakeConnection(), frame({ toSessions: ['abcd1234'] }));
+  await waitFor(() => reportsOf(ambiguous.dispatch).length === 1);
+  assert.deepEqual(ambiguous.inject.calls, [], '歧义短码不得放大投递');
+  assert.equal(ambiguous.inbound.stats().fanoutDropped, 1);
+
+  const named = makeInbound(t, { seats });
+  named.inbound.onFrame(createFakeConnection(), frame({ type: 'invite', payload: { targetSessionId: 'zzzz9999' } }));
+  await waitFor(() => reportsOf(named.dispatch).length === 1);
+  assert.deepEqual(named.inject.calls.map((call) => call.sessionId), ['zzzz9999-solo']);
+});
+
 test('缺省 toSessions：按本机活跃席位扇出（joining 席位不投；邀请帧例外不按活跃过滤）', async (t) => {
   const seats = [seat('sess-b1'), seat('sess-b2'), seat('sess-join', 'joining')];
   const { inbound, dispatch, inject } = makeInbound(t, { seats });

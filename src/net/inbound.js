@@ -2,6 +2,7 @@ import { collabDir, collabFilePath, ensureDir } from '../paths.js';
 import { appendLine, loadLines, replaceFile } from '../storage.js';
 import { COLLAB_CAPABILITY, GOVERNANCE_TYPES, ID_PATTERN, MAX_ACTIVE_SEATS, PROTOCOL_VERSION, isPort, newMsgId, withCollabCapability } from './protocol.js';
 import { CONFLICT_FRAME_TYPES } from '../collab/gate.js';
+import { matchSessionByToken } from '../util/short-id.js';
 import { normalizeToSessions } from './outbox.js';
 
 export const INBOX_FILE_NAME = 'inbox.jsonl';
@@ -454,10 +455,10 @@ function desiredTargetsOf(state, frame, seats, byId, requested) {
   if (frame.type === 'invite') {
     const named = frame.payload?.targetSessionId;
     if (typeof named === 'string' && named !== '') {
-      return [named];   // 指名：只投目标会话；不在可注入面 → 走坏目标丢弃
+      return [resolveTargetToken(byId, named)];   // 指名：只投目标会话；不在可注入面 → 走坏目标丢弃
     }
     if (requested !== null) {
-      return requested;
+      return resolveTargetTokens(byId, requested);
     }
     if (byId.size === 0) {
       state.counters.inviteTargetsUnavailable++;
@@ -470,9 +471,21 @@ function desiredTargetsOf(state, frame, seats, byId, requested) {
     return [...byId.keys()];
   }
   if (requested !== null) {
-    return requested;
+    return resolveTargetTokens(byId, requested);
   }
   return seats.filter((seat) => seat?.state === 'member').map((seat) => seat.sessionId);
+}
+
+/* toSessions/指名载荷可能写短码——接收侧扇出早于协作域消费，短码解析若只发生在消费面，
+ * 帧会先被当坏目标丢掉（在线目标收不到、只剩挂起登记）。这里按与消费面同一口径预解析：
+ * 完整标识或唯一短码命中换成全量标识；歧义/未命中原样保留，仍走坏目标丢弃。 */
+function resolveTargetTokens(byId, tokens) {
+  const sessions = [...byId.keys()].map((sessionId) => ({ sessionId }));
+  return tokens.map((token) => matchSessionByToken(sessions, token) ?? token);
+}
+
+function resolveTargetToken(byId, token) {
+  return resolveTargetTokens(byId, [token])[0];
 }
 
 function safeListInjectableTargets(state, collabId) {
