@@ -20,6 +20,10 @@ import { TOOL_SPECS } from '../src/tools/specs.js';
 const INDEX_ENTRY = join(repoRoot, 'src', 'index.js');
 const BIN_ENTRY = join(repoRoot, 'bin', 'waystation.js');
 
+/* 夹具会话标识：桥进程与测试进程内核直调共用同一会话（ws_check_inbox 按会话过滤，无标识明确拒绝；
+ * 显式注入，不依赖运行环境的 CLAUDE_CODE_SESSION_ID）。 */
+const BRIDGE_SESSION_ID = 'session-bridge-e2e';
+
 function writeStationConfig(home, port) {
   writeFileSync(join(home, 'config.json'), JSON.stringify({ port, scanWindowMs: 300, dialTimeoutMs: 1500, viewerAutoOpen: false }));
 }
@@ -107,7 +111,7 @@ async function startBridgeClient(t, entry, home) {
     command: process.execPath,
     args: [entry],
     cwd: repoRoot,
-    env: { ...process.env, WAYSTATION_HOME: home, WAYSTATION_TEST_GRACE_MS: '1500' },
+    env: { ...process.env, WAYSTATION_HOME: home, CLAUDE_CODE_SESSION_ID: BRIDGE_SESSION_ID, WAYSTATION_TEST_GRACE_MS: '1500' },
   });
   stationTransports.push(transport);   // 文件级兜底纳管
   const client = new Client({ name: 'bridge-e2e-test', version: '0.0.0' });
@@ -243,7 +247,7 @@ test('e2e：call/result 载荷等价——同核直调 handler 与经桥 IPC 往
   assert.equal(status.core.pid, process.pid, '桥接入的是本测试进程内的核心（无冷启）');
   for (const [name, args] of [['ws_check_inbox', { collabId: 'collab-1' }], ['ws_list_collabs', {}]]) {
     const roundTrip = await callToolJson(client, name, args);
-    const direct = await core.registry.call(name, args, core.context);
+    const direct = await core.registry.call(name, args, { ...core.context, sessionId: BRIDGE_SESSION_ID });
     assert.equal(direct.isError, undefined);
     assert.deepEqual(roundTrip, JSON.parse(direct.content[0].text), `${name} 载荷经 IPC 往返与直调结构等值`);
   }

@@ -16,6 +16,10 @@ const BIN_ENTRY = join(repoRoot, 'bin', 'waystation.js');
 const CORE_ENTRY = join(repoRoot, 'bin', 'waystation-core.js');
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
+/* 显式会话标识（ws_check_inbox 按会话过滤：无标识明确拒绝）；不依赖运行环境的
+ * CLAUDE_CODE_SESSION_ID。 */
+const CHECK_INBOX_SESSION_ID = 'session-server-check-inbox';
+
 /* 站点收尾（单核形态）：node:test 的收尾钩子按注册序执行，而临时目录的删除钩子由 makeTempDir 在其
  * 调用点先行注册——「先关桥、再收核、后删目录」要求本收尾钩子抢在删除钩子之前注册（与
  * collab-e2e.test.js 同一模式），否则删除会与存活核心的并发写盘（sessions/、known-hosts.json、日志、
@@ -119,7 +123,7 @@ after(async () => {
 // viewerAutoOpen：起站夹具统一关闭自动开窗（测试不拉起真实观察窗；配置驱动、任何运行器下成立）
 // WAYSTATION_TEST_GRACE_MS：短宽限注入（NODE_TEST_CONTEXT 生效闸随 node --test 在场）——
 // 会话关后核心按短宽限退场，测试收尾不再等满 60s；收核仍按 core.json pid 显式执行。
-async function connectClient(t, entry, home, extraConfig = {}) {
+async function connectClient(t, entry, home, extraConfig = {}, sessionId = null) {
   writeFileSync(
     join(home, 'config.json'),
     JSON.stringify({ scanWindowMs: 300, dialTimeoutMs: 1500, ...extraConfig, viewerAutoOpen: false }),
@@ -128,7 +132,12 @@ async function connectClient(t, entry, home, extraConfig = {}) {
     command: process.execPath,
     args: [entry],
     cwd: repoRoot,
-    env: { ...process.env, WAYSTATION_HOME: home, WAYSTATION_TEST_GRACE_MS: '1500' },
+    env: {
+      ...process.env,
+      WAYSTATION_HOME: home,
+      WAYSTATION_TEST_GRACE_MS: '1500',
+      ...(sessionId === null ? {} : { CLAUDE_CODE_SESSION_ID: sessionId }),
+    },
   });
   const client = new Client({ name: 'waystation-m2-test', version: '0.0.0' });
   const cleanup = stationCleanupOf(t);
@@ -423,7 +432,7 @@ test('端口占用二：显式端口被无关程序占 → ① 降级服务（�
 
 test('ws_check_inbox：进程级读取收件流水（未投递消息的会话主动查出口）', { timeout: 30000 }, async (t) => {
   const home = makeStationHome(t);
-  const client = await connectClient(t, INDEX_ENTRY, home, { port: await pickFreePort() });
+  const client = await connectClient(t, INDEX_ENTRY, home, { port: await pickFreePort() }, CHECK_INBOX_SESSION_ID);
   mkdirSync(join(home, 'collabs', 'collab-1'), { recursive: true });
   const record = {
     msgId: 'msg-1',
@@ -518,7 +527,7 @@ test('治理工具：未知协作的裁定 / 移交 / 抢接 → isError（明�
   const decided = await client.callTool({ name: 'ws_decide', arguments: { collabId: 'collab-none', choice: 'keep' } });
   assert.equal(decided.isError, true);
   assert.ok(decided.content[0].text.includes('没有该协作'));
-  const handed = await client.callTool({ name: 'ws_handover', arguments: { collabId: 'collab-none', target: 'inst-b' } });
+  const handed = await client.callTool({ name: 'ws_handover', arguments: { collabId: 'collab-none', target: 'inst-b', targetSessionId: 'session-none' } });
   assert.equal(handed.isError, true);
   assert.ok(handed.content[0].text.includes('没有该协作'));
   const taken = await client.callTool({ name: 'ws_take_over', arguments: { collabId: 'collab-none' } });
