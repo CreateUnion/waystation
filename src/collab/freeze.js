@@ -80,6 +80,13 @@ export function terminateLocalCopy(state, local, reason) {
       ledger.status = 'terminated';
       delete ledger.frozenAt;
       delete ledger.frozenFrom;
+      /* 终态形态（设计 §3.4）：站长引用与接管窗口必须清空，名单行降为成员。名单不清空是为了
+       * 终止通告仍投给原参与者；残留站长行会让落盘行过不了形态校验，重启时静默回退到终止前的行。 */
+      ledger.manager = null;
+      delete ledger.managerWindow;
+      for (const member of ledger.members) {
+        member.role = 'member';
+      }
     }, { governance: true });
     local.member.state = 'terminated';
     local.member.archivedAt = new Date().toISOString();

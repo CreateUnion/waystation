@@ -2500,9 +2500,16 @@ function withdrawOne(state, local, targetId) {
 function withdrawAll(state, local) {
   /* 整条取消的通告面 = 全体非本机成员（含已单条撤回 / 已拒绝者——它们也应得知该协作已不存在） */
   const recipients = local.ledger.members.filter((entry) => entry.instanceId !== state.self.instanceId);
+  /* 签发席位在清空站长引用前定格：台账 manager 是最后的兜底来源，清空后再算会丢掉会话标识。 */
+  const fromSessionId = managerSessionIdOf(local) ?? undefined;
   mutateLedger(state, local, (ledger) => {
     ledger.status = 'terminated';
+    /* 终态形态（设计 §3.4）：撤回通告的收件人已在上面定格，台账不再需要站长引用/接管窗口；
+     * 名单行降为成员——残留站长行或窗口会让落盘行过不了形态校验，重启时回退到撤回前的行。 */
+    ledger.manager = null;
+    delete ledger.managerWindow;
     for (const member of ledger.members) {
+      member.role = 'member';
       if (member.state === 'invited' || member.state === 'approved') {
         member.state = 'withdrawn';
       }
@@ -2512,7 +2519,6 @@ function withdrawAll(state, local) {
   local.member.archivedAt = new Date().toISOString();
   persistMember(state, local);
   local.mute.clear();
-  const fromSessionId = managerSessionIdOf(local) ?? undefined;
   for (const member of recipients) {
     const endpoint = local.endpoints.get(member.instanceId);
     if (endpoint !== undefined) {
