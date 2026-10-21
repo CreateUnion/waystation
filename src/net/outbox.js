@@ -317,9 +317,10 @@ function fromSessionIdOf(record) {
   return typeof record.fromSessionId === 'string' ? record.fromSessionId : record.from?.sessionId;
 }
 
-/* 席位目标集合归一：缺省（无 toSessions）＝接收核按本机全部活跃席位扇出；非法即拒绝/按损坏跳过。
- * 去重保持首次出现顺序——一机一帧只带一份目标列表。 */
-function normalizeToSessions(value) {
+/* 席位目标集合归一（出站入队与入站受理共用的单一判据）：缺省（无 toSessions）＝接收核按本机
+ * 全部活跃席位扇出；非法即拒绝/按损坏跳过。去重保持首次出现顺序——一机一帧只带一份目标列表。
+ * 返回 undefined（缺省）/ null（非法）/ 归一后的字符串数组（可能为空数组时已按空拒绝）。 */
+export function normalizeToSessions(value) {
   if (value === undefined) {
     return undefined;
   }

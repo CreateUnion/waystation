@@ -176,3 +176,21 @@ test('deliveryStatusOf：未知 msgId 返回 null，不抛错', { timeout: 15000
   const { dispatch } = makeDispatch(t);
   assert.equal(dispatch.deliveryStatusOf(newMsgId()), null);
 });
+
+test('send/sendDirect：缺发送会话受理面直接拒绝；转达身份携 sessionId 放行', { timeout: 15000 }, async (t) => {
+  const { dispatch } = makeDispatch(t);
+  const queued = dispatch.send(target({ fromSessionId: undefined }));
+  assert.equal(queued.ok, false);
+  assert.ok(queued.reason.includes('sessionId'), queued.reason);
+
+  const direct = dispatch.sendDirect(target({ fromSessionId: undefined }));
+  assert.equal(direct.ok, false);
+  assert.ok(direct.reason.includes('sessionId'), direct.reason);
+
+  const relayed = dispatch.send(target({
+    fromSessionId: undefined,
+    from: { instanceId: 'inst-origin', identityName: '源主机', port: 7321, sessionId: 'sess-origin' },
+  }));
+  assert.equal(relayed.ok, true, relayed.reason);
+  assert.equal(dispatch.deliveryStatusOf(relayed.msgId).fromSessionId, 'sess-origin');
+});

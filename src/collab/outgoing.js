@@ -6,10 +6,9 @@ import { createMembersStore } from './members.js';
 import { createCounterStore, notifyIndicatorChange } from './counter.js';
 import { createMuteStore } from './mute.js';
 import { createInjectedStore } from './injected.js';
-import { createJoinsStore } from './joins.js';
 import { consumeInviteChallenge, consumeInviteWaiver, issueInviteChallenge } from './consent.js';
 import { ledgerDigest, removeLedgerFile } from './store.js';
-import { currentManagerIdOf, emitOwnMemberEvent, foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, localTopicOf, memberStateFor, persistLedger, persistMember, persistSnapshot, relayDepartedOf, relayPeerOf, rememberKnownHost, selfJoinedOf } from './local.js';
+import { currentManagerIdOf, emitOwnMemberEvent, foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, localTopicOf, memberStateFor, persistLedger, persistMember, persistSnapshot, relayDepartedOf, relayPeerOf, rememberKnownHost, selfJoinedOf, upsertLocalSeat } from './local.js';
 import { matchConflictCollabs } from './gate.js';
 import { matchSessionByToken } from '../util/short-id.js';
 
@@ -45,46 +44,19 @@ function applyDefaultMute(local) {
   return before.wasMuted !== true;
 }
 
-/* 获准写点（设计 §5:58 明文三处：create＝发起会话 / invite＝点头会话 / grant＝获批会话〔加入域〕）：
- * 写本机获准台账（collabs/<id>/joins.json 的 approvals）——adopt 收紧的唯一判据。只记协作
- * （讨论无批准门、不产获准段，如实不写）；会话标识缺省 / 形态坏＝没有会话可授予，不写。
- * 台账是权限记录、不是主链事实：写不进只留痕，创建 / 入席照旧成立（未获准的会话仍可 ws_join 申请）。
- * approvedBy 记点头者会话（工具面穿参的自然结果——创建即发起会话、同意即点头会话）。 */
-function writeGrantApproval(state, local, sessionId, origin) {
-  if (localModeOf(local) !== 'managed' || typeof sessionId !== 'string' || !ID_PATTERN.test(sessionId)) {
-    return false;
-  }
-  try {
-    const store = createJoinsStore({ dataDir: state.dataDir, collabId: local.collabId, log: state.log });
-    if (store.addApproval({
-      instanceId: state.self.instanceId,
-      sessionId,
-      origin,
-      grantedAt: nowMsOf(state),
-      approvedBy: sessionId,
-    }) !== true) {
-      state.log.warn('获准条目形态不符，未入账（该会话未获准）', { collabId: local.collabId, sessionId, origin });
-      return false;
-    }
-    return true;
-  } catch (error) {
-    state.log.warn('获准台账写入失败（已忽略——未获准会话仍可 ws_join 申请）', { collabId: local.collabId, sessionId, origin, reason: error?.message });
-    return false;
-  }
-}
-
-/* 时刻（毫秒）：与加入域同一时钟基准（服务注入的 now；直调免注入时退回系统时钟）。 */
-function nowMsOf(state) {
-  return typeof state.clock === 'function' ? state.clock() : Date.now();
-}
+/* 获准台账不在本模块落笔：joins.json 的单一写者是加入域（凭 v2 形态整档写）。
+ * 本模块只经加入域接口读取/使用获准事实，避免两套 writer 互相覆盖。 */
 
 export function createCollab(state, { name, topic, targets, mode, sessionId }) {
   const collabMode = mode ?? DEFAULT_COLLAB_MODE;
+  if (typeof sessionId !== 'string' || !ID_PATTERN.test(sessionId)) {
+    return { ok: false, message: '缺少调用会话标识（sessionId）——无标识不得创建协作（设计 §1.1）' };
+  }
   const rejected = createRejection(state, name, topic, targets, collabMode);
   if (rejected !== null) {
     return { ok: false, message: rejected };
   }
-  const ledger = freshLedgerOf(state, name, topic, targets, collabMode);
+  const ledger = freshLedgerOf(state, name, topic, collabMode, sessionId);
   const local = {
     collabId: ledger.collabId,
     role: 'manager',
@@ -110,10 +82,9 @@ export function createCollab(state, { name, topic, targets, mode, sessionId }) {
   }
   persistMember(state, local);
   persistLedger(state, local);
-  const invited = inviteInitialTargets(state, ledger, targets, collabMode, local);
+  const invited = initialInvitesOf(state, local, ledger, targets, collabMode, sessionId);
   state.counters.collabsCreated++;
   applyDefaultMute(local);   // 写点一：创建成功（邀请发送结果不影响入席事实）
-  writeGrantApproval(state, local, sessionId, 'create');   // 获准写点一：发起会话（设计 §5）
   state.openViewer?.({ root: state.viewerRoot, id: ledger.collabId });   // 触发 A：建立即开该协作页（开关在出口内现读）
   /* 新建实例的静音状态必为空（新 collabId 无旧文件），写点一的默认静音必然落笔——提醒同发。 */
   return { ok: true, collabId: ledger.collabId, invited, notice: DEFAULT_MUTE_NOTICE };
@@ -128,16 +99,54 @@ function registerCreateTargets(state, local, targets) {
   local.member.endpoints = Object.fromEntries(local.endpoints);
 }
 
+/* 首邀发送前的席位前提：创建者席位必须先落盘（邀请帧的签发席位就是它）；落盘失败则不发邀请——
+ * 不能一边承诺「邀请已发出」一边没有可核查的发送身份。 */
+function initialInvitesOf(state, local, ledger, targets, collabMode, sessionId) {
+  if (!persistCreatorSeat(state, local, sessionId)) {
+    return targets.map((target) => ({ instanceId: target.instanceId, ok: false, reason: '创建者席位落盘失败——邀请未发出' }));
+  }
+  return inviteInitialTargets(state, ledger, targets, collabMode, local, sessionId);
+}
+
+/* 创建者席位（首个席位、站长角色）：建协路径的席位写点。服务层创建收尾会再 upsert 一次
+ * （幂等合并），这里先写是为了让首邀有可核查的签发身份，且崩溃时席位文件已在盘上。 */
+function persistCreatorSeat(state, local, sessionId) {
+  const before = local.seatPersistFailures ?? 0;
+  upsertLocalSeat(local, {
+    version: 1,
+    sessionId,
+    role: 'manager',
+    state: 'member',
+    joinSeq: 1,
+    joinedAt: new Date().toISOString(),
+    muted: true,
+    unverified: false,
+  }, { persist: true, dataDir: state.dataDir, bridgeId: bridgeIdOfSession(state, sessionId) });
+  const persisted = (local.seatPersistFailures ?? 0) === before;
+  if (!persisted) {
+    state.log.warn('创建者席位落盘失败，首邀不发（席位文件是邀请签发身份的证据面）', {
+      collabId: local.collabId,
+      reason: local.lastSeatPersistError,
+    });
+  }
+  return persisted;
+}
+
+function bridgeIdOfSession(state, sessionId) {
+  const held = state.sessionBridges;
+  return held instanceof Map ? (held.get(sessionId) ?? null) : null;
+}
+
 /* 创建邀请的发送面：逐目标发 invite（单条入队失败只如实标注，不回滚已建协作）；
  * 讨论邀请同携发起人实例标识（= 中继归属；创建者即发起人——与增邀 ws_invite 同款）。 */
-function inviteInitialTargets(state, ledger, targets, collabMode, local) {
+function inviteInitialTargets(state, ledger, targets, collabMode, local, sessionId) {
   const invited = [];
   for (const target of targets) {
     const payload = applyInviteNaming(invitePayloadOf(ledger, [], forumEndpointsOf(collabMode, local)), target);
     if (collabMode === 'forum') {
       payload.originator = { instanceId: state.self.instanceId, identityName: state.self.identityName };
     }
-    const result = sendTo(state, ledger.collabId, target.instanceId, { address: target.address, port: target.port }, 'invite', payload);
+    const result = sendTo(state, ledger.collabId, target.instanceId, { address: target.address, port: target.port }, 'invite', payload, { fromSessionId: sessionId });
     invited.push({ instanceId: target.instanceId, ok: result.ok === true, msgId: result.msgId, reason: result.reason });
     state.counters.invitesSent++;
   }
@@ -152,6 +161,9 @@ function applyInviteNaming(payload, target) {
   if (typeof target?.targetSessionId === 'string') {
     payload.targetSessionId = target.targetSessionId;
   }
+  /* targets 是邀请帧的标准目标描述（唯一性键 instanceId + targetSessionId）：接收侧据此核对
+   * 目标机器/指名会话，旧字段 targetSessionId 仍随带作兼容与投递过滤。 */
+  payload.targets = [{ instanceId: target.instanceId, ...(typeof target.targetSessionId === 'string' ? { targetSessionId: target.targetSessionId } : {}) }];
   return payload;
 }
 
@@ -160,10 +172,11 @@ function forumEndpointsOf(mode, local) {
   return mode === 'forum' ? Object.fromEntries(local.endpoints) : null;
 }
 
-/* 新建台账（v1 proposed；名单 = 本机〔manager〕+ 各目标〔invited〕；模式创建时定死）。
- * 讨论模式的角色名沿用既有结构（发起人 = 本机 manager 记录）——平权语义与角色重命名归各模式链路
- * 落地阶段，本表只保证 mode 字段随实例走。 */
-function freshLedgerOf(state, name, topic, targets, mode) {
+/* 新建台账（共享名单形态：active-only 席位、managerTerm、joinSeqNext；模式创建时定死）。
+ * 受邀目标不写入共享名单——邀请簿记归 invites/pending-invites，真正入席（两段式确认）后才成席位；
+ * 名单出现非 member 行会被载入校验判损坏（设计 §2.1/§4）。讨论模式发起人同样是 manager 记录，
+ * 只是不参与移交流程。 */
+function freshLedgerOf(state, name, topic, mode, sessionId) {
   const now = new Date().toISOString();
   return {
     version: 1,
@@ -172,10 +185,19 @@ function freshLedgerOf(state, name, topic, targets, mode) {
     topic,
     mode,
     status: 'proposed',
-    manager: { instanceId: state.self.instanceId, identityName: state.self.identityName },
+    managerTerm: 1,
+    manager: { instanceId: state.self.instanceId, sessionId, identityName: state.self.identityName, term: 1 },
+    joinSeqNext: 2,
     members: [
-      { instanceId: state.self.instanceId, identityName: state.self.identityName, role: 'manager', state: 'member', joinedAt: now },
-      ...targets.map((target) => ({ instanceId: target.instanceId, identityName: target.identityName, role: 'member', state: 'invited', joinedAt: now })),
+      {
+        instanceId: state.self.instanceId,
+        sessionId,
+        identityName: state.self.identityName,
+        role: mode === 'forum' ? 'member' : 'manager',   // 讨论无站长：名单行不得带 manager 角色
+        state: 'member',
+        joinSeq: 1,
+        joinedAt: now,
+      },
     ],
     board: [],
     createdAt: now,
@@ -188,7 +210,7 @@ function freshLedgerOf(state, name, topic, targets, mode) {
  * 协作＝**仅站长可发起**（治理模式），目标机器须不在有效名单内（已入席机器的新会话走 ws_join
  * 申请、站长批准），受邀行先登记为 invited 再发帧（载荷名单须含目标——被邀者准入判据），
  * 终局行（declined/withdrawn/left）可重邀翻回 invited。 */
-export function inviteMembers(state, { collabId, targets }) {
+export function inviteMembers(state, { collabId, targets, sessionId }) {
   const local = state.collabs.get(collabId);
   if (local === undefined) {
     return { ok: false, message: '本机没有该协作或讨论（collabId 不存在）——先看 ws_list_collabs' };
@@ -200,13 +222,17 @@ export function inviteMembers(state, { collabId, targets }) {
   if (targetsRejection !== null) {
     return { ok: false, message: targetsRejection };
   }
+  const sender = inviteSenderSeatOf(local, sessionId);
+  if (sender.ok !== true) {
+    return { ok: false, message: sender.reason };
+  }
   return localModeOf(local) === 'forum'
-    ? inviteForumMembers(state, local, targets)
-    : inviteManagedMembers(state, local, targets);
+    ? inviteForumMembers(state, local, targets, sender.sessionId)
+    : inviteManagedMembers(state, local, targets, sender.sessionId);
 }
 
 /* 讨论邀请（既有路径保持不变）：任何成员可发起；名额数据源＝折叠成员表（被拒/被撤回者不占名额）。 */
-function inviteForumMembers(state, local, targets) {
+function inviteForumMembers(state, local, targets, fromSessionId) {
   if (!selfJoinedOf(local, state.self.instanceId)) {
     return { ok: false, message: '本机尚未加入该讨论（等待邀请或先回应邀请）——加入为成员后才能邀请他人' };
   }
@@ -222,60 +248,38 @@ function inviteForumMembers(state, local, targets) {
   const invited = [];
   for (const target of targets) {
     const payload = applyInviteNaming(forumInvitePayloadOf(state, local, topic, targets), target);
-    const result = sendTo(state, local.collabId, target.instanceId, { address: target.address, port: target.port }, 'invite', payload);
+    const result = sendTo(state, local.collabId, target.instanceId, { address: target.address, port: target.port }, 'invite', payload, { fromSessionId });
     invited.push({ instanceId: target.instanceId, ok: result.ok === true, msgId: result.msgId, reason: result.reason });
     state.counters.invitesSent++;
   }
   return { ok: true, collabId: local.collabId, invited };
 }
 
-/* 协作增员（站长制）：目标已在有效名单（invited / approved / member）＝如实拒——该机器的新会话
- * 应走 ws_join 申请（站长批准走 join-grant，不扰动既有成员行）；终局行重邀翻回 invited。 */
-function inviteManagedMembers(state, local, targets) {
+/* 协作增员（站长制）：目标机器已有活跃席位＝如实拒——该机器的新会话应走 ws_join 申请
+ * （站长批准走 join-grant，不扰动既有席位行）。邀请只写 invites/pending-invites（邀请簿记），
+ * **不写共享台账**：名单只允许 state=member 的活跃席位，受邀未入席者不是成员。 */
+function inviteManagedMembers(state, local, targets, fromSessionId) {
   if (local.role !== 'manager') {
     return { ok: false, message: '只有站长可以邀请成员加入协作——成员会话请让目标走 ws_join 申请（由站长批准）' };
   }
-  const activeStates = new Set(['invited', 'approved', 'member']);
   for (const target of targets) {
     const held = local.ledger.members.find((entry) => entry.instanceId === target.instanceId);
-    if (held !== undefined && held.role !== 'manager' && activeStates.has(held.state)) {
-      return { ok: false, message: `目标已在协作名单内（${target.identityName ?? target.instanceId}，${held.state}）——其新会话请走 ws_join 申请（或由站长批准）` };
+    if (held !== undefined) {
+      return { ok: false, message: `目标已在协作名单内（${target.identityName ?? target.instanceId}）——其新会话请走 ws_join 申请（或由站长批准）` };
     }
   }
-  const additions = targets.filter((target) => !local.ledger.members.some((entry) => entry.instanceId === target.instanceId));
-  if (local.ledger.members.length + additions.length > MAX_COLLAB_MEMBERS) {
+  if (local.ledger.members.length + targets.length > MAX_COLLAB_MEMBERS) {
     return { ok: false, message: `协作成员已达上限（${MAX_COLLAB_MEMBERS}）——不再发起新邀请` };
-  }
-  const registered = registerManagedInvites(state, local, targets, new Date().toISOString());
-  if (registered === null) {
-    return { ok: false, message: '受邀登记未落地（台账写入被挂起或失败）——未发邀请，可稍后重试' };
   }
   const base = invitePayloadOf(local.ledger, [], null);
   const invited = [];
   for (const target of targets) {
     const payload = applyInviteNaming({ ...base, members: base.members.map((entry) => ({ ...entry })) }, target);
-    const result = sendTo(state, local.collabId, target.instanceId, { address: target.address, port: target.port }, 'invite', payload);
+    const result = sendTo(state, local.collabId, target.instanceId, { address: target.address, port: target.port }, 'invite', payload, { fromSessionId });
     invited.push({ instanceId: target.instanceId, ok: result.ok === true, msgId: result.msgId, reason: result.reason });
     state.counters.invitesSent++;
   }
   return { ok: true, collabId: local.collabId, invited };
-}
-
-/* 协作增员的受邀登记：新目标入表为 invited；终局行重邀翻回 invited（非终局行已在上层拒绝）。 */
-function registerManagedInvites(state, local, targets, now) {
-  return mutateLedger(state, local, (ledger) => {
-    for (const target of targets) {
-      const row = ledger.members.find((entry) => entry.instanceId === target.instanceId);
-      if (row === undefined) {
-        ledger.members.push({ instanceId: target.instanceId, identityName: target.identityName, role: 'member', state: 'invited', joinedAt: now });
-        continue;
-      }
-      /* 终局行重邀（2026-10-19 产品裁定）：翻回 invited；非终局行已在上层拒绝。 */
-      row.state = 'invited';
-      row.identityName = target.identityName;
-      row.joinedAt = now;
-    }
-  });
 }
 
 /* 讨论邀请载荷（发送侧公共构造）：名/主题/模式 + **发起人实例标识（中继归属）** +
@@ -283,12 +287,12 @@ function registerManagedInvites(state, local, targets, now) {
  * 发起人标识随最新邀请定格（中继归属不得由邀请者推断——邀请者≠发起人）；本机未知时省略
  * （不臆造——被邀者按「中继未知」降级直投，待对表补学）。名单 2–32 由协议层照旧校验。 */
 function forumInvitePayloadOf(state, local, topic, targets) {
-  const members = foldedMembersOf(local).map((member) => ({ instanceId: member.instanceId, identityName: member.identityName }));
+  const members = foldedMembersOf(local).map((member) => seatEntryOf(member));
   const seen = new Set(members.map((member) => member.instanceId));
   for (const target of targets) {
     if (!seen.has(target.instanceId)) {
       seen.add(target.instanceId);
-      members.push({ instanceId: target.instanceId, identityName: target.identityName });
+      members.push(seatEntryOf(target));
     }
   }
   const payload = {
@@ -438,17 +442,15 @@ function inviteSummaryOf(local) {
  * 写默认静音、给一行提醒。入席、写静音、提醒三者同谓词——判据取**决策结果**（wanted）而非
  * 原始入参的真值：服务 API 直调传非布尔真值时入席照旧生效，静音与提醒必须跟着生效，
  * 不得只剩半套（拒绝、参数非法、端点未知等分支则一律不写，不留残留）。
- * 获准写点二（设计 §5:58）：同意邀请成功的**点头会话**入本机获准台账（origin:invite）——
- * 会话标识由工具面穿参（缺省＝无会话标识，如实不写；见 writeGrantApproval）。 */
+ * 获准台账不在此处写：joins.json 的单一写者是加入域（v2 整档写），本模块只经加入域接口使用。 */
 function applyInviteDecision(state, local, approve, wanted, reason, sessionId) {
   const result = localModeOf(local) === 'forum'
-    ? decideForumInvite(state, local, wanted, reason)
-    : sendDecision(state, local, approve, wanted, reason);
+    ? decideForumInvite(state, local, wanted, reason, sessionId)
+    : sendDecision(state, local, approve, wanted, reason, sessionId);
   if (wanted !== 'approved' || result.ok !== true) {
     return result;
   }
   const wrote = applyDefaultMute(local);   // 写点二：同意加入成功
-  writeGrantApproval(state, local, sessionId, 'invite');
   state.openViewer?.({ root: state.viewerRoot, id: local.collabId });   // 触发 A：同意入席即开该协作页（开关在出口内现读）
   /* 提醒只在本次真的写了静音时给：幂等重入的早返回根本到不了这里（本次什么都没写），
    * 说「已默认静音」会与事实相反。 */
@@ -459,7 +461,7 @@ function applyInviteDecision(state, local, approve, wanted, reason, sessionId) {
  * （携身份；端点经既有学习面散布）、未收敛前递增间隔重播；生效不依赖邀请者在场。
  * approve/decline 帧仍发回邀请者作簿记（best-effort——端点未知不构成失败）。
  * joined 标记供服务层在加入后驱动一轮回填对表（显式契约，不越模块边界）。 */
-function decideForumInvite(state, local, wanted, reason) {
+function decideForumInvite(state, local, wanted, reason, sessionId) {
   const validated = validateDeclineReason(reason);
   if (validated.ok !== true) {
     return { ok: false, message: validated.message };
@@ -474,10 +476,10 @@ function decideForumInvite(state, local, wanted, reason) {
     const event = emitOwnMemberEvent(state, local, 'join');
     if (event !== null) {
       state.counters.forumJoinsOut++;
-      startJoinReplay(state, local, event);
+      startJoinReplay(state, local, event, sessionId);
     }
   }
-  const bookkeeping = sendInviteBookkeeping(state, local, wanted, validated.reason);
+  const bookkeeping = sendInviteBookkeeping(state, local, wanted, validated.reason, sessionId);
   state.counters.decisionsSent++;
   return { ok: true, decision: wanted, joined: wanted === 'approved', bookkeeping };
 }
@@ -492,20 +494,20 @@ function validateDeclineReason(reason) {
 }
 
 /* 邀请回执的簿记面（approve / decline 发回邀请者；加入生效不依赖它）。 */
-function sendInviteBookkeeping(state, local, wanted, reason) {
+function sendInviteBookkeeping(state, local, wanted, reason, sessionId) {
   const managerId = local.member.manager?.instanceId;
   const endpoint = typeof managerId === 'string' ? local.endpoints.get(managerId) : undefined;
   if (endpoint === undefined) {
     return { delivered: false, reason: '邀请者端点未知（簿记帧未发出——加入 / 拒绝已本地生效）' };
   }
   const payload = wanted === 'approved' || reason === undefined ? {} : { reason };
-  const sent = sendTo(state, local.collabId, managerId, endpoint, wanted === 'approved' ? 'approve' : 'decline', payload);
+  const sent = sendTo(state, local.collabId, managerId, endpoint, wanted === 'approved' ? 'approve' : 'decline', payload, { fromSessionId: sessionId });
   return { delivered: sent.ok === true, msgId: sent.msgId, reason: sent.reason };
 }
 
 /* 决策发帧：先定格 decision（本地状态即真相），再入队；邀请者端点未知给出明确指引。
  * 拒绝原因按协议呈现判据先行校验（超限 / 换行在入队侧会被拒——不得先定格、后静默失败）。 */
-function sendDecision(state, local, approve, wanted, reason) {
+function sendDecision(state, local, approve, wanted, reason, sessionId) {
   const validated = validateDeclineReason(approve ? undefined : reason);
   if (validated.ok !== true) {
     return { ok: false, message: validated.message };
@@ -517,7 +519,7 @@ function sendDecision(state, local, approve, wanted, reason) {
   local.member.decision = wanted;
   persistMember(state, local);
   const payload = approve || validated.reason === undefined ? {} : { reason: validated.reason };
-  const sent = sendTo(state, local.collabId, local.member.manager.instanceId, endpoint, approve ? 'approve' : 'decline', payload);
+  const sent = sendTo(state, local.collabId, local.member.manager.instanceId, endpoint, approve ? 'approve' : 'decline', payload, { fromSessionId: sessionId });
   state.counters.decisionsSent++;
   return { ok: true, decision: wanted, msgId: sent.msgId };
 }
@@ -579,7 +581,9 @@ async function sendManagedMessage(state, local, { text, type, to, toSessionId, f
   if (textRejection !== null) {
     return { ok: false, message: textRejection };
   }
-  const sender = resolveSenderSeat(local, fromSessionId);
+  /* 同机多席时必须显式指定发送会话——缺省兜底会把成员消息署成站长（发送身份可被顶替）。
+   * 单席机器无歧义，可按该唯一席位签名（旧单席记录同样兼容）。 */
+  const sender = resolveSenderSeat(local, fromSessionId, { requireExplicit: localSeatsOf(local).length > 1 });
   if (sender.ok !== true) {
     return { ok: false, message: sender.reason };
   }
@@ -621,19 +625,26 @@ async function deliverMessage(state, local, type, text, targets, fromSessionId) 
     return { ok: false, message: `消息未入队（${failuresTextOf(sent)}）` };
   }
   const delivered = sent.results.filter((entry) => entry.ok === true);
+  const failed = sent.results.filter((entry) => entry.ok !== true);
   return {
     ok: true,
     msgId: delivered.find((entry) => typeof entry.msgId === 'string')?.msgId,
     tier: 'queued',
     to: delivered.map((entry) => entry.instanceId),
-    results: delivered.map((entry) => ({
+    /* 逐机器结果保留全部条目（成功带 msgId、失败带 reason）：部分失败不得被「ok:true」吞掉。 */
+    results: sent.results.map((entry) => ({
       instanceId: entry.instanceId,
       sessionIds: entry.sessionIds,
+      ok: entry.ok === true,
       msgId: entry.msgId,
       local: entry.local === true,
+      reason: entry.reason,
       results: entry.results,
     })),
-    note: '已排队（对方离线时后台重试、对方重开后送达；档位可用 ws_delivery_status 查询）',
+    ...(failed.length === 0 ? {} : { failed: failed.map((entry) => ({ instanceId: entry.instanceId, reason: entry.reason ?? '未知原因' })) }),
+    note: failed.length === 0
+      ? '已排队（对方离线时后台重试、对方重开后送达；档位可用 ws_delivery_status 查询）'
+      : `部分目标未受理（${failuresTextOf(sent)}）；其余已排队，档位可用 ws_delivery_status 查询`,
   };
 }
 
@@ -890,7 +901,9 @@ export function applyRelayedReport(state, { collabId, originMsgId, author }) {
       state.counters.relayReportSkipped++;
       return;
     }
-    const sent = sendTo(state, collabId, author.instanceId, endpoint, 'delivery-status', { refMsgId: originMsgId, tier: 'session' });
+    const sent = sendTo(state, collabId, author.instanceId, endpoint, 'delivery-status', { refMsgId: originMsgId, tier: 'session' }, {
+      fromSessionId: firstActiveSessionIdOf(local) ?? undefined,
+    });
     if (sent.ok === true) {
       state.counters.relayReportSent++;
     } else {
@@ -985,6 +998,13 @@ export function endCollab(state, { collabId }) {
   mutateLedger(state, local, (ledger) => {
     ledger.status = 'completed';
     ledger.endedAt = new Date().toISOString();
+    /* 终态形态（设计 §3.4/D17）：manager 必须为 null，名单不得残留站长行，窗口不得保留。
+     * 名单行降为 member 而非清空：终态快照与 end 通告仍要投给原参与者（投递面在清空后会丢收件人）。 */
+    ledger.manager = null;
+    delete ledger.managerWindow;
+    for (const member of ledger.members) {
+      member.role = 'member';
+    }
   });
   local.member.state = 'completed';
   local.member.archivedAt = new Date().toISOString();
@@ -1003,21 +1023,22 @@ function broadcastCollabEnd(state, local, collabId) {
     broadcastToForumMembers(state, local, 'end', {});
     return;
   }
+  const fromSessionId = managerSessionIdOf(local) ?? undefined;
   for (const instanceId of memberIdsOf(state, local)) {
     const endpoint = local.endpoints.get(instanceId);
     if (endpoint !== undefined) {
-      sendTo(state, collabId, instanceId, endpoint, 'end', {});
+      sendTo(state, collabId, instanceId, endpoint, 'end', {}, { fromSessionId });
     }
   }
 }
 
-export function leaveCollab(state, { collabId }) {
+export function leaveCollab(state, { collabId, sessionId }) {
   const local = state.collabs.get(collabId);
   if (local === undefined) {
     return { ok: false, message: '本机没有该协作' };
   }
   if (localModeOf(local) === 'forum') {
-    return leaveForum(state, local);
+    return leaveForum(state, local, sessionId);
   }
   if (local.role === 'manager') {
     return { ok: false, message: '站长席位不可退出——请先结束协作（显式交接属治理事项）' };
@@ -1028,7 +1049,7 @@ export function leaveCollab(state, { collabId }) {
   const managerId = local.member.manager.instanceId;
   const endpoint = local.endpoints.get(managerId);
   if (endpoint !== undefined) {
-    sendTo(state, collabId, managerId, endpoint, 'leave', {});
+    sendTo(state, collabId, managerId, endpoint, 'leave', {}, { fromSessionId: sessionId ?? firstActiveSessionIdOf(local) ?? undefined });
   }
   local.member.state = 'left';
   local.member.archivedAt = new Date().toISOString();
@@ -1041,7 +1062,7 @@ export function leaveCollab(state, { collabId }) {
 /* 讨论退出（设计 §5.4/§6/§9.1）：leave 事件照走（自播广播、豁免 TTL/上限）；**发起人同普通成员**
  * ——退出即放弃结束权与中继职责（中继无迁移：退出后讨论进入无中继直投、无人可 end 的自然消亡
  * 形态；结束权守卫在 endCollab，本机归档后调用被拒属状态面）。退出后讨论存续；本机归档，不再对表与重播。 */
-function leaveForum(state, local) {
+function leaveForum(state, local, sessionId) {
   if (isLocalArchivedState(local)) {
     return { ok: false, message: '讨论已结束（或已退出）' };
   }
@@ -1050,7 +1071,7 @@ function leaveForum(state, local) {
   if (event !== null) {
     state.counters.forumLeavesOut++;
   }
-  const delivered = event === null ? 0 : broadcastMemberEvent(state, local, 'leave', event);
+  const delivered = event === null ? 0 : broadcastMemberEvent(state, local, 'leave', event, sessionId ?? firstActiveSessionIdOf(local) ?? undefined);
   local.member.state = 'left';
   local.member.archivedAt = new Date().toISOString();
   persistMember(state, local);
@@ -1074,7 +1095,7 @@ export async function viewLedger(state, { collabId }) {
   const managerId = local.member.manager.instanceId;
   const endpoint = local.endpoints.get(managerId);
   if (!archived && endpoint !== undefined) {
-    sendTo(state, collabId, managerId, endpoint, 'snapshot', { kind: 'request' });
+    sendSnapshotRequest(state, local, collabId, managerId, endpoint);
     const live = await waitForSnapshot(state, collabId);
     if (live !== null) {
       return { ok: true, source: 'live', version: live.version, ledger: live.ledger };
@@ -1176,6 +1197,7 @@ export function pushSnapshot(state, local) {
     ledger: frozen,
   };
   persistSnapshot(state, local);
+  const fromSessionId = managerSessionIdOf(local) ?? undefined;
   for (const member of local.ledger.members) {
     if (member.instanceId === state.self.instanceId) {
       continue;
@@ -1185,9 +1207,35 @@ export function pushSnapshot(state, local) {
       state.counters.snapshotSkipped++;
       continue;
     }
-    sendTo(state, local.collabId, member.instanceId, endpoint, 'snapshot', { kind: 'data', version: frozen.version, digest: local.snapshot.digest, ledger: frozen });
+    sendTo(state, local.collabId, member.instanceId, endpoint, 'snapshot', snapshotDataPayloadOf(frozen, local.snapshot.digest), { fromSessionId });
     state.counters.snapshotSent++;
   }
+}
+
+/* 快照数据帧（协议形态）：managerTerm / version / digest / ledger 必填；managerWindow 与台账
+ * 任一侧存在即须一致（受理由协议层按同口径校验）。 */
+function snapshotDataPayloadOf(ledger, digest) {
+  return {
+    kind: 'data',
+    managerTerm: ledger.managerTerm,
+    version: ledger.version,
+    digest,
+    ledger,
+    ...(ledger.managerWindow === undefined ? {} : { managerWindow: ledger.managerWindow }),
+  };
+}
+
+/* 快照请求帧（协议形态）：managerTerm / version 是请求方的已知基线。本机尚无台账/快照基线时
+ * 不编造——跳过并计数，等对表/首份快照建立基线后再请求。 */
+function snapshotRequestPayloadOf(local) {
+  const ledger = local.role === 'manager' ? local.ledger : local.snapshot?.ledger;
+  if (ledger === undefined || ledger === null) {
+    return null;
+  }
+  if (!Number.isInteger(ledger.managerTerm) || ledger.managerTerm < 1 || !Number.isInteger(ledger.version)) {
+    return null;
+  }
+  return { kind: 'request', managerTerm: ledger.managerTerm, version: ledger.version };
 }
 
 /* 发送包装（注入的 dispatch.send 的统一入口）：结果只计数不抛出——协作操作不因单条入队失败而回滚。
@@ -1198,9 +1246,9 @@ export function sendTo(state, collabId, instanceId, endpoint, type, payload, opt
   if (options.from !== undefined) {
     message.from = options.from;
   }
-  /* 发送席位：显式优先；未穿参的治理发送面按本机站长/最早席位兜底（0.2.0 帧必须携 from.sessionId）。 */
-  const local = state.collabs?.get(collabId);
-  const fromSessionId = options.fromSessionId ?? (local === undefined ? undefined : defaultSenderSeat(local, localSeatsOf(local)).sessionId);
+  /* 发送席位：显式优先（转达帧的 from.sessionId 即原发席位）；缺省只接受「本机恰一席 / 旧单席
+   * 记录」这一无歧义情形——不再按站长身份兜底（同机多席时冒名会把成员消息署成站长）。 */
+  const fromSessionId = options.fromSessionId ?? defaultSenderSessionOf(state, collabId);
   if (fromSessionId !== undefined) {
     message.fromSessionId = fromSessionId;
   }
@@ -1217,7 +1265,58 @@ export function sendTo(state, collabId, instanceId, endpoint, type, payload, opt
   return result;
 }
 
-/* 席位定向发送（M3 → M4/M5/M6 契约）：targets = [{instanceId, sessionId}]。
+/* 缺省发送席位的窄口径：本机恰一席才采用；多席必须显式穿参（无 sessionId 不再猜站长）。
+ * 无席位表的旧单席记录以其 sessionId 兼容。 */
+function defaultSenderSessionOf(state, collabId) {
+  const local = state.collabs?.get(collabId);
+  if (local === undefined) {
+    return undefined;
+  }
+  const sender = defaultSenderSeat(local, localSeatsOf(local));
+  return sender.ok === true ? sender.sessionId : undefined;
+}
+
+/* 邀请签发席位：点名会话优先校验；未穿参时按模式取唯一的合法签发者——managed 只能站长席位
+ * （设计 §7.1 的 invite 签发规则），forum 取本机任一活跃成员席位。 */
+function inviteSenderSeatOf(local, sessionId) {
+  if (typeof sessionId === 'string' && sessionId.trim() !== '') {
+    return resolveSenderSeat(local, sessionId, { requireExplicit: true });
+  }
+  if (localModeOf(local) === 'managed') {
+    const manager = managerSessionIdOf(local);
+    return manager === null
+      ? { ok: false, reason: '站长席位未知（等待对表）——无法签发邀请' }
+      : { ok: true, sessionId: manager };
+  }
+  const member = firstActiveSessionIdOf(local);
+  return member === null
+    ? { ok: false, reason: '本机没有活跃席位——无法签发邀请' }
+    : { ok: true, sessionId: member };
+}
+
+/* 站长席位会话：运行态席位优先，其次旧成员记录 / 台账 manager 行。 */
+function managerSessionIdOf(local) {
+  const seat = localSeatsOf(local).find((candidate) => candidate.role === 'manager' && candidate.state === 'member');
+  if (seat !== undefined) {
+    return seat.sessionId;
+  }
+  if (typeof local?.member?.sessionId === 'string') {
+    return local.member.sessionId;
+  }
+  const ledgerSession = local?.ledger?.manager?.sessionId;
+  return typeof ledgerSession === 'string' ? ledgerSession : null;
+}
+
+/* 本机首个活跃席位（同机多席时仅作治理/成员事件的兼容签发面；调用方应尽量显式穿参）。 */
+function firstActiveSessionIdOf(local) {
+  const seat = localSeatsOf(local).find((candidate) => candidate.state === 'member' && candidate.unverified !== true);
+  if (seat !== undefined) {
+    return seat.sessionId;
+  }
+  return typeof local?.member?.sessionId === 'string' ? local.member.sessionId : null;
+}
+
+/* 席位定向发送（契约发送面）：targets = [{instanceId, sessionId}]。
  * 按机器分组：本机目标逐席走旁路注入（不调用 dispatch.send），远端每机器一帧并携 toSessions。
  * 返回逐机器结果（msgId 逐机器；本机结果带 local:true）；任一机器受理即 ok。
  * 发送会话必须是本机活跃席位（member 且未标记 unverified）——非成员/未收敛一律拒绝。 */
@@ -1226,7 +1325,7 @@ export async function sendToSeats(state, { collabId, fromSessionId, type, payloa
   if (local === undefined) {
     return { ok: false, reason: '本机没有该协作（未知 collabId）', results: [] };
   }
-  /* 有席位表（M2 运行时）时必须显式给 fromSessionId；无席位表的历史调用链按兼容席位兜底，
+  /* 有席位表（运行时席位）时必须显式给 fromSessionId；无席位表的历史调用链按兼容席位兜底，
    * 避免把「会话级运行时尚未接线」误判成发送会话非法。 */
   const sender = resolveSenderSeat(local, fromSessionId, { requireExplicit: localSeatsOf(local).length > 0 });
   if (sender.ok !== true) {
@@ -1257,13 +1356,72 @@ export async function sendToSeats(state, { collabId, fromSessionId, type, payloa
   return { ok, fromSessionId: sender.sessionId, results, ...(ok ? {} : { reason: failuresTextOf({ results }) }) };
 }
 
-/* 治理帧发送（同一分组/旁路语义，供 M5 的站长变更、快照、握手等使用）：全部目标同属机器级。 */
+/* 治理帧发送（同一分组/旁路语义，供站长变更、快照、握手等治理发送面使用）：全部目标同属机器级。 */
 export async function sendGovernance(state, input) {
   return sendToSeats(state, input);
 }
 
-/* 机器级投递状态（按 msgId）：委托发送调度器的队列行；未接线返回 null。 */
+/* 本机旁路投递账（设计 §5.3 第 4 条）：发送核按 (msgId, sessionId) 记录本机目标的注入结果，
+ * 机器级终态立即成立（不经 dispatch 队列）。内存短时保留、按插入序淘汰——查询面与持久队列分开。 */
+const LOCAL_DELIVERY_MAX = 512;
+
+function localDeliveriesOf(state) {
+  if (!(state.localDeliveries instanceof Map)) {
+    state.localDeliveries = new Map();
+  }
+  return state.localDeliveries;
+}
+
+function rememberLocalDelivery(state, { collabId, fromSessionId, type, toSessions, results, msgId, createdAt }) {
+  const ledger = localDeliveriesOf(state);
+  ledger.delete(msgId);
+  ledger.set(msgId, {
+    collabId,
+    fromSessionId,
+    type,
+    toSessions,
+    createdAt,
+    outcomes: new Map(results.map((entry) => [entry.sessionId, entry.status ?? (entry.ok === true ? 'injected' : 'dropped')])),
+  });
+  while (ledger.size > LOCAL_DELIVERY_MAX) {
+    ledger.delete(ledger.keys().next().value);
+  }
+}
+
+function localDeliveryOf(state, msgId) {
+  const ledger = localDeliveriesOf(state);
+  return typeof msgId === 'string' ? ledger.get(msgId) ?? null : null;
+}
+
+function localDeliveryRowOf(state, msgId) {
+  const entry = localDeliveryOf(state, msgId);
+  if (entry === null) {
+    return null;
+  }
+  return {
+    msgId,
+    collabId: entry.collabId,
+    type: entry.type,
+    toInstanceId: state.self.instanceId,
+    fromSessionId: entry.fromSessionId ?? null,
+    toSessions: entry.toSessions,
+    tier: 'session',
+    expired: false,
+    attempts: 0,
+    createdAt: entry.createdAt,
+    nextAttemptAt: null,
+    ackedAt: null,
+    deliveredAt: entry.createdAt,
+    note: '本机旁路投递（机器级终态立即成立）',
+  };
+}
+
+/* 机器级投递状态（按 msgId）：本机旁路账优先，其次发送调度器的队列行；未接线返回 null。 */
 export function deliveryStatusOf(state, msgId) {
+  const localRow = localDeliveryRowOf(state, msgId);
+  if (localRow !== null) {
+    return localRow;
+  }
   if (typeof state.deliveryStatusOf === 'function') {
     return state.deliveryStatusOf(msgId);
   }
@@ -1273,8 +1431,19 @@ export function deliveryStatusOf(state, msgId) {
   return null;
 }
 
-/* 本机席位投递明细：委托接收管线的 fanout 事实（M2 接线注入）；未接线返回 unknown。 */
+/* 本机席位投递明细：本机旁路账优先；其余委托接收管线的 fanout 事实（接线注入）；
+ * 未接线返回 unknown。 */
 export function localSeatDeliveryOf(state, msgId, sessionId) {
+  const entry = localDeliveryOf(state, msgId);
+  if (entry !== null) {
+    return {
+      collabId: entry.collabId,
+      msgId,
+      sessionId,
+      status: entry.outcomes.get(sessionId) ?? 'unknown',
+      complete: true,
+    };
+  }
   if (typeof state.localSeatDeliveryOf === 'function') {
     return state.localSeatDeliveryOf(msgId, sessionId);
   }
@@ -1312,20 +1481,60 @@ function isTargetShape(target) {
 }
 
 /* 本机旁路（设计 §1.2/§5.2）：逐席注入，不经过 dispatch.send（跨机发送拒绝本机目标）。
- * 注入面由 M2 运行时提供（injectLocalSeat）；未接线时如实失败并计数，不退化成网络投递。 */
+ * 注入面由运行时席位层提供；未接线时如实失败并计数，不退化成网络投递。
+ * 内容类帧逐席过静音门（与接收扇出同一判据），治理/邀请类豁免；每个本机目标写入投递账。 */
 async function injectLocalTargets(state, local, fromSessionId, { type, payload, instanceId, sessionIds }) {
   const inject = localInjectorOf(state, local, type);
-  if (inject === null) {
-    return { instanceId, sessionIds, ok: false, reason: '本机旁路注入面未接线（M2 injectLocalSeat 缺失）', local: true };
-  }
   const sessions = sessionIds.length > 0 ? sessionIds : localActiveSeatIds(local);
   const frame = localFrameOf(state, local, fromSessionId, { type, payload });
+  const results = inject === null
+    ? sessions.map((sessionId) => ({ sessionId, ok: false, status: 'dropped', reason: '本机旁路注入面未接线' }))
+    : await injectEachSeat(state, local, inject, sessions, fromSessionId, frame, type);
+  rememberLocalDelivery(state, {
+    collabId: local.collabId,
+    fromSessionId,
+    type,
+    toSessions: sessions,
+    results,
+    msgId: frame.msgId,
+    createdAt: frame.ts,
+  });
+  /* 静音抑制是「已受理但未注入」：对发送方仍是本机受理成功（机器级终态），不能报入队失败。 */
+  const ok = results.some((entry) => (entry.ok === true && entry.skipped !== 'self') || entry.status === 'gated');
+  return { instanceId, sessionIds: sessions, ok, local: true, msgId: frame.msgId, results };
+}
+
+async function injectEachSeat(state, local, inject, sessions, fromSessionId, frame, type) {
   const results = [];
   for (const sessionId of sessions) {
-    results.push(await injectOneSeat(inject, local.collabId, sessionId, fromSessionId, frame));
+    results.push(await injectOneSeatWithGate(state, local, inject, { sessionId, fromSessionId, frame, type }));
   }
-  const ok = results.some((entry) => entry.ok === true && entry.skipped !== 'self');
-  return { instanceId, sessionIds: sessions, ok, local: true, msgId: frame.msgId, results };
+  return results;
+}
+
+/* 单席注入：自己跳过；内容类按收件席位静音门抑制（豁免词表与接收扇出同源：post 与帖子类型）。 */
+async function injectOneSeatWithGate(state, local, inject, { sessionId, fromSessionId, frame, type }) {
+  if (sessionId === fromSessionId) {
+    return { sessionId, ok: true, skipped: 'self', status: 'skipped' };
+  }
+  if (isMutedLocalSeat(local, type, sessionId)) {
+    state.counters.localSeatsGated = (state.counters.localSeatsGated ?? 0) + 1;
+    return { sessionId, ok: false, status: 'gated', reason: '收件席位已静音' };
+  }
+  return injectOneSeat(inject, local.collabId, sessionId, frame);
+}
+
+/* 内容类判定与静音门：治理 / 邀请 / 离席 / 结束不受静音抑制（与接收侧豁免清单同一原则）。 */
+function isMutedLocalSeat(local, type, sessionId) {
+  if (!isContentType(type)) {
+    return false;
+  }
+  const seat = localSeatsOf(local).find((candidate) => candidate.sessionId === sessionId);
+  return seat?.muted === true;
+}
+
+function isContentType(type) {
+  return type === 'post' || POST_KINDS.includes(type);
 }
 
 function localInjectorOf(state, local, type) {
@@ -1350,19 +1559,34 @@ function localFrameOf(state, local, fromSessionId, { type, payload }) {
   };
 }
 
-async function injectOneSeat(inject, collabId, sessionId, fromSessionId, frame) {
-  if (sessionId === fromSessionId) {
-    return { sessionId, ok: true, skipped: 'self' };
-  }
+async function injectOneSeat(inject, collabId, sessionId, frame) {
   try {
     const result = await inject(collabId, sessionId, frame);
-    return { sessionId, ok: result?.ok === true, delivered: result?.delivered === true, staged: result?.staged === true, reason: result?.reason };
+    return {
+      sessionId,
+      ok: result?.ok === true,
+      delivered: result?.delivered === true,
+      staged: result?.staged === true,
+      status: injectionStatusOf(result),
+      reason: result?.reason,
+    };
   } catch (error) {
-    return { sessionId, ok: false, reason: `本机注入异常：${error?.message ?? '未知原因'}` };
+    return { sessionId, ok: false, status: 'dropped', reason: `本机注入异常：${error?.message ?? '未知原因'}` };
   }
 }
 
-/* 本机活跃席位（旁路缺省目标）：M2 的 local.seats 是席位运行态权威；无席位表时退回单个兼容席位。 */
+/* 注入结果 → 查询面档位（与接收扇出 outcomes 同口径）：injected / staged / injected（重复）/ dropped。 */
+function injectionStatusOf(result) {
+  if (result?.ok !== true) {
+    return 'dropped';
+  }
+  if (result.duplicate === true || result.delivered === true) {
+    return 'injected';
+  }
+  return result.staged === true ? 'staged' : 'injected';
+}
+
+/* 本机活跃席位（旁路缺省目标）：运行态席位表是权威；无席位表时退回旧单席记录。 */
 function localActiveSeatIds(local) {
   return localSeatsOf(local).filter((seat) => seat.state === 'member').map((seat) => seat.sessionId);
 }
@@ -1386,37 +1610,67 @@ export function endpointFor(state, local, instanceId) {
  * 席位变更通告）的统一出口；端点未知者跳过——可见性由转达与对等回执机制兜底（设计 §9 步骤 1/5）。 */
 export function sendToRoster(state, local, type, payload, options = {}) {
   const sender = resolveSenderSeat(local, options.fromSessionId);
-  const fromSessionId = sender.ok === true ? sender.sessionId : undefined;
+  if (sender.ok !== true || typeof sender.sessionId !== 'string') {
+    state.log.warn('治理广播缺少发送席位（fromSessionId），未发送', {
+      collabId: local.collabId,
+      type,
+      reason: sender.ok === true ? '未解析出会话标识' : sender.reason,
+    });
+    return 0;
+  }
   let sent = 0;
   for (const [instanceId, sessionIds] of rosterGroupsOf(state, local, options.exclude ?? new Set())) {
-    const endpoint = endpointFor(state, local, instanceId);
-    if (endpoint === undefined) {
-      state.counters.rosterSkipped++;   // 治理触达不可及的观测面（跳过不静默）
-      continue;
-    }
-    const result = sendTo(state, local.collabId, instanceId, endpoint, type, payload, {
-      fromSessionId,
-      ...(sessionIds.length > 0 ? { toSessions: sessionIds } : {}),
-    });
-    if (result.ok === true) {
+    if (sendRosterGroup(state, local, sender.sessionId, { type, payload, instanceId, sessionIds })) {
       sent++;
     }
   }
   return sent;
 }
 
-/* 名册按机器分组（排除本机与被排除者）：同机多席只发一帧并携 toSessions。 */
+/* 单个机器组的治理广播：本机组走逐席旁路注入（异步尽力而为），远端组一帧一机。 */
+function sendRosterGroup(state, local, fromSessionId, { type, payload, instanceId, sessionIds }) {
+  if (instanceId === state.self.instanceId) {
+    injectLocalTargets(state, local, fromSessionId, { type, payload, instanceId, sessionIds })
+      .catch((error) => {
+        state.counters.sendFailures++;
+        state.log.warn('本机治理广播注入异常（已隔离）', { collabId: local.collabId, type, reason: error?.message });
+      });
+    return true;
+  }
+  const endpoint = endpointFor(state, local, instanceId);
+  if (endpoint === undefined) {
+    state.counters.rosterSkipped++;   // 治理触达不可及的观测面（跳过不静默）
+    return false;
+  }
+  const result = sendTo(state, local.collabId, instanceId, endpoint, type, payload, {
+    fromSessionId,
+    ...(sessionIds.length > 0 ? { toSessions: sessionIds } : {}),
+  });
+  return result.ok === true;
+}
+
+/* 名册按机器分组（含本机组；排除被点名排除者）：同机多席只发一帧并携 toSessions。
+ * 本机席位表是运行态权威——名单未含的本机新席位也要收到治理广播。 */
 function rosterGroupsOf(state, local, exclude) {
   const groups = new Map();
+  const add = (instanceId, sessionId) => {
+    const sessions = groups.get(instanceId) ?? [];
+    if (typeof sessionId === 'string' && !sessions.includes(sessionId)) {
+      sessions.push(sessionId);
+    }
+    groups.set(instanceId, sessions);
+  };
   for (const entry of localRosterOf(local)) {
-    if (entry.instanceId === state.self.instanceId || exclude.has(entry.instanceId)) {
-      continue;
+    if (!exclude.has(entry.instanceId)) {
+      add(entry.instanceId, entry.sessionId);
     }
-    const sessions = groups.get(entry.instanceId) ?? [];
-    if (typeof entry.sessionId === 'string' && !sessions.includes(entry.sessionId)) {
-      sessions.push(entry.sessionId);
+  }
+  if (!exclude.has(state.self.instanceId)) {
+    for (const seat of localSeatsOf(local)) {
+      if (seat.state === 'member' && seat.unverified !== true) {
+        add(state.self.instanceId, seat.sessionId);
+      }
     }
-    groups.set(entry.instanceId, sessions);
   }
   return groups;
 }
@@ -1425,14 +1679,15 @@ function rosterGroupsOf(state, local, exclude) {
 
 /* 成员事件广播（join / leave；设计 §5.4）：发给群体可达面（折叠成员表 ∪ 邀请者引用 ∪
  * 端点表已知者）中端点已知者与应用层广播豁免（豁免 TTL/上限）。 */
-export function broadcastMemberEvent(state, local, type, event) {
-  return broadcastToForumMembers(state, local, type, { eventId: event.eventId, ts: event.ts });
+export function broadcastMemberEvent(state, local, type, event, fromSessionId) {
+  return broadcastToForumMembers(state, local, type, { eventId: event.eventId, ts: event.ts }, fromSessionId);
 }
 
 /* 讨论控制事件广播出口（join / leave / end 共用）：群体可达面（折叠成员表 ∪ 邀请者引用 ∪
  * 端点表已知者，见 local.forumReachIdsOf）——新成员刚加入时折叠表只有自己，只发邀请者会让
  * 邀请者离线即隔离新人（设计 §5.1「被邀者据此取得入群所需的成员与寻址信息」的落点）。 */
-export function broadcastToForumMembers(state, local, type, payload) {
+export function broadcastToForumMembers(state, local, type, payload, fromSessionId) {
+  const signer = fromSessionId ?? firstActiveSessionIdOf(local) ?? undefined;
   let sent = 0;
   for (const instanceId of forumReachIdsOf(local, state.self.instanceId)) {
     const endpoint = endpointFor(state, local, instanceId);
@@ -1440,7 +1695,7 @@ export function broadcastToForumMembers(state, local, type, payload) {
       state.counters.forumBroadcastSkipped++;
       continue;
     }
-    const result = sendTo(state, local.collabId, instanceId, endpoint, type, payload);
+    const result = sendTo(state, local.collabId, instanceId, endpoint, type, payload, { fromSessionId: signer });
     if (result.ok === true) {
       sent++;
     }
@@ -1451,13 +1706,13 @@ export function broadcastToForumMembers(state, local, type, payload) {
 /* join 未收敛重播（设计 §5.4 防幽灵成员）：同一事件原样重发（事件 id 幂等并集吸收）、
  * 递增间隔有界（每轮至多 intervals.length 次）；确认（对表拉回的成员表含自己）或退出即停，
  * 每轮对表若仍未收敛则由收敛判定重新起一轮。 */
-export function startJoinReplay(state, local, event) {
+export function startJoinReplay(state, local, event, fromSessionId) {
   if (state.joinReplays.has(local.collabId)) {
     return false;   // 一轮在跑：不叠加（防风暴）
   }
-  state.joinReplays.set(local.collabId, { timer: null, attempts: 0 });
+  state.joinReplays.set(local.collabId, { timer: null, attempts: 0, fromSessionId });
   state.counters.joinReplays++;
-  broadcastMemberEvent(state, local, 'join', event);
+  broadcastMemberEvent(state, local, 'join', event, fromSessionId);
   scheduleJoinReplayStep(state, local, event, 0);
   return true;
 }
@@ -1476,7 +1731,7 @@ function scheduleJoinReplayStep(state, local, event, step) {
     held.timer = null;
     held.attempts = step + 1;
     state.counters.joinReplays++;
-    broadcastMemberEvent(state, local, 'join', event);
+    broadcastMemberEvent(state, local, 'join', event, held.fromSessionId);
     scheduleJoinReplayStep(state, local, event, step + 1);
   }, intervals[step]);
   if (typeof timer.unref === 'function') {
@@ -1576,9 +1831,12 @@ export function broadcastFreeze(state, frozenLocal, reason) {
     payload.createdAt = frozenLocal.ledger.createdAt;
     payload.manager = { instanceId: frozenLocal.ledger.manager.instanceId, identityName: frozenLocal.ledger.manager.identityName };
   }
+  const fromSessionId = frozenLocal.role === 'manager'
+    ? managerSessionIdOf(frozenLocal) ?? undefined
+    : firstActiveSessionIdOf(frozenLocal) ?? undefined;
   let sent = 0;
   for (const [instanceId, endpoint] of collectFreezeTargets(state, frozenLocal)) {
-    const result = sendTo(state, frozenLocal.collabId, instanceId, endpoint, 'freeze', payload);
+    const result = sendTo(state, frozenLocal.collabId, instanceId, endpoint, 'freeze', payload, { fromSessionId });
     if (result.ok === true) {
       sent++;
     }
@@ -1650,9 +1908,44 @@ export function promoteToManager(state, local, ledger) {
   local.member.managerSinceVersion = ledger.version;   // 席位时钟：本次席位变更的台账基准版本
   local.suspended = null;
   local.staleManagerId = null;
+  /* 角色派生只看席位：不同步席位角色，后续任一 syncLocalRole 都会把本机改回成员。 */
+  applyManagerSeatRoles(state, local, ledger);
   persistMember(state, local);
   persistLedger(state, local);
   pushSnapshot(state, local);
+}
+
+/* 站长转移的席位侧同步：台账 manager 席位置 manager、其余本机席位回落 member；台账里有席位行
+ * 但运行态缺席时按台账行补建（受让会话尚未在本机建席的窗口）——否则派生角色仍是成员。 */
+function applyManagerSeatRoles(state, local, ledger) {
+  const managerSessionId = ledger.manager?.sessionId;
+  if (typeof managerSessionId !== 'string') {
+    return;
+  }
+  const seats = localSeatsOf(local);
+  for (const seat of seats) {
+    const role = seat.sessionId === managerSessionId ? 'manager' : 'member';
+    if (seat.role !== role) {
+      upsertLocalSeat(local, { sessionId: seat.sessionId, role }, { persist: true, dataDir: state.dataDir });
+    }
+  }
+  if (seats.some((seat) => seat.sessionId === managerSessionId)) {
+    return;
+  }
+  const row = ledger.members.find((entry) => entry.instanceId === state.self.instanceId && entry.sessionId === managerSessionId);
+  if (row === undefined) {
+    return;
+  }
+  upsertLocalSeat(local, {
+    version: 1,
+    sessionId: managerSessionId,
+    role: 'manager',
+    state: 'member',
+    joinSeq: row.joinSeq,
+    joinedAt: row.joinedAt,
+    muted: true,
+    unverified: false,
+  }, { persist: true, dataDir: state.dataDir, bridgeId: bridgeIdOfSession(state, managerSessionId) });
 }
 
 /* 席位变更后的名册角色同步：台账 manager 与 members[].role 恒一致——新任站长置 manager、
@@ -1700,11 +1993,22 @@ export function downgradeToMember(state, local, managerPeer, version) {
   if (Number.isInteger(version)) {
     local.member.managerSinceVersion = version;
   }
+  demoteLocalSeats(state, local);
   local.suspended = null;
   persistMember(state, local);
   retargetStaleQueue(state, local, formerManagerId, managerPeer.instanceId);
   requestCurrentView(state, local);
   state.counters.downgrades++;
+}
+
+/* 降级为成员时的席位侧同步：本机所有席位角色回落 member——残留 manager 席位会被
+ * syncLocalRole 重新派生成站长，随后访问已被删除的 local.ledger（空引用）。 */
+function demoteLocalSeats(state, local) {
+  for (const seat of localSeatsOf(local)) {
+    if (seat.role !== 'member') {
+      upsertLocalSeat(local, { sessionId: seat.sessionId, role: 'member' }, { persist: true, dataDir: state.dataDir });
+    }
+  }
 }
 
 /* 陈旧出站队列重定向：发往旧站长的未确认条目改投新站长（同 msgId 保持——进行中消息在新席位
@@ -1766,7 +2070,20 @@ export function requestCurrentView(state, local) {
   if (endpoint === undefined) {
     return;
   }
-  sendTo(state, local.collabId, managerId, endpoint, 'snapshot', { kind: 'request' });
+  sendSnapshotRequest(state, local, local.collabId, managerId, endpoint);
+}
+
+/* 快照请求的统一发送面：缺基线不编造字段（协议层会按 managerTerm/version 必填拒收）。 */
+function sendSnapshotRequest(state, local, collabId, managerId, endpoint) {
+  const payload = snapshotRequestPayloadOf(local);
+  if (payload === null) {
+    state.counters.snapshotSkipped++;
+    state.log.warn('快照请求缺少本地基线（managerTerm/version 未知），跳过', { collabId });
+    return null;
+  }
+  return sendTo(state, collabId, managerId, endpoint, 'snapshot', payload, {
+    fromSessionId: firstActiveSessionIdOf(local) ?? undefined,
+  });
 }
 
 /* 站长引用更新（成员侧；移交 / 抢接 / 握手共用）：更新记录、重定向陈旧队列并留痕；
@@ -1812,7 +2129,7 @@ export function sendMergeOffer(state, local, managerPeer, baseVersion) {
     version: frozen.version,
     digest: ledgerDigest(frozen),
     ledger: frozen,
-  });
+  }, { fromSessionId: firstActiveSessionIdOf(local) ?? undefined });
 }
 
 /* 本机提示（会话注入面；不经出站队列、不上网络）：notify 注入缺失或投递失败只计数与日志。
@@ -1881,12 +2198,22 @@ function routingParamsOf(to, toSessionId) {
   return { explicit, directed };
 }
 
-/* 成员的发件目标：只能到站长所在机器；给了会话参数时在该机器内精确匹配。 */
+/* 成员的发件目标：只能到站长所在机器，且定向只能落在站长席位本身——同机其他成员席位不是
+ * 星型路由的合法终点（成员 → 站长的唯一上行边）。 */
 function memberTargetsOf(state, local, route, manager) {
   if (route.explicit !== null && route.explicit !== manager.instanceId) {
     return { error: '成员只能发给站长所在机器（星型路由）' };
   }
-  return resolveTargetOnMachine(state, local, manager.instanceId, route.directed, manager);
+  if (route.directed !== null && typeof manager.sessionId !== 'string') {
+    return { error: '站长席位未知（等待对表）——无法定向到站长' };
+  }
+  const resolved = resolveTargetOnMachine(state, local, manager.instanceId, route.directed, manager);
+  if (resolved.error !== undefined || route.directed === null) {
+    return resolved;
+  }
+  return resolved.targets[0]?.sessionId === manager.sessionId
+    ? resolved
+    : { error: '成员只能定向到站长席位（不能指名站长所在机器的其他成员会话）' };
 }
 
 /* 机器内定向：未给会话参数 = 该机器全部活跃席位（接收核按 toSessions 扇出）；
@@ -1988,15 +2315,9 @@ function isMessagingState(stateName) {
   return stateName === undefined || MESSAGING_MEMBER_STATES.includes(stateName);
 }
 
-/* 本机席位表（M2 运行态）：无席位表返回空——调用方按兼容成员记录处理。 */
+/* 本机席位表（运行时状态）：无席位表返回空——调用方按兼容成员记录处理。 */
 function localSeatsOf(local) {
   return local?.seats instanceof Map ? [...local.seats.values()] : [];
-}
-
-function compareSeatJoinSeq(left, right) {
-  const leftSeq = Number.isInteger(left.joinSeq) ? left.joinSeq : Number.MAX_SAFE_INTEGER;
-  const rightSeq = Number.isInteger(right.joinSeq) ? right.joinSeq : Number.MAX_SAFE_INTEGER;
-  return leftSeq - rightSeq;
 }
 
 /* 发送席位解析：显式 fromSessionId 必须是本机活跃成员席位（unverified/joining 不得发）；
@@ -2040,17 +2361,24 @@ function legacySenderSeatOf(local, explicit) {
   return { ok: true, sessionId: explicit };
 }
 
-/* 未穿参的发送面（治理广播等）：站长席位优先，其次最早加入的活动席位；旧单席记录兜底。 */
+/* 未穿参的发送面（治理广播等）：站长席位（治理帧的法定签发者）优先；无站长席时仅当本机
+ * 恰一席才采用；旧单席记录兜底。多席且无站长席 = 无歧义的签发者不存在，拒绝猜测。 */
 function defaultSenderSeat(local, seats) {
-  const memberSeats = seats.filter((seat) => seat.state === 'member' && seat.unverified !== true).sort(compareSeatJoinSeq);
-  const preferred = memberSeats.find((seat) => seat.role === 'manager') ?? memberSeats[0];
-  if (preferred !== undefined) {
-    return { ok: true, sessionId: preferred.sessionId };
+  const memberSeats = seats.filter((seat) => seat.state === 'member' && seat.unverified !== true);
+  const managerSeat = memberSeats.find((seat) => seat.role === 'manager');
+  if (managerSeat !== undefined) {
+    return { ok: true, sessionId: managerSeat.sessionId };
+  }
+  if (memberSeats.length === 1) {
+    return { ok: true, sessionId: memberSeats[0].sessionId };
+  }
+  if (memberSeats.length > 1) {
+    return { ok: false, reason: '同机多席位缺省发送会话有歧义——必须显式给 fromSessionId' };
   }
   const legacySession = local?.member?.sessionId;
   return typeof legacySession === 'string'
     ? { ok: true, sessionId: legacySession }
-    : { ok: true, sessionId: undefined };
+    : { ok: false, reason: '缺少发送会话标识（fromSessionId）' };
 }
 
 /* 协作类载荷构造：topic 走呈现文本、task 生成任务标识、stop 的正文即原因、其余为正文 text。 */
@@ -2077,7 +2405,8 @@ export function managerRecordOf(ledger) {
     name: ledger.name,
     topic: ledger.topic,
     mode: ledger.mode ?? DEFAULT_COLLAB_MODE,
-    manager: { instanceId: ledger.manager.instanceId, identityName: ledger.manager.identityName },
+    sessionId: ledger.manager.sessionId,
+    manager: { instanceId: ledger.manager.instanceId, sessionId: ledger.manager.sessionId, identityName: ledger.manager.identityName },
     roster: ledger.members.map((member) => ({ instanceId: member.instanceId, identityName: member.identityName })),
     endpoints: {},
     decision: null,
@@ -2115,12 +2444,16 @@ function memberRecordOf(local, managerPeer) {
  * @param {Record<string, { address: string, port: number }> | null} [endpoints]
  */
 export function invitePayloadOf(ledger, extraMembers = [], endpoints = null) {
-  const seen = new Set(ledger.members.map((member) => member.instanceId));
-  const members = ledger.members.map((member) => ({ instanceId: member.instanceId, identityName: member.identityName }));
+  /* 名单按协议席位条目形态（instanceId + sessionId + identityName）：邀请准入按席位键校验，
+   * 缺 sessionId 的邀请会被对端协议层整帧拒收。 */
+  const seen = new Set(ledger.members.map((member) => `${member.instanceId}\u0000${member.sessionId ?? ''}`));
+  const members = ledger.members.map((member) => seatEntryOf(member));
   for (const extra of extraMembers) {
-    if (!seen.has(extra.instanceId)) {
-      seen.add(extra.instanceId);
-      members.push({ instanceId: extra.instanceId, identityName: extra.identityName });
+    const entry = seatEntryOf(extra);
+    const key = `${entry.instanceId}\u0000${entry.sessionId ?? ''}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      members.push(entry);
     }
   }
   const payload = {
@@ -2133,6 +2466,16 @@ export function invitePayloadOf(ledger, extraMembers = [], endpoints = null) {
     payload.endpoints = endpoints;
   }
   return payload;
+}
+
+/* 席位条目（邀请载荷的名单行）：只取协议定义字段；缺 sessionId 的旧行不编造，交由协议层拒收。 */
+function seatEntryOf(member) {
+  const sessionId = typeof member.sessionId === 'string' ? member.sessionId : member.targetSessionId;
+  return {
+    instanceId: member.instanceId,
+    ...(typeof sessionId === 'string' ? { sessionId } : {}),
+    identityName: member.identityName,
+  };
 }
 
 function withdrawOne(state, local, targetId) {
@@ -2149,7 +2492,7 @@ function withdrawOne(state, local, targetId) {
   const endpoint = local.endpoints.get(targetId);
   const sent = endpoint === undefined
     ? { ok: false, reason: '端点未知' }
-    : sendTo(state, local.collabId, targetId, endpoint, 'withdraw', { scope: 'single' });
+    : sendTo(state, local.collabId, targetId, endpoint, 'withdraw', { scope: 'single' }, { fromSessionId: managerSessionIdOf(local) ?? undefined });
   state.counters.withdrawn++;
   return { ok: true, scope: 'single', withdrawn: [targetId], delivered: sent.ok === true };
 }
@@ -2169,10 +2512,11 @@ function withdrawAll(state, local) {
   local.member.archivedAt = new Date().toISOString();
   persistMember(state, local);
   local.mute.clear();
+  const fromSessionId = managerSessionIdOf(local) ?? undefined;
   for (const member of recipients) {
     const endpoint = local.endpoints.get(member.instanceId);
     if (endpoint !== undefined) {
-      sendTo(state, local.collabId, member.instanceId, endpoint, 'withdraw', { scope: 'all' });
+      sendTo(state, local.collabId, member.instanceId, endpoint, 'withdraw', { scope: 'all' }, { fromSessionId });
     }
   }
   state.counters.withdrawn += recipients.length;

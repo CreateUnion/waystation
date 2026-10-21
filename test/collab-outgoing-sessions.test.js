@@ -1,6 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { sendMessage, sendToSeats, sendGovernance, deliveryStatusOf } from '../src/collab/outgoing.js';
+import { existsSync } from 'node:fs';
+import { createCollab, deliveryStatusOf, endCollab, localSeatDeliveryOf, pushSnapshot, requestCurrentView, sendGovernance, sendMessage, sendToRoster, sendToSeats } from '../src/collab/outgoing.js';
+import { isLedgerShape } from '../src/collab/model.js';
+import { loadLedger } from '../src/collab/store.js';
+import { seatFilePath } from '../src/paths.js';
+import { PROTOCOL_VERSION, newMsgId, validateMessage, withCollabCapability } from '../src/net/protocol.js';
+import { makeTempDir, waitFor } from './helpers.js';
 
 const SELF = { instanceId: 'inst-self', identityName: '本机', port: 7321 };
 
@@ -29,11 +35,13 @@ function makeState({ role = 'manager', seats, roster, endpoints = {}, counters =
     seats: new Map(seats.map((entry) => [entry.sessionId, entry])),
     counter: { count: () => 0 },
     posts: { size: () => 0 },
+    mute: { clear: () => {} },
   };
   const state = {
     self: SELF,
     collabs: new Map([['collab-1', local]]),
-    counters: { messagesSent: 0, sendFailures: 0, ...counters },
+    joinReplays: new Map(),
+    counters: { messagesSent: 0, sendFailures: 0, ended: 0, ...counters },
     log: { info: () => {}, warn: () => {}, error: () => {} },
     send: (message) => {
       sent.push(message);
@@ -181,3 +189,243 @@ test('deliveryStatusOf：委托发送调度器的机器级行；未接线返回 
   state.deliveryStatusOf = (msgId) => ({ msgId, tier: 'session' });
   assert.deepEqual(deliveryStatusOf(state, 'msg-1'), { msgId: 'msg-1', tier: 'session' });
 });
+
+test('sendMessage：同机多席缺 sessionId 拒绝（不再兜底站长）；单席位可无歧义签名', async () => {
+  const multi = makeState({ seats: [seat('sess-self', { role: 'manager' }), seat('sess-other')], roster: ROSTER, endpoints: ENDPOINTS });
+  const rejected = await sendMessage(multi.state, { collabId: 'collab-1', text: '冒名' });
+  assert.equal(rejected.ok, false);
+  assert.ok(rejected.message.includes('fromSessionId') || rejected.message.includes('发送会话'), rejected.message);
+  assert.deepEqual(multi.sent, []);
+  assert.deepEqual(multi.injected, []);
+
+  const single = makeState({ seats: [seat('sess-self', { role: 'manager' })], roster: ROSTER, endpoints: ENDPOINTS });
+  const sent = await sendMessage(single.state, { collabId: 'collab-1', text: '单席' });
+  assert.equal(sent.ok, true);
+  assert.equal(single.sent[0].fromSessionId, 'sess-self');
+});
+
+test('本机旁路：静音席位不注入但计入受理；投递账可查（deliveryStatusOf/localSeatDeliveryOf）', async () => {
+  const { state, local, injected } = makeState({
+    seats: [seat('sess-self', { role: 'manager' }), seat('sess-local2', { muted: true })],
+    roster: [rosterRow('inst-self', 'sess-self', 'manager'), rosterRow('inst-self', 'sess-local2')],
+  });
+  const result = await sendMessage(state, { collabId: 'collab-1', text: '本机静音', sessionId: 'sess-self' });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.deepEqual(injected, [], '静音席位不注入');
+  const localGroup = result.results.find((entry) => entry.local === true);
+  assert.equal(localGroup.results[0].status, 'gated');
+
+  const row = deliveryStatusOf(state, result.msgId);
+  assert.equal(row.tier, 'session', '本机旁路机器级终态立即成立');
+  assert.deepEqual(row.toSessions, ['sess-local2']);
+  assert.equal(row.fromSessionId, 'sess-self');
+  assert.deepEqual(localSeatDeliveryOf(state, result.msgId, 'sess-local2'), {
+    collabId: 'collab-1', msgId: result.msgId, sessionId: 'sess-local2', status: 'gated', complete: true,
+  });
+  assert.equal(local, state.collabs.get('collab-1'));
+});
+
+test('本机旁路：未静音席位注入成功后投递账为 injected', async () => {
+  const { state, injected } = makeState({
+    seats: [seat('sess-self', { role: 'manager' }), seat('sess-local2')],
+    roster: [rosterRow('inst-self', 'sess-self', 'manager'), rosterRow('inst-self', 'sess-local2')],
+  });
+  const result = await sendMessage(state, { collabId: 'collab-1', text: '本机', sessionId: 'sess-self' });
+  assert.equal(result.ok, true);
+  assert.deepEqual(injected.map((entry) => entry.sessionId), ['sess-local2']);
+  assert.equal(localSeatDeliveryOf(state, result.msgId, 'sess-local2').status, 'injected');
+  assert.equal(deliveryStatusOf(state, result.msgId).deliveredAt !== null, true);
+});
+
+test('成员定向：只能落在站长席位；指名站长机上其他成员席位拒绝', async () => {
+  const roster = [
+    rosterRow('inst-a', 'sess-mgr', 'manager'),
+    rosterRow('inst-a', 'sess-peer'),
+    rosterRow('inst-self', 'sess-mem'),
+  ];
+  const { state, sent } = makeState({
+    role: 'member',
+    seats: [seat('sess-mem')],
+    roster,
+    endpoints: { 'inst-a': { address: '127.0.0.10', port: 7321 } },
+  });
+  const toPeer = await sendMessage(state, { collabId: 'collab-1', text: '越权', to: 'inst-a', toSessionId: 'sess-peer', sessionId: 'sess-mem' });
+  assert.equal(toPeer.ok, false);
+  assert.ok(toPeer.message.includes('站长席位'), toPeer.message);
+  assert.deepEqual(sent, []);
+
+  const toManager = await sendMessage(state, { collabId: 'collab-1', text: '给站长', to: 'inst-a', toSessionId: 'sess-mgr', sessionId: 'sess-mem' });
+  assert.equal(toManager.ok, true);
+  assert.deepEqual(sent.at(-1).toSessions, ['sess-mgr']);
+});
+
+test('部分机器发送失败：逐机器原因随结果返回，不被 ok:true 吞掉', async () => {
+  const { state } = makeState({
+    seats: [seat('sess-self', { role: 'manager' })],
+    roster: [rosterRow('inst-self', 'sess-self', 'manager'), rosterRow('inst-b', 'sess-b1'), rosterRow('inst-c', 'sess-c1')],
+    endpoints: { 'inst-b': { address: '127.0.0.2', port: 7321 } },
+  });
+  const result = await sendMessage(state, { collabId: 'collab-1', text: '广播', sessionId: 'sess-self' });
+  assert.equal(result.ok, true);
+  const failed = result.results.find((entry) => entry.instanceId === 'inst-c');
+  assert.equal(failed.ok, false);
+  assert.ok(failed.reason.includes('端点未知'), failed.reason);
+  assert.deepEqual(result.failed, [{ instanceId: 'inst-c', reason: '端点未知（先扫描或等对方联系）' }]);
+  assert.deepEqual(result.to, ['inst-b']);
+});
+
+test('sendToRoster：本机其他席位走旁路注入，远端一帧一机', async () => {
+  const { state, local, sent, injected } = makeState({
+    seats: [seat('sess-self', { role: 'manager' }), seat('sess-local2')],
+    roster: [rosterRow('inst-self', 'sess-self', 'manager'), rosterRow('inst-self', 'sess-local2'), rosterRow('inst-b', 'sess-b1')],
+    endpoints: ENDPOINTS,
+  });
+  const count = sendToRoster(state, local, 'freeze', { name: '项目', members: [] });
+  assert.equal(count, 2, '本机组 + 远端组');
+  await waitFor(() => injected.length === 1);
+  assert.deepEqual(injected.map((entry) => entry.sessionId), ['sess-local2']);
+  assert.deepEqual(sent.map((message) => message.to.instanceId), ['inst-b']);
+  assert.equal(sent[0].fromSessionId, 'sess-self');
+});
+
+test('建协：创建者席位先落盘；新台账通过形态校验并可重载；首邀携 sessionId 与席位名单', async (t) => {
+  const dir = makeTempDir(t);
+  const { state, sent } = makeCreateState(dir);
+  const result = createCollab(state, {
+    name: '项目',
+    topic: '主题',
+    mode: 'managed',
+    sessionId: 'sess-creator',
+    targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 7321, targetSessionId: 'sess-b1' }],
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  const local = state.collabs.get(result.collabId);
+  assert.equal(isLedgerShape(local.ledger), true);
+  assert.deepEqual(local.ledger.members.map((entry) => entry.state), ['member'], '受邀行不得进共享名单');
+  assert.equal(local.ledger.manager.sessionId, 'sess-creator');
+  assert.equal(local.ledger.managerTerm, 1);
+  assert.equal(local.ledger.joinSeqNext, 2);
+  assert.equal(existsSync(seatFilePath(dir, result.collabId, 'sess-creator')), true, '创建者席位先于首邀落盘');
+  assert.equal(loadLedger(dir, result.collabId).ledger.manager.sessionId, 'sess-creator', '落盘台账可重载');
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].fromSessionId, 'sess-creator');
+  assert.equal(sent[0].payload.members[0].sessionId, 'sess-creator', '邀请名单须携席位标识');
+  assert.deepEqual(sent[0].payload.targets, [{ instanceId: 'inst-b', targetSessionId: 'sess-b1' }]);
+  const wire = withCollabCapability({
+    v: PROTOCOL_VERSION,
+    msgId: newMsgId(),
+    type: 'invite',
+    from: { ...SELF, sessionId: 'sess-creator' },
+    collabId: result.collabId,
+    ts: new Date().toISOString(),
+    payload: sent[0].payload,
+  });
+  assert.equal(validateMessage(wire).ok, true, JSON.stringify(validateMessage(wire)));
+});
+
+test('建协缺 sessionId：拒绝创建（无标识不得创建）', (t) => {
+  const { state } = makeCreateState(makeTempDir(t));
+  const result = createCollab(state, { name: '项目', topic: '主题', targets: [] });
+  assert.equal(result.ok, false);
+  assert.ok(result.message.includes('sessionId'), result.message);
+});
+
+test('快照出站：data 帧携 managerTerm/managerWindow；request 帧携请求方基线，均过协议预检', async () => {
+  const window = { windowBaseTerm: 1, windowEndsAt: '2026-10-21T00:10:00.000Z' };
+  const ledger = ledgerOf({ version: 3, managerWindow: window });
+  const { state, local, sent } = makeState({
+    seats: [seat('sess-self', { role: 'manager' })],
+    roster: ledger.members,
+    endpoints: { ...ENDPOINTS, 'inst-a': { address: '127.0.0.10', port: 7321 } },
+  });
+  local.ledger = ledger;
+  pushSnapshot(state, local);
+  const data = sent.find((message) => message.type === 'snapshot');
+  assert.equal(data.payload.kind, 'data');
+  assert.equal(data.payload.managerTerm, 1);
+  assert.equal(data.payload.version, 3);
+  assert.deepEqual(data.payload.managerWindow, window);
+  assert.equal(data.fromSessionId, 'sess-self');
+  assert.equal(validateMessage(snapshotWire('collab-1', 'sess-self', data.payload)).ok, true);
+
+  local.role = 'member';
+  local.member.manager = { instanceId: 'inst-a', identityName: '主机甲' };
+  local.snapshot = { ledger, version: 3 };
+  requestCurrentView(state, local);
+  const request = sent.filter((message) => message.type === 'snapshot').at(-1);
+  assert.deepEqual(request.payload, { kind: 'request', managerTerm: 1, version: 3 });
+  assert.equal(validateMessage(snapshotWire('collab-1', 'sess-self', request.payload)).ok, true);
+});
+
+test('end：终态台账 manager:null、无站长行/窗口；终态快照与 end 通告仍发原成员', () => {
+  const ledger = ledgerOf({ version: 3 });
+  const { state, local, sent } = makeState({
+    seats: [seat('sess-self', { role: 'manager' })],
+    roster: ledger.members,
+    endpoints: ENDPOINTS,
+  });
+  local.ledger = ledger;
+  const result = endCollab(state, { collabId: 'collab-1' });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(local.ledger.status, 'completed');
+  assert.equal(local.ledger.manager, null, '终态必须 manager:null');
+  assert.equal(local.ledger.members.some((entry) => entry.role === 'manager'), false, '名单不得残留站长行');
+  assert.equal(Object.hasOwn(local.ledger, 'managerWindow'), false, '终态不得携接管窗口');
+  assert.equal(isLedgerShape(local.ledger), true, '终态台账须过形态校验');
+  assert.ok(sent.some((message) => message.type === 'snapshot'), '终态快照先发');
+  assert.ok(sent.some((message) => message.type === 'end' && message.to.instanceId === 'inst-b'), 'end 通告仍达原成员');
+});
+
+function snapshotWire(collabId, sessionId, payload) {
+  return withCollabCapability({
+    v: PROTOCOL_VERSION,
+    msgId: newMsgId(),
+    type: 'snapshot',
+    from: { ...SELF, sessionId },
+    collabId,
+    ts: new Date().toISOString(),
+    payload,
+  });
+}
+
+function ledgerOf({ version = 1, managerWindow } = {}) {
+  const now = '2026-10-21T00:00:00.000Z';
+  return {
+    version,
+    collabId: 'collab-1',
+    name: '项目',
+    topic: '主题',
+    mode: 'managed',
+    status: 'active',
+    managerTerm: 1,
+    manager: { instanceId: SELF.instanceId, sessionId: 'sess-self', identityName: SELF.identityName, term: 1 },
+    joinSeqNext: 2,
+    members: [
+      { instanceId: SELF.instanceId, sessionId: 'sess-self', identityName: SELF.identityName, role: 'manager', state: 'member', joinSeq: 1, joinedAt: now },
+      { instanceId: 'inst-b', sessionId: 'sess-b1', identityName: '主机乙', role: 'member', state: 'member', joinSeq: 2, joinedAt: now },
+    ],
+    board: [],
+    createdAt: now,
+    updatedAt: now,
+    ...(managerWindow === undefined ? {} : { managerWindow }),
+  };
+}
+
+/* 建协用例的状态：空 collabs、可落盘的 dataDir 与最小计数/存储依赖。 */
+function makeCreateState(dataDir) {
+  const sent = [];
+  const state = {
+    dataDir,
+    self: SELF,
+    collabs: new Map(),
+    counters: { collabsCreated: 0, invitesSent: 0, messagesSent: 0, sendFailures: 0, persistFailures: 0 },
+    knownHosts: { remember: () => {} },
+    log: { info: () => {}, warn: () => {}, error: () => {} },
+    send: (message) => {
+      sent.push(message);
+      return { ok: true, msgId: `msg-${message.to.instanceId}`, tier: 'queued' };
+    },
+  };
+  return { state, sent };
+}

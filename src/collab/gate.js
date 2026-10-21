@@ -1,4 +1,4 @@
-import { POST_KINDS } from '../net/protocol.js';
+import { ID_PATTERN, POST_KINDS } from '../net/protocol.js';
 import { CONFLICT_STATES, INVITE_THROTTLE_TABLE_MAX, MAX_PENDING_INVITES } from './model.js';
 import { forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf } from './local.js';
 
@@ -227,13 +227,15 @@ function admitInvite(state, frame, meta) {
     state.counters.invitesRejected++;
     return { ok: false, reason: '邀请来源为本机（拒绝自邀 / 冒名 from）' };
   }
-  if (!members.some((member) => member.instanceId === state.self.instanceId)) {
-    state.counters.invitesRejected++;
-    return { ok: false, reason: '邀请名单不含本机' };
-  }
   if (!members.some((member) => member.instanceId === frame.from.instanceId)) {
     state.counters.invitesRejected++;
     return { ok: false, reason: '邀请来源不在名单中（来源身份与名单不符）' };
+  }
+  /* 目标机器按 targets 判定（设计 §2.2：目标不必在 members 内）；无 targets 的旧版邀请
+   * 退回「名单含本机」的兼容判据。指名会话的收窄在投递面按 payload.targetSessionId 做。 */
+  if (!inviteTargetsLocal(frame, state.self.instanceId, members)) {
+    state.counters.invitesRejected++;
+    return { ok: false, reason: '邀请目标不含本机' };
   }
   const source = typeof meta?.remoteAddress === 'string' && meta.remoteAddress !== '' ? meta.remoteAddress : '';
   const now = Date.now();
@@ -248,6 +250,17 @@ function admitInvite(state, frame, meta) {
   }
   rememberInviteSource(state, source, now);
   return { ok: true };
+}
+
+/* 邀请目标机器：targets 存在时只看 targets（唯一性键 instanceId + targetSessionId）；
+ * 缺省（旧版发送方）退回名单交集。本机命中即可准入——目标会话在不在席由投递面处理
+ * （未入席挂起、注册后补投）。 */
+function inviteTargetsLocal(frame, selfId, members) {
+  const targets = frame.payload?.targets;
+  if (Array.isArray(targets)) {
+    return targets.some((target) => target?.instanceId === selfId);
+  }
+  return members.some((member) => member.instanceId === selfId);
 }
 
 /* 冲突裁定族（freeze / unfreeze / decision）的准入：同名 + 成员交集匹配本地在册协作
@@ -337,10 +350,18 @@ function admitJoinRequest(state, frame, meta) {
  * 平铺注入，与邀请限频 / 请求限流同一样式）。无匹配 / 已过期一律拒并计数。
  * 申请记录不在此移除：回执后的收尾（删记录、接线）归加入域。 */
 function admitJoinDecision(state, frame) {
+  const reqMsgId = frame.payload?.reqMsgId;
+  if (typeof reqMsgId !== 'string') {
+    /* joinId 式回执（邀请接受/两段式）：没有本机申请帧可对，准入按形状放行；
+     * 权威校验在加入域（joinId 未知/会话不符/过期一律 deny，不因准入放行而获准）。 */
+    return isJoinIdShape(frame.payload?.joinId)
+      ? { ok: true }
+      : rejectedJoinDecision(state, '回执缺申请帧标识与加入标识（joinId / reqMsgId 至少其一）——拒绝');
+  }
   const record = state.joinApplications.list().find((application) =>
     application.collabId === frame.collabId
     && application.managerInstanceId === frame.from.instanceId
-    && application.msgId === frame.payload?.reqMsgId);
+    && application.msgId === reqMsgId);
   if (record !== undefined && Date.now() - record.sentAt < state.joinRequestTtlMs) {
     return { ok: true };
   }
@@ -349,6 +370,15 @@ function admitJoinDecision(state, frame) {
     return { ok: false, reason: '加入申请已过期——回执不再受理（时限内未收到回执的申请按失效处置）' };
   }
   return { ok: false, reason: '与本机加入申请台账不匹配（collabId / 站长实例 / 申请帧标识须逐项相符）——拒绝' };
+}
+
+function rejectedJoinDecision(state, reason) {
+  state.counters.joinDecisionsRejected++;
+  return { ok: false, reason };
+}
+
+function isJoinIdShape(value) {
+  return typeof value === 'string' && ID_PATTERN.test(value);
 }
 
 /* 申请限频记录（键 = 来源地址，与邀请限频同一表容量先例）：插入序淘汰——表满丢最旧。 */

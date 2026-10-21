@@ -177,6 +177,10 @@ function send(state, { collabId, to, type, payload, from, fromSessionId, toSessi
   const msgId = newMsgId();
   const ts = new Date().toISOString();
   const identity = identityOf(state, from, fromSessionId);
+  if (!hasSenderSession(identity)) {
+    state.counters.sendsRejected++;
+    return { ok: false, reason: '协作域帧缺少发送会话标识（from.sessionId / fromSessionId 必填）——拒绝以本机名义兜底' };
+  }
   const payloadRejection = frameRejectionOf(frameOf(state, collabId, { msgId, type, payload, createdAt: ts, from: identity, toSessions }));
   if (payloadRejection !== null) {
     state.counters.sendsRejected++;
@@ -190,6 +194,12 @@ function send(state, { collabId, to, type, payload, from, fromSessionId, toSessi
   }
   state.entryIndex.set(msgId, collabId);
   return { ok: true, msgId, tier: 'queued' };
+}
+
+/* 协作域帧的签发席位（硬闸门）：cap=2 帧必须带合法 from.sessionId——不得以本机身份兜底
+ * （兜底出的帧没有 sessionId，对端必拒收）；转达帧的 from 原样使用，其 sessionId 同样必填。 */
+function hasSenderSession(identity) {
+  return typeof identity?.sessionId === 'string' && ID_PATTERN.test(identity.sessionId);
 }
 
 /* 帧身份：显式 from（转达原发者）优先；否则带上发送会话的 fromSessionId；都没有则本机身份。 */
@@ -286,7 +296,12 @@ function sendDirect(state, { collabId, to, type, payload, createdAt, from, fromS
     state.counters.directRejected++;
     return { ok: false, reason: rejection };
   }
-  const record = directRecordOf(collabId, to, { type, payload, createdAt, from: identityOf(state, from, fromSessionId), toSessions });
+  const identity = identityOf(state, from, fromSessionId);
+  if (!hasSenderSession(identity)) {
+    state.counters.directRejected++;
+    return { ok: false, reason: '协作域帧缺少发送会话标识（from.sessionId / fromSessionId 必填）——拒绝以本机名义兜底' };
+  }
+  const record = directRecordOf(collabId, to, { type, payload, createdAt, from: identity, toSessions });
   const payloadRejection = frameRejectionOf(frameOf(state, collabId, record));
   if (payloadRejection !== null) {
     state.counters.directRejected++;
@@ -1007,7 +1022,7 @@ function statusRow(collabId, entry) {
   };
 }
 
-/* 机器级状态查询（M3 → M4/M5/M6 契约）：按 msgId 取唯一一条队列行；未知返回 null。
+/* 机器级状态查询（契约查询面）：按 msgId 取唯一一条队列行；未知返回 null。
  * 只加载协作目录、不启调度（与 deliveryStatus 查询同口径）。 */
 function deliveryStatusOf(state, msgId) {
   if (!isIdLike(msgId)) {
