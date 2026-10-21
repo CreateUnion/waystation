@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
-import { CONFIG_FILE_NAME, buildDefaults, loadConfig, saveConfig } from '../src/config.js';
+import { CONFIG_FILE_NAME, buildDefaults, loadConfig, saveConfig, validateCrossFields } from '../src/config.js';
 import { MAX_IDENTITY_NAME_CHARS, isIdentityName } from '../src/net/protocol.js';
 import { makeTempDir } from './helpers.js';
 
@@ -21,10 +21,23 @@ test('文件缺失：返回默认值且 created=true', (t) => {
   assert.equal(config.probeTimeoutMs, 1000);
   assert.equal(config.inviteTtlMs, 24 * 60 * 60 * 1000);
   assert.equal(config.managerProbeIntervalMs, 30000);
-  assert.equal(config.managerOfflineMs, 120000);
-  assert.equal(config.takeoverWindowMs, 30000);
   assert.equal(config.freezeUnresolvedMs, 48 * 60 * 60 * 1000);
   assert.equal(config.forumSyncIntervalMs, 60000);
+  // 会话级参与者（设计 §11）：缺省参数
+  assert.equal(config.sessionSeatGraceMs, 60000);
+  assert.equal(config.sessionSeatTimeoutMs, 300000);
+  assert.equal(config.seatPresenceIntervalMs, 30000);
+  assert.equal(config.managerLossTimeoutMs, 300000);
+  assert.equal(config.sessionTakeoverWindowMs, 60000);
+  assert.equal(config.handoverConfirmTimeoutMs, 120000);
+  assert.equal(config.joinConfirmTtlMs, 60000);
+  assert.equal(config.pendingInvitesMax, 64);
+  assert.equal(config.stagedMaxPerSeat, 100);
+  assert.equal(config.stagedMaxPerCollab, 500);
+  assert.equal(config.queueMaxPerCollab, 500);
+  // 旧键不再进入生效配置（managerOfflineMs 仅映射、takeoverWindowMs 已退役）
+  assert.equal(Object.hasOwn(config, 'managerOfflineMs'), false);
+  assert.equal(Object.hasOwn(config, 'takeoverWindowMs'), false);
 });
 
 test('buildDefaults：标识名取传入主机名，形状完整', () => {
@@ -35,16 +48,19 @@ test('buildDefaults：标识名取传入主机名，形状完整', () => {
     'dispatchTickMs',
     'forumSyncIntervalMs',
     'freezeUnresolvedMs',
+    'handoverConfirmTimeoutMs',
     'identityName',
     'inviteTtlMs',
+    'joinConfirmTtlMs',
     'joinRequestTtlMs',
     'logDir',
     'logMaxBytes',
     'logMaxFiles',
-    'managerOfflineMs',
+    'managerLossTimeoutMs',
     'managerProbeIntervalMs',
     'messageTtlMs',
     'offlineQueue',
+    'pendingInvitesMax',
     'port',
     'probeTimeoutMs',
     'queueMaxPerCollab',
@@ -52,7 +68,12 @@ test('buildDefaults：标识名取传入主机名，形状完整', () => {
     'retryIntervalMs',
     'retrySlowIntervalMs',
     'scanWindowMs',
-    'takeoverWindowMs',
+    'seatPresenceIntervalMs',
+    'sessionSeatGraceMs',
+    'sessionSeatTimeoutMs',
+    'sessionTakeoverWindowMs',
+    'stagedMaxPerCollab',
+    'stagedMaxPerSeat',
   ]);
   assert.equal(defaults.identityName, '主机甲');
 });
@@ -335,26 +356,86 @@ test('managerProbeIntervalMs：默认 30 秒、越界回落默认并告警', (t)
   assert.ok(warnings[0].includes('managerProbeIntervalMs'));
 });
 
-test('managerOfflineMs：默认 2 分钟、越界回落默认并告警', (t) => {
-  assert.equal(buildDefaults('主机甲').managerOfflineMs, 120000);
+test('managerOfflineMs 旧键：无新键时映射为 managerLossTimeoutMs（沿用旧值）并告警', (t) => {
+  const defaults = buildDefaults('主机甲');
+  assert.equal(defaults.managerLossTimeoutMs, 300000, '新装默认 5 分钟');
+  assert.equal(Object.hasOwn(defaults, 'managerOfflineMs'), false, '旧键不再进入默认配置');
   const dir = makeTempDir(t);
-  writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({ managerOfflineMs: 100 }));
+  writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({ managerOfflineMs: 120000 }));
   const warnings = [];
   const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
-  assert.equal(config.managerOfflineMs, 120000);
+  assert.equal(config.managerLossTimeoutMs, 120000, '存量配置保持旧行为');
+  assert.equal(Object.hasOwn(config, 'managerOfflineMs'), false, '旧键不保留到生效配置');
+  assert.equal(warnings.length, 1);
+  assert.ok(warnings[0].includes('managerOfflineMs'));
+  assert.ok(warnings[0].includes('managerLossTimeoutMs'));
+  saveConfig(dir, config);
+  const onDisk = JSON.parse(readFileSync(join(dir, CONFIG_FILE_NAME), 'utf8'));
+  assert.equal(onDisk.managerLossTimeoutMs, 120000, '写回落到新键');
+  assert.equal(Object.hasOwn(onDisk, 'managerOfflineMs'), false, '写回不再带旧键');
+});
+
+test('managerOfflineMs 旧键：按旧范围 200–3600000 校验，值原样生效（不受新键下界约束）', (t) => {
+  const dir = makeTempDir(t);
+  // 20000 低于新键下界 30000，但旧范围合法；配套参数满足交叉校验（probe<loss、loss≥2×presence）
+  writeFileSync(
+    join(dir, CONFIG_FILE_NAME),
+    JSON.stringify({ managerOfflineMs: 20000, managerProbeIntervalMs: 100, seatPresenceIntervalMs: 5000 }),
+  );
+  const warnings = [];
+  const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+  assert.equal(config.managerLossTimeoutMs, 20000);
   assert.equal(warnings.length, 1);
   assert.ok(warnings[0].includes('managerOfflineMs'));
 });
 
-test('takeoverWindowMs：默认 30 秒、越界回落默认并告警', (t) => {
-  assert.equal(buildDefaults('主机甲').takeoverWindowMs, 30000);
-  const dir = makeTempDir(t);
-  writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({ takeoverWindowMs: 0 }));
-  const warnings = [];
-  const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
-  assert.equal(config.takeoverWindowMs, 30000);
-  assert.equal(warnings.length, 1);
-  assert.ok(warnings[0].includes('takeoverWindowMs'));
+test('managerOfflineMs 旧键：无效值告警忽略，managerLossTimeoutMs 取默认', (t) => {
+  for (const invalid of [100, '120000', null]) {
+    const dir = makeTempDir(t);
+    writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({ managerOfflineMs: invalid }));
+    const warnings = [];
+    const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+    assert.equal(config.managerLossTimeoutMs, 300000, JSON.stringify(invalid));
+    assert.equal(warnings.length, 1, JSON.stringify(invalid));
+    assert.ok(warnings[0].includes('managerOfflineMs'), JSON.stringify(invalid));
+    assert.ok(warnings[0].includes('无效'), JSON.stringify(invalid));
+  }
+});
+
+test('managerOfflineMs 与 managerLossTimeoutMs 并存：新键优先并告警（与文件内键序无关）', (t) => {
+  for (const raw of [
+    { managerOfflineMs: 500000, managerLossTimeoutMs: 120000 },
+    { managerLossTimeoutMs: 120000, managerOfflineMs: 500000 },
+  ]) {
+    const dir = makeTempDir(t);
+    writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify(raw));
+    const warnings = [];
+    const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+    assert.equal(config.managerLossTimeoutMs, 120000, JSON.stringify(raw));
+    assert.equal(Object.hasOwn(config, 'managerOfflineMs'), false);
+    assert.equal(warnings.length, 1, JSON.stringify(raw));
+    assert.ok(warnings[0].includes('managerOfflineMs'));
+    assert.ok(warnings[0].includes('新键'), warnings[0]);
+  }
+});
+
+test('takeoverWindowMs 退役：解析兼容（旧文件不报错）、读取后忽略并告警', (t) => {
+  assert.equal(Object.hasOwn(buildDefaults('主机甲'), 'takeoverWindowMs'), false, '退役键不再进入默认配置');
+  for (const value of [30000, 0, 'x', { nested: true }]) {
+    const dir = makeTempDir(t);
+    writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({ takeoverWindowMs: value }));
+    const warnings = [];
+    const { config, created } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+    assert.equal(created, false, '旧文件不被判定损坏');
+    assert.equal(Object.hasOwn(config, 'takeoverWindowMs'), false, '读取后忽略，不进入生效配置');
+    assert.equal(config.sessionTakeoverWindowMs, 60000, '替代键取默认值');
+    assert.equal(warnings.length, 1, JSON.stringify(value));
+    assert.ok(warnings[0].includes('takeoverWindowMs'));
+    assert.ok(warnings[0].includes('退役'));
+    saveConfig(dir, config);
+    const onDisk = JSON.parse(readFileSync(join(dir, CONFIG_FILE_NAME), 'utf8'));
+    assert.equal(Object.hasOwn(onDisk, 'takeoverWindowMs'), false, '写回不带退役键');
+  }
 });
 
 test('freezeUnresolvedMs：默认 48 小时、越界回落默认并告警', (t) => {
@@ -366,4 +447,168 @@ test('freezeUnresolvedMs：默认 48 小时、越界回落默认并告警', (t) 
   assert.equal(config.freezeUnresolvedMs, 48 * 60 * 60 * 1000);
   assert.equal(warnings.length, 1);
   assert.ok(warnings[0].includes('freezeUnresolvedMs'));
+});
+
+test('会话级参与者字段（设计 §11）：默认值', () => {
+  const defaults = buildDefaults('主机甲');
+  assert.deepEqual(
+    {
+      sessionSeatGraceMs: defaults.sessionSeatGraceMs,
+      sessionSeatTimeoutMs: defaults.sessionSeatTimeoutMs,
+      seatPresenceIntervalMs: defaults.seatPresenceIntervalMs,
+      managerLossTimeoutMs: defaults.managerLossTimeoutMs,
+      sessionTakeoverWindowMs: defaults.sessionTakeoverWindowMs,
+      handoverConfirmTimeoutMs: defaults.handoverConfirmTimeoutMs,
+      joinConfirmTtlMs: defaults.joinConfirmTtlMs,
+      pendingInvitesMax: defaults.pendingInvitesMax,
+      stagedMaxPerSeat: defaults.stagedMaxPerSeat,
+      stagedMaxPerCollab: defaults.stagedMaxPerCollab,
+    },
+    {
+      sessionSeatGraceMs: 60000,
+      sessionSeatTimeoutMs: 300000,
+      seatPresenceIntervalMs: 30000,
+      managerLossTimeoutMs: 300000,
+      sessionTakeoverWindowMs: 60000,
+      handoverConfirmTimeoutMs: 120000,
+      joinConfirmTtlMs: 60000,
+      pendingInvitesMax: 64,
+      stagedMaxPerSeat: 100,
+      stagedMaxPerCollab: 500,
+    },
+  );
+  assert.equal(defaults.queueMaxPerCollab, 500, '队列上限沿用既有字段');
+});
+
+test('会话级参与者字段：逐字段范围或类型非法 → 该项回落默认并告警', (t) => {
+  const defaults = buildDefaults('主机甲');
+  const invalidCases = [
+    ['sessionSeatGraceMs', 4999],
+    ['sessionSeatTimeoutMs', 29999],
+    ['seatPresenceIntervalMs', '30000'],
+    ['managerLossTimeoutMs', 29999],
+    ['sessionTakeoverWindowMs', 600001],
+    ['handoverConfirmTimeoutMs', 9999],
+    ['joinConfirmTtlMs', 9999],
+    ['pendingInvitesMax', 257],
+    ['stagedMaxPerSeat', 1001],
+    ['stagedMaxPerCollab', 5001],
+  ];
+  for (const [key, value] of invalidCases) {
+    const dir = makeTempDir(t);
+    writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({ [key]: value }));
+    const warnings = [];
+    const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+    assert.equal(config[key], defaults[key], `${key}=${JSON.stringify(value)}`);
+    assert.equal(warnings.length, 1, `${key}=${JSON.stringify(value)}`);
+    assert.ok(warnings[0].includes(key), warnings[0]);
+  }
+});
+
+test('会话级参与者字段：合法边界值原样取用', (t) => {
+  const boundary = {
+    sessionSeatGraceMs: 5000,
+    sessionSeatTimeoutMs: 30000,
+    seatPresenceIntervalMs: 5000,
+    managerLossTimeoutMs: 30000,
+    managerProbeIntervalMs: 100,
+    sessionTakeoverWindowMs: 10000,
+    handoverConfirmTimeoutMs: 10000,
+    joinConfirmTtlMs: 10000,
+    pendingInvitesMax: 1,
+    stagedMaxPerSeat: 500,
+    stagedMaxPerCollab: 500,
+  };
+  const dir = makeTempDir(t);
+  writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify(boundary));
+  const warnings = [];
+  const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+  assert.deepEqual(warnings, [], '边界值组合本身通过交叉校验');
+  for (const [key, value] of Object.entries(boundary)) {
+    assert.equal(config[key], value, key);
+  }
+});
+
+test('交叉校验：心跳/失联时序组非法 → 整组回落默认并告警', (t) => {
+  const defaults = buildDefaults('主机甲');
+  const timingKeys = ['seatPresenceIntervalMs', 'sessionSeatTimeoutMs', 'managerProbeIntervalMs', 'managerLossTimeoutMs'];
+  const cases = [
+    ['presence 不早于 timeout', { seatPresenceIntervalMs: 300000, sessionSeatTimeoutMs: 30000 }],
+    ['probe 不早于 loss', { managerProbeIntervalMs: 30000, managerLossTimeoutMs: 30000 }],
+    ['loss 不足 2×presence', { managerProbeIntervalMs: 100, managerLossTimeoutMs: 30000, seatPresenceIntervalMs: 20000 }],
+  ];
+  for (const [label, raw] of cases) {
+    const dir = makeTempDir(t);
+    writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify(raw));
+    const warnings = [];
+    const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+    for (const key of timingKeys) {
+      assert.equal(config[key], defaults[key], `${label}：${key}`);
+    }
+    assert.equal(warnings.length, 1, label);
+    assert.ok(warnings[0].includes('组合'), warnings[0]);
+    assert.ok(warnings[0].includes('整组'), warnings[0]);
+  }
+});
+
+test('交叉校验：合法的自定义时序组合不被回落', (t) => {
+  const dir = makeTempDir(t);
+  writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({
+    seatPresenceIntervalMs: 15000,
+    sessionSeatTimeoutMs: 30000,
+    managerProbeIntervalMs: 100,
+    managerLossTimeoutMs: 30000,
+  }));
+  const warnings = [];
+  const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+  assert.deepEqual(warnings, []);
+  assert.equal(config.seatPresenceIntervalMs, 15000);
+  assert.equal(config.managerLossTimeoutMs, 30000, 'loss 恰为 2×presence 仍合法');
+});
+
+test('交叉校验：暂存每席上限于总上限 → 组内两项整组回落并告警', (t) => {
+  const dir = makeTempDir(t);
+  writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({ stagedMaxPerSeat: 1000, stagedMaxPerCollab: 500 }));
+  const warnings = [];
+  const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+  assert.equal(config.stagedMaxPerSeat, 100);
+  assert.equal(config.stagedMaxPerCollab, 500);
+  assert.equal(warnings.length, 1);
+  assert.ok(warnings[0].includes('stagedMaxPerSeat'));
+  assert.ok(warnings[0].includes('stagedMaxPerCollab'));
+});
+
+test('交叉校验：旧键映射值参与组校验（非法组合整组回落，两条告警）', (t) => {
+  const dir = makeTempDir(t);
+  writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({ managerOfflineMs: 1000 }));
+  const warnings = [];
+  const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+  assert.equal(warnings.length, 2, JSON.stringify(warnings));
+  assert.ok(warnings[0].includes('managerOfflineMs'));
+  assert.ok(warnings[1].includes('组合'));
+  assert.equal(config.managerLossTimeoutMs, 300000, '整组回落覆盖映射值');
+  assert.equal(config.managerProbeIntervalMs, 30000);
+  assert.equal(config.seatPresenceIntervalMs, 30000);
+  assert.equal(config.sessionSeatTimeoutMs, 300000);
+});
+
+test('validateCrossFields：移交确认时限与挂起邀请上限按组回落（返回新对象、不改入参）', () => {
+  const defaults = buildDefaults('主机甲');
+  for (const [key, value, fallback] of [
+    ['handoverConfirmTimeoutMs', 9999, 120000],
+    ['pendingInvitesMax', 0, 64],
+  ]) {
+    const warnings = [];
+    const input = { ...defaults, [key]: value };
+    const checked = validateCrossFields(input, { defaults, warn: (message) => warnings.push(message) });
+    assert.equal(checked[key], fallback, key);
+    assert.equal(warnings.length, 1, key);
+    assert.ok(warnings[0].includes(key), warnings[0]);
+    assert.equal(input[key], value, '入参保持不变');
+    assert.notEqual(checked, input, '返回新对象');
+  }
+  // 无 options 的默认路径：合法配置原样返回、不告警
+  const ok = validateCrossFields({ ...defaults });
+  assert.equal(ok.handoverConfirmTimeoutMs, defaults.handoverConfirmTimeoutMs);
+  assert.equal(ok.stagedMaxPerSeat, defaults.stagedMaxPerSeat);
 });

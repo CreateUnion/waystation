@@ -11,9 +11,15 @@ import { writeJsonAtomic } from './storage.js';
  * 此处重导出只为保持既有导入点（status 工具与测试）不变——不要回迁定义。 */
 export { CONFIG_FILE_NAME };
 
-/* 抢接收集窗口的合法上界（具名导出＝单一权威）：核心侧工具执行安全期限按它派生
+/* 抢接/接管窗口的合法上界（具名导出＝单一权威）：核心侧工具执行安全期限按它派生
  * （routing.js 的 CALL_SAFETY_DEADLINE_MS）——上界调整时两处同步由测试看护，不散写数字。 */
 export const MAX_TAKEOVER_WINDOW_MS = 600000;
+
+/* 显式移交人工确认与两段式入席确认的统一上界（设计 §11 均为 10 分钟上限）。 */
+const SESSION_CONFIRM_MAX_MS = 600000;
+
+/* 显式移交确认时限的下界（设计 §11：≥10s——短于此值人工来不及确认）。 */
+const HANDOVER_CONFIRM_MIN_MS = 10000;
 
 // 字段校验规则表：键与 buildDefaults 一一对应。类型校验挡住手改配置的笔误；
 // 数值范围取「能用」的边界（下界贴语义有效值、上界防荒唐值），具体语义上限在消费方表达
@@ -45,11 +51,20 @@ const FIELD_RULES = {
   // 申请时刻的年龄与它比对（两侧时间戳同为毫秒整数，做差即比）；申请不经 outbox 长队列（否则先被
   // messageTtlMs 过期），故本值不参与队列过期判定
   joinRequestTtlMs: { check: (value) => Number.isInteger(value) && value >= 1000 && value <= 30 * DAY_MS, reason: '需为 1000–2592000000 的整数（毫秒，上限 30 天）' },
-  // 失联判定与抢接规程参数（设计 §9「默认 30s」「默认 2 分钟」「默认 30s，可配」的落点；
-  // 下界取「实用快节律」——测试与极小网络可用，防的是误配打爆探测定时器）
+  // 站长端点探测节律（设计 §11 默认 30s；下界取「实用快节律」——测试与极小网络可用，
+  // 防的是误配打爆探测定时器）；v4 起只用于失联判定，不再驱动选举
   managerProbeIntervalMs: { check: (value) => Number.isInteger(value) && value >= 100 && value <= 600000, reason: '需为 100–600000 的整数（毫秒）' },
-  managerOfflineMs: { check: (value) => Number.isInteger(value) && value >= 200 && value <= 3600000, reason: '需为 200–3600000 的整数（毫秒）' },
-  takeoverWindowMs: { check: (value) => Number.isInteger(value) && value >= 200 && value <= MAX_TAKEOVER_WINDOW_MS, reason: `需为 200–${MAX_TAKEOVER_WINDOW_MS} 的整数（毫秒）` },
+  // 会话级参与者参数（设计 §11 参数表）；时序与容量的组合约束见 CROSS_FIELD_GROUPS
+  sessionSeatGraceMs: { check: (value) => Number.isInteger(value) && value >= 5000 && value <= 600000, reason: '需为 5000–600000 的整数（毫秒）' },
+  sessionSeatTimeoutMs: { check: (value) => Number.isInteger(value) && value >= 30000 && value <= 3600000, reason: '需为 30000–3600000 的整数（毫秒）' },
+  seatPresenceIntervalMs: { check: (value) => Number.isInteger(value) && value >= 5000 && value <= 300000, reason: '需为 5000–300000 的整数（毫秒）' },
+  managerLossTimeoutMs: { check: (value) => Number.isInteger(value) && value >= 30000 && value <= 3600000, reason: '需为 30000–3600000 的整数（毫秒）' },
+  sessionTakeoverWindowMs: { check: (value) => Number.isInteger(value) && value >= 10000 && value <= MAX_TAKEOVER_WINDOW_MS, reason: `需为 10000–${MAX_TAKEOVER_WINDOW_MS} 的整数（毫秒）` },
+  handoverConfirmTimeoutMs: { check: (value) => Number.isInteger(value) && value >= HANDOVER_CONFIRM_MIN_MS && value <= SESSION_CONFIRM_MAX_MS, reason: `需为 ${HANDOVER_CONFIRM_MIN_MS}–${SESSION_CONFIRM_MAX_MS} 的整数（毫秒）` },
+  joinConfirmTtlMs: { check: (value) => Number.isInteger(value) && value >= 10000 && value <= SESSION_CONFIRM_MAX_MS, reason: `需为 10000–${SESSION_CONFIRM_MAX_MS} 的整数（毫秒）` },
+  pendingInvitesMax: { check: (value) => Number.isInteger(value) && value >= 1 && value <= 256, reason: '需为 1–256 的整数' },
+  stagedMaxPerSeat: { check: (value) => Number.isInteger(value) && value >= 1 && value <= 1000, reason: '需为 1–1000 的整数' },
+  stagedMaxPerCollab: { check: (value) => Number.isInteger(value) && value >= 1 && value <= 5000, reason: '需为 1–5000 的整数' },
   // 冻结无裁定的单方处置提示时限（设计 §6 默认 48 小时）
   freezeUnresolvedMs: { check: (value) => Number.isInteger(value) && value >= 60000 && value <= 30 * DAY_MS, reason: '需为 60000–2592000000 的整数（毫秒，上限 30 天）' },
   // 讨论的周期对表节拍（设计 §5.4 anti-entropy 默认 60s 可配）
@@ -57,6 +72,43 @@ const FIELD_RULES = {
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+/* 旧键校验规则：managerLossTimeoutMs 的前身。映射时按旧范围 200–3600000 原样生效，
+ * 不受新键下界约束——存量配置保持旧行为（设计 §11「旧键映射」）。 */
+const LEGACY_FIELD_RULES = {
+  managerOfflineMs: { check: (value) => Number.isInteger(value) && value >= 200 && value <= 3600000, reason: '需为 200–3600000 的整数（毫秒）' },
+};
+
+/* 交叉校验字段组（设计 §11）：组内任一条约束不成立时整组回落默认值并告警。逐字段范围校验已在
+ * FIELD_RULES 完成，这里只处理「单看合法、组合不可用」；回落而非拒绝启动，保证进程可起。 */
+const CROSS_FIELD_GROUPS = [
+  {
+    fields: ['seatPresenceIntervalMs', 'sessionSeatTimeoutMs', 'managerProbeIntervalMs', 'managerLossTimeoutMs'],
+    checks: [
+      { valid: (config) => config.seatPresenceIntervalMs < config.sessionSeatTimeoutMs, reason: 'seatPresenceIntervalMs 需小于 sessionSeatTimeoutMs' },
+      { valid: (config) => config.managerProbeIntervalMs < config.managerLossTimeoutMs, reason: 'managerProbeIntervalMs 需小于 managerLossTimeoutMs' },
+      { valid: (config) => config.managerLossTimeoutMs >= 2 * config.seatPresenceIntervalMs, reason: 'managerLossTimeoutMs 需不小于 2×seatPresenceIntervalMs' },
+    ],
+  },
+  {
+    fields: ['handoverConfirmTimeoutMs'],
+    checks: [
+      { valid: (config) => config.handoverConfirmTimeoutMs >= HANDOVER_CONFIRM_MIN_MS, reason: `handoverConfirmTimeoutMs 需不小于 ${HANDOVER_CONFIRM_MIN_MS}` },
+    ],
+  },
+  {
+    fields: ['stagedMaxPerSeat', 'stagedMaxPerCollab'],
+    checks: [
+      { valid: (config) => config.stagedMaxPerSeat <= config.stagedMaxPerCollab, reason: 'stagedMaxPerSeat 需不大于 stagedMaxPerCollab' },
+    ],
+  },
+  {
+    fields: ['pendingInvitesMax'],
+    checks: [
+      { valid: (config) => config.pendingInvitesMax >= 1, reason: 'pendingInvitesMax 需不小于 1' },
+    ],
+  },
+];
 
 /* 默认身份名的派生：槽位 ≥2 取 `<主机名>-<k>`（同机多站点在扫描列表默认可区分），槽位 1 / 省略即主机名本身。
  * 主机名长度没有全局硬上界（单标签上限 63 字符、Linux 主机名字段可达 64），加后缀后可能越过身份名上限——
@@ -102,12 +154,22 @@ export function buildDefaults(hostName, options = {}) {
     inviteTtlMs: DAY_MS,
     // 加入申请的过期时限：缺省同邀请的 24 小时（申请不经 outbox 长队列，不参与队列过期）
     joinRequestTtlMs: DAY_MS,
-    // 失联判定与抢接规程默认值（设计 §9 明文默认）：
-    // 对站长周期探测 30s；连续失败累计 2 分钟判失联；抢接收集窗口 30s（自广播起算）；
-    // 冻结无裁定 48 小时提示双方（单方处置时限）。
+    // 失联判定与接管规程默认值（设计 §11 参数表）：
+    // 对站长周期探测 30s、站长席位失联 5min 判冻结（≥2×席位心跳周期）；冻结无裁定 48 小时提示双方。
     managerProbeIntervalMs: 30000,
-    managerOfflineMs: 120000,
-    takeoverWindowMs: 30000,
+    managerLossTimeoutMs: 300000,
+    // 会话级参与者默认值（设计 §11）：本机会话离席宽限 60s、席位心跳周期 30s / 超时 5min；
+    // 自动移交后抢接窗口 60s、显式移交人工确认 120s、两段式入席确认 60s；
+    // 挂起邀请 64、单席暂存 100、单协作暂存 500（队列上限沿用 queueMaxPerCollab 500）。
+    sessionSeatGraceMs: 60000,
+    sessionSeatTimeoutMs: 300000,
+    seatPresenceIntervalMs: 30000,
+    sessionTakeoverWindowMs: 60000,
+    handoverConfirmTimeoutMs: 120000,
+    joinConfirmTtlMs: 60000,
+    pendingInvitesMax: 64,
+    stagedMaxPerSeat: 100,
+    stagedMaxPerCollab: 500,
     freezeUnresolvedMs: 48 * 60 * 60 * 1000,
     // 讨论的周期对表节拍（设计 §5.4 明文默认 60s）：落后方按此节拍拉增量、对账与重播。
     forumSyncIntervalMs: 60000,
@@ -120,6 +182,9 @@ export function buildDefaults(hostName, options = {}) {
  * 按未设置处理：保留默认机器名、不告警；调用方应把生效值落盘并在本会话给一次提示（见 status 工具）。
  * 损坏处理遵循设计 §13 的「不静默覆盖」：原文件改名留副本后再按默认值重建。
  * 未知字段原样保留到生效配置里，saveConfig 写回时不丢（前后版本并存的安全带）。
+ * 旧键：managerOfflineMs 映射为 managerLossTimeoutMs（两者并存新键优先）；takeoverWindowMs 已退役，
+ * 解析兼容但读取后忽略——两者都只告警、不进入生效配置（saveConfig 因此不会把旧键写回）。
+ * 返回前执行 validateCrossFields：时序/容量组合非法时整组回落默认值并告警，不拒绝启动。
  * options.defaults：站点感知默认值对象（多站点槽位目录传 buildDefaults(hostname(), { slot })）；
  * 缺省 = buildDefaults(hostname())（主站点语义）。
  */
@@ -134,7 +199,8 @@ export function loadConfig(dataDir, options = {}) {
   // 等原型成员名穿透（`key in defaults` 会命中 Object.prototype 上的内置成员）；
   // unknown 用 null 原型对象：防 `unknown['__proto__'] = ...` 经原型 setter 改写而非落成数据键
   const unknown = Object.create(null);
-  for (const [key, value] of Object.entries(raw)) {
+  const { entries, legacyManagerLoss } = normalizeLegacyKeys(raw, warn);
+  for (const [key, value] of Object.entries(entries)) {
     if (!Object.hasOwn(defaults, key)) {
       unknown[key] = value;
       continue;
@@ -149,7 +215,69 @@ export function loadConfig(dataDir, options = {}) {
       warn(`配置项 ${key} 无效（${checked.reason}），改用默认值 ${JSON.stringify(defaults[key])}`);
     }
   }
-  return { config: { ...config, ...unknown }, created, identityDefaulted };
+  // 映射值按旧范围校验后直接生效（不再过新键 FIELD_RULES）；交叉校验照常约束组合
+  if (legacyManagerLoss !== null) {
+    config.managerLossTimeoutMs = legacyManagerLoss;
+  }
+  return { config: validateCrossFields({ ...config, ...unknown }, { defaults, warn }), created, identityDefaulted };
+}
+
+/* 旧配置键归一（设计 §11）：managerOfflineMs 提取为待映射值，takeoverWindowMs 退役。
+ * entries 为 null 原型副本——旧键不再进入生效配置与 unknown，避免 saveConfig 写回退役键、
+ * 或下次启动把「新键 + 旧键并存」的告警重复打出来。 */
+function normalizeLegacyKeys(raw, warn) {
+  const hasManagerLoss = Object.hasOwn(raw, 'managerLossTimeoutMs');
+  const entries = Object.create(null);
+  let legacyManagerLoss = null;
+  for (const [key, value] of Object.entries(raw)) {
+    if (key === 'managerOfflineMs') {
+      legacyManagerLoss = legacyManagerLossValue(value, hasManagerLoss, warn);
+      continue;
+    }
+    if (key === 'takeoverWindowMs') {
+      warn('配置项 takeoverWindowMs 已退役（被 sessionTakeoverWindowMs 取代），已忽略');
+      continue;
+    }
+    entries[key] = value;
+  }
+  return { entries, legacyManagerLoss };
+}
+
+/* 旧键映射值的判定：新键并存时新键优先；否则按旧范围校验（存量配置保持旧行为，不受新键下界约束）。 */
+function legacyManagerLossValue(value, hasManagerLoss, warn) {
+  if (hasManagerLoss) {
+    warn('配置项 managerOfflineMs 与 managerLossTimeoutMs 同时存在，以新键为准，managerOfflineMs 已忽略');
+    return null;
+  }
+  const rule = LEGACY_FIELD_RULES.managerOfflineMs;
+  if (!rule.check(value)) {
+    warn(`配置项 managerOfflineMs 无效（${rule.reason}），已忽略，managerLossTimeoutMs 采用默认值`);
+    return null;
+  }
+  warn(`配置项 managerOfflineMs 已更名为 managerLossTimeoutMs，按旧值 ${JSON.stringify(value)} 生效`);
+  return value;
+}
+
+/**
+ * 交叉字段校验（设计 §11）：组内任一条约束不成立时，该组字段整组回落 defaults 并告警；
+ * 返回校验后的配置（回落时才复制，不改入参）。options.warn / options.defaults 供测试注入。
+ */
+export function validateCrossFields(config, options = {}) {
+  const warn = options.warn ?? defaultWarn;
+  const defaults = options.defaults ?? buildDefaults(hostname());
+  let result = config;
+  for (const group of CROSS_FIELD_GROUPS) {
+    const failures = group.checks.filter((check) => !check.valid(result));
+    if (failures.length === 0) {
+      continue;
+    }
+    warn(`配置项组合非法（${failures.map((item) => item.reason).join('；')}），已整组回落默认值：${group.fields.join('、')}`);
+    result = { ...result };
+    for (const key of group.fields) {
+      result[key] = defaults[key];
+    }
+  }
+  return result;
 }
 
 /* 身份名「未设置」的口径：字段缺失 / null / 空串 / 纯空白——用户清空字段即回到未设置，
