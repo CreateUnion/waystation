@@ -126,9 +126,9 @@ function nudgeJoinReplay(state, local) {
   if (localModeOf(local) !== 'forum' || local.role !== 'member' || local.joinConfirmed === true) {
     return;
   }
-  const ownJoin = ownJoinEventOf(local, state.self.instanceId);
-  if (ownJoin !== null) {
-    startJoinReplay(state, local, ownJoin);
+  const seats = localJoinSeatsOf(local, state.self.instanceId);
+  if (seats.length > 0) {
+    startJoinReplay(state, local, seats[0].event, seats[0].sessionId ?? undefined);
   }
 }
 
@@ -332,12 +332,20 @@ function mergeBundle(state, local, payload) {
   return { backfilled };
 }
 
+/* 席位键随成员事件落盘：来源携 sessionId 时如实带上（讨论的成员＝会话，折叠与邀请载荷都按
+ * 席位键取人）；缺失时不编造——旧事件按实例折叠，既有档案照常可读（设计 §10）。
+ * 取的是事件/帧自带的席位，不是转发者的：对表 bundle 里含着其他实例署名的历史事件。 */
+function seatSessionFieldOf(source) {
+  return typeof source?.sessionId === 'string' && source.sessionId !== '' ? { sessionId: source.sessionId } : {};
+}
+
 function mergeBundleMembers(state, local, events) {
   for (const event of events) {
     const outcome = local.members.apply({
       eventId: event.eventId,
       kind: event.kind,
       instanceId: event.instanceId,
+      ...seatSessionFieldOf(event),
       identityName: event.identityName,
       ts: event.ts,
     });
@@ -536,6 +544,7 @@ export function applyIncomingJoin(state, frame) {
     eventId: frame.payload.eventId,
     kind: 'join',
     instanceId: frame.from.instanceId,
+    ...seatSessionFieldOf(frame.from),
     identityName: frame.from.identityName,
     ts: frame.payload.ts,
   });
@@ -568,6 +577,7 @@ export function applyIncomingLeave(state, local, frame) {
     eventId: frame.payload.eventId,
     kind: 'leave',
     instanceId: frame.from.instanceId,
+    ...seatSessionFieldOf(frame.from),
     identityName: frame.from.identityName,
     ts: frame.payload.ts,
   });
@@ -603,30 +613,115 @@ export function activateForumIfNeeded(state, local) {
   return true;
 }
 
-/* join 收敛判定（设计 §5.4 对表自愈）：判据 = 对表**拉回**的成员表（对端事件集折叠后）含自己——
- * 本机折叠表恒含自己，不能作确认；对端的表不含 → 递增间隔有界重播（join 重播豁免 TTL/上限）。
- * joinConfirmed 为运行期确认位：未确认时拉取失败/无从发起也照走重播（nudgeJoinReplay）。 */
+/* join 收敛判定（设计 §5.4 对表自愈）：判据 = 对表**拉回**的成员表（对端事件集折叠后）含
+ * **本会话自己的席位**——本机折叠表恒含自己，不能作确认；同实例其他会话的 join 也不是本会话的
+ * 确认证据（成员＝会话，设计 §2.2）。对端的表不含 → 递增间隔有界重播（join 重播豁免 TTL/上限），
+ * 重播只重播本会话自己的事件并由该会话署名——同机另一会话代签会把两个会话的历史记串。
+ * joinConfirmed 为运行期确认位（本机已加入的席位对照对端表全部成立）：未确认时拉取失败/
+ * 无从发起也照走重播（nudgeJoinReplay）。 */
 export function settleJoinConvergence(state, local, bundlePayload) {
   if (localModeOf(local) !== 'forum' || local.role !== 'member' || isLocalArchivedState(local)) {
     return;   // 已归档（结束/退出）：不再重播
   }
-  const ownJoin = ownJoinEventOf(local, state.self.instanceId);
-  if (ownJoin === null) {
+  const seats = localJoinSeatsOf(local, state.self.instanceId);
+  if (seats.length === 0) {
     return;
   }
-  const peerKnows = foldMemberEvents(bundlePayload.members ?? []).some((member) => member.instanceId === state.self.instanceId);
-  if (peerKnows) {
+  const peerMembers = foldMemberEvents(bundlePayload.members ?? []);
+  const pending = seats.filter((seat) => !peerKnowsSeatOf(peerMembers, state.self.instanceId, seat.sessionId));
+  if (pending.length === 0) {
     local.joinConfirmed = true;
     stopJoinReplay(state, local);
     return;
   }
   local.joinConfirmed = false;
-  startJoinReplay(state, local, ownJoin);
+  startJoinReplay(state, local, pending[0].event, pending[0].sessionId ?? undefined);
 }
 
-/* 本机最近一条 join 事件（本机加入过该讨论的判据；最新为 leave 或从未加入 → null）。 */
-export function ownJoinEventOf(local, selfId) {
-  const latest = local.members.latestEventOf(selfId);
+/* 本机在讨论里处于 join 态的席位（每席取自身最新事件）；席位级事件存在时旧实例级事件不参与
+ * 判定——同机其他会话的事件不得被当成本会话的 join。整份档案都是旧事件（无 sessionId）时才
+ * 退回实例级判定，保留既有档案的自愈能力。按会话标识排序：多席都未确认时重播对象稳定。 */
+function localJoinSeatsOf(local, selfId) {
+  const { seats, legacy } = ownSeatEventsOf(local, selfId);
+  if (seats.size === 0) {
+    return legacy !== null && legacy.kind === 'join' ? [{ sessionId: null, event: legacy }] : [];
+  }
+  return [...seats.entries()]
+    .filter(([, event]) => event.kind === 'join')
+    .map(([sessionId, event]) => ({ sessionId, event }))
+    .sort((left, right) => (left.sessionId < right.sessionId ? -1 : 1));
+}
+
+/* 本机事件按席位归并（与成员折叠同一分组规则：sessionId 在场即席位键，缺省归入旧实例级）。
+ * 「最新」用作者内事件序（时刻 → 事件 id 兜底），与折叠表取同一条，避免两处各判一个结论。 */
+function ownSeatEventsOf(local, selfId) {
+  const seats = new Map();
+  /** @type {any} 旧实例级事件（无 sessionId）：只在档案里没有席位级事件时参与判定 */
+  let legacy = null;
+  for (const event of local.members.events()) {
+    if (event.instanceId !== selfId) {
+      continue;
+    }
+    if (isSeatSessionOf(event)) {
+      const held = seats.get(event.sessionId);
+      if (held === undefined || compareSeatEvent(event, held) > 0) {
+        seats.set(event.sessionId, event);
+      }
+      continue;
+    }
+    if (legacy === null || compareSeatEvent(event, legacy) > 0) {
+      legacy = event;
+    }
+  }
+  return { seats, legacy };
+}
+
+function isSeatSessionOf(event) {
+  return typeof event.sessionId === 'string' && event.sessionId !== '';
+}
+
+/* 作者内事件序：先时刻、后事件 id（与 members 折叠的比较键一致）。 */
+function compareSeatEvent(left, right) {
+  const byTs = Date.parse(left.ts) - Date.parse(right.ts);
+  if (byTs !== 0) {
+    return byTs;
+  }
+  if (left.eventId === right.eventId) {
+    return 0;
+  }
+  return left.eventId < right.eventId ? -1 : 1;
+}
+
+/* 对端折叠表是否已含本席位：按 (instanceId, sessionId) 精确匹配，同实例其他会话的行不算。
+ * 旧实例级行（无 sessionId）只在两种情形作确认证据：本机自己也只有旧事件（sessionId 为 null），
+ * 或对端表里完全没有本机的席位行（旧档案整表按实例折叠）。对端已按席位折叠时，旧实例行不得
+ * 顶替本会话——否则同机另一会话的旧历史会把本会话判成已确认，重播提前停掉即成幽灵成员。 */
+function peerKnowsSeatOf(peerMembers, instanceId, sessionId) {
+  let legacy = false;
+  let seatRows = 0;
+  for (const member of peerMembers) {
+    if (member?.instanceId !== instanceId) {
+      continue;
+    }
+    if (typeof member.sessionId !== 'string' || member.sessionId === '') {
+      legacy = true;
+      continue;
+    }
+    seatRows++;
+    if (member.sessionId === sessionId) {
+      return true;
+    }
+  }
+  return legacy && (sessionId === null || seatRows === 0);
+}
+
+/* 指定会话在本机成员事件集里的最新 join 事件（最新为 leave 或该会话从未加入 → null）。
+ * 该会话没有自己的事件时，仅当档案里完全没有席位级事件才退回实例级旧事件（旧档案可读）；
+ * 同实例其他会话的 join 无论如何都不是本会话的 join。 */
+export function ownJoinEventOf(local, selfId, sessionId = null) {
+  const { seats, legacy } = ownSeatEventsOf(local, selfId);
+  const own = sessionId === null ? null : (seats.get(sessionId) ?? null);
+  const latest = own ?? (seats.size === 0 ? legacy : null);
   return latest !== null && latest.kind === 'join' ? latest : null;
 }
 

@@ -8,10 +8,13 @@ export const MEMBERS_FILE_NAME = 'members.jsonl';
 /* 讨论模式的成员事件日志（设计 §5.4「成员关系 = 追加式事件日志」）：
  * join / leave 均为带唯一事件 id 的追加事件；合并 = 事件集并集（同 id 重放天然幂等）；
  * 当前成员表 = 按事件折叠——每个成员取其自身事件序（ts, eventId）最新的一条定其状态。
- * re-join = 新 join 事件（新事件 id）——旧的 join 重放不复活已退出成员（抗重放、抗"复活"）。
+ * 成员是会话（席位键 = 实例 + 会话）：事件自带 sessionId 时按席位折叠，同机多会话各占一员；
+ * 缺该字段的旧事件退回按实例折叠（既有档案照常可读）。re-join = 新 join 事件（新事件 id）——
+ * 旧的 join 重放不复活已退出成员（抗重放、抗"复活"）。
  * 事件只追加、不修改不删除；落盘 JSONL 追加写，加载坏行计数跳过（坏数据不得让服务起不来）。 */
 
-/* 事件形态（加载路径与追加路径共用；bundle 合并侧另协议层同形校验——本层是落盘数据的底线）。 */
+/* 事件形态（加载路径与追加路径共用；bundle 合并侧另协议层同形校验——本层是落盘数据的底线）。
+ * 席位键可缺省（旧事件），给了就必须过标识形态校验——半个席位键比没有更危险。 */
 export function isMemberEventShape(entry) {
   if (!isPlainObject(entry)) {
     return false;
@@ -20,6 +23,9 @@ export function isMemberEventShape(entry) {
     return false;
   }
   if (!isIdLike(entry.instanceId) || !isIdentityName(entry.identityName)) {
+    return false;
+  }
+  if (entry.sessionId !== undefined && !isIdLike(entry.sessionId)) {
     return false;
   }
   return typeof entry.ts === 'string' && entry.ts.length <= 40 && !Number.isNaN(Date.parse(entry.ts));
@@ -128,8 +134,11 @@ function persist(state, event) {
   }
 }
 
-/* 折叠（当前成员表）：逐成员取事件序最新的一条（作者内比较键 = (ts, eventId)——同刻按事件 id
- * 兜底，保证各副本对同一事件集折叠出同一结果）；最新为 join 者入表。输出按实例标识排序（确定性）。 */
+/* 折叠（当前成员表）：按席位键分组，每组取事件序最新的一条（作者内比较键 = (ts, eventId)——
+ * 同刻按事件 id 兜底，保证各副本对同一事件集折叠出同一结果）；最新为 join 者入表。
+ * 事件无 sessionId 时分组键退回实例（旧档案的成员粒度），有则按会话——两类行不互相吞并：
+ * 旧行的实例级身份与席位行的会话身份是不同的历史记录，合并会凭空改写其中一个。
+ * 输出按实例、再按会话排序（确定性）。 */
 function fold(state) {
   return foldMemberEvents([...state.events.values()]);
 }
@@ -138,18 +147,51 @@ function fold(state) {
 export function foldMemberEvents(events) {
   const latest = new Map();
   for (const event of events) {
-    const held = latest.get(event.instanceId);
+    const key = seatKeyOf(event);
+    const held = latest.get(key);
     if (held === undefined || compareEvents(event, held) > 0) {
-      latest.set(event.instanceId, event);
+      latest.set(key, event);
     }
   }
   const members = [];
   for (const event of latest.values()) {
     if (event.kind === 'join') {
-      members.push({ instanceId: event.instanceId, identityName: event.identityName });
+      members.push(seatMemberOf(event));
     }
   }
-  return members.sort((left, right) => (left.instanceId < right.instanceId ? -1 : 1));
+  return members.sort(compareMembers);
+}
+
+/* 分组键：会话标识在场即席位键（实例内以 NUL 隔开，与裸实例键不会撞车）；缺省退回实例键。
+ * 非字符串/空串一律按缺省处理——折叠不得因半个坏字段整表抛错。 */
+function seatKeyOf(event) {
+  const sessionId = seatSessionIdOf(event);
+  return sessionId === null ? event.instanceId : `${event.instanceId}\u0000${sessionId}`;
+}
+
+function seatSessionIdOf(event) {
+  return typeof event.sessionId === 'string' && event.sessionId !== '' ? event.sessionId : null;
+}
+
+function seatMemberOf(event) {
+  const member = { instanceId: event.instanceId, identityName: event.identityName };
+  const sessionId = seatSessionIdOf(event);
+  if (sessionId !== null) {
+    member.sessionId = sessionId;
+  }
+  return member;
+}
+
+function compareMembers(left, right) {
+  if (left.instanceId !== right.instanceId) {
+    return left.instanceId < right.instanceId ? -1 : 1;
+  }
+  const leftSession = left.sessionId ?? '';
+  const rightSession = right.sessionId ?? '';
+  if (leftSession === rightSession) {
+    return 0;
+  }
+  return leftSession < rightSession ? -1 : 1;
 }
 
 /* 作者内事件序：先时刻、后事件 id（同刻兜底）——与帖子显示序同一比较精神（§5.2）。 */
