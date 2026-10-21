@@ -19,6 +19,8 @@ export function ensureCollabDir(dataDir, collabId) {
 /* 协作目录的持久化原语（设计 §15 定案的两条写入路径）：
  * 台账 = 追加写的状态快照流（每行一次变更后的完整台账，加载取最后一条通过形态校验的完整行）；
  * member.json / snapshot.json = 整体替换写（临时文件 + 重命名，存储层既有机制）。
+ * 形态校验一律走 model.js 的新形态（带 managerTerm/joinSeqNext 的席位台账）：旧形态行在新协作目录里
+ * 通不过校验，按「有内容但无可用行」计入 corrupt，交由调用方告警——legacy 只读读取器在 M8，不在本层。
  * 写失败向上抛（调用方按模块语境计数；「绝不因写盘失败退出进程」由调用方兜底）。 */
 
 export function ledgerDigest(ledger) {

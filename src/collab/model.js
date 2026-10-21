@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { DEFAULT_COLLAB_MODE, DIGEST_PATTERN, ID_PATTERN, MAX_COLLAB_MEMBERS, MAX_MESSAGE_TEXT_CHARS, MAX_TOPIC_CHARS, isCollabMode, isIdentityName, isPort, isPresentationText } from '../net/protocol.js';
+import { DEFAULT_COLLAB_MODE, DIGEST_PATTERN, ID_PATTERN, MAX_ACTIVE_SEATS, MAX_FORUM_ACTIVE_SEATS, MAX_MANAGER_TERM, MAX_MESSAGE_TEXT_CHARS, MAX_TOPIC_CHARS, isCollabMode, isIdentityName, isPort, isPresentationText } from '../net/protocol.js';
 
 /* 协作实例模型（设计 §6/§11）：状态集、迁移表与本地记录形态校验。
  * 本地协作文件（member.json / 台账行 / 快照）是外部输入——手改与旧数据都可能出现；
@@ -19,17 +19,15 @@ export const MAX_PENDING_INVITES = 16;
 export const MAX_LOCAL_COLLABS = 64;
 export const MAX_BOARD_ENTRIES = 200;
 export const INVITE_THROTTLE_TABLE_MAX = 64;
-/* 讨论参与者上限（设计 §9，邀请侧软约束）：成员表 ≥16 拒绝发起新邀请、创建 targets ≤15
- *（含发起人共 16）；join / 合并不设限（保收敛）、协议层名单硬顶 MAX_COLLAB_MEMBERS 照旧。 */
-export const MAX_FORUM_MEMBERS = 16;
+/* 讨论活跃席位软顶（设计 §2.5，邀请侧软约束）：按活跃会话计、历史行不占；协议硬顶仍是 32。 */
+export const MAX_FORUM_MEMBERS = MAX_FORUM_ACTIVE_SEATS;
 
-const MEMBER_STATES = ['invited', 'approved', 'declined', 'withdrawn', 'member', 'left'];
 const ROLES = ['manager', 'member'];
 const DECISIONS = [null, 'approved', 'declined', 'withdrawn'];
 const BOARD_KINDS = ['progress', 'note'];
 /* 状态迁移表（设计 §11 状态流转的机器化；裁定流程归治理里程碑，本表是其调用面） */
 const TRANSITIONS = /** @type {Record<string, string[]>} */ ({
-  proposed: ['active', 'frozen', 'terminated'],
+  proposed: ['active', 'completed', 'frozen', 'terminated'],
   active: ['frozen', 'completed'],
   frozen: ['proposed', 'active', 'completed', 'terminated'],
   completed: [],
@@ -39,7 +37,7 @@ const TRANSITIONS = /** @type {Record<string, string[]>} */ ({
 /* 讨论模式的迁移表（四态去冻结，设计 §3/§4）：冻结态不可达、冻结规程不适用。
  * 与 managed 表的差异只有冻结面——其余边同形，收敛/终态语义两模式一致。 */
 const FORUM_TRANSITIONS = /** @type {Record<string, string[]>} */ ({
-  proposed: ['active', 'terminated'],
+  proposed: ['active', 'completed', 'terminated'],
   active: ['completed'],
   completed: [],
   terminated: [],
@@ -74,25 +72,151 @@ export function withDefaultMode(record) {
   return record;
 }
 
-/* 台账对象形态（单一权威形态的校验面）：字段逐一校验；校验通过的对象可参与 digest 计算。 */
+/* 台账对象形态（单一权威形态的校验面）：字段逐一校验；校验通过的对象可参与 digest 计算。
+ * 名单只含活跃席位（state=member）；managed 非终态恰一站长，终态允许空名单/manager:null；
+ * forum 不要求 manager / joinSeq（D10/D17）。 */
 export function isLedgerShape(ledger) {
   if (!isPlainObject(ledger) || !isLedgerHeadShape(ledger)) {
     return false;
   }
-  if (!isPeerShape(ledger.manager)) {
+  const mode = ledger.mode ?? DEFAULT_COLLAB_MODE;
+  const terminal = isTerminalLedger(ledger.status);
+  if (!isManagerWindowShape(ledger.managerWindow, terminal, ledger.managerTerm)) {
     return false;
   }
-  if (!isLedgerRosterShape(ledger.members)) {
+  if (!isLedgerRosterShape(ledger.members, { mode, allowEmpty: terminal })) {
     return false;
   }
-  return isLedgerTailShape(ledger);
+  if (!isLedgerTailShape(ledger)) {
+    return false;
+  }
+  return mode === 'forum' ? isForumLedgerShape(ledger) : isManagedLedgerShape(ledger, terminal);
 }
 
-function isLedgerRosterShape(members) {
-  return Array.isArray(members)
-    && members.length >= 1
-    && members.length <= MAX_COLLAB_MEMBERS
-    && members.every(isLedgerMemberShape);
+/* 席位名单（共享名单的唯一形态）：{instanceId,sessionId,identityName,role,state:'member',joinSeq,joinedAt}；
+ * 唯一性键 (instanceId,sessionId)——同机多会话各自成席；managed 要求 joinSeq、forum 可省。 */
+export function isLedgerRosterShape(members, { mode = DEFAULT_COLLAB_MODE, allowEmpty = false } = {}) {
+  if (!isRosterSizeShape(members, allowEmpty)) {
+    return false;
+  }
+  const seen = new Set();
+  for (const entry of members) {
+    if (!isSeatMemberShape(entry, mode)) {
+      return false;
+    }
+    const key = `${entry.instanceId}\u0000${entry.sessionId}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+  }
+  return true;
+}
+
+function isRosterSizeShape(members, allowEmpty) {
+  if (!Array.isArray(members)) {
+    return false;
+  }
+  const minSize = allowEmpty ? 0 : 1;
+  return members.length >= minSize && members.length <= MAX_ACTIVE_SEATS;
+}
+
+function isSeatMemberShape(entry, mode) {
+  if (!isSeatIdentityShape(entry)) {
+    return false;
+  }
+  if (!ROLES.includes(entry.role) || entry.state !== 'member') {
+    return false;
+  }
+  if (!isOptionalSeqValue(entry.joinSeq)) {
+    return false;
+  }
+  if (mode === DEFAULT_COLLAB_MODE && entry.joinSeq === undefined) {
+    return false;
+  }
+  return isTimestamp(entry.joinedAt);
+}
+
+function isSeatIdentityShape(entry) {
+  return isPlainObject(entry)
+    && isIdLike(entry.instanceId)
+    && isIdLike(entry.sessionId)
+    && isIdentityName(entry.identityName);
+}
+
+function isOptionalSeqValue(value) {
+  return value === undefined || isSeqValue(value);
+}
+
+function isTerminalLedger(status) {
+  return status === 'completed' || status === 'terminated';
+}
+
+function isManagedLedgerShape(ledger, terminal) {
+  if (!isSeqValue(ledger.joinSeqNext)) {
+    return false;
+  }
+  if (ledger.manager === null) {
+    return terminal && !ledger.members.some((entry) => entry.role === 'manager');
+  }
+  if (!isManagerSeatShape(ledger.manager) || ledger.manager.term !== ledger.managerTerm) {
+    return false;
+  }
+  return managerRowMatches(ledger);
+}
+
+function isManagerSeatShape(manager) {
+  return isPlainObject(manager)
+    && isIdLike(manager.instanceId)
+    && isIdLike(manager.sessionId)
+    && isIdentityName(manager.identityName)
+    && isSeqValue(manager.term);
+}
+
+function managerRowMatches(ledger) {
+  const rows = ledger.members.filter((entry) => entry.role === 'manager');
+  if (rows.length !== 1) {
+    return false;
+  }
+  const row = rows[0];
+  return row.instanceId === ledger.manager.instanceId
+    && row.sessionId === ledger.manager.sessionId
+    && row.identityName === ledger.manager.identityName;
+}
+
+/* forum：manager 字段可作中继/发起人记录（D10），名单行不带 joinSeq；joinSeqNext 出现才校验。 */
+function isForumLedgerShape(ledger) {
+  if (ledger.joinSeqNext !== undefined && !isSeqValue(ledger.joinSeqNext)) {
+    return false;
+  }
+  return ledger.manager === undefined || ledger.manager === null || isForumManagerShape(ledger.manager);
+}
+
+function isForumManagerShape(manager) {
+  if (!isPlainObject(manager) || !isIdLike(manager.instanceId) || !isIdentityName(manager.identityName)) {
+    return false;
+  }
+  if (manager.sessionId !== undefined && !isIdLike(manager.sessionId)) {
+    return false;
+  }
+  return manager.term === undefined || isSeqValue(manager.term);
+}
+
+function isManagerWindowShape(window, terminal, managerTerm) {
+  if (window === undefined) {
+    return true;
+  }
+  if (terminal) {
+    return false;
+  }
+  return isPlainObject(window)
+    && isSeqValue(window.windowBaseTerm)
+    && window.windowBaseTerm <= managerTerm
+    && isTimestamp(window.windowEndsAt);
+}
+
+function isSeqValue(value) {
+  return Number.isInteger(value) && value >= 1 && value <= MAX_MANAGER_TERM;
 }
 
 function isLedgerTailShape(ledger) {
@@ -156,7 +280,7 @@ export function isMemberRecordShape(record) {
 }
 
 function isRosterShape(roster) {
-  if (!Array.isArray(roster) || roster.length < 1 || roster.length > MAX_COLLAB_MEMBERS) {
+  if (!Array.isArray(roster) || roster.length < 1 || roster.length > MAX_ACTIVE_SEATS) {
     return false;
   }
   return roster.every((entry) => isPlainObject(entry) && isIdLike(entry.instanceId) && isIdentityName(entry.identityName));
@@ -179,8 +303,50 @@ export function isSnapshotShape(snapshot) {
   return isLedgerShape(snapshot.ledger);
 }
 
+/* 快照受理排序（设计 §2A.2 / §2A.10）：按 (managerTerm, version) 字典序；同 term 不同 manager 是分叉，
+ * 不比较 version（A8/A12）；同 term/version/manager 幂等（A7/A13）。入参可为快照（{ledger}）或台账本身。
+ * 形态非法返回 ok:false，由调用方按「无法判定」处置（不猜顺序）。 */
+export function compareSnapshot(left, right) {
+  const a = ledgerStateOf(left);
+  const b = ledgerStateOf(right);
+  if (a === null || b === null) {
+    return { ok: false, reason: '快照形态非法（需 managerTerm/version 与席位 manager）', order: 0, conflict: false, idempotent: false };
+  }
+  if (a.term !== b.term) {
+    return { ok: true, order: a.term > b.term ? 1 : -1, conflict: false, idempotent: false };
+  }
+  if (a.managerKey !== b.managerKey) {
+    return { ok: true, order: 0, conflict: true, idempotent: false };
+  }
+  if (a.version !== b.version) {
+    return { ok: true, order: a.version > b.version ? 1 : -1, conflict: false, idempotent: false };
+  }
+  return { ok: true, order: 0, conflict: false, idempotent: true };
+}
+
+function ledgerStateOf(value) {
+  if (!isPlainObject(value)) {
+    return null;
+  }
+  const ledger = isPlainObject(value.ledger) ? value.ledger : value;
+  if (!isSeqValue(ledger.managerTerm) || !Number.isInteger(ledger.version) || ledger.version < 1 || !isPlainObject(ledger.manager)) {
+    return null;
+  }
+  if (!isIdLike(ledger.manager.instanceId) || !isIdLike(ledger.manager.sessionId)) {
+    return null;
+  }
+  return {
+    term: ledger.managerTerm,
+    version: ledger.version,
+    managerKey: `${ledger.manager.instanceId}\u0000${ledger.manager.sessionId}`,
+  };
+}
+
 function isLedgerHeadShape(ledger) {
   if (!Number.isInteger(ledger.version) || ledger.version < 1) {
+    return false;
+  }
+  if (!isSeqValue(ledger.managerTerm)) {
     return false;
   }
   if (!isIdLike(ledger.collabId)) {
@@ -193,19 +359,6 @@ function isLedgerHeadShape(ledger) {
     return false;
   }
   return isCollabState(ledger.status);
-}
-
-function isLedgerMemberShape(entry) {
-  if (!isPlainObject(entry)) {
-    return false;
-  }
-  if (!isIdLike(entry.instanceId) || !isIdentityName(entry.identityName)) {
-    return false;
-  }
-  if (!ROLES.includes(entry.role) || !MEMBER_STATES.includes(entry.state)) {
-    return false;
-  }
-  return isTimestamp(entry.joinedAt);
 }
 
 function isBoardEntryShape(entry) {

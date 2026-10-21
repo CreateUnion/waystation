@@ -72,6 +72,78 @@ export function joinsFilePath(dataDir, collabId) {
   return collabFilePath(dataDir, collabId, JOINS_FILE_NAME);
 }
 
+/* —— 会话级参与者 0.2.0 本地文件（设计 §6.2）：载体描述、席位、邀请簿记、交接与恢复标记 —— */
+
+export const CARRIER_FILE_NAME = 'carrier.json';
+export const SEATS_DIR_NAME = 'seats';
+export const INVITES_FILE_NAME = 'invites.json';
+export const PENDING_INVITES_FILE_NAME = 'pending-invites.json';
+export const HANDOVER_OFFERS_FILE_NAME = 'handover-offers.json';
+export const DEPARTED_FILE_NAME = 'departed.jsonl';
+export const RECOVERY_FILE_NAME = 'recovery.json';
+
+/** 载体描述（format:'session-seats' / 'invite-stub'）：新协作的第一份落盘文件，先于台账。 */
+export function carrierFilePath(dataDir, collabId) {
+  return collabFilePath(dataDir, collabId, CARRIER_FILE_NAME);
+}
+
+/** 本机会话席位文件：seats/<sessionId>.json——sessionId 成为文件名，与 collabId 同一硬边界（非法即抛）。 */
+export function seatFilePath(dataDir, collabId, sessionId) {
+  if (typeof sessionId !== 'string' || !ID_PATTERN.test(sessionId)) {
+    throw new TypeError(`sessionId 非法，不得用于路径拼接：${String(sessionId).slice(0, 32)}`);
+  }
+  return join(collabDir(dataDir, collabId), SEATS_DIR_NAME, `${sessionId}.json`);
+}
+
+/** 站长机邀请簿记（managed）：inviteId → 目标与接受记录。 */
+export function invitesFilePath(dataDir, collabId) {
+  return collabFilePath(dataDir, collabId, INVITES_FILE_NAME);
+}
+
+/** 目标机挂起邀请：未入席会话的补投依据。 */
+export function pendingInvitesFilePath(dataDir, collabId) {
+  return collabFilePath(dataDir, collabId, PENDING_INVITES_FILE_NAME);
+}
+
+/** 目标机交接记录：offer 台账与确认状态（重启后可继续确认）。 */
+export function handoverOffersFilePath(dataDir, collabId) {
+  return collabFilePath(dataDir, collabId, HANDOVER_OFFERS_FILE_NAME);
+}
+
+/** 本机离席历史：本地派生索引，权威证据在共享台账事件。 */
+export function departedFilePath(dataDir, collabId) {
+  return collabFilePath(dataDir, collabId, DEPARTED_FILE_NAME);
+}
+
+/** 半写新协作目录标记：有 marker 无台账时按只读处理，不重建空台账。 */
+export function recoveryFilePath(dataDir, collabId) {
+  return collabFilePath(dataDir, collabId, RECOVERY_FILE_NAME);
+}
+
+/* 协作目录内的 run/：单协作文档型运行态（与根 run/ 的机器级接线运行态分离）。 */
+export const AUTO_OFFER_FILE_NAME = 'auto-offer.json';
+export const MANAGER_PENDING_FILE_NAME = 'manager-pending.json';
+export const HANDOVER_PENDING_FILE_NAME = 'handover-pending.json';
+
+export function collabRunDir(dataDir, collabId) {
+  return join(collabDir(dataDir, collabId), RUN_DIR_NAME);
+}
+
+/** 原站长核的 auto-offer 副本（离线成员追赶与重启恢复）。 */
+export function autoOfferFilePath(dataDir, collabId) {
+  return join(collabRunDir(dataDir, collabId), AUTO_OFFER_FILE_NAME);
+}
+
+/** 原站长核在「已收到 accept、未收到新站长签发」期间的只读冻结标记。 */
+export function managerPendingFilePath(dataDir, collabId) {
+  return join(collabRunDir(dataDir, collabId), MANAGER_PENDING_FILE_NAME);
+}
+
+/** 旧站长侧的显式移交在途记录（重启后恢复停写等待或作废）。 */
+export function handoverPendingFilePath(dataDir, collabId) {
+  return join(collabRunDir(dataDir, collabId), HANDOVER_PENDING_FILE_NAME);
+}
+
 /** 槽位 k≥2 的站点数据目录（设计 §13：槽位 1 = 主数据目录本身，k≥2 = <主数据目录>/sites/<k>/，各自含独立 config.json）。
  * 槽位上限由 site.js 的 SLOT_COUNT 约束（本函数只做路径层底线：≥2 的整数）——
  * 与 collabId 同一硬边界：非法值一律抛错，不做清洗或拼接。 */

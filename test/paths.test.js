@@ -3,7 +3,43 @@ import assert from 'node:assert/strict';
 import { statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { COLLABS_DIR_NAME, LOGS_DIR_NAME, BINDINGS_FILE_NAME, CORE_JSON_FILE_NAME, RUN_DIR_NAME, bindingsFilePath, collabDir, collabFilePath, coreJsonPath, resolveDataDir, resolveLogDir, ensureDir, runDir, sessionFilePath, siteDataDir } from '../src/paths.js';
+import {
+  AUTO_OFFER_FILE_NAME,
+  BINDINGS_FILE_NAME,
+  CARRIER_FILE_NAME,
+  COLLABS_DIR_NAME,
+  CORE_JSON_FILE_NAME,
+  DEPARTED_FILE_NAME,
+  HANDOVER_OFFERS_FILE_NAME,
+  HANDOVER_PENDING_FILE_NAME,
+  INVITES_FILE_NAME,
+  LOGS_DIR_NAME,
+  MANAGER_PENDING_FILE_NAME,
+  PENDING_INVITES_FILE_NAME,
+  RECOVERY_FILE_NAME,
+  RUN_DIR_NAME,
+  SEATS_DIR_NAME,
+  autoOfferFilePath,
+  bindingsFilePath,
+  carrierFilePath,
+  collabDir,
+  collabFilePath,
+  coreJsonPath,
+  departedFilePath,
+  ensureDir,
+  handoverOffersFilePath,
+  handoverPendingFilePath,
+  invitesFilePath,
+  managerPendingFilePath,
+  pendingInvitesFilePath,
+  recoveryFilePath,
+  resolveDataDir,
+  resolveLogDir,
+  runDir,
+  seatFilePath,
+  sessionFilePath,
+  siteDataDir,
+} from '../src/paths.js';
 import { makeTempDir } from './helpers.js';
 
 test('resolveDataDir：无环境变量时默认 ~/.waystation', () => {
@@ -93,4 +129,42 @@ test('run/ 常量：运行态目录与核心锁/绑定表文件（设计 §2.3/�
   assert.equal(runDir(dir), join(dir, 'run'));
   assert.equal(coreJsonPath(dir), join(dir, 'run', 'core.json'));
   assert.equal(bindingsFilePath(dir), join(dir, 'run', 'bindings.json'));
+});
+
+test('新协作文件：carrier / seats / 邀请 / 交接 / 离席历史 / 恢复标记（设计 §6.2）', (t) => {
+  const dir = makeTempDir(t);
+  const collab = join(dir, COLLABS_DIR_NAME, 'collab-1');
+  assert.equal(CARRIER_FILE_NAME, 'carrier.json');
+  assert.equal(SEATS_DIR_NAME, 'seats');
+  assert.equal(INVITES_FILE_NAME, 'invites.json');
+  assert.equal(PENDING_INVITES_FILE_NAME, 'pending-invites.json');
+  assert.equal(HANDOVER_OFFERS_FILE_NAME, 'handover-offers.json');
+  assert.equal(DEPARTED_FILE_NAME, 'departed.jsonl');
+  assert.equal(RECOVERY_FILE_NAME, 'recovery.json');
+  assert.equal(carrierFilePath(dir, 'collab-1'), join(collab, 'carrier.json'));
+  assert.equal(seatFilePath(dir, 'collab-1', 'session-a'), join(collab, 'seats', 'session-a.json'));
+  assert.equal(invitesFilePath(dir, 'collab-1'), join(collab, 'invites.json'));
+  assert.equal(pendingInvitesFilePath(dir, 'collab-1'), join(collab, 'pending-invites.json'));
+  assert.equal(handoverOffersFilePath(dir, 'collab-1'), join(collab, 'handover-offers.json'));
+  assert.equal(departedFilePath(dir, 'collab-1'), join(collab, 'departed.jsonl'));
+  assert.equal(recoveryFilePath(dir, 'collab-1'), join(collab, 'recovery.json'));
+});
+
+test('新 run/ 文件：auto-offer / manager-pending / handover-pending 落在协作目录 run/ 下', (t) => {
+  const dir = makeTempDir(t);
+  const run = join(dir, COLLABS_DIR_NAME, 'collab-1', RUN_DIR_NAME);
+  assert.equal(AUTO_OFFER_FILE_NAME, 'auto-offer.json');
+  assert.equal(MANAGER_PENDING_FILE_NAME, 'manager-pending.json');
+  assert.equal(HANDOVER_PENDING_FILE_NAME, 'handover-pending.json');
+  assert.equal(autoOfferFilePath(dir, 'collab-1'), join(run, 'auto-offer.json'));
+  assert.equal(managerPendingFilePath(dir, 'collab-1'), join(run, 'manager-pending.json'));
+  assert.equal(handoverPendingFilePath(dir, 'collab-1'), join(run, 'handover-pending.json'));
+});
+
+test('新路径构造：collabId / sessionId 非法一律抛错——路径穿越硬边界不放宽', (t) => {
+  const dir = makeTempDir(t);
+  assert.throws(() => carrierFilePath(dir, '../evil'), /collabId 非法/);
+  assert.throws(() => seatFilePath(dir, 'collab-1', '../evil'), /sessionId 非法/);
+  assert.throws(() => seatFilePath(dir, 'collab-1', ''), /sessionId 非法/);
+  assert.throws(() => autoOfferFilePath(dir, 'a/b'), /collabId 非法/);
 });

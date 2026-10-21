@@ -41,11 +41,16 @@ export const MESSAGE_TYPES = [
   'topic', 'task', 'progress', 'issue', 'stop', 'reply',
   'freeze', 'unfreeze', 'decision', 'handover', 'takeover-init', 'takeover', 'notice', 'leave', 'end',
   'ping', 'pong', 'delivery-status',
-  'snapshot',
+  'snapshot', 'seat-presence',
   'post',
-  'join', 'join-request', 'join-grant', 'join-deny', 'history-request', 'history-bundle',
+  'join', 'join-request', 'join-grant', 'join-deny', 'join-confirm', 'history-request', 'history-bundle',
   'ack',
 ];
+
+/* 能力闸门（会话级参与者 0.2.0 硬断裂）：协作域帧根节点必须声明 cap=2；
+ * 发现面与 transport 帧（ping/pong/ack）不适用——旧版对端在发现面可见，但协作操作被本闸门拒绝。
+ * PROTOCOL_VERSION 保持 1：断裂靠能力字段显式声明，不靠版本号。 */
+export const COLLAB_CAPABILITY = 2;
 
 /* 帖的语义徽标词表（设计 §5.2：协作类六类＝帖子类型、仅作标签——topic 帖按普通帖处理、
  * 不改任何元状态）。与 ws_send_message 的类型面同一词表（工具层直接引用本常量，单一权威）。 */
@@ -89,6 +94,9 @@ function validateIdentityFields(frame) {
   }
   if (typeof frame.type !== 'string' || !MESSAGE_TYPES.includes(frame.type)) {
     return refuse('未知消息类型');
+  }
+  if (!TRANSPORT_TYPES.includes(frame.type) && frame.cap !== COLLAB_CAPABILITY) {
+    return refuse('协作域帧缺少 cap=2（对端版本不支持会话级协作，需 0.2.0+）');
   }
   if (!isId(frame.msgId)) {
     return refuse('msgId 非法');
@@ -141,6 +149,25 @@ export function validateJoinResolve(datagram) {
 
 export function validateJoinResolveAck(datagram) {
   return validateDiscovery(datagram, 'join-resolve-ack');
+}
+
+/* 发现面能力字段（设计 §7.2，会话级参与者 0.2.0）：participants:2 是加法字段——
+ * 响应存在但缺字段＝旧版/不支持；无响应＝未知（可达性由扫描侧判定，不归本层）。
+ * 发现层校验不因该字段拒收旧版对端（发现仍按 v:1 互通），协作准入由协作域 cap 闸门拒绝。 */
+export const PARTICIPANTS_CAPABILITY = 2;
+
+export function isParticipantsCapability(value) {
+  return value === PARTICIPANTS_CAPABILITY;
+}
+
+/** 探测/敲门/加入/解析应答是否显式声明支持会话级参与者。 */
+export function supportsParticipants(datagram) {
+  return isPlainObject(datagram) && isParticipantsCapability(datagram.participants);
+}
+
+/** 出站发现报文的加法字段：只在构造侧叠加，不改变旧字段语义。 */
+export function withParticipantsCapability(datagram) {
+  return { ...datagram, participants: PARTICIPANTS_CAPABILITY };
 }
 
 /* 解析应答的体积整形（沿加入应答同族：序列化后 ≤ MAX_DATAGRAM_BYTES，含信封）：
@@ -213,7 +240,7 @@ function validateTypeSpecific(frame) {
   }
   const collabRule = COLLAB_PAYLOAD_RULES[frame.type];
   if (collabRule !== undefined) {
-    return collabRule(frame.payload);
+    return collabRule(frame.payload, frame);
   }
   return { ok: true };
 }
@@ -409,6 +436,28 @@ function isId(value) {
   return typeof value === 'string' && ID_PATTERN.test(value);
 }
 
+function isVersion(value) {
+  return Number.isInteger(value) && value >= 1;
+}
+
+/** 任期编号（设计 §2A.1）：1..2^31−1 的整数；到顶拒绝变更、不回绕。 */
+export function isManagerTerm(value) {
+  return Number.isInteger(value) && value >= 1 && value <= MAX_MANAGER_TERM;
+}
+
+/* 席位引用（自动移交/站长变更的来源与目标）：instanceId + sessionId；identityName 可选但须可呈现。 */
+function isSeatRef(value) {
+  if (!isPlainObject(value) || !isId(value.instanceId) || !isId(value.sessionId)) {
+    return false;
+  }
+  return value.identityName === undefined || isIdentityName(value.identityName);
+}
+
+/* 席位身份（名单行 / 站长）：instanceId + sessionId + identityName。 */
+function isSeatPeer(value) {
+  return isSeatRef(value) && isIdentityName(value.identityName);
+}
+
 /** 端口范围判定（1–65535 整数）：协议入站校验与本地文件读取共用同一判据。
  * @param {*} value
  * @returns {value is number} */
@@ -440,7 +489,13 @@ function isCollabCount(value) {
 
 /* —— 协作域载荷形态（协作核心 + 治理与韧性）：本层只判形态（字段完整性 / 类型 / 长度边界 / 数值范围）；
  * 语义裁定（名单含本机、状态是否允许、来源是否现任站长）在协作层。上限值服务呈现链与会话注入链的稳健性。 */
-export const MAX_COLLAB_MEMBERS = 32;
+/* 活跃席位上限（设计 §2.1/§2.5）：managed 协议硬顶 32；forum 软顶 16（按活跃会话计，历史行不占）。
+ * MAX_COLLAB_MEMBERS 是 0.1.x 的退役名，保留为别名供未迁移调用点继续编译。 */
+export const MAX_ACTIVE_SEATS = 32;
+export const MAX_FORUM_ACTIVE_SEATS = 16;
+export const MAX_COLLAB_MEMBERS = MAX_ACTIVE_SEATS;
+/* 任期内序上界（设计 §2A.1 / §6.3）：2^31−1 防伪造 term 永久占优；到顶拒绝变更，不回绕。 */
+export const MAX_MANAGER_TERM = 2147483647;
 export const MAX_TOPIC_CHARS = 200;
 export const MAX_MESSAGE_TEXT_CHARS = 4000;
 export const MAX_REASON_CHARS = 200;
@@ -487,6 +542,8 @@ const COLLAB_PAYLOAD_RULES = {
   'join-request': validateJoinRequestPayload,
   'join-grant': validateJoinGrantPayload,
   'join-deny': validateJoinDenyPayload,
+  'join-confirm': validateJoinConfirmPayload,
+  'seat-presence': validateSeatPresencePayload,
   'history-request': validateHistoryRequestPayload,
   'history-bundle': validateHistoryBundlePayload,
   end: validateOptionalObjectPayload,
@@ -497,6 +554,24 @@ function validateInvitePayload(payload) {
   if (!isPlainObject(payload)) {
     return refuse('invite 缺少 payload');
   }
+  const baseIssue = inviteBaseRejection(payload);
+  if (baseIssue !== null) {
+    return baseIssue;
+  }
+  const members = validateMemberList(payload.members, 'invite.members');
+  if (!members.ok) {
+    return members;
+  }
+  const extrasIssue = inviteExtrasRejection(payload);
+  if (extrasIssue !== null) {
+    return extrasIssue;
+  }
+  /* endpoints（可选加法字段，讨论邀请携带）：现成员端点表，被邀者据此取得入群所需的寻址信息。
+   * 缺省不拒（managed 与旧版邀请不带）；存在则逐项过端点形态。 */
+  return optionalInviteEndpointsRejection(payload.endpoints);
+}
+
+function inviteBaseRejection(payload) {
   if (payload.mode !== undefined && !isCollabMode(payload.mode)) {
     return refuse(`invite.mode 非法（可选值：${COLLAB_MODES.join(' / ')}；缺省 ${DEFAULT_COLLAB_MODE}）`);
   }
@@ -506,19 +581,58 @@ function validateInvitePayload(payload) {
   if (!isPresentationText(payload.topic, MAX_TOPIC_CHARS)) {
     return refuse(`invite.topic 非法（≤${MAX_TOPIC_CHARS} 字符的呈现文本）`);
   }
-  const members = validateMemberList(payload.members, 'invite.members');
-  if (!members.ok) {
-    return members;
+  return null;
+}
+
+function inviteExtrasRejection(payload) {
+  /* managed 邀请簿记键（forum 不生成、不返回 inviteId——D18）：可选，存在则过标识判据。 */
+  if (payload.inviteId !== undefined && !isId(payload.inviteId)) {
+    return refuse('invite.inviteId 非法（1–64 位字母数字与连字符）');
   }
-  /* originator（可选加法字段，讨论邀请携带；设计 §5.1/§5.3）：发起人实例标识（= 中继归属，
-   * 与「邀请者引用」不同字段——邀请者≠发起人，中继归属不得由邀请者推断）。缺省不拒
-   * （旧版对端形态——接收侧按「中继未知」处理，投递降级直投）；存在则须为完整身份对。 */
+  const targets = validateInviteTargets(payload.targets);
+  if (!targets.ok) {
+    return targets;
+  }
+  /* originator（可选加法字段，讨论邀请携带）：发起人实例标识（= 中继归属，与「邀请者引用」
+   * 不同字段——邀请者≠发起人，中继归属不得由邀请者推断）；存在则须为完整身份对。 */
   if (payload.originator !== undefined && !isPeerShape(payload.originator)) {
     return refuse('invite.originator 非法（需 instanceId + identityName 的发起人标识）');
   }
-  /* endpoints（可选加法字段，讨论邀请携带）：现成员端点表，被邀者据此取得入群所需的寻址信息。
-   * 缺省不拒（managed 与旧版邀请不带）；存在则逐项过端点形态。 */
-  return optionalInviteEndpointsRejection(payload.endpoints);
+  return null;
+}
+
+/* 邀请目标机器（设计 §2.2）：不要求目标席位已在 members 中。唯一性键 (instanceId,targetSessionId ?? '')；
+ * targetSessionId 缺省＝不指名邀请（目标机全部活跃会话）。 */
+function validateInviteTargets(targets) {
+  if (targets === undefined) {
+    return { ok: true };
+  }
+  if (!Array.isArray(targets) || targets.length < 1 || targets.length > MAX_ACTIVE_SEATS) {
+    return refuse(`invite.targets 须为 1–${MAX_ACTIVE_SEATS} 项的目标列表`);
+  }
+  const seen = new Set();
+  for (const target of targets) {
+    const rejection = inviteTargetRejection(target);
+    if (rejection !== null) {
+      return rejection;
+    }
+    const key = `${target.instanceId}\u0000${target.targetSessionId ?? ''}`;
+    if (seen.has(key)) {
+      return refuse('invite.targets 含重复目标（instanceId + targetSessionId）');
+    }
+    seen.add(key);
+  }
+  return { ok: true };
+}
+
+function inviteTargetRejection(target) {
+  if (!isPlainObject(target) || !isId(target.instanceId)) {
+    return refuse('invite.targets 条目非法（需 instanceId）');
+  }
+  if (target.targetSessionId !== undefined && !isId(target.targetSessionId)) {
+    return refuse('invite.targets.targetSessionId 非法（1–64 位字母数字与连字符）');
+  }
+  return null;
 }
 
 function optionalInviteEndpointsRejection(endpoints) {
@@ -528,24 +642,23 @@ function optionalInviteEndpointsRejection(endpoints) {
   return bundleEndpointsRejection(endpoints, 'invite.endpoints') ?? { ok: true };
 }
 
-/* 名单形态（invite / freeze / unfreeze / decision 共用）：2–上限项、每项 instanceId 合法且唯一；
- * freeze 场景只需实例标识（用于交集匹配），invite 场景额外要求身份名可呈现。 */
+/* 名单形态（invite / freeze / unfreeze / decision 共用）：1–32 项席位条目
+ * {instanceId,sessionId,identityName}；唯一性键 (instanceId,sessionId)——同机多会话各自成席（D13）。
+ * invite.members 只须含发起人，不要求目标席位在名单中（目标机器另用 targets 描述）。 */
 function validateMemberList(members, label) {
-  if (!Array.isArray(members) || members.length < 2 || members.length > MAX_COLLAB_MEMBERS) {
-    return refuse(`${label} 须为 2–${MAX_COLLAB_MEMBERS} 项的名单`);
+  if (!Array.isArray(members) || members.length < 1 || members.length > MAX_ACTIVE_SEATS) {
+    return refuse(`${label} 须为 1–${MAX_ACTIVE_SEATS} 项的席位名单`);
   }
   const seen = new Set();
   for (const member of members) {
-    if (!isPlainObject(member) || !isId(member.instanceId)) {
-      return refuse(`${label} 条目非法（需 instanceId）`);
+    if (!isPlainObject(member) || !isId(member.instanceId) || !isId(member.sessionId) || !isIdentityName(member.identityName)) {
+      return refuse(`${label} 条目非法（需 instanceId + sessionId + identityName 的席位条目）`);
     }
-    if (label === 'invite.members' && !isIdentityName(member.identityName)) {
-      return refuse('invite.members 条目非法（需 identityName）');
+    const key = `${member.instanceId}\u0000${member.sessionId}`;
+    if (seen.has(key)) {
+      return refuse(`${label} 名单含重复席位标识（instanceId + sessionId）`);
     }
-    if (seen.has(member.instanceId)) {
-      return refuse(`${label} 名单含重复实例标识`);
-    }
-    seen.add(member.instanceId);
+    seen.add(key);
   }
   return { ok: true };
 }
@@ -680,11 +793,9 @@ function validateLeavePayload(payload) {
   return validateReasonPayload(payload);
 }
 
-/* —— 会话主动加入三帧（会话级管理设计 §2）：申请 / 批准 / 拒绝 —— */
+/* —— 会话主动加入四帧（设计 §4.4）：申请 / 批准 / 拒绝 / 确认 —— */
 
-/* 申请：只携目标会话标识（会话短码在协议面之外——短码只是对外表示，帧内一律全标识）。
- * 批准：回带目标会话标识（确认授予对象）+ 申请帧的 msgId（决定与申请对上，拒收无主决定）；
- * 拒绝：只回带申请帧 msgId + 可选原因（形态同 decline / stop 的原因判据）。 */
+/* 申请：只携目标会话标识（会话短码在协议面之外——短码只是对外表示，帧内一律全标识）。 */
 function validateJoinRequestPayload(payload) {
   if (!isPlainObject(payload) || !isId(payload.sessionId)) {
     return refuse('join-request.sessionId 非法（1–64 位字母数字与连字符）');
@@ -692,21 +803,89 @@ function validateJoinRequestPayload(payload) {
   return { ok: true };
 }
 
+/* 批准：joinId + 站长席位 + 签发时 term + grantVersion；sessionId 为可选回带（确认授予对象）。 */
 function validateJoinGrantPayload(payload) {
-  if (!isPlainObject(payload) || !isId(payload.sessionId)) {
-    return refuse('join-grant.sessionId 非法（1–64 位字母数字与连字符）');
+  if (!isPlainObject(payload) || !isId(payload.joinId)) {
+    return refuse('join-grant.joinId 非法（1–64 位字母数字与连字符）');
   }
-  if (!isId(payload.reqMsgId)) {
-    return refuse('join-grant.reqMsgId 非法（申请帧的 msgId）');
+  if (!isSeatPeer(payload.manager)) {
+    return refuse('join-grant.manager 非法（需 instanceId + sessionId + identityName 的站长席位）');
+  }
+  if (!isManagerTerm(payload.managerTerm)) {
+    return refuse(`join-grant.managerTerm 非法（1–${MAX_MANAGER_TERM} 的整数）`);
+  }
+  if (!isVersion(payload.version)) {
+    return refuse('join-grant.version 非法（≥1 的整数）');
+  }
+  if (payload.sessionId !== undefined && !isId(payload.sessionId)) {
+    return refuse('join-grant.sessionId 非法（1–64 位字母数字与连字符）');
   }
   return { ok: true };
 }
 
+/* 拒绝：joinId + 原因（申请侧据此回滚）；reason 枚举是两段式入席的失败路径契约。 */
+const JOIN_DENY_REASONS = ['expired', 'aborted', 'manager-changed', 'capacity'];
+
 function validateJoinDenyPayload(payload) {
-  if (!isPlainObject(payload) || !isId(payload.reqMsgId)) {
-    return refuse('join-deny.reqMsgId 非法（申请帧的 msgId）');
+  if (!isPlainObject(payload) || !isId(payload.joinId)) {
+    return refuse('join-deny.joinId 非法（1–64 位字母数字与连字符）');
   }
-  return validateReasonPayload(payload);
+  if (typeof payload.reason !== 'string' || !JOIN_DENY_REASONS.includes(payload.reason)) {
+    return refuse(`join-deny.reason 非法（${JOIN_DENY_REASONS.join(' / ')}）`);
+  }
+  if (payload.managerTerm !== undefined && !isManagerTerm(payload.managerTerm)) {
+    return refuse(`join-deny.managerTerm 非法（1–${MAX_MANAGER_TERM} 的整数）`);
+  }
+  return { ok: true };
+}
+
+/* 确认：申请人回执 joinId + 其持有的 term/version；grantVersion 只作记录，版本推进由接收侧回快照。 */
+function validateJoinConfirmPayload(payload) {
+  if (!isPlainObject(payload) || !isId(payload.joinId)) {
+    return refuse('join-confirm.joinId 非法（1–64 位字母数字与连字符）');
+  }
+  if (!isManagerTerm(payload.managerTerm)) {
+    return refuse(`join-confirm.managerTerm 非法（1–${MAX_MANAGER_TERM} 的整数）`);
+  }
+  if (!isVersion(payload.version)) {
+    return refuse('join-confirm.version 非法（≥1 的整数）');
+  }
+  return { ok: true };
+}
+
+/* —— 席位心跳（设计 §2A.9）：本机在该协作的活跃会话列表 —— */
+function validateSeatPresencePayload(payload, frame) {
+  if (!isPlainObject(payload) || !isId(payload.collabId) || !isId(payload.instanceId)) {
+    return refuse('seat-presence 需 collabId + instanceId');
+  }
+  if (payload.collabId !== frame.collabId || payload.instanceId !== frame.from.instanceId) {
+    return refuse('seat-presence 的 collabId / instanceId 必须与帧一致');
+  }
+  const sessionsIssue = seatPresenceSessionsRejection(payload.sessions);
+  if (sessionsIssue !== null) {
+    return sessionsIssue;
+  }
+  if (!isTimestamp(payload.sentAt)) {
+    return refuse('seat-presence.sentAt 非法（时间戳）');
+  }
+  return { ok: true };
+}
+
+function seatPresenceSessionsRejection(sessions) {
+  if (!Array.isArray(sessions) || sessions.length < 1 || sessions.length > MAX_ACTIVE_SEATS) {
+    return refuse(`seat-presence.sessions 须为 1–${MAX_ACTIVE_SEATS} 项的会话列表`);
+  }
+  const seen = new Set();
+  for (const sessionId of sessions) {
+    if (!isId(sessionId)) {
+      return refuse('seat-presence.sessions 含非法会话标识');
+    }
+    if (seen.has(sessionId)) {
+      return refuse('seat-presence.sessions 含重复会话标识');
+    }
+    seen.add(sessionId);
+  }
+  return null;
 }
 
 /* 同步游标（排他语义的复合位置）：(ts, postId)——只由拉取推进；同刻按 postId 序兜底。 */
@@ -955,7 +1134,7 @@ function validateNoticePayload(payload) {
     return refuse('notice 缺少 payload');
   }
   if (typeof payload.event !== 'string' || !Object.hasOwn(NOTICE_EVENT_RULES, payload.event)) {
-    return refuse('notice.event 非法（本版：established / roster / snapshot-stored / manager-changed / handshake / merge-request / merge-outcome）');
+    return refuse('notice.event 非法（本版：established / roster / snapshot-stored / manager-changed / auto-offer / handshake / merge-request / merge-outcome）');
   }
   return NOTICE_EVENT_RULES[payload.event](payload);
 }
@@ -965,6 +1144,7 @@ const NOTICE_EVENT_RULES = {
   roster: validateVersionedNotice,
   'snapshot-stored': validateVersionedNotice,
   'manager-changed': validateManagerChangedNotice,
+  'auto-offer': validateAutoOfferNotice,
   handshake: validateHandshakeNotice,
   'merge-request': validateMergeRequestNotice,
   'merge-outcome': validateMergeOutcomeNotice,
@@ -978,27 +1158,142 @@ function validateVersionedNotice(payload) {
   return { ok: true };
 }
 
-/* 站长已变更（移交完成后旧席位广播）：新站长身份与交接版本均必填；endpoint（新站长端点）
- * 为可选加法字段——随通告下发以解除「只与旧站长通信过的成员」与新站长的端点互盲。 */
+/* 站长变更（设计 §2A.1 受理表）：任期、版本、来源、前任、窗口与摘要均为受理依据；
+ * 本层只判字段形态与按 via 的必备面，受理裁定（A1–A14）在协作层。 */
+const MANAGER_CHANGE_VIAS = ['initial', 'handover', 'auto', 'takeover', 'takeover-manual'];
+
 function validateManagerChangedNotice(payload) {
-  if (!Number.isInteger(payload.version) || payload.version < 1) {
+  const coreIssue = managerChangeCoreRejection(payload);
+  if (coreIssue !== null) {
+    return coreIssue;
+  }
+  const markIssue = managerChangeMarkRejection(payload);
+  if (markIssue !== null) {
+    return markIssue;
+  }
+  const windowIssue = managerChangeWindowRejection(payload);
+  if (windowIssue !== null) {
+    return windowIssue;
+  }
+  return managerChangeViaRejection(payload);
+}
+
+function managerChangeCoreRejection(payload) {
+  if (!isManagerTerm(payload.term)) {
+    return refuse(`manager-changed.term 非法（1–${MAX_MANAGER_TERM} 的整数）`);
+  }
+  if (!isVersion(payload.version)) {
     return refuse('manager-changed.version 非法（≥1 的整数）');
   }
-  if (!isPeerShape(payload.manager)) {
-    return refuse('manager-changed.manager 非法（需 instanceId + identityName）');
+  if (!isSeatPeer(payload.manager)) {
+    return refuse('manager-changed.manager 非法（需 instanceId + sessionId + identityName 的站长席位）');
   }
-  return optionalEndpointRejection(payload.endpoint, 'manager-changed.endpoint');
+  if (typeof payload.via !== 'string' || !MANAGER_CHANGE_VIAS.includes(payload.via)) {
+    return refuse(`manager-changed.via 非法（${MANAGER_CHANGE_VIAS.join(' / ')}）`);
+  }
+  if (!isSeatRef(payload.prevManager)) {
+    return refuse('manager-changed.prevManager 非法（需 instanceId + sessionId 的前任席位）');
+  }
+  return null;
 }
 
-/* 可选端点字段（治理载荷的加法扩展；旧帧无此字段行为不变）：结构底线在此（原样拒收超限
- * 或形态不符），地址的 IP 字面量语义由协作层在采用前复核（协议层不引 node:net）。 */
-function optionalEndpointRejection(endpoint, label) {
-  if (endpoint === undefined) {
-    return { ok: true };
+function managerChangeMarkRejection(payload) {
+  if (payload.offerId !== undefined && !isId(payload.offerId)) {
+    return refuse('manager-changed.offerId 非法（1–64 位字母数字与连字符）');
   }
-  return endpointEntryRejection(endpoint, label);
+  if (!isTimestamp(payload.effectiveAt)) {
+    return refuse('manager-changed.effectiveAt 非法（时间戳）');
+  }
+  if (typeof payload.digest !== 'string' || !DIGEST_PATTERN.test(payload.digest)) {
+    return refuse('manager-changed.digest 非法（64 位小写十六进制）');
+  }
+  return null;
 }
 
+function managerChangeWindowRejection(payload) {
+  if (payload.windowBaseTerm !== undefined && !isManagerTerm(payload.windowBaseTerm)) {
+    return refuse(`manager-changed.windowBaseTerm 非法（1–${MAX_MANAGER_TERM} 的整数）`);
+  }
+  if (payload.windowEndsAt !== undefined && !isTimestamp(payload.windowEndsAt)) {
+    return refuse('manager-changed.windowEndsAt 非法（时间戳）');
+  }
+  if (payload.authorizedAt !== undefined && !isTimestamp(payload.authorizedAt)) {
+    return refuse('manager-changed.authorizedAt 非法（时间戳）');
+  }
+  return null;
+}
+
+/* 按 via 的必备面：handover/auto 带 offerId；auto 带窗口结束时刻；takeover 带窗口基准与授权时刻；
+ * takeover-manual 带授权时刻；端点除 initial 外必填（解除新旧站长端点互盲）。 */
+function managerChangeViaRejection(payload) {
+  const endpointIssue = managerChangeEndpointRejection(payload);
+  if (endpointIssue !== null) {
+    return endpointIssue;
+  }
+  const offerIssue = managerChangeOfferRejection(payload);
+  if (offerIssue !== null) {
+    return offerIssue;
+  }
+  const authorizationIssue = managerChangeAuthorizationRejection(payload);
+  return authorizationIssue ?? { ok: true };
+}
+
+function managerChangeOfferRejection(payload) {
+  if ((payload.via === 'handover' || payload.via === 'auto') && !isId(payload.offerId)) {
+    return refuse('manager-changed.offerId 必填（handover / auto）');
+  }
+  if (payload.via === 'auto' && !isTimestamp(payload.windowEndsAt)) {
+    return refuse('manager-changed.windowEndsAt 必填（auto）');
+  }
+  return null;
+}
+
+function managerChangeAuthorizationRejection(payload) {
+  if (payload.via === 'takeover' && (!isManagerTerm(payload.windowBaseTerm) || !isTimestamp(payload.authorizedAt))) {
+    return refuse('manager-changed 的 takeover 需 windowBaseTerm + authorizedAt');
+  }
+  if (payload.via === 'takeover-manual' && !isTimestamp(payload.authorizedAt)) {
+    return refuse('manager-changed 的 takeover-manual 需 authorizedAt');
+  }
+  return null;
+}
+
+function managerChangeEndpointRejection(payload) {
+  if (payload.endpoint === undefined && payload.via === 'initial') {
+    return null;
+  }
+  if (!isPlainObject(payload.endpoint)) {
+    return refuse('manager-changed.endpoint 必填（新站长端点）');
+  }
+  const checked = endpointEntryRejection(payload.endpoint, 'manager-changed.endpoint');
+  return checked.ok ? null : checked;
+}
+
+/* 自动移交广播（原站长核发 offer 时）：接收侧按 offerId 暂存，A2 的 manager-changed 必须匹配。 */
+function validateAutoOfferNotice(payload) {
+  if (!isId(payload.offerId)) {
+    return refuse('auto-offer.offerId 非法（1–64 位字母数字与连字符）');
+  }
+  if (!isSeatRef(payload.prevManager)) {
+    return refuse('auto-offer.prevManager 非法（需 instanceId + sessionId）');
+  }
+  if (!isSeatRef(payload.target)) {
+    return refuse('auto-offer.target 非法（需 instanceId + sessionId）');
+  }
+  if (!isManagerTerm(payload.baseTerm)) {
+    return refuse(`auto-offer.baseTerm 非法（1–${MAX_MANAGER_TERM} 的整数）`);
+  }
+  if (!isVersion(payload.version)) {
+    return refuse('auto-offer.version 非法（≥1 的整数）');
+  }
+  if (!isTimestamp(payload.expiresAt)) {
+    return refuse('auto-offer.expiresAt 非法（时间戳）');
+  }
+  return { ok: true };
+}
+
+/* 端点形态底线在此（address 字符串 + 端口范围），地址的 IP 字面量语义由协作层在采用前复核
+ * （协议层不引 node:net）。 */
 function endpointEntryRejection(endpoint, label) {
   if (!isPlainObject(endpoint) || typeof endpoint.address !== 'string' || endpoint.address === '' || endpoint.address.length > 64) {
     return refuse(`${label} 非法（需 address 字符串，≤64 字符）`);
@@ -1009,21 +1304,50 @@ function endpointEntryRejection(endpoint, label) {
   return { ok: true };
 }
 
-/* 握手对表（启动 / 网络恢复 / 治理通告后的收敛机制）：角色、版本、在途或生效抢接视图、回帧标记。 */
+/* 握手对表（设计 §2A.1/§7.1）：应答自己的 (managerTerm, version, manager, managerEndpoint?)；
+ * manager 可为 null（无台账），managerEndpoint 随应答下发以解除端点互盲。takeover 为旧版兼容观测字段。 */
 function validateHandshakeNotice(payload) {
-  if (payload.role !== 'manager' && payload.role !== 'member') {
-    return refuse('handshake.role 非法（manager / member）');
+  const baseIssue = handshakeBaseRejection(payload);
+  if (baseIssue !== null) {
+    return baseIssue;
   }
-  if (payload.version !== null && (!Number.isInteger(payload.version) || payload.version < 1)) {
-    return refuse('handshake.version 非法（null 或 ≥1 的整数）');
-  }
-  if (payload.takeover !== null && !isTakeoverRecord(payload.takeover)) {
-    return refuse('handshake.takeover 非法（null 或抢接记录）');
+  const optionalIssue = handshakeOptionalRejection(payload);
+  if (optionalIssue !== null) {
+    return optionalIssue;
   }
   if (payload.reply !== true && payload.reply !== false) {
     return refuse('handshake.reply 非法（布尔）');
   }
   return { ok: true };
+}
+
+function handshakeBaseRejection(payload) {
+  if (payload.role !== 'manager' && payload.role !== 'member') {
+    return refuse('handshake.role 非法（manager / member）');
+  }
+  if (!isManagerTerm(payload.managerTerm)) {
+    return refuse(`handshake.managerTerm 非法（1–${MAX_MANAGER_TERM} 的整数）`);
+  }
+  if (payload.version !== null && !isVersion(payload.version)) {
+    return refuse('handshake.version 非法（null 或 ≥1 的整数）');
+  }
+  if (payload.manager !== null && !isSeatPeer(payload.manager)) {
+    return refuse('handshake.manager 非法（null 或 instanceId + sessionId + identityName 的站长席位）');
+  }
+  return null;
+}
+
+function handshakeOptionalRejection(payload) {
+  if (payload.managerEndpoint !== undefined) {
+    const endpointIssue = endpointEntryRejection(payload.managerEndpoint, 'handshake.managerEndpoint');
+    if (!endpointIssue.ok) {
+      return endpointIssue;
+    }
+  }
+  if (payload.takeover !== undefined && payload.takeover !== null && !isTakeoverRecord(payload.takeover)) {
+    return refuse('handshake.takeover 非法（null 或抢接记录）');
+  }
+  return null;
 }
 
 /* 抢接记录（handshake 与 takeover-init report 共用）：在途或生效相位 + 候选身份 + 基准版本。 */
@@ -1255,17 +1579,39 @@ function isPeerShape(peer) {
   return isPlainObject(peer) && isId(peer.instanceId) && isIdentityName(peer.identityName);
 }
 
-function validateSnapshotPayload(payload) {
+/* 快照（设计 §2A.1/§7.1）：请求携本方 (managerTerm,version)，可带 catchup 目的；
+ * 数据帧的台账必须与帧的 managerTerm/version/managerWindow/collabId 自洽——不一致按损坏拒收。 */
+function validateSnapshotPayload(payload, frame) {
   if (!isPlainObject(payload)) {
     return refuse('snapshot 缺少 payload');
   }
+  if (payload.purpose !== undefined && payload.purpose !== 'catchup') {
+    return refuse('snapshot.purpose 非法（仅 catchup）');
+  }
   if (payload.kind === 'request') {
-    return { ok: true };
+    return snapshotRequestRejection(payload);
   }
   if (payload.kind !== 'data') {
     return refuse('snapshot.kind 非法（request / data）');
   }
-  if (!Number.isInteger(payload.version) || payload.version < 1) {
+  return snapshotDataRejection(payload, frame);
+}
+
+function snapshotRequestRejection(payload) {
+  if (!isManagerTerm(payload.managerTerm)) {
+    return refuse(`snapshot.managerTerm 非法（1–${MAX_MANAGER_TERM} 的整数）`);
+  }
+  if (!isVersion(payload.version)) {
+    return refuse('snapshot.version 非法（≥1 的整数）');
+  }
+  return { ok: true };
+}
+
+function snapshotDataRejection(payload, frame) {
+  if (!isManagerTerm(payload.managerTerm)) {
+    return refuse(`snapshot.managerTerm 非法（1–${MAX_MANAGER_TERM} 的整数）`);
+  }
+  if (!isVersion(payload.version)) {
     return refuse('snapshot.version 非法（≥1 的整数）');
   }
   if (typeof payload.digest !== 'string' || !DIGEST_PATTERN.test(payload.digest)) {
@@ -1274,7 +1620,38 @@ function validateSnapshotPayload(payload) {
   if (!isPlainObject(payload.ledger)) {
     return refuse('snapshot.ledger 非法（须为台账对象）');
   }
+  if (payload.managerWindow !== undefined && !isManagerWindowShape(payload.managerWindow)) {
+    return refuse('snapshot.managerWindow 非法（需 windowBaseTerm + windowEndsAt）');
+  }
+  return snapshotConsistencyRejection(payload, frame);
+}
+
+function snapshotConsistencyRejection(payload, frame) {
+  const ledger = payload.ledger;
+  if (ledger.managerTerm !== payload.managerTerm || ledger.version !== payload.version) {
+    return refuse('snapshot 台账的 managerTerm / version 与帧不一致');
+  }
+  if (ledger.collabId !== undefined && ledger.collabId !== frame.collabId) {
+    return refuse('snapshot 台账的 collabId 与帧不一致');
+  }
+  if (payload.managerWindow !== undefined && !sameManagerWindow(payload.managerWindow, ledger.managerWindow)) {
+    return refuse('snapshot.managerWindow 与台账不一致');
+  }
   return { ok: true };
+}
+
+function isManagerWindowShape(value) {
+  return isPlainObject(value) && isManagerTerm(value.windowBaseTerm) && isTimestamp(value.windowEndsAt);
+}
+
+function sameManagerWindow(left, right) {
+  if (left === undefined && right === undefined) {
+    return true;
+  }
+  if (!isPlainObject(left) || !isPlainObject(right)) {
+    return false;
+  }
+  return left.windowBaseTerm === right.windowBaseTerm && left.windowEndsAt === right.windowEndsAt;
 }
 
 function refuse(reason) {

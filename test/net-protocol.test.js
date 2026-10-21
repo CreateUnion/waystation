@@ -1,25 +1,33 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  COLLAB_CAPABILITY,
   DELIVERY_EXEMPT_TYPES,
   DIGEST_PATTERN,
   GOVERNANCE_TYPES,
   ID_PATTERN,
+  MAX_ACTIVE_SEATS,
   MAX_COLLAB_COUNT,
   MAX_COLLAB_MEMBERS,
   MAX_DATAGRAM_BYTES,
+  MAX_FORUM_ACTIVE_SEATS,
   MAX_FRAME_BYTES,
+  MAX_MANAGER_TERM,
   MAX_MESSAGE_TEXT_CHARS,
   MAX_TOPIC_CHARS,
   MESSAGE_TYPES,
+  PARTICIPANTS_CAPABILITY,
   POST_KINDS,
   PROTOCOL_VERSION,
   TRANSPORT_TYPES,
   fitJoinResolveAck,
   isIdentityName,
+  isParticipantsCapability,
   isPresentationText,
   newMsgId,
   parseFrame,
+  supportsParticipants,
+  withParticipantsCapability,
   validateJoinAck,
   validateJoinKnock,
   validateJoinResolve,
@@ -39,6 +47,7 @@ function envelope(overrides = {}) {
     type: 'reply',
     from: SELF,
     collabId: 'collab-1',
+    cap: 2,
     ts: new Date().toISOString(),
     payload: { text: '你好' },
     ...overrides,
@@ -159,6 +168,21 @@ test('发现报文：探测/应答校验（含 collabCount 数值范围）', () 
   assert.equal(validateProbeAck({ ...ack, collabCount: undefined }).ok, false);
 });
 
+test('发现面 participants 能力字段 helper：2 为支持、缺字段为不支持、加法构造不改旧字段', () => {
+  assert.equal(PARTICIPANTS_CAPABILITY, 2);
+  assert.equal(isParticipantsCapability(2), true);
+  assert.equal(isParticipantsCapability(undefined), false);
+  assert.equal(isParticipantsCapability(1), false);
+  assert.equal(isParticipantsCapability('2'), false);
+  assert.equal(supportsParticipants({ participants: 2 }), true);
+  assert.equal(supportsParticipants({}), false, '响应缺字段＝旧版不支持');
+  assert.equal(supportsParticipants(null), false);
+  const ack = withParticipantsCapability({ v: 1, type: 'probe-ack', instanceId: 'inst-a', identityName: '主机甲', collabCount: 0 });
+  assert.equal(ack.participants, 2);
+  assert.equal(ack.type, 'probe-ack');
+  assert.equal(validateProbeAck(ack).ok, true, '加法字段不影响发现层校验');
+});
+
 test('发现报文根节点非对象（null / 字符串）：validateProbe / validateProbeAck 拒绝', () => {
   assert.equal(validateProbe(null).ok, false);
   assert.equal(validateProbeAck('text').ok, false);
@@ -170,19 +194,40 @@ test('发现报文类型不匹配（探测/应答互收）：拒绝', () => {
   assert.equal(validateProbeAck({ ...ackShape, type: 'probe' }).ok, false);
 });
 
-test('常量：版本、类型集、治理集、传输集与体积上限', () => {
+test('常量：版本、类型集（会话级两型）、治理集、传输集、能力与上限', () => {
   assert.equal(PROTOCOL_VERSION, 1);
-  assert.equal(MESSAGE_TYPES.length, 31);
-  for (const type of ['invite', 'approve', 'decline', 'withdraw', 'topic', 'task', 'progress', 'issue', 'stop', 'reply', 'freeze', 'unfreeze', 'decision', 'handover', 'takeover-init', 'takeover', 'notice', 'leave', 'end', 'ping', 'pong', 'delivery-status', 'snapshot', 'post', 'join', 'join-request', 'join-grant', 'join-deny', 'history-request', 'history-bundle', 'ack']) {
+  assert.equal(COLLAB_CAPABILITY, 2);
+  assert.equal(MESSAGE_TYPES.length, 33);
+  for (const type of ['invite', 'approve', 'decline', 'withdraw', 'topic', 'task', 'progress', 'issue', 'stop', 'reply', 'freeze', 'unfreeze', 'decision', 'handover', 'takeover-init', 'takeover', 'notice', 'leave', 'end', 'ping', 'pong', 'delivery-status', 'snapshot', 'post', 'join', 'join-request', 'join-grant', 'join-deny', 'join-confirm', 'seat-presence', 'history-request', 'history-bundle', 'ack']) {
     assert.ok(MESSAGE_TYPES.includes(type), type);
   }
   assert.deepEqual(GOVERNANCE_TYPES, ['freeze', 'unfreeze', 'decision', 'takeover-init', 'takeover']);
   assert.deepEqual(TRANSPORT_TYPES, ['ping', 'pong', 'ack']);
   assert.deepEqual(POST_KINDS, ['topic', 'task', 'progress', 'issue', 'stop', 'reply']);
+  assert.equal(MAX_ACTIVE_SEATS, 32);
+  assert.equal(MAX_FORUM_ACTIVE_SEATS, 16);
+  assert.equal(MAX_COLLAB_MEMBERS, MAX_ACTIVE_SEATS, '退役名保留为别名（既有模块仍引用）');
+  assert.equal(MAX_MANAGER_TERM, 2147483647);
   assert.equal(MAX_FRAME_BYTES, 1048576);
   assert.equal(MAX_DATAGRAM_BYTES, 512);
   assert.equal(ID_PATTERN.test('../x'), false);
   assert.equal(ID_PATTERN.test('a/b'), false);
+});
+
+test('能力闸门：协作域帧须 cap=2；缺失 / 低版本 / 非法值拒收并给明确 reason', () => {
+  assert.equal(validateMessage(envelope()).ok, true);
+  for (const cap of [undefined, 1, 3, '2', null]) {
+    const checked = validateMessage(envelope({ cap }));
+    assert.equal(checked.ok, false, String(cap));
+    assert.ok(checked.reason.includes('cap'), checked.reason);
+  }
+  assert.ok(validateMessage(envelope({ cap: undefined })).reason.includes('0.2.0'), '提示需 0.2.0+');
+});
+
+test('能力闸门：transport 帧（ping / pong / ack）豁免 cap', () => {
+  assert.equal(validateMessage(envelope({ type: 'ping', collabId: undefined, cap: undefined })).ok, true);
+  assert.equal(validateMessage(envelope({ type: 'pong', collabId: undefined, replyTo: newMsgId(), cap: undefined })).ok, true);
+  assert.equal(validateMessage(envelope({ type: 'ack', collabId: undefined, ackFor: newMsgId(), cap: undefined })).ok, true);
 });
 
 test('投递豁免集：治理五型 + 讨论 end/join/leave；拉取两件套不泛化豁免', () => {
@@ -206,6 +251,7 @@ function frameWith(overrides = {}) {
     type: 'reply',
     from: { instanceId: 'inst-a', identityName: '主机甲' },
     collabId: 'collab-1',
+    cap: 2,
     ts: new Date().toISOString(),
     payload: { text: '你好' },
     ...overrides,
@@ -268,17 +314,25 @@ function collabFrame(type, payload) {
   return frameWith({ type, payload });
 }
 
-test('协作域 invite：合法通过（中文名、主题、成员 2 项）', () => {
-  const members = [
-    { instanceId: 'inst-a', identityName: '主机甲' },
-    { instanceId: 'inst-b', identityName: '主机乙' },
-  ];
-  assert.equal(validateMessage(collabFrame('invite', { name: '联调项目', topic: '发布联调', members })).ok, true);
+/* 席位条目（invite / freeze / unfreeze / decision 名单共用）：instanceId + sessionId + identityName。 */
+function seatOf(instanceId, sessionId, identityName) {
+  return { instanceId, sessionId, identityName };
+}
+
+const SEAT_A = seatOf('inst-a', 'sess-a', '主机甲');
+const SEAT_B = seatOf('inst-b', 'sess-b', '主机乙');
+
+test('协作域 invite：合法通过（中文名、主题、席位名单 2 项 + targets）', () => {
+  assert.equal(validateMessage(collabFrame('invite', {
+    name: '联调项目',
+    topic: '发布联调',
+    members: [SEAT_A, SEAT_B],
+    targets: [{ instanceId: 'inst-b' }],
+  })).ok, true);
 });
 
 test('协作域 invite：mode 可选（缺省 = managed 旧行为）、词表内通过、词表外拒', () => {
-  const members = [{ instanceId: 'inst-a', identityName: '甲' }, { instanceId: 'inst-b', identityName: '乙' }];
-  const base = { name: '项目', topic: '主题', members };
+  const base = { name: '项目', topic: '主题', members: [SEAT_A, SEAT_B] };
   assert.equal(validateMessage(collabFrame('invite', base)).ok, true, '缺 mode（旧版对端）通过');
   assert.equal(validateMessage(collabFrame('invite', { ...base, mode: 'managed' })).ok, true);
   assert.equal(validateMessage(collabFrame('invite', { ...base, mode: 'forum' })).ok, true);
@@ -290,30 +344,58 @@ test('协作域 invite：mode 可选（缺省 = managed 旧行为）、词表内
 });
 
 test('协作域 invite：name 非法逐拒（控制字符 / 超 64 字符 / 空串 / 缺字段）', () => {
-  const members = [{ instanceId: 'inst-a', identityName: '甲' }, { instanceId: 'inst-b', identityName: '乙' }];
+  const members = [SEAT_A, SEAT_B];
   for (const name of ['甲\n乙', 'x'.repeat(65), '', undefined]) {
-    const checked = validateMessage(collabFrame('invite', { name, topic: '主题', members }));
-    assert.equal(checked.ok, false, String(name));
-    assert.ok(checked.reason.includes('invite'), checked.reason);
+    assert.equal(validateMessage(collabFrame('invite', { name, topic: '主题', members })).ok, false, String(name));
   }
 });
 
 test('协作域 invite：topic 非法逐拒（201 字符 / 零宽字符 / 缺字段）', () => {
-  const members = [{ instanceId: 'inst-a', identityName: '甲' }, { instanceId: 'inst-b', identityName: '乙' }];
+  const members = [SEAT_A, SEAT_B];
   for (const topic of ['x'.repeat(201), '主\u200b题', undefined]) {
     assert.equal(validateMessage(collabFrame('invite', { name: '项目', topic, members })).ok, false, String(topic));
   }
 });
 
-test('协作域 invite：members 形态逐拒（少于 2 / 超 32 / 重复实例标识 / 条目缺字段）', () => {
-  const two = [{ instanceId: 'inst-a', identityName: '甲' }, { instanceId: 'inst-b', identityName: '乙' }];
-  const many = Array.from({ length: 33 }, (raw, index) => ({ instanceId: `inst-${index}`, identityName: `主机-${index}` }));
-  const dup = [...two, { instanceId: 'inst-a', identityName: '别名' }];
-  const cases = [[two[0]], many, dup, [{ instanceId: 'inst-a' }, two[1]], 'not-an-array'];
-  for (const members of cases) {
+test('协作域 invite：members 为席位条目——下界 1、上界 32、同实例多会话可并存', () => {
+  const many = Array.from({ length: 33 }, (raw, index) => seatOf(`inst-${index}`, `sess-${index}`, `主机-${index}`));
+  const sameMachine = [SEAT_A, seatOf('inst-a', 'sess-a2', '主机甲')];
+  assert.equal(validateMessage(collabFrame('invite', { name: '项目', topic: '主题', members: [SEAT_A] })).ok, true, '只须含发起人');
+  assert.equal(validateMessage(collabFrame('invite', { name: '项目', topic: '主题', members: sameMachine })).ok, true);
+  assert.equal(validateMessage(collabFrame('invite', { name: '项目', topic: '主题', members: many.slice(0, 32) })).ok, true);
+  for (const members of [[], many, 'not-an-array']) {
     assert.equal(validateMessage(collabFrame('invite', { name: '项目', topic: '主题', members })).ok, false, JSON.stringify(members).slice(0, 40));
   }
   assert.equal(MAX_COLLAB_MEMBERS, 32);
+});
+
+test('协作域 invite：members 重复席位键 / 条目缺 sessionId 或 identityName 拒', () => {
+  const cases = [
+    [SEAT_A, SEAT_A],
+    [SEAT_A, { instanceId: 'inst-a', identityName: '主机甲' }],
+    [SEAT_A, { instanceId: 'inst-a', sessionId: 'sess-a2' }],
+    [SEAT_A, { instanceId: '../x', sessionId: 'sess-b', identityName: '乙' }],
+    [SEAT_A, { instanceId: 'inst-b', sessionId: 'bad id!', identityName: '乙' }],
+  ];
+  for (const members of cases) {
+    assert.equal(validateMessage(collabFrame('invite', { name: '项目', topic: '主题', members })).ok, false, JSON.stringify(members).slice(0, 60));
+  }
+});
+
+test('协作域 invite：targets 可选；唯一性键 (instanceId,targetSessionId ?? \'\')、条目形态受检', () => {
+  const base = { name: '项目', topic: '主题', members: [SEAT_A] };
+  assert.equal(validateMessage(collabFrame('invite', base)).ok, true, 'targets 缺省合法');
+  assert.equal(validateMessage(collabFrame('invite', { ...base, targets: [{ instanceId: 'inst-b' }, { instanceId: 'inst-b', targetSessionId: 'sess-b' }] })).ok, true);
+  const bad = [
+    [],
+    [{ instanceId: 'inst-b' }, { instanceId: 'inst-b' }],
+    [{ targetSessionId: 'sess-b' }],
+    [{ instanceId: 'inst-b', targetSessionId: 'bad id!' }],
+    'x',
+  ];
+  for (const targets of bad) {
+    assert.equal(validateMessage(collabFrame('invite', { ...base, targets })).ok, false, JSON.stringify(targets).slice(0, 60));
+  }
 });
 
 test('协作域 approve / end / leave：payload 省略或空对象通过、非对象拒', () => {
@@ -389,7 +471,7 @@ test('协作域 join / leave（讨论成员事件）：事件 id 与事件时刻
   assert.equal(validateMessage(collabFrame('leave', { ...stamp, reason: '退出' })).ok, true);
 });
 
-/* 会话主动加入三帧（会话级管理设计 §2）：申请 / 批准 / 拒绝——协作域帧，sessionId 与 reqMsgId 过标识判据。 */
+/* 会话主动加入四帧（会话级参与者设计 §4.4）：申请 / 批准 / 拒绝 / 确认——协作域帧，标识字段过 ID 判据。 */
 
 test('协作域 join-request：sessionId 必携且合法（缺 payload / 非对象 / 非标识逐项拒）', () => {
   assert.equal(validateMessage(collabFrame('join-request', { sessionId: 'sess-1' })).ok, true);
@@ -402,35 +484,73 @@ test('协作域 join-request：sessionId 必携且合法（缺 payload / 非对�
   assert.equal(validateMessage(collabFrame('join-request', [])).ok, false, 'payload 须为 JSON 对象');
 });
 
-test('协作域 join-grant：sessionId 与 reqMsgId 双必携（各逐项拒）', () => {
-  assert.equal(validateMessage(collabFrame('join-grant', { sessionId: 'sess-1', reqMsgId: 'msg-1' })).ok, true);
-  for (const sessionId of [undefined, 'bad id!', 42]) {
-    const checked = validateMessage(collabFrame('join-grant', { sessionId, reqMsgId: 'msg-1' }));
-    assert.equal(checked.ok, false, String(sessionId));
-    assert.ok(checked.reason.includes('join-grant.sessionId'), checked.reason);
+function joinGrantOf(overrides = {}) {
+  return {
+    joinId: 'join-1',
+    sessionId: 'sess-1',
+    manager: { instanceId: 'inst-a', sessionId: 'sess-a', identityName: '主机甲' },
+    managerTerm: 1,
+    version: 2,
+    ...overrides,
+  };
+}
+
+test('协作域 join-grant：joinId / manager / managerTerm / version 必携，term 1..2^31−1', () => {
+  assert.equal(validateMessage(collabFrame('join-grant', joinGrantOf())).ok, true);
+  for (const joinId of [undefined, '../x', 42]) {
+    const checked = validateMessage(collabFrame('join-grant', joinGrantOf({ joinId })));
+    assert.equal(checked.ok, false, String(joinId));
+    assert.ok(checked.reason.includes('join-grant.joinId'), checked.reason);
   }
-  for (const reqMsgId of [undefined, '../x', 42]) {
-    const checked = validateMessage(collabFrame('join-grant', { sessionId: 'sess-1', reqMsgId }));
-    assert.equal(checked.ok, false, String(reqMsgId));
-    assert.ok(checked.reason.includes('join-grant.reqMsgId'), checked.reason);
-  }
+  assert.equal(validateMessage(collabFrame('join-grant', joinGrantOf({ manager: { instanceId: 'inst-a', identityName: '甲' } }))).ok, false, 'manager 需席位身份');
+  assert.equal(validateMessage(collabFrame('join-grant', joinGrantOf({ managerTerm: 0 }))).ok, false);
+  assert.equal(validateMessage(collabFrame('join-grant', joinGrantOf({ managerTerm: 2147483648 }))).ok, false);
+  assert.equal(validateMessage(collabFrame('join-grant', joinGrantOf({ version: 0 }))).ok, false);
   assert.equal(validateMessage(collabFrame('join-grant', {})).ok, false);
 });
 
-test('协作域 join-deny：reqMsgId 必携、reason 可选（沿原因判据：超长与控制字符拒）', () => {
-  assert.equal(validateMessage(collabFrame('join-deny', { reqMsgId: 'msg-1' })).ok, true);
-  assert.equal(validateMessage(collabFrame('join-deny', { reqMsgId: 'msg-1', reason: '该会话不在席' })).ok, true);
-  assert.equal(validateMessage(collabFrame('join-deny', {})).ok, false);
-  assert.equal(validateMessage(collabFrame('join-deny', { reqMsgId: 'bad id!' })).ok, false);
-  assert.equal(validateMessage(collabFrame('join-deny', { reqMsgId: 'msg-1', reason: 'x'.repeat(201) })).ok, false);
-  assert.equal(validateMessage(collabFrame('join-deny', { reqMsgId: 'msg-1', reason: '带\u0007控制符' })).ok, false);
+test('协作域 join-deny：joinId 必携、reason 枚举（expired / aborted / manager-changed / capacity）', () => {
+  assert.equal(validateMessage(collabFrame('join-deny', { joinId: 'join-1', reason: 'expired' })).ok, true);
+  assert.equal(validateMessage(collabFrame('join-deny', { joinId: 'join-1', reason: 'aborted', managerTerm: 2 })).ok, true);
+  assert.equal(validateMessage(collabFrame('join-deny', { joinId: 'join-1' })).ok, false, 'reason 必填');
+  assert.equal(validateMessage(collabFrame('join-deny', { joinId: 'bad id!', reason: 'expired' })).ok, false);
+  assert.equal(validateMessage(collabFrame('join-deny', { joinId: 'join-1', reason: 'later' })).ok, false);
+  assert.equal(validateMessage(collabFrame('join-deny', { joinId: 'join-1', reason: 'expired', managerTerm: 0 })).ok, false);
 });
 
-test('协作域 join 三帧：属协作域必须携 collabId（缺 collabId 拒）', () => {
+test('协作域 join-confirm：joinId + managerTerm + version 必携（两段式确认）', () => {
+  assert.equal(validateMessage(collabFrame('join-confirm', { joinId: 'join-1', managerTerm: 1, version: 2 })).ok, true);
+  assert.equal(validateMessage(collabFrame('join-confirm', { managerTerm: 1, version: 2 })).ok, false);
+  assert.equal(validateMessage(collabFrame('join-confirm', { joinId: 'bad id!', managerTerm: 1, version: 2 })).ok, false);
+  assert.equal(validateMessage(collabFrame('join-confirm', { joinId: 'join-1', managerTerm: 0, version: 2 })).ok, false);
+  assert.equal(validateMessage(collabFrame('join-confirm', { joinId: 'join-1', managerTerm: 1 })).ok, false);
+});
+
+test('协作域 seat-presence：instanceId / sessions 列表 / sentAt 必携；与帧 collabId/from 一致', () => {
+  const legal = { collabId: 'collab-1', instanceId: 'inst-a', sessions: ['sess-a', 'sess-a2'], sentAt: new Date().toISOString() };
+  assert.equal(validateMessage(collabFrame('seat-presence', legal)).ok, true);
+  const bad = [
+    { ...legal, instanceId: undefined },
+    { ...legal, instanceId: 'inst-b' },
+    { ...legal, collabId: 'collab-2' },
+    { ...legal, sessions: [] },
+    { ...legal, sessions: 'sess-a' },
+    { ...legal, sessions: ['bad id!'] },
+    { ...legal, sessions: ['sess-a', 'sess-a'] },
+    { ...legal, sessions: Array.from({ length: 33 }, (raw, index) => `sess-${index}`) },
+    { ...legal, sentAt: '昨天' },
+  ];
+  for (const payload of bad) {
+    assert.equal(validateMessage(collabFrame('seat-presence', payload)).ok, false, JSON.stringify(payload).slice(0, 60));
+  }
+});
+
+test('协作域加入四帧：属协作域必须携 collabId（缺 collabId 拒）', () => {
   const cases = [
     ['join-request', { sessionId: 'sess-1' }],
-    ['join-grant', { sessionId: 'sess-1', reqMsgId: 'msg-1' }],
-    ['join-deny', { reqMsgId: 'msg-1' }],
+    ['join-grant', joinGrantOf()],
+    ['join-deny', { joinId: 'join-1', reason: 'expired' }],
+    ['join-confirm', { joinId: 'join-1', managerTerm: 1, version: 2 }],
   ];
   for (const [type, payload] of cases) {
     assert.equal(validateMessage(collabFrame(type, payload)).ok, true, type);
@@ -491,7 +611,7 @@ test('协作域 history-bundle：交换面与尾部面逐字段校验（more=tru
 });
 
 test('协作域 invite：endpoints 为可选加法字段（讨论携带；形态同端点表）', () => {
-  const members = [{ instanceId: 'inst-a', identityName: '主机甲' }, { instanceId: 'inst-b', identityName: '主机乙' }];
+  const members = [SEAT_A, SEAT_B];
   const base = { name: '讨论甲', topic: '议题', members };
   assert.equal(validateMessage(collabFrame('invite', base)).ok, true);
   assert.equal(validateMessage(collabFrame('invite', { ...base, endpoints: { 'inst-a': { address: '127.0.0.1', port: 7321 } } })).ok, true);
@@ -507,21 +627,50 @@ test('协作域 notice：event 枚举（established / roster / snapshot-stored�
   assert.equal(validateMessage(collabFrame('notice', { event: 'established', version: 0 })).ok, false);
 });
 
-test('协作域 freeze / snapshot：freeze 名单形态；snapshot request 通过、data 需 version+digest+ledger', () => {
-  const members = [{ instanceId: 'inst-a' }, { instanceId: 'inst-b' }];
-  assert.equal(validateMessage(collabFrame('freeze', { name: '项目', members })).ok, true);
+test('协作域 freeze：名单为席位条目、1–32 项（下界 1 依 D13）；缺 sessionId/identityName 拒', () => {
+  assert.equal(validateMessage(collabFrame('freeze', { name: '项目', members: [SEAT_A] })).ok, true, '单席合法');
+  assert.equal(validateMessage(collabFrame('freeze', { name: '项目', members: [SEAT_A, SEAT_B] })).ok, true);
   assert.equal(validateMessage(collabFrame('freeze', { name: '项目', members: [{ instanceId: 'inst-a' }] })).ok, false);
-  assert.equal(validateMessage(collabFrame('freeze', { name: '项目', members: [{ identityName: '甲' }, { instanceId: 'inst-b' }] })).ok, false);
-  assert.equal(validateMessage(collabFrame('snapshot', { kind: 'request' })).ok, true);
-  const digest = 'a'.repeat(64);
-  assert.equal(validateMessage(collabFrame('snapshot', { kind: 'data', version: 2, digest, ledger: {} })).ok, true);
-  assert.equal(validateMessage(collabFrame('snapshot', { kind: 'data', version: 2, digest: 'zz', ledger: {} })).ok, false);
-  assert.equal(validateMessage(collabFrame('snapshot', { kind: 'data', version: 2, digest })).ok, false);
+  assert.equal(validateMessage(collabFrame('freeze', { name: '项目', members: [{ instanceId: 'inst-a', sessionId: 'sess-a' }] })).ok, false);
+  assert.equal(validateMessage(collabFrame('freeze', { name: '项目', members: [{ instanceId: 'inst-a', identityName: '甲' }] })).ok, false);
+});
+
+test('协作域 snapshot request：kind=request 需 managerTerm+version；purpose 仅 catchup', () => {
+  assert.equal(validateMessage(collabFrame('snapshot', { kind: 'request' })).ok, false, '缺 term/version');
+  assert.equal(validateMessage(collabFrame('snapshot', { kind: 'request', managerTerm: 2, version: 2 })).ok, true);
+  assert.equal(validateMessage(collabFrame('snapshot', { kind: 'request', managerTerm: 2, version: 2, purpose: 'catchup' })).ok, true);
+  assert.equal(validateMessage(collabFrame('snapshot', { kind: 'request', managerTerm: 0, version: 2 })).ok, false);
+  assert.equal(validateMessage(collabFrame('snapshot', { kind: 'request', managerTerm: 2, version: 0 })).ok, false);
+  assert.equal(validateMessage(collabFrame('snapshot', { kind: 'request', managerTerm: 2, version: 2, purpose: 'other' })).ok, false);
+});
+
+function snapshotData(overrides = {}) {
+  const ledger = { collabId: 'collab-1', managerTerm: 2, version: 2, managerWindow: { windowBaseTerm: 1, windowEndsAt: '2026-10-13T00:00:00.000Z' } };
+  return {
+    kind: 'data',
+    managerTerm: 2,
+    version: 2,
+    managerWindow: { windowBaseTerm: 1, windowEndsAt: '2026-10-13T00:00:00.000Z' },
+    digest: 'a'.repeat(64),
+    ledger,
+    ...overrides,
+  };
+}
+
+test('协作域 snapshot data：帧与台账的 managerTerm/version/collabId/managerWindow 必须自洽', () => {
+  assert.equal(validateMessage(collabFrame('snapshot', snapshotData())).ok, true);
+  assert.equal(validateMessage(collabFrame('snapshot', snapshotData({ managerWindow: undefined }))).ok, true, '帧可省窗口，台账保留基准');
+  assert.equal(validateMessage(collabFrame('snapshot', snapshotData({ digest: 'zz' }))).ok, false);
+  assert.equal(validateMessage(collabFrame('snapshot', snapshotData({ ledger: undefined }))).ok, false);
+  assert.equal(validateMessage(collabFrame('snapshot', { ...snapshotData(), ledger: { collabId: 'collab-1', managerTerm: 3, version: 2 } })).ok, false, 'term 不一致');
+  assert.equal(validateMessage(collabFrame('snapshot', { ...snapshotData(), ledger: { collabId: 'collab-1', managerTerm: 2, version: 1 } })).ok, false, 'version 不一致');
+  assert.equal(validateMessage(collabFrame('snapshot', { ...snapshotData(), ledger: { collabId: 'collab-2', managerTerm: 2, version: 2 } })).ok, false, 'collabId 不一致');
+  assert.equal(validateMessage(collabFrame('snapshot', { ...snapshotData(), ledger: { collabId: 'collab-1', managerTerm: 2, version: 2 } })).ok, false, '帧有窗口而台账无');
   assert.equal(validateMessage(collabFrame('snapshot', { kind: 'push' })).ok, false);
 });
 
 test('协作域全类型覆盖：对每个协作域类型给非法 payload 必拒（防漏挂表）', () => {
-  const collabTypes = ['invite', 'approve', 'decline', 'withdraw', 'topic', 'task', 'progress', 'issue', 'stop', 'reply', 'notice', 'freeze', 'snapshot', 'post', 'join', 'join-request', 'join-grant', 'join-deny', 'history-request', 'history-bundle', 'end', 'leave'];
+  const collabTypes = ['invite', 'approve', 'decline', 'withdraw', 'topic', 'task', 'progress', 'issue', 'stop', 'reply', 'notice', 'freeze', 'snapshot', 'post', 'join', 'join-request', 'join-grant', 'join-deny', 'join-confirm', 'seat-presence', 'history-request', 'history-bundle', 'end', 'leave'];
   const invalidPayload = {
     invite: { name: '项目' },
     approve: 'x',
@@ -540,7 +689,9 @@ test('协作域全类型覆盖：对每个协作域类型给非法 payload 必�
     join: {},
     'join-request': {},
     'join-grant': { sessionId: 'sess-1' },
-    'join-deny': { reqMsgId: 'bad id!' },
+    'join-deny': {},
+    'join-confirm': {},
+    'seat-presence': {},
     'history-request': 'x',
     'history-bundle': {},
     end: 'x',
@@ -566,7 +717,7 @@ test('isPresentationText：空 / 超限 / 控制与不可见字符拒、中文�
 const digestOf = 'a'.repeat(64);
 
 test('治理域 freeze：createdAt / manager 为可选参考字段（存在则校验）', () => {
-  const members = [{ instanceId: 'inst-a' }, { instanceId: 'inst-b' }];
+  const members = [SEAT_A, SEAT_B];
   assert.equal(validateMessage(frameWith({ type: 'freeze', payload: { name: '项目', members } })).ok, true);
   assert.equal(validateMessage(frameWith({ type: 'freeze', payload: { name: '项目', members, createdAt: new Date().toISOString(), manager: { instanceId: 'inst-a', identityName: '主机甲' } } })).ok, true);
   assert.equal(validateMessage(frameWith({ type: 'freeze', payload: { name: '项目', members, createdAt: 42 } })).ok, false);
@@ -574,7 +725,7 @@ test('治理域 freeze：createdAt / manager 为可选参考字段（存在则�
 });
 
 test('治理域 decision：choice 枚举、名单必填、执行型字段与 createdAt 逐项校验', () => {
-  const members = [{ instanceId: 'inst-a' }, { instanceId: 'inst-b' }];
+  const members = [SEAT_A, SEAT_B];
   const legal = { choice: 'merge', name: '项目', members };
   assert.equal(validateMessage(frameWith({ type: 'decision', payload: legal })).ok, true);
   assert.equal(validateMessage(frameWith({ type: 'decision', payload: { ...legal, winner: 'collab-1', collabId: 'collab-2', executed: true, createdAt: new Date().toISOString(), reason: '裁定' } })).ok, true);
@@ -592,7 +743,7 @@ test('治理域 decision：choice 枚举、名单必填、执行型字段与 cre
 });
 
 test('治理域 unfreeze：name + members 必填、reason 可选（与 freeze 同判据）', () => {
-  const members = [{ instanceId: 'inst-a' }, { instanceId: 'inst-b' }];
+  const members = [SEAT_A, SEAT_B];
   assert.equal(validateMessage(frameWith({ type: 'unfreeze', payload: { name: '项目', members } })).ok, true);
   assert.equal(validateMessage(frameWith({ type: 'unfreeze', payload: { name: '项目', members, reason: '保持两条' } })).ok, true);
   assert.equal(validateMessage(frameWith({ type: 'unfreeze', payload: { name: '项目' } })).ok, false);
@@ -676,32 +827,104 @@ test('治理域全类型覆盖：五个治理类型给非法 payload 必拒（�
   }
 });
 
-test('notice manager-changed：manager 与 version 必填；endpoint 可选且形状受检', () => {
-  const manager = { instanceId: 'inst-b', identityName: '主机乙' };
-  assert.equal(validateMessage(frameWith({ type: 'notice', payload: { event: 'manager-changed', version: 3, manager } })).ok, true);
-  assert.equal(validateMessage(frameWith({ type: 'notice', payload: { event: 'manager-changed', version: 3 } })).ok, false);
-  assert.equal(validateMessage(frameWith({ type: 'notice', payload: { event: 'manager-changed', version: 0, manager } })).ok, false);
-  /* 端点互盲修复的加法字段：新站长端点随通告下发（旧帧无此字段行为不变；自家新帧不被自家拒收）。 */
-  const withEndpoint = { event: 'manager-changed', version: 3, manager, endpoint: { address: '127.0.0.2', port: 7321 } };
-  assert.equal(validateMessage(frameWith({ type: 'notice', payload: withEndpoint })).ok, true, 'endpoint 放行');
+function managerChangedOf(overrides = {}) {
+  return {
+    event: 'manager-changed',
+    manager: { instanceId: 'inst-b', sessionId: 'sess-b', identityName: '主机乙' },
+    term: 2,
+    version: 3,
+    via: 'handover',
+    prevManager: { instanceId: 'inst-a', sessionId: 'sess-a' },
+    offerId: 'offer-1',
+    effectiveAt: new Date().toISOString(),
+    endpoint: { address: '127.0.0.2', port: 7321 },
+    digest: 'a'.repeat(64),
+    ...overrides,
+  };
+}
+
+test('notice manager-changed：term/version/via/prevManager/effectiveAt/digest/endpoint 必填逐项拒', () => {
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: managerChangedOf() })).ok, true);
+  const required = ['manager', 'term', 'version', 'via', 'prevManager', 'effectiveAt', 'digest'];
+  for (const field of required) {
+    assert.equal(validateMessage(frameWith({ type: 'notice', payload: managerChangedOf({ [field]: undefined }) })).ok, false, field);
+  }
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: managerChangedOf({ term: 0 }) })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: managerChangedOf({ term: 2147483648 }) })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: managerChangedOf({ version: 0 }) })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: managerChangedOf({ via: 'coup' }) })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: managerChangedOf({ digest: 'zz' }) })).ok, false);
+});
+
+test('notice manager-changed：manager 与 prevManager 按席位形态（需 sessionId）', () => {
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: managerChangedOf({ manager: { instanceId: 'inst-b', identityName: '主机乙' } }) })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: managerChangedOf({ prevManager: { instanceId: 'inst-a' } }) })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: managerChangedOf({ offerId: '../x' }) })).ok, false);
   for (const endpoint of [{ address: '127.0.0.2', port: 0 }, { address: 7, port: 7321 }, 'x', { port: 7321 }, { address: '', port: 7321 }]) {
-    assert.equal(validateMessage(frameWith({ type: 'notice', payload: { ...withEndpoint, endpoint } })).ok, false, JSON.stringify(endpoint));
+    assert.equal(validateMessage(frameWith({ type: 'notice', payload: managerChangedOf({ endpoint }) })).ok, false, JSON.stringify(endpoint));
   }
 });
 
+test('notice manager-changed：按 via 校验窗口/授权字段（auto / takeover / takeover-manual / initial）', () => {
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: managerChangedOf({ via: 'auto' }) })).ok, false, 'auto 需 windowEndsAt');
+  const auto = managerChangedOf({ via: 'auto', windowEndsAt: new Date().toISOString() });
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: auto })).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: managerChangedOf({ via: 'takeover' }) })).ok, false, 'takeover 需窗口基准');
+  const takeover = managerChangedOf({ via: 'takeover', windowBaseTerm: 1, authorizedAt: new Date().toISOString() });
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: takeover })).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: managerChangedOf({ via: 'takeover-manual' }) })).ok, false, '手动接管需 authorizedAt');
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: managerChangedOf({ via: 'takeover-manual', authorizedAt: new Date().toISOString() }) })).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: managerChangedOf({ via: 'initial', endpoint: undefined }) })).ok, true, 'initial 可缺 endpoint');
+});
+
+function handshakeOf(overrides = {}) {
+  return { event: 'handshake', role: 'member', managerTerm: 1, version: null, manager: null, reply: false, ...overrides };
+}
+
+test('notice handshake：managerTerm 必填、manager 可 null 或席位、managerEndpoint 可选', () => {
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: handshakeOf() })).ok, true);
+  const manager = { instanceId: 'inst-a', sessionId: 'sess-a', identityName: '主机甲' };
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: handshakeOf({ role: 'manager', version: 3, manager, managerEndpoint: { address: '127.0.0.1', port: 7321 }, reply: true }) })).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: handshakeOf({ managerTerm: undefined }) })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: handshakeOf({ managerTerm: 0 }) })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: handshakeOf({ managerTerm: 2147483648 }) })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: handshakeOf({ manager: { instanceId: 'inst-a', identityName: '主机甲' } }) })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: handshakeOf({ managerEndpoint: { address: 'x', port: 0 } }) })).ok, false);
+});
+
 test('notice handshake：role / version / takeover / reply 逐字段拒', () => {
-  const legal = { event: 'handshake', role: 'member', version: null, takeover: null, reply: false };
-  assert.equal(validateMessage(frameWith({ type: 'notice', payload: legal })).ok, true);
   const record = { phase: 'inflight', candidate: { instanceId: 'inst-b', identityName: '主机乙' }, baseVersion: 2 };
-  assert.equal(validateMessage(frameWith({ type: 'notice', payload: { ...legal, role: 'manager', version: 3, takeover: record, reply: true } })).ok, true);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: handshakeOf({ role: 'manager', version: 3, takeover: record, reply: true }) })).ok, true);
   for (const payload of [
-    { ...legal, role: 'boss' },
-    { ...legal, version: 0 },
-    { ...legal, takeover: { phase: 'x', candidate: { instanceId: 'inst-b', identityName: '乙' }, baseVersion: 1 } },
-    { ...legal, reply: 'yes' },
+    handshakeOf({ role: 'boss' }),
+    handshakeOf({ version: 0 }),
+    handshakeOf({ takeover: { phase: 'x', candidate: { instanceId: 'inst-b', identityName: '乙' }, baseVersion: 1 } }),
+    handshakeOf({ reply: 'yes' }),
   ]) {
     assert.equal(validateMessage(frameWith({ type: 'notice', payload })).ok, false, JSON.stringify(payload).slice(0, 60));
   }
+});
+
+test('notice auto-offer：offerId / prevManager / target / baseTerm / version / expiresAt 必填逐项拒', () => {
+  const legal = {
+    event: 'auto-offer',
+    offerId: 'offer-1',
+    prevManager: { instanceId: 'inst-a', sessionId: 'sess-a' },
+    target: { instanceId: 'inst-b', sessionId: 'sess-b' },
+    baseTerm: 1,
+    version: 2,
+    expiresAt: new Date().toISOString(),
+  };
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: legal })).ok, true);
+  for (const field of ['offerId', 'prevManager', 'target', 'baseTerm', 'version', 'expiresAt']) {
+    assert.equal(validateMessage(frameWith({ type: 'notice', payload: { ...legal, [field]: undefined } })).ok, false, field);
+  }
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: { ...legal, prevManager: { instanceId: 'inst-a' } } })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: { ...legal, target: { instanceId: 'inst-b' } } })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: { ...legal, baseTerm: 0 } })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: { ...legal, baseTerm: 2147483648 } })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: { ...legal, version: 0 } })).ok, false);
+  assert.equal(validateMessage(frameWith({ type: 'notice', payload: { ...legal, expiresAt: '昨天' } })).ok, false);
 });
 
 test('notice merge-request：baseVersion / version / digest / ledger 逐字段拒', () => {
