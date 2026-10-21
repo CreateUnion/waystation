@@ -1,8 +1,10 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { PENDING_INVITES_FILE_NAME, SEATS_DIR_NAME, collabDir, collabFilePath } from '../paths.js';
 import { appendLine } from '../storage.js';
-import { LEDGER_FILE_NAME, MEMBER_FILE_NAME, listLocalCollabIds, loadLedger, loadMember, loadSnapshot, quarantineLedger } from './store.js';
+import {
+  LEDGER_FILE_NAME, MEMBER_FILE_NAME, SNAPSHOT_FILE_NAME, listLocalCollabIds, loadLedger, loadMember, loadSnapshot, quarantineLedger,
+} from './store.js';
 import { isArchived, withDefaultMode } from './model.js';
 import { CARRIER_FORMAT_SESSION_SEATS, readCarrier, readCarrierFormat, writeCarrier } from './carrier.js';
 import { assertWritable, classifyCollabDir, createLegacyRejectionCounter, markLegacyCompleted, readLegacyCollab } from './legacy.js';
@@ -1237,6 +1239,7 @@ function approveNow(state, input) {
   if (result.ok === true && result.joined === true) {
     const local = state.collabs.get(input?.collabId);
     if (local !== undefined) {
+      upgradeJoinedCarrierOf(state, local, input?.sessionId);
       settleKnockedSession(state, local);
       queueMicrotask(() => {
         triggerSync(state, local, { reason: 'join-decided' });
@@ -1244,6 +1247,21 @@ function approveNow(state, input) {
     }
   }
   return result;
+}
+
+/* 讨论同意即入席：落点从 invite-stub 升级为 session-seats（设计 §4.2）。升级归加入域，
+ * 本层只在同意成功后触发；失败只计数告警——下一步的重启会把未升级的讨论按占位跳过，
+ * 因此必须留痕而不是静默。 */
+function upgradeJoinedCarrierOf(state, local, sessionId) {
+  if (typeof state.join?.ensureJoinedCarrier !== 'function') {
+    return;
+  }
+  try {
+    state.join.ensureJoinedCarrier(local.collabId, sessionId);
+  } catch (error) {
+    state.counters.eventFailures++;
+    state.log.warn('讨论落点载体升级异常（已隔离）', { collabId: local.collabId, reason: error?.message });
+  }
 }
 
 /* 席位邀请的同意（0.2.0 两段式）：邀请簿记校验与 join-grant 签发在加入域；本层只保留
@@ -1325,7 +1343,8 @@ function settleKnockedSession(state, local) {
 /* 指名邀请的点头判定（「会话级加入」点名落点三）：member.json 的 targetSessionId 定格「只有该
  * 会话能点头」——其余会话（含无会话标识的调用）即使拿到邀请也拒，指引走 ws_join。判据读取成
  * 员记录文件（指名标记的写入方是核心路由面，内存记录可能尚未载入该字段），读不出退回内存记录；
- * 目标按短码定格时用唯一前缀匹配（与接收侧同一口径）。null＝无指名 / 未指名：交既有路径。
+ * 目标按完整标识全等或 8 位短码全等匹配（matchSessionByToken，不做前缀展开）。null＝无指名 /
+ * 未指名：交既有路径。
  * 调用者会话标识取自输入（工具面穿 context.sessionId；caller.sessionId 形态一并接受）。 */
 function namedInviteRefusalOf(state, input) {
   const collabId = input?.collabId;
@@ -1425,7 +1444,9 @@ function soleSeatSessionId(local) {
   return seats.length === 1 ? seats[0].sessionId : null;
 }
 
-/* 席位级静音（设计 §5.4）：只改调用会话自己的席位并落盘；无该席拒绝（不静默改他人/整机）。 */
+/* 席位级静音（设计 §5.4）：只改调用会话自己的席位并落盘；无该席拒绝（不静默改他人/整机）。
+ * 静音窗口基线随静音状态文件持久（设静音时记当下累计，重复设静音不重置；取消时算差值）。
+ * 基线缺失（旧文件 / 计数取不到）时摘要降级为不带 N 的文案，不虚构数字。 */
 function setSeatMuteNow(state, local, input, muted) {
   const sessionId = typeof input?.sessionId === 'string' ? input.sessionId : soleSeatSessionId(local);
   const seat = typeof sessionId === 'string' ? localSeatOfLocal(local, sessionId) : null;
@@ -1437,8 +1458,9 @@ function setSeatMuteNow(state, local, input, muted) {
   seat.muted = muted;
   persistSeatOf(state, local, sessionId);
   notifyIndicatorChange(state);
+  const muteBefore = local.mute.setMuted(muted, countNow);
   if (muted === false && wasMuted) {
-    notifyLocal(state, local, resumeNoticeText(local, countNow, null));
+    notifyLocal(state, local, resumeNoticeText(local, countNow, muteBefore.baseline));
   }
   return { ok: true, collabId: local.collabId, muted };
 }
@@ -1494,9 +1516,10 @@ function writableVerdictOf(state, collabId) {
   return assertWritable(dir);
 }
 
-/* legacy 判定：本进程刚落地的邀请目录只有 member.json（邀请目录尚未写 invite-stub carrier）——
- * 它在启动判定里不可能以 legacy 出现（启动时 legacy 目录不会进 state.collabs），故按「邀请落点」
- * 放行；运行中的协作丢了 carrier 时同时还有台账/席位，仍按 legacy 拒绝（fail-closed）。
+/* legacy 判定：本进程刚落地的邀请目录在载体尚未写成时会短暂只剩 member.json——
+ * 它在启动判定里不可能以 legacy 出现（启动时 legacy 目录不会进 state.collabs），故仅对
+ * 「明确的邀请落点」放行；任何已有席位/快照证据的成员目录或站长目录一律按 legacy 拒绝
+ * （fail-closed：运行中丢了 carrier 的真实成员目录不得被当成邀请落点）。
  * 返回 null＝不是 legacy 类判定。 */
 function legacyWriteVerdictOf(state, collabId, dir, kind) {
   if (kind !== 'legacy' && kind !== 'archived-legacy') {
@@ -1509,14 +1532,30 @@ function legacyWriteVerdictOf(state, collabId, dir, kind) {
   return { ok: false, reason: 'legacy' };
 }
 
-/* 邀请落点形态：有成员记录、没有共享台账，且尚未真正入席。
- * 两段式签发 grant 后先写 seats/ 再收确认，故有席位目录时必须以挂起邀请在场为判据；
- * 没有席位目录的旧版邀请落点（0.1.x 对端不带 inviteId）仍按落点放行。 */
+/* 邀请落点形态（收紧）：成员角色（role=member）的成员记录 ＋ 挂起邀请 ＋ 无共享台账，
+ * 且尚无席位 / 快照证据——两段式 grant 会先写 seats/ 再收确认，所以「有席位目录」只能说明
+ * 这是已经真正入席过的成员目录（运行中丢了 carrier），必须按 legacy 拒绝。
+ * 站长目录（role=manager）同样不在放行面内。 */
 function isInviteLandingDir(dir) {
   if (!existsSync(join(dir, MEMBER_FILE_NAME)) || existsSync(join(dir, LEDGER_FILE_NAME))) {
     return false;
   }
-  return existsSync(join(dir, PENDING_INVITES_FILE_NAME)) || !existsSync(join(dir, SEATS_DIR_NAME));
+  if (existsSync(join(dir, SEATS_DIR_NAME)) || existsSync(join(dir, SNAPSHOT_FILE_NAME))) {
+    return false;
+  }
+  if (!existsSync(join(dir, PENDING_INVITES_FILE_NAME))) {
+    return false;
+  }
+  return memberRoleOfDir(dir) === 'member';
+}
+
+/* 只取成员记录的角色作落点线索（形态校验归加载面；读不出即不放行）。 */
+function memberRoleOfDir(dir) {
+  try {
+    return JSON.parse(readFileSync(join(dir, MEMBER_FILE_NAME), 'utf8'))?.role ?? null;
+  } catch {
+    return null;
+  }
 }
 
 function rememberReadonly(state, collabId, verdict) {
@@ -2097,20 +2136,35 @@ function inviteBridgeTargetOf(state, sessionId, frame) {
   return typeof bridgeId === 'string' && bridgeId !== '' ? bridgeId : null;
 }
 
-/* 指名邀请只投目标会话（短码与全标识同既有点名口径）：发送侧不知道目标机有哪些会话，
- * 接收侧逐席判定，非目标席按坏目标隔离。 */
+/* 指名邀请只投目标会话（短码与完整标识都按精确匹配，不做前缀展开）：发送侧不知道目标机
+ * 有哪些会话，接收侧逐席判定，非目标席按坏目标隔离。0.2.0 的目标写在 targets[] 里，
+ * 仅在缺 targets 时回退旧版顶层 targetSessionId。 */
 function inviteTargetMismatchOf(frame, sessionId) {
   if (frame?.type !== 'invite') {
     return false;
   }
-  const token = frame?.payload?.targetSessionId;
-  if (token === undefined || token === null || token === '') {
+  const named = namedInviteTargetsOf(frame);
+  if (named === null) {
     return false;
   }
-  if (typeof token !== 'string') {
+  if (named.some((token) => typeof token !== 'string')) {
     return true;
   }
-  return sessionId !== token && !sessionId.startsWith(token);
+  return !named.some((token) => matchSessionByToken([{ sessionId }], token) === sessionId);
+}
+
+/* 指名目标集合：targets[] 中带 targetSessionId 的项优先（没有这类项＝不指名）；
+ * 旧版载荷才读顶层 targetSessionId。 */
+function namedInviteTargetsOf(frame) {
+  const targets = frame?.payload?.targets;
+  if (Array.isArray(targets)) {
+    const named = targets
+      .map((target) => target?.targetSessionId)
+      .filter((token) => token !== undefined && token !== null && token !== '');
+    return named.length === 0 ? null : named;
+  }
+  const token = frame?.payload?.targetSessionId;
+  return token === undefined || token === null || token === '' ? null : [token];
 }
 
 async function deliverToSeatNow(state, seat, frame) {
@@ -2229,7 +2283,26 @@ async function registerBridgeNow(state, sessionId, bridgeId) {
     flushed += await flushStagedOf(state, seat);
   }
   state.counters.seatBridgeRegistrations++;
-  return { ok: true, seats, flushed };
+  const invites = await replayPendingInvitesOnRegisterOf(state, sessionId);
+  return { ok: true, seats, flushed, invites: invites.delivered };
+}
+
+/* 注册补投之二（设计 §4.2）：本机挂起邀请按簿记语义重投给刚注册的会话——指名精确匹配、
+ * 不指名匹配全部。协作范围取「已加载协作 ∪ 盘上协作目录」：邀请占位目录（invite-stub）
+ * 重启后不参与注册表加载，只在盘上，补投必须仍然找得到它。补投是附属面，异常只计数告警。 */
+async function replayPendingInvitesOnRegisterOf(state, sessionId) {
+  if (typeof state.join?.replayPendingInvites !== 'function') {
+    return { delivered: 0 };
+  }
+  const collabIds = [...new Set([...state.collabs.keys(), ...listLocalCollabIds(state.dataDir)])];
+  try {
+    return await state.join.replayPendingInvites(sessionId, collabIds, (collabId, target, frame) =>
+      injectLocalSeatOf(state, collabId, target, frame));
+  } catch (error) {
+    state.counters.pendingInviteReplayFailures = (state.counters.pendingInviteReplayFailures ?? 0) + 1;
+    state.log.warn('挂起邀请补投异常（已隔离——注册不受影响）', { sessionId, reason: error?.message });
+    return { delivered: 0 };
+  }
 }
 
 /* 桥握手让位（毫秒级，仅在有暂存时付一次）。 */

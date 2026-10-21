@@ -711,9 +711,9 @@ test('pendingJoinsOf：未知协作返空数组；待批准面是内存申请，
   await made.service.join.request({ collabId: created.collabId, sessionId: 'newcomer-1' });
   assert.equal(made.service.join.pendingJoinsOf(created.collabId).length, 1);
   clockMs += 5000;
-  assert.equal(made.service.join.pendingJoinsOf(created.collabId).length, 1, '0.2.0 待批准申请是内存态（时限由申请人重发轮承担）');
+  assert.equal(made.service.join.pendingJoinsOf(created.collabId).length, 0, '超过申请时限的待批准申请被剪除');
   assert.deepEqual(pendingOf(made.dir, created.collabId), [], '待批准申请不落 joins.json');
-  assert.equal(made.service.list().collabs[0].pendingJoins.length, 1, '展示面与提供方同源');
+  assert.equal(made.service.list().collabs[0].pendingJoins.length, 0, '展示面与提供方同源');
 });
 
 /* —— 讨论直连分支（模式＝forum） —— */
@@ -1669,8 +1669,8 @@ test('冷启动 grant → confirm → 快照 → 重启：成员目录按 sessio
   assert.equal(classifyCollabDir(collabDir(applicant.dir, COLD_COLLAB)).kind, 'session-seats', '重启判档不落 legacy/recovery');
   assert.equal(existsSync(collabFilePath(applicant.dir, COLD_COLLAB, MIGRATION_FILE_NAME)), false, '不得写归档标记');
   const record = JSON.parse(readFileSync(collabFilePath(applicant.dir, COLD_COLLAB, MEMBER_FILE_NAME), 'utf8'));
-  assert.equal(record.topic !== '', true, '成员记录主题非空');
-  assert.equal(record.name, COLD_COLLAB);
+  assert.equal(record.name, '冷启动项目', '快照采纳后回填真实协作名');
+  assert.equal(record.topic, '主题', '快照采纳后回填真实主题');
 
   const reloaded = reloadServiceOf(applicant);
   assert.equal(reloaded.stats().loadFailures, 0, '成员目录重启零加载失败');

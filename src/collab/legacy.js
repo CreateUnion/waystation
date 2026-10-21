@@ -88,14 +88,21 @@ function carrierKind(dir, carrier) {
     : { kind: 'recovery', detail: 'carrier-without-ledger' };
 }
 
-/* 会话级成员目录只有 carrier ＋ seats/（＋ snapshot.json）——共享台账只由站长写，
- * 不能拿「无台账」判半写。判据限定「成员记录 role=member 且已有参与面证据」：
- * 站长目录丢了台账仍必须判半写只读（不得沿用旧正判定），成员目录才有席位/快照无台账的合法形态。 */
+/* 会话级成员目录＝carrier ＋ seats/（＋ snapshot.json）——共享台账只由站长写，不能拿「无台账」
+ * 判半写。判据按参与面证据（席位或合法快照）成立，不要求 member.json（它只是兼容读面，
+ * 缺失或解析失败都不该单独把成员目录打成半写）；角色从席位与成员记录取：
+ * 出现站长席位 / 成员记录 role=manager 的目录丢了台账仍必须判半写只读。 */
 function sessionSeatsWritten(dir) {
   if (ledgerWritten(dir)) {
     return true;
   }
-  return memberRoleOf(dir) === 'member' && (seatsWritten(dir) || existsSync(join(dir, SNAPSHOT_FILE_NAME)));
+  if (!participationEvidenceOf(dir)) {
+    return false;
+  }
+  if (memberRoleOf(dir) === 'manager' || seatRolesOf(dir).includes('manager')) {
+    return false;
+  }
+  return true;
 }
 
 /* 只取角色作判档线索；形态校验归加载面（本文件不复用新形态校验器）。 */
@@ -104,6 +111,44 @@ function memberRoleOf(dir) {
     return JSON.parse(readFileSync(join(dir, MEMBER_FILE_NAME), 'utf8'))?.role ?? null;
   } catch {
     return null;
+  }
+}
+
+function participationEvidenceOf(dir) {
+  return seatsWritten(dir) || snapshotWritten(dir);
+}
+
+/* 快照证据要求可解析且带名单：半截/坏快照不能单独证明「已入席」。 */
+function snapshotWritten(dir) {
+  try {
+    const parsed = JSON.parse(readFileSync(join(dir, SNAPSHOT_FILE_NAME), 'utf8'));
+    return isPlainObject(parsed) && isPlainObject(parsed.ledger) && Array.isArray(parsed.ledger.members);
+  } catch {
+    return false;
+  }
+}
+
+/* 席位角色（判档线索）：坏文件跳过——单条坏席位由加载面计数，不影响目录形态判定。 */
+function seatRolesOf(dir) {
+  const roles = [];
+  for (const name of seatFileNamesOf(dir)) {
+    try {
+      const parsed = JSON.parse(readFileSync(join(dir, SEATS_DIR_NAME, name), 'utf8'));
+      if (isPlainObject(parsed) && typeof parsed.role === 'string') {
+        roles.push(parsed.role);
+      }
+    } catch {
+      // 席位文件损坏：跳过该条（加载面另行计数）
+    }
+  }
+  return roles;
+}
+
+function seatFileNamesOf(dir) {
+  try {
+    return readdirSync(join(dir, SEATS_DIR_NAME));
+  } catch {
+    return [];
   }
 }
 
