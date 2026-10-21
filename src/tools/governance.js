@@ -1,5 +1,5 @@
 import { ID_PATTERN } from '../net/protocol.js';
-import { collabIdArg, errorResult, optionalTextArg, resultOf } from './collab.js';
+import { callerSessionOf, collabIdArg, errorResult, optionalTextArg, resultOf } from './collab.js';
 import { WS_DECIDE_SPEC, WS_HANDOVER_SPEC, WS_TAKE_OVER_SPEC } from './specs.js';
 
 /* 治理工具集（设计 §10 工具最小集的治理落点）：裁定 / 移交 / 抢接——薄层，只做参数形态校验
@@ -13,25 +13,31 @@ export function decideTool() {
       if (collabId === null) {
         return errorResult('参数 collabId 非法：需要非空白字符串');
       }
+      /* 裁定按调用席位授权（spec：站长席位；任期分叉下成员也可 terminate）：无会话标识
+       * 没有可核对席位，不得退回整机兼容。 */
+      const caller = callerSessionOf(context, 'ws_decide');
+      if (caller.refusal !== null) {
+        return caller.refusal;
+      }
       if (args.mergeOffer !== undefined) {
-        return decideMergeOfferCall(args, collabId, context);
+        return decideMergeOfferCall(args, collabId, caller.sessionId, context);
       }
       if (args.choice !== 'merge' && args.choice !== 'keep' && args.choice !== 'terminate') {
         return errorResult('参数非法：需恰提供一种形态——choice（冻结裁定：merge / keep / terminate）或 mergeOffer（合流递交裁定：accept / reject）');
       }
-      return resultOf(await context.collab.decide({ collabId, choice: args.choice }));
+      return resultOf(await context.collab.decide({ collabId, choice: args.choice, sessionId: caller.sessionId }));
     },
   };
 }
 
-function decideMergeOfferCall(args, collabId, context) {
+function decideMergeOfferCall(args, collabId, sessionId, context) {
   if (args.choice !== undefined) {
     return errorResult('参数非法：choice 与 mergeOffer 只能提供一种');
   }
   if (args.mergeOffer !== 'accept' && args.mergeOffer !== 'reject') {
     return errorResult('参数 mergeOffer 非法：可选值为 accept / reject');
   }
-  return resultOf(context.collab.decideMerge({ collabId, mergeOffer: args.mergeOffer }));
+  return resultOf(context.collab.decideMerge({ collabId, mergeOffer: args.mergeOffer, sessionId }));
 }
 
 export function handoverTool() {
@@ -42,16 +48,22 @@ export function handoverTool() {
       if (collabId === null) {
         return errorResult('参数 collabId 非法：需要非空白字符串');
       }
+      /* 移交的双角色都以调用会话为席位主体：无标识时服务层会退回整机兼容，成员会话可冒充
+       * 站长发起移交——工具层必须先拒。 */
+      const caller = callerSessionOf(context, 'ws_handover');
+      if (caller.refusal !== null) {
+        return caller.refusal;
+      }
       const parsed = handoverArgsOf(args);
       if (parsed.error !== undefined) {
         return errorResult(parsed.error);
       }
       if (parsed.role === 'target') {
-        return handoverTargetCall(parsed.value, collabId, context);
+        return handoverTargetCall(parsed.value, collabId, caller.sessionId, context);
       }
       /* 发起角色：目标席位由 target + targetSessionId 共同定位（同机多席必须指名）；
        * 发起立即返回，不在工具层等目标确认（确认时限与迟到判定归服务）。 */
-      return resultOf(await context.collab.handover({ collabId, ...parsed.value, sessionId: context.sessionId }));
+      return resultOf(await context.collab.handover({ collabId, ...parsed.value, sessionId: caller.sessionId }));
     },
   };
 }
@@ -126,27 +138,27 @@ function handoverTargetArgsOf({ args, offerId, target, targetSessionId, decision
 
 /* 目标角色：拒绝走独立回执入口（不得落回接受路径），确认走一次性挑战令牌。
  * 目标侧绝不自行提升为站长——提升只发生在旧站长收到 accept 后签发站长变更。 */
-async function handoverTargetCall(value, collabId, context) {
+async function handoverTargetCall(value, collabId, sessionId, context) {
   if (value.decision === 'reject') {
-    return rejectHandoverCall(value, collabId, context);
+    return rejectHandoverCall(value, collabId, sessionId, context);
   }
   if (typeof context.collab.confirmHandover !== 'function') {
     return errorResult('目标确认移交不可用：服务层尚未暴露 confirmHandover（移交提议已记录，本机不会自行提升）');
   }
-  const result = await context.collab.confirmHandover({ collabId, sessionId: context.sessionId, offerId: value.offerId, token: value.confirmToken });
+  const result = await context.collab.confirmHandover({ collabId, sessionId, offerId: value.offerId, token: value.confirmToken });
   if (result?.needsUserConfirmation === true) {
     return confirmationChallengeOf(result, value.offerId);
   }
   return resultOf(result);
 }
 
-async function rejectHandoverCall(value, collabId, context) {
+async function rejectHandoverCall(value, collabId, sessionId, context) {
   if (typeof context.collab.rejectHandover !== 'function') {
     return errorResult('目标拒绝移交不可用：服务层尚未暴露拒绝入口（rejectHandover）——本次未回执');
   }
   /* 拒绝要发帧回执，服务入口必然是异步的：不 await 会把 Promise 当结果对象，
    * 走到 result.ok !== true 分支产出空文案（用户看不到拒绝是否生效）。 */
-  return resultOf(await context.collab.rejectHandover({ collabId, sessionId: context.sessionId, offerId: value.offerId, reason: value.reason }));
+  return resultOf(await context.collab.rejectHandover({ collabId, sessionId, offerId: value.offerId, reason: value.reason }));
 }
 
 export function takeOverTool() {

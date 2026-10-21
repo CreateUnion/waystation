@@ -54,6 +54,11 @@ async function callCollabTool(tool, args, collab) {
   return tool.handler(args, collabContextOf(collab));
 }
 
+/* 治理 / 邀请类工具以调用会话为席位主体：这些工具的用例一律带会话标识。 */
+function governedContextOf(collab, sessionId = 'session-a-0123456789') {
+  return { ...collabContextOf(collab), sessionId };
+}
+
 /* 假服务：记录调用、按用例注入响应——本文件的目的是工具层的参数形态与输出口径，
  * 业务判定（状态门控 / 冻结白名单）归协作服务自身的用例（collab-service.test.js）。 */
 const SERVICE_DEFAULTS = {
@@ -493,6 +498,25 @@ async function listEntryFor(collab, collabId, sessionId) {
   return payload.collabs.find((entry) => entry.collabId === collabId);
 }
 
+/* 同机双席夹具（真服务）：站长会话 A 创建协作，第二会话 B 经本机申请 → 批准 → confirm 入席。
+ * 用于验证治理工具的会话标识确实穿透到服务层席位授权（成员会话必须被拒）。 */
+async function twoSeatServiceOf(t) {
+  const service = realCollabServiceOf(makeTempDir(t));
+  const managerSessionId = 'session-a-0123456789';
+  const memberSessionId = 'session-b-9876543210';
+  const target = { instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 };
+  const created = service.create({ name: '联调项目', topic: '发布联调', targets: [target], sessionId: managerSessionId });
+  assert.equal(created.ok, true, created.message);
+  const requested = await service.join.request({ collabId: created.collabId, sessionId: memberSessionId });
+  assert.equal(requested.ok, true, requested.message);
+  const approved = await service.join.approve({ collabId: created.collabId, sessionId: memberSessionId, approve: true, approvedBy: managerSessionId });
+  assert.equal(approved.ok, true, approved.message);
+  const confirmed = service.join.confirmJoining(approved.joinId, memberSessionId, { instanceId: 'inst-self', managerTerm: 1, activeSeats: 1 });
+  assert.equal(confirmed.ok, true, confirmed.message);
+  assert.equal(service.listLocalSeats(created.collabId).length, 2, '前置：同机双席（站长 + 成员）');
+  return { service, collabId: created.collabId, managerSessionId, memberSessionId };
+}
+
 test('ws_list_collabs：freezeReason 服务给了就透传、没给不伪造', async () => {
   const frozen = fakeService({
     list: { collabs: [{ collabId: 'collab-1', name: '联调项目', role: 'member', state: 'frozen', freezeReason: 'manager-offline', memberCount: 2, archived: false }] },
@@ -502,6 +526,33 @@ test('ws_list_collabs：freezeReason 服务给了就透传、没给不伪造', a
   const plain = fakeService({ list: { collabs: [{ collabId: 'collab-2', name: '联调项目', role: 'manager', state: 'active', memberCount: 1, archived: false }] } });
   const unfrozen = JSON.parse((await callCollabTool(listCollabsTool(), {}, plain)).content[0].text);
   assert.equal(Object.hasOwn(unfrozen.collabs[0], 'freezeReason'), false, '服务未给该字段时不得凭空补值');
+});
+
+test('ws_list_collabs：freezeReason 兼容条目顶层与 sessions 嵌套（顶层优先，缺失回退嵌套）', async () => {
+  const service = fakeService({
+    list: {
+      collabs: [
+        { collabId: 'collab-nested', name: '嵌套形态', role: 'member', state: 'active', sessions: { freezeReason: 'manager-offline' }, memberCount: 2, archived: false },
+        { collabId: 'collab-top', name: '顶层形态', role: 'member', state: 'active', freezeReason: 'manager-fork', sessions: { freezeReason: 'manager-offline' }, memberCount: 2, archived: false },
+      ],
+    },
+  });
+  const listed = JSON.parse((await callCollabTool(listCollabsTool(), {}, service)).content[0].text);
+  assert.equal(listed.collabs[0].freezeReason, 'manager-offline', '服务只把原因嵌在 sessions 时提升到条目顶层');
+  assert.equal(listed.collabs[1].freezeReason, 'manager-fork', '两种形状并存时以条目顶层为准');
+  assert.equal(listed.collabs[1].sessions.freezeReason, 'manager-offline', '嵌套字段原样保留（服务形状不被改写）');
+});
+
+test('ws_list_collabs：freezeReason 真服务形状（服务嵌在 sessions，工具层在条目顶层暴露）', async (t) => {
+  const dir = makeTempDir(t);
+  const service = realCollabServiceOf(dir);
+  const sessionId = 'session-a-0123456789';
+  const created = service.create({ name: '联调项目', topic: '发布联调', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }], sessionId });
+  assert.equal(created.ok, true, created.message);
+  assert.equal(service.freezeOnManagerOffline(created.collabId), true);
+  const entry = await listEntryFor(service, created.collabId, sessionId);
+  assert.equal(entry.sessions.freezeReason, 'manager-offline', '服务当前把原因嵌在 sessions 下');
+  assert.equal(entry.freezeReason, 'manager-offline', '设计 §9 的条目字段由工具层补齐（顶层优先、嵌套回退）');
 });
 
 test('ws_list_collabs：按调用会话穿参（context 既有注入；无标识会话传 undefined）', async () => {
@@ -647,13 +698,14 @@ test('ws_create_collab：targets 形态逐拒（非数组 / 空 / 条目缺字�
 
 test('ws_create_collab：合法 → 透传 trim 后的参数（含身份名）、输出 invited 详情', async () => {
   const collab = fakeService();
-  const result = await callCollabTool(createCollabTool(), {
+  const context = { ...collabContextOf(collab), sessionId: 'session-a-0123456789' };
+  const result = await createCollabTool().handler({
     name: ' 联调项目 ',
     topic: ' 发布联调 ',
     targets: [{ instanceId: 'inst-b', identityName: ' 主机乙 ', address: '127.0.0.2', port: 17321 }],
-  }, collab);
+  }, context);
   assert.equal(result.isError, undefined);
-  assert.deepEqual(collab.calls.create, [{ name: '联调项目', topic: '发布联调', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }], mode: 'managed', sessionId: undefined }], 'sessionId 随本会话上下文穿参（本上下文无标识：如实传空）');
+  assert.deepEqual(collab.calls.create, [{ name: '联调项目', topic: '发布联调', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }], mode: 'managed', sessionId: 'session-a-0123456789' }], 'sessionId 随本会话上下文穿参（无标识会话由服务拒绝，见真服务用例）');
   const payload = JSON.parse(result.content[0].text);
   assert.equal(payload.collabId, 'collab-1');
   assert.equal(payload.invited[0].ok, true);
@@ -661,9 +713,10 @@ test('ws_create_collab：合法 → 透传 trim 后的参数（含身份名）�
 
 test('ws_create_collab：mode 透传（缺省 managed / 显式 forum）、枚举外拒绝（不触服务）', async () => {
   const collab = fakeService();
-  await callCollabTool(createCollabTool(), { name: '项目', topic: '主题', mode: 'forum', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }] }, collab);
+  const context = { ...collabContextOf(collab), sessionId: 'session-a-0123456789' };
+  await createCollabTool().handler({ name: '项目', topic: '主题', mode: 'forum', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }] }, context);
   assert.equal(collab.calls.create[0].mode, 'forum');
-  const bad = await callCollabTool(createCollabTool(), { name: '项目', topic: '主题', mode: 'discussion', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }] }, collab);
+  const bad = await createCollabTool().handler({ name: '项目', topic: '主题', mode: 'discussion', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }] }, context);
   assert.equal(bad.isError, true);
   assert.ok(bad.content[0].text.includes('mode 非法'));
   assert.equal(collab.calls.create.length, 1, '枚举外拒绝不触服务');
@@ -671,13 +724,14 @@ test('ws_create_collab：mode 透传（缺省 managed / 显式 forum）、枚举
 
 test('ws_create_collab：服务业务拒绝 → isError + 原文案', async () => {
   const collab = fakeService({ create: { ok: false, message: '本机参与协作数已达上限（64）——先结束或退出旧协作' } });
-  const result = await callCollabTool(createCollabTool(), { name: '项目', topic: '主题', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }] }, collab);
+  const result = await createCollabTool().handler({ name: '项目', topic: '主题', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }] }, { ...collabContextOf(collab), sessionId: 'session-a-0123456789' });
   assert.equal(result.isError, true);
   assert.ok(result.content[0].text.includes('上限'));
 });
 
 test('ws_invite：collabId / targets 形态逐拒（缺参 / 空 / 条目缺字段），不触服务', async () => {
   const collab = fakeService();
+  const context = { ...collabContextOf(collab), sessionId: 'session-a-0123456789' };
   const target = { instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 };
   const cases = [
     { targets: [target] },
@@ -688,25 +742,27 @@ test('ws_invite：collabId / targets 形态逐拒（缺参 / 空 / 条目缺字�
     { collabId: 'collab-1', targets: [{ ...target, address: 'not-an-ip' }] },
   ];
   for (const args of cases) {
-    const result = await callCollabTool(inviteTool(), args, collab);
+    const result = await inviteTool().handler(args, context);
     assert.equal(result.isError, true, JSON.stringify(args));
   }
   assert.equal(collab.calls.invite.length, 0);
 });
 
-test('ws_invite：合法 → 透传 trim 后的参数、输出 invited 详情；服务拒绝 → isError + 原文案', async () => {
+test('ws_invite：合法 → 透传 trim 后的参数与本会话标识、输出 invited 详情；服务拒绝 → isError + 原文案', async () => {
   const collab = fakeService();
-  const result = await callCollabTool(inviteTool(), {
+  const context = { ...collabContextOf(collab), sessionId: 'session-a-0123456789' };
+  const result = await inviteTool().handler({
     collabId: ' collab-1 ',
     targets: [{ instanceId: 'inst-b', identityName: ' 主机乙 ', address: '127.0.0.2', port: 17321 }],
-  }, collab);
+  }, context);
   assert.equal(result.isError, undefined);
-  assert.deepEqual(collab.calls.invite, [{ collabId: 'collab-1', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }] }]);
+  assert.deepEqual(collab.calls.invite, [{ collabId: 'collab-1', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }], sessionId: 'session-a-0123456789' }], '旧邀请面同样携调用会话（站长席位授权）');
   const payload = JSON.parse(result.content[0].text);
   assert.equal(payload.collabId, 'collab-1');
   assert.equal(payload.invited[0].ok, true);
+  assert.equal(payload.capability, 'unverified', '探测面缺失时标记能力未确认（不静默放行）');
   const denied = fakeService({ invite: { ok: false, message: '协作模式（managed）的增员补齐另立任务中——ws_invite 当前仅用于讨论模式' } });
-  const refused = await callCollabTool(inviteTool(), { collabId: 'collab-1', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }] }, denied);
+  const refused = await inviteTool().handler({ collabId: 'collab-1', targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 }] }, { ...collabContextOf(denied), sessionId: 'session-a-0123456789' });
   assert.equal(refused.isError, true);
   assert.ok(refused.content[0].text.includes('另立任务'));
 });
@@ -785,7 +841,82 @@ test('ws_invite：论坛无邀请簿记 → 整批回退旧邀请面（不产生
   const target = { instanceId: 'inst-forum', identityName: '论坛乙', address: '127.0.0.2', port: 17321 };
   const forum = await inviteTool().handler({ collabId: 'collab-f', targets: [target] }, context);
   assert.equal(forum.isError, undefined);
-  assert.deepEqual(collab.calls.invite, [{ collabId: 'collab-f', targets: [target] }], '论坛回退旧邀请面（不产生 inviteId）');
+  assert.deepEqual(collab.calls.invite, [{ collabId: 'collab-f', targets: [target], sessionId: 'session-a-0123456789' }], '论坛回退旧邀请面（不产生 inviteId；调用会话照常穿参）');
+});
+
+test('ws_invite：加入域路径的能力闸门——不支持/未知的目标逐目标拒绝，不产生邀请记录', async () => {
+  const createCalls = [];
+  const collab = fakeService();
+  const probed = [];
+  const net = {
+    probeCapability: async (options) => {
+      probed.push(options);
+      if (options.instanceId === 'inst-old') {
+        return { ok: true, capability: 'unsupported' };
+      }
+      if (options.instanceId === 'inst-quiet') {
+        return { ok: true, capability: 'unknown' };
+      }
+      return { ok: true, capability: 'supported' };
+    },
+  };
+  const context = { ...collabContextOf(collab), net, join: inviteJoinFakeOf(createCalls), sessionId: 'session-a-0123456789' };
+  const result = await inviteTool().handler({
+    collabId: 'collab-1',
+    targets: [
+      { instanceId: 'inst-new', identityName: '主机新', address: '127.0.0.2', port: 17321 },
+      { instanceId: 'inst-old', identityName: '旧版机', address: '127.0.0.3', port: 17321 },
+      { instanceId: 'inst-quiet', identityName: '无应答机', address: '127.0.0.4', port: 17321 },
+    ],
+  }, context);
+  assert.equal(result.isError, undefined, '支持的目标照常签发（逐目标语义）');
+  assert.deepEqual(probed.map((entry) => [entry.address, entry.port, entry.instanceId]), [
+    ['127.0.0.2', 17321, 'inst-new'],
+    ['127.0.0.3', 17321, 'inst-old'],
+    ['127.0.0.4', 17321, 'inst-quiet'],
+  ], '逐目标单播探测（地址/端口/实例标识为归户证据）');
+  assert.deepEqual(createCalls.map((entry) => entry.targetInstanceId), ['inst-new'], '不支持/未知的目标不产生邀请记录（不留已签发的误导）');
+  const invited = JSON.parse(result.content[0].text).invited;
+  assert.equal(invited[0].ok, true);
+  assert.ok(invited[1].reason.includes('不支持'), invited[1].reason);
+  assert.ok(invited[2].reason.includes('无法确认'), invited[2].reason);
+});
+
+test('ws_invite：探测面降级 / 异常 → 能力按未知拒绝（不静默放行）', async () => {
+  const createCalls = [];
+  const collab = fakeService();
+  let mode = 'degraded';
+  const net = {
+    probeCapability: async () => {
+      if (mode === 'throw') {
+        throw new Error('发现面未启动');
+      }
+      return { ok: false, message: '端口段全满——本地功能可用' };
+    },
+  };
+  const context = { ...collabContextOf(collab), net, join: inviteJoinFakeOf(createCalls), sessionId: 'session-a-0123456789' };
+  const target = { instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 };
+  const degraded = await inviteTool().handler({ collabId: 'collab-1', targets: [target] }, context);
+  assert.equal(degraded.isError, true);
+  assert.ok(degraded.content[0].text.includes('无法确认'), degraded.content[0].text);
+  mode = 'throw';
+  const thrown = await inviteTool().handler({ collabId: 'collab-1', targets: [target] }, context);
+  assert.equal(thrown.isError, true);
+  assert.ok(thrown.content[0].text.includes('发现面未启动'), thrown.content[0].text);
+  assert.equal(createCalls.length, 0, '能力未确认时不签发邀请');
+});
+
+test('ws_invite：旧邀请面的能力闸门整批前置（不支持目标 → 不触旧服务）', async () => {
+  const collab = fakeService();
+  const net = { probeCapability: async () => ({ ok: true, capability: 'unsupported' }) };
+  const context = { ...collabContextOf(collab), net, sessionId: 'session-a-0123456789' };
+  const result = await inviteTool().handler({
+    collabId: 'collab-1',
+    targets: [{ instanceId: 'inst-old', identityName: '旧版机', address: '127.0.0.2', port: 17321 }],
+  }, context);
+  assert.equal(result.isError, true);
+  assert.ok(result.content[0].text.includes('不支持'), result.content[0].text);
+  assert.equal(collab.calls.invite.length, 0, '能力闸门先于旧邀请面');
 });
 
 test('ws_invite / ws_withdraw_invite（真服务）：邀请簿记返回 inviteId，撤回按记录生效', async (t) => {
@@ -843,6 +974,63 @@ test('真服务：交接确认与投递查询入口已接线（走业务拒绝�
   const payload = JSON.parse(status.content[0].text);
   assert.equal(payload.localSeat.sessionId, sessionId, '本机席位明细经真实服务面取数');
   assert.equal(payload.localSeat.status, 'unknown', '无投递事实时如实 unknown（不是伪造已注入）');
+});
+
+test('真服务：治理 / 邀请工具把会话标识穿透到席位授权（成员会话被拒、站长会话通过）', async (t) => {
+  const { service, collabId, managerSessionId, memberSessionId } = await twoSeatServiceOf(t);
+  const memberContext = governedContextOf(service, memberSessionId);
+  const managerContext = governedContextOf(service, managerSessionId);
+  const freshTarget = { instanceId: 'inst-c', identityName: '主机丙', address: '127.0.0.3', port: 17321 };
+
+  const memberEnd = await endCollabTool().handler({ collabId }, memberContext);
+  assert.equal(memberEnd.isError, true, '成员会话不得结束协作');
+  assert.match(memberEnd.content[0].text, /站长席位/);
+
+  const memberDecide = await decideTool().handler({ collabId, choice: 'keep' }, memberContext);
+  assert.equal(memberDecide.isError, true, '成员会话不得裁定');
+  assert.match(memberDecide.content[0].text, /站长席位/);
+  const managerDecide = await decideTool().handler({ collabId, choice: 'keep' }, managerContext);
+  assert.equal(managerDecide.isError, true, '未冻结时业务拒绝');
+  assert.doesNotMatch(managerDecide.content[0].text, /只有站长席位/, '站长会话已通过席位授权');
+  assert.match(managerDecide.content[0].text, /未冻结/);
+
+  const memberWithdraw = await withdrawInviteTool().handler({ collabId, target: 'inst-nobody' }, memberContext);
+  assert.equal(memberWithdraw.isError, true, '成员会话不得按 target 撤回');
+  assert.match(memberWithdraw.content[0].text, /站长席位/);
+  const managerWithdraw = await withdrawInviteTool().handler({ collabId, target: 'inst-nobody' }, managerContext);
+  assert.equal(managerWithdraw.isError, true, '业务拒绝（无匹配邀请）');
+  assert.doesNotMatch(managerWithdraw.content[0].text, /只有站长席位/, '站长会话已通过席位授权');
+
+  const memberInvite = await inviteTool().handler({ collabId, targets: [freshTarget] }, memberContext);
+  assert.equal(memberInvite.isError, true, '成员会话不得邀请');
+  assert.match(memberInvite.content[0].text, /站长席位/);
+  const managerInvite = await inviteTool().handler({ collabId, targets: [freshTarget] }, managerContext);
+  assert.equal(managerInvite.isError, undefined, managerInvite.content[0].text);
+
+  const managerEnd = await endCollabTool().handler({ collabId }, managerContext);
+  assert.equal(managerEnd.isError, undefined, '站长会话结束成功');
+});
+
+test('治理 / 邀请类工具：无会话标识 → isError，不调服务（不得退回整机兼容）', async () => {
+  const collab = fakeService();
+  const governance = fakeGovernanceService();
+  const target = { instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 };
+  const cases = [
+    { tool: endCollabTool(), args: { collabId: 'collab-1' }, service: collab },
+    { tool: decideTool(), args: { collabId: 'collab-1', choice: 'keep' }, service: governance },
+    { tool: handoverTool(), args: { collabId: 'collab-1', target: 'inst-b', targetSessionId: 'sess-b' }, service: governance },
+    { tool: inviteTool(), args: { collabId: 'collab-1', targets: [target] }, service: collab },
+    { tool: withdrawInviteTool(), args: { collabId: 'collab-1', target: 'inst-b' }, service: collab },
+  ];
+  for (const { tool, args, service } of cases) {
+    for (const context of [collabContextOf(service), { ...collabContextOf(service), sessionId: '   ' }]) {
+      const result = await tool.handler(args, context);
+      assert.equal(result.isError, true, tool.name);
+      assert.ok(result.content[0].text.includes('会话标识'), `${tool.name}: ${result.content[0].text}`);
+    }
+  }
+  assert.equal(collab.calls.end.length + collab.calls.invite.length + collab.calls.withdraw.length, 0, '缺会话标识不触服务');
+  assert.equal(governance.calls.decide.length + governance.calls.handover.length, 0, '缺会话标识不触服务');
 });
 
 test('ws_request_join：name 缺失 / 空白 / 非字符串 → isError，不发敲门', async () => {
@@ -1021,28 +1209,30 @@ test('ws_approve_invite：同意与拒绝两态透传（reason 随拒绝；invit
 
 test('ws_withdraw_invite：target 精确撤回透传；inviteId 走加入域簿记（不再报待接线）', async () => {
   const collab = fakeService();
-  await callCollabTool(withdrawInviteTool(), { collabId: 'collab-1', target: ' inst-b ' }, collab);
-  assert.deepEqual(collab.calls.withdraw, [{ collabId: 'collab-1', target: 'inst-b' }], '只按目标撤回单条记录');
-  const missing = await callCollabTool(withdrawInviteTool(), { collabId: 'collab-1' }, collab);
+  const sessionId = 'session-a-0123456789';
+  const context = { ...collabContextOf(collab), sessionId };
+  await withdrawInviteTool().handler({ collabId: 'collab-1', target: ' inst-b ' }, context);
+  assert.deepEqual(collab.calls.withdraw, [{ collabId: 'collab-1', target: 'inst-b', sessionId }], '只按目标撤回单条记录；调用会话随参（席位授权）');
+  const missing = await withdrawInviteTool().handler({ collabId: 'collab-1' }, context);
   assert.equal(missing.isError, true);
   assert.ok(missing.content[0].text.includes('ws_end_collab'), '缺定位参数时指向结束协作的唯一入口');
 
   const withdrawCalls = [];
   const join = { withdrawInvite(input) { withdrawCalls.push(input); return { ok: true, inviteId: input.inviteId, withdrawn: true }; } };
-  const context = { ...collabContextOf(collab), join, sessionId: 'session-a-0123456789' };
-  const withdrawn = await withdrawInviteTool().handler({ collabId: ' collab-1 ', inviteId: ' inv-1 ' }, context);
+  const joinContext = { ...context, join };
+  const withdrawn = await withdrawInviteTool().handler({ collabId: ' collab-1 ', inviteId: ' inv-1 ' }, joinContext);
   assert.equal(withdrawn.isError, undefined);
   assert.deepEqual(withdrawCalls, [{ collabId: 'collab-1', managerSessionId: 'session-a-0123456789', inviteId: 'inv-1' }], '按记录撤回：inviteId + 签发会话');
   assert.equal(JSON.parse(withdrawn.content[0].text).withdrawn, true);
-  const unavailable = await withdrawInviteTool().handler({ collabId: 'collab-1', inviteId: 'inv-1' }, { ...context, join: {} });
+  const unavailable = await withdrawInviteTool().handler({ collabId: 'collab-1', inviteId: 'inv-1' }, { ...joinContext, join: {} });
   assert.equal(unavailable.isError, true);
   assert.ok(unavailable.content[0].text.includes('join.withdrawInvite'), '加入域面未暴露时明确报错，不静默落回整条撤回');
 
-  const both = await callCollabTool(withdrawInviteTool(), { collabId: 'collab-1', inviteId: 'inv-1', target: 'inst-b' }, collab);
+  const both = await withdrawInviteTool().handler({ collabId: 'collab-1', inviteId: 'inv-1', target: 'inst-b' }, context);
   assert.equal(both.isError, true);
-  const badId = await callCollabTool(withdrawInviteTool(), { collabId: 'collab-1', inviteId: '  ' }, collab);
+  const badId = await withdrawInviteTool().handler({ collabId: 'collab-1', inviteId: '  ' }, context);
   assert.equal(badId.isError, true);
-  const bad = await callCollabTool(withdrawInviteTool(), { collabId: 'collab-1', target: 42 }, collab);
+  const bad = await withdrawInviteTool().handler({ collabId: 'collab-1', target: 42 }, context);
   assert.equal(bad.isError, true);
   assert.equal(collab.calls.withdraw.length, 1, '拒绝路径均未调旧服务（不会被解释为整条取消）');
 });
@@ -1141,16 +1331,27 @@ test('ws_set_mute：muted 缺失 / 非布尔、collabId 非法 → isError，不
   assert.ok(refused.content[0].text.includes('collabId 不存在'));
 });
 
-test('ws_end_collab / ws_leave_collab：合法透传、拒绝路径 isError、缺参不调服务', async () => {
+test('ws_end_collab / ws_leave_collab：合法透传本会话标识、拒绝路径 isError、缺参不调服务', async () => {
   const collab = fakeService();
-  assert.equal((await callCollabTool(endCollabTool(), { collabId: 'collab-1' }, collab)).isError, undefined);
+  const context = { ...collabContextOf(collab), sessionId: 'session-a-0123456789' };
+  assert.equal((await endCollabTool().handler({ collabId: 'collab-1' }, context)).isError, undefined);
   assert.equal((await callCollabTool(leaveCollabTool(), { collabId: 'collab-1' }, collab)).isError, undefined);
-  assert.deepEqual(collab.calls.end, [{ collabId: 'collab-1' }]);
+  assert.deepEqual(collab.calls.end, [{ collabId: 'collab-1', sessionId: 'session-a-0123456789' }], '结束按调用会话授权（不再是整机调用）');
   assert.deepEqual(collab.calls.leave, [{ collabId: 'collab-1', sessionId: undefined }], '无会话上下文时如实传空（由服务拒绝，不代签其他会话）');
-  assert.equal((await callCollabTool(endCollabTool(), {}, collab)).isError, true);
+  assert.equal((await endCollabTool().handler({}, context)).isError, true);
   const denied = fakeService({ leave: { ok: false, message: '站长席位不可退出——请先结束协作或显式交接' } });
   assert.equal((await callCollabTool(leaveCollabTool(), { collabId: 'collab-1' }, denied)).isError, true);
   assert.equal(collab.calls.end.length, 1);
+});
+
+test('ws_end_collab：无会话标识 → isError，不调服务（不得退回整机兼容）', async () => {
+  const collab = fakeService();
+  for (const context of [collabContextOf(collab), { ...collabContextOf(collab), sessionId: '   ' }]) {
+    const result = await endCollabTool().handler({ collabId: 'collab-1' }, context);
+    assert.equal(result.isError, true);
+    assert.ok(result.content[0].text.includes('会话标识'), result.content[0].text);
+  }
+  assert.equal(collab.calls.end.length, 0, '缺会话标识不触服务');
 });
 
 test('ws_leave_collab：透传本会话标识（只退本会话席位，不按首个活跃席位代签）', async () => {
@@ -1198,12 +1399,13 @@ function fakeGovernanceService(responses = {}) {
 
 test('ws_decide：恰提供一种形态（choice / mergeOffer 二者必居其一）', async () => {
   const collab = fakeGovernanceService();
-  const withoutForms = await callCollabTool(decideTool(), { collabId: 'collab-1' }, collab);
+  const context = governedContextOf(collab);
+  const withoutForms = await decideTool().handler({ collabId: 'collab-1' }, context);
   assert.equal(withoutForms.isError, true);
   assert.ok(withoutForms.content[0].text.includes('一种形态'));
-  const bothForms = await callCollabTool(decideTool(), { collabId: 'collab-1', choice: 'keep', mergeOffer: 'accept' }, collab);
+  const bothForms = await decideTool().handler({ collabId: 'collab-1', choice: 'keep', mergeOffer: 'accept' }, context);
   assert.equal(bothForms.isError, true);
-  const badCollab = await callCollabTool(decideTool(), { collabId: '  ' }, collab);
+  const badCollab = await decideTool().handler({ collabId: '  ' }, context);
   assert.equal(badCollab.isError, true);
   assert.equal(collab.calls.decide.length, 0);
   assert.equal(collab.calls.decideMerge.length, 0);
@@ -1211,31 +1413,33 @@ test('ws_decide：恰提供一种形态（choice / mergeOffer 二者必居其一
 
 test('ws_decide：choice 合法透传、枚举外拒绝、服务拒绝 isError', async () => {
   const collab = fakeGovernanceService();
-  const kept = await callCollabTool(decideTool(), { collabId: ' collab-1 ', choice: 'keep' }, collab);
+  const context = { ...collabContextOf(collab), sessionId: 'session-a-0123456789' };
+  const kept = await decideTool().handler({ collabId: ' collab-1 ', choice: 'keep' }, context);
   assert.equal(kept.isError, undefined);
-  assert.deepEqual(collab.calls.decide, [{ collabId: 'collab-1', choice: 'keep' }]);
-  const merged = await callCollabTool(decideTool(), { collabId: 'collab-1', choice: 'merge' }, collab);
-  const terminated = await callCollabTool(decideTool(), { collabId: 'collab-1', choice: 'terminate' }, collab);
+  assert.deepEqual(collab.calls.decide, [{ collabId: 'collab-1', choice: 'keep', sessionId: 'session-a-0123456789' }]);
+  const merged = await decideTool().handler({ collabId: 'collab-1', choice: 'merge' }, context);
+  const terminated = await decideTool().handler({ collabId: 'collab-1', choice: 'terminate' }, context);
   assert.equal(merged.isError, undefined);
   assert.equal(terminated.isError, undefined);
   assert.deepEqual(collab.calls.decide, [
-    { collabId: 'collab-1', choice: 'keep' },
-    { collabId: 'collab-1', choice: 'merge' },
-    { collabId: 'collab-1', choice: 'terminate' },
+    { collabId: 'collab-1', choice: 'keep', sessionId: 'session-a-0123456789' },
+    { collabId: 'collab-1', choice: 'merge', sessionId: 'session-a-0123456789' },
+    { collabId: 'collab-1', choice: 'terminate', sessionId: 'session-a-0123456789' },
   ]);
-  const bad = await callCollabTool(decideTool(), { collabId: 'collab-1', choice: 'maybe' }, collab);
+  const bad = await decideTool().handler({ collabId: 'collab-1', choice: 'maybe' }, context);
   assert.equal(bad.isError, true);
   const denied = fakeGovernanceService({ decide: { ok: false, message: '只有冻结中的协作需要裁定（当前未冻结）' } });
-  assert.equal((await callCollabTool(decideTool(), { collabId: 'collab-1', choice: 'terminate' }, denied)).isError, true);
+  assert.equal((await decideTool().handler({ collabId: 'collab-1', choice: 'terminate' }, governedContextOf(denied))).isError, true);
   assert.equal(collab.calls.decide.length, 3, 'merge / terminate 各透传一次、枚举外拒绝不触服务');
 });
 
-test('ws_decide：mergeOffer 合法透传、枚举外拒绝', async () => {
+test('ws_decide：mergeOffer 合法透传（含本会话标识）、枚举外拒绝', async () => {
   const collab = fakeGovernanceService();
-  const accepted = await callCollabTool(decideTool(), { collabId: 'collab-1', mergeOffer: 'accept' }, collab);
+  const context = { ...collabContextOf(collab), sessionId: 'session-a-0123456789' };
+  const accepted = await decideTool().handler({ collabId: 'collab-1', mergeOffer: 'accept' }, context);
   assert.equal(accepted.isError, undefined);
-  assert.deepEqual(collab.calls.decideMerge, [{ collabId: 'collab-1', mergeOffer: 'accept' }]);
-  const bad = await callCollabTool(decideTool(), { collabId: 'collab-1', mergeOffer: 'later' }, collab);
+  assert.deepEqual(collab.calls.decideMerge, [{ collabId: 'collab-1', mergeOffer: 'accept', sessionId: 'session-a-0123456789' }]);
+  const bad = await decideTool().handler({ collabId: 'collab-1', mergeOffer: 'later' }, context);
   assert.equal(bad.isError, true);
   assert.equal(collab.calls.decideMerge.length, 1);
 });
@@ -1321,6 +1525,7 @@ test('ws_handover 目标拒绝角色：decision=reject 须 reason；无服务入
 
 test('ws_handover 角色参数冲突：offerId 与 target/targetSessionId 不可同给；decision/confirmToken 须配 offerId', async () => {
   const collab = fakeGovernanceService();
+  const context = governedContextOf(collab);
   for (const args of [
     { collabId: 'collab-1', offerId: 'offer-1', target: 'inst-b' },
     { collabId: 'collab-1', offerId: 'offer-1', target: 'inst-b', targetSessionId: 'sess-b' },
@@ -1329,7 +1534,7 @@ test('ws_handover 角色参数冲突：offerId 与 target/targetSessionId 不可
     { collabId: 'collab-1', offerId: 'offer-1', decision: 'maybe' },
     { collabId: 'collab-1', offerId: 'offer-1', confirmToken: '  ' },
   ]) {
-    const result = await callCollabTool(handoverTool(), args, collab);
+    const result = await handoverTool().handler(args, context);
     assert.equal(result.isError, true, JSON.stringify(args));
   }
   assert.equal(collab.calls.handover.length, 0);
@@ -1364,14 +1569,14 @@ test('ws_take_over：退役 confirm 一律拒绝；首次挑战映射 confirmTok
   assert.equal(JSON.parse(applied.content[0].text).applied, true);
 
   const denied = fakeGovernanceService({ takeOver: { ok: false, message: '现任站长未被判定失联' } });
-  const refused = await callCollabTool(takeOverTool(), { collabId: 'collab-1' }, denied);
+  const refused = await takeOverTool().handler({ collabId: 'collab-1' }, { ...collabContextOf(denied), sessionId: 'session-a-0123456789' });
   assert.equal(refused.isError, true);
   assert.ok(refused.content[0].text.includes('失联'));
 });
 
 test('治理工具输出封装：ok 载荷 JSON 化输出（含仅 ok 的内建字段）', async () => {
   const collab = fakeGovernanceService();
-  const decided = await callCollabTool(decideTool(), { collabId: 'collab-1', choice: 'keep' }, collab);
+  const decided = await decideTool().handler({ collabId: 'collab-1', choice: 'keep' }, { ...collabContextOf(collab), sessionId: 'session-a-0123456789' });
   const payload = JSON.parse(decided.content[0].text);
   assert.equal(payload.choice, 'keep');
   assert.equal(payload.message, '已解除冻结并广播');
@@ -1437,22 +1642,22 @@ test('工具返回口径：22 工具成功载荷均为含 ok:true 的 JSON 对�
     { tool: deliveryStatusTool(), args: {}, context: contextWith(net) },
     { tool: checkInboxTool(), args: { collabId: 'collab-1' }, context: contextWith(net, { sessionId: 'session-a-0123456789' }) },
     { tool: listCollabsTool(), args: {}, context: collabContextOf(collab) },
-    { tool: createCollabTool(), args: { name: '项目', topic: '主题', targets: [single] }, context: collabContextOf(collab) },
+    { tool: createCollabTool(), args: { name: '项目', topic: '主题', targets: [single] }, context: governedContextOf(collab) },
     { tool: approveInviteTool(), args: { collabId: 'collab-1', inviteId: 'inv-1', approve: true }, context: collabContextOf(collab) },
     { tool: allowNextInviteTool(), args: {}, context: collabContextOf(collab) },
-    { tool: withdrawInviteTool(), args: { collabId: 'collab-1', target: 'inst-b' }, context: collabContextOf(collab) },
+    { tool: withdrawInviteTool(), args: { collabId: 'collab-1', target: 'inst-b' }, context: governedContextOf(collab) },
     { tool: viewLedgerTool(), args: { collabId: 'collab-1' }, context: collabContextOf(collab) },
     { tool: sendMessageTool(), args: { collabId: 'collab-1', text: '你好' }, context: collabContextOf(collab) },
     { tool: setMuteTool(), args: { collabId: 'collab-1', muted: true }, context: collabContextOf(collab) },
     { tool: leaveCollabTool(), args: { collabId: 'collab-1' }, context: collabContextOf(collab) },
-    { tool: endCollabTool(), args: { collabId: 'collab-1' }, context: collabContextOf(collab) },
-    { tool: inviteTool(), args: { collabId: 'collab-1', targets: [single] }, context: collabContextOf(collab) },
+    { tool: endCollabTool(), args: { collabId: 'collab-1' }, context: governedContextOf(collab) },
+    { tool: inviteTool(), args: { collabId: 'collab-1', targets: [single] }, context: governedContextOf(collab) },
     { tool: requestJoinTool(), args: { name: '讨论甲' }, context: contextWith(net) },
     { tool: joinTool(), args: { collabId: 'collab-1' }, context: joinContextOf(join) },
     { tool: approveJoinTool(), args: { collabId: 'collab-1', sessionId: 'newcomer-1', approve: true }, context: joinContextOf(join) },
-    { tool: decideTool(), args: { collabId: 'collab-1', choice: 'keep' }, context: collabContextOf(governance) },
-    { tool: handoverTool(), args: { collabId: 'collab-1', target: 'inst-b', targetSessionId: 'sess-b' }, context: collabContextOf(governance) },
-    { tool: takeOverTool(), args: { collabId: 'collab-1' }, context: collabContextOf(governance) },
+    { tool: decideTool(), args: { collabId: 'collab-1', choice: 'keep' }, context: governedContextOf(governance) },
+    { tool: handoverTool(), args: { collabId: 'collab-1', target: 'inst-b', targetSessionId: 'sess-b' }, context: governedContextOf(governance) },
+    { tool: takeOverTool(), args: { collabId: 'collab-1' }, context: governedContextOf(governance) },
   ];
   assert.equal(cases.length, 22, '覆盖全部 22 工具');
   for (const { tool, args, context } of cases) {

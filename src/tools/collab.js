@@ -36,7 +36,24 @@ export function listCollabsTool() {
 
 function withSessionSeatFields(context, entry) {
   const seat = context.collab.localSeatOf?.(entry.collabId, context.sessionId) ?? null;
-  return { ...entry, sessionRole: seat?.role ?? null, sessionState: seat?.state ?? null };
+  const freezeReason = freezeReasonOf(entry);
+  return {
+    ...entry,
+    sessionRole: seat?.role ?? null,
+    sessionState: seat?.state ?? null,
+    ...(freezeReason === null ? {} : { freezeReason }),
+  };
+}
+
+/* 冻结原因的形状兼容（设计 §9 把 freezeReason 列为条目字段）：服务现把原因嵌在 sessions 下，
+ * 工具层优先取条目顶层、缺失时回退嵌套——两种形状都不让展示面丢原因。 */
+function freezeReasonOf(entry) {
+  const top = entry.freezeReason;
+  if (typeof top === 'string' && top.trim() !== '') {
+    return top;
+  }
+  const nested = entry.sessions?.freezeReason;
+  return typeof nested === 'string' && nested.trim() !== '' ? nested : null;
 }
 
 export function createCollabTool() {
@@ -71,31 +88,80 @@ export function inviteTool() {
       if (collabId === null) {
         return errorResult('参数 collabId 非法：需要非空白字符串');
       }
+      const caller = callerSessionOf(context, 'ws_invite');
+      if (caller.refusal !== null) {
+        return caller.refusal;
+      }
       const targets = targetsArg(args);
       if (targets === null) {
         return errorResult(targetsErrorMessage());
       }
+      const verdicts = await capabilityVerdictsOf(targets, context);
       /* 邀请簿记归加入域：逐目标签发 inviteId（撤回 / 对账的定位键）。加入域面未暴露时
        * 回退旧邀请面（论坛与尚未接线的装配），不让工具层直接依赖 outgoing 内部。 */
       if (typeof context.join?.createInvite === 'function') {
-        return inviteViaJoinDomain(collabId, targets, context);
+        return inviteViaJoinDomain(collabId, targets, verdicts, caller.sessionId, context);
       }
-      return resultOf(await context.collab.invite({ collabId, targets }));
+      return inviteViaLegacySurface(collabId, targets, verdicts, caller.sessionId, context);
     },
   };
 }
 
-async function inviteViaJoinDomain(collabId, targets, context) {
-  const invited = [];
+/* 邀请前的能力闸门（设计 §7.2）：加入域的 createInvite 不做能力判定，若工具层不预检，就会对
+ * 旧版对端留下已签发的邀请记录并向调用方报成功。逐目标单播探测一次（探测结果写入 known-hosts，
+ * 服务层闸门可复用），不支持/无法确认的目标如实拒绝。探测面不可用的装配无法判定——如实标记
+ * unverified 而不是把未知当支持。 */
+async function capabilityVerdictsOf(targets, context) {
+  const probe = context.net?.probeCapability;
+  if (typeof probe !== 'function') {
+    return targets.map(() => ({ state: 'unverified' }));
+  }
+  const verdicts = [];
   for (const target of targets) {
-    const created = await context.join.createInvite(inviteCallOf(collabId, target, context));
+    verdicts.push(await capabilityVerdictOf(probe, target));
+  }
+  return verdicts;
+}
+
+async function capabilityVerdictOf(probe, target) {
+  const probed = await probeCapabilityResultOf(probe, target);
+  if (probed?.ok !== true) {
+    return { state: 'unknown', reason: `无法确认目标驿站（${target.instanceId}）支持会话级协作：${probed?.message ?? '能力探测失败'}——未发出邀请` };
+  }
+  if (probed.capability === 'supported') {
+    return { state: 'supported' };
+  }
+  if (probed.capability === 'unsupported') {
+    return { state: 'unsupported', reason: `目标驿站（${target.instanceId}）版本不支持会话级协作（需 0.2.0+）——未发出邀请` };
+  }
+  return { state: 'unknown', reason: `无法确认目标驿站（${target.instanceId}）支持会话级协作——未发出邀请（请确认对方为 0.2.0+ 且在线）` };
+}
+
+/* 探测面异常按「能力未确认」归一：探测失败不得被当成支持而放行邀请。 */
+async function probeCapabilityResultOf(probe, target) {
+  try {
+    return await probe({ address: target.address, port: target.port, instanceId: target.instanceId });
+  } catch (error) {
+    return { ok: false, message: error?.message ?? '能力探测失败' };
+  }
+}
+
+async function inviteViaJoinDomain(collabId, targets, verdicts, sessionId, context) {
+  const invited = [];
+  for (const [index, target] of targets.entries()) {
+    const verdict = verdicts[index];
+    if (verdict.state === 'unsupported' || verdict.state === 'unknown') {
+      invited.push({ instanceId: target.instanceId, ok: false, reason: verdict.reason });
+      continue;
+    }
+    const created = await context.join.createInvite(inviteCallOf(collabId, target, sessionId));
     /* 论坛无邀请簿记（设计 D18）：整批回退旧邀请面，forum 不生成也不返回 inviteId。 */
     if (created.code === 'forum-no-invite') {
-      return resultOf(await context.collab.invite({ collabId, targets }));
+      return inviteViaLegacySurface(collabId, targets, verdicts, sessionId, context);
     }
     /* 逐目标如实回报：前面的目标可能已发出邀请，不能用一个错误吞掉已签发的事实。 */
     invited.push(created.ok === true
-      ? inviteRecordOf(target, created)
+      ? inviteRecordOf(target, created, verdict)
       : { instanceId: target.instanceId, ok: false, reason: created.message });
   }
   /* 一个都没签发出＝本次邀请失败：顶层 ok:true 会让代理把「谁也没邀请到」当成功——
@@ -107,18 +173,22 @@ async function inviteViaJoinDomain(collabId, targets, context) {
   return okResult({ ok: true, collabId, invited });
 }
 
-function inviteCallOf(collabId, target, context) {
+function inviteCallOf(collabId, target, sessionId) {
   return {
     collabId,
-    managerSessionId: context.sessionId,
+    managerSessionId: sessionId,
     targetInstanceId: target.instanceId,
     ...(target.targetSessionId === undefined ? {} : { targetSessionId: target.targetSessionId }),
   };
 }
 
-/* 逐目标结果沿用旧邀请面的形状（instanceId / ok / msgId），另携 inviteId 与有效期。 */
-function inviteRecordOf(target, created) {
+/* 逐目标结果沿用旧邀请面的形状（instanceId / ok / msgId），另携 inviteId 与有效期。
+ * 探测面缺失时附 capability:'unverified'：邀请照发，但调用方知道能力未经确认。 */
+function inviteRecordOf(target, created, verdict) {
   const record = { instanceId: target.instanceId, ok: true, inviteId: created.inviteId };
+  if (verdict.state === 'unverified') {
+    record.capability = 'unverified';
+  }
   if (created.expiresAt !== undefined) {
     record.expiresAt = created.expiresAt;
   }
@@ -126,6 +196,20 @@ function inviteRecordOf(target, created) {
     record.msgId = created.delivery.msgId;
   }
   return record;
+}
+
+/* 旧邀请面（论坛 / 加入域未接线）：能力闸门按整批前置（与 service.invite 的既有口径一致）；
+ * 旧面不逐目标携带结论，探测面缺失时以顶层标记如实说明能力未经确认。 */
+async function inviteViaLegacySurface(collabId, targets, verdicts, sessionId, context) {
+  const refused = verdicts.find((verdict) => verdict.state === 'unsupported' || verdict.state === 'unknown');
+  if (refused !== undefined) {
+    return errorResult(refused.reason);
+  }
+  const result = await context.collab.invite({ collabId, targets, sessionId });
+  if (result.ok === true && verdicts.some((verdict) => verdict.state === 'unverified')) {
+    return okResult({ ...result, capability: 'unverified' });
+  }
+  return resultOf(result);
 }
 
 /* targets 非法时的统一文案（两工具共用——形状与上限同一权威）。 */
@@ -212,14 +296,18 @@ export function withdrawInviteTool() {
       if (collabId === null) {
         return errorResult('参数 collabId 非法：需要非空白字符串');
       }
+      const caller = callerSessionOf(context, 'ws_withdraw_invite');
+      if (caller.refusal !== null) {
+        return caller.refusal;
+      }
       const parsed = withdrawArgsOf(args);
       if (parsed.error !== undefined) {
         return errorResult(parsed.error);
       }
       if (parsed.inviteId !== undefined) {
-        return withdrawByInviteId(parsed.inviteId, collabId, context);
+        return withdrawByInviteId(parsed.inviteId, collabId, caller.sessionId, context);
       }
-      return resultOf(await context.collab.withdraw({ collabId, target: parsed.target }));
+      return resultOf(await context.collab.withdraw({ collabId, target: parsed.target, sessionId: caller.sessionId }));
     },
   };
 }
@@ -246,11 +334,11 @@ function withdrawArgsOf(args) {
 
 /* 按邀请记录撤回（邀请簿记）：定位键是 inviteId，签发者为本会话；
  * 加入域面未暴露时明确报错（不得静默落回 target / 整条撤回路径）。 */
-function withdrawByInviteId(inviteId, collabId, context) {
+function withdrawByInviteId(inviteId, collabId, sessionId, context) {
   if (typeof context.join?.withdrawInvite !== 'function') {
     return errorResult('参数 inviteId 暂不可用：服务层尚未暴露按邀请记录撤回（join.withdrawInvite）');
   }
-  return resultOf(context.join.withdrawInvite({ collabId, managerSessionId: context.sessionId, inviteId }));
+  return resultOf(context.join.withdrawInvite({ collabId, managerSessionId: sessionId, inviteId }));
 }
 
 export function viewLedgerTool() {
@@ -350,9 +438,29 @@ export function endCollabTool() {
       if (collabId === null) {
         return errorResult('参数 collabId 非法：需要非空白字符串');
       }
-      return resultOf(await context.collab.end({ collabId }));
+      /* 结束是站长会话的治理动作（managed）：调用会话必须随参——缺标识时服务层会退回整机
+       * 兼容，同机成员会话因此能结束整条协作。 */
+      const caller = callerSessionOf(context, 'ws_end_collab');
+      if (caller.refusal !== null) {
+        return caller.refusal;
+      }
+      return resultOf(await context.collab.end({ collabId, sessionId: caller.sessionId }));
     },
   };
+}
+
+/* 治理 / 邀请类工具的会话前提（设计 §1.1/§1.2）：会话标识是席位授权的主体，缺失时不得退回
+ * 整机兼容——否则同机任一成员会话都会被当成站长。返回 { sessionId, refusal }：refusal 非空
+ * 即应原样作为工具错误返回；调用参数一律用归一后的 sessionId。 */
+export function callerSessionOf(context, toolName) {
+  const sessionId = typeof context.sessionId === 'string' ? context.sessionId.trim() : '';
+  if (sessionId === '') {
+    return {
+      sessionId,
+      refusal: errorResult(`本会话无会话标识：${toolName} 以调用会话的席位授权，无法确定调用席位——请从带会话标识的终端调用`),
+    };
+  }
+  return { sessionId, refusal: null };
 }
 
 /* 工具返回口径（22 工具单一权威）：成功 = 顶层含 ok:true 的 JSON 对象（列表载荷用命名字段承载：
