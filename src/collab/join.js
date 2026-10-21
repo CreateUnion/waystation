@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { isIP } from 'node:net';
 import {
-  COLLAB_CAPABILITY, ID_PATTERN, MAX_ACTIVE_SEATS, MAX_REASON_CHARS, MAX_TOPIC_CHARS, PROTOCOL_VERSION,
-  isIdentityName, isPresentationText, newMsgId,
+  ID_PATTERN, MAX_ACTIVE_SEATS, MAX_REASON_CHARS, MAX_TOPIC_CHARS, PROTOCOL_VERSION,
+  isIdentityName, isPresentationText, newMsgId, withCollabCapability,
 } from '../net/protocol.js';
 import {
   createInvitesFileStore, createJoiningFileStore, createJoinApplicationsStore, createJoinsStore, createPendingInvitesFileStore,
@@ -10,12 +10,17 @@ import {
 import { joinDenyReasonOf } from './invites.js';
 import {
   currentManagerIdOf, isLocalArchivedState, listLocalSeatsOf, localModeOf, localNameOf, localRosterOf, localSeatOfLocal,
-  localStateOf, localTopicOf, managerSeatOfLocal, removeLocalSeat, seatsOfLocal, selfJoinedOf, upsertLocalSeat,
+  localStateOf, localTopicOf, managerSeatOfLocal, persistMember, removeLocalSeat, seatsOfLocal, selfJoinedOf, upsertLocalSeat,
 } from './local.js';
 import { LOCAL_LEFT_STATE } from './model.js';
 import { endpointFor, invitePayloadOf, mutateLedger } from './outgoing.js';
+import { createPostsStore } from './posts.js';
+import { createMembersStore } from './members.js';
+import { createCounterStore } from './counter.js';
+import { createMuteStore } from './mute.js';
+import { createInjectedStore } from './injected.js';
 import { ledgerDigest } from './store.js';
-import { shortSessionId } from '../util/short-id.js';
+import { isSessionShortCode, matchSessionByToken, shortSessionId } from '../util/short-id.js';
 
 /* 加入域服务（会话级加入 §2/§4）：会话申请 / 站长批准 / 接线 / 拒绝呈现 ＋ 讨论直连。
  * 两侧视角同域：发起机（申请、回执落地、接线）与站长机（待批准面、批准 / 拒绝回执）；
@@ -73,7 +78,7 @@ export function createJoinDomain({ state, send = null, openViewer = null, log = 
     isGranted: (collabId, sessionId) => isGranted(joinState, collabId, sessionId),
     /* 讨论同意门落地后的收口（服务在邀请被批准时调用）：把敲门登记在册的请求会话接线。 */
     bindKnockedSession: (local) => bindKnockedSession(joinState, local),
-    /* —— 0.2.0 会话级邀请与两段式入席（契约 M4 → M5/M6） —— */
+    /* —— 会话级邀请与两段式入席（邀请簿记、挂起补投、join 两段式；设计 §4） —— */
     ...sessionJoinApiOf(joinState),
   };
   /* 准入门的上限判定注入面（待批准存活面）：门只调 list() 取数、不筛不删，过期待批准由本提供方剪除。 */
@@ -316,12 +321,16 @@ function dispatchJoinRequest(joinState, plan) {
   if (result.ok !== true) {
     return { ok: false, message: `加入申请发送失败：${result.reason}——稍后重试` };
   }
+  /* 站长端点随申请台账定格：后续 grant 到达时本机可能还没有该协作（冷启动），
+   * 回执的寻址只能靠这条记录（协作记录建起来之前没有端点表可查）。 */
   joinState.state.joinApplications.add({
     collabId: plan.collabId,
     sessionId: plan.sessionId,
     managerInstanceId: plan.manager.instanceId,
     msgId: result.msgId,
     sentAt: plan.sentAt,
+    ...(typeof plan.manager.address === 'string' ? { managerAddress: plan.manager.address } : {}),
+    ...(Number.isInteger(plan.manager.port) ? { managerPort: plan.manager.port } : {}),
   });
   armRetry(joinState, plan);
   return {
@@ -548,6 +557,13 @@ function bridgeIdOf(joinState, sessionId) {
   return (typeof resolve === 'function' ? idOf(resolve(sessionId)) : null) ?? sessionId;
 }
 
+/* 席位绑定的桥（运行态注入面用）：与服务装配处的注册表同源，缺省 null＝未注册。 */
+function bridgeOfSeat(joinState, sessionId) {
+  const bridges = joinState.state.sessionBridges;
+  const bridgeId = bridges instanceof Map ? bridges.get(sessionId) : undefined;
+  return typeof bridgeId === 'string' && bridgeId !== '' ? bridgeId : null;
+}
+
 function openCollabView(joinState, collabId) {
   if (joinState.openViewer !== null) {
     joinState.openViewer({ root: MAIN_VIEWER_ROOT, id: collabId });
@@ -649,9 +665,44 @@ async function requestForum(joinState, local, sessionId) {
     if (bindSession(joinState, { collabId: local.collabId, sessionId, origin: 'join' }) !== true) {
       return { ok: false, message: '接线未落地（绑定表不可用）——本会话收不到该讨论的注入' };
     }
+    ensureBoundSeatOf(joinState, local, sessionId);
     return { ok: true, collabId: local.collabId, sessionId, mode: 'forum', bound: true, note: '讨论在席＝本机接线立即（无批准门）——本会话开始接收该讨论的注入' };
   }
   return knockByName(joinState, localNameOf(local), sessionId);
+}
+
+/* 接线成功后的本机席位（论坛加入在域内直接补齐）：席位是发邀请、状态栏与静音的取数面，
+ * 只有绑定表记录而无席位会让已加入的成员「看不见也邀不了」。已有席位（含发起人的站长席）
+ * 不覆盖角色。 */
+function ensureBoundSeatOf(joinState, local, sessionId) {
+  if (localSeatOfLocal(local, sessionId) !== null) {
+    return;
+  }
+  upsertLocalSeat(local, {
+    version: 1,
+    sessionId,
+    role: 'member',
+    state: 'member',
+    joinSeq: rosterJoinSeqOf(local, sessionId),
+    joinedAt: new Date(joinState.now()).toISOString(),
+    muted: true,
+    unverified: false,
+  }, seatWriteOptionsOf(joinState, sessionId));
+}
+
+/* 席位整写选项（持久化 ＋ 当前桥）：upsertLocalSeat 的桥字段类型由 local.js 推断，
+ * 这里以 any 传递运行期真实桥标识（null＝未注册）。 */
+function seatWriteOptionsOf(joinState, sessionId) {
+  return /** @type {any} */ ({
+    persist: true,
+    dataDir: joinState.state.dataDir,
+    bridgeId: bridgeOfSeat(joinState, sessionId),
+  });
+}
+
+function rosterJoinSeqOf(local, sessionId) {
+  const row = rosterRowsOf(local).find((entry) => entry.sessionId === sessionId);
+  return Number.isInteger(row?.joinSeq) ? row.joinSeq : seatsOfLocal(local).size + 1;
 }
 
 async function knockByName(joinState, name, sessionId) {
@@ -690,6 +741,7 @@ function bindKnockedSession(joinState, local) {
   if (bindSession(joinState, { collabId: local.collabId, sessionId: registered.sessionId, origin: 'join' }) !== true) {
     return null;   // 接线未落地：登记保留（本会话待下次落地接线）
   }
+  ensureBoundSeatOf(joinState, local, registered.sessionId);
   joinState.knocks.delete(name);   // 一次性登记：席位已交回，不重复接线
   return registered.sessionId;
 }
@@ -726,6 +778,11 @@ function knockNoteOf(replies) {
 function handleJoinRequest(joinState, frame) {
   const collabId = frame.collabId;
   const local = joinState.state.collabs.get(collabId);
+  /* 已结束/已退出的协作不再收申请：入站门可能放行 join-request，写面必须自行 fail-closed。 */
+  if (local !== undefined && isLocalArchivedState(local)) {
+    joinState.log.warn('加入申请未落待批准面（协作已结束）', { collabId });
+    return { ok: false, action: 'join-refused', collabId, reason: 'archived' };
+  }
   if (!isJoinManager(local)) {
     return refuseForeignJoin(joinState, frame, collabId);
   }
@@ -933,6 +990,7 @@ function registerInvitedMember(joinState, local, pending) {
     if (row === undefined) {
       ledger.members.push({
         instanceId: pending.instanceId,
+        sessionId: pending.sessionId,
         identityName: applicantNameOf(pending),
         role: 'member',
         state: 'invited',
@@ -940,6 +998,7 @@ function registerInvitedMember(joinState, local, pending) {
       });
       return;
     }
+    row.sessionId = pending.sessionId;
     row.state = 'invited';
     row.identityName = applicantNameOf(pending);
     row.joinedAt = new Date(joinState.now()).toISOString();
@@ -1345,9 +1404,10 @@ function failureMessage(message, extra = {}) {
   return { ok: false, ...extra, message };
 }
 
-/* 席位直投：本机目标走 M2 旁路；远端一帧（toSessions 指名要投的会话）。
- * 本机注入面是异步的，这里只拿到「已排入」——失败计数由 M2 侧负责，主链不阻塞。 */
-function sendSeatFrame(joinState, { collabId, instanceId, sessionId, type, payload, fromSessionId }) {
+/* 席位直投：本机目标走本机旁路注入，远端一帧（toSessions 指名要投的会话）。
+ * 本机注入面可能是异步的（准入/交付都要等桥面落定），因此本函数一律返回 Promise：
+ * 调用方必须 await 到 resolve 值再决定成败与回滚，不得把「已排入」当成功。 */
+async function sendSeatFrame(joinState, { collabId, instanceId, sessionId, type, payload, fromSessionId }) {
   if (instanceId !== joinState.state.self.instanceId) {
     return sendRemoteSeatFrame(joinState, { collabId, instanceId, sessionId, type, payload, fromSessionId });
   }
@@ -1356,18 +1416,67 @@ function sendSeatFrame(joinState, { collabId, instanceId, sessionId, type, paylo
     : injectSeatFrame(joinState, { collabId, sessionId, type, payload, fromSessionId });
 }
 
-/* 不指名邀请投本机时按活跃会话逐个注入（设计 §4.3：投目标机当前全部已注册会话）。 */
-function injectLocalBroadcast(joinState, { collabId, type, payload, fromSessionId }) {
-  const local = joinState.state.collabs.get(collabId);
-  const sessions = (typeof joinState.state.listLocalSeats === 'function'
-    ? joinState.state.listLocalSeats(collabId)
-    : (local === undefined ? [] : listLocalSeatsOf(local)))
-    .filter((seat) => seat.state === 'member' && seat.sessionId !== fromSessionId);
+/* 不指名邀请投本机时按全部已注册会话逐个注入（设计 §4.3）：目标会话可以不持有席位
+ * （受邀未入席），因此目标面取注入面/桥注册表，而不是只枚举已有 member 席位。 */
+async function injectLocalBroadcast(joinState, { collabId, type, payload, fromSessionId }) {
+  const sessions = injectableSessionsOf(joinState, collabId).filter((sessionId) => sessionId !== fromSessionId);
   if (sessions.length === 0) {
     return { ok: false, reason: '本机没有可投递的活跃会话' };
   }
-  const results = sessions.map((seat) => injectSeatFrame(joinState, { collabId, sessionId: seat.sessionId, type, payload, fromSessionId }));
-  return { ok: results.some((entry) => entry.ok === true), local: true, results };
+  const results = [];
+  for (const sessionId of sessions) {
+    results.push(await injectSeatFrame(joinState, { collabId, sessionId, type, payload, fromSessionId }));
+  }
+  const delivered = results.some((entry) => entry.ok === true);
+  return delivered ? { ok: true, local: true, results } : { ok: false, reason: results[0]?.reason ?? '目标会话不可注入', results };
+}
+
+/* 本机可投递的会话标识：服务的注入目标面优先（席位 ∪ 桥注册的邀请目标），缺失时退回
+ * 本机席位表与桥注册表——邀请注入不要求接收者已是席位（设计 §4.3）。 */
+function injectableSessionsOf(joinState, collabId) {
+  const state = joinState.state;
+  const sessions = new Set();
+  collectSessionIdsOf(sessions, state.listInjectableTargets, state, collabId);
+  collectSessionIdsOf(sessions, state.listLocalSeats, state, collabId);
+  collectLocalSeatIdsOf(sessions, state.collabs?.get?.(collabId));
+  for (const sessionId of bridgeSessionIdsOf(state)) {
+    sessions.add(sessionId);
+  }
+  return [...sessions];
+}
+
+function collectLocalSeatIdsOf(sessions, local) {
+  for (const seat of local === undefined ? [] : listLocalSeatsOf(local)) {
+    if (idOf(seat.sessionId) !== null) {
+      sessions.add(seat.sessionId);
+    }
+  }
+}
+
+function collectSessionIdsOf(sessions, list, state, collabId) {
+  if (typeof list !== 'function') {
+    return;
+  }
+  for (const entry of safeSessionListOf(list, state, collabId)) {
+    if (idOf(entry?.sessionId) !== null) {
+      sessions.add(entry.sessionId);
+    }
+  }
+}
+
+/* 目标面是附属机制：读不出按「无可投递目标」处置，不打断发送主链。 */
+function safeSessionListOf(list, state, collabId) {
+  try {
+    const entries = list.call(state, collabId);
+    return Array.isArray(entries) ? entries : [];
+  } catch {
+    return [];
+  }
+}
+
+function bridgeSessionIdsOf(state) {
+  const bridges = state.sessionBridges;
+  return bridges instanceof Map ? [...bridges.keys()] : [];
 }
 
 function sendRemoteSeatFrame(joinState, { collabId, instanceId, sessionId, type, payload, fromSessionId }) {
@@ -1388,28 +1497,27 @@ function sendRemoteSeatFrame(joinState, { collabId, instanceId, sessionId, type,
   return result?.ok === true ? { ok: true, msgId: result.msgId } : { ok: false, reason: result?.reason ?? '发送面未返回结果' };
 }
 
-function injectSeatFrame(joinState, { collabId, sessionId, type, payload, fromSessionId }) {
+async function injectSeatFrame(joinState, { collabId, sessionId, type, payload, fromSessionId }) {
   const inject = joinState.state.injectLocalSeat;
   if (typeof inject !== 'function') {
-    return { ok: false, reason: '本机注入面未接线（M2 injectLocalSeat 缺失）' };
+    return { ok: false, reason: '本机注入面未接线（服务未提供 injectLocalSeat）' };
   }
   if (idOf(sessionId) === null) {
     return { ok: false, reason: '本机目标缺少会话标识' };
   }
-  const frame = {
+  const frame = withCollabCapability({
     v: PROTOCOL_VERSION,
-    cap: COLLAB_CAPABILITY,
     msgId: newMsgId(),
     type,
     collabId,
     from: { ...joinState.state.self, sessionId: fromSessionId },
     ts: new Date(joinState.now()).toISOString(),
     payload,
-  };
+  });
   return injectFrameNow(joinState, inject, { collabId, sessionId, type }, frame);
 }
 
-function injectFrameNow(joinState, inject, { collabId, sessionId, type }, frame) {
+async function injectFrameNow(joinState, inject, { collabId, sessionId, type }, frame) {
   let result;
   try {
     result = inject(collabId, sessionId, frame);
@@ -1419,12 +1527,21 @@ function injectFrameNow(joinState, inject, { collabId, sessionId, type }, frame)
   return resolveInjectionOf(joinState, result, { collabId, sessionId, type });
 }
 
-function resolveInjectionOf(joinState, result, { collabId, sessionId, type }) {
+/* 注入结果以 resolve 值为准：异步面拒绝时通常**正常 resolve** `{ok:false,reason}`，
+ * 把 thenable 当成功会让邀请/授权在未送达时留下 open 记录或幽灵 grant。 */
+async function resolveInjectionOf(joinState, result, { collabId, sessionId, type }) {
+  let settled = result;
   if (isThenable(result)) {
-    result.catch((error) => joinState.log.warn('本机席位注入失败（已计数）', { collabId, sessionId, type, reason: error?.message }));
-    return { ok: true, local: true, scheduled: true };
+    try {
+      settled = await result;
+    } catch (error) {
+      joinState.log.warn('本机席位注入失败', { collabId, sessionId, type, reason: error?.message });
+      return { ok: false, reason: error?.message ?? '本机注入异常' };
+    }
   }
-  return result?.ok === true ? { ok: true, local: true, result } : { ok: false, reason: result?.reason ?? '目标会话不可注入' };
+  return settled?.ok === true
+    ? { ok: true, local: true, result: settled }
+    : { ok: false, reason: settled?.reason ?? '目标会话不可注入' };
 }
 
 function isThenable(value) {
@@ -1442,6 +1559,34 @@ function inviteTargetOf(input) {
   }
   const targetSessionId = idOf(rawSession);
   return targetSessionId === null ? null : { instanceId, targetSessionId };
+}
+
+/* 指名目标的本机解析（短码或完整标识，精确匹配、歧义拒绝）：本机投递面按全量标识找桥，
+ * 原样传短码必然投不出去；远端目标保持原样，由目标机按同一口径解析。 */
+function resolveLocalInviteTargetOf(joinState, collabId, target) {
+  if (target.targetSessionId === undefined || target.instanceId !== joinState.state.self.instanceId) {
+    return { ok: true, target };
+  }
+  const token = target.targetSessionId;
+  const sessions = injectableSessionsOf(joinState, collabId).map((sessionId) => ({ sessionId }));
+  const matched = matchSessionByToken(sessions, token);
+  if (matched !== null) {
+    return { ok: true, target: { ...target, targetSessionId: matched } };
+  }
+  if (!isSessionShortCode(token)) {
+    return { ok: true, target };   // 完整标识原样保留：目标会话尚未注册时由目标机补投路径判定
+  }
+  return unresolvedShortTargetOf(sessions, token);
+}
+
+function unresolvedShortTargetOf(sessions, token) {
+  const ambiguous = sessions.filter((entry) => shortSessionId(entry.sessionId) === token).length > 1;
+  return failureMessage(
+    ambiguous
+      ? `指名会话短码在本机有歧义（${token}）——请给完整会话标识`
+      : `指名会话短码在本机没有匹配的已注册会话（${token}）`,
+    { reason: 'target-session-unresolved' },
+  );
 }
 
 function inviteIdsOf(input) {
@@ -1485,7 +1630,7 @@ function invitePayloadV2Of(joinState, local, inviteId, target, managerSessionId)
   };
 }
 
-function createInviteOf(joinState, input) {
+async function createInviteOf(joinState, input) {
   const prechecked = createInviteContextOf(joinState, input);
   if (prechecked.ok !== true) {
     return prechecked;
@@ -1504,7 +1649,7 @@ function createInviteOf(joinState, input) {
     return failureMessage(`邀请簿记写入失败：${saved.reason}——邀请未发出（避免重启后无从校验）`);
   }
   const payload = invitePayloadV2Of(joinState, local, opened.inviteId, target, ids.managerSessionId);
-  const sent = sendSeatFrame(joinState, {
+  const sent = await sendSeatFrame(joinState, {
     collabId: ids.collabId, instanceId: target.instanceId, sessionId: target.targetSessionId,
     type: 'invite', payload, fromSessionId: ids.managerSessionId,
   });
@@ -1525,8 +1670,25 @@ function createInviteContextOf(joinState, input) {
   if (local === undefined) {
     return failureMessage('本机没有该协作（collabId 不存在）——先看 ws_list_collabs');
   }
+  const refusal = inviteContextRefusalOf(joinState, local, ids);
+  if (refusal !== null) {
+    return refusal;
+  }
+  const target = inviteTargetOf(input);
+  if (target === null) {
+    return failureMessage('邀请目标非法：需要 targetInstanceId 与可选的 targetSessionId');
+  }
+  const resolved = /** @type {any} */ (resolveLocalInviteTargetOf(joinState, ids.collabId, target));
+  return resolved.ok === true ? { ok: true, ids, local, target: resolved.target } : resolved;
+}
+
+/* 邀请前置拒绝：讨论无簿记 / 已结束 / 非站长会话 / 元状态缺失 / 席位已满。null＝可邀请。 */
+function inviteContextRefusalOf(joinState, local, ids) {
   if (localModeOf(local) === 'forum') {
     return failureMessage('讨论无邀请簿记：forum 不生成、不返回 inviteId（设计 D18）', { code: 'forum-no-invite' });
+  }
+  if (isLocalArchivedState(local)) {
+    return failureMessage('该协作已结束（或本机已退出）——不再发起邀请');
   }
   if (!isManagerSession(joinState, local, ids.managerSessionId)) {
     return failureMessage('只有站长会话可以邀请成员');
@@ -1534,16 +1696,12 @@ function createInviteContextOf(joinState, input) {
   if (!isIdentityName(localNameOf(local)) || !isPresentationText(localTopicOf(local), MAX_TOPIC_CHARS)) {
     return failureMessage('本地记录缺协作名或主题（协议面无法组出合法邀请）——待元状态补齐后重试');
   }
-  if (activeSeatsCount(joinState, local, null) >= MAX_ACTIVE_SEATS) {
-    return failureMessage(`协作活跃席位已达上限（${MAX_ACTIVE_SEATS}）——不再发起新邀请`);
-  }
-  const target = inviteTargetOf(input);
-  return target === null
-    ? failureMessage('邀请目标非法：需要 targetInstanceId 与可选的 targetSessionId')
-    : { ok: true, ids, local, target };
+  return activeSeatsCount(joinState, local, null) >= MAX_ACTIVE_SEATS
+    ? failureMessage(`协作活跃席位已达上限（${MAX_ACTIVE_SEATS}）——不再发起新邀请`)
+    : null;
 }
 
-function acceptInviteOf(joinState, input) {
+async function acceptInviteOf(joinState, input) {
   const ids = acceptInviteIdsOf(input);
   if (ids.ok !== true) {
     return ids;
@@ -1582,9 +1740,9 @@ function acceptInviteIdsOf(input) {
     : { ok: true, collabId, inviteId, sessionId };
 }
 
-function acceptRemoteInviteOf(joinState, { collabId, inviteId, sessionId, manager, books }) {
+async function acceptRemoteInviteOf(joinState, { collabId, inviteId, sessionId, manager, books }) {
   rememberInviteAcceptanceOf(joinState, { collabId, sessionId, managerInstanceId: manager.instanceId });
-  const sent = sendSeatFrame(joinState, {
+  const sent = await sendSeatFrame(joinState, {
     collabId, instanceId: manager.instanceId, sessionId: manager.sessionId, type: 'approve', payload: { inviteId }, fromSessionId: sessionId,
   });
   if (sent.ok !== true) {
@@ -1619,22 +1777,26 @@ function forgetInviteAcceptanceOf(joinState, collabId, sessionId) {
   }
 }
 
-function acceptLocalInviteOf(joinState, { collabId, inviteId, sessionId, manager, books }) {
+async function acceptLocalInviteOf(joinState, { collabId, inviteId, sessionId, manager, books }) {
   const consumed = books.pending.store.consumeForSession({ collabId, inviteId, sessionId, declined: false, now: joinState.now() });
   if (consumed.ok !== true) {
     return failureMessage(`邀请已不可接受：${consumed.reason}`, { reason: consumed.reason });
   }
   books.pending.save();
   rememberInviteAcceptanceOf(joinState, { collabId, sessionId, managerInstanceId: joinState.state.self.instanceId });
-  const approved = approveInviteForSeat(joinState, {
+  const approved = await approveInviteForSeat(joinState, {
     collabId, inviteId, instanceId: joinState.state.self.instanceId, sessionId, managerSessionId: manager.sessionId,
     identityName: joinState.state.self.identityName,
   });
   return approved.ok === true ? { ...approved, accepted: true, inviteId } : approved;
 }
 
-function approveInviteForSeat(joinState, input) {
+async function approveInviteForSeat(joinState, input) {
   const local = joinState.state.collabs.get(input.collabId);
+  /* 终态协作不再受理邀请批准（入站门可能放行 approve，写面自行 fail-closed）。 */
+  if (local !== undefined && isLocalArchivedState(local)) {
+    return failureMessage('该协作已结束（或本机已退出）——不再处置邀请');
+  }
   if (!isManagerSession(joinState, local, input.managerSessionId)) {
     return failureMessage('只有站长会话可以批准邀请');
   }
@@ -1654,7 +1816,7 @@ function approveInviteForSeat(joinState, input) {
       ? grantSeatOf(joinState, local, books, existing, input.managerSessionId, input.inviteId)
       : failureMessage('同一会话已有其他实例的在途 grant——拒绝覆盖（instance-mismatch）', { reason: 'instance-mismatch' });
   }
-  const begun = beginSeatJoiningOf(joinState, local, books, {
+  const begun = await beginSeatJoiningOf(joinState, local, books, {
     collabId: input.collabId, instanceId: input.instanceId, sessionId: input.sessionId,
     managerSessionId: input.managerSessionId, inviteId: input.inviteId, identityName: input.identityName,
   });
@@ -1664,7 +1826,7 @@ function approveInviteForSeat(joinState, input) {
   return grantSeatOf(joinState, local, books, /** @type {any} */ (begun).record, input.managerSessionId, input.inviteId);
 }
 
-function beginSeatJoiningOf(joinState, local, books, input) {
+async function beginSeatJoiningOf(joinState, local, books, input) {
   const seat = { instanceId: input.instanceId, sessionId: input.sessionId };
   const begun = books.joining.registry.beginJoining({
     collabId: input.collabId,
@@ -1691,9 +1853,9 @@ function beginSeatJoiningOf(joinState, local, books, input) {
 }
 
 /* 批准失败：容量满回 join-deny(capacity)；形态/实例冲突如实回报，不覆盖他人 grant。 */
-function beginJoiningFailureOf(joinState, local, input, begun) {
+async function beginJoiningFailureOf(joinState, local, input, begun) {
   if (begun.reason === 'capacity') {
-    sendJoinDenyOf(joinState, local, input, denialJoinIdOf(), 'capacity');
+    await sendJoinDenyOf(joinState, local, input, denialJoinIdOf(), 'capacity');
     forgetPendingRequestOf(joinState, input.collabId, input);
     return failureMessage(`活跃席位已满（${MAX_ACTIVE_SEATS}）——已回 join-deny(capacity)`, { reason: 'capacity' });
   }
@@ -1703,7 +1865,7 @@ function beginJoiningFailureOf(joinState, local, input, begun) {
   return failureMessage('在途入席记录写入失败（参数非法）', { reason: begun.reason });
 }
 
-function grantSeatOf(joinState, local, books, record, managerSessionId, inviteId) {
+async function grantSeatOf(joinState, local, books, record, managerSessionId, inviteId) {
   if (record === null) {
     return failureMessage('在途入席记录不存在', { reason: 'unknown' });
   }
@@ -1719,7 +1881,7 @@ function grantSeatOf(joinState, local, books, record, managerSessionId, inviteId
     version: record.grantVersion,
     sessionId: record.sessionId,
   };
-  const sent = sendSeatFrame(joinState, {
+  const sent = await sendSeatFrame(joinState, {
     collabId: record.collabId,
     instanceId: record.instanceId,
     sessionId: record.sessionId,
@@ -1739,7 +1901,7 @@ function denialJoinIdOf() {
   return `join-deny-${randomUUID()}`;
 }
 
-function sendJoinDenyOf(joinState, local, seat, joinId, reason, managerTerm = undefined) {
+async function sendJoinDenyOf(joinState, local, seat, joinId, reason, managerTerm = undefined) {
   const managerSessionId = managerSessionOf(joinState, local);
   if (managerSessionId === null) {
     return { ok: false, reason: '站长席位未知' };
@@ -1761,7 +1923,7 @@ function sendJoinDenyOf(joinState, local, seat, joinId, reason, managerTerm = un
   });
 }
 
-function approveJoinOf(joinState, input) {
+async function approveJoinOf(joinState, input) {
   const context = approveJoinContextOf(joinState, input);
   if (context.ok !== true) {
     return context;
@@ -1795,27 +1957,33 @@ function approveJoinContextOf(joinState, input) {
   if (localModeOf(local) === 'forum') {
     return failureMessage('讨论无批准门：请用 ws_approve_invite（forum 不产生 inviteId）', { code: 'forum-no-invite' });
   }
+  if (isLocalArchivedState(local)) {
+    return failureMessage('该协作已结束（或本机已退出）——不再处置加入申请');
+  }
   if (!isManagerSession(joinState, local, managerSessionId)) {
     return failureMessage('本机不是该协作的站长会话（无批准权）——批准权不随数据副本走');
   }
   return { ok: true, local, managerSessionId, wanted };
 }
 
-function grantPendingRequestOf(joinState, local, request, managerSessionId, rawInviteId) {
+async function grantPendingRequestOf(joinState, local, request, managerSessionId, rawInviteId) {
   const inviteId = rawInviteId === undefined || rawInviteId === null ? null : idOf(rawInviteId);
   if (rawInviteId !== undefined && rawInviteId !== null && inviteId === null) {
     return failureMessage('inviteId 形态非法');
   }
   const result = inviteId === null
-    ? beginAndGrantPendingOf(joinState, local, request, managerSessionId)
-    : approveInviteForSeat(joinState, { ...request, collabId: local.collabId, inviteId, managerSessionId });
+    ? await beginAndGrantPendingOf(joinState, local, request, managerSessionId)
+    : await approveInviteForSeat(joinState, { ...request, collabId: local.collabId, inviteId, managerSessionId });
   if (result.ok === true) {
     forgetPendingRequestOf(joinState, local.collabId, request);
   }
   return result;
 }
 
-function beginAndGrantPendingOf(joinState, local, request, managerSessionId) {
+/* 批准申请：申请人可能从未收到过邀请（按名解析 → join-request 的冷启动路径），其本机还没有
+ * 该协作的参与记录——grant 到达时会因无从核对而失败。因此先复用受邀入席（补一条指名邀请，
+ * 由对方的事件面建立本地记录），再签发 grant；已在名单的申请人跳过这一步。 */
+async function beginAndGrantPendingOf(joinState, local, request, managerSessionId) {
   const books = booksOf(joinState, local.collabId);
   if (isRosterMember(joinState, local, request.instanceId, request.sessionId)) {
     return { ok: true, member: true, alreadyMember: true, sessionId: request.sessionId };
@@ -1826,7 +1994,19 @@ function beginAndGrantPendingOf(joinState, local, request, managerSessionId) {
       ? grantSeatOf(joinState, local, books, existing, managerSessionId, null)
       : failureMessage('同一会话已有其他实例的在途 grant——拒绝覆盖（instance-mismatch）', { reason: 'instance-mismatch' });
   }
-  const begun = beginSeatJoiningOf(joinState, local, books, {
+  /* 容量先判：满员即回 deny，不再给注定失败的申请人补发邀请（邀请会先于 deny 到达）。 */
+  const capacityRefusal = await capacityRefusalOf(joinState, local, request);
+  if (capacityRefusal !== null) {
+    return capacityRefusal;
+  }
+  /* 本机会话自批：本机已有该协作记录，grant 走核内旁路即可，不需要（也无从）再向自己发邀请。 */
+  const seated = request.instanceId === joinState.state.self.instanceId
+    ? { ok: true, seated: true }
+    : await ensureApplicantInvitedOf(joinState, local, request);
+  if (seated.ok !== true) {
+    return seated;
+  }
+  const begun = await beginSeatJoiningOf(joinState, local, books, {
     collabId: local.collabId, instanceId: request.instanceId, sessionId: request.sessionId,
     managerSessionId, inviteId: undefined, identityName: request.identityName,
   });
@@ -1836,12 +2016,49 @@ function beginAndGrantPendingOf(joinState, local, request, managerSessionId) {
   return grantSeatOf(joinState, local, books, /** @type {any} */ (begun).record, managerSessionId, null);
 }
 
-function rejectPendingRequestOf(joinState, local, request, reason) {
+/* 冷启动申请人的先期邀请（设计 §4.4 第 1 步）：按名解析 → join-request 的申请人本机还没有
+ * 该协作的参与记录，grant 到达时无从核对。先补一条**指名邀请**（载荷带申请人自己的席位条目），
+ * 由对方的事件面建立本地记录；共享名单是 active-only，批准前不得写入 invited 行
+ * （名单形态只接受 state:'member'，写入即让台账在重启读回时判损坏）。 */
+async function ensureApplicantInvitedOf(joinState, local, request) {
+  const target = decisionTargetOf(joinState, local.collabId, request.instanceId);
+  if (target === null) {
+    return { ok: false, message: `申请人端点未知（${request.instanceId}）——先 ws_list_hosts 确认对方在线，或让申请人重新申请（入站帧会带来端点）` };
+  }
+  const extra = { instanceId: request.instanceId, sessionId: request.sessionId, identityName: applicantNameOf(request) };
+  const payload = {
+    ...invitePayloadOf(local.ledger, [extra]),
+    targetSessionId: request.sessionId,
+    targets: [{ instanceId: request.instanceId, targetSessionId: request.sessionId }],
+  };
+  const sent = await sendFrameOf(joinState, {
+    collabId: local.collabId, target, type: 'invite', payload,
+    fromSessionId: senderSessionOf(joinState, local.collabId) ?? undefined,
+  });
+  if (sent.ok !== true) {
+    return { ok: false, message: `入席邀请发送失败：${sent.reason}——未落处置，可稍后重试` };
+  }
+  joinState.state.counters.invitesSent++;
+  return { ok: true, seated: false };
+}
+
+/* 批准前的容量判定（口径与 beginJoining 一致：共享名单活跃席位，不含本席）。 */
+async function capacityRefusalOf(joinState, local, request) {
+  const seat = { instanceId: request.instanceId, sessionId: request.sessionId };
+  if (activeSeatsCount(joinState, local, seat) < MAX_ACTIVE_SEATS) {
+    return null;
+  }
+  await sendJoinDenyOf(joinState, local, request, denialJoinIdOf(), 'capacity');
+  forgetPendingRequestOf(joinState, local.collabId, request);
+  return failureMessage(`活跃席位已满（${MAX_ACTIVE_SEATS}）——已回 join-deny(capacity)`, { reason: 'capacity' });
+}
+
+async function rejectPendingRequestOf(joinState, local, request, reason) {
   const validated = validateReason(reason);
   if (validated.ok !== true) {
     return failureMessage(validated.message);
   }
-  const sent = sendJoinDenyOf(joinState, local, request, denialJoinIdOf(), 'aborted', managerTermOf(local));
+  const sent = await sendJoinDenyOf(joinState, local, request, denialJoinIdOf(), 'aborted', managerTermOf(local));
   if (sent.ok !== true) {
     return failureMessage(`拒绝回执发送失败：${sent.reason}——未落处置，可稍后重试`);
   }
@@ -1932,11 +2149,34 @@ function confirmJoiningOf(joinState, joinId, sessionId, input) {
   if (prepared.ok !== true) {
     return prepared;
   }
+  const refusal = confirmStateRefusalOf(found, /** @type {any} */ (prepared), joinId);
+  if (refusal !== null) {
+    return refusal;
+  }
   const confirmed = found.books.joining.registry.confirmJoining(joinId, sessionId, /** @type {any} */ (prepared).confirmInput);
   if (confirmed.ok !== true) {
     return confirmFailureOf(found, confirmed);
   }
   return finishConfirmOf(joinState, found, sessionId, prepared, joinId);
+}
+
+/* confirm 前的当前态校验（不依赖入站门）：协作归档/终态一律拒绝；未入名单的旧 grant 必须仍属
+ * 本机当前任期——站长更替后旧 grant 不得在任期内落地（已入名单的席位保留，见设计 §4.4.8）。
+ * fail-closed：两种拒绝都作废在途记录并落盘，避免幽灵 grant 滞留到下次清扫。 */
+function confirmStateRefusalOf(found, prepared, joinId) {
+  if (prepared.local === undefined || isLocalArchivedState(prepared.local)) {
+    return refuseStaleJoinOf(found, joinId, 'aborted', '协作已结束（或本机已退出）——在途 grant 已作废');
+  }
+  if (prepared.alreadyMember !== true && found.record.managerTerm !== managerTermOf(prepared.local)) {
+    return refuseStaleJoinOf(found, joinId, 'manager-changed', '站长任期已变更（managerTerm 不符）——旧 grant 已作废');
+  }
+  return null;
+}
+
+function refuseStaleJoinOf(found, joinId, reason, message) {
+  found.books.joining.registry.abortJoining(joinId, reason);
+  found.books.joining.save();
+  return failureMessage(message, { reason });
 }
 
 function confirmPreparedOf(joinState, found, sessionId, input) {
@@ -1974,7 +2214,9 @@ function finishConfirmOf(joinState, found, sessionId, prepared, joinId) {
   if (committed.ok !== true) {
     found.books.joining.registry.unconfirmJoining(joinId);
     found.books.joining.save();
-    return failureMessage('共享名单写入失败——在途 grant 已回滚为未确认，可重试', { reason: 'roster-write-failed' });
+    return committed.reason === 'archived'
+      ? failureMessage('协作已结束——在途入席已作废', { reason: 'aborted' })
+      : failureMessage('共享名单写入失败——在途 grant 已回滚为未确认，可重试', { reason: 'roster-write-failed' });
   }
   found.books.joining.registry.releaseJoining(found.collabId, sessionId);
   found.books.joining.save();
@@ -2004,6 +2246,11 @@ function commitSeatToRosterOf(joinState, local, record, joinId) {
   }
   if (localModeOf(local) === 'forum') {
     return { ok: false, reason: 'forum-no-roster' };
+  }
+  /* 终态台账不得再收席位（终态空名单/manager:null 是契约不变量）：入口已在归档时拒绝，
+   * 这里是写面的最后一道 fail-closed——迟到 confirm 不得把成员写进已结束的协作。 */
+  if (local.ledger?.status === 'completed' || local.ledger?.status === 'terminated') {
+    return { ok: false, reason: 'archived' };
   }
   const identityName = joinState.seatNames.get(joinId) ?? nameForSeat(joinState, record);
   let joinSeq = null;
@@ -2091,10 +2338,10 @@ function markLocalSeatMemberOf(joinState, local, record, joinSeq) {
     joinedAt: new Date(joinState.now()).toISOString(),
     muted: true,
     unverified: false,
-  }, { persist: true, dataDir: joinState.state.dataDir });
+  }, seatWriteOptionsOf(joinState, record.sessionId));
 }
 
-function handleJoinConfirmOf(joinState, frame) {
+async function handleJoinConfirmOf(joinState, frame) {
   const context = joinConfirmContextOf(joinState, frame);
   if (context === null) {
     return null;
@@ -2127,10 +2374,10 @@ function isLocalManagedManager(local) {
   return localModeOf(local) === 'managed' && (managerSeatOfLocal(local) !== null || local.role === 'manager');
 }
 
-function applyJoinConfirmOf(joinState, context, found) {
+async function applyJoinConfirmOf(joinState, context, found) {
   const { local, joinId, seat } = context;
   if (found.record.instanceId !== seat.instanceId || found.record.sessionId !== seat.sessionId) {
-    sendJoinDenyOf(joinState, local, seat, joinId, 'aborted', found.record.managerTerm);
+    await sendJoinDenyOf(joinState, local, seat, joinId, 'aborted', found.record.managerTerm);
     return { ok: true, action: 'join-denied', joinId, reason: 'session-mismatch' };
   }
   const result = confirmJoiningOf(joinState, joinId, seat.sessionId, {
@@ -2140,28 +2387,28 @@ function applyJoinConfirmOf(joinState, context, found) {
   if (result.ok !== true) {
     return confirmDeniedOf(joinState, local, found, joinId, seat, result);
   }
-  sendSnapshotToSeatOf(joinState, local, seat);
+  await sendSnapshotToSeatOf(joinState, local, seat);
   return { ok: true, action: 'join-confirmed', joinId, alreadyMember: /** @type {any} */ (result).alreadyMember === true };
 }
 
-function confirmUnknownJoinOf(joinState, local, joinId, seat) {
+async function confirmUnknownJoinOf(joinState, local, joinId, seat) {
   if (isRosterMember(joinState, local, seat.instanceId, seat.sessionId)) {
-    sendSnapshotToSeatOf(joinState, local, seat);
+    await sendSnapshotToSeatOf(joinState, local, seat);
     return { ok: true, action: 'join-confirmed', joinId, alreadyMember: true };
   }
-  sendJoinDenyOf(joinState, local, seat, joinId, 'aborted');
+  await sendJoinDenyOf(joinState, local, seat, joinId, 'aborted');
   return { ok: true, action: 'join-denied', joinId, reason: 'unknown' };
 }
 
-function confirmDeniedOf(joinState, local, found, joinId, seat, result) {
+async function confirmDeniedOf(joinState, local, found, joinId, seat, result) {
   if (result.reason === 'roster-write-failed') {
     return { ok: false, action: 'join-retry', joinId, reason: result.reason, message: result.message };
   }
-  sendJoinDenyOf(joinState, local, seat, joinId, result.reason, found.record.managerTerm);
+  await sendJoinDenyOf(joinState, local, seat, joinId, result.reason, found.record.managerTerm);
   return { ok: true, action: 'join-denied', joinId, reason: result.reason };
 }
 
-function sendSnapshotToSeatOf(joinState, local, seat) {
+async function sendSnapshotToSeatOf(joinState, local, seat) {
   const ledger = local?.ledger;
   if (ledger === undefined || ledger === null) {
     return { ok: false, reason: '本机无台账' };
@@ -2182,20 +2429,89 @@ function sendSnapshotToSeatOf(joinState, local, seat) {
   });
 }
 
-function handleJoinGrantOf(joinState, frame) {
+async function handleJoinGrantOf(joinState, frame) {
   const context = joinGrantContextOf(joinState, frame);
   if (context === null) {
     return null;
   }
-  const local = joinState.state.collabs.get(context.collabId);
-  if (local === undefined) {
-    return { ok: false, action: 'join-failed', reason: 'unknown-collab' };
-  }
+  const held = joinState.state.collabs.get(context.collabId);
   const application = matchSessionApplicationOf(joinState, frame, context.collabId, context.managerInstanceId);
   if (application === null) {
-    return resendConfirmForGrantOf(joinState, local, context, frame);
+    if (held === undefined) {
+      joinState.log.warn('join-grant 与本机申请台账不匹配（忽略）', { collabId: context.collabId, msgId: frame.msgId });
+      return null;
+    }
+    return resendConfirmForGrantOf(joinState, held, context, frame);
   }
+  const local = held ?? ensureLocalForGrantOf(joinState, frame, context, application);
   return beginLocalJoiningOf(joinState, local, application, context.joinId, frame.payload);
+}
+
+/* 冷启动 grant 的本地参与记录：按名解析 → join-request 的申请人本机此前没有该协作，
+ * 邀请帧又没到（丢失/乱序/对端未走受邀入席）。建一条最小记录让两段式继续——协作名先以
+ * 标识占位，名册与主题随后续快照补齐；不落地会让 grant 永远无从核对（unknown-collab 空等）。 */
+function ensureLocalForGrantOf(joinState, frame, context, application) {
+  const held = joinState.state.collabs.get(context.collabId);
+  if (held !== undefined) {
+    return held;
+  }
+  const created = provisionalLocalOf(joinState, context.collabId, frame.payload?.manager ?? {});
+  seedManagerEndpointOf(joinState, created, context.managerInstanceId, application);
+  joinState.state.collabs.set(context.collabId, created);
+  persistMember(joinState.state, created);
+  joinState.log.warn('收到加入授权但本机无该协作记录——已建最小参与记录（元数据待快照补齐）', {
+    collabId: context.collabId, joinId: context.joinId,
+  });
+  return created;
+}
+
+/* 站长端点（回执寻址）：申请台账定格的端点优先，缺省退回已知主机清单。 */
+function seedManagerEndpointOf(joinState, local, managerInstanceId, application) {
+  const fromApplication = endpointPairOf(application?.managerAddress, application?.managerPort);
+  const endpoint = fromApplication ?? lookupHostOf(joinState, managerInstanceId);
+  if (endpoint !== null) {
+    local.endpoints.set(managerInstanceId, endpoint);
+  }
+}
+
+function endpointPairOf(address, port) {
+  return typeof address === 'string' && isIP(address) !== 0 && Number.isInteger(port) && port >= 1 && port <= 65535
+    ? { address, port }
+    : null;
+}
+
+function provisionalLocalOf(joinState, collabId, manager) {
+  const base = { dataDir: joinState.state.dataDir, collabId, log: joinState.log };
+  const managerName = isIdentityName(manager.identityName) ? manager.identityName : manager.instanceId;
+  const now = new Date(joinState.now()).toISOString();
+  return {
+    collabId,
+    role: 'member',
+    ledger: null,
+    member: {
+      collabId,
+      role: 'member',
+      state: 'proposed',
+      name: collabId,
+      topic: '',
+      mode: 'managed',
+      manager: { instanceId: manager.instanceId, identityName: managerName },
+      roster: [{ instanceId: manager.instanceId, identityName: managerName }],
+      endpoints: {},
+      invitedAt: now,
+      decision: null,
+      provisional: true,
+    },
+    endpoints: new Map(),
+    snapshot: null,
+    posts: createPostsStore(base),
+    members: createMembersStore(base),
+    counter: createCounterStore(base),
+    mute: createMuteStore(base),
+    injected: createInjectedStore(base),
+    suspended: null,
+    staleManagerId: null,
+  };
 }
 
 function joinGrantContextOf(joinState, frame) {
@@ -2217,14 +2533,14 @@ function joinGrantIdsOf(frame) {
 }
 
 /* 重复 grant（首次 confirm 丢失）：本机席位已记同一 joinId 时重发 confirm，不重复建席位。 */
-function resendConfirmForGrantOf(joinState, local, context, frame) {
+async function resendConfirmForGrantOf(joinState, local, context, frame) {
   const sessionId = idOf(frame?.payload?.sessionId);
   const seat = sessionId === null ? null : localSeatOfLocal(local, sessionId);
   if (seat === null || seat.joinId !== context.joinId) {
     joinState.log.warn('join-grant 与本机申请台账不匹配（忽略）', { collabId: context.collabId, msgId: frame.msgId });
     return null;
   }
-  const sent = sendSeatFrame(joinState, {
+  const sent = await sendSeatFrame(joinState, {
     collabId: context.collabId, instanceId: context.managerInstanceId, sessionId: context.managerSessionId,
     type: 'join-confirm', payload: { joinId: context.joinId, managerTerm: frame.payload.managerTerm, version: frame.payload.version },
     fromSessionId: seat.sessionId,
@@ -2243,7 +2559,8 @@ function matchSessionApplicationOf(joinState, frame, collabId, managerInstanceId
     && joinState.now() - application.sentAt < ttlOf(joinState)) ?? null;
 }
 
-function beginLocalJoiningOf(joinState, local, application, joinId, payload) {
+async function beginLocalJoiningOf(joinState, local, application, joinId, payload) {
+  const seatOptions = seatWriteOptionsOf(joinState, application.sessionId);
   upsertLocalSeat(local, {
     version: 1,
     sessionId: application.sessionId,
@@ -2255,9 +2572,9 @@ function beginLocalJoiningOf(joinState, local, application, joinId, payload) {
     joinedAt: new Date(joinState.now()).toISOString(),
     muted: true,
     unverified: false,
-  }, { persist: true, dataDir: joinState.state.dataDir });
+  }, seatOptions);
   clearApplications(joinState, application.collabId, application.sessionId);
-  const sent = sendSeatFrame(joinState, {
+  const sent = await sendSeatFrame(joinState, {
     collabId: application.collabId,
     instanceId: application.managerInstanceId,
     sessionId: payload.manager.sessionId,
@@ -2270,11 +2587,13 @@ function beginLocalJoiningOf(joinState, local, application, joinId, payload) {
     return { ok: false, action: 'join-failed', reason: sent.reason };
   }
   /* 发出 confirm 后立即转 member(unverified)：可接收注入、禁止发消息；收到含本席快照后由
-   * 快照消费面清除 unverified；回执失败时按同一 joinId 回滚。 */
+   * 快照消费面清除 unverified；回执失败时按同一 joinId 回滚。
+   * 合并必须带 sessionId：缺了它会以 undefined 为键新建匿名席位，原加入席停在 joining。 */
   upsertLocalSeat(local, {
+    sessionId: application.sessionId,
     state: 'member',
     unverified: true,
-  }, { persist: true, dataDir: joinState.state.dataDir });
+  }, seatOptions);
   return { ok: true, action: 'joining', joinId, sessionId: application.sessionId, unverified: true };
 }
 
@@ -2392,13 +2711,45 @@ function handleInviteFrameOf(joinState, frame) {
   if (managerSessionId === null) {
     return failureMessage('邀请帧缺少 from.sessionId');
   }
+  const target = /** @type {any} */ (resolveIncomingTargetOf(joinState, frame));
+  if (target.ok !== true) {
+    return target;
+  }
   return registerPendingInviteOf(joinState, {
     collabId: frame.collabId,
     inviteId,
     fromManager: { instanceId: frame.from.instanceId, sessionId: managerSessionId },
-    targetSessionId: frame.payload?.targetSessionId,
+    targetSessionId: target.sessionId,
     now: joinState.now(),
   });
+}
+
+/* 收到邀请的指名目标：本机可唯一解析的短码换成全量会话标识后落盘（补投与可见性比较按全量
+ * 标识）；解析不出时原样保留，由比较面的短码口径兜底（会话晚注册也能看到）。 */
+function resolveIncomingTargetOf(joinState, frame) {
+  const raw = namedTargetTokenOf(joinState, frame);
+  if (raw === undefined || raw === null) {
+    return { ok: true, sessionId: undefined };
+  }
+  const token = idOf(raw);
+  if (token === null) {
+    return failureMessage('邀请载荷的 targetSessionId 形态非法');
+  }
+  const sessions = injectableSessionsOf(joinState, frame.collabId).map((sessionId) => ({ sessionId }));
+  return { ok: true, sessionId: matchSessionByToken(sessions, token) ?? token };
+}
+
+/* 指名目标的取数面：0.2.0 邀请把目标写在 targets[]（按机器定位），旧版面带顶层 targetSessionId。
+ * 本机目标项存在即以其为准——没有 targetSessionId 就是**不指名**（不得回落到顶层字段）。 */
+function namedTargetTokenOf(joinState, frame) {
+  const targets = frame?.payload?.targets;
+  if (Array.isArray(targets)) {
+    const own = targets.find((target) => target?.instanceId === joinState.state.self.instanceId);
+    if (own !== undefined) {
+      return own.targetSessionId;
+    }
+  }
+  return frame?.payload?.targetSessionId;
 }
 
 function pendingInvitesForOf(joinState, input) {
@@ -2411,7 +2762,7 @@ function pendingInvitesForOf(joinState, input) {
   return books.pending.store.matchPendingForSession({ collabId, sessionId, inviteId: input.inviteId, now: joinState.now() });
 }
 
-/* 站长侧收到受邀会话的 approve（M5 消费面在 approve 携 inviteId 时转交本域）。 */
+/* 站长侧收到受邀会话的 approve（approve 携 inviteId 时由事件面转交本域签发 grant）。 */
 function handleInviteApprovalOf(joinState, frame) {
   const context = inviteApprovalContextOf(joinState, frame);
   if (context === null) {
@@ -2449,7 +2800,7 @@ function allBooksOf(joinState) {
   return [...collabIds].map((collabId) => [collabId, booksOf(joinState, collabId)]);
 }
 
-function expireJoiningOf(joinState, at) {
+async function expireJoiningOf(joinState, at) {
   let expired = 0;
   for (const [collabId, books] of allBooksOf(joinState)) {
     const local = joinState.state.collabs.get(collabId);
@@ -2461,7 +2812,7 @@ function expireJoiningOf(joinState, at) {
     expired += result.expired;
     for (const record of result.records) {
       if (local !== undefined) {
-        sendJoinDenyOf(joinState, local, record, record.joinId, 'expired', record.managerTerm);
+        await sendJoinDenyOf(joinState, local, record, record.joinId, 'expired', record.managerTerm);
       }
     }
   }
@@ -2480,7 +2831,7 @@ function expirePendingInvitesOf(joinState, at) {
   return { expired };
 }
 
-function invalidateForManagerChangeOf(joinState, managerTerm) {
+async function invalidateForManagerChangeOf(joinState, managerTerm) {
   let aborted = 0;
   for (const [collabId, books] of allBooksOf(joinState)) {
     const local = joinState.state.collabs.get(collabId);
@@ -2492,7 +2843,7 @@ function invalidateForManagerChangeOf(joinState, managerTerm) {
     aborted += result.aborted.length;
     for (const record of result.abortedRecords) {
       if (local !== undefined) {
-        sendJoinDenyOf(joinState, local, record, record.joinId, 'manager-changed', record.managerTerm);
+        await sendJoinDenyOf(joinState, local, record, record.joinId, 'manager-changed', record.managerTerm);
       }
     }
   }

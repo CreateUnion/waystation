@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { ID_PATTERN, MAX_ACTIVE_SEATS } from '../net/protocol.js';
+import { matchSessionByToken } from '../util/short-id.js';
 
 /* 邀请与两段式入席的纯内存簿记（设计 §4.1–§4.4）。
  * 三本账各管一段：发起侧 invites（谁被邀请、谁已接受/拒绝）、目标机 pending invites（未入席会话的补投依据）、
@@ -225,8 +226,14 @@ function targetMatchOf(record, seat) {
   if (sameMachine.length === 0) {
     return 'target-mismatch';
   }
-  const usable = sameMachine.find((target) => target.targetSessionId === undefined || target.targetSessionId === seat.sessionId);
+  const usable = sameMachine.find((target) => target.targetSessionId === undefined || targetSessionIdMatches(target.targetSessionId, seat.sessionId));
   return usable === undefined ? 'session-mismatch' : usable;
+}
+
+/* 指名目标与会话的全等比较：目标可能记的是短码（用户从列表取到的 8 位表示），按短码精确匹配；
+ * 完整标识按全等；歧义（同短码多候选）与非法输入由 matchSessionByToken 返回 null（拒绝）。 */
+function targetSessionIdMatches(targetSessionId, sessionId) {
+  return matchSessionByToken([{ sessionId }], targetSessionId) === sessionId;
 }
 
 /* 接受：重复接受幂等（重发不产生第二席）；指名邀请接受后整条关闭，不指名保持 open 多席。
@@ -594,7 +601,7 @@ function pendingVisibleOf(record, sessionId, at, declines) {
   if (record.state !== 'open' || at >= record.expiresAt) {
     return false;
   }
-  if (record.targetSessionId !== null && record.targetSessionId !== sessionId) {
+  if (record.targetSessionId !== null && !targetSessionIdMatches(record.targetSessionId, sessionId)) {
     return false;
   }
   return !record.acceptedSessions.includes(sessionId) && !(declines?.has(sessionId) ?? false);
@@ -670,7 +677,7 @@ function pendingSeatOf(state, collabId, inviteId, sessionId) {
       continue;
     }
     matchedCollab = true;
-    if (record.targetSessionId === sessionId) {
+    if (record.targetSessionId !== null && targetSessionIdMatches(record.targetSessionId, sessionId)) {
       return { record, reason: 'unknown' };
     }
     if (record.targetSessionId === null) {
