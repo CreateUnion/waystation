@@ -60,7 +60,7 @@ function makeService(t, overrides = {}) {
 /* 0.2.0 会话级调用：创建/离席等入口必须携调用会话。旧夹具以直调服务装配协作，
  * 这里补上本机默认席位；显式传入的值优先（含显式 null——用于验证无标识拒绝）。 */
 function defaultSessionOf(service) {
-  for (const entry of ['create', 'leave', 'end', 'invite']) {
+  for (const entry of ['create', 'send', 'leave', 'end', 'invite']) {
     const raw = service[entry];
     service[entry] = (input = {}) => raw({ sessionId: SELF_SEAT, ...input });
   }
@@ -1989,8 +1989,8 @@ test('讨论双节点并发发帖：真实 join 装配（自播 + 对表拉回�
   const synced = await syncWhenIdle(madeB.service, collabId);
   assert.equal(synced.ok, true, JSON.stringify(synced));
   assert.deepEqual((await madeB.service.view({ collabId })).members.map((entry) => entry.instanceId).sort(), ['inst-a', 'inst-b']);
-  const postedA = await madeA.service.send({ collabId, text: '甲的第一帖' });
-  const postedB = await madeB.service.send({ collabId, text: '乙的第一帖' });
+  const postedA = await madeA.service.send({ collabId, text: '甲的第一帖', sessionId: SELF_SEAT });
+  const postedB = await madeB.service.send({ collabId, text: '乙的第一帖', sessionId: 'sess-inst-b' });
   assert.equal(postedA.ok, true);
   assert.equal(postedB.ok, true);
   assert.equal(postedA.results[0].ok, true, 'A（发起人=中继）直接扇出经折叠成员表达 B');

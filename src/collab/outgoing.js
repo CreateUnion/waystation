@@ -13,6 +13,7 @@ import { matchConflictCollabs } from './gate.js';
 import { CARRIER_FORMAT_INVITE_STUB, CARRIER_FORMAT_SESSION_SEATS, readCarrier, writeCarrier } from './carrier.js';
 import { collabDir } from '../paths.js';
 import { ledgerTermOf, writeLocalTerminalCopy } from './takeover.js';
+import { createInvitesFileStore } from './joins.js';
 import { matchSessionByToken } from '../util/short-id.js';
 
 /* 对外操作与协作态变更实现（服务公共 API 的落点）：请求来自本机会话（工具面）——
@@ -191,9 +192,9 @@ function inviteInitialTargets(state, ledger, targets, collabMode, local, session
   return invited;
 }
 
-/* 首邀簿记：加入域是邀请记录的唯一写者，出站层只经其最小 API 开/撤记录。
- * state.join 缺失只出现在直调 createCollab 的单元状态（非服务装配）——按旧行为发帧，
- * 生产组合根恒定装配加入域，不会走到这个兜底。 */
+/* managed 邀请簿记（建协首邀与既有协作增邀共用）：加入域是邀请记录的唯一写者，出站层只经其
+ * 最小 API 开/撤记录。state.join 缺失只出现在直调 createCollab / inviteMembers 的单元状态
+ * （非服务装配）——按旧行为发帧，生产组合根恒定装配加入域，不会走到这个兜底。 */
 function initialInviteRecordOf(state, collabId, target, managerSessionId) {
   const open = state.join?.openInitialInvite;
   if (typeof open !== 'function') {
@@ -351,7 +352,9 @@ function inviteForumMembers(state, local, targets, fromSessionId) {
 
 /* 协作增员（站长制）：目标机器已有活跃席位＝如实拒——该机器的新会话应走 ws_join 申请
  * （站长批准走 join-grant，不扰动既有席位行）。邀请只写 invites/pending-invites（邀请簿记），
- * **不写共享台账**：名单只允许 state=member 的活跃席位，受邀未入席者不是成员。 */
+ * **不写共享台账**：名单只允许 state=member 的活跃席位，受邀未入席者不是成员。
+ * 每个目标先开邀请记录再发帧（设计 §4.1/§4.4）：帧携 inviteId，受邀会话才能走 approve 两段式；
+ * 簿记写失败不发，发送失败撤回该条——不留「可接受却无人投递」的 open 记录。 */
 function inviteManagedMembers(state, local, targets, fromSessionId) {
   if (local.role !== 'manager') {
     return { ok: false, message: '只有站长可以邀请成员加入协作——成员会话请让目标走 ws_join 申请（由站长批准）' };
@@ -368,12 +371,28 @@ function inviteManagedMembers(state, local, targets, fromSessionId) {
   const base = invitePayloadOf(local.ledger, [], null);
   const invited = [];
   for (const target of targets) {
-    const payload = applyInviteNaming({ ...base, members: base.members.map((entry) => ({ ...entry })) }, target);
-    const result = sendTo(state, local.collabId, target.instanceId, { address: target.address, port: target.port }, 'invite', payload, { fromSessionId });
-    invited.push({ instanceId: target.instanceId, ok: result.ok === true, msgId: result.msgId, reason: result.reason });
+    invited.push(inviteManagedTargetOf(state, local, base, target, fromSessionId));
     state.counters.invitesSent++;
   }
   return { ok: true, collabId: local.collabId, invited };
+}
+
+/* 单个目标：先开邀请记录再发帧；簿记写失败不发，发送失败撤回该条。返回条目始终携带可追溯的
+ * inviteId（发送失败时仍能定位被撤回的那条）。 */
+function inviteManagedTargetOf(state, local, base, target, fromSessionId) {
+  const opened = initialInviteRecordOf(state, local.collabId, target, fromSessionId);
+  if (opened.ok !== true) {
+    return { instanceId: target.instanceId, ok: false, reason: opened.reason };
+  }
+  const payload = applyInviteNaming({ ...base, members: base.members.map((entry) => ({ ...entry })) }, target);
+  if (opened.inviteId !== undefined) {
+    payload.inviteId = opened.inviteId;
+  }
+  const result = sendTo(state, local.collabId, target.instanceId, { address: target.address, port: target.port }, 'invite', payload, { fromSessionId });
+  if (result.ok !== true && opened.inviteId !== undefined) {
+    withdrawInitialInviteRecordOf(state, local.collabId, opened.inviteId);
+  }
+  return invitedEntryOf(target, opened, result);
 }
 
 /* 讨论邀请载荷（发送侧公共构造）：名/主题/模式 + **发起人实例标识（中继归属）** +
@@ -845,16 +864,12 @@ async function sendForumPost(state, local, { text, type, to, sessionId }) {
   if (isArchived(localStateOf(local))) {
     return { ok: false, message: '讨论已结束（或已终止）——不再接受新帖' };
   }
-  /* 发帖是成员行为：本机未加入（仅受邀）不发帖——发出去也无人收（扇出按折叠成员表）。 */
-  if (!selfJoinedOf(local, state.self.instanceId)) {
-    return { ok: false, message: '本机尚未加入该讨论（等待邀请或先回应邀请）——加入后才能发言' };
-  }
-  const textRejection = textRejectionOf('reply', text);
-  if (textRejection !== null) {
-    return { ok: false, message: textRejection };
+  const sender = forumPostSenderOf(state, local, text, sessionId);
+  if (sender.ok !== true) {
+    return { ok: false, message: sender.message };
   }
   const post = allocateOwnPost(state, local, kind, text);
-  const routed = await routeForumPost(state, local, post, sessionId);
+  const routed = await routeForumPost(state, local, post, sender.sessionId);
   state.counters.postsSent++;
   return {
     ok: true,
@@ -866,6 +881,21 @@ async function sendForumPost(state, local, { text, type, to, sessionId }) {
     results: routed.results,
     note: routed.note,
   };
+}
+
+/* 发帖前置与签发席位：成员资格、正文、发送席位三查都必须在分配 post 之前。发帖也是成员会话的
+ * 行为——有运行时席位表时必须显式给本机活跃席位：缺标识会把「调用者没穿会话」误报成中继降级，
+ * 冒名会话则会拿别人的席位盖章直投。 */
+function forumPostSenderOf(state, local, text, sessionId) {
+  if (!selfJoinedOf(local, state.self.instanceId)) {
+    return { ok: false, message: '本机尚未加入该讨论（等待邀请或先回应邀请）——加入后才能发言' };
+  }
+  const textRejection = textRejectionOf('reply', text);
+  if (textRejection !== null) {
+    return { ok: false, message: textRejection };
+  }
+  const sender = resolveSenderSeat(local, sessionId, { requireExplicit: localSeatsOf(local).length > 0 });
+  return sender.ok === true ? sender : { ok: false, message: sender.reason };
 }
 
 /* —— 讨论的中继分发（设计 §5.2/§9.1：中继 = 发起人，无选举无迁移） —— */
@@ -1164,7 +1194,7 @@ export function endCollab(state, { collabId }) {
   }
   const status = local.ledger.status;
   if (status === 'proposed') {
-    return { ok: false, message: '协作尚未建立——取消请用 ws_withdraw_invite（整条撤回）' };
+    return endProposedManaged(state, local, collabId);
   }
   if (status !== 'active' && status !== 'frozen') {
     return { ok: false, message: '协作已结束（或已终止）' };
@@ -1187,6 +1217,87 @@ export function endCollab(state, { collabId }) {
   broadcastCollabEnd(state, local, collabId);   // 双通道之一：在线广播（豁免 TTL/上限）
   state.counters.ended++;
   return { ok: true };
+}
+
+/* proposed managed 的取消（设计 §3.4 用户裁定）：协作尚未建立、名单只有创建者，创建者会话可
+ * 直接收尾——台账转 terminated 终态、撤回全部 open 邀请记录、向已知邀请目标广播 end。
+ * 不删除协作目录 / 席位文件 / 邀请记录：终态与撤回态本身是留痕，删除属用户数据删除。
+ * 非创建者会话的拒绝在服务层按席位完成（seatGovernedWrite），本函数只管创建者路径。 */
+function endProposedManaged(state, local, collabId) {
+  if (localModeOf(local) !== 'managed') {
+    return { ok: false, message: '协作尚未建立——取消请用 ws_withdraw_invite（整条撤回）' };
+  }
+  const targets = knownInviteTargetsOf(state, collabId);
+  mutateLedger(state, local, (ledger) => {
+    ledger.status = 'terminated';
+    ledger.endedAt = new Date().toISOString();
+    /* 终态形态（设计 §3.4）：manager 必须为 null，名单不得残留站长行，窗口不得保留。 */
+    ledger.manager = null;
+    delete ledger.managerWindow;
+    for (const member of ledger.members) {
+      member.role = 'member';
+    }
+  });
+  local.member.state = 'terminated';
+  local.member.archivedAt = new Date().toISOString();
+  persistMember(state, local);
+  stopJoinReplay(state, local);
+  withdrawOpenInvitesOf(state, collabId);
+  broadcastEndToInviteTargets(state, local, targets);
+  state.counters.ended++;
+  return { ok: true };
+}
+
+/* 已知邀请目标（end 广播的收件人）：邀请记录的全量目标（含已撤回，收件侧无记录时幂等忽略）。
+ * 记录文件是邀请目标的唯一权威面——proposed 台账的名单只有创建者，拿名单取收件人会漏发。 */
+function knownInviteTargetsOf(state, collabId) {
+  const targets = new Set();
+  for (const record of inviteRecordsOf(state, collabId)) {
+    for (const target of record.targets) {
+      if (target.instanceId !== state.self.instanceId) {
+        targets.add(target.instanceId);
+      }
+    }
+  }
+  return [...targets];
+}
+
+function inviteRecordsOf(state, collabId) {
+  return createInvitesFileStore({ dataDir: state.dataDir, collabId, log: state.log }).list();
+}
+
+/* 撤回该协作全部 open 邀请记录：经加入域的撤回面落笔（in-memory 账与文件同源，避免另一处
+ * 缓存的 open 记录在后续保存时复活）。无加入域的单元装配没有 0.2.0 邀请记录，如实跳过。 */
+function withdrawOpenInvitesOf(state, collabId) {
+  const open = inviteRecordsOf(state, collabId).filter((record) => record.state === 'open');
+  const withdraw = state.join?.withdrawInitialInvite;
+  if (typeof withdraw !== 'function') {
+    if (open.length > 0) {
+      state.log.warn('取消协作时缺少加入域撤回面（open 邀请记录未撤回）', { collabId, count: open.length });
+    }
+    return;
+  }
+  for (const record of open) {
+    const withdrawn = withdraw({ collabId, inviteId: record.inviteId });
+    if (withdrawn?.ok !== true) {
+      state.log.warn('取消协作时撤回邀请记录失败（记录可能仍为 open）', {
+        collabId,
+        inviteId: record.inviteId,
+        reason: withdrawn?.reason ?? '撤回面未返回结果',
+      });
+    }
+  }
+}
+
+function broadcastEndToInviteTargets(state, local, instanceIds) {
+  const fromSessionId = managerSessionIdOf(local) ?? undefined;
+  for (const instanceId of instanceIds) {
+    const endpoint = endpointFor(state, local, instanceId);
+    if (endpoint === undefined) {
+      continue;
+    }
+    sendTo(state, local.collabId, instanceId, endpoint, 'end', {}, { fromSessionId });
+  }
 }
 
 /* 结束广播（设计 §5.5 控制事件类；end 豁免 TTL/上限）：讨论经折叠成员表出口（端点未知者
@@ -2111,19 +2222,43 @@ export function rememberRelayedOrigin(state, origin) {
  * 同名交集协作的成员端点；端点未知者跳过（转达与快照机制兜底可见性）。
  * 站长席位侧检出时随带被冻条的发起时间与站长（合流并集与保留方判定的参考数据；
  * 成员侧检出无从提供——接收侧按数据缺省保守处理）。 */
+/* 冻结广播的签发席位：协议层要求协作帧携 from.sessionId，缺了整帧被接收侧拒收。
+ * 提议期冲突的本地记录还没有本协作席位，回退到本机任一活跃席位——冻结是机器级的冲突通告，
+ * 不绑定单条协作的席位；一个活跃席位都没有时如实不带（发送侧会失败，不冒名）。 */
+function freezeSignerSessionOf(state, frozenLocal) {
+  if (frozenLocal.role === 'manager') {
+    return managerSessionIdOf(frozenLocal) ?? anyActiveLocalSessionOf(state);
+  }
+  return firstActiveSessionIdOf(frozenLocal) ?? anyActiveLocalSessionOf(state);
+}
+
+function anyActiveLocalSessionOf(state) {
+  for (const local of state.collabs.values()) {
+    const sessionId = firstActiveSessionIdOf(local);
+    if (sessionId !== null) {
+      return sessionId;
+    }
+  }
+  return undefined;
+}
+
 export function broadcastFreeze(state, frozenLocal, reason) {
   const payload = {
     name: localNameOf(frozenLocal),
-    members: localRosterOf(frozenLocal).map((entry) => ({ instanceId: entry.instanceId, identityName: entry.identityName })),
+    /* 席位条目形态（设计 §2.2/D13）：freeze.members 按 (instanceId,sessionId) 校验，丢 sessionId
+     * 的帧会被接收侧协议层整帧拒收，冲突传播到此中断。 */
+    members: localRosterOf(frozenLocal).map((entry) => ({
+      instanceId: entry.instanceId,
+      ...(typeof entry.sessionId === 'string' ? { sessionId: entry.sessionId } : {}),
+      identityName: entry.identityName,
+    })),
     reason,
   };
   if (frozenLocal.role === 'manager') {
     payload.createdAt = frozenLocal.ledger.createdAt;
     payload.manager = { instanceId: frozenLocal.ledger.manager.instanceId, identityName: frozenLocal.ledger.manager.identityName };
   }
-  const fromSessionId = frozenLocal.role === 'manager'
-    ? managerSessionIdOf(frozenLocal) ?? undefined
-    : firstActiveSessionIdOf(frozenLocal) ?? undefined;
+  const fromSessionId = freezeSignerSessionOf(state, frozenLocal);
   let sent = 0;
   for (const [instanceId, endpoint] of collectFreezeTargets(state, frozenLocal)) {
     const result = sendTo(state, frozenLocal.collabId, instanceId, endpoint, 'freeze', payload, { fromSessionId });

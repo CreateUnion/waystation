@@ -180,7 +180,7 @@ function handleInvite(state, frame, meta) {
   learnInviteEndpoints(state, local, frame);
   state.counters.invitesReceived++;
   if (member.mode !== 'forum') {
-    const conflict = matchConflictCollabs(state, member.name, member.roster.map((entry) => entry.instanceId));
+    const conflict = matchConflictCollabs(state, member.name, inviteConflictIdsOf(frame, member));
     if (conflict.length > 0) {
       freezeOnInviteConflict(state, frame, local, conflict);
       return;
@@ -303,7 +303,25 @@ function payloadOriginatorOf(state, frame) {
 }
 
 function inviteRosterOf(frame) {
-  return frame.payload.members.map((entry) => ({ instanceId: entry.instanceId, identityName: entry.identityName }));
+  return frame.payload.members.map((entry) => ({
+    instanceId: entry.instanceId,
+    ...(typeof entry.sessionId === 'string' ? { sessionId: entry.sessionId } : {}),
+    identityName: entry.identityName,
+  }));
+}
+
+/* 同名冲突的候选参与者：邀请成员 ∪ 目标机器（设计 §2.2/D13）。managed 的既有协作增邀只把发起人
+ * 放进 members，被邀目标只出现在 targets——只看 members 会让被邀成员侧漏检与既有协作的参与者交集，
+ * 冲突因此不冻结。两侧同去重，targets 缺失的旧帧退回成员面。 */
+function inviteConflictIdsOf(frame, member) {
+  const ids = new Set(member.roster.map((entry) => entry.instanceId));
+  const targets = Array.isArray(frame.payload?.targets) ? frame.payload.targets : [];
+  for (const target of targets) {
+    if (typeof target?.instanceId === 'string') {
+      ids.add(target.instanceId);
+    }
+  }
+  return [...ids];
 }
 
 /* 邀请来源端点学习（记录创建时的一次性学习——注册表尚无本条，走 learnEndpoints 之外的特例路径）。 */
@@ -334,8 +352,9 @@ function learnInviteEndpoints(state, local, frame) {
 }
 
 /* 冲突检出（第一检测点）：冻结新到那条并连带冻结本机全部匹配协作（检出方本地一并冻上，
- * 避免旧那条在检出机与另一机的副本形成分叉），随后广播。广播 reason 用固定短文案
- * （协议上限 200 字符——拼接多个实例标识会越界；明细在日志字段里）。 */
+ * 避免旧那条在检出机与另一机的副本形成分叉）。广播必须覆盖两条：只播新到那条时，旧那条的
+ * 其他参与者（本机名单之外）收不到冲突事实，检出机与它们会长期停在「一边冻结、一边活跃」。
+ * 广播 reason 用固定短文案（协议上限 200 字符——拼接多个实例标识会越界；明细在日志字段里）。 */
 function freezeOnInviteConflict(state, frame, local, conflict) {
   const now = new Date().toISOString();
   local.member.state = 'frozen';
@@ -353,6 +372,9 @@ function freezeOnInviteConflict(state, frame, local, conflict) {
     conflicts: conflict.map((entry) => entry.collabId).join('、'),
   });
   broadcastFreeze(state, local, '同名冲突：与本机既有协作参与者有交集');
+  for (const other of conflict) {
+    broadcastFreeze(state, other, '同名冲突：与本机既有协作参与者有交集');
+  }
 }
 
 /* 同意帧携 inviteId（会话级邀请）：转加入域的批准面签发 join-grant；无 inviteId 的旧形态
@@ -788,6 +810,7 @@ function snapshotRecordOf(frame) {
 function storeAcceptedSnapshot(state, local, record) {
   local.snapshot = record;
   persistSnapshot(state, local);
+  rememberSnapshotRoster(state, local, record.ledger);
   clearUnverifiedSeats(state, local, record.ledger);
   bump(state, 'snapshotStored');
   const runtime = m5RuntimeOf(state);
@@ -795,6 +818,25 @@ function storeAcceptedSnapshot(state, local, record) {
   if (override !== undefined && override.managerTerm <= ledgerTermOf(record.ledger)) {
     runtime.termState.delete(local.collabId);
   }
+}
+
+/* 成员侧名单随权威快照刷新：member.roster 原先只在邀请时定格，而 0.2.0 的 managed 邀请 members
+ * 只含发起人——入席后不刷新会让同名冲突匹配看不到本机与后来成员，冲突永远检不出。名单权威是
+ * 共享台账，roster 只是成员机的本地视图；讨论不入此路径（成员关系按事件折叠）。 */
+function rememberSnapshotRoster(state, local, ledger) {
+  if (local.role === 'manager' || localModeOf(local) === 'forum') {
+    return;
+  }
+  const members = Array.isArray(ledger?.members) ? ledger.members : [];
+  if (members.length === 0) {
+    return;
+  }
+  local.member.roster = members.map((entry) => ({
+    instanceId: entry.instanceId,
+    ...(typeof entry.sessionId === 'string' ? { sessionId: entry.sessionId } : {}),
+    identityName: entry.identityName,
+  }));
+  persistMember(state, local);
 }
 
 /* 快照含本席 → 回填 joinSeq/joinedAt 并清除 unverified（两段式入席的收敛面，设计 §4.4⑤）：

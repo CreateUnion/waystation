@@ -83,6 +83,8 @@ function adaptSessionCalls(service, sessionId) {
   };
   const leave = service.leave;
   service.leave = (input = {}) => leave({ sessionId, ...input });
+  const send = service.send;
+  service.send = (input = {}) => send({ sessionId, ...input });
 }
 
 /* 对表/收敛参数（用例按需覆盖；缺省为测试友好的收敛值，产品默认见模块常量）。 */
