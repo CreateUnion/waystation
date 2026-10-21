@@ -553,8 +553,7 @@ async function twoSeatServiceOf(t) {
   assert.equal(requested.ok, true, requested.message);
   const approved = await service.join.approve({ collabId: created.collabId, sessionId: memberSessionId, approve: true, approvedBy: managerSessionId });
   assert.equal(approved.ok, true, approved.message);
-  const confirmed = service.join.confirmJoining(approved.joinId, memberSessionId, { instanceId: 'inst-self', managerTerm: 1, activeSeats: 1 });
-  assert.equal(confirmed.ok, true, confirmed.message);
+  /* 同机旁路在 approve 内已完成 grant→confirm；再手动 confirm 会命中「未知 joinId」。 */
   assert.equal(service.listLocalSeats(created.collabId).length, 2, '前置：同机双席（站长 + 成员）');
   return { service, collabId: created.collabId, managerSessionId, memberSessionId };
 }
