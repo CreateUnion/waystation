@@ -8,7 +8,9 @@ import { createInjectedStore } from './injected.js';
 import { appendLedger, ledgerDigest } from './store.js';
 import { collabDir, ensureDir } from '../paths.js';
 import { archiveLocalSeatsOfState, isLocalArchivedState, localModeOf, localRosterOf, localStateOf, persistMember, persistSnapshot, rememberKnownHost, retiredMuteHandle, selfJoinedOf, upsertLocalSeat } from './local.js';
-import { managerFreezeReasonOf, matchConflictCollabs, memberSeatAdmits, noteForumGovernanceIgnored } from './gate.js';
+import {
+  managerFreezeReasonOf, matchConflictCollabs, memberSeatAdmits, noteForumGovernanceIgnored, seatEntryMatches, seatListAdmits,
+} from './gate.js';
 import { applyEndpoint, applyFreezeLocally, broadcastFreeze, downgradeToMember, endpointFor, governanceTargets, memberIdsOf, mutateLedger, notifyLocal, relayGovernance, relayRedistribute, selfIsRelay, sendTo, stopJoinReplay } from './outgoing.js';
 import { applyIncomingJoin, applyIncomingLeave, handleHistoryBundle, handleHistoryRequest } from './sync.js';
 import {
@@ -18,7 +20,7 @@ import {
 } from './takeover.js';
 import { handleDecision, handleMergeOutcome, handleMergeRequest, handleUnfreeze } from './freeze.js';
 import { adoptHandoverAsTarget, dropHandoverInFlight, handleAutoOffer, handleHandover } from './handover.js';
-import { acceptManagerChange } from './term.js';
+import { acceptManagerChange, windowAcceptsTakeover } from './term.js';
 
 /* 接收事件处理（consume 的落点）：端点学习、邀请建记录与冲突检测、回应与建立、撤回 / 退出 / 结束、
  * 主题与进度联动、冻结接收与转达、快照接收 / 回执 / 请求应答、治理与韧性五型（抢接 / 裁定 / 解冻 / 移交 /
@@ -82,16 +84,92 @@ function refreshPresenceBeforeLearn(state, frame, meta) {
 
 /* 解除冻结/裁定执行后清除冻结原因（载体与成员记录）：冻结态已不在 → 观察窗不得继续显示。
  * 台账 status 由 legacy 冻结族维护；本函数只清展示原因，不改状态机。 */
-function handleUnfreezeEvent(state, frame) {
-  const result = handleUnfreeze(state, frame);
+async function handleUnfreezeEvent(state, frame) {
+  if (!conflictDecisionIssuerAdmits(state, frame)) {
+    return refuseGovernanceFrame(state, 'unfreezeRejected', frame, '解冻');
+  }
+  const result = await withSeatScopedCollabs(state, frame, () => handleUnfreeze(state, frame));
   clearStaleFreezeReasons(state);
   return result;
 }
 
-function handleDecisionEvent(state, frame) {
-  const result = handleDecision(state, frame);
+async function handleDecisionEvent(state, frame) {
+  if (!conflictDecisionIssuerAdmits(state, frame)) {
+    return refuseGovernanceFrame(state, 'decisionRejected', frame, '裁定');
+  }
+  const result = await withSeatScopedCollabs(state, frame, () => handleDecision(state, frame));
   clearStaleFreezeReasons(state);
   return result;
+}
+
+function refuseGovernanceFrame(state, counter, frame, label) {
+  bump(state, counter);
+  state.log.warn(`${label}帧签发者不在名单或无从匹配（拒绝并计数）`, {
+    collabId: frame.collabId,
+    from: frame.from?.instanceId,
+    sessionId: frame.from?.sessionId,
+  });
+  return undefined;
+}
+
+/* 裁定/解冻的签发者（设计 §7.1）：matched 的 managed 副本必须至少有一个能确认 from 是
+ * 「现任站长或已记录的对端站长」；有对端站长数据时不得接受其他在册席位冒名。
+ * 未匹配/讨论实例交原处理器计数（讨论无治理面）。 */
+function conflictDecisionIssuerAdmits(state, frame) {
+  const payload = frame.payload;
+  if (!isPlainObject(payload) || !Array.isArray(payload.members)) {
+    return false;
+  }
+  const managed = matchConflictCollabs(state, payload.name, payload.members);
+  if (managed.length === 0) {
+    return true;
+  }
+  if (!seatListAdmits(payload.members, frame.from)) {
+    return false;
+  }
+  return managed.some((local) => conflictIssuerKnownTo(local, frame.from.instanceId));
+}
+
+function conflictIssuerKnownTo(local, instanceId) {
+  const localManager = local.role === 'manager' ? local.ledger?.manager?.instanceId : local.member?.manager?.instanceId;
+  /* 只信冻结帧里站长侧声明的 manager：意向帧的 managerInstanceId 只是帧来源，不是站长身份。 */
+  const rivalManager = local.conflictRival?.managerInstanceId;
+  if (typeof rivalManager !== 'string' || rivalManager === '') {
+    return true;   // 无对端站长数据：只能按名单校验（§12 明文信任边界的如实上限）
+  }
+  return instanceId === rivalManager || instanceId === localManager;
+}
+
+/* 席位键匹配修正（D13）：freeze.js 的裁定/解冻处理器仍把 members 降为实例标识匹配，
+ * 同机两会话、同名但席位不相交时会误命中另一条协作。调用期间临时隐藏「仅实例命中、
+ * 席位不命中」的本地副本，让原处理器只作用于席位相交的条目；结束后原样恢复。
+ * 只在歧义场景（同机多会话同名协作）触发，不改变正常路径。 */
+async function withSeatScopedCollabs(state, frame, run) {
+  const extras = instanceOnlyMatchedCollabIds(state, frame.payload);
+  if (extras.length === 0) {
+    return run();
+  }
+  const hidden = [];
+  for (const collabId of extras) {
+    const local = state.collabs.get(collabId);
+    if (local !== undefined) {
+      state.collabs.delete(collabId);
+      hidden.push([collabId, local]);
+    }
+  }
+  try {
+    return await run();
+  } finally {
+    for (const [collabId, local] of hidden) {
+      state.collabs.set(collabId, local);
+    }
+  }
+}
+
+function instanceOnlyMatchedCollabIds(state, payload) {
+  const bySeat = new Set(matchConflictCollabs(state, payload.name, payload.members).map((local) => local.collabId));
+  const byInstance = matchConflictCollabs(state, payload.name, payload.members.map((entry) => entry.instanceId));
+  return byInstance.map((local) => local.collabId).filter((collabId) => !bySeat.has(collabId));
 }
 
 function clearStaleFreezeReasons(state) {
@@ -314,14 +392,26 @@ function inviteRosterOf(frame) {
  * 放进 members，被邀目标只出现在 targets——只看 members 会让被邀成员侧漏检与既有协作的参与者交集，
  * 冲突因此不冻结。两侧同去重，targets 缺失的旧帧退回成员面。 */
 function inviteConflictIdsOf(frame, member) {
-  const ids = new Set(member.roster.map((entry) => entry.instanceId));
+  /* 席位键（D13）：名单条目带 sessionId 时按 (instanceId,sessionId) 求交集，旧行才退回实例。
+   * 邀请 targets 的指名会话字段是 targetSessionId（协议形态），一并转成席位键。 */
+  const seats = new Map();
+  const remember = (entry) => {
+    if (typeof entry?.instanceId !== 'string') {
+      return;
+    }
+    const key = `${entry.instanceId}\u0000${typeof entry.sessionId === 'string' ? entry.sessionId : ''}`;
+    if (!seats.has(key)) {
+      seats.set(key, { instanceId: entry.instanceId, ...(typeof entry.sessionId === 'string' ? { sessionId: entry.sessionId } : {}) });
+    }
+  };
+  for (const entry of member.roster) {
+    remember(entry);
+  }
   const targets = Array.isArray(frame.payload?.targets) ? frame.payload.targets : [];
   for (const target of targets) {
-    if (typeof target?.instanceId === 'string') {
-      ids.add(target.instanceId);
-    }
+    remember({ instanceId: target?.instanceId, ...(typeof target?.targetSessionId === 'string' ? { sessionId: target.targetSessionId } : {}) });
   }
-  return [...ids];
+  return [...seats.values()];
 }
 
 /* 邀请来源端点学习（记录创建时的一次性学习——注册表尚无本条，走 learnEndpoints 之外的特例路径）。 */
@@ -473,7 +563,10 @@ export function maybeEstablish(state, local) {
 }
 
 function activeSeatKeysOf(ledger) {
-  return ledger.members.map((entry) => entry.instanceId);
+  return ledger.members.map((entry) => ({
+    instanceId: entry.instanceId,
+    ...(typeof entry.sessionId === 'string' ? { sessionId: entry.sessionId } : {}),
+  }));
 }
 
 /* 建立：状态转 active（名单已是 active-only，无需再翻状态）；快照由台账变更统一推送，
@@ -646,7 +739,14 @@ function handleRelaySubmission(state, local, frame) {
  * 会话（设计 §5.7 裁定：讨论无冻结概念，注入只会困惑接收模型）。 */
 function handleFreeze(state, frame) {
   const payload = frame.payload;
-  const matched = matchConflictCollabs(state, payload.name, payload.members.map((entry) => entry.instanceId));
+  /* 签发者校验（设计 §7.1）：同名冲突冻结由任一活跃成员席位签发——from 必须按其声明的席位键
+   * 在名单内；声明了 payload.manager 时 from 必须就是该站长席位。未授权帧拒收并计数。 */
+  if (!freezeIssuerAdmits(state, frame)) {
+    bump(state, 'freezeRejected');
+    state.log.warn('冻结帧签发者不在名单（拒绝并计数）', { collabId: frame.collabId, from: frame.from?.instanceId, sessionId: frame.from?.sessionId });
+    return;
+  }
+  const matched = matchConflictCollabs(state, payload.name, payload.members);
   if (matched.length === 0) {
     return noteForumGovernanceIgnored(state, frame) ? { sessionDeliver: false } : undefined;
   }
@@ -725,10 +825,9 @@ function acceptSnapshotFrame(state, frame) {
     state.log.warn('无本地任期基线的首个快照来源不成立（已忽略）', { collabId: frame.collabId });
     return;
   }
-  /* 重启降级（设计 §2A.8⑥）：旧站长按 handshake 学到的更高任期向新站长取快照；授权证据
-   * 必须绑定「直连应答来自快照来源机器 + 其报告的 term/manager 与快照一致」，并在任期判决
-   * 之前落下受理记录，否则 term.js 会按「来源非本地现任站长」再次拒收。 */
-  recordHandshakeSnapshotEvidence(state, local, frame, termState);
+  /* 重启降级（设计 §2A.8⑥）：旧站长按 handshake 学到的更高任期向新站长取快照。握手只作
+   * 候选比较与请求依据（2026-10-21 裁定「handshakeHighest 不构成授权」）：证据由 ctx 传入
+   * 任期判决按旧站长重启面单独校验，绝不在判决前写 acceptedManager。 */
   const ctx = termCtxOf(state, local, frame);
   const gate = snapshotAutoCatchupGate(state, local, frame, termState, ctx);
   const result = gate ?? acceptManagerChange(termState, frame.payload, ctx);
@@ -962,6 +1061,11 @@ function isSnapshotAnswerAllowed(state, local, frame, ledgerSource) {
   if (local === undefined || !isPlainObject(ledgerSource)) {
     return false;
   }
+  /* 请求来源校验（设计 §7.1）：名单/peerView 内的席位，或本机台账 leave 事件中的旧站长。
+   * 不校验等于任意知道 collabId 的主机都能拉走完整台账（并可用来伪造治理帧名单）。 */
+  if (!snapshotRequesterAdmits(local, frame)) {
+    return false;
+  }
   if (local.role === 'manager' && local.suspended === null) {
     return true;
   }
@@ -971,6 +1075,32 @@ function isSnapshotAnswerAllowed(state, local, frame, ledgerSource) {
   }
   const pending = m5RuntimeOf(state).managerPending.get(local.collabId);
   return pending !== undefined && frame.from.instanceId === pending.target?.instanceId;
+}
+
+/* 快照请求来源：共享名单/peerView 内的席位，或本机台账 leave/名单移除事件中
+ * manager-lost/manager-session-closed 的旧站长（回归追赶，设计 §7.1）。 */
+function snapshotRequesterAdmits(local, frame) {
+  const from = frame.from;
+  if (!isPlainObject(from) || typeof from.instanceId !== 'string' || from.instanceId === '') {
+    return false;
+  }
+  const ledger = local.role === 'manager' ? local.ledger : local.snapshot?.ledger;
+  const members = Array.isArray(ledger?.members) ? ledger.members : [];
+  if (seatListAdmits(members.length > 0 ? members : localRosterOf(local), from)) {
+    return true;
+  }
+  return departedManagerSeatOf(ledger, from);
+}
+
+/* 台账 leave/名单移除事件中的旧站长（manager-lost/manager-session-closed）：回归追赶来源。 */
+function departedManagerSeatOf(ledger, from) {
+  const events = Array.isArray(ledger?.events) ? ledger.events : [];
+  return events.some((event) => isDepartedManagerEventOf(event, from));
+}
+
+function isDepartedManagerEventOf(event, from) {
+  const managerLost = event?.reason === 'manager-lost' || event?.reason === 'manager-session-closed';
+  return event?.type === 'leave' && managerLost && seatEntryMatches(event.seat, from);
 }
 
 function isCatchupAnswerOf(state, local, frame) {
@@ -1009,6 +1139,13 @@ function handleEnd(state, frame) {
     state.log.warn('站长席位收到结束通告（忽略——结束只能由本机发起）', { collabId: local.collabId });
     return;
   }
+  /* 签发者校验（设计 §7.1）：managed 只认现任站长席位；forum 只认发起人（中继）。
+   * 知道 collabId 的任意主机不得归档本机协作。 */
+  if (!endIssuerAdmits(state, local, frame)) {
+    bump(state, 'endRejected');
+    state.log.warn('结束通告签发者不是现任站长/发起人（拒绝并计数）', { collabId: local.collabId, from: frame.from?.instanceId, sessionId: frame.from?.sessionId });
+    return;
+  }
   local.member.state = 'completed';
   local.member.archivedAt = new Date().toISOString();
   persistMember(state, local);
@@ -1016,6 +1153,33 @@ function handleEnd(state, frame) {
   forgetMuteBaselinesOfCollab(state, local.collabId);
   stopJoinReplay(state, local);
   state.counters.endedIn++;
+}
+
+/* 结束通告的签发者（设计 §7.1）：managed＝现任站长席位；forum＝发起人（邀请者/中继）。
+ * 缺站长引用或来源不符一律拒绝（知道 collabId 不等于有权归档）。 */
+function endIssuerAdmits(state, local, frame) {
+  if (localModeOf(local) === 'forum') {
+    return forumEndIssuerAdmits(local, frame.from);
+  }
+  const manager = managerSeatOfLedger(state, local);
+  return manager !== null && seatEntryMatches(manager, frame.from);
+}
+
+function forumEndIssuerAdmits(local, from) {
+  const initiator = local.member?.originator?.instanceId ?? local.member?.manager?.instanceId ?? null;
+  return typeof initiator === 'string' && from?.instanceId === initiator;
+}
+
+/* 冻结帧签发者：from 必须按其席位键在声明的成员名单内；声明 manager 时必须与 from 一致。 */
+function freezeIssuerAdmits(state, frame) {
+  const payload = frame.payload;
+  if (!isPlainObject(payload) || !Array.isArray(payload.members) || !seatListAdmits(payload.members, frame.from)) {
+    return false;
+  }
+  if (isPlainObject(payload.manager) && payload.manager.instanceId !== frame.from?.instanceId) {
+    return false;
+  }
+  return true;
 }
 
 /* 退出到达：讨论 = 成员事件并入（折叠出表）+ 触发对表（设计 §5.4——leave 是广播事件，
@@ -1187,9 +1351,7 @@ function compareTermStates(left, right) {
 
 function termCtxOf(state, local, frame) {
   const runtime = m5RuntimeOf(state);
-  const maps = termMapsOf(state);
   const manager = managerSeatOfLedger(state, local);
-  const pendingOffer = runtime.managerPending.get(local.collabId) ?? runtime.autoPending.get(local.collabId);
   return {
     now: wallNow(state),
     localFrozen: runtime.frozen.get(local.collabId) ?? null,
@@ -1197,13 +1359,7 @@ function termCtxOf(state, local, frame) {
     isMemberSeat: (seat) => memberSeatsOf(local).some((entry) => sameSeat(entry, seat)),
     managerReachable: managerReachableEvidence(state, local),
     managerDeparted: manager !== null && runtime.departed(local.collabId, manager),
-    autoOffers: offersForCtx(state, local.collabId),
-    autoInFlight: pendingOffer !== undefined,
-    pendingOfferId: pendingOffer?.offerId,
-    pendingTarget: pendingOffer?.target,
-    acceptedManager: maps.accepted.get(local.collabId) ?? runtime.acceptedManagers.get(local.collabId),
-    handshakeHighest: highestHandshakeOf(state, local.collabId),
-    authorizedEvidence: maps.authorized.get(local.collabId),
+    ...termEvidenceCtxOf(state, local, frame),
     suspended: suspendCtxOf(state, local),
     handoverTarget: runtime.handoverTargets.get(local.collabId),
     handoverBaseTerm: runtime.pendingHandovers.get(local.collabId)?.baseTerm,
@@ -1213,6 +1369,27 @@ function termCtxOf(state, local, frame) {
     ledgerDigestOf: (value) => ledgerDigest(value),
     from: { instanceId: frame.from.instanceId, sessionId: frame.from.sessionId },
     syncExpired: runtime.syncExpired?.has(local.collabId) === true,
+  };
+}
+
+/* 受理证据面（任期判决的输入）：auto-offer、acceptedManager、catchup 选择、握手与 fork 证据。
+ * 单独成形以保持 termCtxOf 的可读性；缺证据一律由 term.js fail-closed。 */
+function termEvidenceCtxOf(state, local, frame) {
+  const runtime = m5RuntimeOf(state);
+  const maps = termMapsOf(state);
+  const pendingOffer = runtime.managerPending.get(local.collabId) ?? runtime.autoPending.get(local.collabId);
+  return {
+    autoOffers: offersForCtx(state, local.collabId),
+    autoInFlight: pendingOffer !== undefined,
+    pendingOfferId: pendingOffer?.offerId,
+    pendingTarget: pendingOffer?.target,
+    acceptedManager: maps.accepted.get(local.collabId) ?? runtime.acceptedManagers.get(local.collabId),
+    catchupSource: runtime.catchupSources?.get?.(local.collabId),
+    handshakeHighest: highestHandshakeOf(state, local.collabId),
+    /* 旧站长重启追赶证据（§2A.8⑥）：只对本机仍是站长、快照来源是旧名单成员且其握手应答
+     * 与快照一致时才成立；仅供任期判决，不落盘、不构成通用授权。 */
+    handshakeCatchup: handshakeCatchupEvidenceOf(state, local, frame, termStateOf(state, local)),
+    authorizedEvidence: maps.authorized.get(local.collabId),
   };
 }
 
@@ -1363,10 +1540,15 @@ function applyManagerResult(state, local, frame, result) {
   applyManagerActions(state, local, frame, result);
 }
 
-/* fork 收敛证据（设计 §2A.3/§2A.10）：被拒/待同步的窗口内 takeover 授权可绑定到后续快照；
- * 只记录「更高 term + authorizedAt 与 manager 齐备」的证据，同 term 冲突不产生授权。 */
+/* fork 收敛证据（设计 §2A.3/§2A.10）：被拒/待同步的窗口内 takeover 授权可绑定到后续快照。
+ * 只有「除本地分叉/任期跳跃外其余 A3/A4 要件均成立」的帧才算证据：成员来源且来源＝新站长、
+ * term=本地+1、version 更新、prevManager 匹配、窗口或站长不可达证据有效；证据绑定签发席位，
+ * 快照必须由该席位送达。被窗口/来源/任期前提拒绝的帧一律不产生证据（不得洗白）。 */
 function noteAuthorizedEvidence(state, local, frame, result) {
-  const evidence = result.accepted === true ? null : authorizedEvidenceOf(state, local, frame.payload);
+  if (result.accepted === true || /** @type {any} */ (result).idempotent === true || result.freezeReason !== undefined) {
+    return;
+  }
+  const evidence = authorizedEvidenceOf(state, local, frame);
   if (evidence === null) {
     return;
   }
@@ -1374,18 +1556,17 @@ function noteAuthorizedEvidence(state, local, frame, result) {
   bump(state, 'authorizedEvidenceRecorded');
 }
 
-function authorizedEvidenceOf(state, local, change) {
-  if (!isPlainObject(change) || !['takeover', 'takeover-manual'].includes(change.via)) {
+function authorizedEvidenceOf(state, local, frame) {
+  const change = frame.payload;
+  const source = evidenceSourceOf(change, frame);
+  if (source === null || !evidenceShapeOk(change)) {
     return null;
   }
-  if (!isAuthorizedTimestamp(change.authorizedAt)) {
-    return null;
+  const current = evidenceCurrentOf(state, local, change);
+  if (current === null || !memberSeatsOf(local).some((seat) => sameSeat(seat, source))) {
+    return null;   // 来源必须是名单内活跃成员席位
   }
-  if (!isPlainObject(change.manager) || typeof change.manager.sessionId !== 'string') {
-    return null;
-  }
-  const current = termStateOf(state, local);
-  if (current === null || !Number.isInteger(change.term) || change.term <= current.managerTerm) {
+  if (!evidencePrerequisites(state, local, change, current)) {
     return null;
   }
   return {
@@ -1393,7 +1574,66 @@ function authorizedEvidenceOf(state, local, change) {
     authorizedAt: change.authorizedAt,
     term: change.term,
     manager: { instanceId: change.manager.instanceId, sessionId: change.manager.sessionId, identityName: change.manager.identityName },
+    source: { instanceId: source.instanceId, sessionId: source.sessionId },
   };
+}
+
+/* 证据签发者：A3/A4 均由新站长本人签发（from 席位＝manager 席位）。 */
+function evidenceSourceOf(change, frame) {
+  if (!isPlainObject(change) || !['takeover', 'takeover-manual'].includes(change.via)) {
+    return null;
+  }
+  const source = { instanceId: frame.from?.instanceId, sessionId: frame.from?.sessionId };
+  if (!isSeatRef(source) || !isSeatRef(change.manager) || !sameSeat(source, change.manager)) {
+    return null;
+  }
+  return source;
+}
+
+function evidenceShapeOk(change) {
+  return isAuthorizedTimestamp(change.authorizedAt)
+    && Number.isInteger(change.term)
+    && Number.isFinite(change.version);
+}
+
+/* 分叉收敛允许任期跳跃（胜者可能已推进多个任期）；同 term/落后/版本不新/prevManager 不符都不产生证据。 */
+function evidenceCurrentOf(state, local, change) {
+  const current = termStateOf(state, local);
+  if (current === null || current.manager === null || !sameSeat(change.prevManager, current.manager)) {
+    return null;
+  }
+  if (!(change.term > current.managerTerm) || !(change.version > current.version)) {
+    return null;
+  }
+  return current;
+}
+
+function isSeatRef(value) {
+  return isPlainObject(value)
+    && typeof value.instanceId === 'string' && value.instanceId !== ''
+    && typeof value.sessionId === 'string' && value.sessionId !== '';
+}
+
+/* 证据前提：takeover 的本地同步帧要求窗口基准与授权时点均有效（窗口已关不得洗白）；
+ * 任期跳跃帧无法用本地窗口复核，按「授权与传播分离」只认 authorizedAt；takeover-manual 要求站长不可达。 */
+function evidencePrerequisites(state, local, change, current) {
+  if (change.via === 'takeover') {
+    if (change.term !== current.managerTerm + 1) {
+      return true;
+    }
+    if (change.windowBaseTerm !== current.managerTerm) {
+      return false;
+    }
+    if (!isPlainObject(current.managerWindow) || current.managerWindow.windowBaseTerm !== current.managerTerm) {
+      return false;
+    }
+    return windowAcceptsTakeover(current.managerWindow, change.authorizedAt, {
+      now: wallNow(state),
+      windowMs: windowMsOf(state),
+      windowBaseAt: m5RuntimeOf(state).managerWindowBaseAt.get(local.collabId),
+    });
+  }
+  return managerUnreachable(state, local) === true;
 }
 
 function applyManagerActions(state, local, frame, result) {
@@ -1487,16 +1727,12 @@ function applyAcceptedNextState(state, local, frame, nextState) {
   maps.termState.set(local.collabId, nextState);
   maps.authorized.delete(local.collabId);
   runtime.managerPending.delete(local.collabId);
+  runtime.catchupSources?.delete?.(local.collabId);
   runtime.managerEvidenceAt.set(local.collabId, monoNow(state));
   clearAutoTransferState(state, local.collabId);
   dropHandoverInFlight(state, local.collabId);
   clearSyncWatch(state, local.collabId);
-  if (isPlainObject(nextState.managerWindow) && frame.payload.effectiveAt !== undefined) {
-    const at = Date.parse(frame.payload.effectiveAt);
-    runtime.managerWindowBaseAt.set(local.collabId, Number.isFinite(at) ? at : Date.now());
-  } else {
-    runtime.managerWindowBaseAt.delete(local.collabId);
-  }
+  applyNextStateWindow(state, local, frame, nextState);
   if (local.role === 'manager') {
     const readonlyLedger = local.ledger === null ? null : structuredClone(local.ledger);
     keepReadonlySnapshot(state, local);
@@ -1521,6 +1757,7 @@ function applyTerminalAdoption(state, local, nextState) {
   /* acceptedManager 保留：本地终态后的权威台账恢复需要它作来源证据（不得在采纳终态时清掉）。 */
   maps.termState.set(local.collabId, { managerTerm: nextState.managerTerm, manager: null, version: nextState.version });
   runtime.managerPending.delete(local.collabId);
+  runtime.catchupSources?.delete?.(local.collabId);
   runtime.managerWindowBaseAt.delete(local.collabId);
   clearAutoTransferState(state, local.collabId);
   dropHandoverInFlight(state, local.collabId);
@@ -1537,9 +1774,25 @@ function applyTerminalAdoption(state, local, nextState) {
     local.member.archivedAt = new Date().toISOString();
     persistMember(state, local);
   }
+  /* 与 handleEnd/terminateLocalCopy 同口径：归档本机席位（退出注入与静音聚合）、清静音基线、
+   * 停 join 重播——终态快照是本机正常终态路径之一，不得只改 member.state 而留下活跃席位。 */
+  archiveLocalSeatsOfState(state, local);
+  forgetMuteBaselinesOfCollab(state, local.collabId);
+  stopJoinReplay(state, local);
   clearManagerFreeze(state, local.collabId);
   bump(state, 'terminalAdoptions');
   notifyLocal(state, local, '协作已结束——本机采用本地只读终态。');
+}
+
+/* 采纳新任期时的窗口基准：携窗口且事件有 effectiveAt 才按事件时刻开窗，否则清除。 */
+function applyNextStateWindow(state, local, frame, nextState) {
+  const runtime = m5RuntimeOf(state);
+  const at = Date.parse(frame.payload.effectiveAt);
+  if (isPlainObject(nextState.managerWindow) && frame.payload.effectiveAt !== undefined) {
+    runtime.managerWindowBaseAt.set(local.collabId, Number.isFinite(at) ? at : Date.now());
+    return;
+  }
+  runtime.managerWindowBaseAt.delete(local.collabId);
 }
 
 /** @param {{ status?: string } | undefined} [ledger] 权威快照台账（站长变更帧未携时缺省） */
@@ -1550,13 +1803,49 @@ function applyMemberManagerRef(state, local, nextState, ledger = undefined) {
   backfillMemberBasicsOf(local.member, ledger);
   local.member.manager = { instanceId: nextState.manager.instanceId, identityName: nextState.manager.identityName };
   local.member.managerSinceVersion = nextState.version;
-  if (['completed', 'terminated', 'frozen', 'left'].includes(local.member.state)) {
-    /* 权威快照的台账本身是冻结态时，采纳它只能确认冻结，不能把本机冻结解除——冲突冻结的
-     * 解除只走裁定/解冻路径（设计 §2A.3「不因单一变更自动解除」）。 */
-    local.member.state = ledger?.status === 'frozen' ? 'frozen' : 'active';   // 权威台账覆盖本地终态/冻结（设计 §3.4）
-    delete local.member.archivedAt;
+  /* 同名冲突冻结与任期冻结分开判：冲突冻结只由裁定/解冻解除，manager-changed 或 active 快照
+   * 都不得把它翻回 active（设计 §2A.3「不因单一变更自动解除」）。 */
+  if (conflictFrozenMemberOf(state, local)) {
+    persistMember(state, local);
+    return;
   }
+  if (local.member.state === 'active' && ledger?.status === 'frozen') {
+    /* 权威台账已冻结（同名冲突在站长侧检出）：在线成员按台账收敛为 frozen，避免继续写入被拒。 */
+    markMemberFrozenByLedger(local);
+    persistMember(state, local);
+    return;
+  }
+  reviveTerminalMemberStateOf(local, ledger);
   persistMember(state, local);
+}
+
+/* 权威台账覆盖本地终态/冻结（设计 §3.4）：台账仍冻结则保持 frozen，否则回 active。 */
+function reviveTerminalMemberStateOf(local, ledger) {
+  if (!['completed', 'terminated', 'frozen', 'left'].includes(local.member.state)) {
+    return;
+  }
+  local.member.state = ledger?.status === 'frozen' ? 'frozen' : 'active';
+  delete local.member.archivedAt;
+}
+
+/* 本机同名冲突冻结（非任期三态）：运行时冻结表是任期冻结的权威；无任期冻结而成员已 frozen，
+ * 且持久化原因不是三态之一，即冲突冻结（含旧版共享冻结）。 */
+function conflictFrozenMemberOf(state, local) {
+  if (local.member?.state !== 'frozen' || m5RuntimeOf(state).frozen.has(local.collabId)) {
+    return false;
+  }
+  const reason = local.member.freezeReason ?? local.freezeReason;
+  return !['manager-offline', 'manager-pending', 'manager-fork'].includes(reason);
+}
+
+function markMemberFrozenByLedger(local) {
+  if (local.member.state === 'frozen') {
+    return;
+  }
+  local.member.frozenFrom = local.member.state;
+  local.member.frozenAt = new Date().toISOString();
+  local.member.state = 'frozen';
+  delete local.member.archivedAt;
 }
 
 /* 采纳快照即按台账回填成员记录（设计 §3.1/§4.4④）：冷启动且邀请记录不全时，本地名/题与
@@ -1679,7 +1968,7 @@ function snapshotSourceAuthorized(state, local, frame, termState, ctx) {
   if (local.suspended?.reason === 'handover-pending' && sameSeat(source, handoverTarget) && sameSeat(manager, handoverTarget)) {
     return true;
   }
-  if (handshakeManagerEvidenceOf(state, local, frame, ledger)) {
+  if (handshakeCatchupAuthorizes(ctx, ledger, source)) {
     return true;
   }
   return localAutoOfferMatches(state, local, frame, termState, source, manager);
@@ -1710,6 +1999,43 @@ function handshakeManagerEvidenceOf(state, local, frame, ledger) {
   return reportedManagerEndpointOk(state, local, manager, response.endpoint);
 }
 
+/* 旧站长重启追赶（§2A.8⑥，2026-10-21 裁定）：握手证据只能服务「本机仍是旧站长、来源是旧名单
+ * 成员、本机台账 manager 仍是自己」的追赶；成员/冻结态/本地终态一律不得经握手证据转正。
+ * 证据内容仍须与快照完全一致，且不写入 acceptedManager（判决前落记录等于授予通用授权）。 */
+function handshakeCatchupEvidenceOf(state, local, frame, termState) {
+  const ledger = frame.payload?.ledger;
+  if (local.role !== 'manager' || termState === null || !isPlainObject(ledger)) {
+    return undefined;
+  }
+  if (ledger.manager === null || ledgerTermOf(ledger) <= termState.managerTerm) {
+    return undefined;
+  }
+  if (!handshakeManagerEvidenceOf(state, local, frame, ledger)) {
+    return undefined;
+  }
+  if (!rosterHadSeat(localRosterOf(local), ledger.manager)) {
+    return undefined;   // 来源必须在旧名单（现场成员），名单外主机不构成回归证据
+  }
+  return {
+    term: ledgerTermOf(ledger),
+    manager: { instanceId: ledger.manager.instanceId, sessionId: ledger.manager.sessionId, identityName: ledger.manager.identityName },
+    source: { instanceId: frame.from.instanceId, sessionId: frame.from.sessionId },
+  };
+}
+
+function rosterHadSeat(roster, seat) {
+  return (Array.isArray(roster) ? roster : []).some((entry) => entry?.instanceId === seat.instanceId
+    && (entry.sessionId === undefined || entry.sessionId === seat.sessionId));
+}
+
+function handshakeCatchupAuthorizes(ctx, ledger, source) {
+  const evidence = ctx.handshakeCatchup;
+  return isPlainObject(evidence)
+    && evidence.term === ledgerTermOf(ledger)
+    && sameSeat(evidence.manager, ledger.manager)
+    && sameSeat(evidence.source, source);
+}
+
 function reportedManagerEndpointOk(state, local, manager, reported) {
   if (reported === undefined) {
     return true;   // 站长本人应答时不携 managerEndpoint（该字段只描述他机站长）
@@ -1719,22 +2045,6 @@ function reportedManagerEndpointOk(state, local, manager, reported) {
   }
   const endpoint = endpointFor(state, local, manager.instanceId);
   return endpoint !== undefined && endpoint.address === reported.address && endpoint.port === reported.port;
-}
-
-function recordHandshakeSnapshotEvidence(state, local, frame, termState) {
-  const ledger = frame.payload.ledger;
-  if (!isPlainObject(ledger) || ledger.manager === null || ledgerTermOf(ledger) <= termState.managerTerm) {
-    return;
-  }
-  if (!handshakeManagerEvidenceOf(state, local, frame, ledger)) {
-    return;
-  }
-  termMapsOf(state).accepted.set(local.collabId, {
-    term: ledgerTermOf(ledger),
-    manager: { instanceId: ledger.manager.instanceId, sessionId: ledger.manager.sessionId, identityName: ledger.manager.identityName },
-    source: { instanceId: frame.from.instanceId, sessionId: frame.from.sessionId },
-  });
-  bump(state, 'handshakeSnapshotEvidence');
 }
 
 /* 只认本机已收到的匹配 auto-offer（2026-10-21 裁定）：快照台账 events 可自造，不作证据。 */

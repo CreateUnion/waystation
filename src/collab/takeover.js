@@ -17,6 +17,7 @@ import {
   applyDirectFrame, applySeatPresence, autoSuccessorCandidates, createPresenceTable, expireSeats, isReachable,
 } from './presence.js';
 import { clearManagerWindow, managerWindowRemaining } from './term.js';
+import { seatEntryMatches } from './gate.js';
 
 /* 任期内核的运行时接线（设计 §2A/§3.2）：presence 周期与离席判定、站长失联冻结、会话宽限离席、
  * 会话关闭自动移交、手动/窗口接管。纯判决在 term.js / presence.js；本模块把判决接到台账、
@@ -74,6 +75,8 @@ export function m5RuntimeOf(state) {
       autoAcceptTimers: new Map(),
       managerPending: new Map(),     // 已收 accept 未收签发的只读等待
       acceptedManagers: new Map(),   // collabId → {term,manager,source}
+      catchupSources: new Map(),    // collabId → {instanceId,sessionId} 本轮 catch-up 请求目标（不构成授权）
+      handshakeRequests: new Map(), // collabId → Map(instanceId → at)：本机发出过的握手请求（放行对应应答）
       handshakeResponses: new Map(), // collabId → Map(instanceId → {term,version,manager,seat})
       managerEvidenceAt: new Map(),
       frozen: new Map(),             // collabId → manager-offline/manager-pending/manager-fork（三态，域外值按活跃）
@@ -86,6 +89,7 @@ export function m5RuntimeOf(state) {
       resends: new Map(),            // D15 重发记录
       departures: new Set(),
       managerWindowBaseAt: new Map(),
+      pendingManagerClosures: new Map(),   // 显式移交在途时站长会话已关闭：待移交收口后补自动移交
     };
     runtime.departed = (collabId, seat) => runtime.departures.has(seatKey(collabId, seat.instanceId, seat.sessionId));
     state.m5Runtime = runtime;
@@ -586,10 +590,11 @@ function applyProbeResult(state, local, probeState, result) {
   if (result.reachable === true) {
     bump(state, 'probeSuccesses');
     const wasOffline = probeState.offline;
-    probeState.failSince = null;
-    probeState.offline = false;
+    /* 探测应答是站长可达的直接证据（设计 §2A.3「探测应答均算证据」）：只探测站长端点，
+     * 成功即刷新失联计时并解除 manager-offline 冻结，否则「站长在线且探测一直成功、
+     * 成员仍被误冻结」。 */
+    noteManagerReachable(state, local, monoNow(state));
     if (wasOffline) {
-      bump(state, 'managerRecovered');
       state.log.info('站长恢复应答（判定解除）', { collabId: local.collabId });
       runHandshake(state, { collabId: local.collabId });
     }
@@ -641,13 +646,13 @@ function handoverConfirmMs(state) {
 
 export function runPresenceTick(state) {
   try {
-    const wallNow = nowMs(state);
     const mono = monoNow(state);
-    sendPresenceSweep(state, wallNow);
+    /* 时长判定一律用单调钟（设计 D3）；墙钟只用于载荷里的展示时间戳（presence sentAt）。 */
+    sendPresenceSweep(state, nowMs(state));
     sweepPresenceExpiry(state, mono);
-    sweepSeatGrace(state, wallNow);
+    sweepSeatGrace(state, mono);
     checkManagerLoss(state, mono);
-    resendPendingChanges(state, wallNow);
+    resendPendingChanges(state, mono);
   } catch (error) {
     state.log.error('席位心跳定时器异常（已隔离）', { reason: error.message });
   }
@@ -747,7 +752,7 @@ export function handleSeatPresenceFrame(state, frame, meta) {
   const notice = frame.payload;
   const now = monoNow(state);
   const result = applySeatPresence(m5RuntimeOf(state).presence, notice, now, {
-    peerInstanceId: peer,
+    ...transportEvidenceOf(state, local, meta),
     mode: localModeOf(local),
     relayPeerInstanceId: peer,
     currentRelayPeerInstanceId: relayInstanceOf(state, local),
@@ -815,9 +820,8 @@ export function noteDirectFramePresence(state, frame, meta) {
   if (local === undefined || frame.type === 'seat-presence') {
     return;
   }
-  const peer = transportPeerOf(meta);
   const now = monoNow(state);
-  const result = applyDirectFrame(m5RuntimeOf(state).presence, frame, now, { peerInstanceId: peer });
+  const result = applyDirectFrame(m5RuntimeOf(state).presence, frame, now, transportEvidenceOf(state, local, meta));
   if (result.refreshed === true) {
     bump(state, 'presenceDirectRefreshed');
     noteManagerEvidence(state, local, frame.from?.instanceId, now);
@@ -825,15 +829,47 @@ export function noteDirectFramePresence(state, frame, meta) {
 }
 
 /* 传输对端实例必须由连接层给出（meta.peerInstanceId，设计 §2A.9「只信直连」）；
- * 不得取帧内 from，也不得按地址反查——两者都会让发送方自证身份（fail-closed）。 */
+ * 不得取帧内 from，也不得按地址反查——两者都会让发送方自证身份（fail-closed）。
+ * accepted 入站连接没有对端实例（只有拨号侧盖章）：退回「远端地址＝该机器已知端点地址」证据。
+ * 地址来自连接层，机器地址取自本协作端点表/known-hosts；同 IP 多实例无法区分，属明文信任边界
+ * （设计 §12 已知弱点），不构成新的身份认证。 */
 function transportPeerOf(meta) {
   return typeof meta?.peerInstanceId === 'string' && meta.peerInstanceId !== '' ? meta.peerInstanceId : null;
+}
+
+function transportEvidenceOf(state, local, meta) {
+  const address = typeof meta?.remoteAddress === 'string' && meta.remoteAddress !== '' ? meta.remoteAddress : null;
+  if (address === null) {
+    return { peerInstanceId: transportPeerOf(meta) };
+  }
+  return {
+    peerInstanceId: transportPeerOf(meta),
+    peerAddress: address,
+    instanceAddressOf: (instanceId) => endpointFor(state, local, instanceId)?.address,
+  };
 }
 
 function noteManagerEvidence(state, local, instanceId, now) {
   const manager = managerSeatOfLedger(state, local);
   if (manager !== null && instanceId === manager.instanceId) {
-    m5RuntimeOf(state).managerEvidenceAt.set(local.collabId, now);
+    noteManagerReachable(state, local, now, { clearFreeze: false });
+  }
+}
+
+/* 站长可达证据落地（探测成功 / 握手应答 / 直连帧）：刷新失联计时并清掉陈旧的探测离线结论
+ * （设计 §2A.2「失联证据保活」——直到一次成功探测或握手应答）。clearFreeze=true 时
+ * 解除 manager-offline 冻结；更高任期正在追赶的握手不清冻结（等快照受理）。 */
+function noteManagerReachable(state, local, now, options = {}) {
+  const runtime = m5RuntimeOf(state);
+  runtime.managerEvidenceAt.set(local.collabId, now);
+  const probeState = state.probes?.get?.(local.collabId);
+  if (probeState !== undefined) {
+    probeState.failSince = null;
+    probeState.offline = false;
+  }
+  if (options.clearFreeze !== false && runtime.frozen.get(local.collabId) === 'manager-offline') {
+    bump(state, 'managerRecovered');
+    clearManagerFreeze(state, local.collabId);
   }
 }
 
@@ -843,7 +879,7 @@ function noteManagerEvidenceFromList(state, local, notice, now) {
   }
   const manager = managerSeatOfLedger(state, local);
   if (manager !== null && notice.instanceId === manager.instanceId && notice.sessions.includes(manager.sessionId)) {
-    m5RuntimeOf(state).managerEvidenceAt.set(local.collabId, now);
+    noteManagerReachable(state, local, now, { clearFreeze: false });
   }
 }
 
@@ -993,7 +1029,10 @@ export function noteSeatClosed(state, collabId, sessionId, at = null) {
   if (seat === undefined || seat.state !== 'member') {
     return false;
   }
-  m5RuntimeOf(state).closedSeats.set(seatKey(collabId, state.self.instanceId, sessionId), { sessionId, closedAt: at ?? nowMs(state) });
+  m5RuntimeOf(state).closedSeats.set(seatKey(collabId, state.self.instanceId, sessionId), {
+    sessionId,
+    closedAt: at ?? monoNow(state),   // 宽限判定用单调钟（D3）：墙钟前跳/回拨不得提前或推迟离席
+  });
   bump(state, 'seatClosedNoted');
   return true;
 }
@@ -1002,8 +1041,9 @@ export function noteSeatReopened(state, collabId, sessionId) {
   return m5RuntimeOf(state).closedSeats.delete(seatKey(collabId, state.self.instanceId, sessionId));
 }
 
-export function sweepSeatGrace(state, now = nowMs(state)) {
+export function sweepSeatGrace(state, now = monoNow(state)) {
   const runtime = m5RuntimeOf(state);
+  const wallNow = nowMs(state);   // 留痕时间戳用墙钟；判定用传入的单调钟
   for (const [key, record] of [...runtime.closedSeats.entries()]) {
     const local = state.collabs.get(key.split('\u0000')[0]);
     /* 宽限期内同会话重连即取消离席（设计 §3.2）：席位重新持有桥即视为重开，宽限不再计时。 */
@@ -1019,7 +1059,7 @@ export function sweepSeatGrace(state, now = nowMs(state)) {
       continue;
     }
     runtime.closedSeats.delete(key);
-    closeSeatAfterGrace(state, local, record.sessionId, now);
+    closeSeatAfterGrace(state, local, record.sessionId, wallNow);
   }
 }
 
@@ -1049,6 +1089,19 @@ function closeSeatAfterGrace(state, local, sessionId, now) {
 
 /* 站长会话关闭（机器在线）：宽限到期后按 joinSeq 选可达成员自动移交；无成员则写终态。 */
 function closeManagerSeat(state, local, seat, now) {
+  const others = local.ledger.members.filter((member) => member.role !== 'manager');
+  /* 席位保留到移交发帧之后：闭塞的站长席位仍是本机唯一可签发的身份（fromSessionId），
+   * 先移除会让 auto-offer/变更广播因无席位署名而被发送面拒绝。
+   * 显式移交在途时自动移交被写闸抑制（not-writable）：记录待办并保留席位，
+   * 待移交到期/被拒解除挂起后再补触发（§2A.4「到期或被拒后才进入自动路径」）。 */
+  if (others.length > 0) {
+    const outcome = autoTransfer(state, { collabId: local.collabId, managerSessionId: seat.sessionId });
+    if (outcome.ok !== true && outcome.reason === 'not-writable' && local.suspended !== null) {
+      m5RuntimeOf(state).pendingManagerClosures.set(local.collabId, { sessionId: seat.sessionId });
+      bump(state, 'managerClosureDeferred');
+      return;
+    }
+  }
   appendDeparted(state, local.collabId, {
     instanceId: state.self.instanceId,
     sessionId: seat.sessionId,
@@ -1056,18 +1109,30 @@ function closeManagerSeat(state, local, seat, now) {
     term: ledgerTermOf(local.ledger),
     at: new Date(now).toISOString(),
   });
-  const others = local.ledger.members.filter((member) => member.role !== 'manager');
-  /* 席位保留到移交发帧之后：闭塞的站长席位仍是本机唯一可签发的身份（fromSessionId），
-   * 先移除会让 auto-offer/变更广播因无席位署名而被发送面拒绝。 */
-  if (others.length > 0) {
-    autoTransfer(state, { collabId: local.collabId, managerSessionId: seat.sessionId });
-  }
   removeLocalSeat(local, seat.sessionId, { persist: true, dataDir: state.dataDir });
   /* 台账仍在本机时角色以台账为准：席位缓存退出不得让本机提前变成员。 */
   local.role = 'manager';
   if (others.length === 0) {
     completeTerminalCollab(state, local);
   }
+}
+
+/* 显式移交收口（到期/被拒/更高任期）后补做被抑制的站长会话关闭：席位在挂起期间保留，
+ * 此时写闸已解除，自动移交可按正常路径发起。无待办时幂等返回。 */
+export function continueManagerClosureAfterSuspend(state, collabId) {
+  const runtime = m5RuntimeOf(state);
+  const held = runtime.pendingManagerClosures.get(collabId);
+  if (held === undefined) {
+    return false;
+  }
+  runtime.pendingManagerClosures.delete(collabId);
+  const local = state.collabs.get(collabId);
+  const seat = local?.seats?.get?.(held.sessionId);
+  if (local === undefined || seat === undefined || seat.state !== 'member') {
+    return false;
+  }
+  closeManagerSeat(state, local, seat, nowMs(state));
+  return true;
 }
 
 /* 成员会话关闭：作者广播 leave；managed 站长核移除名单行并刷新快照。 */
@@ -1628,7 +1693,7 @@ function restorableAutoOfferOf(state, local, raw) {
 /* —— D15 重发：站长变更未 ack 前按 presence 节律重发（定向 prevManager + 已端点成员）。 —— */
 
 export function rememberPendingChange(state, collabId, entry) {
-  const now = nowMs(state);
+  const now = monoNow(state);   // D15 重发节律与收敛时限用单调钟（D3）
   m5RuntimeOf(state).resends.set(collabId, { ...entry, sentAt: now, startedAt: now, attempts: 1, acked: new Set() });
 }
 
@@ -1690,6 +1755,19 @@ function resendTargetsOf(state, local, entry) {
 }
 
 function resendManagerChanged(state, local, entry) {
+  const targets = resendManagerChangeTargetsOf(local, entry);
+  for (const [instanceId, member] of targets) {
+    if (instanceId === state.self.instanceId || entry.acked?.has?.(instanceId) === true) {
+      continue;   // 已 ack 的目标不再重发（D15：定向重发只到 prevManager 与未 ack 成员）
+    }
+    const endpoint = endpointFor(state, local, instanceId);
+    if (endpoint !== undefined) {
+      sendManagerChangedTo(state, local, entry, instanceId, member, endpoint);
+    }
+  }
+}
+
+function resendManagerChangeTargetsOf(local, entry) {
   const targets = new Map();
   if (isPlainObject(entry.prevManager)) {
     targets.set(entry.prevManager.instanceId, entry.prevManager);
@@ -1697,19 +1775,14 @@ function resendManagerChanged(state, local, entry) {
   for (const member of local.ledger?.members ?? []) {
     targets.set(member.instanceId, member);
   }
-  for (const [instanceId, member] of targets) {
-    if (instanceId === state.self.instanceId) {
-      continue;
-    }
-    const endpoint = endpointFor(state, local, instanceId);
-    if (endpoint === undefined) {
-      continue;
-    }
-    sendTo(state, local.collabId, instanceId, endpoint, 'notice', entry.payload, {
-      fromSessionId: entry.fromSessionId,
-      ...(member?.sessionId === undefined ? {} : { toSessions: [member.sessionId] }),
-    });
-  }
+  return targets;
+}
+
+function sendManagerChangedTo(state, local, entry, instanceId, member, endpoint) {
+  sendTo(state, local.collabId, instanceId, endpoint, 'notice', entry.payload, {
+    fromSessionId: entry.fromSessionId,
+    ...(member?.sessionId === undefined ? {} : { toSessions: [member.sessionId] }),
+  });
 }
 
 /* —— 握手（启动 / 网络恢复 / 治理通告后的对表） —— */
@@ -1732,21 +1805,7 @@ function handshakeOne(state, local) {
     return;
   }
   if (local.role === 'manager') {
-    const sent = sendToRoster(state, local, 'notice', payload);
-    state.counters.handshakesSent = (state.counters.handshakesSent ?? 0) + sent;
-    /* 本机旁路也计入 sendToRoster 的 sent；没有任何远端端点时对表无从发生，直接按未解析处理。 */
-    if (!hasRemoteHandshakeTarget(state, local)) {
-      markHandshakeUnresolved(state, local);
-      return;
-    }
-    armHandshakeWatch(state, local, sent > 0);
-    /* 启动即对表可能早于本机站点端口就位（入队被拒、sent=0）：没有重试就会永久停在旧任期。
-     * 在这里做有界补发，等发送面可用后再对表一次。 */
-    if (sent === 0) {
-      scheduleHandshakeRetry(state, local);
-      return;
-    }
-    clearHandshakeRetry(state, local);
+    handshakeAsManager(state, local, payload);
     return;
   }
   const manager = managerSeatOfLedger(state, local);
@@ -1760,8 +1819,30 @@ function handshakeOne(state, local) {
   const result = sendTo(state, local.collabId, manager.instanceId, endpoint, 'notice', payload);
   if (result.ok === true) {
     state.counters.handshakesSent = (state.counters.handshakesSent ?? 0) + 1;
+    rememberHandshakeRequest(state, local.collabId, manager.instanceId);
   }
   armHandshakeWatch(state, local, result.ok === true);
+}
+
+/* 站长侧对表：单人协作无条件跳过（无可对表对端）；有远端成员但全无端点才按未解析挂起。
+ * 发送面未就位（sent=0）时有界补发，避免启动早于站点端口就位而永久停在旧任期。 */
+function handshakeAsManager(state, local, payload) {
+  const sent = sendToRoster(state, local, 'notice', payload);
+  state.counters.handshakesSent = (state.counters.handshakesSent ?? 0) + sent;
+  if (!hasRemoteMember(state, local)) {
+    clearHandshakeRetry(state, local);
+    return;
+  }
+  if (!hasRemoteHandshakeTarget(state, local)) {
+    markHandshakeUnresolved(state, local);
+    return;
+  }
+  armHandshakeWatch(state, local, sent > 0);
+  if (sent === 0) {
+    scheduleHandshakeRetry(state, local);
+    return;
+  }
+  clearHandshakeRetry(state, local);
 }
 
 /* 发送面未就位时的一次性补发（有界，避免启动失败路径无限重试）。 */
@@ -1801,6 +1882,10 @@ function clearHandshakeRetry(state, local) {
     clearTimeout(timer);
     runtime.handshakeRetryTimers.delete(local.collabId);
   }
+}
+
+function hasRemoteMember(state, local) {
+  return (local.ledger?.members ?? []).some((member) => member.instanceId !== state.self.instanceId);
 }
 
 function hasRemoteHandshakeTarget(state, local) {
@@ -1879,6 +1964,13 @@ export async function handleHandshake(state, frame) {
   if (local === undefined || frame.from.instanceId === state.self.instanceId || isLocalArchivedState(local)) {
     return;
   }
+  /* 请求来源校验（设计 §7.1）：只接受名单/peerView 内的席位，或本机台账 leave 事件中
+   * manager-lost/manager-session-closed 的旧站长（回归追赶）。握手应答是快照授权链的前件，
+   * 不校验来源等于让任意主机自报最高 pair 并把「未受理的站长」写进受理记录。 */
+  if (!handshakeSourceAdmits(local, frame.from) && !handshakeReplyRequestedOf(state, local, frame)) {
+    handleUnlistedHandshake(state, local, frame);
+    return;
+  }
   bump(state, 'handshakesIn');
   clearHandshakeWatch(state, local);
   if (local.suspended !== null && local.suspended.reason === 'handshake-unresolved') {
@@ -1887,10 +1979,112 @@ export async function handleHandshake(state, frame) {
   local.handshakeUnresolved = false;
   recordHandshakeResponse(state, local, frame);
   noteManagerChangeAck(state, local, frame);
+  noteHandshakeManagerReachability(state, local, frame);
   evaluateRemoteHandshake(state, local, frame);
   if (frame.payload.reply !== true) {
     sendHandshakeReply(state, local, frame);
   }
+}
+
+/* 现任站长本人的握手应答＝可达证据：解除 manager-offline 冻结（同 term 回归的常规恢复面），
+ * 并清掉陈旧的探测离线结论。更高任期在途时保持冻结，等 catch-up 快照受理后按 A10 解除。 */
+function noteHandshakeManagerReachability(state, local, frame) {
+  const manager = managerSeatOfLedger(state, local);
+  if (!isSameManagerSeat(manager, frame.from)) {
+    return;
+  }
+  const localTerm = ledgerTermOf(local.ledger ?? local.snapshot?.ledger);
+  const remoteTerm = frame.payload?.managerTerm;
+  const higherTermInFlight = Number.isInteger(remoteTerm) && remoteTerm > localTerm;
+  noteManagerReachable(state, local, monoNow(state), { clearFreeze: higherTermInFlight ? false : true });
+}
+
+function isSameManagerSeat(manager, from) {
+  if (manager === null || !isPlainObject(from) || manager.instanceId !== from.instanceId) {
+    return false;
+  }
+  if (typeof manager.sessionId !== 'string' || typeof from.sessionId !== 'string') {
+    return true;
+  }
+  return manager.sessionId === from.sessionId;
+}
+
+/* 本机请求过的应答者：对表扫描/成员向站长请求后，只在应答时限内放行该机器的 reply=true。
+ * 名单陈旧时（对方快照尚未包含本机）这是唯一能证明「该应答属于本轮请求」的证据。 */
+function rememberHandshakeRequest(state, collabId, instanceId) {
+  if (typeof instanceId !== 'string' || instanceId === '') {
+    return;
+  }
+  const runtime = m5RuntimeOf(state);
+  let held = runtime.handshakeRequests.get(collabId);
+  if (!(held instanceof Map)) {
+    held = new Map();
+    runtime.handshakeRequests.set(collabId, held);
+  }
+  held.set(instanceId, monoNow(state));
+}
+
+function handshakeReplyRequestedOf(state, local, frame) {
+  if (frame.payload?.reply !== true || typeof frame.from?.instanceId !== 'string') {
+    return false;
+  }
+  const at = m5RuntimeOf(state).handshakeRequests.get(local.collabId)?.get(frame.from.instanceId);
+  if (!Number.isFinite(at)) {
+    return false;
+  }
+  return monoNow(state) - at <= positiveMs(state.handshakeReplyTimeoutMs, HANDSHAKE_REPLY_TIMEOUT_MS) + 1000;
+}
+
+/* 握手的请求来源面（设计 §7.1）：名单/peerView 内的席位，或旧站长回归
+ * （本机台账 leave/名单移除事件里 reason 为 manager-lost/manager-session-closed）。
+ * 旧帧无 sessionId 时退回实例判据；同机多席位不得借实例互相顶替（携席位时按席位键）。 */
+function handshakeSourceAdmits(local, from) {
+  if (!isPlainObject(from) || typeof from.instanceId !== 'string' || from.instanceId === '') {
+    return false;
+  }
+  if (handshakeRosterAdmits(local, from)) {
+    return true;
+  }
+  const ledger = local.role === 'manager' ? local.ledger : local.snapshot?.ledger;
+  return departedManagerEventSeatOf(ledger, from) !== null;
+}
+
+/* 名单/peerView：本机记录、最近快照、台账三面任一含该席位即放行（成员快照可能落后于入席）。 */
+function handshakeRosterAdmits(local, from) {
+  return rosterAdmitsSeat(localRosterOf(local), from)
+    || rosterAdmitsSeat(local.snapshot?.ledger?.members, from)
+    || rosterAdmitsSeat(local.ledger?.members, from);
+}
+
+function rosterAdmitsSeat(roster, from) {
+  return (Array.isArray(roster) ? roster : []).some((entry) => seatEntryMatches(entry, from));
+}
+
+function departedManagerEventSeatOf(ledger, from) {
+  const events = Array.isArray(ledger?.events) ? ledger.events : [];
+  return events.find((event) => isDepartedManagerEventOf(event, from))?.seat ?? null;
+}
+
+function isDepartedManagerEventOf(event, from) {
+  const departedReason = event?.reason === 'manager-lost' || event?.reason === 'manager-session-closed';
+  return event?.type === 'leave' && departedReason && seatEntryMatches(event.seat, from);
+}
+
+/* 名单可能陈旧（成员快照尚未包含后入席者）：未在名单的**请求**仍回自己的 pair，让对端完成
+ * 对表；但绝不记录对方自报值，也不据此请求快照——应答不是授权。未在名单的**应答**
+ * （reply=true）不满足本机请求上下文，按未授权拒收。 */
+function handleUnlistedHandshake(state, local, frame) {
+  if (frame.payload?.reply !== true) {
+    bump(state, 'handshakeUnlistedReplies');
+    sendHandshakeReply(state, local, frame);
+    return;
+  }
+  bump(state, 'handshakeRejected');
+  state.log.warn('握手应答来源不在名单/peerView 或本机请求上下文（拒绝）', {
+    collabId: local.collabId,
+    from: frame.from.instanceId,
+    sessionId: frame.from.sessionId,
+  });
 }
 
 function recordHandshakeResponse(state, local, frame) {
@@ -1995,8 +2189,9 @@ export function requestSnapshotFrom(state, local, instanceId, purpose = 'catchup
   return sent;
 }
 
-/* 追赶来源登记：termCtxOf 目前只把 acceptedManager 透传给任期判决，故选择结果挂在该记录上
- * （合并已有字段，不覆盖更高 term 的受理记录）。选择按机器实例——应答会话可与握手会话不同。 */
+/* 追赶来源登记：只记「本轮请求了谁的快照」，供冻结态 catch-up 的名单陈旧放宽；
+ * 绝不写 acceptedManager（那是 A1–A4 的受理记录，握手/请求都不构成授权）。
+ * 选择按机器实例——应答会话可与握手会话不同。采纳快照后由接线层清除（单次请求上下文）。 */
 function rememberCatchupSource(state, local, instanceId) {
   const runtime = m5RuntimeOf(state);
   const seat = runtime.handshakeResponses.get(local.collabId)?.get(instanceId)?.seat;
@@ -2004,13 +2199,7 @@ function rememberCatchupSource(state, local, instanceId) {
   if (isPlainObject(seat) && typeof seat.sessionId === 'string' && seat.sessionId !== '') {
     selection.sessionId = seat.sessionId;
   }
-  for (const map of [runtime.acceptedManagers, runtime.acceptedManagerMap]) {
-    if (!(map instanceof Map)) {
-      continue;
-    }
-    const existing = map.get(local.collabId);
-    map.set(local.collabId, { ...(isPlainObject(existing) ? existing : {}), catchupSource: selection });
-  }
+  runtime.catchupSources.set(local.collabId, selection);
 }
 
 /* —— 接管（窗口内 takeover / 站长不可达 takeover-manual，设计 §2A.6/§2A.7） —— */
@@ -2219,7 +2408,10 @@ function sendHandshakeSweep(state, local) {
   for (const instanceId of handshakeTargetsOf(state, local)) {
     const endpoint = endpointFor(state, local, instanceId);
     if (endpoint !== undefined) {
-      sendTo(state, local.collabId, instanceId, endpoint, 'notice', payload, { fromSessionId: payload.sessionId });
+      const sent = sendTo(state, local.collabId, instanceId, endpoint, 'notice', payload, { fromSessionId: payload.sessionId });
+      if (sent.ok === true) {
+        rememberHandshakeRequest(state, local.collabId, instanceId);
+      }
     }
   }
 }
@@ -2255,6 +2447,11 @@ function managerAnsweredHandshake(state, local) {
  * 仍然有效，直到一次成功探测——否则名单刷新解除 manager-offline 会让「完全没见过站长 presence」
  * 被误判成可达。 */
 function managerKnownOffline(state, local) {
+  /* 最近的站长握手应答比陈旧的探测结论更直接（设计 §2A.2「失联证据保活」）：站长刚应答过，
+   * 就不得按其不可达受理手动接管。 */
+  if (managerAnsweredHandshake(state, local)) {
+    return false;
+  }
   const runtime = m5RuntimeOf(state);
   return runtime.frozen.get(local.collabId) === 'manager-offline'
     || state.probes?.get?.(local.collabId)?.offline === true;
@@ -2344,8 +2541,7 @@ function viaOf(state, local) {
 }
 
 function windowRemainingOf(state, local) {
-  /* 快照未到时以已采纳的任期状态为窗口基准（否则窗口接管会被误当成手动接管）。 */
-  const window = m5RuntimeOf(state).termState?.get(local.collabId)?.managerWindow ?? local.snapshot?.ledger?.managerWindow;
+  const window = takeoverWindowOf(state, local);
   if (window === undefined) {
     return 0;
   }
@@ -2353,6 +2549,18 @@ function windowRemainingOf(state, local) {
     sessionTakeoverWindowMs: takeoverWindowMs(state),
     baseAt: m5RuntimeOf(state).managerWindowBaseAt.get(local.collabId),
   });
+}
+
+/* 窗口基准：已采纳的任期状态领先时只用它的 window（缺失即无窗口）——不得回退到陈旧快照的
+ * 上一任期窗口，否则「已采纳 term 3、快照仍 term 2」会把手动接管误判成窗口接管。 */
+function takeoverWindowOf(state, local) {
+  const adopted = m5RuntimeOf(state).termState?.get(local.collabId);
+  const snapshotLedger = local.snapshot?.ledger;
+  if (isPlainObject(adopted) && Number.isInteger(adopted.managerTerm)
+    && adopted.managerTerm >= ledgerTermOf(snapshotLedger)) {
+    return adopted.managerWindow;
+  }
+  return snapshotLedger?.managerWindow;
 }
 
 function ledgerBaseOf(local) {

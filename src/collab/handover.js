@@ -11,8 +11,9 @@ import { makeAutoOffer } from './term.js';
 import { applyEndpoint, downgradeToMember, endpointFor, notifyLocal, promoteToManager, sendTo, sendToSeats } from './outgoing.js';
 import { probePeer } from './takeover.js';
 import {
-  clearAutoTransferState, clearManagerFreeze, ledgerTermOf, localSeatsOf, m5RuntimeOf, managerSeatOfLedger, markManagerPending, presenceSignerOf,
-  registerLifecycleRestorer, registerLocalAutoOfferHandler, rememberPendingChange, restoreAutoTransferState,
+  clearAutoTransferState, clearManagerFreeze, continueManagerClosureAfterSuspend, ledgerTermOf, localSeatsOf, m5RuntimeOf,
+  managerSeatOfLedger, markManagerPending, presenceSignerOf, registerLifecycleRestorer, registerLocalAutoOfferHandler,
+  rememberPendingChange, restoreAutoTransferState,
 } from './takeover.js';
 
 /* 显式移交（设计 §2A.4）与自动接受（§2A.5 目标侧）：
@@ -308,6 +309,8 @@ function clearPendingHandover(state, local) {
   }
   rmPendingFile(state, local);
   resumeAfterHandover(state, local);
+  /* 显式移交在途期间站长会话已关闭：写闸解除后补做自动移交（§2A.4）。 */
+  continueManagerClosureAfterSuspend(state, local.collabId);
 }
 
 function resumeAfterHandover(state, local) {

@@ -14,13 +14,17 @@
  *   形态 {collabId,instanceId,sessions:[sessionId...],sentAt?}；非法 → notice-invalid。
  *   直连：options.peerInstanceId 是传输连接对端实例（来自连接层，不得取帧内 from），必须等于 notice.instanceId；
  *         缺 → peer-missing，不符 → peer-mismatch。
+ *         入站 accepted 连接没有对端实例（拨号方才盖章），此时退回「传输对端地址」证据：
+ *         options.peerAddress 是本连接远端地址，options.instanceAddressOf(instanceId) 返回本协作端点表/
+ *         known-hosts 记录的该机器地址；两者相等才算直连证据。地址未知 → peer-address-unknown，
+ *         不符 → peer-address-mismatch。同 IP 多实例无法区分，属既有明文信任边界（§12），记录为已知弱点。
  *   forum 中继转发的副本（notice 顶层或 notice.payload 带 originMsgId）：要求
- *         options.mode === 'forum'、options.relayPeerInstanceId 是转达该副本的连接对端、
- *         relayPeerInstanceId === options.currentRelayPeerInstanceId（本机记录的当前中继），
- *         且 options.peerInstanceId === relayPeerInstanceId；否则 relay-rejected / peer-mismatch。
+ *         options.mode === 'forum'、连接对端是本机记录的当前中继（按 peerInstanceId 或 peerAddress 证据），
+ *         且 options.relayPeerInstanceId（若给出）与当前中继一致；否则 relay-rejected / peer-mismatch。
  *         副本的 notice.instanceId 仍是原发机器，不是中继。
- * - applyDirectFrame(table, frame, now, options)：frame 为完整协作帧；options.peerInstanceId 是连接对端，
- *   必须等于 frame.from.instanceId；转达副本（顶层或 payload.originMsgId）不刷新，返回 relayed。
+ * - applyDirectFrame(table, frame, now, options)：frame 为完整协作帧；连接对端（peerInstanceId 或
+ *   peerAddress + instanceAddressOf 的地址证据）必须对应该帧 from.instanceId；转达副本（顶层或
+ *   payload.originMsgId）不刷新，返回 relayed。
  * - isReachable / autoSuccessorCandidates：hasEndpoint 必须显式 true/false、timeoutMs>0、now 有限；
  *   缺省按不可达（fail-closed）。expired/unlisted 优先于 lastSeenAt。
  * - expireSeats：now/timeoutMs 非法 → 返回 []（不判离、不回落墙钟）；两处出口无 reason，按 fail-closed 处理。 */
@@ -106,23 +110,44 @@ function isPresenceNotice(notice) {
 }
 
 /* 直连要求传输对端就是原发机器；forum 中继转发只放行「连接对端＝本机记录的当前中继」的那一份。
- * 转达者的身份来自连接，不来自帧内 from；缺 peer 证据一律拒绝。 */
+ * 转达者的身份来自连接，不来自帧内 from；缺 peer 证据一律拒绝。
+ * accepted 连接无对端实例时按「远端地址＝该机器已知端点地址」作证据（同 IP 多实例为已知弱点）。 */
 function presenceSourceRejection(notice, options) {
-  const peer = options.peerInstanceId;
-  if (typeof peer !== 'string' || peer === '') {
-    return 'peer-missing';
-  }
   if (originOf(notice) === null) {
-    return peer === notice.instanceId ? null : 'peer-mismatch';
+    return transportPeerProblem(options, notice.instanceId);
   }
   const relayPeer = options.relayPeerInstanceId;
+  const currentRelay = options.currentRelayPeerInstanceId;
+  const claimedRelayOk = relayPeer === undefined || relayPeer === null || relayPeer === currentRelay;
   const viaCurrentRelay = options.mode === 'forum'
-    && typeof relayPeer === 'string'
-    && relayPeer === options.currentRelayPeerInstanceId;
+    && typeof currentRelay === 'string'
+    && currentRelay !== ''
+    && claimedRelayOk;
   if (!viaCurrentRelay) {
     return 'relay-rejected';
   }
-  return peer === relayPeer ? null : 'peer-mismatch';
+  return transportPeerProblem(options, currentRelay);
+}
+
+/* 连接对端证据：优先连接层盖章的实例标识；入站 accepted 连接缺失时退回远端地址 + 已知端点地址。
+ * 缺地址证据一律 fail-closed；地址匹配只证明「同一网络来源」，不区分同 IP 的多个实例。 */
+function transportPeerProblem(options, expectedInstanceId) {
+  const peer = options.peerInstanceId;
+  if (typeof peer === 'string' && peer !== '') {
+    return peer === expectedInstanceId ? null : 'peer-mismatch';
+  }
+  const address = options.peerAddress;
+  if (typeof address !== 'string' || address === '') {
+    return 'peer-missing';
+  }
+  if (typeof options.instanceAddressOf !== 'function') {
+    return 'peer-missing';
+  }
+  const known = options.instanceAddressOf(expectedInstanceId);
+  if (typeof known !== 'string' || known === '') {
+    return 'peer-address-unknown';
+  }
+  return known === address ? null : 'peer-address-mismatch';
 }
 
 function freshEntry(notice, sessionId, at) {
@@ -216,11 +241,7 @@ function directSourceOf(frame) {
 }
 
 function peerProblemOf(direct, options) {
-  const peer = options.peerInstanceId;
-  if (typeof peer !== 'string' || peer === '') {
-    return 'peer-missing';
-  }
-  return peer === direct.instanceId ? null : 'peer-mismatch';
+  return transportPeerProblem(options, direct.instanceId);
 }
 
 /* 判离席由调用方决定；本函数把超时项标记为 tombstone 并返回被标记的条目。

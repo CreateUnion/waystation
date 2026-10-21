@@ -22,10 +22,14 @@
  *   ① 已受理但本地状态尚未推进（落盘/重启间隙）；② 本地已进入终态后，经受理的新站长恢复权威台账。
  * - handshakeHighest：{term,version,manager}——本轮 handshake 最高 pair；只服务 offline catch-up，
  *   不构成终态恢复/覆盖授权（终态 pair 的 manager 为 null）。
- * - catchupSource（或 acceptedManager.catchupSource）：{instanceId}——本机刚发过 catch-up 快照请求的
+ * - handshakeCatchup：{term,manager,source}——旧站长重启追赶证据（§2A.8⑥）。只有接线层确认
+ *   「本机仍是旧站长 + 来源在旧名单 + 来源机器的直连握手应答与快照 term/manager 一致」时才传入；
+ *   只服务于更高 term 的非终态快照采纳，不构成终态覆盖授权，也不写 acceptedManager。
+ * - catchupSource（兼容 acceptedManager.catchupSource）：{instanceId}——本机刚发过 catch-up 快照请求的
  *   目标机器，只在该请求上下文内把「名单陈旧、缺后入席成员」的来源放行给冻结态追赶；缺省 → 只认名单成员。
- *   接线层 termCtxOf 目前只透传 acceptedManager，选择结果挂在该记录上（见 takeover.requestSnapshotFrom）。
- * - authorizedEvidence：{via,authorizedAt,term,manager}——fork 收敛证据，必须绑定快照；缺省/不匹配 → 保持冻结。
+ *   接线层由 takeover.requestSnapshotFrom 单独登记并在采纳快照后清除，不写 acceptedManager。
+ * - authorizedEvidence：{via,authorizedAt,term,manager,source}——fork 收敛证据，必须绑定快照内容与送达来源
+ *   （source 即证据签发席位）；缺省/不匹配 → 保持冻结。仅当 A3/A4 除本地分叉外的要件均成立时才由接线层记录。
  * - suspended / handoverTarget：显式移交等待中的目标席位；终态恢复的 handover 证据另需 handoverBaseTerm
  *   且 baseTerm < 快照 term；缺省 → 不按 handover-pending 受理。
  * - windowBaseAt：本地开窗生效时刻（§2A.6 收敛基准）；缺省退回绝对 endsAt 并封顶。
@@ -573,7 +577,7 @@ function isRequestedCatchupAnswer(ctx, source, snapshot) {
 
 /* §2A.6：窗口以签发时长为本，偏移按事件时刻收敛；回拨/远期窗口都不得延长纠错窗。
  * baseAt 由接线层取自签发帧 effectiveAt（或本地开窗时刻）；缺失时退回绝对 endsAt 并封顶。 */
-function windowAcceptsTakeover(window, authorizedAt, ctx) {
+export function windowAcceptsTakeover(window, authorizedAt, ctx) {
   const endsAt = timeOf(window.windowEndsAt);
   const nowMs = nowOf(ctx);
   const windowMs = windowMsOf(ctx);
@@ -871,7 +875,7 @@ function snapshotFrozenResult(state, snapshot, frame, ctx) {
       return acceptOfflineCatchup(state, snapshot, frame, ctx);
     }
     case 'manager-fork': {
-      return acceptForkedCatchup(state, snapshot, ctx);
+      return acceptForkedCatchup(state, snapshot, frame, ctx);
     }
     case 'manager-pending': {
       return rejected(state, 'frozen-manager-pending');
@@ -905,20 +909,25 @@ function matchesHandshakeHighest(snapshot, highest) {
 }
 
 /* 分叉冻结只接受能收敛到快照本身的授权证据：证据的 term/manager 必须与快照一致，
- * 不能拿一份陈旧或别处的授权去解锁另一份快照（设计 §2A.10 不变量 5）。 */
-function acceptForkedCatchup(state, snapshot, ctx) {
-  if (authorizedEvidenceMatches(ctx.authorizedEvidence, snapshot)) {
+ * 且快照必须由该授权的签发者本人送达（证据绑定来源）——不能拿一份陈旧或别处的授权
+ * 解锁另一份快照（设计 §2A.10 不变量 5）。已受理的更高 term 站长（A1–A4 链）同样可信。 */
+function acceptForkedCatchup(state, snapshot, frame, ctx) {
+  const source = sourceOf(frame, ctx);
+  if (authorizedEvidenceMatches(ctx.authorizedEvidence, snapshot, source)
+    || isAcceptedManagerSeat(ctx.acceptedManager, snapshot, source)) {
     return accepted(snapshotNextState(snapshot), 'snapshot-authorized-accepted', ['adopt', 'clear-freeze']);
   }
   return rejected(state, 'frozen-manager-fork');
 }
 
-function authorizedEvidenceMatches(evidence, snapshot) {
+function authorizedEvidenceMatches(evidence, snapshot, source) {
   return isPlainObject(evidence)
     && (evidence.via === 'takeover' || evidence.via === 'takeover-manual')
     && Number.isFinite(timeOf(evidence.authorizedAt))
     && evidence.term === snapshot.managerTerm
-    && sameSeat(evidence.manager, snapshot.manager);
+    && sameSeat(evidence.manager, snapshot.manager)
+    && isRef(evidence.source)
+    && sameSeat(evidence.source, source);
 }
 
 function acceptHigherSnapshot(state, snapshot, frame, ctx) {
@@ -935,8 +944,21 @@ function acceptHigherSnapshot(state, snapshot, frame, ctx) {
   if (hasLocalAutoOfferCatchup(state, snapshot, source, ctx)) {
     return accepted(snapshotNextState(snapshot), 'snapshot-auto-catchup-accepted', ['adopt']);
   }
+  if (handshakeCatchupMatches(ctx.handshakeCatchup, snapshot, source)) {
+    return accepted(snapshotNextState(snapshot), 'snapshot-handshake-catchup-accepted', ['adopt']);
+  }
   /* A10：其余来源一律拒绝并冻结，不得「经快照转正」（设计 §2A.2 A10）。 */
   return frozen(state, 'snapshot-untrusted-higher-term');
+}
+
+/* 旧站长重启追赶：证据必须绑定快照来源与内容（term/manager 完全一致）。接线层已校验
+ * 「本机仍是旧站长、来源在旧名单」，本层只做快照一致性复核，不放宽成任意握手授权。 */
+function handshakeCatchupMatches(evidence, snapshot, source) {
+  return isPlainObject(evidence)
+    && evidence.term === snapshot.managerTerm
+    && isRef(evidence.manager)
+    && sameSeat(evidence.manager, snapshot.manager)
+    && sameSeat(evidence.source, source);
 }
 
 /* acceptedManager 必须绑定受理记录里的 manager 席位（record.manager），不按 record.source：

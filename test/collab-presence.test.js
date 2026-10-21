@@ -94,6 +94,72 @@ test('applySeatPresence：传输对端必须等于原发机器；缺 peer 证据
   assert.deepEqual(applyList(table, notice, NOW).refreshed, [{ instanceId: 'inst-a', sessionId: 'session-a' }]);
 });
 
+test('accepted 连接无对端实例：按远端地址 + 已知端点地址作直连证据', () => {
+  const addressOf = (instanceId) => (instanceId === 'inst-a' ? '10.0.0.1' : undefined);
+  const notice = listNotice('inst-a', ['session-a']);
+  const accepted = createPresenceTable();
+  const result = applySeatPresence(accepted, notice, NOW, { peerAddress: '10.0.0.1', instanceAddressOf: addressOf });
+  assert.equal(result.reason, undefined);
+  assert.deepEqual(result.refreshed, [{ instanceId: 'inst-a', sessionId: 'session-a' }]);
+  assert.equal(presenceOf(accepted, 'inst-a', 'session-a').lastSeenAt, NOW);
+
+  const mismatch = createPresenceTable();
+  assert.equal(applySeatPresence(mismatch, notice, NOW, { peerAddress: '10.0.0.9', instanceAddressOf: addressOf }).reason, 'peer-address-mismatch');
+  assert.equal(tableRejected(mismatch), true);
+  assert.equal(applySeatPresence(mismatch, notice, NOW, { peerAddress: '10.0.0.1' }).reason, 'peer-missing', '缺地址解析器按未知拒绝');
+  assert.equal(applySeatPresence(mismatch, notice, NOW, { instanceAddressOf: addressOf }).reason, 'peer-missing', '缺连接远端地址按未知拒绝');
+  assert.equal(applySeatPresence(mismatch, notice, NOW, {
+    peerAddress: '10.0.0.1',
+    instanceAddressOf: () => undefined,
+  }).reason, 'peer-address-unknown');
+  /* 连接层已盖章实例时仍以实例为准：地址相同也不能替代实例证据。 */
+  assert.equal(applySeatPresence(mismatch, notice, NOW, {
+    peerInstanceId: 'inst-b',
+    peerAddress: '10.0.0.1',
+    instanceAddressOf: addressOf,
+  }).reason, 'peer-mismatch');
+});
+
+test('applySeatPresence：中继转发的副本在 accepted 连接上按中继地址放行', () => {
+  const table = createPresenceTable();
+  const notice = { ...listNotice('inst-a', ['session-a']), originMsgId: 'origin-1' };
+  const addressOf = (instanceId) => ({ 'inst-r': '10.0.0.8', 'inst-a': '10.0.0.1' })[instanceId];
+  const accepted = applySeatPresence(table, notice, NOW, {
+    peerAddress: '10.0.0.8',
+    instanceAddressOf: addressOf,
+    mode: 'forum',
+    currentRelayPeerInstanceId: 'inst-r',
+  });
+  assert.equal(accepted.reason, undefined);
+  assert.deepEqual(accepted.refreshed, [{ instanceId: 'inst-a', sessionId: 'session-a' }]);
+  assert.equal(applySeatPresence(table, notice, NOW, {
+    peerAddress: '10.0.0.1',
+    instanceAddressOf: addressOf,
+    mode: 'forum',
+    currentRelayPeerInstanceId: 'inst-r',
+  }).reason, 'peer-address-mismatch', '原发机器直连的转达副本不是当前中继');
+  assert.equal(applySeatPresence(table, notice, NOW, {
+    peerAddress: '10.0.0.8',
+    instanceAddressOf: addressOf,
+    mode: 'forum',
+    relayPeerInstanceId: 'inst-old',
+    currentRelayPeerInstanceId: 'inst-r',
+  }).reason, 'relay-rejected', '声称的转达者与当前中继不符');
+});
+
+test('applyDirectFrame：accepted 连接按地址证据刷新；地址不符/未知拒绝', () => {
+  const table = createPresenceTable();
+  const addressOf = (instanceId) => (instanceId === 'inst-a' ? '10.0.0.1' : undefined);
+  const frame = { collabId: COLLAB, from: { instanceId: 'inst-a', sessionId: 'session-a' }, at: NOW };
+  assert.equal(applyDirectFrame(table, frame, NOW, { peerAddress: '10.0.0.1', instanceAddressOf: addressOf }).refreshed, true);
+  assert.equal(applyDirectFrame(createPresenceTable(), frame, NOW, { peerAddress: '10.0.0.9', instanceAddressOf: addressOf }).reason, 'peer-address-mismatch');
+  assert.equal(applyDirectFrame(createPresenceTable(), frame, NOW, { peerAddress: '10.0.0.1' }).reason, 'peer-missing');
+});
+
+function tableRejected(table) {
+  return table.size === 0;
+}
+
 test('applySeatPresence：forum 只放行当前中继转发的列表（真实 payload 形态）', () => {
   const table = createPresenceTable();
   /* 真实中继把 originMsgId 合并进 payload 顶层；notice 就是该 payload。 */

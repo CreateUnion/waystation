@@ -671,10 +671,10 @@ test('A10 快照：manager-offline 只受理与握手最高 pair 一致且来源
   })), 'source-not-member');
 });
 
-test('A10 快照：fork 证据必须绑定快照 term/manager，pending 只读', () => {
+test('A10 快照：fork 证据必须绑定快照 term/manager 与送达来源，pending 只读', () => {
   const state = stateOf({ term: 2, version: 12, manager: SEAT_B });
   const frame = snapshotOf({ term: 3, version: 14, manager: SEAT_C, from: SEAT_A });
-  const good = { via: 'takeover-manual', authorizedAt: iso(NOW - 1000), term: 3, manager: seatRef(SEAT_C) };
+  const good = { via: 'takeover-manual', authorizedAt: iso(NOW - 1000), term: 3, manager: seatRef(SEAT_C), source: seatRef(SEAT_A) };
   accepts(acceptManagerChange(state, frame, snapshotCtx({ localFrozen: 'manager-fork', authorizedEvidence: good })));
   rejects(acceptManagerChange(state, frame, snapshotCtx({
     localFrozen: 'manager-fork',
@@ -684,6 +684,10 @@ test('A10 快照：fork 证据必须绑定快照 term/manager，pending 只读',
     localFrozen: 'manager-fork',
     authorizedEvidence: { ...good, term: 2 },
   })), 'frozen-manager-fork');
+  rejects(acceptManagerChange(state, frame, snapshotCtx({
+    localFrozen: 'manager-fork',
+    authorizedEvidence: { ...good, source: seatRef(SEAT_B) },
+  })), 'frozen-manager-fork', '证据来源与快照来源不符不得解锁');
   rejects(acceptManagerChange(state, frame, snapshotCtx({ localFrozen: 'manager-pending' })), 'frozen-manager-pending');
 });
 

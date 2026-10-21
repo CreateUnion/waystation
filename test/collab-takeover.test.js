@@ -620,7 +620,7 @@ test('catch-up：同 term 版本落后 → 向最高应答者请求快照，携 
   assert.equal(selected.length >= 1, true, '向最高应答者请求快照');
   assert.equal(selected.every((frame) => frame.payload.purpose === 'catchup'), true, '冻结态成员只应答携 purpose 的请求');
   const runtime = m5RuntimeOf(state);
-  assert.equal(runtime.acceptedManagers.get(COLLAB)?.catchupSource?.instanceId, RIVAL.instanceId, '登记本请求选中的来源');
+  assert.equal(runtime.catchupSources.get(COLLAB)?.instanceId, RIVAL.instanceId, '登记本请求选中的来源（不写受理记录）');
   assert.equal(local.role, 'member', '未按旧台账提升');
 });
 
@@ -631,7 +631,7 @@ test('catch-up：同 term 版本落后的握手应答 → 向应答者请求快�
   assert.equal(requests.length, 1);
   assert.equal(requests[0].to.instanceId, RIVAL.instanceId);
   assert.equal(requests[0].payload.purpose, 'catchup', '同 term 版本落后同样是追赶');
-  assert.equal(m5RuntimeOf(state).acceptedManagers.get(COLLAB)?.catchupSource?.instanceId, RIVAL.instanceId);
+  assert.equal(m5RuntimeOf(state).catchupSources.get(COLLAB)?.instanceId, RIVAL.instanceId);
 });
 
 test('catch-up 受理：陈旧名单缺来源，但本机请求过且内容＝握手最高 pair → 同 term 采纳', () => {

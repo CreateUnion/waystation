@@ -9,6 +9,10 @@ import { currentManagerIdOf, forumReachIdsOf, isLocalArchivedState, localModeOf,
  * 会话级加入的 join 家族（设计 §2）同在第一梯队，见 admitJoinFamily——回执帧的发起机尚无
  * 该协作（申请先于入席），未知 collabId 判定不得先吞。 */
 
+function isPlainObject(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 const FROZEN_ALLOWED = new Set(['freeze', 'unfreeze', 'decision', 'takeover-init', 'takeover', 'notice', 'snapshot', 'end', 'leave']);
 const ARCHIVED_ALLOWED = new Set(['snapshot', 'notice', 'end', 'leave', 'history-request', 'history-bundle']);
 /* 任期冻结（设计 §1.3）：生命周期接线层把冻结核在 state.m5Runtime.frozen，冻结原因另落成员记录/载体。
@@ -228,44 +232,71 @@ function admitForumPost(state, local, frame) {
   return { ok: true };
 }
 
-/* 同名 + 成员交集的匹配面（设计 §6 判据的机器化）：冻结通告、冲突检测、转达目标共用。
- * memberIds 传「完整参与者集合」（含发起者）——判据是两条协作的参与者集合有交集。
- * 模式隔离（设计 §6）：冲突匹配只取 managed 实例——讨论不参与同名冲突匹配（任何方向：
- * 不冻结别人、也不被人冻结；跨模式同名视为不同实例）。 */
-export function matchConflictCollabs(state, name, memberIds) {
-  return collabsMatchingName(state, name, memberIds, 'managed');
+/* 同名 + 成员交集的匹配面（设计 §6 判据的机器化，D13 席位键）：冻结通告、冲突检测、转达目标共用。
+ * members 传「完整参与者集合」（含发起者，席位条目 {instanceId,sessionId}）——判据是两条协作的
+ * 参与者席位集合有交集。旧调用方传实例标识字符串时退回实例判据（兼容面）；任一侧缺 sessionId
+ * 也退回实例键。模式隔离（设计 §6）：冲突匹配只取 managed 实例——讨论不参与同名冲突匹配
+ * （任何方向：不冻结别人、也不被人冻结；跨模式同名视为不同实例）。 */
+export function matchConflictCollabs(state, name, members) {
+  return collabsMatchingName(state, name, members, 'managed');
 }
 
 /* 讨论侧同名匹配：冻结流程帧的「忽略 + 受理」判定用——同判据、只取讨论实例。 */
-export function matchForumCollabs(state, name, memberIds) {
-  return collabsMatchingName(state, name, memberIds, 'forum');
+export function matchForumCollabs(state, name, members) {
+  return collabsMatchingName(state, name, members, 'forum');
+}
+
+/* 席位条目 vs 席位条目的匹配（设计 D13）：instanceId 必须相同；两侧都有 sessionId 时必须相等；
+ * 任一侧缺 sessionId（旧帧/旧名单行）退回实例键。 */
+export function seatEntryMatches(entry, seat) {
+  if (!isPlainObject(entry) || !isPlainObject(seat) || entry.instanceId !== seat.instanceId) {
+    return false;
+  }
+  if (typeof entry.sessionId !== 'string' || entry.sessionId === '') {
+    return true;
+  }
+  if (typeof seat.sessionId !== 'string' || seat.sessionId === '') {
+    return true;
+  }
+  return entry.sessionId === seat.sessionId;
+}
+
+/* 成员条目列表是否含该席位（治理帧签发者校验：冻结/裁定/解冻的 from 须在名单内）。 */
+export function seatListAdmits(entries, seat) {
+  return (Array.isArray(entries) ? entries : []).some((entry) => seatEntryMatches(entry, seat));
 }
 
 /* 冻结族帧命中讨论实例的忽略计数（消费侧，与准入侧的受理 + ack 配对）：命中返回 true。
  * 冻结规程不施于讨论、讨论无治理面——忽略即正确处理（设计 §6；只可能来自同名 managed 邻域
  * 的广播，跨模式同名视为不同实例）。 */
 export function noteForumGovernanceIgnored(state, frame) {
-  const memberIds = frame.payload.members.map((member) => member.instanceId);
-  if (matchForumCollabs(state, frame.payload.name, memberIds).length === 0) {
+  if (matchForumCollabs(state, frame.payload.name, frame.payload.members).length === 0) {
     return false;
   }
   state.counters.forumGovernanceIgnored++;
   return true;
 }
 
-function collabsMatchingName(state, name, memberIds, mode) {
-  const ids = new Set(memberIds);
+function collabsMatchingName(state, name, members, mode) {
+  const seats = seatEntriesOf(members);
   const matched = [];
   for (const local of state.collabs.values()) {
     if (localModeOf(local) !== mode || !CONFLICT_STATES.includes(localStateOf(local))) {
       continue;
     }
     const roster = localRosterOf(local);
-    if (localNameOf(local) === name && roster.some((entry) => ids.has(entry.instanceId))) {
+    if (localNameOf(local) === name && roster.some((entry) => seats.some((seat) => seatEntryMatches(entry, seat)))) {
       matched.push(local);
     }
   }
   return matched;
+}
+
+/* 匹配输入归一：字符串＝旧版实例标识（无席位信息），对象保留 instanceId/sessionId。 */
+function seatEntriesOf(members) {
+  return (Array.isArray(members) ? members : [])
+    .map((member) => (typeof member === 'string' ? { instanceId: member } : member))
+    .filter((member) => isPlainObject(member) && typeof member.instanceId === 'string');
 }
 
 function admitInvite(state, frame, meta) {
@@ -332,11 +363,10 @@ function inviteTargetsLocal(frame, selfId, members) {
  * 讨论实例命中（设计 §6）：受理 + ack，忽略与计数在消费侧（冻结流程帧只可能来自同名 managed
  * 邻域的广播，跨模式同名视为不同实例）；受理而非拒绝是为了不让邻域的治理重试被无 ack 钉死。 */
 function admitConflictFrame(state, frame) {
-  const memberIds = frame.payload.members.map((member) => member.instanceId);
-  if (matchConflictCollabs(state, frame.payload.name, memberIds).length > 0) {
+  if (matchConflictCollabs(state, frame.payload.name, frame.payload.members).length > 0) {
     return { ok: true };
   }
-  if (matchForumCollabs(state, frame.payload.name, memberIds).length > 0) {
+  if (matchForumCollabs(state, frame.payload.name, frame.payload.members).length > 0) {
     return { ok: true };
   }
   state.counters.freezeUnmatched++;
