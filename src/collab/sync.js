@@ -590,12 +590,13 @@ export function applyIncomingLeave(state, local, frame) {
 
 /* 发起人侧：首个他方 join 使讨论由「提议中」转「进行中」（设计 §5.1 个别加入制；
  * 发起人自身的创建即入表不构成该边——它是「第一个」成员，不是「首个加入者」）。
- * 成立时刻 = 他方 join 事件的最早 ts（确定性——与到达序无关）。 */
+ * 成立时刻 = 他方 join 事件的最早 ts（确定性——与到达序无关）。
+ * 「他方」按席位判（设计 §2.2）：同机另一会话是独立成员，它的入席也算首个加入者。 */
 export function activateForumIfNeeded(state, local) {
   if (local.role !== 'manager' || local.ledger.status !== 'proposed') {
     return false;
   }
-  const events = local.members.events().filter((event) => event.kind === 'join' && event.instanceId !== state.self.instanceId);
+  const events = local.members.events().filter((event) => isOtherJoinEventOf(event, state.self.instanceId, initiatorSessionOf(local)));
   if (events.length === 0) {
     return false;
   }
@@ -611,6 +612,25 @@ export function activateForumIfNeeded(state, local) {
   state.counters.forumEstablished++;
   state.log.info('讨论成立（首个成员加入）', { collabId: local.collabId, establishedAt });
   return true;
+}
+
+/* 发起人自己的席位：本机站长席（forum 里 role=manager 即发起人记录）优先，无角色标记时按入席序
+ * 取最早席；无席位表的历史夹具返回 null——整机即发起人，退回实例判据。 */
+function initiatorSessionOf(local) {
+  return primarySeatOf(local)?.sessionId ?? null;
+}
+
+/* 「他方 join」：讨论成员是会话（设计 §2.2/§4.5）——发起人自己席位之外的会话入席才算他人加入，
+ * 同机另一会话的 join 不能因为「同实例」被吞掉。事件带 sessionId 时按 (instanceId, sessionId) 判；
+ * 旧事件无 sessionId 时退回实例判据（本机的旧事件视为发起人自己的，既有档案判定不变）。 */
+function isOtherJoinEventOf(event, selfId, initiatorSessionId) {
+  if (event.kind !== 'join') {
+    return false;
+  }
+  if (initiatorSessionId === null || !isSeatSessionOf(event)) {
+    return event.instanceId !== selfId;
+  }
+  return event.instanceId !== selfId || event.sessionId !== initiatorSessionId;
 }
 
 /* join 收敛判定（设计 §5.4 对表自愈）：判据 = 对表**拉回**的成员表（对端事件集折叠后）含
@@ -838,8 +858,10 @@ function managerMetaOf(state, local) {
   return meta;
 }
 
+/* 成立时刻的取数面与 activateForumIfNeeded 同一「他方」判据：两处若各用一套，发起人侧对
+ * 成立时刻与成立边沿会给出互相矛盾的结论（同机会话入席只算一处成立）。 */
 function earliestOtherJoinTs(state, local) {
-  const events = local.members.events().filter((event) => event.kind === 'join' && event.instanceId !== state.self.instanceId);
+  const events = local.members.events().filter((event) => isOtherJoinEventOf(event, state.self.instanceId, initiatorSessionOf(local)));
   return events.length === 0 ? null : earliestTsOf(events);
 }
 
