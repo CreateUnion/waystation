@@ -1,4 +1,4 @@
-import { DEFAULT_COLLAB_MODE, isPort } from '../net/protocol.js';
+import { DEFAULT_COLLAB_MODE, MAX_ACTIVE_SEATS, isPort } from '../net/protocol.js';
 import { LOCAL_LEFT_STATE, MAX_BOARD_ENTRIES, isSnapshotShape } from './model.js';
 import { createPostsStore } from './posts.js';
 import { createMembersStore } from './members.js';
@@ -7,8 +7,8 @@ import { forgetMuteBaselinesOfCollab } from './mute.js';
 import { createInjectedStore } from './injected.js';
 import { appendLedger, ledgerDigest } from './store.js';
 import { collabDir, ensureDir } from '../paths.js';
-import { archiveLocalSeatsOfState, isLocalArchivedState, localModeOf, localStateOf, persistMember, persistSnapshot, rememberKnownHost, retiredMuteHandle, selfJoinedOf, upsertLocalSeat } from './local.js';
-import { matchConflictCollabs, memberSeatAdmits, noteForumGovernanceIgnored } from './gate.js';
+import { archiveLocalSeatsOfState, isLocalArchivedState, localModeOf, localRosterOf, localStateOf, persistMember, persistSnapshot, rememberKnownHost, retiredMuteHandle, selfJoinedOf, upsertLocalSeat } from './local.js';
+import { managerFreezeReasonOf, matchConflictCollabs, memberSeatAdmits, noteForumGovernanceIgnored } from './gate.js';
 import { applyEndpoint, applyFreezeLocally, broadcastFreeze, downgradeToMember, endpointFor, governanceTargets, memberIdsOf, mutateLedger, notifyLocal, relayGovernance, relayRedistribute, selfIsRelay, sendTo, stopJoinReplay } from './outgoing.js';
 import { applyIncomingJoin, applyIncomingLeave, handleHistoryBundle, handleHistoryRequest } from './sync.js';
 import {
@@ -354,6 +354,9 @@ function learnInviteEndpoints(state, local, frame) {
 /* 冲突检出（第一检测点）：冻结新到那条并连带冻结本机全部匹配协作（检出方本地一并冻上，
  * 避免旧那条在检出机与另一机的副本形成分叉）。广播必须覆盖两条：只播新到那条时，旧那条的
  * 其他参与者（本机名单之外）收不到冲突事实，检出机与它们会长期停在「一边冻结、一边活跃」。
+ * 两条广播共用「检出涉及的本地条名单并集」：对端在任一副本上都能命中本帧，并借此学到对端
+ * 副本的参与者（第三方的合并裁定据此能同时命中两侧副本）。邀请目标若不在任何本地名单里则
+ * 带不到席位键——名单按席位条目校验，宁缺勿造。
  * 广播 reason 用固定短文案（协议上限 200 字符——拼接多个实例标识会越界；明细在日志字段里）。 */
 function freezeOnInviteConflict(state, frame, local, conflict) {
   const now = new Date().toISOString();
@@ -371,10 +374,30 @@ function freezeOnInviteConflict(state, frame, local, conflict) {
     name: local.member.name,
     conflicts: conflict.map((entry) => entry.collabId).join('、'),
   });
-  broadcastFreeze(state, local, '同名冲突：与本机既有协作参与者有交集');
+  const participants = conflictParticipantsOf(local, conflict);
+  broadcastFreeze(state, local, '同名冲突：与本机既有协作参与者有交集', participants);
   for (const other of conflict) {
-    broadcastFreeze(state, other, '同名冲突：与本机既有协作参与者有交集');
+    broadcastFreeze(state, other, '同名冲突：与本机既有协作参与者有交集', participants);
   }
+}
+
+function conflictParticipantsOf(local, conflict) {
+  const union = new Map();
+  for (const source of [local, ...conflict]) {
+    for (const entry of localRosterOf(source)) {
+      if (union.size >= MAX_ACTIVE_SEATS) {
+        return [...union.values()];   // 协议名单上限：本条名单优先，对端多出的席位由对端自己的广播覆盖
+      }
+      if (typeof entry.instanceId !== 'string' || typeof entry.sessionId !== 'string' || typeof entry.identityName !== 'string') {
+        continue;
+      }
+      const key = `${entry.instanceId}\u0000${entry.sessionId}`;
+      if (!union.has(key)) {
+        union.set(key, { instanceId: entry.instanceId, sessionId: entry.sessionId, identityName: entry.identityName });
+      }
+    }
+  }
+  return [...union.values()];
 }
 
 /* 同意帧携 inviteId（会话级邀请）：转加入域的批准面签发 join-grant；无 inviteId 的旧形态
@@ -1483,7 +1506,11 @@ function applyAcceptedNextState(state, local, frame, nextState) {
   } else {
     applyMemberManagerRef(state, local, nextState, frame.payload?.ledger);
   }
-  clearManagerFreeze(state, local.collabId);
+  /* 只清站长任期冻结（manager-offline/pending/fork）：同名冲突冻结不因快照采纳而解除，
+   * 否则权威快照（哪怕是冻结态台账）一到就把侦测侧的冲突冻结静默翻回 active（设计 §2A.3）。 */
+  if (managerFreezeReasonOf(state, local.collabId) !== null) {
+    clearManagerFreeze(state, local.collabId);
+  }
   notifyLocal(state, local, `站长已变更：现任站长「${nextState.manager.identityName}」（任期 ${nextState.managerTerm}）——本机已按新任期收敛。`);
 }
 
@@ -1515,6 +1542,7 @@ function applyTerminalAdoption(state, local, nextState) {
   notifyLocal(state, local, '协作已结束——本机采用本地只读终态。');
 }
 
+/** @param {{ status?: string } | undefined} [ledger] 权威快照台账（站长变更帧未携时缺省） */
 function applyMemberManagerRef(state, local, nextState, ledger = undefined) {
   if (local.member === null || typeof local.member !== 'object') {
     return;
@@ -1523,7 +1551,9 @@ function applyMemberManagerRef(state, local, nextState, ledger = undefined) {
   local.member.manager = { instanceId: nextState.manager.instanceId, identityName: nextState.manager.identityName };
   local.member.managerSinceVersion = nextState.version;
   if (['completed', 'terminated', 'frozen', 'left'].includes(local.member.state)) {
-    local.member.state = 'active';   // 权威台账覆盖本地终态/冻结（设计 §3.4）
+    /* 权威快照的台账本身是冻结态时，采纳它只能确认冻结，不能把本机冻结解除——冲突冻结的
+     * 解除只走裁定/解冻路径（设计 §2A.3「不因单一变更自动解除」）。 */
+    local.member.state = ledger?.status === 'frozen' ? 'frozen' : 'active';   // 权威台账覆盖本地终态/冻结（设计 §3.4）
     delete local.member.archivedAt;
   }
   persistMember(state, local);

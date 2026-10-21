@@ -1,3 +1,4 @@
+import { MAX_ACTIVE_SEATS } from '../net/protocol.js';
 import { MAX_BOARD_ENTRIES, canTransition, isLedgerShape } from './model.js';
 import { archiveLocalSeatsOfState, inferredFrozenFrom, isLocalArchivedState, localNameOf, localRosterOf, localStateOf, managerSeatOfLocal, persistLedger, persistMember, persistSnapshot } from './local.js';
 import { forgetMuteBaselinesOfCollab } from './mute.js';
@@ -212,10 +213,39 @@ function rosterRefs(local) {
   }));
 }
 
+/* 裁定帧的匹配名单：本方席位 ∪ 检出时记下的对端席位 ∪ 对端意向席位。只带本方名单时，
+ * 被并入条与执行方名单没有席位交集，裁定帧到不了对端副本（同一条裁定必须同时命中两侧，
+ * 接收侧才能「保留方解冻、被并入条终止」）。缺席位键的条目造不出合法名单，跳过。 */
+function decisionMembersOf(local) {
+  const union = new Map();
+  const remember = (entry) => {
+    if (union.size >= MAX_ACTIVE_SEATS) {
+      return;
+    }
+    if (typeof entry?.instanceId !== 'string' || typeof entry?.sessionId !== 'string' || typeof entry?.identityName !== 'string') {
+      return;
+    }
+    const key = `${entry.instanceId}\u0000${entry.sessionId}`;
+    if (!union.has(key)) {
+      union.set(key, { instanceId: entry.instanceId, sessionId: entry.sessionId, identityName: entry.identityName });
+    }
+  };
+  for (const entry of rosterRefs(local)) {
+    remember(entry);
+  }
+  for (const source of [local.conflictRival, local.mergeIntent]) {
+    for (const entry of source?.members ?? []) {
+      remember(entry);
+    }
+  }
+  const merged = [...union.values()];
+  return merged.length > 0 ? merged : rosterRefs(local);
+}
+
 /* 保持两条：解除冻结并广播 unfreeze（对端同判据解除；两套名字/名单各自保留）。 */
 function executeKeep(state, local) {
   unfreezeLocal(state, local, '裁定：保持两条');
-  sendToRoster(state, local, 'unfreeze', { name: localNameOf(local), members: rosterRefs(local), reason: '裁定：保持两条' });
+  sendToRoster(state, local, 'unfreeze', { name: localNameOf(local), members: decisionMembersOf(local), reason: '裁定：保持两条' });
   state.counters.freezeDecisionsOut++;
   return { ok: true, choice: 'keep', message: '已解除冻结并广播——两条协作各自继续（名称建议加后缀区分）' };
 }
@@ -223,7 +253,7 @@ function executeKeep(state, local) {
 /* 终止：本机该条转终态并广播（对端同 collabId 副本终止、其余匹配条解除冻结）。 */
 function executeTerminate(state, local) {
   const collabId = local.collabId;
-  const members = rosterRefs(local);
+  const members = decisionMembersOf(local);
   const name = localNameOf(local);
   terminateLocalCopy(state, local, '裁定：终止本方一条');
   sendToRoster(state, local, 'decision', { choice: 'terminate', name, members, collabId, executed: true });
@@ -249,7 +279,7 @@ function executeMerge(state, local) {
   terminateLocalCopies(state, local);
   const winner = local.collabId;
   sendToRoster(state, local, 'decision', {
-    choice: 'merge', name: localNameOf(local), members: rosterRefs(local), winner, executed: true, createdAt: local.ledger.createdAt,
+    choice: 'merge', name: localNameOf(local), members: decisionMembersOf(local), winner, executed: true, createdAt: local.ledger.createdAt,
   });
   state.counters.freezeDecisionsOut++;
   local.mergeIntent = null;
@@ -278,7 +308,7 @@ function mergeWinnerOf(state, local) {
 /* 非保留方的表态：广播意向帧（executed:false，随带本机发起时间）——保留方收到后提示其本机人执行。 */
 function sendMergeIntent(state, local) {
   sendToRoster(state, local, 'decision', {
-    choice: 'merge', name: localNameOf(local), members: rosterRefs(local), winner: local.collabId, executed: false, createdAt: local.ledger.createdAt,
+    choice: 'merge', name: localNameOf(local), members: decisionMembersOf(local), winner: local.collabId, executed: false, createdAt: local.ledger.createdAt,
   });
   state.counters.freezeDecisionsOut++;
 }

@@ -2242,16 +2242,19 @@ function anyActiveLocalSessionOf(state) {
   return undefined;
 }
 
-export function broadcastFreeze(state, frozenLocal, reason) {
+/** @param {Array<{ instanceId: string, sessionId: string, identityName: string }> | null} [participants] */
+export function broadcastFreeze(state, frozenLocal, reason, participants = null) {
+  /* 席位条目形态（设计 §2.2/D13）：freeze.members 按 (instanceId,sessionId) 校验，丢 sessionId
+   * 的帧会被接收侧协议层整帧拒收，冲突传播到此中断。参与者集合由检出方给出时（同一冲突涉及
+   * 多条本地副本）原样使用——对端据此在任一副本上命中。 */
+  const members = participants !== null && participants.length > 0 ? participants : localRosterOf(frozenLocal).map((entry) => ({
+    instanceId: entry.instanceId,
+    ...(typeof entry.sessionId === 'string' ? { sessionId: entry.sessionId } : {}),
+    identityName: entry.identityName,
+  }));
   const payload = {
     name: localNameOf(frozenLocal),
-    /* 席位条目形态（设计 §2.2/D13）：freeze.members 按 (instanceId,sessionId) 校验，丢 sessionId
-     * 的帧会被接收侧协议层整帧拒收，冲突传播到此中断。 */
-    members: localRosterOf(frozenLocal).map((entry) => ({
-      instanceId: entry.instanceId,
-      ...(typeof entry.sessionId === 'string' ? { sessionId: entry.sessionId } : {}),
-      identityName: entry.identityName,
-    })),
+    members,
     reason,
   };
   if (frozenLocal.role === 'manager') {
@@ -2260,7 +2263,7 @@ export function broadcastFreeze(state, frozenLocal, reason) {
   }
   const fromSessionId = freezeSignerSessionOf(state, frozenLocal);
   let sent = 0;
-  for (const [instanceId, endpoint] of collectFreezeTargets(state, frozenLocal)) {
+  for (const [instanceId, endpoint] of collectFreezeTargets(state, frozenLocal, members)) {
     const result = sendTo(state, frozenLocal.collabId, instanceId, endpoint, 'freeze', payload, { fromSessionId });
     if (result.ok === true) {
       sent++;
@@ -3097,8 +3100,8 @@ function isEndpointValue(target) {
 }
 
 /* 冻结目标集：被冻协作成员端点 ∪ 同名交集协作成员端点（去重、除本机）。 */
-function collectFreezeTargets(state, frozenLocal) {
-  const ids = localRosterOf(frozenLocal).map((entry) => entry.instanceId);
+function collectFreezeTargets(state, frozenLocal, members = localRosterOf(frozenLocal)) {
+  const ids = members.map((entry) => entry.instanceId);
   const targets = new Map();
   addTargetsOf(state, frozenLocal, targets);
   for (const other of matchConflictCollabs(state, localNameOf(frozenLocal), ids)) {

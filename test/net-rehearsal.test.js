@@ -536,12 +536,9 @@ test('协作预演：建协全流程（邀请→同意→建立→对话→看�
   assert.equal(ledger.ledger.members.length, 2);
 });
 
-/* 跳因（产品缺陷）：0.2.0 的 managed 邀请把目标机器放在 payload.targets、members 只含发起人；
- * 接收侧冲突检测（src/collab/events.js:183）只取 inviteRosterOf(frame)（:305-307 仅映射
- * payload.members），被邀机器看不到「自己也在新邀请的参与者集合里」，同名交集检测因此不触发——
- * 本预演无法进入冻结。替代覆盖：test/collab-events.test.js 的邀请冲突单测（构造 members 含目标的
- * 旧形态）与 test/collab-gate.test.js 的交集匹配面。 */
-test('协作预演：同名并发冲突（三节点双冻结 + 广播）', { timeout: 90000, skip: '产品缺陷：邀请冲突检测未纳入 payload.targets（events.js:183/305），被邀成员侧检不出同名交集；替代覆盖见 collab-events/collab-gate 单测' }, async (t) => {
+/* 冲突候选含邀请载荷的 targets：被邀机器据此看到「自己也在新邀请的参与者集合里」，
+ * 同名交集检测触发双冻结与广播（设计 §2A.2）。 */
+test('协作预演：同名并发冲突（三节点双冻结 + 广播）', { timeout: 90000 }, async (t) => {
   // 三站点占三连端口：整段取
   const { port, nodes: [a, b, c] } = await startNodesGuarded(t, 3, (startPort) => spawnTriadNodes(t, startPort));
   const first = await a.command({ cmd: 'create_collab', name: '重名项目', topic: '甲发起的联调', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });
@@ -984,9 +981,8 @@ test('治理预演：离线错过通告 → 恢复后送达即让位（D15 重�
   assert.equal(aEntry.role, 'member', '通告送达即让位降级');
 });
 
-/* 跳因同上（产品缺陷）：被邀成员侧检不出同名交集，冲突双冻结无从发生；人裁定合并本身的覆盖在
- * test/collab-freeze.test.js（合并/终止裁定）与 test/collab-governance.test.js。 */
-test('治理预演：同名冲突双冻结 → 人裁定合并 → 三方收敛', { timeout: 180000, skip: '产品缺陷：邀请冲突检测未纳入 payload.targets（events.js:183/305），被邀成员侧检不出同名交集；替代覆盖见 collab-freeze/collab-governance 裁定单测' }, async (t) => {
+/* 冲突候选含 targets 后，双冻结可传播；人裁定合并走既有 freeze 裁定面。 */
+test('治理预演：同名冲突双冻结 → 人裁定合并 → 三方收敛', { timeout: 180000 }, async (t) => {
   const config = GOVERNANCE_CONFIG;
   const { port, nodes: [a, b, c] } = await startNodesGuarded(t, 3, (startPort) => spawnTriadNodes(t, startPort, config));
   const x = await a.command({ cmd: 'create_collab', name: '合并项目', topic: '主题', targets: [{ instanceId: b.ready.instanceId, identityName: '主机乙', address: '127.0.0.1', port: port + 1 }] });

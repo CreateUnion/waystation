@@ -669,6 +669,31 @@ test('C2 首份快照：无基线成员收到站长自洽快照 → 落库、清
   assert.ok((otherHarness.state.counters.snapshotCorrupt ?? 0) >= 1);
 });
 
+test('C2a 首份快照的台账本身冻结：本地同名冲突冻结不被解除（设计 §2A.3）', async (t) => {
+  const manager = { instanceId: 'inst-a', sessionId: 'sess-a', identityName: '甲' };
+  const memberRow = { instanceId: 'inst-self', sessionId: 'sess-self', identityName: '本机' };
+  const ledger = ledgerOf({ manager, members: [memberRow], version: 11, status: 'frozen' });
+  const local = localOf({ seats: [seatOf('sess-self')], snapshot: null, endpoints: [['inst-a', { address: '10.0.0.1', port: 17321 }]] });
+  Object.assign(local.member, { state: 'frozen', frozenAt: iso(), frozenFrom: 'active' });
+  const harness = stateOf(t, local);
+  await handleEvent(harness.state, frameOf('snapshot', { kind: 'data', managerTerm: 1, version: 11, digest: ledgerDigest(ledger), ledger }, manager), { remoteAddress: '10.0.0.1' });
+  assert.equal(local.snapshot?.version, 11, '首份冻结态快照照常落库');
+  assert.equal(local.member.state, 'frozen', '权威台账是冻结态：只能确认冻结，不得翻回 active');
+});
+
+test('C2b 同 term 更高 version 快照受理：只清任期冻结，冲突冻结保留（设计 §2A.3）', async (t) => {
+  const manager = { instanceId: 'inst-a', sessionId: 'sess-a', identityName: '甲' };
+  const memberRow = { instanceId: 'inst-self', sessionId: 'sess-self', identityName: '本机' };
+  const baseline = ledgerOf({ manager, members: [memberRow], version: 10 });
+  const local = localOf({ ledger: baseline, seats: [seatOf('sess-self')], endpoints: [['inst-a', { address: '10.0.0.1', port: 17321 }]] });
+  Object.assign(local.member, { state: 'frozen', frozenAt: iso(), frozenFrom: 'active' });
+  const harness = stateOf(t, local);
+  const next = ledgerOf({ manager, members: [memberRow], version: 11, status: 'frozen' });
+  await handleEvent(harness.state, frameOf('snapshot', { kind: 'data', managerTerm: 1, version: 11, digest: ledgerDigest(next), ledger: next }, manager), { remoteAddress: '10.0.0.1' });
+  assert.equal(local.snapshot?.version, 11, 'A11：同 term 同 manager 的更高 version 快照受理');
+  assert.equal(local.member.state, 'frozen', '采纳快照不得把检出侧的冲突冻结静默翻回 active');
+});
+
 test('C3 伪造 auto-offer + 自签 auto → 拒收；随后的更高任期快照按 A10 拒收并冻结', async (t) => {
   const attacker = { instanceId: 'inst-c', sessionId: 'sess-c', identityName: '丙' };
   const local = localOf({ seats: [seatOf('sess-self')] });
