@@ -71,7 +71,14 @@ export function approveJoinTool() {
       /* reason 按描述语义归一：approve=true 时在工具层丢弃（服务层该分支不消费）——与
        * ws_approve_invite 同一口径（同意 + 理由是无定义组合）。 */
       const reason = args.approve === false ? optionalTextArg(args, 'reason') : undefined;
-      return resultOf(await context.join.approve({ collabId, sessionId, approve: args.approve, reason, approvedBy }));
+      /* managerSessionId 是 0.2.0 两段式的签发席位（服务层据此走 beginJoining → join-grant）；
+       * inviteId 可选：受邀会话经 ws_approve_invite 批准时带上，用于校验邀请簿记。 */
+      const inviteId = optionalTextArg(args, 'inviteId');
+      return resultOf(await context.join.approve({
+        collabId, sessionId, approve: args.approve, reason, approvedBy,
+        managerSessionId: approvedBy,
+        ...(inviteId === undefined || inviteId === '' ? {} : { inviteId }),
+      }));
     },
   };
 }

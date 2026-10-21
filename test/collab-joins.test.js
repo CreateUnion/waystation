@@ -75,7 +75,8 @@ test('加入台账形态谓词：顶层两名单齐备、条目逐字段拒', ()
   assert.equal(isJoinsShape({ v: 1, pendingJoins: [], approvals: [] }), true);
   assert.equal(isJoinsShape({ v: 1, pendingJoins: [] }), false, '缺名单');
   assert.equal(isJoinsShape({ v: 1, pendingJoins: {}, approvals: [] }), false, '名单非数组');
-  assert.equal(isJoinsShape({ v: 2, pendingJoins: [], approvals: [] }), false, '版本不符');
+  assert.equal(isJoinsShape({ v: 2, pendingJoins: [] }), true, 'v2 只要求 pendingJoins（0.2.0 写侧形态）');
+  assert.equal(isJoinsShape({ v: 3, pendingJoins: [], approvals: [] }), false, '版本不符');
   assert.equal(isJoinsShape(null), false);
   assert.equal(isJoinsShape([1]), false);
   assert.equal(isPendingJoinShape(pendingRecord()), true);
