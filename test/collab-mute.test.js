@@ -369,6 +369,33 @@ test('静音开关：入席默认静音、显式取消后不抑制、席位落�
   assert.ok(noSeat.message.includes('没有席位'), noSeat.message);
 });
 
+test('论坛受邀同意：默认静音落到本会话席位（席位文件是唯一权威，不写退役 mute.json）', async (t) => {
+  const made = makeService(t);
+  const collabId = 'collab-forum-approve-seat';
+  const admitted = await receive(made.service, inviteFrame({ collabId }));
+  assert.equal(admitted?.ok, true, admitted?.reason);
+  await approveWithConsent(made.service, { collabId, sessionId: MEMBER_SESSION });
+  const seat = seatOf(made.service, collabId, MEMBER_SESSION);
+  assert.ok(seat !== null, '论坛同意即建本会话席位');
+  assert.equal(seat.muted, true, '默认静音落席位（listLocalSeats 可见）');
+  const record = JSON.parse(readFileSync(seatPath(made.dir, collabId, MEMBER_SESSION), 'utf8'));
+  assert.equal(record.muted, true, '席位文件 muted=true（默认静音落盘）');
+  assert.equal(existsSync(mutePath(made.dir, collabId)), false, '不再写退役 mute.json');
+  assert.equal(suppressedOf(made.service, { type: 'post', collabId }, MEMBER_SESSION), true, '同意后即时按席位静音');
+});
+
+test('静音兜底不抑治理帧：同名讨论静音时，未知 collabId 的治理帧仍放行（设计 §5.4）', async (t) => {
+  const made = makeService(t);
+  const forumId = await makeForum(made, { name: '联调项目' });
+  setMuteOf(made, forumId, MEMBER_SESSION, true);
+  /* 旧兜底按名称 + 成员交集匹配到同名讨论，会把这帧误判为「被忽略治理帧」而抑制；
+   * 治理帧应始终放行（静音只做内容类减法）。 */
+  const foreignGovernance = freezeFrameOf('collab-unknown-governance', SELF_A, '联调项目', [SELF_INSTANCE]);
+  assert.equal(suppressedOf(made.service, foreignGovernance, MEMBER_SESSION), false, '未知协作的治理帧不得被同名讨论的静音兜底抑制');
+  assert.equal(suppressedOf(made.service, { ...foreignGovernance, type: 'end' }, MEMBER_SESSION), false, '结束帧同样放行');
+  assert.equal(suppressedOf(made.service, { type: 'invite', collabId: 'collab-unknown-invite' }, MEMBER_SESSION), false, '邀请帧不受静音抑制');
+});
+
 test('静音栅栏判定：内容类按收件席位抑制；结束 / 邀请 / 快照 / 治理等待办照常', async (t) => {
   const made = makeService(t);
   const forumId = await makeForum(made, { name: '联调项目' });
@@ -457,7 +484,7 @@ test('取消静音的错过内容摘要：N=静音期新增（讨论=帖 / 协�
   assert.equal(resumeNoticeTextOf(made), `静音期间本协作新增 2 条——${MANAGED_SUMMARY_TAIL}`);
 });
 
-test('同机两席静音互不影响：一席静音不抑制另一席；摘要基线按协作共用（设计未要求每席独立摘要）', async (t) => {
+test('同机两席静音互不影响：一席静音不抑制另一席；摘要基线按席位独立（进程内）', async (t) => {
   const made = makePipedService(t);
   const collabId = await makeManaged(made, { name: '协作甲' });
   await unmuteAll(made, collabId);
@@ -469,31 +496,27 @@ test('同机两席静音互不影响：一席静音不抑制另一席；摘要�
   await waitFor(() => (deliveriesOf(made, MEMBER_SESSION, 'progress').length === 1 ? true : null));
   assert.equal(deliveriesOf(made, MANAGER_SESSION, 'progress').length, 0, '静音席不注入');
   assert.equal(deliveriesOf(made, MEMBER_SESSION, 'progress')[0].frame.payload.text, '给成员席', '未静音席照常注入');
-  /* 两席同时静音（共用协作级基线）后，先取消的一席按差值给 N，后取消的那席基线已被清空：
-   * 摘要降级为不带 N——设计只写「静音按会话、逐席判定」，没有要求每席独立摘要基线。 */
+  /* 两席同时静音后各自按自己的窗口算差值：先取消的一席 N=2（基线 0），后取消的那席
+   * 在累计 2 时进入静音、窗口内无新增 → N=0（逐席基线，互不清空）。 */
   setMuteOf(made, collabId, MEMBER_SESSION, true);
   setMuteOf(made, collabId, MANAGER_SESSION, false);
   assert.equal(resumeNoticeTextOf(made), `静音期间本协作新增 2 条——${MANAGED_SUMMARY_TAIL}`);
   setMuteOf(made, collabId, MEMBER_SESSION, false);
-  assert.equal(resumeNoticeTextOf(made), `静音期间本协作可能有新内容——${MANAGED_SUMMARY_TAIL}`, '共用基线被前一席取消清空后，后一席降级为不带 N（不虚构数字）');
+  assert.equal(resumeNoticeTextOf(made), `静音期间本协作新增 0 条——${MANAGED_SUMMARY_TAIL}`, '逐席基线：后一席按自己的窗口算 N');
 });
 
-test('基线缺失与坏基线文件：摘要降级不带 N；静音态由席位文件权威，坏文件留痕', async (t) => {
+test('重启后席位仍静音、摘要降级不带 N；退役 mute.json 留盘不读不写', async (t) => {
   const made = makeService(t);
   const collabId = await makeManaged(made, { name: '协作甲' });
   setMuteOf(made, collabId, MANAGER_SESSION, true);
-  writeFileSync(mutePath(made.dir, collabId), JSON.stringify({ v: 1, muted: true, baseline: null }));
+  /* 退役文件的相反内容不得影响新权威：席位 muted=true 即静音，旧文件的 muted:false 无人读取。 */
+  writeFileSync(mutePath(made.dir, collabId), JSON.stringify({ v: 1, muted: false, baseline: 123 }));
   const reloaded = makeService(t, { dir: made.dir });
-  assert.equal(suppressedOf(reloaded.service, { type: 'progress', collabId }, MANAGER_SESSION), true, '基线缺失不影响席位静音');
+  assert.equal(seatOf(reloaded.service, collabId, MANAGER_SESSION).muted, true, '重启后静音态来自席位文件');
+  assert.equal(suppressedOf(reloaded.service, { type: 'progress', collabId }, MANAGER_SESSION), true, '重启后仍按席位静音（不读旧文件）');
   setMuteOf(reloaded, collabId, MANAGER_SESSION, false);
-  assert.equal(resumeNoticeTextOf(reloaded), `静音期间本协作可能有新内容——${MANAGED_SUMMARY_TAIL}`, '基线缺失：摘要降级为不带 N');
-  setMuteOf(reloaded, collabId, MANAGER_SESSION, true);
-  writeFileSync(mutePath(made.dir, collabId), '{ 坏文件');
-  const reloaded2 = makeService(t, { dir: made.dir });
-  assert.equal(suppressedOf(reloaded2.service, { type: 'progress', collabId }, MANAGER_SESSION), true, '坏基线文件不改变席位静音态');
-  assert.ok(reloaded2.logs.some((entry) => entry.message.includes('静音状态文件不可用')), '坏文件必须留痕（告警）');
-  setMuteOf(reloaded2, collabId, MANAGER_SESSION, false);
-  assert.equal(resumeNoticeTextOf(reloaded2), `静音期间本协作可能有新内容——${MANAGED_SUMMARY_TAIL}`, '坏基线：摘要同样降级');
+  assert.equal(resumeNoticeTextOf(reloaded), `静音期间本协作可能有新内容——${MANAGED_SUMMARY_TAIL}`, '基线仅进程内：重启后缺失，摘要降级不带 N');
+  assert.deepEqual(JSON.parse(readFileSync(mutePath(made.dir, collabId), 'utf8')), { v: 1, muted: false, baseline: 123 }, '退役文件留盘不删不改');
 });
 
 test('静音期首帧帖：不注入不记真；重复副本无注入事实不回报；取消后仍不进注入；新帖即时恢复注入', async (t) => {
@@ -565,30 +588,36 @@ test('已注入标记：正常注入记真（跨重启保留）；重复副本�
   assert.equal(deliveriesOf(made, MEMBER_SESSION, 'join').filter((entry) => entry.msgId === joinCopy.msgId).length, 0, 'join 重复副本不注入');
 });
 
-test('清理挂点：成员退出（讨论）与站长结束 / 整条撤回（协作）清理静音状态', async (t) => {
+test('清理挂点：离席删除本席（静音随席位退场）；终态改为归档保留（不删除用户数据）', async (t) => {
   const made = makeService(t);
   const forumId = await makeMemberForum(made, { collabId: 'collab-clear-leave', name: '联调项目' });
   setMuteOf(made, forumId, MEMBER_SESSION, true);
-  assert.equal(existsSync(mutePath(made.dir, forumId)), true);
+  assert.equal(existsSync(seatPath(made.dir, forumId, MEMBER_SESSION)), true, '前置：本会话席位在盘');
   assert.equal(made.service.leave({ collabId: forumId, sessionId: MEMBER_SESSION }).ok, true);
   assert.equal(seatOf(made.service, forumId, MEMBER_SESSION), null, '离席删除本机席位');
-  assert.equal(existsSync(mutePath(made.dir, forumId)), false, '退出清理静音基线文件');
+  assert.equal(existsSync(seatPath(made.dir, forumId, MEMBER_SESSION)), false, '离席删除席位文件（静音随席位退场）');
+  assert.equal(existsSync(mutePath(made.dir, forumId)), false, '离席不写退役 mute.json');
   assert.equal(suppressedOf(made.service, { type: 'post', collabId: forumId }, MEMBER_SESSION), false, '离席后不静音');
   assert.equal(made.service.setMute({ collabId: forumId, sessionId: MEMBER_SESSION, muted: true }).ok, false, '离席后不能改席位静音');
   const managedEnd = await makeManaged(made, { name: '协作结束' });
   setMuteOf(made, managedEnd, MANAGER_SESSION, true);
-  assert.equal(existsSync(mutePath(made.dir, managedEnd)), true);
   assert.equal(made.service.end({ collabId: managedEnd, sessionId: MANAGER_SESSION }).ok, true);
-  assert.equal(seatOf(made.service, managedEnd, MANAGER_SESSION), null, '结束删除全部本机席位');
-  assert.equal(existsSync(mutePath(made.dir, managedEnd)), false, '结束清理静音基线文件');
+  const ended = seatOf(made.service, managedEnd, MANAGER_SESSION);
+  assert.ok(ended !== null, '结束不删除本机席位（保留历史）');
+  assert.equal(ended.archived, true, '结束给本机席位写 archivedAt');
+  const endedRecord = JSON.parse(readFileSync(seatPath(made.dir, managedEnd, MANAGER_SESSION), 'utf8'));
+  assert.ok(Number.isFinite(Date.parse(endedRecord.archivedAt)), 'archivedAt 已落盘');
   const managedWithdraw = createManaged(made, { name: '协作撤回' });
   setMuteOf(made, managedWithdraw, MANAGER_SESSION, true);
-  assert.equal(existsSync(mutePath(made.dir, managedWithdraw)), true);
   assert.equal(made.service.withdraw({ collabId: managedWithdraw, sessionId: MANAGER_SESSION }).ok, true);
-  assert.equal(existsSync(mutePath(made.dir, managedWithdraw)), false, '整条撤回清理静音基线文件');
+  const withdrawn = seatOf(made.service, managedWithdraw, MANAGER_SESSION);
+  assert.ok(withdrawn !== null, '整条撤回不删除本机席位');
+  assert.equal(withdrawn.archived, true, '整条撤回归档本机席位');
+  const withdrawnRecord = JSON.parse(readFileSync(seatPath(made.dir, managedWithdraw, MANAGER_SESSION), 'utf8'));
+  assert.ok(Number.isFinite(Date.parse(withdrawnRecord.archivedAt)), '撤回 archivedAt 已落盘');
 });
 
-test('静音期结束帧照常注入；成员侧归档（handleEnd）清理静音基线，归档后内容由准入拒绝', async (t) => {
+test('静音期结束帧照常注入；成员侧归档（handleEnd）保留席位并写 archivedAt，归档后内容由准入拒绝', async (t) => {
   const made = makePipedService(t);
   const collabId = await makeMemberForum(made, { collabId: 'collab-end-inject', name: '联调项目' });
   setMuteOf(made, collabId, MEMBER_SESSION, true);
@@ -597,7 +626,12 @@ test('静音期结束帧照常注入；成员侧归档（handleEnd）清理静�
   made.inbound.onFrame(connection, endFrameOf(collabId, SELF_A));
   await waitFor(() => deliveriesOf(made, MEMBER_SESSION, 'end').length === 1);
   assert.equal(made.inbound.stats().sessionGated, 0, '结束帧不落入静音抑制集（只做减法）');
-  assert.equal(existsSync(mutePath(made.dir, collabId)), false, '归档清理静音基线文件');
+  const archived = seatOf(made.service, collabId, MEMBER_SESSION);
+  assert.ok(archived !== null, '归档不删除本机席位');
+  assert.equal(archived.archived, true, '成员侧归档写 archivedAt');
+  const record = JSON.parse(readFileSync(seatPath(made.dir, collabId, MEMBER_SESSION), 'utf8'));
+  assert.ok(Number.isFinite(Date.parse(record.archivedAt)), 'archivedAt 已落盘（重启仍可读）');
+  assert.equal(existsSync(mutePath(made.dir, collabId)), false, '不写退役 mute.json');
   const post = postFrameOf(collabId, SELF_A, { postId: 'post-after-end', text: '归档后' });
   const admitted = await made.service.hooks.admit(post, { remoteAddress: '127.0.0.2' });
   assert.equal(admitted.ok, false, '归档后内容由准入拒绝（不依赖残留席位静音）');

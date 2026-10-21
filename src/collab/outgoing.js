@@ -4,11 +4,11 @@ import { MAX_FORUM_MEMBERS, MAX_LOCAL_COLLABS, canTransition, isArchived, newCol
 import { createPostsStore, displayOrderOf, newPostId } from './posts.js';
 import { createMembersStore } from './members.js';
 import { createCounterStore, notifyIndicatorChange } from './counter.js';
-import { createMuteStore } from './mute.js';
+import { forgetMuteBaselinesOfCollab, rememberMuteBaselineIfAbsent } from './mute.js';
 import { createInjectedStore } from './injected.js';
 import { consumeInviteChallenge, consumeInviteWaiver, issueInviteChallenge } from './consent.js';
 import { ledgerDigest, removeLedgerFile } from './store.js';
-import { currentManagerIdOf, emitOwnMemberEvent, foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, localTopicOf, memberStateFor, persistLedger, persistMember, persistSnapshot, relayDepartedOf, relayPeerOf, rememberKnownHost, selfJoinedOf, upsertLocalSeat } from './local.js';
+import { archiveLocalSeatsOfState, currentManagerIdOf, emitOwnMemberEvent, foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localSeatOfLocal, localStateOf, localTopicOf, memberStateFor, persistLedger, persistMember, persistSnapshot, relayDepartedOf, relayPeerOf, rememberKnownHost, retiredMuteHandle, seatsOfLocal, selfJoinedOf, upsertLocalSeat } from './local.js';
 import { matchConflictCollabs } from './gate.js';
 import { CARRIER_FORMAT_INVITE_STUB, CARRIER_FORMAT_SESSION_SEATS, readCarrier, writeCarrier } from './carrier.js';
 import { collabDir } from '../paths.js';
@@ -38,13 +38,37 @@ export function contentCountOf(local) {
  * 与静音写入同谓词产出（工具层只做输出封装，不另立一份「本次是否写了静音」的判定）。 */
 const DEFAULT_MUTE_NOTICE = '已默认静音——消息不注入本会话；实时观看走观察窗（/ws-view），要本会话实时跟进用 /ws-mute 取消静音';
 
-/* 入席默认静音（设计 §3.1）：本机成为参与者时默认写入静音，基线 = 写入时刻的当下累计读数。
- * 返回本次是否真写了（前态未静音即本次落笔；已在静音中不重复写）——提醒据此如实给，不虚报。
+/* 入席默认静音（设计 §3.1）：本机成为参与者时把默认静音落到**本会话席位**（席位文件的 muted
+ * 是唯一权威，契约 §8），基线 = 写入时刻的当下累计读数（进程内按席位记录）。
+ * 返回本次是否真写了（前态未静音或基线首次建立即本次落笔）——提醒据此如实给，不虚报。
  * 只在「创建成功」与「同意加入成功」两处调用——挂到记录创建 / 成员落盘这类宽调用点，
- * 会把受邀未同意者也静音、在拒绝路径留下 mute.json 残留（本机不同意还被静音的故障形态）。 */
-function applyDefaultMute(local) {
-  const before = local.mute.setMuted(true, contentCountOf(local));
-  return before.wasMuted !== true;
+ * 会把受邀未同意者也静音（本机不同意还被静音的故障形态）。
+ * managed 两段式在同意时尚未建席：基线按调用会话先记下，席位由加入域建席时落 muted:true。 */
+function applyDefaultMute(state, local, sessionId) {
+  const target = defaultMuteSessionOf(local, sessionId);
+  if (target === null) {
+    return false;
+  }
+  const firstApplication = rememberMuteBaselineIfAbsent(state, local.collabId, target, contentCountOf(local));
+  const seat = localSeatOfLocal(local, target);
+  if (seat === null) {
+    return firstApplication;
+  }
+  const wrote = seat.muted !== true;
+  if (wrote) {
+    seat.muted = true;
+    upsertLocalSeat(local, { sessionId: target, muted: true }, { persist: true, dataDir: state.dataDir });
+  }
+  return wrote || firstApplication;
+}
+
+/* 默认静音的落点：调用会话自己的席位；无会话标识时仅在恰一席的兼容路径下取该席。 */
+function defaultMuteSessionOf(local, sessionId) {
+  if (typeof sessionId === 'string' && sessionId !== '') {
+    return sessionId;
+  }
+  const seats = [...seatsOfLocal(local).values()];
+  return seats.length === 1 ? seats[0].sessionId : null;
 }
 
 /* 获准台账不在本模块落笔：joins.json 的单一写者是加入域（凭 v2 形态整档写）。
@@ -70,7 +94,8 @@ export function createCollab(state, { name, topic, targets, mode, sessionId }) {
     posts: createPostsStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
     members: createMembersStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
     counter: createCounterStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
-    mute: createMuteStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log }),
+    /* 退役 mute.json 的兼容句柄（仅供尚未迁出的清理调用点）；静音权威是席位文件。 */
+    mute: retiredMuteHandle(),
     injected: createInjectedStore({ dataDir: state.dataDir, collabId: ledger.collabId, log: state.log }),
     suspended: null,
     staleManagerId: null,
@@ -87,7 +112,7 @@ export function createCollab(state, { name, topic, targets, mode, sessionId }) {
   persistLedger(state, local);
   const invited = initialInvitesOf(state, local, ledger, targets, collabMode, sessionId);
   state.counters.collabsCreated++;
-  applyDefaultMute(local);   // 写点一：创建成功（邀请发送结果不影响入席事实）
+  applyDefaultMute(state, local, sessionId);   // 写点一：创建成功（邀请发送结果不影响入席事实）
   state.openViewer?.({ root: state.viewerRoot, id: ledger.collabId });   // 触发 A：建立即开该协作页（开关在出口内现读）
   /* 新建实例的静音状态必为空（新 collabId 无旧文件），写点一的默认静音必然落笔——提醒同发。 */
   return { ok: true, collabId: ledger.collabId, invited, notice: DEFAULT_MUTE_NOTICE };
@@ -468,7 +493,7 @@ function applyInviteDecision(state, local, approve, wanted, reason, sessionId) {
   if (wanted !== 'approved' || result.ok !== true) {
     return result;
   }
-  const wrote = applyDefaultMute(local);   // 写点二：同意加入成功
+  const wrote = applyDefaultMute(state, local, sessionId);   // 写点二：同意加入成功
   state.openViewer?.({ root: state.viewerRoot, id: local.collabId });   // 触发 A：同意入席即开该协作页（开关在出口内现读）
   /* 提醒只在本次真的写了静音时给：幂等重入的早返回根本到不了这里（本次什么都没写），
    * 说「已默认静音」会与事实相反。 */
@@ -537,6 +562,7 @@ function ensureJoinedSeatOf(state, local, sessionId) {
     state: 'member',
     joinSeq: 1,
     joinedAt: new Date().toISOString(),
+    muted: true,
   }, { persist: true, dataDir: state.dataDir, bridgeId: bridgeIdOfSession(state, target) });
 }
 
@@ -1091,7 +1117,6 @@ export function endCollab(state, { collabId }) {
   local.member.state = 'completed';
   local.member.archivedAt = new Date().toISOString();
   persistMember(state, local);
-  local.mute.clear();
   stopJoinReplay(state, local);
   broadcastCollabEnd(state, local, collabId);   // 双通道之一：在线广播（豁免 TTL/上限）
   state.counters.ended++;
@@ -1133,7 +1158,6 @@ export function leaveCollab(state, { collabId, sessionId }) {
   local.member.state = 'left';
   local.member.archivedAt = new Date().toISOString();
   persistMember(state, local);
-  local.mute.clear();
   state.counters.left++;
   /* 站长不可达（无端点或发送失败）且本机最后一人离席：写本地只读终态副本（设计 §3.4），
    * 不冒充权威台账——权威台账仍归站长机，恢复接触后由更高版本快照覆盖。 */
@@ -1235,7 +1259,6 @@ function leaveForum(state, local, sessionId) {
   local.member.state = 'left';
   local.member.archivedAt = new Date().toISOString();
   persistMember(state, local);
-  local.mute.clear();
   state.counters.left++;
   return { ok: true, delivered, eventId: event?.eventId ?? null };
 }
@@ -2748,7 +2771,9 @@ function withdrawAll(state, local) {
   local.member.state = 'terminated';
   local.member.archivedAt = new Date().toISOString();
   persistMember(state, local);
-  local.mute.clear();
+  /* 终态归档本机席位（保留历史，不删除用户数据）：写 archivedAt 并退出活跃判定。 */
+  archiveLocalSeatsOfState(state, local);
+  forgetMuteBaselinesOfCollab(state, local.collabId);
   for (const member of recipients) {
     const endpoint = local.endpoints.get(member.instanceId);
     if (endpoint !== undefined) {

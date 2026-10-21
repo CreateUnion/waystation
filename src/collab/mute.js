@@ -1,18 +1,14 @@
 import { readFileSync, rmSync } from 'node:fs';
 import { writeJsonAtomic } from '../storage.js';
 import { collabDir, collabFilePath, ensureDir } from '../paths.js';
-import { CONFLICT_FRAME_TYPES, matchConflictCollabs, matchForumCollabs } from './gate.js';
-import { localModeOf } from './local.js';
-import { POST_KINDS } from '../net/protocol.js';
 
 export const MUTE_FILE_NAME = 'mute.json';
 
-/* 静音状态（设计 §5.7）：per-collab 本地行为开关——纯本地，不广播、无外发帧。
- * 静音期「内容类」帧不进会话注入，「状态与待办类」一概照旧（只做减法，抑制集见 muteSuppresses）；
- * 取消时以「当前累计 − 基线」给一行错过内容摘要。形态 { v: 1, muted, baseline }：baseline 是
- * 设静音时刻的累计读数（论坛 = 帖子列表 size、managed = 内容消息计数，由调用方取数），
- * 随状态文件持久——跨重启不丢。健壮性沿既有 store 语义：坏文件按默认（不静音）归零并留痕、
- * 落盘失败只计数告警、内存态继续——行为开关不得让服务起不来。 */
+/* 静音状态：0.2.0 起按会话席位持久（seats/<sessionId>.json 的 muted，唯一权威），
+ * mute.json 退出语义面、留盘不删（契约 §8）——本文件的 store 仅为旧档读取器保留，
+ * 新代码不得实例化或以其作为静音/摘要基线权威。
+ * 摘要基线改为进程内按席位（collabId + sessionId）记录（见下方 baseline 原语）：进程重启后
+ * 基线缺失，取消静音时按既有降级文案（不带 N），不新增持久化字段。 */
 
 export function isMuteShape(record) {
   if (typeof record !== 'object' || record === null || Array.isArray(record)) {
@@ -141,34 +137,56 @@ function clear(state) {
   }
 }
 
-/* 静音栅栏判定（设计 §5.7 抑制集；模式感知；服务域接线）。
- * ① 论坛实时帖（各 kind 一律）：post 帧只属于讨论实例（准入已保证）；
- * ② managed 内容消息：六类判据取协议层 POST_KINDS（与内容计数、ws_send_message 类型面同一权威词表）；
- * ③ 论坛被忽略治理帧（freeze 族「受理 + ack、忽略」）：复刻消费侧忽略条件——managed 无命中
- *    （本机有处置面，帧仍是待办：照常注入）且命中的讨论实例中任一处于静音（帧对该实例无待办价值）。
- * 其余一律不抑制（只做减法：end / 邀请 / 协作侧 freeze 等待办、一切非内容帧照旧注入）。 */
-export function muteSuppresses(state, frame) {
-  if (frame.type === 'post') {
-    const local = state.collabs.get(frame.collabId);
-    return local !== undefined && local.mute.isMuted();
+/* —— 静音摘要基线（进程内，按席位） ——
+ * 键 = collabId + sessionId：同机两席各算各的窗口，互不清空。基线只在静音写入点记录
+ * （默认静音 / ws_set_mute 设静音），取消时算 N 并删除；进程重启后内存表为空，
+ * 取消静音按「基线缺失」降级（不虚构数字），不新增持久化字段。 */
+
+function baselinesOf(state) {
+  if (!(state.muteBaselines instanceof Map)) {
+    state.muteBaselines = new Map();
   }
-  if (POST_KINDS.includes(frame.type)) {
-    const local = state.collabs.get(frame.collabId);
-    return local !== undefined && localModeOf(local) !== 'forum' && local.mute.isMuted();
-  }
-  if (CONFLICT_FRAME_TYPES.has(frame.type)) {
-    return suppressesIgnoredGovernance(state, frame);
-  }
-  return false;
+  return state.muteBaselines;
 }
 
-/* 被忽略治理帧的静音判定：与消费侧 noteForumGovernanceIgnored 同一判据面（不另立口径——
- * 两处判据一旦分叉，会出现「计入忽略但照旧注入」或反向的错位）。取数前提同消费侧：形态由
- * 协议层校验、准入按同字段匹配通过——能走到投递步的治理帧 payload 必然齐全。 */
-function suppressesIgnoredGovernance(state, frame) {
-  const memberIds = frame.payload.members.map((member) => member.instanceId);
-  if (matchConflictCollabs(state, frame.payload.name, memberIds).length > 0) {
+function baselineKeyOf(collabId, sessionId) {
+  return `${collabId}\u0000${sessionId}`;
+}
+
+/* 首次进入静音窗口时记下当前累计；重复设静音不重置（窗口仍从首次算起）。
+ * 返回是否本次新记（调用方据此判断「默认静音是否首次落地」）。 */
+export function rememberMuteBaselineIfAbsent(state, collabId, sessionId, currentCount) {
+  const baselines = baselinesOf(state);
+  const key = baselineKeyOf(collabId, sessionId);
+  if (baselines.has(key)) {
     return false;
   }
-  return matchForumCollabs(state, frame.payload.name, memberIds).some((local) => local.mute.isMuted());
+  baselines.set(key, Number.isInteger(currentCount) && currentCount >= 0 ? currentCount : null);
+  return true;
+}
+
+/* 取走并删除基线（取消静音）：缺基线返回 null＝摘要降级。 */
+export function takeMuteBaseline(state, collabId, sessionId) {
+  const baselines = baselinesOf(state);
+  const key = baselineKeyOf(collabId, sessionId);
+  if (!baselines.has(key)) {
+    return null;
+  }
+  const baseline = baselines.get(key);
+  baselines.delete(key);
+  return baseline;
+}
+
+export function forgetMuteBaseline(state, collabId, sessionId) {
+  baselinesOf(state).delete(baselineKeyOf(collabId, sessionId));
+}
+
+/* 协作终态 / 整机清理：一次清掉该协作全部席位基线（避免进程内表滞留无主条目）。 */
+export function forgetMuteBaselinesOfCollab(state, collabId) {
+  const prefix = `${collabId}\u0000`;
+  for (const key of baselinesOf(state).keys()) {
+    if (key.startsWith(prefix)) {
+      baselinesOf(state).delete(key);
+    }
+  }
 }

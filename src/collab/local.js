@@ -207,6 +207,47 @@ export function seatViewOf(seat) {
     joinSeq: Number.isInteger(seat.joinSeq) ? seat.joinSeq : null,
     muted: seat.muted === true,
     unverified: seat.unverified === true,
+    archived: isSeatArchived(seat),
+  };
+}
+
+/* 归档席位（契约 §8 的 archivedAt）：终态保留历史，不再参与注入、静音聚合与活跃判定。
+ * 席位的 state 只有 joining/member 两态（持久化格式冻结），归档语义单独由时间戳承载。 */
+export function isSeatArchived(seat) {
+  return typeof seat?.archivedAt === 'string' && seat.archivedAt !== '';
+}
+
+/* 终态归档本机全部席位（结束 / 撤回）：写 archivedAt 并落盘，不删除席位文件。
+ * 写失败只计数留痕（重启后会被当作活跃席位读取），不阻断终态处理。 */
+export function archiveLocalSeatsOfState(state, local) {
+  const before = local.seatPersistFailures ?? 0;
+  const at = new Date().toISOString();
+  const archived = [];
+  for (const seat of seatsOfLocal(local).values()) {
+    if (isSeatArchived(seat)) {
+      continue;
+    }
+    seat.archivedAt = at;
+    archived.push(seat.sessionId);
+    saveSeatQuietly(local, state.dataDir, seat);
+  }
+  if ((local.seatPersistFailures ?? 0) > before) {
+    state.log.warn('席位归档写入失败（重启后可能仍按活跃席位读取）', {
+      collabId: local.collabId,
+      reason: local.lastSeatPersistError,
+    });
+  }
+  return archived;
+}
+
+/* 退役静音 store 的兼容句柄（单向空实现）：freeze / sync / takeover 的清理钩子尚未迁出，
+ * 这些调用点只调用 clear()。新代码不得经它读写静音态——席位文件的 muted 是唯一权威（契约 §8）。 */
+export function retiredMuteHandle() {
+  return {
+    clear: () => {},
+    isMuted: () => false,
+    setMuted: () => ({ wasMuted: false, baseline: null }),
+    stats: () => ({ muted: false, baseline: null }),
   };
 }
 
@@ -238,7 +279,7 @@ export function managerSeatOfLocal(local) {
 
 export function hasActiveSeat(local) {
   for (const seat of seatsOfLocal(local).values()) {
-    if (seat.state === 'member') {
+    if (seat.state === 'member' && !isSeatArchived(seat)) {
       return true;
     }
   }
@@ -401,12 +442,16 @@ export function foldedMembersOf(local) {
   return local.members.fold().map((member) => withSessionSeatOf(local, member));
 }
 
-/* 折叠结果补席位键（设计 D13）：成员事件本身携 sessionId，但折叠只产出身份字段；
- * 邀请载荷与名单匹配按席位键逐条校验，缺 sessionId 的条目会被对端协议层整帧拒收。
- * 旧事件没有该字段时不编造——调用方按缺省处理，绝不用同机其他会话的标识顶替。 */
+/* 折叠结果补席位键（设计 D13）：邀请载荷与名单匹配按席位键逐条校验，缺 sessionId 的条目会被
+ * 对端协议层整帧拒收。折叠产出已携 sessionId 时必须原样保留（同机多会话各一行）；
+ * 只有旧事件（无席位键）才回退按 instanceId 反查最新事件——反查只能得到该机器最近一个会话，
+ * 用它覆盖在场值会把同机两行改写成同一席位（视图重复、邀请名单丢行）。 */
 function withSessionSeatOf(local, member) {
+  if (typeof member.sessionId === 'string' && member.sessionId !== '') {
+    return member;
+  }
   const sessionId = local.members.latestEventOf(member.instanceId)?.sessionId;
-  return typeof sessionId === 'string' ? { ...member, sessionId } : member;
+  return typeof sessionId === 'string' && sessionId !== '' ? { ...member, sessionId } : member;
 }
 
 /* 讨论的群体可达面（控制事件广播 / 对表候选 / 拉取应答准入的共用成员集）：

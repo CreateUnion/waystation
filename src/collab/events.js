@@ -3,11 +3,11 @@ import { LOCAL_LEFT_STATE, MAX_BOARD_ENTRIES, isSnapshotShape } from './model.js
 import { createPostsStore } from './posts.js';
 import { createMembersStore } from './members.js';
 import { createCounterStore, notifyIndicatorChange } from './counter.js';
-import { createMuteStore } from './mute.js';
+import { forgetMuteBaselinesOfCollab } from './mute.js';
 import { createInjectedStore } from './injected.js';
 import { appendLedger, ledgerDigest } from './store.js';
 import { collabDir, ensureDir } from '../paths.js';
-import { isLocalArchivedState, localModeOf, localStateOf, persistMember, persistSnapshot, rememberKnownHost, selfJoinedOf, upsertLocalSeat } from './local.js';
+import { archiveLocalSeatsOfState, isLocalArchivedState, localModeOf, localStateOf, persistMember, persistSnapshot, rememberKnownHost, retiredMuteHandle, selfJoinedOf, upsertLocalSeat } from './local.js';
 import { matchConflictCollabs, noteForumGovernanceIgnored } from './gate.js';
 import { applyEndpoint, applyFreezeLocally, broadcastFreeze, downgradeToMember, endpointFor, governanceTargets, memberIdsOf, mutateLedger, notifyLocal, relayGovernance, relayRedistribute, selfIsRelay, sendTo, stopJoinReplay } from './outgoing.js';
 import { applyIncomingJoin, applyIncomingLeave, handleHistoryBundle, handleHistoryRequest } from './sync.js';
@@ -170,7 +170,8 @@ function handleInvite(state, frame, meta) {
     posts: createPostsStore({ dataDir: state.dataDir, collabId: frame.collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
     members: createMembersStore({ dataDir: state.dataDir, collabId: frame.collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
     counter: createCounterStore({ dataDir: state.dataDir, collabId: frame.collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
-    mute: createMuteStore({ dataDir: state.dataDir, collabId: frame.collabId, log: state.log }),
+    /* 退役 mute.json 的兼容句柄（仅供尚未迁出的清理调用点）；静音权威是席位文件。 */
+    mute: retiredMuteHandle(),
     injected: createInjectedStore({ dataDir: state.dataDir, collabId: frame.collabId, log: state.log }),
     suspended: null,
     staleManagerId: null,
@@ -466,7 +467,8 @@ function handleWithdrawInbound(state, frame) {
     local.member.state = 'terminated';
     local.member.archivedAt = new Date().toISOString();
     persistMember(state, local);
-    local.mute.clear();
+    archiveLocalSeatsOfState(state, local);
+    forgetMuteBaselinesOfCollab(state, local.collabId);
     state.counters.terminatedIn++;
     return;
   }
@@ -943,7 +945,8 @@ function handleEnd(state, frame) {
   local.member.state = 'completed';
   local.member.archivedAt = new Date().toISOString();
   persistMember(state, local);
-  local.mute.clear();
+  archiveLocalSeatsOfState(state, local);
+  forgetMuteBaselinesOfCollab(state, local.collabId);
   stopJoinReplay(state, local);
   state.counters.endedIn++;
 }

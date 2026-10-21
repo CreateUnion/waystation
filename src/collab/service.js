@@ -10,14 +10,15 @@ import { CARRIER_FORMAT_SESSION_SEATS, readCarrier, readCarrierFormat, writeCarr
 import { assertWritable, classifyCollabDir, createLegacyRejectionCounter, markLegacyCompleted, readLegacyCollab } from './legacy.js';
 import { writeRecovery } from './migration.js';
 import {
-  hasActiveSeat, listLocalSeatsOf, loadSeats, localSeatOfLocal, managerSeatOfLocal, seatsOfLocal,
+  archiveLocalSeatsOfState, hasActiveSeat, isSeatArchived, listLocalSeatsOf, loadSeats, localSeatOfLocal,
+  managerSeatOfLocal, retiredMuteHandle, seatsOfLocal,
   removeLocalSeat, setLocalSeatRole, seatViewOf, syncLocalRole, upsertLocalSeat,
 } from './local.js';
 import { INBOX_FILE_NAME } from '../net/inbound.js';
 import { createPostsStore } from './posts.js';
 import { createMembersStore } from './members.js';
 import { createCounterStore, notifyIndicatorChange } from './counter.js';
-import { createMuteStore, muteSuppresses } from './mute.js';
+import { forgetMuteBaseline, forgetMuteBaselinesOfCollab, rememberMuteBaselineIfAbsent, takeMuteBaseline } from './mute.js';
 import { createInjectedStore } from './injected.js';
 import { createJoinsStore } from './joins.js';
 import { consumeInviteChallenge, consumeInviteWaiver, grantInviteWaiver, issueInviteChallenge } from './consent.js';
@@ -141,12 +142,23 @@ async function capabilityRefusalOfTarget(state, target) {
   if (knownRefusal !== undefined) {
     return knownRefusal;
   }
-  const probe = await state.probeCapability({
-    address: target.address,
-    port: target.port,
-    instanceId,
-  });
+  const probe = await probeCapabilitySafely(state, target, instanceId);
   return probeCapabilityRefusalOf(probe, instanceId);
+}
+
+/* 探测是外部输入：异常按「无法确认目标能力」归结果（fail-closed），不得穿出调用链。 */
+async function probeCapabilitySafely(state, target, instanceId) {
+  try {
+    return await state.probeCapability({
+      address: target.address,
+      port: target.port,
+      instanceId,
+    });
+  } catch (error) {
+    state.counters.capabilityProbeFailures++;
+    state.log.warn('能力探测异常（按无法确认拒绝）', { instanceId, reason: error?.message });
+    return { capability: 'probe-failed', reason: error?.message ?? null };
+  }
 }
 
 /* undefined＝未观测过（需探测）；null＝已知支持；对象＝已知不支持。 */
@@ -164,6 +176,12 @@ function probeCapabilityRefusalOf(probe, instanceId) {
   }
   if (probe?.capability === 'unsupported') {
     return unsupportedCapabilityRefusalOf(instanceId);
+  }
+  if (probe?.capability === 'probe-failed') {
+    return {
+      ok: false,
+      message: `无法确认目标驿站（${instanceId}）支持会话级协作（探测异常：${probe.reason ?? '未知原因'}）——请确认对方为 0.2.0+ 且在线后重试`,
+    };
   }
   return { ok: false, message: `无法确认目标驿站（${instanceId}）支持会话级协作——请确认对方为 0.2.0+ 且在线后重试` };
 }
@@ -228,6 +246,9 @@ function seatStateOf(options) {
     readonlyCollabs: new Map(),  // collabId → { reason }（recovery / 半写 / 站长席位缺失）
     legacyRejections: createLegacyRejectionCounter(),
     stagedSeq: 0,   // 暂存到达序（跨席位「丢最旧」的判据）
+    /* 静音摘要基线（collabId + sessionId → 累计读数）：进程内，不落盘（契约 §8）；
+     * 重启后为空 → 取消静音按既有降级文案（不带 N）。 */
+    muteBaselines: new Map(),
   };
 }
 
@@ -628,19 +649,21 @@ function sessionGateFrame(state, frame, meta = null) {
   }
 }
 
-/* 静音判定（设计 §5.4）：有席位表时按收件席位逐条判定，只有内容类（post 与 POST_KINDS）受静音影响；
- * 治理/邀请/离席等一律豁免。无席位表退回旧静音文件（兼容面，单布尔）。 */
+/* 静音判定（设计 §5.4）：按收件席位逐条判定，只有内容类（post 与 POST_KINDS）受静音影响。
+ * 治理 / 结束 / 邀请 / 快照 / 待办类帧在任何兜底之前直接放行——静音只做内容类减法；
+ * 静音权威是席位文件的 muted（旧 mute.json 不再读取，无「协作级兜底」）。
+ * 归档席位不参与注入，自然也不抑制（其收件面已退出活跃判定）。 */
 function suppressForSeat(state, frame, sessionId) {
-  const local = state.collabs.get(frame?.collabId);
-  if (local === undefined || seatsOfLocal(local).size === 0) {
-    return muteSuppresses(state, frame);
+  if (!isContentFrameOf(frame)) {
+    return false;
   }
-  if (frame.type !== 'post' && !POST_KINDS.includes(frame.type)) {
+  const local = state.collabs.get(frame?.collabId);
+  if (local === undefined) {
     return false;
   }
   const seatId = typeof sessionId === 'string' ? sessionId : soleSeatSessionId(local);
   const seat = typeof seatId === 'string' ? localSeatOfLocal(local, seatId) : null;
-  return seat?.muted === true;
+  return seat !== null && seat.muted === true && !isSeatArchived(seat);
 }
 
 /* 已注入事实的记真面（sessionDelivered 钩子）：只记帖——吸收路径的终态回执以该标记为前件
@@ -770,7 +793,9 @@ function loadOne(state, collabId) {
     posts: createPostsStore({ dataDir: state.dataDir, collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
     members: createMembersStore({ dataDir: state.dataDir, collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
     counter: createCounterStore({ dataDir: state.dataDir, collabId, log: state.log, onChange: () => notifyIndicatorChange(state) }),
-    mute: createMuteStore({ dataDir: state.dataDir, collabId, log: state.log }),
+    /* 退役静音 store 的句柄：仅供尚未迁出的清理调用点（freeze/sync/takeover）使用；
+     * 本模块不读写 mute.json，静音权威是席位文件的 muted。 */
+    mute: retiredMuteHandle(),
     injected: createInjectedStore({ dataDir: state.dataDir, collabId, log: state.log }),
     suspended: null,
     staleManagerId: null,
@@ -1076,12 +1101,9 @@ function isOwnForumEvent(state, event, localIds, hasLocalSeats) {
   return hasLocalSeats && event.instanceId === state.self.instanceId;
 }
 
-/* 静音按席位聚合（设计 §5.4/§10）：有席位读席位、无席位退回旧静音文件（兼容面）。 */
+/* 静音按席位聚合（设计 §5.4/§10）：只统计活跃席位——归档席位是历史，不参与静音展示。 */
 function mutedOf(local) {
-  if (seatsOfLocal(local).size === 0) {
-    return local.mute.isMuted();
-  }
-  return listLocalSeatsOf(local).some((seat) => seat.muted);
+  return listLocalSeatsOf(local).some((seat) => seat.muted && seat.archived !== true);
 }
 
 function listEntryOf(state, local, now, caller) {
@@ -1131,16 +1153,19 @@ function freezeReasonOfLocal(local) {
   return typeof reason === 'string' && reason.trim() !== '' ? reason.trim() : null;
 }
 
-/* 状态栏席位视图：本机全部席位的稳定字段集（不暴露暂存/inbox 等运行态）。 */
+/* 状态栏席位视图：本机活跃席位的稳定字段集（不暴露暂存/inbox 等运行态）。
+ * 归档席位（终态历史）不在此面——状态栏的「协作中」判定以活跃席位为准。 */
 function localSeatEntriesOf(state, local) {
-  return listLocalSeatsOf(local).map((seat) => ({
-    sessionId: seat.sessionId,
-    identityName: state.self.identityName,
-    role: seat.role,
-    state: seat.state,
-    joinSeq: seat.joinSeq,
-    muted: seat.muted === true,
-  }));
+  return listLocalSeatsOf(local)
+    .filter((seat) => seat.archived !== true)
+    .map((seat) => ({
+      sessionId: seat.sessionId,
+      identityName: state.self.identityName,
+      role: seat.role,
+      state: seat.state,
+      joinSeq: seat.joinSeq,
+      muted: seat.muted === true,
+    }));
 }
 
 /* 待批准面（设计 §2/§6，站长侧）：条目 = {instanceId, identityName?, sessionId 短码, requestedAt}。
@@ -1226,6 +1251,14 @@ function allowNextInviteOf(state, input) {
 }
 
 function approveNow(state, input) {
+  /* 邀请回应必须由具体会话发起：无会话同意会把 invite-stub 升级为 session-seats 却写不出席位，
+   * 目录随后被判「carrier 无台账」永久只读。拒绝必须在任何载体升级 / 目录写入之前。 */
+  if (!validSessionId(input?.sessionId)) {
+    return {
+      ok: false,
+      message: '缺少调用会话标识（sessionId）——同意 / 拒绝邀请必须由具体会话发起；无会话不产生机器级回应，也不会改写协作目录',
+    };
+  }
   const refusal = namedInviteRefusalOf(state, input);
   if (refusal !== null) {
     return refusal;
@@ -1416,9 +1449,10 @@ async function syncNow(state, input = {}) {
 
 /* 静音开关的驱动面（ws_set_mute；纯本地行为开关：无外发帧、不广播——对端无感）。
  * 校验：muted 须布尔（工具层同校验，此处仍是权威面——直调 API 的路径同样要挡）、collabId 须本机存在。
- * 取消时（真翻转）经 notifyLocal 投一行错过内容摘要——N = 当前累计 − 基线（基线随静音状态文件持久，
- * 跨重启不丢）；累计面：讨论 = 帖子列表 size（含回填帖）、协作 = 内容消息计数（与状态栏读数同一取数面）。
- * 基线缺失（设静音时为旧数据 / 累计面不可用）时摘要降级为不带 N 的表述——宁可不给数、不给错数。
+ * 取消时（真翻转）经 notifyLocal 投一行错过内容摘要——N = 当前累计 − 基线（基线进程内按席位记录，
+ * 不落盘；进程重启后缺失即降级）；累计面：讨论 = 帖子列表 size（含回填帖）、
+ * 协作 = 内容消息计数（与状态栏读数同一取数面）。
+ * 基线缺失（重启 / 累计面不可用）时摘要降级为不带 N 的表述——宁可不给数、不给错数。
  * 静音态同属指示面（清单行与状态栏 🔇 标记都读它）：切换后即时触发观察面刷新，不等心跳。 */
 function setMuteNow(state, input) {
   const collabId = input?.collabId;
@@ -1445,22 +1479,29 @@ function soleSeatSessionId(local) {
 }
 
 /* 席位级静音（设计 §5.4）：只改调用会话自己的席位并落盘；无该席拒绝（不静默改他人/整机）。
- * 静音窗口基线随静音状态文件持久（设静音时记当下累计，重复设静音不重置；取消时算差值）。
- * 基线缺失（旧文件 / 计数取不到）时摘要降级为不带 N 的文案，不虚构数字。 */
+ * 静音窗口基线记录在进程内（按 collabId + sessionId）：设静音时记当下累计，重复设静音不重置；
+ * 取消时算差值并删除基线。基线缺失（进程重启 / 计数取不到）时摘要降级为不带 N 的文案。
+ * 归档席位只供历史查看，不再是静音操作的对象。 */
 function setSeatMuteNow(state, local, input, muted) {
   const sessionId = typeof input?.sessionId === 'string' ? input.sessionId : soleSeatSessionId(local);
   const seat = typeof sessionId === 'string' ? localSeatOfLocal(local, sessionId) : null;
   if (seat === null) {
     return { ok: false, message: '本会话在该协作没有席位——静音按会话设置，不能改其他会话' };
   }
+  if (isSeatArchived(seat)) {
+    return { ok: false, message: '该协作已归档——席位仅作历史查看，不能再改静音' };
+  }
   const countNow = contentCountOf(local);
   const wasMuted = seat.muted === true;
+  if (muted === true) {
+    rememberMuteBaselineIfAbsent(state, local.collabId, sessionId, countNow);
+  }
+  const baseline = muted === false ? takeMuteBaseline(state, local.collabId, sessionId) : null;
   seat.muted = muted;
   persistSeatOf(state, local, sessionId);
   notifyIndicatorChange(state);
-  const muteBefore = local.mute.setMuted(muted, countNow);
   if (muted === false && wasMuted) {
-    notifyLocal(state, local, resumeNoticeText(local, countNow, muteBefore.baseline));
+    notifyLocal(state, local, resumeNoticeText(local, countNow, baseline));
   }
   return { ok: true, collabId: local.collabId, muted };
 }
@@ -1942,9 +1983,20 @@ function runWithSeatRole(local, seat, run) {
 function endNow(state, input) {
   const result = endCollab(state, input);
   if (result?.ok === true) {
-    removeAllSeatsOf(state, input?.collabId);
+    archiveAllSeatsOf(state, input?.collabId);
   }
   return result;
+}
+
+/* 终态归档本机席位（设计 §3.4 / 契约 §8）：保留席位文件并写 archivedAt——删除属用户数据删除，
+ * 不在终态路径做。归档后席位退出注入、静音聚合与状态栏活跃判定。 */
+function archiveAllSeatsOf(state, collabId) {
+  const local = state.collabs.get(collabId);
+  if (local === undefined) {
+    return;
+  }
+  archiveLocalSeatsOfState(state, local);
+  forgetMuteBaselinesOfCollab(state, collabId);
 }
 
 function removeSeatOf(state, collabId, sessionId) {
@@ -1956,23 +2008,13 @@ function removeSeatOf(state, collabId, sessionId) {
   noteSeatRemoval(state, local.collabId, sessionId, outcome);
 }
 
-function removeAllSeatsOf(state, collabId) {
-  const local = state.collabs.get(collabId);
-  if (local === undefined) {
-    return;
-  }
-  for (const sessionId of [...seatsOfLocal(local).keys()]) {
-    const outcome = removeLocalSeat(local, sessionId, { persist: true, dataDir: state.dataDir });
-    noteSeatRemoval(state, collabId, sessionId, outcome);
-  }
-}
-
 /* 席位移除留痕：判离席丢弃的暂存计数；席位文件删不掉时重启会「复活」席位（台账已无该席），
  * 只 warn 不静默。 */
 function noteSeatRemoval(state, collabId, sessionId, outcome) {
   if (!outcome.existed) {
     return;
   }
+  forgetMuteBaseline(state, collabId, sessionId);
   if (outcome.stagedDropped > 0) {
     state.counters.seatStagedDropped += outcome.stagedDropped;
   }
@@ -2108,7 +2150,7 @@ function seatForInjection(state, collabId, sessionId, frame) {
   const local = state.collabs.get(collabId);
   const seat = local === undefined ? null : localSeatOfLocal(local, sessionId);
   if (seat !== null) {
-    return injectableSeatOf(local, seat);
+    return injectableSeatOf(local, seat, frame);
   }
   const bridgeId = inviteBridgeTargetOf(state, sessionId, frame);
   if (bridgeId !== null) {
@@ -2117,11 +2159,20 @@ function seatForInjection(state, collabId, sessionId, frame) {
   return { ok: false, result: { ok: false, reason: local === undefined ? 'unknown-collab' : 'no-seat' } };
 }
 
-function injectableSeatOf(local, seat) {
+function injectableSeatOf(local, seat, frame) {
   if (seat.state !== 'member' && seat.state !== 'joining') {
     return { ok: false, result: { ok: false, reason: 'seat-not-injectable' } };
   }
+  /* 归档席位只退出**内容类**注入：终态/控制帧（end/leave/withdraw 等）仍需送达本会话——
+   * 归档由 consume 在投递前完成，若在这里一并拒绝，结束通告本身就会被吞掉。 */
+  if (isSeatArchived(seat) && isContentFrameOf(frame)) {
+    return { ok: false, result: { ok: false, reason: 'seat-archived' } };
+  }
   return { ok: true, local, seat };
+}
+
+function isContentFrameOf(frame) {
+  return frame?.type === 'post' || POST_KINDS.includes(frame?.type);
 }
 
 /* 反向首帧白名单（设计 §5.1/§4.4）：邀请与两段式回执可投尚未入席的会话——接收者按桥注册面放行；
@@ -2378,13 +2429,15 @@ function localSeatDeliveryOfOf(state, msgId, sessionId) {
  * 非邀请帧仍由注入面按席位拒绝，虚拟条目只服务邀请首帧。 */
 function listInjectableTargetsOf(state, collabId) {
   const local = state.collabs.get(collabId);
+  /* 归档席位仍留在目标集：终态/控制帧（end/leave/withdraw 等）由 consume 先行处置后再投递，
+   * 必须在注入面可达；内容类由 injectableSeatOf 按 seat-archived 拒绝。 */
   const targets = local === undefined ? [] : listLocalSeatsOf(local);
   const seated = new Set(targets.map((seat) => seat.sessionId));
   for (const [sessionId, bridgeId] of state.sessionBridges) {
     if (seated.has(sessionId)) {
       continue;
     }
-    targets.push({ sessionId, role: 'member', state: 'joining', joinSeq: null, muted: false, unverified: true, bridgeId });
+    targets.push({ sessionId, role: 'member', state: 'joining', joinSeq: null, muted: false, unverified: true, archived: false, bridgeId });
   }
   return targets;
 }
@@ -2432,20 +2485,22 @@ function seatsForRoutingOf(state, collabId) {
   if (local === undefined) {
     return [];
   }
-  return [...seatsOfLocal(local).values()].map((seat) => ({
-    sessionId: seat.sessionId,
-    role: seat.role,
-    state: seat.state,
-    unverified: seat.unverified === true,
-    bridgeId: seat.bridgeId,
-  }));
+  return [...seatsOfLocal(local).values()]
+    .filter((seat) => !isSeatArchived(seat))
+    .map((seat) => ({
+      sessionId: seat.sessionId,
+      role: seat.role,
+      state: seat.state,
+      unverified: seat.unverified === true,
+      bridgeId: seat.bridgeId,
+    }));
 }
 
 function seatsOfSession(state, sessionId) {
   const seats = [];
   for (const local of state.collabs.values()) {
     const seat = localSeatOfLocal(local, sessionId);
-    if (seat !== null) {
+    if (seat !== null && !isSeatArchived(seat)) {
       seats.push({ collabId: local.collabId, ...seatViewOf(seat) });
     }
   }
@@ -2639,6 +2694,7 @@ function emptyGuardCounters() {
     eventFailures: 0,
     gateFailures: 0,
     sessionGateFailures: 0,
+    capabilityProbeFailures: 0,
     indicatorChangeFailures: 0,
     loadFailures: 0,
     bindingsCorrupt: 0,       // 读取绑定表遇损坏的留痕（列表会话视角现读——核心加载之后的再次指认面）
