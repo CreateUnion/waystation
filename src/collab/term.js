@@ -236,8 +236,8 @@ function snapshotStateOf(frame) {
   };
 }
 
-/* 台账终态形态（与名单内核 model.js 的 isTerminalLedger 同一词表）：status 终态必须 manager:null
- * 且无残留窗口，非终态必须 manager 非空；形态不成立按损坏拒收，不进入任期判定。 */
+/* 台账终态形态：status 终态必须 manager:null 且无残留窗口，非终态必须 manager 非空；
+ * 与 model.isTerminalLedger 同一判据，但本函数同时接受非终态（形态一致性，不是「是否终态」）。 */
 function isTerminalLedgerConsistent(ledger, window) {
   const terminal = ledger.status === 'completed' || ledger.status === 'terminated';
   return (ledger.manager === null) === terminal && (!terminal || window === undefined);

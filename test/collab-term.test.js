@@ -885,9 +885,9 @@ test('终态形态：manager:null 必须携终态 status，且不得残留窗口
     ledger: withWindow,
     from: { ...SEAT_B },
   }, snapshotCtx({ memberSeats: [SEAT_B] })), 'frame-invalid');
-  /* 反向形态：终态 status 必须 manager:null；M1 形态当前仍放行，M5 侧按损坏拒收。 */
+  /* 反向形态：终态 status 必须 manager:null；名单内核与任期层同一判据，必须拒收。 */
   const terminalWithManager = ledgerOf({ term: 2, version: 11, manager: SEAT_B, status: 'completed' });
-  assert.equal(isLedgerShape(terminalWithManager), true);
+  assert.equal(isLedgerShape(terminalWithManager), false);
   rejects(acceptManagerChange(stateOf(), {
     kind: 'data',
     managerTerm: 2,

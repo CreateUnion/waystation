@@ -73,14 +73,14 @@ export function withDefaultMode(record) {
 }
 
 /* 台账对象形态（单一权威形态的校验面）：字段逐一校验；校验通过的对象可参与 digest 计算。
- * 名单只含活跃席位（state=member）；managed 非终态恰一站长，终态允许空名单/manager:null；
- * forum 不要求 manager / joinSeq（D10/D17）。 */
+ * 名单只含活跃席位（state=member）；managed 非终态恰一站长且 manager 非空，终态必须 manager:null
+ * （可空名单）；forum 不要求 manager / joinSeq（D10/D17）。 */
 export function isLedgerShape(ledger) {
   if (!isPlainObject(ledger) || !isLedgerHeadShape(ledger)) {
     return false;
   }
   const mode = ledger.mode ?? DEFAULT_COLLAB_MODE;
-  const terminal = isTerminalLedger(ledger.status);
+  const terminal = isTerminalStatus(ledger.status);
   if (!isManagerWindowShape(ledger.managerWindow, terminal, ledger.managerTerm)) {
     return false;
   }
@@ -91,6 +91,16 @@ export function isLedgerShape(ledger) {
     return false;
   }
   return mode === 'forum' ? isForumLedgerShape(ledger) : isManagedLedgerShape(ledger, terminal);
+}
+
+/* 终态台账（设计 §3.4：status∈{completed,terminated} 必须 manager:null 且无残留窗口）。
+ * 反向判据在形态校验器里：非终态必须 manager 非空，终态 status 配非空 manager 按损坏拒收。
+ * 任期判定与快照比较共用本函数，不得另立终态词表（单一权威源）。 */
+export function isTerminalLedger(ledger) {
+  if (!isPlainObject(ledger) || !isTerminalStatus(ledger.status)) {
+    return false;
+  }
+  return ledger.manager === null && ledger.managerWindow === undefined;
 }
 
 /* 席位名单（共享名单的唯一形态）：{instanceId,sessionId,identityName,role,state:'member',joinSeq,joinedAt}；
@@ -160,7 +170,7 @@ function isOptionalSeqValue(value) {
   return value === undefined || isSeqValue(value);
 }
 
-function isTerminalLedger(status) {
+function isTerminalStatus(status) {
   return status === 'completed' || status === 'terminated';
 }
 
@@ -171,7 +181,8 @@ function isManagedLedgerShape(ledger, terminal) {
   if (ledger.manager === null) {
     return terminal && !ledger.members.some((entry) => entry.role === 'manager');
   }
-  if (!isManagerSeatShape(ledger.manager) || ledger.manager.term !== ledger.managerTerm) {
+  /* 终态 status 必须 manager:null（设计 §3.4）：终态 + 非空 manager 是损坏，不得当活跃台账受理。 */
+  if (terminal || !isManagerSeatShape(ledger.manager) || ledger.manager.term !== ledger.managerTerm) {
     return false;
   }
   return managerRowMatches(ledger);
@@ -327,7 +338,7 @@ export function compareSnapshot(left, right) {
   const a = ledgerStateOf(left);
   const b = ledgerStateOf(right);
   if (a === null || b === null) {
-    return { ok: false, reason: '快照形态非法（需 managerTerm/version 与席位 manager）', order: 0, conflict: false, idempotent: false };
+    return { ok: false, reason: '快照形态非法（需 managerTerm/version；终态 status 配 manager:null，非终态配席位 manager）', order: 0, conflict: false, idempotent: false };
   }
   if (a.term !== b.term) {
     return { ok: true, order: a.term > b.term ? 1 : -1, conflict: false, idempotent: false };
@@ -346,22 +357,32 @@ function ledgerStateOf(value) {
     return null;
   }
   const ledger = isPlainObject(value.ledger) ? value.ledger : value;
-  if (!isSeqValue(ledger.managerTerm) || !Number.isInteger(ledger.version) || ledger.version < 1) {
+  if (!isSnapshotHeadShape(ledger)) {
     return null;
   }
-  /* 终态台账允许 manager:null（D17）：空 manager 键参与同 term 比较（双方 null 比 version/幂等，
-   * 一方 null 一方非 null → 冲突），不得因终态而拒绝排序。 */
+  const managerKey = snapshotManagerKeyOf(ledger);
+  return managerKey === null ? null : { term: ledger.managerTerm, version: ledger.version, managerKey };
+}
+
+function isSnapshotHeadShape(ledger) {
+  return isSeqValue(ledger.managerTerm) && Number.isInteger(ledger.version) && ledger.version >= 1;
+}
+
+/* 终态台账允许 manager:null（D17）：空 manager 键参与同 term 比较（双方 null 比 version/幂等，
+ * 一方 null 一方非 null → 冲突），不得因终态而拒绝排序；非终态空 manager 与「终态 status 配席位
+ * manager」都是损坏，返回 null 由调用方按无法判定处置。 */
+function snapshotManagerKeyOf(ledger) {
   if (ledger.manager === null) {
-    return { term: ledger.managerTerm, version: ledger.version, managerKey: '' };
+    return isTerminalLedger(ledger) ? '' : null;
   }
-  if (!isPlainObject(ledger.manager) || !isIdLike(ledger.manager.instanceId) || !isIdLike(ledger.manager.sessionId)) {
+  if (isTerminalStatus(ledger.status) || !isSeatRefLike(ledger.manager)) {
     return null;
   }
-  return {
-    term: ledger.managerTerm,
-    version: ledger.version,
-    managerKey: `${ledger.manager.instanceId}\u0000${ledger.manager.sessionId}`,
-  };
+  return `${ledger.manager.instanceId}\u0000${ledger.manager.sessionId}`;
+}
+
+function isSeatRefLike(manager) {
+  return isPlainObject(manager) && isIdLike(manager.instanceId) && isIdLike(manager.sessionId);
 }
 
 function isLedgerHeadShape(ledger) {

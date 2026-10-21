@@ -13,6 +13,7 @@ import {
   isLedgerShape,
   isMemberRecordShape,
   isSnapshotShape,
+  isTerminalLedger,
   newCollabId,
   withDefaultMode,
 } from '../src/collab/model.js';
@@ -170,10 +171,9 @@ test('newCollabId：ID 形态且不重复', () => {
   assert.notEqual(first, second);
 });
 
-test('isLedgerShape：席位台账（含 board 条目与 endedAt）通过、JSON round-trip 后仍通过', () => {
+test('isLedgerShape：席位台账（含 board 条目）通过、JSON round-trip 后仍通过', () => {
   const ledger = sampleLedger({
-    status: 'completed',
-    endedAt: '2026-10-13T01:00:00.000Z',
+    status: 'active',
     board: [{ entryId: 'entry-1', ts: '2026-10-13T00:30:00.000Z', from: { instanceId: 'inst-b', identityName: '主机乙' }, kind: 'progress', text: '过半' }],
   });
   assert.equal(isLedgerShape(ledger), true);
@@ -249,15 +249,39 @@ test('managed 站长一致性：非终态恰一 manager 且与名单行、term �
   assert.equal(isLedgerShape(sampleLedger({ members: [seat({ instanceId: 'inst-b', sessionId: 'sess-b', identityName: '主机乙' })] })), false, '名单无站长行');
 });
 
-test('终态：completed/terminated 允许空名单与 manager:null；managerWindow 清除', () => {
+test('终态：completed/terminated 允许空名单与 manager:null；终态 + 非空 manager 拒；窗口清除', () => {
   assert.equal(isLedgerShape(sampleLedger({ status: 'completed', manager: null, members: [] })), true);
   assert.equal(isLedgerShape(sampleLedger({ status: 'terminated', manager: null, members: [], endedAt: AT })), true);
-  assert.equal(isLedgerShape(sampleLedger({ status: 'completed' })), true, '保留站长与名单也合法');
+  assert.equal(isLedgerShape(sampleLedger({ status: 'completed' })), false, '终态 status + 非空 manager 是损坏');
+  assert.equal(isLedgerShape(sampleLedger({ status: 'terminated' })), false, 'terminated 同判据');
   assert.equal(isLedgerShape(sampleLedger({ status: 'completed', manager: null })), false, 'manager:null 时名单不得残留站长行');
   assert.equal(isLedgerShape(sampleLedger({
     status: 'completed',
-    managerWindow: { windowBaseTerm: 1, windowEndsAt: AT },
+    manager: null,
+    managerTerm: 2,
+    managerWindow: { windowBaseTerm: 2, windowEndsAt: AT },
   })), false, '终态不得携带 managerWindow');
+  assert.equal(isLedgerShape(sampleLedger({
+    status: 'completed',
+    managerWindow: { windowBaseTerm: 1, windowEndsAt: AT },
+  })), false, '终态 + 非空 manager + 窗口同样拒');
+});
+
+test('isTerminalLedger：仅「终态 status + manager:null + 无窗口」为真', () => {
+  assert.equal(isTerminalLedger(sampleLedger({ status: 'completed', manager: null, members: [] })), true);
+  assert.equal(isTerminalLedger(sampleLedger({ status: 'terminated', manager: null, members: [] })), true);
+  assert.equal(isTerminalLedger(sampleLedger({ status: 'active' })), false, '非终态不是终态台账');
+  assert.equal(isTerminalLedger(sampleLedger({ status: 'active', manager: null })), false, '非终态空 manager 不是终态');
+  assert.equal(isTerminalLedger(sampleLedger({ status: 'completed' })), false, '终态 + 非空 manager 不是合法终态');
+  assert.equal(isTerminalLedger(sampleLedger({
+    status: 'terminated',
+    manager: null,
+    members: [],
+    managerTerm: 2,
+    managerWindow: { windowBaseTerm: 2, windowEndsAt: AT },
+  })), false, '终态残留窗口');
+  assert.equal(isTerminalLedger(null), false);
+  assert.equal(isTerminalLedger('completed'), false);
 });
 
 test('forum 分支：不要求 manager / joinSeq / joinSeqNext；managerTerm 仍在', () => {
@@ -356,11 +380,32 @@ test('compareSnapshot：也接受台账对象（无 ledger 包装）', () => {
 });
 
 test('compareSnapshot：终态 manager:null 参与比较——同 null 比 version/幂等，null 与席位同 term 冲突', () => {
-  const terminal = (version) => ({ managerTerm: 1, version, manager: null });
+  const terminal = (version) => ({ status: 'completed', managerTerm: 1, version, manager: null });
   assert.equal(compareSnapshot(terminal(3), terminal(4)).order, -1);
   assert.equal(compareSnapshot(terminal(4), terminal(4)).idempotent, true);
   assert.equal(compareSnapshot(terminal(3), snapshotOf(1, 9)).conflict, true);
   assert.equal(compareSnapshot(terminal(3), { managerTerm: 1, version: 3 }).ok, false, 'manager 字段缺失仍是非法形态');
+});
+
+test('compareSnapshot：manager:null 只在终态 status 下合法——非终态空 manager / 终态带席位均拒', () => {
+  const terminal = { status: 'terminated', managerTerm: 1, version: 3, manager: null };
+  assert.equal(compareSnapshot(terminal, terminal).idempotent, true);
+  const activeNull = compareSnapshot({ status: 'active', managerTerm: 1, version: 3, manager: null }, terminal);
+  assert.equal(activeNull.ok, false, '非终态空 manager 是损坏');
+  assert.ok(activeNull.reason.includes('终态'), '错误文案点明终态语义');
+  assert.equal(compareSnapshot({ managerTerm: 1, version: 3, manager: null }, terminal).ok, false, '缺终态 status 无法判定');
+  assert.equal(compareSnapshot({ status: 'completed', managerTerm: 1, version: 3, manager: snapshotOf(1, 3).ledger.manager }, terminal).ok, false, '终态 status 配席位 manager 是损坏');
+  const windowed = compareSnapshot({ status: 'completed', managerTerm: 1, version: 3, manager: null, managerWindow: { windowBaseTerm: 1, windowEndsAt: AT } }, terminal);
+  assert.equal(windowed.ok, false, '终态残留窗口是损坏');
+});
+
+test('compareSnapshot：同为终态同 term 比 version；终态与非终态同 term 冲突', () => {
+  const terminal = (version) => ({ status: 'completed', managerTerm: 2, version, manager: null });
+  assert.equal(compareSnapshot(terminal(5), terminal(6)).order, -1);
+  assert.equal(compareSnapshot(terminal(6), terminal(5)).order, 1);
+  const cross = compareSnapshot(terminal(5), { status: 'active', managerTerm: 2, version: 9, manager: snapshotOf(2, 9).ledger.manager });
+  assert.equal(cross.conflict, true);
+  assert.equal(cross.order, 0);
 });
 
 test('isSnapshotShape：合法通过；digest 非 64 位小写十六进制或 ledger 形态坏拒', () => {
@@ -375,6 +420,11 @@ test('isSnapshotShape：合法通过；digest 非 64 位小写十六进制或 le
   assert.equal(isSnapshotShape({ ...snapshot, digest: 'A'.repeat(64) }), false);
   assert.equal(isSnapshotShape({ ...snapshot, ledger: [] }), false);
   assert.equal(isSnapshotShape({ ...snapshot, version: 0 }), false);
+  assert.equal(isSnapshotShape({
+    ...snapshot,
+    ledger: sampleLedger({ status: 'completed', manager: null, members: [] }),
+  }), true, '终态空名单 + manager:null 的快照合法');
+  assert.equal(isSnapshotShape({ ...snapshot, ledger: sampleLedger({ status: 'completed' }) }), false, '终态快照带非空 manager 是损坏');
 });
 
 test('isLedgerShape 对空对象 / null / 数组一律拒（形态底线）', () => {

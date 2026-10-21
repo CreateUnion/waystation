@@ -19,6 +19,8 @@ import {
   saveSnapshot,
 } from '../src/collab/store.js';
 
+/* 台账夹具按 0.2.0 席位形态（模型层校验的唯一形态）：managerTerm / joinSeqNext /
+ * manager.term / 席位键 sessionId + joinSeq；0.1.x 旧形态只由 legacy 读取器处理。 */
 function ledgerOf(version, overrides = {}) {
   return {
     version,
@@ -26,10 +28,12 @@ function ledgerOf(version, overrides = {}) {
     name: '联调项目',
     topic: '发布联调',
     status: 'proposed',
-    manager: { instanceId: 'inst-a', identityName: '主机甲' },
+    managerTerm: 1,
+    joinSeqNext: 3,
+    manager: { instanceId: 'inst-a', sessionId: 'sess-a', identityName: '主机甲', term: 1 },
     members: [
-      { instanceId: 'inst-a', identityName: '主机甲', role: 'manager', state: 'member', joinedAt: '2026-10-13T00:00:00.000Z' },
-      { instanceId: 'inst-b', identityName: '主机乙', role: 'member', state: 'invited', joinedAt: '2026-10-13T00:00:00.000Z' },
+      { instanceId: 'inst-a', sessionId: 'sess-a', identityName: '主机甲', role: 'manager', state: 'member', joinSeq: 1, joinedAt: '2026-10-13T00:00:00.000Z' },
+      { instanceId: 'inst-b', sessionId: 'sess-b', identityName: '主机乙', role: 'member', state: 'member', joinSeq: 2, joinedAt: '2026-10-13T00:00:00.000Z' },
     ],
     board: [],
     createdAt: '2026-10-13T00:00:00.000Z',
