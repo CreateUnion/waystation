@@ -731,3 +731,21 @@ function reopen(t, dir, delivered, overrides = {}) {
     syncPeerPicker: () => [],
   });
 }
+
+/* 带 inviteId 的同意走 0.2.0 两段式邀请接受（加入域校验邀请簿记 → 签发 join-grant），
+ * 不再落旧机器级 approveInvite；用户确认门照旧：首次只签挑战，令牌/豁免后才进入接受路径。 */
+test('ws_approve_invite 带 inviteId：确认门后路由加入域的邀请接受（不落旧机器级回应）', async (t) => {
+  const { dir } = makeService(t);
+  const collabId = seedTwoSeats(dir);
+  const service = reopen(t, dir, []);
+  const challenged = await service.approve({ collabId, inviteId: 'invite-0001', approve: true, sessionId: 'sess-dev' });
+  assert.equal(challenged.needsUserConfirmation, true, '首次调用只签发确认挑战');
+  const accepted = await service.approve({ collabId, inviteId: 'invite-0001', approve: true, sessionId: 'sess-dev', confirmToken: challenged.confirmToken });
+  assert.equal(accepted.ok, false);
+  assert.match(accepted.message ?? '', /邀请不存在|不属于本会话/, '进入邀请接受路径（校验邀请簿记）');
+  assert.doesNotMatch(accepted.message ?? '', /待回应邀请/, '不再走旧机器级 approveInvite');
+  service.allowNextInvite({ sessionId: 'sess-dev' });
+  const waived = await service.approve({ collabId, inviteId: 'invite-0002', approve: true, sessionId: 'sess-dev' });
+  assert.match(waived.message ?? '', /邀请不存在|不属于本会话/, '一次性豁免同样进入接受路径');
+  service.close();
+});

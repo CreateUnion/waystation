@@ -18,7 +18,7 @@ import { createCounterStore, notifyIndicatorChange } from './counter.js';
 import { createMuteStore, muteSuppresses } from './mute.js';
 import { createInjectedStore } from './injected.js';
 import { createJoinsStore } from './joins.js';
-import { grantInviteWaiver } from './consent.js';
+import { consumeInviteChallenge, consumeInviteWaiver, grantInviteWaiver, issueInviteChallenge } from './consent.js';
 import { JOIN_REQUEST_RETRY_MAX_MS, JOIN_REQUEST_RETRY_MS, JOIN_REQUEST_TTL_MS, createJoinDomain, resolveJoinTarget } from './join.js';
 import { ID_PATTERN, POST_KINDS } from '../net/protocol.js';
 import { shortSessionId } from '../util/short-id.js';
@@ -1089,6 +1089,11 @@ function approveNow(state, input) {
   if (refusal !== null) {
     return refusal;
   }
+  /* 0.2.0 两段式：带 inviteId 的同意走加入域的邀请接受（校验邀请簿记 → 签发 join-grant）；
+   * 旧 approveInvite 只做机器级「回应已记录」，不产生席位。 */
+  if (isSeatInviteAcceptance(input)) {
+    return acceptSeatInviteNow(state, input);
+  }
   const result = approveInvite(state, input);
   if (result.ok === true && result.joined === true) {
     const local = state.collabs.get(input?.collabId);
@@ -1100,6 +1105,57 @@ function approveNow(state, input) {
     }
   }
   return result;
+}
+
+/* 席位邀请的同意（0.2.0 两段式）：邀请簿记校验与 join-grant 签发在加入域；本层只保留
+ * 用户确认门（与旧路径同一份一次性挑战/豁免）并接席位收尾。 */
+function isSeatInviteAcceptance(input) {
+  return input?.approve === true && typeof input?.inviteId === 'string' && input.inviteId !== '';
+}
+
+async function acceptSeatInviteNow(state, input) {
+  const local = state.collabs.get(input?.collabId);
+  if (local === undefined) {
+    return approveInvite(state, input);   // 本机无该协作记录：退回旧路径给出既有错误面
+  }
+  const consent = inviteAcceptanceConsentOf(state, local, input);
+  if (consent !== null) {
+    return consent;
+  }
+  const result = await state.join.acceptInvite({ collabId: input.collabId, inviteId: input.inviteId, sessionId: input.sessionId });
+  if (result?.ok === true && result.bound === true) {
+    ensureSeatAfterJoin(state, result.collabId ?? input.collabId, result.sessionId ?? input.sessionId, 'member');
+  }
+  return result;
+}
+
+function inviteAcceptanceConsentOf(state, local, { sessionId, confirmToken }) {
+  if (typeof sessionId !== 'string' || sessionId === '') {
+    return null;
+  }
+  if (consumeInviteWaiver(state, { sessionId }) || consumeInviteChallenge(state, { sessionId, collabId: local.collabId, token: confirmToken })) {
+    return null;
+  }
+  return {
+    ok: false,
+    needsUserConfirmation: true,
+    confirmToken: issueInviteChallenge(state, { sessionId, collabId: local.collabId }),
+    invite: inviteSummaryOfLocal(local),
+    message: '同意邀请需要用户明确确认：请把邀请信息转述给用户，取得明确同意后携带 confirmToken 重试；若用户明确表示下一次无需确认，可先用 ws_allow_next_invite 登记一次性豁免',
+  };
+}
+
+function inviteSummaryOfLocal(local) {
+  const manager = local.member?.manager;
+  return {
+    collabId: local.collabId,
+    name: localNameOf(local),
+    mode: localModeOf(local),
+    topic: local.member?.topic ?? null,
+    manager: manager === undefined ? null : { instanceId: manager.instanceId, identityName: manager.identityName },
+    invitedAt: local.member?.invitedAt ?? null,
+    expiresAt: local.member?.expiresAt ?? null,
+  };
 }
 
 /* 敲门登记的本会话接线（讨论「加入后本会话接线」的收口）：同意门的写点（放行者席位）在 handler
