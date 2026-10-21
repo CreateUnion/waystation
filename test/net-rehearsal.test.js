@@ -897,12 +897,17 @@ test('治理预演：假失联中止（确认前原站长复活 → 接管中止
   assert.equal(aEntry.role, 'manager', '原站长未被替换');
 });
 
-/* 跳因（产品缺陷）：三成员星型下两名成员互不知端点——managed 成员只与站长通信，端点表按协作
- * 隔离；抢接的握手扫描只遍历 local.endpoints（src/collab/takeover.js:2164-2174），不走带
- * known-hosts 兜底的 endpointFor（src/collab/outgoing.js:1864-1874），站长离线时成员间对表
- * 零应答，并发接管无法进入同 term 冲突面。替代覆盖：test/collab-takeover.test.js:621
- * 「A8 同 term 不同 manager → 冻结 manager-fork、停写并计数」。 */
-test('治理预演：并发抢接（同 term 冲突一律冻结，不静默选胜者）', { timeout: 240000, skip: '产品缺陷：抢接握手扫描只遍历 local.endpoints、不用 known-hosts 兜底（takeover.js:2164-2174），成员间零应答；替代覆盖见 collab-takeover 同 term 冻结单测' }, async (t) => {
+/* 跳因（产品缺陷，2026-10-21 更新）：握手目标面已补齐（协作名单 ∪ 端点表，逐目标走 endpointFor
+ * 的 known-hosts 兜底，见 takeover.js 的 handshakeTargetsOf）——星型拓扑下两名成员已能互相对表，
+ * 预演实测乙的 take_over 可签发挑战。仍阻断在最后入席成员的基线快照落后与追赶链路：
+ * 丙的本地台账停在 version 2 且名单缺乙（[甲,丙]），乙已是 version 3（[甲,乙,丙]）；并发对表后
+ * 丙按设计拒绝（「可达成员的台账版本 3 高于本机——已请求快照」），但 ① 同 term 版本落后的快照
+ * 请求未带 purpose:'catchup'（beginTakeOver 分支），冻结态乙按 §7.1 不应答（snapshotSkipped
+ * 增长）；② 临时注入 purpose 验证后乙应答，丙又按「来源不在本地名单」拒收（term.js
+ * acceptOfflineCatchup 的 isMemberSource；termRejects 增长），5s 后仍停在 version 2。
+ * 根因在最后入席成员的快照收敛/名单刷新（join/快照受理面，当前在途）。替代覆盖：
+ * test/collab-takeover.test.js「A8 同 term 不同 manager → 冻结 manager-fork」与「握手目标面」组。 */
+test('治理预演：并发抢接（同 term 冲突一律冻结，不静默选胜者）', { timeout: 240000, skip: '产品缺陷：最后入席成员基线快照落后且名单缺人，追赶快照按来源非成员拒收（term.js isMemberSource）；握手目标面修复已由 collab-takeover 单测覆盖' }, async (t) => {
   const { port, nodes: [a, b, c] } = await startNodesGuarded(t, 3, (startPort) => spawnTriadNodes(t, startPort, GOVERNANCE_CONFIG));
   const collabId = await buildGovernedTriad(t, { a, b, c, port });
   await a.command({ cmd: 'exit' });

@@ -569,6 +569,63 @@ test('A3/A4 接管基准：应答给出更高 term/version 时按最高 pair 判
   assert.equal(windowed.local.ledger.members.find((entry) => entry.instanceId === MGR.instanceId)?.role, 'member', '窗口接管保留旧站长席位并降级');
 });
 
+/* —— 握手目标面（设计 §2A.6②/§2A.7①）：名单成员靠 known-hosts 寻址、不泛扫 —— */
+
+test('握手目标面：成员机无协作内端点、known-hosts 有名单成员端点 → 握手实际发出并计入', async (t) => {
+  const { state, local, sent } = takeoverStateOf(t, { ledger: ledgerForTakeover(), endpoints: [] });
+  state.knownHosts = { remember: () => {}, lookup: (instanceId) => (instanceId === RIVAL.instanceId ? RIVAL_ENDPOINT : null) };
+  const challenge = await takeOver(state, { collabId: COLLAB, sessionId: MEM.sessionId });
+  const handshakes = sent.filter((frame) => frame.type === 'notice' && frame.payload?.event === 'handshake');
+  assert.deepEqual(handshakes.map((frame) => frame.to?.instanceId), [RIVAL.instanceId], '名单成员按 known-hosts 端点进入握手面');
+  assert.equal(challenge.ok, true, challenge.message);
+  assert.equal(challenge.needsUserConfirmation, true);
+  assert.equal(local.role, 'member', '对表阶段不提升');
+});
+
+test('握手目标面：known-hosts 无记录 → 零应答按既有路径拒绝', async (t) => {
+  const { state, local, sent } = takeoverStateOf(t, { ledger: ledgerForTakeover(), endpoints: [] });
+  const verdict = await takeOver(state, { collabId: COLLAB, sessionId: MEM.sessionId });
+  assert.equal(verdict.ok, false);
+  assert.ok(verdict.message.includes('零应答'), verdict.message);
+  assert.equal(sent.some((frame) => frame.type === 'notice' && frame.payload?.event === 'handshake'), false, '无地址可解析时不发握手');
+  assert.equal(local.role, 'member', '零应答不得以本机旧台账接管');
+});
+
+test('握手目标面：端点表与名单并集去重，名单外实例不被探测（防探测放大）', async (t) => {
+  const outsiderEndpoint = { address: '127.0.0.4', port: 17321 };
+  const { state, sent } = takeoverStateOf(t, {
+    ledger: ledgerForTakeover(),
+    endpoints: [[RIVAL.instanceId, RIVAL_ENDPOINT]],
+  });
+  state.knownHosts = {
+    remember: () => {},
+    lookup: (instanceId) => {
+      if (instanceId === RIVAL.instanceId) {
+        return RIVAL_ENDPOINT;
+      }
+      return instanceId === 'inst-outsider' ? outsiderEndpoint : null;
+    },
+  };
+  const challenge = await takeOver(state, { collabId: COLLAB, sessionId: MEM.sessionId });
+  const handshakes = sent.filter((frame) => frame.type === 'notice' && frame.payload?.event === 'handshake');
+  assert.deepEqual(handshakes.map((frame) => frame.to?.instanceId), [RIVAL.instanceId], '同一实例只发一次；名单外 known-hosts 条目不发');
+  assert.equal(challenge.ok, true, challenge.message);
+});
+
+test('握手目标面：端点表已知但不在名单的实例仍纳入握手，其应答不充当成员见证', async (t) => {
+  const legacy = { instanceId: 'inst-old', sessionId: 'sess-old', identityName: '旧机' };
+  const { state, sent } = takeoverStateOf(t, {
+    ledger: ledgerForTakeover(),
+    endpoints: [[legacy.instanceId, { address: '127.0.0.5', port: 17321 }]],
+    replies: { [legacy.instanceId]: { seat: legacy, managerTerm: 1, version: 3, manager: MGR } },
+  });
+  const verdict = await takeOver(state, { collabId: COLLAB, sessionId: MEM.sessionId });
+  const handshakes = sent.filter((frame) => frame.type === 'notice' && frame.payload?.event === 'handshake');
+  assert.deepEqual(handshakes.map((frame) => frame.to?.instanceId), [legacy.instanceId], '端点表条目进入握手面（旧站长/历史端点回归面）');
+  assert.equal(verdict.ok, false);
+  assert.ok(verdict.message.includes('零应答'), '名单成员全无端点时，名单外机器的应答不作对表证据');
+});
+
 /* —— 接收侧受理（设计 §2A.2） —— */
 
 function changeOf({ via = 'takeover', term, version, manager, prevManager = { instanceId: MGR.instanceId, sessionId: MGR.sessionId }, windowBaseTerm, authorizedAt }) {

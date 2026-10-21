@@ -2166,13 +2166,33 @@ function compareHighest(left, right) {
   return left.version - right.version;
 }
 
+/* 接管对表的握手目标面（设计 §2A.6②/§2A.7①）：协作名单内的在册实例 ∪ 本协作端点表已知者。
+ * 星型拓扑下成员之间没有协作内端点，只有站点级 known-hosts 记录——逐目标经 endpointFor 解析
+ * （端点表优先、known-hosts 兜底）才能让成员彼此对表。只查点名的实例，不遍历 known-hosts：
+ * 那份清单含本站见过的无关主机，泛扫会把接管变成对它们的探测放大面。 */
+function handshakeTargetsOf(state, local) {
+  const targets = new Set();
+  for (const entry of localRosterOf(local)) {
+    if (entry.instanceId !== state.self.instanceId) {
+      targets.add(entry.instanceId);
+    }
+  }
+  for (const instanceId of local.endpoints.keys()) {
+    if (instanceId !== state.self.instanceId) {
+      targets.add(instanceId);
+    }
+  }
+  return targets;
+}
+
 function sendHandshakeSweep(state, local) {
   const payload = handshakePayload(state, local, false);
   if (payload === null) {
     return;
   }
-  for (const [instanceId, endpoint] of local.endpoints) {
-    if (instanceId !== state.self.instanceId) {
+  for (const instanceId of handshakeTargetsOf(state, local)) {
+    const endpoint = endpointFor(state, local, instanceId);
+    if (endpoint !== undefined) {
       sendTo(state, local.collabId, instanceId, endpoint, 'notice', payload, { fromSessionId: payload.sessionId });
     }
   }
