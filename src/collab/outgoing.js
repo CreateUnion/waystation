@@ -10,7 +10,9 @@ import { consumeInviteChallenge, consumeInviteWaiver, issueInviteChallenge } fro
 import { ledgerDigest, removeLedgerFile } from './store.js';
 import { currentManagerIdOf, emitOwnMemberEvent, foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, localTopicOf, memberStateFor, persistLedger, persistMember, persistSnapshot, relayDepartedOf, relayPeerOf, rememberKnownHost, selfJoinedOf, upsertLocalSeat } from './local.js';
 import { matchConflictCollabs } from './gate.js';
-import { writeLocalTerminalCopy } from './takeover.js';
+import { CARRIER_FORMAT_INVITE_STUB, CARRIER_FORMAT_SESSION_SEATS, readCarrier, writeCarrier } from './carrier.js';
+import { collabDir } from '../paths.js';
+import { ledgerTermOf, writeLocalTerminalCopy } from './takeover.js';
 import { matchSessionByToken } from '../util/short-id.js';
 
 /* 对外操作与协作态变更实现（服务公共 API 的落点）：请求来自本机会话（工具面）——
@@ -474,6 +476,7 @@ function decideForumInvite(state, local, wanted, reason, sessionId) {
   }
   persistMember(state, local);
   if (wanted === 'approved') {
+    upgradeInviteStubCarrier(state, local, sessionId);
     const event = emitOwnMemberEvent(state, local, 'join');
     if (event !== null) {
       state.counters.forumJoinsOut++;
@@ -483,6 +486,68 @@ function decideForumInvite(state, local, wanted, reason, sessionId) {
   const bookkeeping = sendInviteBookkeeping(state, local, wanted, validated.reason, sessionId);
   state.counters.decisionsSent++;
   return { ok: true, decision: wanted, joined: wanted === 'approved', bookkeeping };
+}
+
+/* 讨论邀请的落点从 invite-stub 升为 session-seats（设计 §4.2）：论坛没有两段式 grant，
+ * 同意即入席；不升级则该目录重启后仍按邀请占位读取，参与不会被加载。保留 stub 已有的
+ * 元数据（创建时间/发起人/讨论元信息），只补入席后的必需面。 */
+function upgradeInviteStubCarrier(state, local, sessionId) {
+  const dir = collabDir(state.dataDir, local.collabId);
+  const base = inviteStubCarrierOf(dir);
+  if (base === null) {
+    return false;
+  }
+  try {
+    writeCarrier(dir, sessionSeatsCarrierFrom(state, local, base));
+  } catch (error) {
+    state.counters.inviteCarrierUpgradeFailures = (state.counters.inviteCarrierUpgradeFailures ?? 0) + 1;
+    state.log.warn('邀请占位载体升级失败（重启后该参与可能不被加载）', { collabId: local.collabId, reason: error?.message });
+    return false;
+  }
+  ensureJoinedSeatOf(state, local, sessionId);
+  state.counters.inviteCarriersUpgraded = (state.counters.inviteCarriersUpgraded ?? 0) + 1;
+  return true;
+}
+
+/* 入席必需面：判档要求载体之外还有「已参与」证据（席位或快照）——论坛没有快照，
+ * 补一条本会话席位使目录重启后按 session-seats 正常加载。 */
+function ensureJoinedSeatOf(state, local, sessionId) {
+  const target = typeof sessionId === 'string' && sessionId !== '' ? sessionId : firstActiveSessionIdOf(local);
+  if (typeof target !== 'string' || target === '') {
+    return;
+  }
+  upsertLocalSeat(local, {
+    sessionId: target,
+    role: 'member',
+    state: 'member',
+    joinSeq: 1,
+    joinedAt: new Date().toISOString(),
+  }, { persist: true, dataDir: state.dataDir });
+}
+
+function inviteStubCarrierOf(dir) {
+  const held = readCarrier(dir);
+  if (held.status !== 'ok' || held.carrier === null) {
+    return null;
+  }
+  return held.carrier.format === CARRIER_FORMAT_INVITE_STUB ? held.carrier : null;
+}
+
+function sessionSeatsCarrierFrom(state, local, base) {
+  const member = local.member ?? {};
+  return {
+    ...base,
+    format: CARRIER_FORMAT_SESSION_SEATS,
+    name: nonEmptyTextOr(member.name, base.name),
+    topic: nonEmptyTextOr(member.topic, base.topic),
+    mode: localModeOf(local),
+    endpoints: Object.fromEntries(local.endpoints ?? []),
+    snapshotVersion: local.snapshot?.version ?? 0,
+  };
+}
+
+function nonEmptyTextOr(value, fallback) {
+  return typeof value === 'string' && value !== '' ? value : fallback;
 }
 
 /* 拒绝原因的服务层预校验（与 sendDecision 同一判据；空串归一为未给出）。 */
@@ -1048,11 +1113,8 @@ export function leaveCollab(state, { collabId, sessionId }) {
   if (isLocalArchivedState(local)) {
     return { ok: false, message: '协作已结束（或已退出）' };
   }
-  const managerId = local.member.manager.instanceId;
-  const endpoint = local.endpoints.get(managerId);
   const fromSessionId = sessionId ?? firstActiveSessionIdOf(local) ?? undefined;
-  const delivered = endpoint !== undefined
-    && sendTo(state, collabId, managerId, endpoint, 'leave', {}, { fromSessionId }).ok === true;
+  const delivered = deliverLeaveOfSeat(state, local, collabId, fromSessionId);
   local.member.state = 'left';
   local.member.archivedAt = new Date().toISOString();
   persistMember(state, local);
@@ -1064,6 +1126,73 @@ export function leaveCollab(state, { collabId, sessionId }) {
     writeLocalTerminalCopy(state, local);
   }
   return { ok: true, delivered };
+}
+
+/* 离席的两条落地面：本机就是站长核时由本核移除共享名单行（设计 §3.2）；否则把 leave 帧
+ * 定向发给现任站长。返回离席事实是否已交付（本核写名单视为已交付）。 */
+function deliverLeaveOfSeat(state, local, collabId, sessionId) {
+  if (removeOwnRosterRowOnManagerCore(state, local, sessionId)) {
+    return true;
+  }
+  const managerId = local.member.manager.instanceId;
+  const endpoint = local.endpoints.get(managerId);
+  return endpoint !== undefined && sendTo(state, collabId, managerId, endpoint, 'leave', {}, { fromSessionId: sessionId }).ok === true;
+}
+
+/* 站长核上的成员席位离席：移除共享名单行、追加 leave 事件、广播名单版本（设计 §3.2）。
+ * 只处理本机成员席位（站长席位走自动移交，不在这里删行）。返回是否由本核完成写入。 */
+function removeOwnRosterRowOnManagerCore(state, local, sessionId) {
+  if (local.ledger === null || typeof sessionId !== 'string' || sessionId === '') {
+    return false;
+  }
+  const row = local.ledger.members.find((member) => member.instanceId === state.self.instanceId
+    && member.role !== 'manager'
+    && member.sessionId === sessionId);
+  if (row === undefined) {
+    return false;
+  }
+  const applied = mutateLedger(state, local, (ledger) => {
+    ledger.members = ledger.members.filter((member) => member !== row);
+    ledger.events = [...(Array.isArray(ledger.events) ? ledger.events : []), {
+      type: 'leave',
+      seat: { instanceId: row.instanceId, sessionId: row.sessionId, identityName: row.identityName },
+      reason: 'left',
+      term: ledgerTermOf(ledger),
+      at: new Date().toISOString(),
+    }];
+  });
+  if (applied === null) {
+    return false;
+  }
+  releaseJoiningOfSeat(state, local.collabId, row.sessionId);
+  sendRosterVersion(state, local);
+  state.counters.rostersLocalLeave++;
+  return true;
+}
+
+function releaseJoiningOfSeat(state, collabId, sessionId) {
+  try {
+    state.join?.releaseJoining?.(collabId, sessionId);
+  } catch (error) {
+    state.counters.eventFailures++;
+    state.log.warn('未确认入席记录释放失败（已隔离）', { collabId, sessionId, reason: error?.message });
+  }
+}
+
+/* 名单版本通告（managed）：一机一帧，除本机与站长签发席位外逐个已知端点发送。 */
+function sendRosterVersion(state, local) {
+  const fromSessionId = managerSessionIdOf(local) ?? undefined;
+  const notified = new Set();
+  for (const member of local.ledger.members) {
+    if (member.instanceId === state.self.instanceId || notified.has(member.instanceId)) {
+      continue;
+    }
+    notified.add(member.instanceId);
+    const endpoint = local.endpoints.get(member.instanceId);
+    if (endpoint !== undefined) {
+      sendTo(state, local.collabId, member.instanceId, endpoint, 'notice', { event: 'roster', version: local.ledger.version }, { fromSessionId });
+    }
+  }
 }
 
 /* 本次离席后本机是否再无席位：会话级席位表是权威；无席位表的旧单席记录按整机唯一成员处理。 */
@@ -1821,7 +1950,12 @@ export function stopJoinReplays(state) {
  * 逐目标归属的本地协作信息供转达帧寻址。 */
 export function governanceTargets(state, local) {
   const targets = new Map();
-  for (const entry of localRosterOf(local)) {
+  /* 成员侧以最近快照名单为准：member.roster 只在邀请时定格，转达/广播若照它取收件人，
+   * 后加入的成员会被漏发（设计 §2A.8④ 的「其余成员」）。 */
+  const roster = local.role === 'member' && Array.isArray(local.snapshot?.ledger?.members)
+    ? local.snapshot.ledger.members
+    : localRosterOf(local);
+  for (const entry of roster) {
     const endpoint = endpointFor(state, local, entry.instanceId);
     if (endpoint !== undefined) {
       targets.set(entry.instanceId, { address: endpoint.address, port: endpoint.port, collabId: local.collabId });
@@ -2005,16 +2139,32 @@ function applyManagerSeatRoles(state, local, ledger) {
   }, { persist: true, dataDir: state.dataDir, bridgeId: bridgeIdOfSession(state, managerSessionId) });
 }
 
-/* 席位变更后的名册角色同步：台账 manager 与 members[].role 恒一致——新任站长置 manager、
- * 其余旧 manager 位回落 member（否则旧站长被移交前置按 role 误拒，交回路径永久不可达）。 */
+/* 席位变更后的名册角色同步：台账 manager 与 members[].role 恒一致——只把 manager 对应的
+ * 那一行置 manager，其余行（含同机其他会话）一律回 member。按 instanceId 判定会把同机两席
+ * 同时升为 manager，写出两份 manager 行的非法台账。 */
 function syncRosterRoles(ledger) {
+  const manager = ledger?.manager;
+  if (typeof manager !== 'object' || manager === null || typeof manager.instanceId !== 'string') {
+    return;
+  }
   for (const member of ledger.members) {
-    if (member.instanceId === ledger.manager.instanceId) {
+    if (isManagerRoleRow(member, manager)) {
       member.role = 'manager';
-    } else if (member.role === 'manager') {
+    } else if (member.role !== 'member') {
       member.role = 'member';
     }
   }
+}
+
+/* 旧台账可能缺 sessionId：此时按实例匹配（每机一席的兼容面）；有 sessionId 即精确到席位。 */
+function isManagerRoleRow(member, manager) {
+  if (member.instanceId !== manager.instanceId) {
+    return false;
+  }
+  if (typeof manager.sessionId !== 'string' || manager.sessionId === '') {
+    return true;
+  }
+  return member.sessionId === undefined || member.sessionId === manager.sessionId;
 }
 
 /* 生效抢接记录的席位翻页作废：keepCandidateId 指保留「关于该候选」的记录（传 null 清空全部）。
@@ -2191,13 +2341,16 @@ export function sendMergeOffer(state, local, managerPeer, baseVersion) {
 
 /* 本机提示（会话注入面；不经出站队列、不上网络）：notify 注入缺失或投递失败只计数与日志。
  * 帧形态为 notice + event:'local-alert'——该事件不入协议表（外发不存在；伪造入站被协议拒收）。
+ * options.targetSessionId：指名接收会话（路由按会话寻址优先于调用者/绑定归属；同机移交的
+ * 目标会话据此能收到 offerId）。
  * 返回值契约（join-ack 判据的通道，单核路由面消费）：false = 提示无接收者（路由面明示
  * 「绑定会话不活跃 / 无绑定 / 调用者桥不在线」）；其余（true / undefined / 旧式注入面返回值）
  * = 按已投出处理——旧注入面（如既有的 deliverFrame）零改动，只有显式 false 才是否决信号。 */
-export function notifyLocal(state, local, text) {
+export function notifyLocal(state, local, text, options = {}) {
   if (typeof state.notify !== 'function') {
     return undefined;
   }
+  const targetSessionId = options?.targetSessionId;
   try {
     const routed = state.notify({
       v: PROTOCOL_VERSION,
@@ -2206,7 +2359,11 @@ export function notifyLocal(state, local, text) {
       from: state.self,
       collabId: local.collabId,
       ts: new Date().toISOString(),
-      payload: { event: 'local-alert', text },
+      payload: {
+        event: 'local-alert',
+        text,
+        ...(typeof targetSessionId === 'string' && targetSessionId !== '' ? { targetSessionId } : {}),
+      },
     });
     if (routed === false) {
       return false;

@@ -11,8 +11,8 @@ import { makeAutoOffer } from './term.js';
 import { applyEndpoint, downgradeToMember, endpointFor, notifyLocal, promoteToManager, sendTo, sendToSeats } from './outgoing.js';
 import { probePeer } from './takeover.js';
 import {
-  clearManagerFreeze, ledgerTermOf, localSeatsOf, m5RuntimeOf, managerSeatOfLedger, markManagerPending, presenceSignerOf, registerLifecycleRestorer,
-  registerLocalAutoOfferHandler, rememberPendingChange, restoreAutoTransferState,
+  clearAutoTransferState, clearManagerFreeze, ledgerTermOf, localSeatsOf, m5RuntimeOf, managerSeatOfLedger, markManagerPending, presenceSignerOf,
+  registerLifecycleRestorer, registerLocalAutoOfferHandler, rememberPendingChange, restoreAutoTransferState,
 } from './takeover.js';
 
 /* 显式移交（设计 §2A.4）与自动接受（§2A.5 目标侧）：
@@ -94,7 +94,11 @@ function deliverOfferLocally(state, local, offer, targetSeat) {
   if (storeOfferRecord(state, local, record) === null) {
     return { ok: false, reason: 'offer 形态不符' };
   }
-  notifyLocal(state, local, `收到站长移交提议（offerId ${record.offerId}）：如接受，请用 ws_handover 携 offerId 确认（先签发挑战令牌）。`);
+  /* 同机多席：提示必须指名目标会话——发起者（旧站长）会话持有调用上下文，
+   * 不指名时路由只投调用者桥，目标会话拿不到 offerId 就无法 confirm/reject。 */
+  notifyLocal(state, local, `收到站长移交提议（offerId ${record.offerId}）：如接受，请用 ws_handover 携 offerId 确认（先签发挑战令牌）。`, {
+    targetSessionId: targetSeat.sessionId,
+  });
   return { ok: true };
 }
 
@@ -745,6 +749,9 @@ function signAutoChange(state, local, record, autoOffer) {
   });
   m5RuntimeOf(state).managerWindowBaseAt.set(local.collabId, nowMs(state));
   bump(state, 'autoChangesSigned');
+  /* 本机签发完成后自动移交即收口：同机路径不会有 accept 广播回头清状态（广播跳过本机），
+   * 残留的 5s 定时器会把刚接管的协作顺延给下一人甚至写成终态。 */
+  clearAutoTransferState(state, local.collabId);
 }
 
 function buildAutoLedger(state, local, record, autoOffer, sessionId) {
@@ -862,7 +869,9 @@ function selfEndpointOf(state) {
 
 function handleAccept(state, local, frame) {
   const runtime = m5RuntimeOf(state);
-  const pending = runtime.pendingHandovers.get(local.collabId);
+  /* 自动移交的旧站长侧不落 pendingHandovers（那套记录属显式移交）；accept 的匹配依据是
+   * autoPending。缺此回退会把目标对新站长签发的接受当迟到丢弃，5s 后照常顺延（同 term 双主）。 */
+  const pending = runtime.pendingHandovers.get(local.collabId) ?? runtime.autoPending.get(local.collabId);
   if (pending === undefined) {
     bump(state, 'lateHandoverAccepts');
     return;
@@ -1372,19 +1381,54 @@ function handoverChangeAuthorized(state, local, record, change) {
   if (current === null || !sameSeat(record.from, current) || !sameSeat(change.from, current)) {
     return false;
   }
-  return handoverTermBaselineOk(local, record, change, current) && handoverTargetSeatOk(state, local, record, change);
+  return handoverTermBaselineOk(state, local, record, change, current) && handoverTargetSeatOk(state, local, record, change);
 }
 
-/* 本地任期仍以 offer 的 baseTerm 为基线、版本尚未推进（陈旧 offer 不得降回或直接提升）。 */
-function handoverTermBaselineOk(local, record, change, current) {
-  if (!sameSeat(change.prevManager, current) || local.snapshot === null || local.snapshot.ledger === null) {
+/* 本地任期仍以 offer 的 baseTerm 为基线、版本尚未推进（陈旧 offer 不得降回或直接提升）。
+ * 基线取已采纳的权威任期：成员采纳 manager-changed 后快照尚未拉回时，快照仍是旧站长/旧任期。 */
+function handoverTermBaselineOk(state, local, record, change, current) {
+  if (!sameSeat(change.prevManager, current)) {
     return false;
   }
-  const localTerm = ledgerTermOf(local.snapshot.ledger);
-  if (record.baseTerm !== localTerm || change.term !== localTerm + 1) {
+  const baseline = adoptedTermBaselineOf(state, local);
+  if (baseline === null) {
     return false;
   }
-  return record.version >= local.snapshot.version && change.version > local.snapshot.version;
+  if (record.baseTerm !== baseline.term || change.term !== baseline.term + 1) {
+    return false;
+  }
+  return record.version >= baseline.version && change.version > baseline.version;
+}
+
+function adoptedTermBaselineOf(state, local) {
+  const ledgerBaseline = ledgerTermBaselineOf(local);
+  const adopted = m5RuntimeOf(state).termState?.get?.(local.collabId);
+  if (!isPlainObject(adopted) || !Number.isInteger(adopted.managerTerm)) {
+    return ledgerBaseline;
+  }
+  const adoptedBaseline = {
+    term: adopted.managerTerm,
+    version: Number.isInteger(adopted.version) ? adopted.version : 0,
+  };
+  if (ledgerBaseline === null) {
+    return adoptedBaseline;
+  }
+  return termBaselineAhead(adoptedBaseline, ledgerBaseline) ? adoptedBaseline : ledgerBaseline;
+}
+
+function ledgerTermBaselineOf(local) {
+  const ledger = local.role === 'manager' ? local.ledger : local.snapshot?.ledger;
+  if (!isPlainObject(ledger) || !Number.isInteger(ledger.version)) {
+    return null;
+  }
+  return { term: ledgerTermOf(ledger), version: ledger.version };
+}
+
+function termBaselineAhead(left, right) {
+  if (left.term !== right.term) {
+    return left.term > right.term;
+  }
+  return left.version > right.version;
 }
 
 function handoverTargetSeatOk(state, local, record, change) {

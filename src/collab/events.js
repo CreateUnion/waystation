@@ -676,6 +676,10 @@ function acceptSnapshotFrame(state, frame) {
     state.log.warn('无本地任期基线的首个快照来源不成立（已忽略）', { collabId: frame.collabId });
     return;
   }
+  /* 重启降级（设计 §2A.8⑥）：旧站长按 handshake 学到的更高任期向新站长取快照；授权证据
+   * 必须绑定「直连应答来自快照来源机器 + 其报告的 term/manager 与快照一致」，并在任期判决
+   * 之前落下受理记录，否则 term.js 会按「来源非本地现任站长」再次拒收。 */
+  recordHandshakeSnapshotEvidence(state, local, frame, termState);
   const ctx = termCtxOf(state, local, frame);
   const gate = snapshotAutoCatchupGate(state, local, frame, termState, ctx);
   const result = gate ?? acceptManagerChange(termState, frame.payload, ctx);
@@ -703,7 +707,7 @@ function adoptFirstSnapshot(state, local, frame, record) {
   local.snapshot = record;
   persistSnapshot(state, local);
   termMapsOf(state).termState.set(local.collabId, nextState);
-  applyMemberManagerRef(state, local, nextState);
+  applyMemberManagerRef(state, local, nextState, record.ledger);
   clearUnverifiedSeats(state, local, record.ledger);
   bump(state, 'snapshotBaselineAdopted');
   bump(state, 'snapshotStored');
@@ -1211,7 +1215,10 @@ function handleManagerChanged(state, frame) {
     return;
   }
   const change = { ...frame.payload, from: frame.from };
+  /* 转达目标取采纳前的名册：采纳会降级/改写本地名单（设计 §2A.8④）。 */
+  const relayTargets = new Map(governanceTargets(state, local));
   if (adoptHandoverAsTarget(state, local, change)) {
+    relayManagerChange(state, frame, relayTargets);
     return;
   }
   const ctx = termCtxOf(state, local, frame);
@@ -1221,6 +1228,15 @@ function handleManagerChanged(state, frame) {
     learnManagerEndpoint(state, local, result.nextState.manager, frame.payload.endpoint);
   }
   applyManagerResult(state, local, frame, result);
+  /* 已受理的站长变更由接收核继续转发（D15）：旧站长降级后仍要把变更送到其余成员；
+   * 未受理/拒收的帧不扩散。 */
+  if (result.accepted === true) {
+    relayManagerChange(state, frame, relayTargets);
+  }
+}
+
+function relayManagerChange(state, frame, targets) {
+  state.counters.managerChangeRelayed = (state.counters.managerChangeRelayed ?? 0) + relayGovernance(state, frame, targets);
 }
 
 /* 旧站长仍在线时收到更高 term 的 takeover-manual：按 §2A.7⑥/§2A.8 降级采纳，
@@ -1418,7 +1434,7 @@ function applyAcceptedNextState(state, local, frame, nextState) {
     writeReadonlyLedgerCopy(state, local, readonlyLedger);
     bump(state, 'managerDowngrades');
   } else {
-    applyMemberManagerRef(state, local, nextState);
+    applyMemberManagerRef(state, local, nextState, frame.payload?.ledger);
   }
   clearManagerFreeze(state, local.collabId);
   notifyLocal(state, local, `站长已变更：现任站长「${nextState.manager.identityName}」（任期 ${nextState.managerTerm}）——本机已按新任期收敛。`);
@@ -1452,10 +1468,11 @@ function applyTerminalAdoption(state, local, nextState) {
   notifyLocal(state, local, '协作已结束——本机采用本地只读终态。');
 }
 
-function applyMemberManagerRef(state, local, nextState) {
+function applyMemberManagerRef(state, local, nextState, ledger = undefined) {
   if (local.member === null || typeof local.member !== 'object') {
     return;
   }
+  backfillMemberBasicsOf(local.member, ledger);
   local.member.manager = { instanceId: nextState.manager.instanceId, identityName: nextState.manager.identityName };
   local.member.managerSinceVersion = nextState.version;
   if (['completed', 'terminated', 'frozen', 'left'].includes(local.member.state)) {
@@ -1463,6 +1480,24 @@ function applyMemberManagerRef(state, local, nextState) {
     delete local.member.archivedAt;
   }
   persistMember(state, local);
+}
+
+/* 采纳快照即按台账回填成员记录（设计 §3.1/§4.4④）：冷启动且邀请记录不全时，本地名/题与
+ * 「尚未回应」态会一直停在 collabId/proposed；名单已收到的快照就是参与成立的权威面。 */
+function backfillMemberBasicsOf(member, ledger) {
+  if (!isPlainObject(ledger)) {
+    return;
+  }
+  if (typeof ledger.name === 'string' && ledger.name !== '') {
+    member.name = ledger.name;
+  }
+  if (typeof ledger.topic === 'string') {
+    member.topic = ledger.topic;
+  }
+  if (member.state === 'proposed' && ledger.status === 'active') {
+    member.state = 'active';
+    delete member.archivedAt;
+  }
 }
 
 /* 降级后保留只读台账副本（设计 §2A.8③）：目录若无台账会被判 carrier-without-ledger/recovery 只读，
@@ -1560,16 +1595,69 @@ function snapshotSourceAuthorized(state, local, frame, termState, ctx) {
   if (sameSeat(source, termState.manager)) {
     return true;
   }
-  const accepted = ctx.acceptedManager;
-  if (isPlainObject(accepted) && accepted.term === ledgerTermOf(ledger) && sameSeat(accepted.manager, manager)
-    && sameSeat(accepted.manager, source)) {
+  if (acceptedManagerAuthorizes(ctx.acceptedManager, ledger, source)) {
     return true;
   }
   const handoverTarget = m5RuntimeOf(state).handoverTargets.get(local.collabId);
   if (local.suspended?.reason === 'handover-pending' && sameSeat(source, handoverTarget) && sameSeat(manager, handoverTarget)) {
     return true;
   }
+  if (handshakeManagerEvidenceOf(state, local, frame, ledger)) {
+    return true;
+  }
   return localAutoOfferMatches(state, local, frame, termState, source, manager);
+}
+
+function acceptedManagerAuthorizes(accepted, ledger, source) {
+  return isPlainObject(accepted)
+    && accepted.term === ledgerTermOf(ledger)
+    && sameSeat(accepted.manager, ledger.manager)
+    && sameSeat(accepted.manager, source);
+}
+
+/* 握手学到的站长证据（设计 §2A.8⑥）：快照来源机器本人直接应答过 handshake，且应答报告的
+ * term/manager 与快照一致、报告端点与本地已知端点一致。任一不满足即不授权——不得放宽成
+ * 「任意成员报告的最高 pair」授权。 */
+function handshakeManagerEvidenceOf(state, local, frame, ledger) {
+  const manager = ledger.manager;
+  if (!isPlainObject(manager) || typeof manager.instanceId !== 'string' || frame.from.instanceId !== manager.instanceId) {
+    return false;
+  }
+  const response = m5RuntimeOf(state).handshakeResponses.get(local.collabId)?.get(manager.instanceId);
+  if (response === undefined) {
+    return false;
+  }
+  if (response.term !== ledgerTermOf(ledger) || !sameSeat(response.manager, manager)) {
+    return false;
+  }
+  return reportedManagerEndpointOk(state, local, manager, response.endpoint);
+}
+
+function reportedManagerEndpointOk(state, local, manager, reported) {
+  if (reported === undefined) {
+    return true;   // 站长本人应答时不携 managerEndpoint（该字段只描述他机站长）
+  }
+  if (!isPlainObject(reported) || typeof reported.address !== 'string' || !Number.isInteger(reported.port)) {
+    return false;
+  }
+  const endpoint = endpointFor(state, local, manager.instanceId);
+  return endpoint !== undefined && endpoint.address === reported.address && endpoint.port === reported.port;
+}
+
+function recordHandshakeSnapshotEvidence(state, local, frame, termState) {
+  const ledger = frame.payload.ledger;
+  if (!isPlainObject(ledger) || ledger.manager === null || ledgerTermOf(ledger) <= termState.managerTerm) {
+    return;
+  }
+  if (!handshakeManagerEvidenceOf(state, local, frame, ledger)) {
+    return;
+  }
+  termMapsOf(state).accepted.set(local.collabId, {
+    term: ledgerTermOf(ledger),
+    manager: { instanceId: ledger.manager.instanceId, sessionId: ledger.manager.sessionId, identityName: ledger.manager.identityName },
+    source: { instanceId: frame.from.instanceId, sessionId: frame.from.sessionId },
+  });
+  bump(state, 'handshakeSnapshotEvidence');
 }
 
 /* 只认本机已收到的匹配 auto-offer（2026-10-21 裁定）：快照台账 events 可自造，不作证据。 */

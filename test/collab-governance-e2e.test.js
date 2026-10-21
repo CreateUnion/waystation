@@ -13,21 +13,19 @@ import { seedSessionCollab } from './helpers/session-participants.js';
 
 const INDEX_ENTRY = join(repoRoot, 'src', 'index.js');
 
-/* 治理验收预演（真实组合根 × 2 + 假会话收件箱）：显式交接与离线拒绝走 ws_* 工具面全链。
+/* 治理验收预演（真实组合根 × 2 + 假会话收件箱）：显式交接、失联抢接与离线拒绝走 ws_* 工具面全链。
  *
- * 0.2.0 迁移：两站以**预置协作目录**启动（carrier(session-seats) + 新台账 + seats/）——邀请侧
- * 当前受「新邀请载荷 members 不含目标 → 旧准入判据拒绝」缺陷影响（已报 ISSUE），本文件不经邀请
- * 成席，直接以同构数据根造出「A 站长 / B 成员」。
+ * 夹具形态（consume-only）：两站以**预置协作目录**启动（carrier(session-seats) + 新台账 + seats/）——
+ * 本文件不经 create/invite/join 的产品路径，只覆盖 ws_handover / ws_take_over 工具链与离线拒绝；
+ * 创建/邀请/加入由 e2e-session-invites 等套件覆盖。
  *
- * 已删除/挂起用例（设计依据）：
- * - 「失联抢接（ws_take_over 全链）+ 原站长重启握手降级」：**挂起**（skip）。服务层
- *   `takeOver` 误用 managerOnly 席位授权（成员会话一律被拒，ISSUE），且降级后旧站长目录被判
- *   recovery 只读（ISSUE）。A4 受理语义已由 collab-takeover 的直驱用例覆盖。
- * - 「旧席位台账已清理」断言：设计 §2A.4③ 要求保留本地只读副本（现实现删 ledger.jsonl、
- *   留 snapshot.json，按 ISSUE 上报）；用例改断言快照副本存在。
+ * 用例调整（设计依据）：
+ * - 「失联抢接 + 原站长重启握手降级」：服务层 takeOver 已改为成员席位可发起（managerOnly:false），
+ *   降级后旧站长保留只读台账副本；本用例恢复运行。
+ * - 「旧席位台账已清理」断言：§2A.4③ 要求保留本地只读副本；主交接用例断言快照副本存在。
  *
  * 发现隔离：临时核心经 testDiscoveryOffEnv 关闭真实 LAN 广播/探测（WAYSTATION_TEST_DISABLE_DISCOVERY），
- * 不得向用户真实核心注入握手/敲门事件。 */
+ * 启动后还以 ws_status 硬断言核心进程实际读到开关（disabled=true、未绑定 UDP、无扫描）。 */
 
 /* 会话标识：同数据根稳定（重开站点＝原会话重连，绑定恢复活跃）；不同数据根互异。 */
 const sessionIdsByHome = new Map();
@@ -163,14 +161,16 @@ function writeStationConfig(home, port, identityName, extra = {}) {
     retryIntervalMs: 200,
     retryFastCount: 100,
     messageTtlMs: 3600000,
+    /* 0.2.0 配置下界（config.js）：低于下界的值会整组回落到产品默认，夹具必须给合法值——
+     * 失联判定最快 30s，因此本文件的失联用例按 30s+ 等待。 */
     managerProbeIntervalMs: 200,
-    managerLossTimeoutMs: 1500,
+    managerLossTimeoutMs: 30000,
     sessionTakeoverWindowMs: 60000,
-    sessionSeatGraceMs: 1500,
-    sessionSeatTimeoutMs: 60000,
-    seatPresenceIntervalMs: 500,
-    handoverConfirmTimeoutMs: 8000,
-    joinConfirmTtlMs: 5000,
+    sessionSeatGraceMs: 5000,
+    sessionSeatTimeoutMs: 30000,
+    seatPresenceIntervalMs: 5000,
+    handoverConfirmTimeoutMs: 15000,
+    joinConfirmTtlMs: 10000,
     ...extra,
     viewerAutoOpen: false,
   }));
@@ -202,6 +202,18 @@ async function callTool(client, name, args = {}) {
   const called = await client.callTool({ name, arguments: args });
   const text = called.content[0].text;
   return { isError: called.isError === true, payload: called.isError === true ? text : JSON.parse(text) };
+}
+
+/* 发现隔离硬断言：ws_status 由核心进程应答，disabled=true 证明子进程真的收到隔离开关；
+ * bound=false / scanning=0 证明没有 UDP 绑定与扫描轮次（静态 env 传递链不再作为唯一依据）。 */
+async function assertDiscoveryIsolated(client) {
+  const status = await callTool(client, 'ws_status');
+  assert.equal(status.isError, false, String(status.payload));
+  const discovery = status.payload.net?.counters?.discovery;
+  assert.ok(discovery !== undefined, 'ws_status 暴露发现层状态');
+  assert.equal(discovery.disabled, true, '核心进程读到发现隔离开关（子进程环境传递到位）');
+  assert.equal(discovery.bound, false, '发现层未绑定 UDP');
+  assert.equal(discovery.scanning, 0, '发现层无扫描轮次');
 }
 
 /* —— 预置双站协作（A 站长 / B 成员） —— */
@@ -274,6 +286,7 @@ async function startStudio(t, extraConfig = {}) {
       const entry = listed.find((candidate) => candidate.collabId === COLLAB);
       return entry !== undefined && entry.state === 'active' ? true : null;
     }, { timeoutMs: 20000 });
+    await assertDiscoveryIsolated(client);
   }
   return { homeA, homeB, portA, portB, inboxA, inboxB, a, b };
 }
@@ -290,11 +303,12 @@ function parseChallenge(text) {
   }
 }
 
-/* 目标侧确认一次：offer 尚未到达→null（重试）；挑战→携令牌确认。 */
+/* 目标侧确认一次：offer 尚未到达→null（重试）；挑战→携令牌确认。
+ * 首调必须是挑战：若工具退化为一次调用直接确认，这里持续返回 null，用例按超时红暴露回归。 */
 async function confirmOfferOnTarget(client, offerId) {
   const challenge = await callTool(client, 'ws_handover', { collabId: COLLAB, offerId });
   if (challenge.isError !== true) {
-    return challenge;
+    return null;
   }
   const parsed = parseChallenge(challenge.payload);
   if (parsed?.needsUserConfirmation !== true) {
@@ -334,40 +348,69 @@ test('治理验收：显式交接（ws_handover 两段式确认，旧站长降�
   assert.equal(existsSync(join(homeA, 'collabs', COLLAB, 'snapshot.json')), true, '旧站长保留只读快照副本');
 });
 
-test('治理验收：失联抢接（ws_take_over 全链）+ 原站长重启握手降级', {
-  /* 产品缺陷 ISSUE（M9 归因）：服务层 takeOver 以 managerOnly 席位授权包装，成员会话（工具面
-   * 必带 sessionId）一律被拒「只有站长席位可以执行该操作」——ws_take_over 全链不可达。
-   * A4 受理语义由 collab-takeover 的直驱用例覆盖；另降级后旧站长目录被判 recovery 只读。 */
-  skip: '产品缺陷 ISSUE：服务层 takeOver 误用 managerOnly 授权，成员会话无法发起接管',
-}, async (t) => {
+/* 失联抢接全链：关闭并收掉原站长核心 → B 按探测判失联 → 成员会话发起 ws_take_over（挑战 + 令牌）→ B 成为站长。 */
+test('治理验收：失联抢接（ws_take_over 全链，成员会话发起）', { timeout: 120000 }, async (t) => {
   const studio = await startStudio(t);
-  const { a, b, homeA, portA, inboxA } = studio;
+  const { a, b, homeA, portA } = studio;
   await a.close();
-  await waitForRebindable(portA);
+  /* 模拟原站长整机离线：桥退场后核心可能按存续宽限继续监听——显式收核再等端口释放。 */
+  killCoreOf(homeA);
+  await waitForRebindable(portA, { timeoutMs: 15000 });
   await waitFor(async () => {
     const listed = (await callTool(b, 'ws_list_collabs')).payload.collabs;
     const entry = listed.find((candidate) => candidate.collabId === COLLAB);
     return entry !== undefined && entry.managerOffline === true ? true : null;
-  }, { timeoutMs: 30000 });
+  }, { timeoutMs: 45000 });
   const verdict = await callTool(b, 'ws_take_over', { collabId: COLLAB });
-  assert.equal(verdict.isError, false, String(verdict.payload));
-  assert.equal(verdict.payload.needsUserConfirmation, true);
-  const applied = await callTool(b, 'ws_take_over', { collabId: COLLAB, confirmToken: verdict.payload.confirmToken });
+  assert.equal(verdict.isError, true, '首次调用只签发确认挑战');
+  const challenge = parseChallenge(verdict.payload);
+  assert.equal(challenge?.needsUserConfirmation, true, String(verdict.payload));
+  assert.equal(typeof challenge.confirmToken, 'string');
+  const applied = await callTool(b, 'ws_take_over', { collabId: COLLAB, confirmToken: challenge.confirmToken });
   assert.equal(applied.isError, false, String(applied.payload));
   const bLedger = await callTool(b, 'ws_view_ledger', { collabId: COLLAB });
-  assert.equal(bLedger.payload.ledger.manager.instanceId, INST_B);
+  assert.equal(bLedger.payload.ledger.manager.instanceId, INST_B, '接管生效：新站长为 B');
+  assert.equal(bLedger.payload.ledger.managerTerm, 2, '任期 +1');
+  const listedB = (await callTool(b, 'ws_list_collabs')).payload.collabs;
+  assert.equal(roleOf({ collabs: listedB }, COLLAB), 'manager');
+});
+
+/* 旧站长重启降级：§2A.8⑥ 要求重启后按 handshake 学到更高任期并向新站长取快照采纳。
+ * 授权链绑定「快照来源机器本人的直连 handshake 应答」与其报告的 term/manager/managerEndpoint；
+ * D15 定向重发持续到 ack 或被更高任期取代（时长不低于失联判定窗口）。 */
+test('治理验收：原站长重启握手降级（旧站长按更高任期退回成员）', {
+  skip: 'M5 侧已修（握手证据快照采纳、D15 重发持续到 ack）；e2e 仍红于 M3 传输层：旧站长重启后对端继续复用指向已杀核心的旧 TCP 连接（B framesOut 增长、dialTotal 不再增长，A2 只收到 ack），重发的 manager-changed 与握手应答均到不了重启核——需 M3 连接失效检测/重拨后解封',
+}, async (t) => {
+  const studio = await startStudio(t);
+  const { a, b, homeA, portA, inboxA } = studio;
+  await a.close();
+  killCoreOf(homeA);
+  await waitForRebindable(portA, { timeoutMs: 15000 });
+  await waitFor(async () => {
+    const listed = (await callTool(b, 'ws_list_collabs')).payload.collabs;
+    const entry = listed.find((candidate) => candidate.collabId === COLLAB);
+    return entry !== undefined && entry.managerOffline === true ? true : null;
+  }, { timeoutMs: 45000 });
+  const verdict = await callTool(b, 'ws_take_over', { collabId: COLLAB });
+  assert.equal(verdict.isError, true);
+  const challenge = parseChallenge(verdict.payload);
+  await callTool(b, 'ws_take_over', { collabId: COLLAB, confirmToken: challenge.confirmToken });
   const a2 = await startStation(t, { home: homeA, port: portA, inbox: inboxA });
   await waitFor(async () => {
     const listed = (await callTool(a2, 'ws_list_collabs')).payload.collabs;
     return roleOf({ collabs: listed }, COLLAB) === 'member' ? true : null;
-  }, { timeoutMs: 30000 });
+  }, { timeoutMs: 30000, intervalMs: 250 });
+  const bStatus = await callTool(b, 'ws_status');
+  assert.equal(bStatus.payload.collab.handshakesIn >= 1, true, '可达 peer（B）应答了重启站长的握手');
+  await assertDiscoveryIsolated(a2);
 });
 
 test('治理验收：交接目标离线 → 明确拒绝并指引（在线校验经即时探测通道）', { timeout: 120000 }, async (t) => {
   const studio = await startStudio(t);
   const { a, b, portB, homeB } = studio;
   await b.close();
-  await waitForRebindable(portB);
+  killCoreOf(homeB);
+  await waitForRebindable(portB, { timeoutMs: 30000 });
   const handed = await callTool(a, 'ws_handover', {
     collabId: COLLAB,
     target: INST_B,

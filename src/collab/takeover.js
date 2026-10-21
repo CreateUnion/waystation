@@ -32,7 +32,9 @@ const DEFAULT_SEAT_GRACE_MS = 60000;
 const DEFAULT_HANDOVER_CONFIRM_MS = 120000;
 const DEFAULT_PRESENCE_INTERVAL_MS = 30000;
 const DEFAULT_DIAL_MS = 5000;
-const HANDSHAKE_RESEND_LIMIT = 20;
+/* 启动对表的补发节律与上限：站点端口就位通常在一拍内，上限只防启动失败路径无限重试。 */
+const HANDSHAKE_RETRY_MS = 250;
+const HANDSHAKE_RETRY_LIMIT = 20;
 
 function isPlainObject(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -96,11 +98,77 @@ export function ledgerTermOf(ledger) {
 }
 
 export function managerSeatOfLedger(state, local) {
+  const adopted = adoptedManagerSeatOf(state, local);
+  if (adopted !== undefined) {
+    return adopted;
+  }
   const raw = managerRawOf(local);
   if (!isManagerRaw(raw)) {
     return null;
   }
   return managerSeatWithSession(state, local, raw);
+}
+
+/* 已采纳的任期状态（events 的 termState 覆盖层）领先于本地台账/快照时，它就是本机当前站长。
+ * 成员采纳 manager-changed 后快照尚未拉回时，只看 snapshot 会继续把旧站长当现任（来源判定、
+ * 陈旧 offer 受理都会跟着错）。返回 undefined＝覆盖层不领先，走本地台账/快照。 */
+function adoptedManagerSeatOf(state, local) {
+  const adopted = adoptedTermStateOf(state, local);
+  if (adopted === undefined || !managerOverrideAhead(adopted, local)) {
+    return undefined;
+  }
+  if (adopted.manager === null) {
+    return null;
+  }
+  return managerSeatOfAdopted(state, local, adopted);
+}
+
+function adoptedTermStateOf(state, local) {
+  const adopted = m5RuntimeOf(state).termState?.get?.(local.collabId);
+  return isPlainObject(adopted) && Number.isInteger(adopted.managerTerm) ? adopted : undefined;
+}
+
+function managerOverrideAhead(adopted, local) {
+  const ledger = managerRawLedgerOf(local);
+  const ledgerTerm = ledgerTermOf(ledger);
+  const ledgerVersion = Number.isInteger(ledger?.version) ? ledger.version : 0;
+  const adoptedVersion = Number.isInteger(adopted.version) ? adopted.version : 0;
+  return adopted.managerTerm > ledgerTerm
+    || (adopted.managerTerm === ledgerTerm && adoptedVersion > ledgerVersion);
+}
+
+function managerSeatOfAdopted(state, local, adopted) {
+  if (!isManagerRaw(adopted.manager)) {
+    return undefined;
+  }
+  const sessionId = adoptedSessionIdOf(state, local, adopted.manager);
+  if (typeof sessionId !== 'string' || sessionId === '') {
+    return null;
+  }
+  return managerSeatFrom(adopted.manager, sessionId, adopted.managerTerm);
+}
+
+function adoptedSessionIdOf(state, local, manager) {
+  if (typeof manager.sessionId === 'string' && manager.sessionId !== '') {
+    return manager.sessionId;
+  }
+  return seatSessionOfInstance(state, local, manager.instanceId);
+}
+
+/* 本机权威 (term,version)：termState 覆盖层领先时以它为准——握手与对表必须报同一对值，
+ * 否则「新 manager + 旧 term」会被对端按同 term 不同 manager 判成分叉。 */
+function adoptedPairOf(state, local) {
+  const ledger = local.role === 'manager' ? local.ledger : local.snapshot?.ledger;
+  const ledgerTerm = ledgerTermOf(ledger);
+  const ledgerVersion = Number.isInteger(ledger?.version) ? ledger.version : 0;
+  const adopted = adoptedTermStateOf(state, local);
+  if (adopted !== undefined && managerOverrideAhead(adopted, local)) {
+    return {
+      term: adopted.managerTerm,
+      version: Number.isInteger(adopted.version) ? adopted.version : ledgerVersion,
+    };
+  }
+  return { term: ledgerTerm, version: ledgerVersion };
 }
 
 function managerRawOf(local) {
@@ -438,14 +506,17 @@ export function stopPresenceTicker(state) {
     clearInterval(runtime.presenceTimer);
     runtime.presenceTimer = null;
   }
-  for (const timer of runtime.autoAcceptTimers.values()) {
+  clearTimerMap(runtime.autoAcceptTimers);
+  clearTimerMap(runtime.syncWatch);
+  clearTimerMap(runtime.handshakeRetryTimers);
+  runtime.handshakeRetries?.clear?.();
+}
+
+function clearTimerMap(timers) {
+  for (const timer of timers?.values?.() ?? []) {
     clearTimeout(timer);
   }
-  runtime.autoAcceptTimers.clear();
-  for (const timer of runtime.syncWatch?.values?.() ?? []) {
-    clearTimeout(timer);
-  }
-  runtime.syncWatch?.clear?.();
+  timers?.clear?.();
 }
 
 export function runProbeTick(state) {
@@ -523,7 +594,9 @@ function applyProbeResult(state, local, probeState, result) {
     return;
   }
   bump(state, 'probeFailures');
-  const now = nowMs(state);
+  /* 失联判定同一时钟域：探测失败累计与 managerEvidenceAt 都用单调钟，墙钟前跳/回拨
+   * 不得让一次失败就冻结或让判定长期不生效。 */
+  const now = monoNow(state);
   if (probeState.failSince === null) {
     probeState.failSince = now;
   }
@@ -823,6 +896,9 @@ function removeExpiredRemoteSeat(state, local, entry) {
   if (applied !== null) {
     releaseJoiningOf(state, local.collabId, row.sessionId);
     bump(state, 'seatsRemovedRemote');
+    /* 移除与广播同属站长核义务（设计 §3.2）：只落台账不发名单通告，其余成员会长期保留
+     * 已离席行，直到下一次快照或重新对表。 */
+    broadcastRosterRefresh(state, local);
   }
 }
 
@@ -927,12 +1003,30 @@ export function noteSeatReopened(state, collabId, sessionId) {
 export function sweepSeatGrace(state, now = nowMs(state)) {
   const runtime = m5RuntimeOf(state);
   for (const [key, record] of [...runtime.closedSeats.entries()]) {
+    const local = state.collabs.get(key.split('\u0000')[0]);
+    /* 宽限期内同会话重连即取消离席（设计 §3.2）：席位重新持有桥即视为重开，宽限不再计时。 */
+    if (seatReopenedInGrace(local, record.sessionId)) {
+      if (local !== undefined) {
+        noteSeatReopened(state, local.collabId, record.sessionId);
+      } else {
+        runtime.closedSeats.delete(key);
+      }
+      continue;
+    }
     if (now - record.closedAt < seatGraceMs(state)) {
       continue;
     }
     runtime.closedSeats.delete(key);
-    closeSeatAfterGrace(state, state.collabs.get(key.split('\u0000')[0]), record.sessionId, now);
+    closeSeatAfterGrace(state, local, record.sessionId, now);
   }
+}
+
+function seatReopenedInGrace(local, sessionId) {
+  if (local === undefined) {
+    return false;
+  }
+  const seat = local.seats?.get?.(sessionId);
+  return seat !== undefined && typeof seat.bridgeId === 'string' && seat.bridgeId !== '';
 }
 
 function closeSeatAfterGrace(state, local, sessionId, now) {
@@ -1232,6 +1326,7 @@ function dispatchAutoOffer(state, local, prevManager, target) {
   const expiresAt = new Date(now + handoverConfirmMs(state)).toISOString();
   const offer = {
     offerId,
+    auto: true,
     prevManager,
     target: { instanceId: target.instanceId, sessionId: target.sessionId ?? '' },
     baseTerm: ledgerTermOf(ledger),
@@ -1509,6 +1604,7 @@ function restorableAutoOfferOf(state, local, raw) {
   }
   const offer = {
     offerId: raw.offerId,
+    auto: true,
     prevManager: managerSeatOfLedger(state, local),
     target: raw.target,
     baseTerm: raw.baseTerm,
@@ -1527,7 +1623,8 @@ function restorableAutoOfferOf(state, local, raw) {
 /* —— D15 重发：站长变更未 ack 前按 presence 节律重发（定向 prevManager + 已端点成员）。 —— */
 
 export function rememberPendingChange(state, collabId, entry) {
-  m5RuntimeOf(state).resends.set(collabId, { ...entry, sentAt: nowMs(state), attempts: 1 });
+  const now = nowMs(state);
+  m5RuntimeOf(state).resends.set(collabId, { ...entry, sentAt: now, startedAt: now, attempts: 1, acked: new Set() });
 }
 
 function resendPendingChanges(state, now) {
@@ -1541,13 +1638,50 @@ function resendPendingChanges(state, now) {
       runtime.resends.delete(collabId);
       continue;
     }
+    if (managerChangeSuperseded(state, local, entry)) {
+      runtime.resends.delete(collabId);
+      continue;
+    }
     entry.sentAt = now;
     entry.attempts++;
     resendManagerChanged(state, local, entry);
-    if (entry.attempts > HANDSHAKE_RESEND_LIMIT) {
+    if (resendSettled(state, local, entry, now)) {
       runtime.resends.delete(collabId);
     }
   }
+}
+
+/* 更高任期已在本地落地：旧变更不再有转发价值。 */
+function managerChangeSuperseded(state, local, entry) {
+  const localTerm = ledgerTermOf(local.ledger ?? local.snapshot?.ledger);
+  return Number.isInteger(entry.payload?.term) && localTerm > entry.payload.term;
+}
+
+/* 重发至少持续 managerLossTimeoutMs（覆盖失联判定窗口，重启的旧站长才可能重新收到）；
+ * 之后只有「已知端点目标全部 ack」才停——不设固定尝试次数上限（D15：直到 ack 或被更高任期取代）。 */
+function resendSettled(state, local, entry, now) {
+  const startedAt = Number.isFinite(entry.startedAt) ? entry.startedAt : entry.sentAt;
+  if (now - startedAt < managerLossTimeoutMsOf(state)) {
+    return false;
+  }
+  const targets = resendTargetsOf(state, local, entry);
+  if (targets.length === 0) {
+    return true;
+  }
+  return targets.every((instanceId) => entry.acked?.has?.(instanceId) === true);
+}
+
+function resendTargetsOf(state, local, entry) {
+  const targets = new Set();
+  if (isPlainObject(entry.prevManager) && endpointFor(state, local, entry.prevManager.instanceId) !== undefined) {
+    targets.add(entry.prevManager.instanceId);
+  }
+  for (const member of local.ledger?.members ?? []) {
+    if (member.instanceId !== state.self.instanceId && endpointFor(state, local, member.instanceId) !== undefined) {
+      targets.add(member.instanceId);
+    }
+  }
+  return [...targets];
 }
 
 function resendManagerChanged(state, local, entry) {
@@ -1601,6 +1735,13 @@ function handshakeOne(state, local) {
       return;
     }
     armHandshakeWatch(state, local, sent > 0);
+    /* 启动即对表可能早于本机站点端口就位（入队被拒、sent=0）：没有重试就会永久停在旧任期。
+     * 在这里做有界补发，等发送面可用后再对表一次。 */
+    if (sent === 0) {
+      scheduleHandshakeRetry(state, local);
+      return;
+    }
+    clearHandshakeRetry(state, local);
     return;
   }
   const manager = managerSeatOfLedger(state, local);
@@ -1618,6 +1759,45 @@ function handshakeOne(state, local) {
   armHandshakeWatch(state, local, result.ok === true);
 }
 
+/* 发送面未就位时的一次性补发（有界，避免启动失败路径无限重试）。 */
+function scheduleHandshakeRetry(state, local) {
+  const runtime = m5RuntimeOf(state);
+  if (!(runtime.handshakeRetries instanceof Map)) {
+    runtime.handshakeRetries = new Map();
+  }
+  const attempts = runtime.handshakeRetries.get(local.collabId) ?? 0;
+  if (attempts >= HANDSHAKE_RETRY_LIMIT) {
+    runtime.handshakeRetries.delete(local.collabId);
+    return;
+  }
+  const prior = runtime.handshakeRetryTimers?.get?.(local.collabId);
+  if (prior !== undefined) {
+    clearTimeout(prior);
+  }
+  if (!(runtime.handshakeRetryTimers instanceof Map)) {
+    runtime.handshakeRetryTimers = new Map();
+  }
+  runtime.handshakeRetries.set(local.collabId, attempts + 1);
+  const timer = setTimeout(() => {
+    runtime.handshakeRetryTimers.delete(local.collabId);
+    handshakeOne(state, local);
+  }, HANDSHAKE_RETRY_MS);
+  if (typeof timer.unref === 'function') {
+    timer.unref();
+  }
+  runtime.handshakeRetryTimers.set(local.collabId, timer);
+}
+
+function clearHandshakeRetry(state, local) {
+  const runtime = m5RuntimeOf(state);
+  runtime.handshakeRetries?.delete?.(local.collabId);
+  const timer = runtime.handshakeRetryTimers?.get?.(local.collabId);
+  if (timer !== undefined) {
+    clearTimeout(timer);
+    runtime.handshakeRetryTimers.delete(local.collabId);
+  }
+}
+
 function hasRemoteHandshakeTarget(state, local) {
   return (local.ledger?.members ?? []).some((member) => member.instanceId !== state.self.instanceId
     && endpointFor(state, local, member.instanceId) !== undefined);
@@ -1625,16 +1805,16 @@ function hasRemoteHandshakeTarget(state, local) {
 
 function handshakePayload(state, local, reply) {
   const manager = managerSeatOfLedger(state, local);
-  const version = localVersionOf(local);
-  if (version === null) {
+  if (localVersionOf(local) === null) {
     return null;
   }
+  const pair = adoptedPairOf(state, local);
   const signer = presenceSignerOf(local);
   return {
     event: 'handshake',
     role: local.role,
-    managerTerm: ledgerTermOf(local.ledger ?? local.snapshot?.ledger),
-    version,
+    managerTerm: pair.term,
+    version: pair.version,
     manager: manager === null ? null : { instanceId: manager.instanceId, sessionId: manager.sessionId, identityName: manager.identityName },
     ...managerEndpointPayloadOf(state, local, manager),
     takeover: null,
@@ -1701,6 +1881,7 @@ export async function handleHandshake(state, frame) {
   }
   local.handshakeUnresolved = false;
   recordHandshakeResponse(state, local, frame);
+  noteManagerChangeAck(state, local, frame);
   evaluateRemoteHandshake(state, local, frame);
   if (frame.payload.reply !== true) {
     sendHandshakeReply(state, local, frame);
@@ -1715,8 +1896,27 @@ function recordHandshakeResponse(state, local, frame) {
     manager: frame.payload.manager,
     endpoint: frame.payload.managerEndpoint,
     seat: { instanceId: frame.from.instanceId, sessionId: frame.from.sessionId },
+    at: monoNow(state),
   });
   m5RuntimeOf(state).handshakeResponses.set(local.collabId, responses);
+}
+
+/* D15 的 ack 面：对端以回帧（reply=true）报出同一站长与不低于变更的任期，即视为已收到。 */
+function noteManagerChangeAck(state, local, frame) {
+  if (frame.payload?.reply !== true) {
+    return;
+  }
+  const entry = m5RuntimeOf(state).resends.get(local.collabId);
+  if (entry === undefined || !(entry.acked instanceof Set) || !Number.isInteger(entry.payload?.term)) {
+    return;
+  }
+  if (!Number.isInteger(frame.payload.managerTerm) || frame.payload.managerTerm < entry.payload.term) {
+    return;
+  }
+  if (!sameSeat(frame.payload.manager, entry.payload.manager)) {
+    return;
+  }
+  entry.acked.add(frame.from.instanceId);
 }
 
 function sendHandshakeReply(state, local, frame) {
@@ -1772,10 +1972,11 @@ export function requestSnapshotFrom(state, local, instanceId, purpose = null) {
   if (endpoint === undefined) {
     return false;
   }
+  const pair = adoptedPairOf(state, local);
   const payload = {
     kind: 'request',
-    managerTerm: ledgerTermOf(local.ledger ?? local.snapshot?.ledger),
-    version: localVersionOf(local) ?? 1,
+    managerTerm: pair.term,
+    version: pair.version >= 1 ? pair.version : 1,
     ...(purpose === null ? {} : { purpose }),
   };
   const signer = presenceSignerOf(local);
@@ -1871,8 +2072,9 @@ async function beginTakeOver(state, local, sessionId) {
     return { ok: false, message: collected.message };
   }
   const highest = collected.highest;
-  const localTerm = ledgerTermOf(local.snapshot?.ledger);
-  const localVersion = localVersionOf(local) ?? 0;
+  const localPair = adoptedPairOf(state, local);
+  const localTerm = localPair.term;
+  const localVersion = localPair.version;
   if (highest.term > localTerm) {
     requestSnapshotFrom(state, local, highest.seat.instanceId, 'catchup');
     return { ok: false, message: `可达成员的任期为 ${highest.term}（高于本机 ${localTerm}）——已请求快照，请采纳后再发起接管` };
@@ -1903,10 +2105,18 @@ async function collectHighest(state, local) {
   await waitMs(positiveMs(state.handshakeReplyTimeoutMs, HANDSHAKE_REPLY_TIMEOUT_MS));
   const responses = runtime.handshakeResponses.get(local.collabId) ?? new Map();
   const external = [...responses.values()].filter((entry) => entry.seat?.instanceId !== state.self.instanceId);
+  /* 设计 §2A.7②（仅手动接管）：最高 term 的站长可达即放弃接管。窗口内接管（§2A.6）是
+   * 用户纠错通道，与站长是否可达无关——同一句可达性检查不得把两条路径一起拦下。 */
+  const manager = managerSeatOfLedger(state, local);
+  const windowOnly = windowRemainingOf(state, local) > 0;
+  if (!windowOnly && manager !== null && external.some((entry) => entry.seat?.instanceId === manager.instanceId)) {
+    requestSnapshotFrom(state, local, manager.instanceId, 'catchup');
+    return { ok: false, message: '现任站长经握手应答可达——放弃接管，已请求快照对表' };
+  }
   /* 设计 §2A.7③：名单里还有其他成员却全部无应答 → 拒绝接管并上报，不得用本机旧台账宣告
    * term+1（会与真实更高任期分叉）。名单只剩本机与失联站长时，本机快照即最高已知 pair，
    * 允许以它为基准接管——否则「站长整机断电、只剩一名成员」的核心场景永远无法恢复。 */
-  if (external.length === 0 && hasOtherMemberSeats(local, state)) {
+  if (memberWitnessesOf(local, external).length === 0 && hasOtherMemberSeats(local, state)) {
     return {
       ok: false,
       message: '与其他可达成员对表失败（零应答）——按设计不得以本机旧台账接管；请先恢复联系或改用显式移交',
@@ -1925,10 +2135,20 @@ function hasOtherMemberSeats(local, state) {
   return (ledger?.members ?? []).some((member) => member.role !== 'manager' && member.instanceId !== state.self.instanceId);
 }
 
+/* 对表见证：应答机器必须是在册的非站长成员机器——未知机器的应答不得充当「其他成员」证据。 */
+function memberWitnessesOf(local, external) {
+  const ledger = local.snapshot?.ledger ?? local.ledger;
+  const memberInstances = new Set((ledger?.members ?? [])
+    .filter((member) => member.role !== 'manager')
+    .map((member) => member.instanceId));
+  return external.filter((entry) => memberInstances.has(entry.seat?.instanceId));
+}
+
 function ownHighestOf(state, local) {
+  const pair = adoptedPairOf(state, local);
   return {
-    term: ledgerTermOf(local.snapshot?.ledger),
-    version: localVersionOf(local) ?? 0,
+    term: pair.term,
+    version: pair.version,
     manager: managerSeatOfLedger(state, local),
     seat: { instanceId: state.self.instanceId, sessionId: presenceSignerOf(local)?.sessionId },
   };
@@ -1962,6 +2182,24 @@ function waitMs(ms) {
   });
 }
 
+/* 握手应答是比 presence 更直接的达证据：现任站长机器在本轮对表中应答过，就不满足
+ * 「站长不可达」前提（确认挑战有效期内也可能收到新的握手，须在生效前复查）。 */
+function managerAnsweredHandshake(state, local) {
+  const manager = managerSeatOfLedger(state, local);
+  if (manager === null) {
+    return false;
+  }
+  const answered = m5RuntimeOf(state).handshakeResponses.get(local.collabId)?.get(manager.instanceId);
+  if (answered === undefined) {
+    return false;
+  }
+  /* 应答会留在映射里供他处查询；只有仍在失联判定时限内的应答才算「现在可达」。 */
+  if (!Number.isFinite(answered.at)) {
+    return true;
+  }
+  return monoNow(state) - answered.at <= managerLossMs(state);
+}
+
 /* 站长可达性：本地冻结/失联超时为不可达；否则以 endpoint + presence 新鲜度为证据。 */
 export function managerUnreachable(state, local) {
   const runtime = m5RuntimeOf(state);
@@ -1989,11 +2227,22 @@ export function managerUnreachable(state, local) {
   }) !== true;
 }
 
+/* 生效前复查前提：窗口内接管不受限；手动接管要求站长仍不可达（握手应答即达证据）。 */
+function takeoverPremiseRejection(state, local) {
+  if (windowRemainingOf(state, local) > 0) {
+    return null;
+  }
+  if (managerAnsweredHandshake(state, local)) {
+    return '现任站长刚应答了握手（可达）——放弃接管，先对表收敛';
+  }
+  return managerUnreachable(state, local) ? null : '现任站长已恢复可达——放弃接管，先对表收敛';
+}
+
 /* 手动/窗口接管的生效写入（设计 §2A.6⑤/§2A.7⑤）：以最高台账为基准、移除失联站长、无新窗。 */
 async function finishTakeOver(state, local, sessionId, challenge) {
-  const windowOnly = windowRemainingOf(state, local) > 0;
-  if (!windowOnly && !managerUnreachable(state, local)) {
-    return { ok: false, message: '现任站长已恢复可达——放弃接管，先对表收敛' };
+  const premise = takeoverPremiseRejection(state, local);
+  if (premise !== null) {
+    return { ok: false, message: premise };
   }
   const base = ledgerBaseOf(local);
   if (base === null) {
@@ -2120,11 +2369,14 @@ function isSameManagerRow(member, manager) {
 
 function promoteTakeOver(state, local, ledger, via, authorizedAt) {
   const prevManager = managerSeatOfLedger(state, local);
+  /* 变更必须先于快照入队（设计 §2A.6⑤）：promoteToManager 会给全体成员推新任期快照，
+   * 新站长若在成员收到 manager-changed 之前先收到该快照，A10 会把「无授权证据的更高 term
+   * 快照」拒收并冻结 manager-fork——窗口内接管因此永远收敛不了。 */
+  const payload = managerChangedPayloadOf(state, ledger, via, authorizedAt, prevManager);
+  broadcastManagerChanged(state, local, payload, { sessionId: ledger.manager.sessionId }, prevManager);
   promoteToManager(state, local, ledger);
   clearManagerFreeze(state, local.collabId);
   const signer = managerSeatOfLedger(state, local);
-  const payload = managerChangedPayloadOf(state, ledger, via, authorizedAt, prevManager);
-  broadcastManagerChanged(state, local, payload, signer, prevManager);
   rememberPendingChange(state, local.collabId, { payload, prevManager, fromSessionId: signer?.sessionId });
   m5RuntimeOf(state).acceptedManagers.set(local.collabId, {
     term: ledger.managerTerm,
@@ -2162,11 +2414,7 @@ function selfEndpointOf(state) {
 }
 
 function broadcastManagerChanged(state, local, payload, signer, prevManager) {
-  const targets = new Map((local.ledger?.members ?? []).map((member) => [member.instanceId, member]));
-  if (isPlainObject(prevManager) && !targets.has(prevManager.instanceId)) {
-    targets.set(prevManager.instanceId, prevManager);
-  }
-  for (const member of targets.values()) {
+  for (const member of managerChangeTargetsOf(local, prevManager).values()) {
     if (member.instanceId === state.self.instanceId) {
       continue;
     }
@@ -2176,9 +2424,23 @@ function broadcastManagerChanged(state, local, payload, signer, prevManager) {
     }
     sendTo(state, local.collabId, member.instanceId, endpoint, 'notice', payload, {
       fromSessionId: signer?.sessionId,
-      ...(member.sessionId === undefined ? {} : { toSessions: [member.sessionId] }),
+      ...recipientOptionsOf(member),
     });
   }
+}
+
+/* 变更先于提升发送：成员核此时还没有本地台账，名册取最近快照（含旧站长与其余成员）。 */
+function managerChangeTargetsOf(local, prevManager) {
+  const roster = local.ledger?.members ?? local.snapshot?.ledger?.members ?? [];
+  const targets = new Map(roster.map((member) => [member.instanceId, member]));
+  if (isPlainObject(prevManager) && !targets.has(prevManager.instanceId)) {
+    targets.set(prevManager.instanceId, prevManager);
+  }
+  return targets;
+}
+
+function recipientOptionsOf(entry) {
+  return entry.sessionId === undefined ? {} : { toSessions: [entry.sessionId] };
 }
 
 /* 兼容观测帧（takeover-init）：v4 不再由它产生任期变更，仅保留接收/转达以免旧对端重试被钉死。 */
