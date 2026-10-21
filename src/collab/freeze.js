@@ -376,10 +376,14 @@ function managerSessionOf(local) {
   return managerSeatOfLocal(local)?.sessionId;
 }
 
-/* 本机持有的被并入条（同名交集的其他本地协作）转终止。 */
+/* 本机持有的被并入条（同名交集的其他本地协作）转终止。匹配按席位键（设计 D13）：同机两会话
+ * 同名但席位不相交时不得按实例键误终止；旧数据缺 sessionId 时仍退回实例键。 */
 function terminateLocalCopies(state, local) {
-  const ids = localRosterOf(local).map((entry) => entry.instanceId);
-  for (const other of matchConflictCollabs(state, localNameOf(local), ids)) {
+  const seats = localRosterOf(local).map((entry) => ({
+    instanceId: entry.instanceId,
+    ...(typeof entry.sessionId === 'string' && entry.sessionId !== '' ? { sessionId: entry.sessionId } : {}),
+  }));
+  for (const other of matchConflictCollabs(state, localNameOf(local), seats)) {
     if (other.collabId !== local.collabId) {
       terminateLocalCopy(state, other, '裁定合并：被并入条转终止');
     }

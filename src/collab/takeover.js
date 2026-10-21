@@ -25,6 +25,9 @@ import { seatEntryMatches } from './gate.js';
 
 export const TAKEOVER_PROBE_INTERVAL_MS = 2000;
 export const HANDSHAKE_REPLY_TIMEOUT_MS = 5000;
+/* 权威台账传播的冻结标记（设计 §2A.2 C4）：与同名冲突冻结、任期三态冻结区分。
+ * 复用成员记录既有的 freezeReason 字段承载，不新增持久化格式。 */
+export const LEDGER_FROZEN_REASON = 'ledger';
 /* 手动/窗口接管的一次性挑战时限：超时须重新发起并重新对表。 */
 export const TAKE_OVER_CHALLENGE_TTL_MS = 120000;
 export const SEAT_GRACE_MARGIN_MS = 10000;
@@ -89,7 +92,8 @@ export function m5RuntimeOf(state) {
       resends: new Map(),            // D15 重发记录
       departures: new Set(),
       managerWindowBaseAt: new Map(),
-      pendingManagerClosures: new Map(),   // 显式移交在途时站长会话已关闭：待移交收口后补自动移交
+      pendingManagerClosures: new Map(),   // 挂起期间站长会话已关闭：恢复面上补自动移交
+      managerCatchupAt: new Map(),         // collabId → 启动追赶窗口开启时刻（单调钟）
     };
     runtime.departed = (collabId, seat) => runtime.departures.has(seatKey(collabId, seat.instanceId, seat.sessionId));
     state.m5Runtime = runtime;
@@ -281,7 +285,11 @@ export function persistFreezeReason(state, collabId, reason) {
   }
   local.freezeReason = reason;
   if (local.member !== null && typeof local.member === 'object') {
-    local.member.freezeReason = reason;
+    /* 台账传播的冻结标记描述成员状态的来源，任期冻结只是叠加的停写原因：不得覆盖它，
+     * 否则冻结解除后成员无法再由 active 台账恢复（设计 §2A.2 C4）。 */
+    if (local.member.freezeReason !== LEDGER_FROZEN_REASON) {
+      local.member.freezeReason = reason;
+    }
     persistMember(state, local);
   }
   return writeCarrierFreezeReason(state, collabId, reason);
@@ -295,7 +303,10 @@ export function clearFreezeReason(state, collabId) {
   }
   delete local.freezeReason;
   if (local.member !== null && typeof local.member === 'object') {
-    if (local.member.freezeReason !== undefined) {
+    /* 成员仍处冻结态时保留台账传播标记：任期冻结解除不等于台账已解冻，成员必须等
+     * authoritative active 台账再恢复（设计 §2A.2 C4）。成员已恢复/归档则正常清掉。 */
+    const keepLedgerMark = local.member.freezeReason === LEDGER_FROZEN_REASON && local.member.state === 'frozen';
+    if (local.member.freezeReason !== undefined && !keepLedgerMark) {
       delete local.member.freezeReason;
       persistMember(state, local);
     }
@@ -416,6 +427,9 @@ export function resumeLocal(state, local, reason) {
   }
   bump(state, 'resumptions');
   state.log.info('协作对外写已恢复', { collabId: local.collabId, reason });
+  /* 待办的站长席位关闭（会话已关闭但写闸抑制）必须在任一挂起原因解除时补做：只靠显式移交
+   * 收口唤醒会让 handshake-unresolved 等挂起永久保留站长席位（设计 §2A.4 I3）。 */
+  continueManagerClosureAfterSuspend(state, local.collabId);
 }
 
 function checkSuspensionDeadlines(state, now) {
@@ -439,6 +453,11 @@ function checkSuspensionDeadlines(state, now) {
 export function startLiveness(state) {
   if (state.probeTimer !== null) {
     return;
+  }
+  /* 启动追赶窗口的钟点（设计 §2A.2）：窗口只从 core 启动后的这段时限内开启。 */
+  const runtime = m5RuntimeOf(state);
+  if (!Number.isFinite(runtime.coreStartedAt)) {
+    runtime.coreStartedAt = monoNow(state);
   }
   state.probeTimer = setInterval(() => {
     runProbeTick(state);
@@ -1142,7 +1161,9 @@ export function continueManagerClosureAfterSuspend(state, collabId) {
   runtime.pendingManagerClosures.delete(collabId);
   const local = state.collabs.get(collabId);
   const seat = local?.seats?.get?.(held.sessionId);
-  if (local === undefined || seat === undefined || seat.state !== 'member') {
+  /* 恢复面可能晚于任期收敛：本机已降级为成员时不得再按站长席位收口（closeManagerSeat 读台账）。 */
+  if (local === undefined || local.role !== 'manager' || local.ledger === null
+    || seat === undefined || seat.state !== 'member') {
     return false;
   }
   closeManagerSeat(state, local, seat, nowMs(state));
@@ -1819,6 +1840,7 @@ function handshakeOne(state, local) {
     return;
   }
   if (local.role === 'manager') {
+    openManagerCatchupWindow(state, local.collabId);
     handshakeAsManager(state, local, payload);
     return;
   }
@@ -1836,6 +1858,42 @@ function handshakeOne(state, local) {
     rememberHandshakeRequest(state, local.collabId, manager.instanceId);
   }
   armHandshakeWatch(state, local, result.ok === true);
+}
+
+/* 启动追赶窗口（设计 §2A.2）：旧站长重启追赶的握手证据只在本机作为站长的首个握手轮
+ * （core 启动后的对表）到「首次成功收敛或 managerLossTimeoutMs 到期」之间有效。
+ * 窗口以 core 启动时刻起算：启动超过该时限后才发生的握手不再开启窗口。 */
+export function openManagerCatchupWindow(state, collabId, at = monoNow(state)) {
+  const runtime = m5RuntimeOf(state);
+  if (!(runtime.managerCatchupAt instanceof Map)) {
+    runtime.managerCatchupAt = new Map();
+  }
+  if (!Number.isFinite(runtime.coreStartedAt)) {
+    runtime.coreStartedAt = at;
+  }
+  if (at - runtime.coreStartedAt > managerLossTimeoutMsOf(state)) {
+    return false;
+  }
+  if (runtime.managerCatchupAt.has(collabId)) {
+    return false;
+  }
+  runtime.managerCatchupAt.set(collabId, at);
+  return true;
+}
+
+export function managerCatchupWindowOpen(state, collabId, now = monoNow(state)) {
+  const runtime = m5RuntimeOf(state);
+  const at = runtime.managerCatchupAt?.get?.(collabId);
+  if (!Number.isFinite(at) || !Number.isFinite(runtime.coreStartedAt)) {
+    return false;
+  }
+  return now - runtime.coreStartedAt <= managerLossTimeoutMsOf(state);
+}
+
+/* 收敛即关闭：窗口只服务启动期的一次追赶，不得长期保留降级授权面。 */
+export function closeManagerCatchupWindow(state, collabId) {
+  const held = m5RuntimeOf(state).managerCatchupAt;
+  return held instanceof Map ? held.delete(collabId) : false;
 }
 
 /* 站长侧对表：单人协作无条件跳过（无可对表对端）；有远端成员但全无端点才按未解析挂起。

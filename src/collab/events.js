@@ -14,8 +14,9 @@ import {
 import { applyEndpoint, applyFreezeLocally, broadcastFreeze, downgradeToMember, endpointFor, governanceTargets, memberIdsOf, mutateLedger, notifyLocal, relayGovernance, relayRedistribute, selfIsRelay, sendTo, stopJoinReplay } from './outgoing.js';
 import { applyIncomingJoin, applyIncomingLeave, handleHistoryBundle, handleHistoryRequest } from './sync.js';
 import {
-  appendDeparted, applyManagerFreeze, clearAutoTransferState, clearFreezeReason, clearManagerFreeze, handleHandshake, handleSeatPresenceFrame,
-  handleTakeover, handleTakeoverInit, ledgerTermOf, m5RuntimeOf, managerLossTimeoutMsOf, managerSeatOfLedger, managerUnreachable,
+  LEDGER_FROZEN_REASON, appendDeparted, applyManagerFreeze, clearAutoTransferState, clearFreezeReason, clearManagerFreeze,
+  closeManagerCatchupWindow, handleHandshake, handleSeatPresenceFrame, handleTakeover, handleTakeoverInit, ledgerTermOf,
+  m5RuntimeOf, managerCatchupWindowOpen, managerLossTimeoutMsOf, managerSeatOfLedger, managerUnreachable,
   noteDirectFramePresence, presenceSignerOf, requestSnapshotFrom, resumeLocal, runHandshake, unexpiredAutoInFlight,
 } from './takeover.js';
 import { handleDecision, handleMergeOutcome, handleMergeRequest, handleUnfreeze } from './freeze.js';
@@ -1774,6 +1775,8 @@ function applyAcceptedNextState(state, local, frame, nextState) {
   dropHandoverInFlight(state, local.collabId);
   clearSyncWatch(state, local.collabId);
   applyNextStateWindow(state, local, frame, nextState);
+  /* 首次成功收敛即关闭启动追赶窗口（设计 §2A.2）：窗口只服务旧站长重启后的那一次追赶。 */
+  closeManagerCatchupWindow(state, local.collabId);
   if (local.role === 'manager') {
     const readonlyLedger = local.ledger === null ? null : structuredClone(local.ledger);
     keepReadonlySnapshot(state, local);
@@ -1860,22 +1863,43 @@ function applyMemberManagerRef(state, local, nextState, ledger = undefined) {
   persistMember(state, local);
 }
 
-/* 权威台账覆盖本地终态/冻结（设计 §3.4）：台账仍冻结则保持 frozen，否则回 active。 */
+/* 权威台账覆盖本地终态/冻结（设计 §3.4）：台账仍冻结则保持 frozen，否则回 active。
+ * 由台账传播的冻结只认明确的 authoritative active 台账解除（manager-changed 可能不携台账，
+ * 不能当作解冻依据）；恢复时清掉专用标记与冻结标记，否则下次判据会误认成同名冲突冻结（设计 §2A.2 C4）。 */
 function reviveTerminalMemberStateOf(local, ledger) {
   if (!['completed', 'terminated', 'frozen', 'left'].includes(local.member.state)) {
     return;
   }
-  local.member.state = ledger?.status === 'frozen' ? 'frozen' : 'active';
+  const ledgerFrozen = local.member.freezeReason === LEDGER_FROZEN_REASON;
+  if (ledger?.status === 'frozen') {
+    if (local.member.state !== 'frozen') {
+      markMemberFrozenByLedger(local);
+    }
+    return;
+  }
+  if (ledgerFrozen && ledger?.status !== 'active') {
+    return;
+  }
+  local.member.state = 'active';
   delete local.member.archivedAt;
+  if (ledgerFrozen) {
+    delete local.member.freezeReason;
+    delete local.member.frozenAt;
+    delete local.member.frozenFrom;
+  }
 }
 
 /* 本机同名冲突冻结（非任期三态）：运行时冻结表是任期冻结的权威；无任期冻结而成员已 frozen，
- * 且持久化原因不是三态之一，即冲突冻结（含旧版共享冻结）。 */
+ * 持久化原因也不是三态或台账传播标记，即冲突冻结（含旧版共享冻结）。
+ * 台账传播的冻结不在此列：它必须能由 authoritative active 台账反向恢复（设计 §2A.2 C4）。 */
 function conflictFrozenMemberOf(state, local) {
   if (local.member?.state !== 'frozen' || m5RuntimeOf(state).frozen.has(local.collabId)) {
     return false;
   }
   const reason = local.member.freezeReason ?? local.freezeReason;
+  if (reason === LEDGER_FROZEN_REASON) {
+    return false;
+  }
   return !['manager-offline', 'manager-pending', 'manager-fork'].includes(reason);
 }
 
@@ -1883,8 +1907,10 @@ function markMemberFrozenByLedger(local) {
   if (local.member.state === 'frozen') {
     return;
   }
-  local.member.frozenFrom = local.member.state;
+  /* frozenFrom 只允许 proposed/active（成员记录形态）；终态被台账冻结时按 active 记。 */
+  local.member.frozenFrom = local.member.state === 'proposed' ? 'proposed' : 'active';
   local.member.frozenAt = new Date().toISOString();
+  local.member.freezeReason = LEDGER_FROZEN_REASON;
   local.member.state = 'frozen';
   delete local.member.archivedAt;
 }
@@ -2040,9 +2066,11 @@ function handshakeManagerEvidenceOf(state, local, frame, ledger) {
   return reportedManagerEndpointOk(state, local, manager, response.endpoint);
 }
 
-/* 旧站长重启追赶（§2A.8⑥，2026-10-21 裁定）：握手证据只能服务「本机仍是旧站长、来源是旧名单
- * 成员、本机台账 manager 仍是自己」的追赶；成员/冻结态/本地终态一律不得经握手证据转正。
- * 证据内容仍须与快照完全一致，且不写入 acceptedManager（判决前落记录等于授予通用授权）。 */
+/* 旧站长重启追赶（§2A.8⑥，2026-10-21 裁定；2026-10-22 收紧）：握手证据只能服务
+ * 「本机仍是旧站长、来源是旧名单成员、本机台账 manager 仍是自己」的启动追赶——成员/冻结态/
+ * 本地终态一律不得经握手证据转正。证据只在启动追赶窗口内、且快照来源是本轮应答中最高
+ * (term,version) 持有者时成立；证据内容仍须与快照完全一致，且不写入 acceptedManager
+ * （判决前落记录等于授予通用授权）。 */
 function handshakeCatchupEvidenceOf(state, local, frame, termState) {
   const ledger = frame.payload?.ledger;
   if (local.role !== 'manager' || termState === null || !isPlainObject(ledger)) {
@@ -2051,8 +2079,8 @@ function handshakeCatchupEvidenceOf(state, local, frame, termState) {
   if (ledger.manager === null || ledgerTermOf(ledger) <= termState.managerTerm) {
     return undefined;
   }
-  if (!handshakeManagerEvidenceOf(state, local, frame, ledger)) {
-    return undefined;
+  if (!handshakeRoundAuthorizesCatchup(state, local, frame, ledger)) {
+    return undefined;   // 窗口外或非最高 pair：不得据此降级在位站长
   }
   if (!rosterHadSeat(localRosterOf(local), ledger.manager)) {
     return undefined;   // 来源必须在旧名单（现场成员），名单外主机不构成回归证据
@@ -2062,6 +2090,39 @@ function handshakeCatchupEvidenceOf(state, local, frame, termState) {
     manager: { instanceId: ledger.manager.instanceId, sessionId: ledger.manager.sessionId, identityName: ledger.manager.identityName },
     source: { instanceId: frame.from.instanceId, sessionId: frame.from.sessionId },
   };
+}
+
+/* 启动追赶窗口 + 来源本人直连应答一致 + 来源是本轮最高 (term,version) 持有者（设计 §2A.2）。 */
+function handshakeRoundAuthorizesCatchup(state, local, frame, ledger) {
+  return managerCatchupWindowOpen(state, local.collabId)
+    && handshakeManagerEvidenceOf(state, local, frame, ledger)
+    && handshakeSourceIsHighestPair(state, local, ledger.manager);
+}
+
+/* 本轮握手应答中的最高 pair（设计 §2A.2）：来源应答必须等于最高 (term,version)；任一旁证更高即不授权。 */
+function handshakeSourceIsHighestPair(state, local, manager) {
+  const responses = m5RuntimeOf(state).handshakeResponses.get(local.collabId);
+  const source = responses?.get(manager.instanceId);
+  if (!isHandshakePairReport(source)) {
+    return false;
+  }
+  for (const entry of responses.values()) {
+    if (isHandshakePairReport(entry) && compareHandshakePair(entry, source) > 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isHandshakePairReport(entry) {
+  return isPlainObject(entry) && Number.isInteger(entry.term) && Number.isInteger(entry.version);
+}
+
+function compareHandshakePair(left, right) {
+  if (left.term !== right.term) {
+    return left.term - right.term;
+  }
+  return left.version - right.version;
 }
 
 function rosterHadSeat(roster, seat) {

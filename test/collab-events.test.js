@@ -14,9 +14,10 @@ import { classifyCollabDir } from '../src/collab/legacy.js';
 import { readCarrier } from '../src/collab/carrier.js';
 import {
   applyManagerFreeze, autoTransfer, clearFreezeReason, clearManagerFreeze, managerUnreachable, m5RuntimeOf, noteSeatClosed,
-  persistFreezeReason, runHandshake, runPresenceTick, runProbeTick, sweepSeatGrace, takeOver,
+  openManagerCatchupWindow, persistFreezeReason, runHandshake, runPresenceTick, runProbeTick, sweepSeatGrace, takeOver,
 } from '../src/collab/takeover.js';
 import { rejectHandover, restoreM5State } from '../src/collab/handover.js';
+import { decide } from '../src/collab/freeze.js';
 
 /* M5 接线（设计 §2A/§3.2）：任期受理、auto 追赶门、快照生产端、presence 直连/中继、
  * 离席留痕、自动/显式移交与手动接管。夹具直接构造共享态与席位表，不经协议层形态预检。 */
@@ -344,6 +345,8 @@ test('C2 旧站长重启：旧名单成员的直连握手 + 一致快照仍可�
   const base = ledgerOf({ term: 1, version: 10, manager: managerA, members: [managerB] });
   const local = localOf({ role: 'manager', ledger: base, seats: [seatOf('sess-a', 'manager', 1)], endpoints: [['inst-b', { address: '10.0.0.2', port: 17321 }]] });
   const harness = stateOf(t, local);
+  /* 旧站长重启的追赶证据只在启动追赶窗口内成立（设计 §2A.2）。 */
+  openManagerCatchupWindow(harness.state, COLLAB);
   await handleEvent(harness.state, frameOf('notice', {
     event: 'handshake', role: 'manager', managerTerm: 2, version: 11, manager: managerB, takeover: null, reply: true,
   }, managerB), { remoteAddress: '10.0.0.2' });
@@ -356,6 +359,53 @@ test('C2 旧站长重启：旧名单成员的直连握手 + 一致快照仍可�
   assert.equal(local.role, 'member', '旧站长按更高任期退回成员');
   assert.equal(local.member.manager.instanceId, 'inst-b');
   assert.equal(m5RuntimeOf(harness.state).frozen.has(COLLAB), false);
+});
+
+test('R2 在位站长（启动窗口已过）：在册成员自报高 term + 同内容快照不得降级/删台账', async (t) => {
+  const managerA = { instanceId: 'inst-self', sessionId: 'sess-a', identityName: '本机' };
+  const memberB = { instanceId: 'inst-b', sessionId: 'sess-b', identityName: '乙' };
+  const base = ledgerOf({ term: 1, version: 10, manager: managerA, members: [memberB] });
+  const local = localOf({ role: 'manager', ledger: base, seats: [seatOf('sess-a', 'manager', 1)], endpoints: [['inst-b', { address: '10.0.0.2', port: 17321 }]] });
+  const harness = stateOf(t, local);
+  runHandshake(harness.state, { collabId: COLLAB });
+  harness.mono.now += 300001;   // 超过 managerLossTimeoutMs（300000）：启动追赶窗口已关
+  await handleEvent(harness.state, frameOf('notice', {
+    event: 'handshake', role: 'manager', managerTerm: 99, version: 99, manager: memberB, takeover: null, reply: false,
+  }, memberB), { remoteAddress: '10.0.0.2' });
+  const next = ledgerOf({ term: 99, version: 99, manager: memberB, members: [managerA] });
+  await handleEvent(harness.state, frameOf('snapshot', {
+    kind: 'data', managerTerm: 99, version: 99, digest: ledgerDigest(next), ledger: next,
+  }, memberB), { remoteAddress: '10.0.0.2' });
+  assert.equal(local.role, 'manager', '窗口外不得据此降级在位站长');
+  assert.equal(local.ledger.manager.instanceId, 'inst-self', '在位站长台账不得被替换');
+  assert.equal(m5RuntimeOf(harness.state).frozen.get(COLLAB), 'manager-fork', '无授权更高任期快照按分叉冻结');
+  assert.equal(m5RuntimeOf(harness.state).acceptedManagers.get(COLLAB), undefined, '不写受理记录');
+});
+
+test('R2 窗口内但快照来源不是本轮最高 pair：不得据此降级在位站长', async (t) => {
+  const managerA = { instanceId: 'inst-self', sessionId: 'sess-a', identityName: '本机' };
+  const memberB = { instanceId: 'inst-b', sessionId: 'sess-b', identityName: '乙' };
+  const memberC = { instanceId: 'inst-c', sessionId: 'sess-c', identityName: '丙' };
+  const base = ledgerOf({ term: 1, version: 10, manager: managerA, members: [memberB, memberC] });
+  const local = localOf({
+    role: 'manager', ledger: base, seats: [seatOf('sess-a', 'manager', 1)],
+    endpoints: [['inst-b', { address: '10.0.0.2', port: 17321 }], ['inst-c', { address: '10.0.0.3', port: 17321 }]],
+  });
+  const harness = stateOf(t, local);
+  openManagerCatchupWindow(harness.state, COLLAB);
+  await handleEvent(harness.state, frameOf('notice', {
+    event: 'handshake', role: 'manager', managerTerm: 2, version: 11, manager: memberB, takeover: null, reply: false,
+  }, memberB), { remoteAddress: '10.0.0.2' });
+  await handleEvent(harness.state, frameOf('notice', {
+    event: 'handshake', role: 'manager', managerTerm: 3, version: 12, manager: memberC, takeover: null, reply: false,
+  }, memberC), { remoteAddress: '10.0.0.3' });
+  const fromB = ledgerOf({ term: 2, version: 11, manager: memberB, members: [managerA] });
+  await handleEvent(harness.state, frameOf('snapshot', {
+    kind: 'data', managerTerm: 2, version: 11, digest: ledgerDigest(fromB), ledger: fromB,
+  }, memberB), { remoteAddress: '10.0.0.2' });
+  assert.equal(local.role, 'manager', '非最高 pair 来源不构成追赶证据');
+  assert.equal(local.ledger.manager.instanceId, 'inst-self');
+  assert.equal(m5RuntimeOf(harness.state).frozen.get(COLLAB), 'manager-fork');
 });
 
 test('C2 旧站长重启：快照来源不在旧名单时握手证据不成立（仍冻结）', async (t) => {
@@ -944,6 +994,39 @@ test('C4 活跃成员收到冻结态权威台账：本地收敛为 frozen（保�
   assert.ok(local.member.frozenAt);
 });
 
+test('R1 台账传播的 frozen → authoritative active 快照：成员恢复 active 并清冻结标记', async (t) => {
+  const manager = { instanceId: 'inst-a', sessionId: 'sess-a', identityName: '甲' };
+  const memberRow = { instanceId: 'inst-self', sessionId: 'sess-self', identityName: '本机' };
+  const baseline = ledgerOf({ manager, members: [memberRow], version: 10 });
+  const local = localOf({ ledger: baseline, seats: [seatOf('sess-self')], endpoints: [['inst-a', { address: '10.0.0.1', port: 17321 }]] });
+  const harness = stateOf(t, local);
+  const frozenLedger = ledgerOf({ manager, members: [memberRow], version: 11, status: 'frozen' });
+  await handleEvent(harness.state, frameOf('snapshot', {
+    kind: 'data', managerTerm: 1, version: 11, digest: ledgerDigest(frozenLedger), ledger: frozenLedger,
+  }, manager), { remoteAddress: '10.0.0.1' });
+  assert.equal(local.member.state, 'frozen', '冻结台账先把成员收敛为 frozen');
+  assert.equal(local.member.freezeReason, 'ledger', '台账传播冻结带可区分标记');
+
+  /* manager-changed 可能不携台账：不得把它当作 authoritative active 解冻依据。 */
+  const nextManager = { instanceId: 'inst-b', sessionId: 'sess-b', identityName: '乙' };
+  await handleEvent(harness.state, frameOf('notice', changeOf({
+    via: 'handover', term: 2, version: 12, manager: nextManager,
+    prevManager: { instanceId: 'inst-a', sessionId: 'sess-a' }, offerId: 'offer-r1',
+  }), manager), { remoteAddress: '10.0.0.1' });
+  assert.equal(local.member.state, 'frozen', '未携台账的 manager-changed 不得解除台账传播冻结');
+  assert.equal(local.member.freezeReason, 'ledger');
+
+  const activeLedger = ledgerOf({ term: 2, version: 13, manager: nextManager, members: [memberRow] });
+  await handleEvent(harness.state, frameOf('snapshot', {
+    kind: 'data', managerTerm: 2, version: 13, digest: ledgerDigest(activeLedger), ledger: activeLedger,
+  }, nextManager), { remoteAddress: '10.0.0.2' });
+  assert.equal(local.snapshot?.version, 13, 'authoritative active 快照受理');
+  assert.equal(local.member.state, 'active', '权威台账回 active 时成员必须恢复（设计 §2A.2 C4）');
+  assert.equal(local.member.freezeReason, undefined, '台账传播冻结标记清除');
+  assert.equal(local.member.frozenAt, undefined);
+  assert.equal(local.member.frozenFrom, undefined);
+});
+
 test('C6 同机两会话同名但席位不相交：冻结帧不得误命中另一条协作', async (t) => {
   const seatOne = { instanceId: 'inst-i1', sessionId: 'sess-1', identityName: 'S1' };
   const seatTwo = { instanceId: 'inst-i1', sessionId: 'sess-2', identityName: 'S2' };
@@ -983,6 +1066,35 @@ test('C6 裁定/解冻按席位键作用：同机另一会话的同名协作不�
   second.member.state = 'frozen';
   await handleEvent(harness.state, unfreeze, { remoteAddress: '10.0.0.1' });
   assert.equal(second.member.state, 'frozen', '解冻不得波及席位不相交的副本');
+});
+
+test('R7 合并裁定的本机并条按席位键：同机另一会话的同名协作不得被误终止', (t) => {
+  const seatOne = { instanceId: 'inst-i1', sessionId: 'sess-1', identityName: 'S1' };
+  const seatTwo = { instanceId: 'inst-i1', sessionId: 'sess-2', identityName: 'S2' };
+  const ledger = ledgerOf({
+    manager: seatOne,
+    members: [{ instanceId: 'inst-b', sessionId: 'sess-b', identityName: '乙' }],
+  });
+  ledger.name = '同名项目';
+  ledger.status = 'frozen';
+  ledger.frozenFrom = 'active';
+  const winner = localOf({
+    role: 'manager', ledger, seats: [seatOf('sess-1', 'manager', 1)],
+    endpoints: [['inst-b', { address: '10.0.0.2', port: 17321 }]],
+  });
+  const other = localOf({ seats: [seatOf('sess-2')] });
+  Object.assign(other, {
+    collabId: 'collab-two',
+    member: { ...other.member, collabId: 'collab-two', name: '同名项目', roster: [seatTwo] },
+  });
+  const harness = stateOf(t, winner);
+  harness.state.collabs.set('collab-two', other);
+  const result = decide(harness.state, { collabId: COLLAB, choice: 'merge' });
+  assert.equal(result.ok, true, result.message);
+  assert.equal(winner.ledger.status, 'active', '保留条按合并解冻');
+  assert.equal(other.member.state, 'active', '席位不相交的同机另一会话不得被并入终止');
+  assert.equal(other.member.archivedAt, undefined);
+  assert.ok(harness.sent.some((entry) => entry.type === 'decision' && entry.payload?.choice === 'merge'), '合并裁定照常广播');
 });
 
 test('C5 end 签发者校验：非现任站长不得归档本机协作', async (t) => {
@@ -1082,6 +1194,33 @@ test('I3 显式移交在途时站长会话关闭：到期后补发自动移交',
   assert.equal(m5RuntimeOf(harness.state).pendingManagerClosures.has(COLLAB), false, '收口后待办清除');
   assert.equal(harness.sent.some((entry) => entry.type === 'notice' && entry.payload?.event === 'auto-offer'), true, '显式移交到期后补发自动移交');
   assert.equal(local.seats.has('sess-a'), false, '补做后移除已关闭的站长席位');
+});
+
+test('R3 handshake-unresolved + 站长会话关闭 + 恢复联系：补做自动移交', async (t) => {
+  const manager = { instanceId: 'inst-self', sessionId: 'sess-a', identityName: '本机' };
+  const memberB = { instanceId: 'inst-b', sessionId: 'sess-b', identityName: '乙' };
+  const local = localOf({
+    role: 'manager',
+    ledger: ledgerOf({ manager, members: [memberB] }),
+    seats: [seatOf('sess-a', 'manager', 1)],
+  });
+  const harness = stateOf(t, local);
+  runHandshake(harness.state, { collabId: COLLAB });
+  assert.equal(local.suspended?.reason, 'handshake-unresolved', '无端点成员时启动握手未解析');
+  noteSeatClosed(harness.state, COLLAB, 'sess-a');
+  harness.mono.now = 1000 + 1001;
+  sweepSeatGrace(harness.state);
+  assert.equal(m5RuntimeOf(harness.state).pendingManagerClosures.has(COLLAB), true, '挂起期间记录待办并保留席位');
+  assert.equal(local.seats.has('sess-a'), true);
+
+  /* 恢复联系：成员握手到达，端点学习解除 handshake-unresolved，待办必须在恢复面被唤醒。 */
+  await handleEvent(harness.state, frameOf('notice', {
+    event: 'handshake', role: 'member', managerTerm: 1, version: 10,
+    manager: { instanceId: 'inst-self', sessionId: 'sess-a', identityName: '本机' }, takeover: null, reply: true,
+  }, memberB), { remoteAddress: '10.0.0.2' });
+  assert.equal(m5RuntimeOf(harness.state).pendingManagerClosures.has(COLLAB), false, '恢复联系后待办必须被唤醒');
+  assert.equal(local.seats.has('sess-a'), false, '待办补做后移除已关闭的站长席位');
+  assert.equal(harness.sent.some((entry) => entry.type === 'notice' && entry.payload?.event === 'auto-offer'), true, '补做自动移交并广播 auto-offer');
 });
 
 test('I5 席位宽限用单调钟：墙钟前跳不提前判离', (t) => {
@@ -1960,6 +2099,7 @@ test('旧站长重启降级：直连 handshake 绑定的更高任期快照被采
   const base = ledgerOf({ term: 1, version: 10, manager: managerA, members: [managerB] });
   const local = localOf({ role: 'manager', ledger: base, seats: [seatOf('sess-a', 'manager', 1)], endpoints: [['inst-b', { address: '10.0.0.2', port: 17321 }]] });
   const harness = stateOf(t, local);
+  openManagerCatchupWindow(harness.state, COLLAB);
   m5RuntimeOf(harness.state).handshakeResponses.set(COLLAB, new Map([['inst-b', {
     term: 2, version: 11, manager: { ...managerB }, seat: { instanceId: 'inst-b', sessionId: 'sess-b' },
   }]]));
