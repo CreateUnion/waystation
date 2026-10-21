@@ -7,29 +7,28 @@ import { makeLedger, seedSessionCollab } from './helpers/session-participants.js
 import { createCollabService } from '../src/collab/service.js';
 import { ledgerDigest, loadLedger } from '../src/collab/store.js';
 
-/* 治理面（冻结裁定 / 合流递交 / 显式移交 / 站长变更接收 / 挂起期写闸 / 端点学习）。
+/* 治理面（冻结裁定 / 合流递交 / 显式移交 / 站长变更接收 / 挂起期写闸 / 端点学习 / 转达）。
  *
- * 已删除用例清单（设计依据）：
- * - 「活跃协作的新增成员同意门：approve→member、decline→declined」：共享名单只放活跃席位，
- *   邀请在途态归 invites/pending-invites（设计 §0.2 D1、§2.1、§4.1）；用例不再断言 invited 行。
- * - 「decide merge（保留方）：新增参与者以 invited 入账」：同上（D1）。merge 的意向/执行与
- *   执行帧断言保留；新增参与者只发邀请（同意门后由入席路径写名单），共享名单不写非 member 行。
- * - 「移交全链：旧席位台账已清理」：设计 §2A.4③ 要求保留本地只读副本；现实现删 ledger.jsonl、
- *   保留 snapshot.json——按现状断言快照副本并报 ISSUE（不在测试里固化删除行为）。
- * - 「移交守卫：超时不删（阻塞等待确认）」：新移交立即返回 offerId、不阻塞（§2A.4③）；
- *   改为「等待期挂起 + 到期解挂」用例。
- * - 「manager-changed 旧载荷形态（无 term/version/offerId/digest）」：A1 必填字段（§2A.1 帧表、
- *   §2A.2 A1）；旧形态退役。
- * - 「载荷学习触发陈旧队列重投」：出站队列已改为 M3 机器级 outbox（§5.3），旧夹具的队列在途
- *   条目形态不再成立；端点学习面仍由「端点学习」用例覆盖。
- * - 「端点留痕：非法端点（地址/端口）忽略并计数」：端点形态由协议层 validateFrame 拒收
- *   （src/net/protocol.js 的 endpointEntryRejection），消费面不再重复校验；本套件经 hooks
- *   直投刻意绕过协议层，故不再断言消费面拒收（协议层覆盖见 net-protocol 测试）。
- * - 「抢接意图 taken-over 观测量 / takeover-init 挂起」：抢接公告与收集窗口已删除（§0.4），
- *   挂起改由显式移交在途产生（§2A.4）。
+ * 夹具形态（consume-only）：carrier(session-seats) + 新台账（managerTerm/joinSeqNext/
+ * manager.sessionId/席位 joinSeq）+ seats/ 全部预置——本文件不经 create/invite/join 的产品路径，
+ * 只覆盖治理帧的受理、决策与出站面；创建/邀请/加入的产品路径由 e2e-* 与 join/invite 套件覆盖，
+ * 不能据本文件声称创建/邀请/加入可用。协作域帧携 cap=2、from.sessionId（设计 §1.1/§2.1/§5.1）。
  *
- * 夹具形态：carrier(session-seats) + 新台账（managerTerm/joinSeqNext/manager.sessionId/席位 joinSeq）
- * + seats/；协作域帧携 cap=2、from.sessionId（设计 §1.1/§2.1/§5.1）。 */
+ * 已删除用例 → 设计依据 / 替代覆盖：
+ * - 活跃协作的新增成员同意门（invited 行）：共享名单只放活跃席位（设计 §0.2 D1、§2.1、§4.1）；
+ *   合流新增参与者改发邀请，由「decide merge（保留方）」覆盖。
+ * - decide merge（保留方）新增参与者以 invited 入账：同上（D1）；本地保留方的「解冻 + 本地并集 +
+ *   广播 executed=true」由「decide merge（本地保留方）」覆盖。
+ * - 移交后旧席位台账已清理：§2A.4③ 要求保留本地只读副本；「移交全链」断言 ledger.jsonl 副本
+ *   可读且快照副本存在，不固化删除行为。
+ * - 移交阻塞等待确认：§2A.4③ 立即返回 offerId、不阻塞；改由「移交等待期」覆盖。
+ * - manager-changed 旧载荷形态（无 term/version/offerId/digest）：§2A.1 帧表必填字段。
+ * - 载荷学习触发陈旧队列重投：出站队列已改为机器级 outbox（§5.3）；端点学习面仍由
+ *   「端点学习」覆盖。
+ * - 端点留痕：非法端点（地址/端口）忽略并计数：端点形态由协议层 validateFrame 拒收
+ *   （net-protocol 覆盖）；本套件经 hooks 直投刻意绕过协议层，不再断言消费面拒收。
+ * - 抢接意图 taken-over 观测量 / takeover-init 挂起：抢接公告与收集窗口已删除（§0.4），
+ *   挂起改由显式移交在途产生（§2A.4）。 */
 
 const COLLAB = 'collab-governance';
 const NAME = '联调项目';
@@ -68,16 +67,29 @@ function memberRecordOf(endpoints) {
   };
 }
 
-/* 站长侧：本机 inst-a，成员 inst-b / inst-c 端点已知。 */
-function makeManagerHarness(t, { endpoints = { [MEM.instanceId]: MEM_ENDPOINT, [RIVAL.instanceId]: RIVAL_ENDPOINT }, config = {}, probe = async () => ({ reachable: true, rttMs: 1 }) } = {}) {
+function managerHarnessOptionsOf(options) {
+  return {
+    endpoints: options.endpoints ?? { [MEM.instanceId]: MEM_ENDPOINT, [RIVAL.instanceId]: RIVAL_ENDPOINT },
+    config: options.config ?? {},
+    probe: options.probe ?? (async () => ({ reachable: true, rttMs: 1 })),
+    managerTerm: options.managerTerm ?? 1,
+    version: options.version ?? 3,
+    window: options.window,
+  };
+}
+
+/* 站长侧：本机 inst-a，成员 inst-b / inst-c 端点已知。term/version/window 供接管窗口场景。 */
+function makeManagerHarness(t, options = {}) {
+  const { endpoints, config, probe, managerTerm, version, window } = managerHarnessOptionsOf(options);
   const dir = makeTempDir(t);
   seedSessionCollab(dir, COLLAB, {
     name: NAME,
     status: 'active',
-    managerTerm: 1,
-    version: 3,
-    manager: MGR,
+    managerTerm,
+    version,
+    manager: { ...MGR, term: managerTerm },
     members: membersOf(),
+    managerWindow: window,
     seats: [{ sessionId: MGR.sessionId, role: 'manager', joinSeq: 1 }],
     endpoints,
     snapshotFrom: MGR.instanceId,
@@ -248,6 +260,52 @@ test('decide 守卫：管理员席位缺失 / 非冻结 / 非法 choice 逐拒',
   const refused = member.service.decide({ collabId: COLLAB, choice: 'keep', sessionId: MEM.sessionId });
   assert.equal(refused.ok, false, '成员席在冻结中仍不得裁定');
   assert.ok(refused.message.includes('站长'), refused.message);
+  const memberTerminate = member.service.decide({ collabId: COLLAB, choice: 'terminate', sessionId: MEM.sessionId });
+  assert.equal(memberTerminate.ok, false, '非任期分叉的冻结仍由站长裁定（不得借 terminate 越权）');
+  assert.ok(memberTerminate.message.includes('站长'), memberTerminate.message);
+});
+
+test('冻结写门：任期冻结不改台账 status 也停写，更高任期证据解除后恢复', async (t) => {
+  const harness = makeManagerHarness(t);
+  assert.equal(harness.service.isWritable(COLLAB), true);
+  assert.equal(harness.service.freezeOnManagerOffline(COLLAB), true);
+  assert.equal(harness.service.isWritable(COLLAB), false, '站长侧冻结不改台账 status 也必须拒绝写');
+  const entry = harness.service.list().collabs[0];
+  assert.equal(entry.freezeReason, 'manager-offline', '条目顶层下发冻结原因');
+  assert.equal(entry.sessions.freezeReason, 'manager-offline', '嵌套 sessions.freezeReason 保留兼容');
+  const decision = harness.service.decide({ collabId: COLLAB, choice: 'keep', sessionId: MGR.sessionId });
+  assert.equal(decision.ok, false);
+  assert.match(decision.message, /未冻结/, 'manager-offline 的恢复出口是手动接管，不是同名冲突裁定');
+  await receive(harness.service, frameOf('notice', MEM, changeOf({
+    via: 'takeover-manual',
+    term: 2,
+    version: 4,
+    manager: MEM,
+    authorizedAt: new Date().toISOString(),
+  })));
+  assert.equal(harness.service.isWritable(COLLAB), true, '解冻后恢复可写');
+  assert.equal(harness.service.list().collabs[0].freezeReason, undefined, '解冻后顶层冻结原因消失');
+});
+
+test('任期分叉的成员席出口：terminate 可终止本方分支，merge / keep 不发', async (t) => {
+  const member = makeMemberHarness(t);
+  await receive(member.service, frameOf('notice', RIVAL, changeOf({
+    term: 2,
+    version: 4,
+    manager: RIVAL,
+    endpoint: RIVAL_ENDPOINT,
+  })));
+  assert.equal(member.service.list().collabs[0].sessions.freezeReason, 'manager-fork');
+  for (const choice of ['merge', 'keep']) {
+    const refused = member.service.decide({ collabId: COLLAB, choice, sessionId: MEM.sessionId });
+    assert.equal(refused.ok, false, `${choice} 不适用且成员席无权裁定`);
+  }
+  const terminated = member.service.decide({ collabId: COLLAB, choice: 'terminate', sessionId: MEM.sessionId });
+  assert.equal(terminated.ok, true, terminated.message);
+  const entry = member.service.list().collabs[0];
+  assert.equal(entry.state, 'terminated');
+  assert.equal(entry.archived, true);
+  assert.equal(member.sent.length, 0, '本地归档不广播');
 });
 
 test('裁定执行帧接收：终止命中本机条；本机更早数据时拒绝被并入', async (t) => {
@@ -356,6 +414,24 @@ test('decide merge（非保留方）：改发意向帧，不本地执行', async
   assert.equal(intents[0].payload.executed, false);
 });
 
+test('decide merge（本地保留方）：解冻并本地执行，广播 executed=true 与 winner（名单只含活跃席位）', async (t) => {
+  const harness = makeManagerHarness(t);
+  await freezeViaBroadcast(harness, {
+    extra: { createdAt: '2026-10-22T00:00:00.000Z', manager: { instanceId: RIVAL.instanceId, identityName: RIVAL.identityName } },
+  });
+  harness.sent.length = 0;
+  const merged = harness.service.decide({ collabId: COLLAB, choice: 'merge', sessionId: MGR.sessionId });
+  assert.equal(merged.ok, true, merged.message);
+  assert.ok(merged.message.includes('合并已执行'), merged.message);
+  assert.equal(harness.service.list().collabs[0].state, 'active', '保留方本地解冻');
+  const decisions = harness.sent.filter((frame) => frame.type === 'decision');
+  assert.equal(decisions.length >= 1, true, '执行帧逐成员机器广播');
+  assert.equal(decisions[0].payload.executed, true, '保留方执行而非意向');
+  assert.equal(decisions[0].payload.winner, COLLAB);
+  const ledger = (await harness.service.view({ collabId: COLLAB })).ledger;
+  assert.equal(ledger.members.every((entry) => entry.state === 'member'), true, '共享名单只含活跃席位');
+});
+
 test('decide merge（保留方）：新增参与者只发邀请，共享名单不写非 member 行（D1）', async (t) => {
   const outsider = { instanceId: 'inst-d', sessionId: 'sess-d', identityName: '丁机' };
   const harness = makeManagerHarness(t, {
@@ -374,7 +450,7 @@ test('decide merge（保留方）：新增参与者只发邀请，共享名单�
   const invites = harness.sent.filter((frame) => frame.type === 'invite');
   assert.equal(invites.length, 1, '新增参与者走邀请');
   assert.equal(invites[0].to.instanceId, outsider.instanceId);
-  assert.deepEqual(invites[0].payload.targets, [{ instanceId: outsider.instanceId }], '目标机器按 targets 准入');
+  assert.deepEqual(invites[0].payload.targets, [{ instanceId: outsider.instanceId, targetSessionId: outsider.sessionId }], '目标机器按 targets 准入');
   assert.equal(typeof invites[0].fromSessionId, 'string', '邀请由站长席位签发');
   const decisions = harness.sent.filter((frame) => frame.type === 'decision');
   assert.equal(decisions.length >= 1, true);
@@ -486,7 +562,7 @@ async function finishOnSource(a, acceptPayload) {
   return a.sent.filter((entry) => entry.type === 'notice' && entry.payload.event === 'manager-changed').at(-1);
 }
 
-test('移交全链：目标确认后旧站长降级（保留只读快照）、受让方收到变更后担任站长', async (t) => {
+test('移交全链：目标确认后旧站长降级（保留只读台账与快照副本）、受让方收到变更后担任站长', { timeout: 10000 }, async (t) => {
   const a = makeManagerHarness(t);
   const b = makeMemberHarness(t);
   const { pending, offer } = await startHandover(a);
@@ -509,6 +585,9 @@ test('移交全链：目标确认后旧站长降级（保留只读快照）、�
   assert.equal(changed.payload.manager.sessionId, MEM.sessionId);
   assert.equal(changed.payload.windowEndsAt, undefined, '显式移交不开窗');
   assert.equal(a.service.list().collabs[0].role, 'member', '旧站长降级');
+  assert.equal(existsSync(join(a.dir, 'collabs', COLLAB, 'ledger.jsonl')), true, '保留本地台账只读副本（§2A.4③）');
+  const keptLedger = loadLedger(a.dir, COLLAB);
+  assert.equal(keptLedger.corrupt, false, '只读台账副本仍可读');
   assert.equal(existsSync(join(a.dir, 'collabs', COLLAB, 'snapshot.json')), true, '保留只读快照副本');
 
   await receive(b.service, frameOf('notice', MGR, changed.payload));
@@ -600,7 +679,11 @@ test('A1 站长变更接收：来源为现任站长 → 更新引用并记席位
     manager: { instanceId: RIVAL.instanceId, sessionId: RIVAL.sessionId, identityName: RIVAL.identityName },
   })));
   assert.equal(rogue.service.list().collabs[0].state, 'frozen', '来源非现任站长 → 冻结分叉');
+  assert.equal(rogue.service.list().collabs[0].sessions.freezeReason, 'manager-fork', '冻结原因可读（嵌套兼容）');
+  assert.equal(rogue.service.list().collabs[0].freezeReason, 'manager-fork', '条目顶层下发冻结原因');
   assert.equal(memberRecordOnDisk(rogue.dir).manager.instanceId, MGR.instanceId, '不采纳');
+  const blocked = await rogue.service.send({ collabId: COLLAB, text: '分叉期消息', type: 'issue', sessionId: MEM.sessionId });
+  assert.equal(blocked.ok, false, '冻结即停写');
 });
 
 test('移交等待期：常规写被拒（offer 后即挂起）；accept 到达后照常完成并解挂', async (t) => {
@@ -643,13 +726,7 @@ test('移交回执来源校验：非本次目标的 accept 被忽略并计数', 
   assert.equal(a.service.stats().eventMismatch, before + 1, '来源不符计数');
 });
 
-test('席位交回：A→B 移交后 B 可把席位交回 A', {
-  /* 产品缺陷 ISSUE（M9 归因）：降级路径删除 ledger.jsonl、只留 snapshot.json，目录因此被判
-   * 「carrier-without-ledger → recovery」只读（assertWritable 拒绝一切写入与协作域帧）——
-   * 旧站长降级后无法再接收任何帧，交回链不可达。设计 §2A.4③ 要求保留本地台账只读副本，
-   * 修复前本用例按跳过记录；主链（confirm→降级→快照副本）由上一用例覆盖。 */
-  skip: '产品缺陷 ISSUE：降级删除台账使目录被判 recovery 只读，旧站长无法再接收入站帧/交回席位',
-}, async (t) => {
+test('席位交回：A→B 移交后 B 可把席位交回 A（降级方保留只读副本，仍可受让）', async (t) => {
   const a = makeManagerHarness(t);
   const b = makeMemberHarness(t, { endpoints: { [MGR.instanceId]: MGR_ENDPOINT, [MEM.instanceId]: MEM_ENDPOINT } });
   const { offer } = await startHandover(a);
@@ -716,7 +793,7 @@ test('冲突裁定族零匹配：拒绝并计数（freezeUnmatched）', async (t
   assert.equal(harness.service.stats().freezeUnmatched >= 1, true);
 });
 
-/* —— 端点学习与转达（M7-F1 / G-I14） —— */
+/* —— 端点学习与转达（设计 §2A.8④/§5.1：旧站长向其余成员转发变更，from 保持原发席位） —— */
 
 test('端点学习：manager-changed 携新站长端点即学得', async (t) => {
   const harness = makeMemberHarness(t);
@@ -729,22 +806,29 @@ test('端点学习：manager-changed 携新站长端点即学得', async (t) => 
   assert.deepEqual(memberRecordOnDisk(harness.dir).endpoints[RIVAL.instanceId], { address: '127.0.0.9', port: 17321 }, '成员学到新站长端点');
 });
 
-test('转达保留原发席位：转达的 manager-changed 不改写 from、接收方采纳新站长', async (t) => {
-  const relay = makeMemberHarness(t);
-  const change = changeOf({
-    term: 2,
+test('旧站长转达站长变更：向其余成员转发且 from 保持原发席位', async (t) => {
+  /* 场景：站主任期 2 的窗口内被成员 RIVAL 接管（A3）。旧站长接到变更后降级，并须把变更
+   * 转发给其余成员（§2A.8④）；转达帧的 from 仍是签发者 RIVAL——改写为转达者会让接收方
+   * 把旧站长当成新站长。 */
+  const harness = makeManagerHarness(t, {
+    managerTerm: 2,
+    version: 3,
+    window: { windowBaseTerm: 2, windowEndsAt: new Date(Date.now() + 60000).toISOString() },
+  });
+  harness.sent.length = 0;
+  await receive(harness.service, frameOf('notice', RIVAL, changeOf({
+    via: 'takeover',
+    term: 3,
     version: 4,
     manager: { instanceId: RIVAL.instanceId, sessionId: RIVAL.sessionId, identityName: RIVAL.identityName },
+    windowBaseTerm: 2,
+    authorizedAt: new Date().toISOString(),
     endpoint: RIVAL_ENDPOINT,
-  });
-  await receive(relay.service, frameOf('notice', MGR, change));
-  const relayed = relay.sent.filter((entry) => entry.type === 'notice' && entry.payload.event === 'manager-changed').at(-1);
-  if (relayed !== undefined) {
-    assert.equal(relayed.from.instanceId, MGR.instanceId, '转达帧保留原发实例');
-    assert.equal(relayed.from.sessionId, MGR.sessionId, '转达帧保留原发席位');
-  }
-  const target = makeMemberHarness(t);
-  await receive(target.service, frameOf('notice', MGR, change));
-  assert.equal(memberRecordOnDisk(target.dir).manager.instanceId, RIVAL.instanceId, '接收方采纳真实新站长');
-  assert.equal(memberRecordOnDisk(target.dir).endpoints[RIVAL.instanceId]?.address, RIVAL_ENDPOINT.address);
+  })));
+  assert.equal(harness.service.list().collabs[0].role, 'member', '旧站长按更高任期降级');
+  const relayed = harness.sent.filter((entry) => entry.type === 'notice' && entry.payload?.event === 'manager-changed');
+  assert.equal(relayed.length, 1, '向其余成员转达变更（不得静默丢弃）');
+  assert.equal(relayed[0].to.instanceId, MEM.instanceId, '转达给其他成员机器');
+  assert.equal(relayed[0].from.instanceId, RIVAL.instanceId, 'from 保持原发实例');
+  assert.equal(relayed[0].from.sessionId, RIVAL.sessionId, 'from 保持原发席位');
 });

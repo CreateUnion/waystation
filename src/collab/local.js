@@ -36,10 +36,13 @@ function isSeatRoleStateShape(record) {
   return SEAT_ROLES.includes(record.role) && SEAT_STATES.includes(record.state);
 }
 
-/* 已入席的席位必须能回答「第几位、何时入席」；joining 阶段的席位由加入域先落记录，
- * 序号与入席时刻要等站长名单确认后才补——两段式期间允许缺省。 */
+/* 已收敛的席位必须能回答「第几位、何时入席」；joining 阶段与 member(unverified) 由加入域
+ * 先落记录，序号与入席时刻要等含本席的快照到达后才回填——两段式期间允许缺省。 */
 function isSeatMemberComplete(record) {
-  return record.state !== 'member' || (isSeatSeqValue(record.joinSeq) && isTimestamp(record.joinedAt));
+  if (record.state !== 'member' || record.unverified === true) {
+    return true;
+  }
+  return isSeatSeqValue(record.joinSeq) && isTimestamp(record.joinedAt);
 }
 
 function isSeatTimeShape(record) {

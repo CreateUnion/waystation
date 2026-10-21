@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { collabDir, carrierFilePath, runDir } from '../src/paths.js';
 import { makeTempDir } from './helpers.js';
@@ -8,6 +8,7 @@ import { createCollabService } from '../src/collab/service.js';
 import { readCarrierFormat } from '../src/collab/carrier.js';
 import { readMigration, readRecovery } from '../src/collab/migration.js';
 import { seatFilePath } from '../src/paths.js';
+import { ledgerDigest } from '../src/collab/store.js';
 
 /* M2 运行时席位与本地投递：席位载入/派生、本机旁路、暂存补投、桥注册、核心存续、legacy/recovery 写门、
  * 绑定表退役与新建协作的载体/席位落盘。夹具直接落新形态文件（M1 台账形态 + M8 载体标记）。 */
@@ -106,6 +107,41 @@ function carrierOf(collabId) {
     snapshotVersion: 1,
     createdAt: NOW,
   };
+}
+
+/* 两段式入席重启夹具：成员侧（站长在远端），席位文件是 member(unverified) 且缺 joinSeq/joinedAt。 */
+function seedUnverifiedMemberOf(dir) {
+  const collabId = 'collab-unverified-restart';
+  const manager = { instanceId: 'inst-peer', sessionId: 'sess-mgr', identityName: '对端', term: 1 };
+  const ledger = {
+    version: 2,
+    managerTerm: 1,
+    joinSeqNext: 4,
+    collabId,
+    name: '两段式',
+    topic: '入席收敛',
+    mode: 'managed',
+    status: 'active',
+    manager,
+    members: [
+      { ...manager, role: 'manager', state: 'member', joinSeq: 1, joinedAt: NOW },
+      { instanceId: 'inst-self', sessionId: 'sess-unv', identityName: '本机', role: 'member', state: 'member', joinSeq: 3, joinedAt: NOW },
+    ],
+    board: [],
+    createdAt: NOW,
+    updatedAt: NOW,
+  };
+  mkdirSync(join(collabDir(dir, collabId), 'seats'), { recursive: true });
+  writeJson(carrierFilePath(dir, collabId), { ...carrierOf(collabId), manager });
+  writeJson(join(collabDir(dir, collabId), 'ledger.jsonl'), ledger);
+  writeJson(join(collabDir(dir, collabId), 'snapshot.json'), {
+    version: ledger.version, digest: ledgerDigest(ledger), receivedAt: NOW,
+    from: { instanceId: manager.instanceId, identityName: manager.identityName }, ledger,
+  });
+  writeJson(seatFilePath(dir, collabId, 'sess-unv'), {
+    version: 1, sessionId: 'sess-unv', role: 'member', state: 'member', muted: false, unverified: true,
+  });
+  return { collabId, manager, ledger };
 }
 
 /* 双席夹具：一场站长席 + 一场成员席，均在本机；台账名单与新形态一致。 */
@@ -697,6 +733,126 @@ test('能力闸门：未知先探测、不支持明确拒绝、已知支持不�
   known.service.close();
 });
 
+test('M5 重启恢复冻结：载体 freezeReason 回填，重启后仍停写', async (t) => {
+  const { dir, delivered } = makeService(t);
+  const collabId = seedTwoSeats(dir);
+  const live = reopen(t, dir, delivered);
+  assert.equal(live.isWritable(collabId), true);
+  assert.equal(live.freezeOnManagerOffline(collabId), true);
+  assert.equal(live.isWritable(collabId), false);
+  live.close();
+
+  const restarted = reopen(t, dir, delivered);
+  assert.equal(restarted.isWritable(collabId), false, '重启后运行态容器为空，仍须按载体原因停写');
+  const entry = restarted.list().collabs.find((item) => item.collabId === collabId);
+  assert.equal(entry.freezeReason, 'manager-offline', '冻结原因随载体恢复并下发到条目顶层');
+  restarted.close();
+});
+
+test('邀请入口能力闸门：加入域 ws_invite 对不支持目标拒绝且探测一次', async (t) => {
+  const { dir } = makeService(t);
+  const collabId = seedTwoSeats(dir);
+  let probes = 0;
+  const service = reopen(t, dir, [], {
+    probeCapability: async () => {
+      probes++;
+      return { ok: true, capability: 'unsupported' };
+    },
+    knownHosts: { remember: () => {}, lookup: () => ({ address: '127.0.0.1', port: 17322 }), participantsOf: () => undefined },
+  });
+  const refused = await service.join.createInvite({ collabId, managerSessionId: 'sess-mgr', targetInstanceId: 'inst-peer' });
+  assert.equal(refused.ok, false);
+  assert.match(refused.message, /不支持会话级协作/);
+  assert.equal(probes, 1, '未知能力：邀请前先单播探测一次');
+  assert.equal(existsSync(join(collabDir(dir, collabId), 'invites.json')), false, '拒绝路径不留邀请簿记');
+  service.close();
+});
+
+test('邀请入口能力闸门：已知支持不重复探测', async (t) => {
+  const { dir } = makeService(t);
+  const collabId = seedTwoSeats(dir);
+  let probes = 0;
+  const service = reopen(t, dir, [], {
+    probeCapability: async () => {
+      probes++;
+      return { ok: true, capability: 'unknown' };
+    },
+    knownHosts: { remember: () => {}, lookup: () => ({ address: '127.0.0.1', port: 17322 }), participantsOf: () => 2 },
+  });
+  const invited = await service.join.createInvite({ collabId, managerSessionId: 'sess-mgr', targetInstanceId: 'inst-peer' });
+  assert.equal(invited.ok, true, invited.message);
+  assert.equal(probes, 0, '已知支持不重复探测');
+  service.close();
+});
+
+test('M7 同源：forum 成员数按席位计（本机双席 + 远端一席 = 3）', async (t) => {
+  const { service, dir } = makeService(t);
+  const created = service.create({
+    name: '讨论',
+    topic: '议题',
+    targets: [{ instanceId: 'inst-peer', identityName: '对端', address: '127.0.0.1', port: 17322 }],
+    mode: 'forum',
+    sessionId: 'sess-forum-a',
+  });
+  assert.equal(created.ok, true, created.message);
+  const collabId = created.collabId;
+  service.close();
+
+  writeSeat(dir, collabId, seatOf('sess-forum-b'));
+  appendFileSync(
+    join(collabDir(dir, collabId), 'members.jsonl'),
+    `${JSON.stringify({ eventId: 'evt-remote-1', kind: 'join', instanceId: 'inst-peer', identityName: '对端', ts: NOW })}\n`,
+    'utf8',
+  );
+  const reopened = reopen(t, dir, []);
+  const entry = reopened.list().collabs.find((item) => item.collabId === collabId);
+  assert.equal(entry.memberCount, 3, '同机双席 + 远端一席（不得按机器折叠成 2）');
+  assert.equal(entry.seatCount, 3, 'seatCount 与观察窗席位口径同源');
+  reopened.close();
+});
+
+test('服务层治理写收紧：有席位表时缺会话标识一律拒绝（显式兼容旁路除外）', async (t) => {
+  const { dir, delivered } = makeService(t);
+  const collabId = seedTwoSeats(dir);
+  const service = reopen(t, dir, delivered);
+  const decided = service.decide({ collabId, choice: 'keep' });
+  assert.equal(decided.ok, false);
+  assert.match(decided.message, /会话标识/, '绕过工具面的调用方同样被席位授权拒绝');
+  const ended = service.end({ collabId });
+  assert.equal(ended.ok, false);
+  assert.match(ended.message, /会话标识/);
+  service.close();
+
+  const compat = reopen(t, dir, delivered, { legacySessionlessWrites: true });
+  const compatDecided = compat.decide({ collabId, choice: 'keep' });
+  assert.doesNotMatch(compatDecided.message, /会话标识/, '显式兼容旁路只对构造时开启的旧调用方生效');
+  assert.match(compatDecided.message, /冻结/, '旁路后进入业务判定');
+  compat.close();
+});
+
+test('两段式入席重启：unverified member 缺 joinSeq 可载入，快照回填后转 verified 可发送', async (t) => {
+  const { dir, delivered } = makeService(t);
+  const { collabId, manager, ledger } = seedUnverifiedMemberOf(dir);
+  const service = reopen(t, dir, delivered);
+  assert.equal(service.localSeatOf(collabId, 'sess-unv')?.unverified, true, '缺 joinSeq 的 unverified 席位重启后可载入');
+  assert.equal((await service.send({ collabId, text: '未收敛', type: 'issue', sessionId: 'sess-unv' })).ok, false, '未收敛不得发送');
+
+  const next = { ...ledger, version: 3, updatedAt: NOW };
+  const frame = {
+    v: 1, cap: 2, type: 'snapshot', msgId: 'snap-unv-1', collabId, ts: NOW,
+    from: { instanceId: manager.instanceId, sessionId: manager.sessionId, identityName: manager.identityName, port: 17322 },
+    payload: { kind: 'data', version: next.version, managerTerm: 1, digest: ledgerDigest(next), ledger: next },
+  };
+  const admitted = await service.hooks.admit(frame, { remoteAddress: '127.0.0.1' });
+  assert.equal(admitted.ok, true, JSON.stringify(admitted));
+  await service.hooks.consume(frame, { remoteAddress: '127.0.0.1' });
+  assert.equal(service.localSeatOf(collabId, 'sess-unv')?.unverified, false, '含本席快照清除 unverified');
+  const onDisk = JSON.parse(readFileSync(seatFilePath(dir, collabId, 'sess-unv'), 'utf8'));
+  assert.deepEqual({ joinSeq: onDisk.joinSeq, joinedAt: onDisk.joinedAt, unverified: onDisk.unverified }, { joinSeq: 3, joinedAt: NOW, unverified: undefined }, '回填序号/时刻并落盘为 verified');
+  assert.equal((await service.send({ collabId, text: '已收敛', type: 'issue', sessionId: 'sess-unv' })).ok, true, '收敛后可发送');
+  service.close();
+});
+
 test('接管授权：成员席可发起（不再被 managerOnly 拦下）', async (t) => {
   const { dir, delivered } = makeService(t);
   const collabId = seedTwoSeats(dir);
@@ -727,6 +883,7 @@ function reopen(t, dir, delivered, overrides = {}) {
     }),
     deliveryStatusOf: overrides.deliveryStatusOf ?? null,
     localSeatDeliveryOf: overrides.localSeatDeliveryOf ?? null,
+    legacySessionlessWrites: overrides.legacySessionlessWrites === true,
     log: quietLog(),
     syncPeerPicker: () => [],
   });

@@ -789,16 +789,35 @@ function storeAcceptedSnapshot(state, local, record) {
   }
 }
 
-/* 快照含本席 → 清除 unverified（两段式入席的收敛面，设计 §4.4⑤）：自此可发消息。 */
+/* 快照含本席 → 回填 joinSeq/joinedAt 并清除 unverified（两段式入席的收敛面，设计 §4.4⑤）：
+ * 自此可发消息。名单行缺序号/时刻时保持 unverified（不得写出形态非法的 verified 席位）。 */
 function clearUnverifiedSeats(state, local, ledger) {
   const members = Array.isArray(ledger?.members) ? ledger.members : [];
   for (const seat of local.seats?.values?.() ?? []) {
-    if (seat.unverified !== true || !isSelfSeatIn(members, state.self.instanceId, seat.sessionId)) {
-      continue;
+    if (seat.unverified === true) {
+      clearUnverifiedSeatOf(state, local, members, seat);
     }
-    upsertLocalSeat(local, { ...seat, unverified: false }, { persist: true, dataDir: state.dataDir });
-    bump(state, 'unverifiedCleared');
   }
+}
+
+function clearUnverifiedSeatOf(state, local, members, seat) {
+  const row = selfSeatRowOf(members, state.self.instanceId, seat.sessionId);
+  if (row === null) {
+    return;
+  }
+  const joinSeq = Number.isInteger(seat.joinSeq) ? seat.joinSeq : row.joinSeq;
+  const joinedAt = typeof seat.joinedAt === 'string' ? seat.joinedAt : row.joinedAt;
+  if (!Number.isInteger(joinSeq) || typeof joinedAt !== 'string') {
+    bump(state, 'unverifiedBackfillMissing');
+    return;
+  }
+  upsertLocalSeat(local, { ...seat, joinSeq, joinedAt, unverified: false }, { persist: true, dataDir: state.dataDir });
+  bump(state, 'unverifiedCleared');
+}
+
+function selfSeatRowOf(members, instanceId, sessionId) {
+  return members.find((member) => member.instanceId === instanceId
+    && (member.sessionId === undefined || member.sessionId === sessionId)) ?? null;
 }
 
 function isSelfSeatIn(members, instanceId, sessionId) {

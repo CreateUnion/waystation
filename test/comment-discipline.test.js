@@ -11,43 +11,14 @@ const repoRoot = fileURLToPath(new URL('..', import.meta.url));
  * 只扫 src/ 与 bin/（同 stdout 纪律扫描口径）：测试夹具会刻意构造违规样本串。 */
 const PLAN_REFERENCE_PATTERN = /批次\s*\d|WP-\d+|\bG\d+\b|\bT\d+\b|\bM[1-9]\b/;
 
-/* 迁移期存量基线（跨模块欠账）：下列行是提交树（HEAD 01b4e34）中实际存在的编号引用，由各属主清理
- * （M2 的 service.js/main.js 条目待 M2 清理）。基线按「相对路径 + 整行文本」精确匹配——同文件
- * 新增或改写出的违规不会命中，仍会被拦截；清理后可逐条删除。
- * 新增违规一律不得加入本表（本表只减不增）——未提交工作树里新写入的编号不属于存量。 */
+/* 迁移期存量基线（跨模块欠账）：下列行是提交树中实际存在的编号引用，由各属主清理。
+ * 基线按「相对路径 + 整行文本」精确匹配——同文件新增或改写出的违规不会命中，仍会被拦截；
+ * 清理后可逐条删除。新增违规一律不得加入本表（本表只减不增）——未提交工作树里新写入的编号
+ * 不属于存量。 */
 const LEGACY_OFFENDERS = new Set([
   'src/collab/join.js||/* participants 是 0.2.0 的加法能力字段（三态判定归 M12/M6）：这里只透传，不在名字解析面丢弃。 */',
   'src/collab/local.js||/* 契约面（M2 → 全体）：只给席位事实，不暴露暂存/inbox 运行态。 */',
   'src/collab/local.js||/** 席位变化后同步派生缓存（旧模块仍读 local.role；M3/M5 迁完后它只作兼容读面）。 */',
-  'src/collab/service.js||/* 席位 inbox 只保留近期投递事实（运行态观测面；落盘 inbox.jsonl 归 M3）。 */',
-  'src/collab/service.js||/* 出站/入站模块（M3）经 state 直取的本机旁路面：与 API 同源，避免两套注入入口。 */',
-  'src/collab/service.js||/* 投递查询面（M3 → M6）：本机旁路的席位明细优先取内存事实，未命中再委托接收管线的落盘账；',
-  'src/collab/service.js||/* 能力闸门（设计 §7.2；契约 M6：闸门落服务层）：邀请 / 申请 / 建协作前要求目标支持会话级协作。',
-  'src/collab/service.js||/* 生命周期与交接面（M5 → M6）：目标侧确认、冻结判定/解除、presence 视图与自动移交。 */',
-  'src/collab/service.js||/* 席位运行面（契约 M2 → M3/M4/M5/M6/M7）：读席位、本机旁路注入、桥注册、核心存续。',
-  'src/collab/service.js||/* 站长转移的席位角色迁移（M5 移交/接管调用）：同时改席位与派生缓存并落盘。 */',
-  'src/collab/service.js||/* 邀请簿记面（M4 → M6）：邀请由站长会话发起/撤回，接受与确认由目标会话发起。 */',
-  'src/collab/service.js||/* 签名与 M4 契约一致：confirmJoining(joinId, sessionId, {instanceId,managerTerm,activeSeats?})。 */',
-  'src/collab/service.js||/* 加入域两个入口的席位收尾（M2 兼容桥）：加入域以 bound（本机接线）/seated（申请人已在册）',
-  'src/collab/service.js||/* 确认写名单后由建立判定推进 proposed→active（M5 的建立规则）。 */',
-  'src/collab/service.js||* 旧形态（0.1.x）由 M8 判据归档为只读、半写目录按 recovery 只读；单条失败只计数跳过，',
-  'src/collab/service.js||/* 所有席位移除路径（服务离席/结束、M5 心跳超时与会话关闭直接调 removeLocalSeat）共用同一收尾。 */',
-  'src/collab/service.js||/* 旧协作的只读列表项（设计 §10）：状态按 completed 展示，内容取自 M8 只读读取器。 */',
-  'src/collab/service.js||/* 无显式调用会话时的兼容取数：本机恰一席＝该席（多席必须显式，M6 工具面穿 sessionId）。 */',
-  'src/collab/service.js||/* legacy 判定：本进程刚落地的邀请目录只有 member.json（M4 尚未写 invite-stub carrier）——',
-  'src/collab/service.js||* 无显式会话标识时保留整机兼容（M6 工具面尚未全量穿 sessionId；接线后由 seatAuthRefusalOf 收紧），',
-  'src/collab/service.js||* 设计 §8 要求 carrier 先于台账；createCollab 属 M3 且内部直接落台账，本层只能在其后补写——',
-  'src/collab/service.js||/* 创建后台账读回自检（跨属主集成面）：M3 的台账写入形态尚未切到 M1 形态时，本层先把',
-  "src/collab/service.js||state.log.warn('新建协作的台账读回失败（重启将判损坏，待台账写面切到 M1 形态）', { collabId });",
-  'src/collab/service.js||/* 离开/结束的席位清理：成功结果之后执行（离席广播与标记由 M5 负责，本层只维护本机席位态）。',
-  'src/collab/service.js||/* 站长席可离席（设计 §3.4）：先触发自动移交（M5）；无接手者＝直接终态，移交失败＝如实拒绝，',
-  'src/collab/service.js||/* 离席/席位移除必须释放未确认的两段式记录（M4 契约）：否则同键再次入席被旧 joining 挡住。 */',
-  'src/collab/service.js||/* 邀请的无席位直投：受邀会话的桥在线即交付；离线不暂存（没有席位可挂），由 M4 的挂起邀请',
-  'src/collab/service.js||* 丢帧必须同时释放 msgId 去重：否则发送方重试同一 msgId 会被判 duplicate（M3 计为成功），消息永久丢失。 */',
-  'src/collab/service.js||/* 桥断开＝席位会话结束起点（M5 的宽限计时/自动移交判据）。 */',
-  'src/core/main.js||/* 治理帧自报端点与单调钟（M5）：移交/接管的 endpoint 与超时判定不得用墙钟。 */',
-  'src/core/main.js||* 查询面也在此接上——M6 的「机器级状态＋本机席位明细」不得私接 net 内部结构（契约 M3 → M6）。 */',
-  'src/core/main.js||/* 席位扇出面（M2 运行时）：两件齐备即启用逐席 toSessions 扇出与本机旁路暂存/补投。',
   'src/core/routing.js||/* toSessions 定向（M3 携）：只投列表中的本机席位；坏目标隔离，不把整帧投给其他席位。 */',
   'src/core/routing.js||* toSessions 是**帧顶层**字段（M3 契约）：字段存在但形态非法时不回落广播——坏目标只隔离自身，',
 ]);

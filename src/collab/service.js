@@ -22,13 +22,13 @@ import { consumeInviteChallenge, consumeInviteWaiver, grantInviteWaiver, issueIn
 import { JOIN_REQUEST_RETRY_MAX_MS, JOIN_REQUEST_RETRY_MS, JOIN_REQUEST_TTL_MS, createJoinDomain, resolveJoinTarget } from './join.js';
 import { ID_PATTERN, POST_KINDS } from '../net/protocol.js';
 import { shortSessionId } from '../util/short-id.js';
-import { decideAdmission, SYNC_REQUEST_MAX, SYNC_REQUEST_WINDOW_MS } from './gate.js';
+import { decideAdmission, frozenWriteRefusalOf, managerFreezeReasonOf, SYNC_REQUEST_MAX, SYNC_REQUEST_WINDOW_MS } from './gate.js';
 import { handleEvent, maybeEstablish } from './events.js';
 import { localModeOf, localNameOf, localRosterOf, localStateOf, localTopicOf, persistLedger, persistMember } from './local.js';
 import { applyRelayedReport, approveInvite, contentCountOf, countLiveCollabs, createCollab, endCollab, handleJoinKnock, inviteMembers, leaveCollab, notifyLocal, sendMessage, viewLedger, withdrawInvite } from './outgoing.js';
 import { JOIN_REPLAY_INTERVALS_MS, SYNC_MAX_REQUESTS_PER_CYCLE, SYNC_MAX_SOURCES_PER_CYCLE, SYNC_REPLY_TIMEOUT_MS, SYNC_SOFT_BUNDLE_BYTES, SYNC_TAIL_POSTS, SYNC_TAIL_WINDOW_MS, runSyncCycle, runSyncSweep, startSyncEngine, stopSyncEngine, triggerSync } from './sync.js';
 import {
-  HANDSHAKE_REPLY_TIMEOUT_MS, TAKEOVER_PROBE_INTERVAL_MS, autoTransfer, clearFreezeReason, freezeOnManagerOffline,
+  HANDSHAKE_REPLY_TIMEOUT_MS, TAKEOVER_PROBE_INTERVAL_MS, autoTransfer, clearFreezeReason, freezeOnManagerOffline, m5RuntimeOf,
   noteSeatClosed, presenceSnapshot, runHandshake, startLiveness, stopLiveness, takeOver,
 } from './takeover.js';
 import { decide, decideMergeOffer } from './freeze.js';
@@ -51,7 +51,7 @@ const DEFAULT_STAGED_PER_SEAT = 100;
 const DEFAULT_STAGED_PER_COLLAB = 500;
 /* 核心空闲退出必须晚于席位宽限：先完成离席广播/标记再退出（设计 §3.2）。 */
 export const SEAT_GRACE_MARGIN_MS = 10000;
-/* 席位 inbox 只保留近期投递事实（运行态观测面；落盘 inbox.jsonl 归 M3）。 */
+/* 席位 inbox 只保留近期投递事实（运行态观测面；落盘 inbox.jsonl 归出站/入站层）。 */
 const SEAT_INBOX_MAX = 200;
 
 /**
@@ -84,13 +84,13 @@ const SEAT_INBOX_MAX = 200;
  */
 export function createCollabService(options) {
   const state = /** @type {any} */ (buildState(options));
-  /* 出站/入站模块（M3）经 state 直取的本机旁路面：与 API 同源，避免两套注入入口。 */
+  /* 出站/入站层经 state 直取的本机旁路面：与 API 同源，避免两套注入入口。 */
   state.injectLocalSeat = (collabId, sessionId, frame) => injectLocalSeatOf(state, collabId, sessionId, frame);
   state.listLocalSeats = (collabId) => {
     const local = state.collabs.get(collabId);
     return local === undefined ? [] : listLocalSeatsOf(local);
   };
-  /* 投递查询面（M3 → M6）：本机旁路的席位明细优先取内存事实，未命中再委托接收管线的落盘账；
+  /* 投递查询面（出站/入站层 → 工具面）：本机旁路的席位明细优先取内存事实，未命中再委托接收管线的落盘账；
    * 组合根以闭包注入（IPC 监听步才构造），运行期再触达。 */
   state.inboundLocalSeatDeliveryOf = pickOption(options, 'localSeatDeliveryOf', null);
   state.deliveryStatusOf = pickOption(options, 'deliveryStatusOf', null);
@@ -112,7 +112,7 @@ function joinSenderOf(state) {
   return typeof state.sendDirect === 'function' ? state.sendDirect : null;
 }
 
-/* 能力闸门（设计 §7.2；契约 M6：闸门落服务层）：邀请 / 申请 / 建协作前要求目标支持会话级协作。
+/* 能力闸门（设计 §7.2；契约要求闸门落服务层）：邀请 / 申请 / 建协作前要求目标支持会话级协作。
  * 已知支持不重复探测（省一次往返）；已知不支持直接拒绝；未知先单播探测一次，仍未知按未知拒绝。
  * probeCapability 未注入（单测/降级）时不设闸——生产组合根恒定注入。 */
 const CAPABILITY_SUPPORTED = 2;
@@ -168,6 +168,33 @@ function probeCapabilityRefusalOf(probe, instanceId) {
 
 function unsupportedCapabilityRefusalOf(instanceId) {
   return { ok: false, message: `目标驿站（${instanceId}）版本不支持会话级协作（需 0.2.0+）——无法邀请 / 申请 / 建协作` };
+}
+
+/* 加入域的邀请入口（ws_invite 的实际落点）不经过 outgoing 的 inviteMembers 闸门：
+ * 服务层按同一判据补一次（已知支持放行 / 已知不支持拒绝 / 未知先探测一次）。
+ * 邀请输入只携目标实例，端点由协作端点表或已知主机清单解析。 */
+function createInviteWithCapability(state, input) {
+  if (typeof state.probeCapability !== 'function') {
+    return state.join.createInvite(input);
+  }
+  return (async () => {
+    const refusal = await capabilityRefusalOfTargets(state, capabilityTargetsOfInvite(state, input));
+    return refusal ?? state.join.createInvite(input);
+  })();
+}
+
+function capabilityTargetsOfInvite(state, input) {
+  const instanceId = input?.targetInstanceId;
+  if (typeof instanceId !== 'string' || instanceId === '' || instanceId === state.self.instanceId) {
+    return [];
+  }
+  const endpoint = inviteTargetEndpointOf(state, input?.collabId, instanceId);
+  return [{ instanceId, address: endpoint?.address, port: endpoint?.port }];
+}
+
+function inviteTargetEndpointOf(state, collabId, instanceId) {
+  const local = state.collabs.get(collabId);
+  return local?.endpoints?.get?.(instanceId) ?? state.knownHosts?.lookup?.(instanceId);
 }
 
 function buildState(options) {
@@ -226,6 +253,9 @@ function coreStateOf(options) {
     takeoverProbeIntervalMs: options.takeoverProbeIntervalMs ?? TAKEOVER_PROBE_INTERVAL_MS,
     handshakeReplyTimeoutMs: options.handshakeReplyTimeoutMs ?? HANDSHAKE_REPLY_TIMEOUT_MS,
     handoverConfirmTimeoutMs: options.handoverConfirmTimeoutMs ?? HANDOVER_CONFIRM_TIMEOUT_MS,
+    /* 显式兼容旁路：仅供尚未穿会话标识的旧调用方/旧夹具；生产组合根不得设置。
+     * 默认关闭时，managed 且有席位表的治理写缺 sessionId 一律拒绝（防冒充其他会话）。 */
+    legacySessionlessWrites: options.legacySessionlessWrites === true,
   };
 }
 
@@ -299,8 +329,7 @@ function apiOf(state) {
     /* 接管是成员侧动作（设计 §2A.6/§2A.7）：活跃成员席位即可发起，A3/A4 受理门与确认令牌另管。 */
     takeOver: (input) => forumGovernanceRejection(state, input?.collabId)
       ?? seatGovernedWrite(state, input, () => takeOver(state, input), { managerOnly: false, allowFrozen: true }),
-    decide: (input) => forumGovernanceRejection(state, input?.collabId)
-      ?? seatGovernedWrite(state, input, () => withFreezeCleared(state, input?.collabId, () => decide(state, input)), { allowFrozen: true }),
+    decide: (input) => decideApiOf(state, input),
     decideMerge: (input) => forumGovernanceRejection(state, input?.collabId)
       ?? seatGovernedWrite(state, input, () => withFreezeCleared(state, input?.collabId, () => decideMergeOffer(state, input)), { allowFrozen: true }),
     handover: (input) => forumGovernanceRejection(state, input?.collabId) ?? seatGovernedWrite(state, input, () => handover(state, input)),
@@ -332,6 +361,16 @@ function apiOf(state) {
   };
 }
 
+/* 冻结裁定入口：任期分叉的工具出口（设计 §2A.3）——terminate 只归档本方分支，成员席同样可执行；
+ * 其余冻结裁定仍按站长制授权，不得借 terminate 越权。 */
+function decideApiOf(state, input) {
+  return forumGovernanceRejection(state, input?.collabId)
+    ?? seatGovernedWrite(state, input, () => withFreezeCleared(state, input?.collabId, () => decide(state, input)), {
+      allowFrozen: true,
+      managerOnly: input?.choice !== 'terminate' || managerFreezeReasonOf(state, input?.collabId) !== 'manager-fork',
+    });
+}
+
 function hooksApiOf(state) {
   return {
     admit: (frame, meta) => gateFrame(state, frame, meta),
@@ -341,7 +380,7 @@ function hooksApiOf(state) {
   };
 }
 
-/* 生命周期与交接面（M5 → M6）：目标侧确认、冻结判定/解除、presence 视图与自动移交。 */
+/* 生命周期与交接面（生命周期层 → 工具面）：目标侧确认、冻结判定/解除、presence 视图与自动移交。 */
 function lifecycleApiOf(state) {
   return {
     confirmHandover: (input) => guardedWrite(state, input?.collabId, () => confirmHandover(state, input)),
@@ -355,7 +394,7 @@ function lifecycleApiOf(state) {
   };
 }
 
-/* 席位运行面（契约 M2 → M3/M4/M5/M6/M7）：读席位、本机旁路注入、桥注册、核心存续。
+/* 席位运行面（运行时 → 出站/加入/生命周期/工具/观察窗）：读席位、本机旁路注入、桥注册、核心存续。
  * 全部异常隔离为结果对象——席位面是投递主链的基础设施，不得让单次坏输入穿出。 */
 function seatApiOf(state) {
   return {
@@ -376,7 +415,7 @@ function seatApiOf(state) {
       const seat = local === undefined ? null : managerSeatOfLocal(local);
       return seat === null ? null : seatViewOf(seat);
     },
-    /* 站长转移的席位角色迁移（M5 移交/接管调用）：同时改席位与派生缓存并落盘。 */
+    /* 站长转移的席位角色迁移（移交/接管调用）：同时改席位与派生缓存并落盘。 */
     setSeatRole: (collabId, sessionId, role) => {
       const local = state.collabs.get(collabId);
       const seat = local === undefined ? null : setLocalSeatRole(local, sessionId, role);
@@ -396,7 +435,7 @@ function seatApiOf(state) {
       return seat === null ? null : seat;
     },
     seatsOfSession: (sessionId) => seatsOfSession(state, sessionId),
-    isWritable: (collabId) => writableVerdictOf(state, collabId).ok && frozenRefusalOf(state, collabId) === null,
+    isWritable: (collabId) => writableVerdictOf(state, collabId).ok && frozenWriteRefusalOf(state, collabId) === null,
   };
 }
 
@@ -408,21 +447,30 @@ function joinApiOf(state) {
   return {
     request: (input) => guardedWrite(state, input?.collabId, () => joinRequestNow(state, input)),
     /* 批准权按批准者席位判定（input.sessionId 是申请人会话，不能拿它当授权对象）。 */
-    approve: (input) => seatGovernedWrite(state, { ...input, sessionId: input?.approvedBy }, () => joinApproveNow(state, input)),
+    approve: (input) => approveGovernedOf(state, input),
     pendingJoinsOf: (collabId) => state.join.pendingJoinsOf(collabId),
     isGranted: (collabId, sessionId) => state.join.isGranted(collabId, sessionId),
-    /* 邀请簿记面（M4 → M6）：邀请由站长会话发起/撤回，接受与确认由目标会话发起。 */
-    createInvite: (input) => seatGovernedWrite(state, { ...input, sessionId: input?.managerSessionId }, () => state.join.createInvite(input)),
+    /* 邀请簿记面（加入域 → 工具面）：邀请由站长会话发起/撤回，接受与确认由目标会话发起。 */
+    createInvite: (input) => seatGovernedWrite(state, { ...input, sessionId: input?.managerSessionId }, () => createInviteWithCapability(state, input)),
     withdrawInvite: (input) => seatGovernedWrite(state, { ...input, sessionId: input?.managerSessionId }, () => state.join.withdrawInvite(input)),
     acceptInvite: (input) => guardedWrite(state, input?.collabId, () => state.join.acceptInvite(input)),
-    /* 签名与 M4 契约一致：confirmJoining(joinId, sessionId, {instanceId,managerTerm,activeSeats?})。 */
+    /* 签名与加入域契约一致：confirmJoining(joinId, sessionId, {instanceId,managerTerm,activeSeats?})。 */
     confirmJoining: (joinId, sessionId, input) => guardedWrite(state, input?.collabId, () => state.join.confirmJoining(joinId, sessionId, input)),
     pendingJoiningProjection: (collabId) => state.join.pendingJoiningProjection(collabId),
     pendingInvitesFor: (input) => state.join.pendingInvitesFor(input),
   };
 }
 
-/* 加入域两个入口的席位收尾（M2 兼容桥）：加入域以 bound（本机接线）/seated（申请人已在册）
+/* 批准入口的席位授权对象是批准者会话；批准者标识缺失/非法时交给加入域给出具体 approvedBy 错误
+ * （不得先被席位门吞成「无会话标识」），但仍过写门。 */
+function approveGovernedOf(state, input) {
+  if (!validSessionId(input?.approvedBy)) {
+    return guardedWrite(state, input?.collabId, () => joinApproveNow(state, input));
+  }
+  return seatGovernedWrite(state, { ...input, sessionId: input.approvedBy }, () => joinApproveNow(state, input));
+}
+
+/* 加入域两个入口的席位收尾（服务层兼容桥）：加入域以 bound（本机接线）/seated（申请人已在册）
  * 表达结果，旧 joined/member 键已不再返回——按实际返回形态收口，否则条件恒假、入席后没有本机席位。 */
 function joinRequestNow(state, input) {
   if (typeof state.probeCapability === 'function' && input?.target !== undefined) {
@@ -555,7 +603,7 @@ function joinGrantResult(state, frame) {
 
 function joinConfirmResult(state, frame) {
   const result = state.join.handleJoinConfirm(frame);
-  /* 确认写名单后由建立判定推进 proposed→active（M5 的建立规则）。 */
+  /* 确认写名单后由建立判定推进 proposed→active（建立规则）。 */
   const local = state.collabs.get(frame.collabId);
   if (result?.action === 'join-confirmed' && local !== undefined) {
     maybeEstablish(state, local);
@@ -637,7 +685,7 @@ function startService(state) {
 }
 
 /* 注册表加载：collabs/ 目录逐协作恢复（成员记录或载体文件、台账 / 快照 / 席位可选）；
- * 旧形态（0.1.x）由 M8 判据归档为只读、半写目录按 recovery 只读；单条失败只计数跳过，
+ * 旧形态（0.1.x）由迁移判据归档为只读、半写目录按 recovery 只读；单条失败只计数跳过，
  * 不阻塞进程（坏数据不得让服务起不来）。 */
 function loadRegistry(state) {
   for (const collabId of listLocalCollabIds(state.dataDir)) {
@@ -664,7 +712,9 @@ function loadOneEntry(state, collabId) {
     recordReadonlyEntry(state, collabId, dir, kind);
     return;
   }
-  state.collabs.set(collabId, loadOne(state, collabId));
+  const local = loadOne(state, collabId);
+  state.collabs.set(collabId, local);
+  restoreManagerFreezeRuntime(state, collabId);
 }
 
 /* 只读目录（半写 / 损坏）：半写写 recovery.json 留证；损坏只置内存标记（不改写坏数据）。 */
@@ -721,6 +771,7 @@ function loadOne(state, collabId) {
     suspended: null,
     staleManagerId: null,
   };
+  applyCarrierFreezeReason(local, carrier.carrier);
   if (recoveredSeat !== null) {
     state.counters.seatRecoveredFromCarrier++;
     state.log.warn('站长席位文件缺失/损坏：按载体记录恢复内存席位（不重写损坏文件）', { collabId, sessionId: recoveredSeat.sessionId });
@@ -734,12 +785,46 @@ function loadOne(state, collabId) {
   return local;
 }
 
-/* 所有席位移除路径（服务离席/结束、M5 心跳超时与会话关闭直接调 removeLocalSeat）共用同一收尾。 */
+/* 所有席位移除路径（服务离席/结束、心跳超时与会话关闭直接调 removeLocalSeat）共用同一收尾。 */
 function attachSeatRemovalHook(state, local) {
   if (local === null || typeof local !== 'object') {
     return;
   }
   local.onSeatRemoved = (sessionId, outcome) => noteSeatRemoval(state, local.collabId, sessionId, outcome);
+}
+
+/* 重启恢复冻结（设计 §2A.3/§6.2）：冻结原因是任期面事实，运行态容器随进程丢失；
+ * 载体是权威写入面，重启后必须回填，否则站长侧「不改台账 status」的停写判据会失效。
+ * 载入阶段先按原值回填本地记录；注册表登记后再由 gate 的三态词表校验并入运行态。 */
+function applyCarrierFreezeReason(local, carrier) {
+  const raw = carrier?.freezeReason;
+  if (typeof raw !== 'string' || raw === '') {
+    return;
+  }
+  local.freezeReason = raw;
+  if (local.member !== null && typeof local.member === 'object') {
+    local.member.freezeReason = raw;
+  }
+}
+
+function restoreManagerFreezeRuntime(state, collabId) {
+  const local = state.collabs.get(collabId);
+  if (local?.freezeReason === undefined) {
+    return;
+  }
+  const reason = managerFreezeReasonOf(state, collabId);
+  if (reason === null) {
+    delete local.freezeReason;
+    if (local.member !== null && typeof local.member === 'object') {
+      delete local.member.freezeReason;
+    }
+    return;
+  }
+  m5RuntimeOf(state).frozen.set(collabId, reason);
+  /* 成员侧与运行态冻结同步（站长侧只停写，不改台账状态机——设计 §2A.3）。 */
+  if (local.role === 'member' && local.member !== null && local.member.state !== 'left') {
+    local.member.state = 'frozen';
+  }
 }
 
 /* 站长席位文件丢失时的恢复判据（设计 §6.3/§1.1）：只有载体明确写「本站长就是本机」时才恢复，
@@ -878,7 +963,7 @@ function listCollabs(state, input) {
   return { collabs };
 }
 
-/* 旧协作的只读列表项（设计 §10）：状态按 completed 展示，内容取自 M8 只读读取器。 */
+/* 旧协作的只读列表项（设计 §10）：状态按 completed 展示，内容取自迁移只读读取器。 */
 function legacyListEntryOf(collabId, summary) {
   return {
     collabId,
@@ -932,13 +1017,59 @@ function indicators(state) {
   return readings;
 }
 
-/* 成员数读数：讨论 = 折叠成员表（成员事件并集折叠——被拒/被撤回者不占名额、退出者即时出表，
- * 与邀请名额判据同一权威）；managed = 台账/定格名单（既有口径不变）。 */
-function memberCountOf(local) {
+/* 成员数读数：讨论 = 本机席位＋远端席位（与观察窗同源的席位口径，设计 §10）；
+ * managed = 台账/定格名单（既有口径不变）。 */
+function memberCountOf(state, local) {
   if (localModeOf(local) === 'forum') {
-    return local.members.fold().length;
+    return forumSeatCountOf(state, local);
   }
   return localRosterOf(local).length;
+}
+
+/* 讨论人数按席位计：本机活跃席位 + 成员事件折叠出的远端席位。本机行按会话标识排除，
+ * 无会话标识的旧事件按实例排除（仅在本机确有席位时）——否则同机双席会重复计数。 */
+function forumSeatCountOf(state, local) {
+  const localSeats = listLocalSeatsOf(local);
+  const localIds = new Set(localSeats.map((seat) => seat.sessionId));
+  const remote = activeForumSeatEventsOf(local)
+    .filter((event) => !isOwnForumEvent(state, event, localIds, localSeats.length > 0));
+  return localSeats.length + remote.length;
+}
+
+/* 按席位键（实例 + 会话）取最新事件，只有最新仍为 join 者才算在席（leave 后不得残留）。 */
+function activeForumSeatEventsOf(local) {
+  const latest = new Map();
+  for (const event of local.members.events()) {
+    const key = forumSeatKeyOf(event);
+    const held = latest.get(key);
+    if (held === undefined || compareForumEvents(event, held) > 0) {
+      latest.set(key, event);
+    }
+  }
+  return [...latest.values()].filter((event) => event.kind === 'join');
+}
+
+function forumSeatKeyOf(event) {
+  const sessionId = typeof event.sessionId === 'string' && event.sessionId !== '' ? event.sessionId : null;
+  return sessionId === null ? event.instanceId : `${event.instanceId}/${sessionId}`;
+}
+
+function compareForumEvents(left, right) {
+  const byTs = Date.parse(left.ts) - Date.parse(right.ts);
+  if (byTs !== 0) {
+    return byTs;
+  }
+  if (left.eventId === right.eventId) {
+    return 0;
+  }
+  return left.eventId < right.eventId ? -1 : 1;
+}
+
+function isOwnForumEvent(state, event, localIds, hasLocalSeats) {
+  if (typeof event.sessionId === 'string' && event.sessionId !== '') {
+    return localIds.has(event.sessionId);
+  }
+  return hasLocalSeats && event.instanceId === state.self.instanceId;
 }
 
 /* 静音按席位聚合（设计 §5.4/§10）：有席位读席位、无席位退回旧静音文件（兼容面）。 */
@@ -952,6 +1083,8 @@ function mutedOf(local) {
 function listEntryOf(state, local, now, caller) {
   const stateName = localStateOf(local);
   const probeState = state.probes.get(local.collabId);
+  const freezeReason = freezeReasonOfLocal(local);
+  const seatCount = memberCountOf(state, local);
   return {
     collabId: local.collabId,
     name: localNameOf(local),
@@ -959,8 +1092,12 @@ function listEntryOf(state, local, now, caller) {
     mode: localModeOf(local),
     state: stateName,
     version: local.role === 'manager' ? (local.ledger?.version ?? null) : (local.snapshot === null ? null : local.snapshot.version),
-    memberCount: memberCountOf(local),
+    memberCount: seatCount,
+    /* 席位口径人数（讨论 = 本机席位 + 远端席位；managed = 名单行）：供观察窗/状态栏同源取数。 */
+    seatCount,
     muted: mutedOf(local),
+    /* 条目顶层冻结原因（工具/状态栏契约字段）；sessions.freezeReason 保留兼容。 */
+    ...(freezeReason === null ? {} : { freezeReason }),
     /* 本机席位表（状态栏按会话呈现的唯一来源）：身份名取本机展示名，会话标识保持全量——
      * 状态栏侧按短码精确匹配本会话。冻结原因随 sessions 下发（只读展示面）。 */
     sessions: sessionsViewOf(state, local),
@@ -1279,7 +1416,7 @@ function setMuteNow(state, input) {
   return setSeatMuteNow(state, local, input, muted);
 }
 
-/* 无显式调用会话时的兼容取数：本机恰一席＝该席（多席必须显式，M6 工具面穿 sessionId）。 */
+/* 无显式调用会话时的兼容取数：本机恰一席＝该席（多席必须显式；工具面已穿会话标识）。 */
 function soleSeatSessionId(local) {
   const seats = [...seatsOfLocal(local).values()];
   return seats.length === 1 ? seats[0].sessionId : null;
@@ -1354,7 +1491,7 @@ function writableVerdictOf(state, collabId) {
   return assertWritable(dir);
 }
 
-/* legacy 判定：本进程刚落地的邀请目录只有 member.json（M4 尚未写 invite-stub carrier）——
+/* legacy 判定：本进程刚落地的邀请目录只有 member.json（邀请目录尚未写 invite-stub carrier）——
  * 它在启动判定里不可能以 legacy 出现（启动时 legacy 目录不会进 state.collabs），故按「邀请落点」
  * 放行；运行中的协作丢了 carrier 时同时还有台账/席位，仍按 legacy 拒绝（fail-closed）。
  * 返回 null＝不是 legacy 类判定。 */
@@ -1399,7 +1536,7 @@ function legacyFallbackSummary(collabId) {
 }
 
 function guardedWrite(state, collabId, run, { allowFrozen = false } = {}) {
-  const frozen = frozenRefusalOf(state, collabId);
+  const frozen = frozenWriteRefusalOf(state, collabId);
   if (!allowFrozen && frozen !== null) {
     return { ok: false, message: frozen };
   }
@@ -1409,15 +1546,6 @@ function guardedWrite(state, collabId, run, { allowFrozen = false } = {}) {
   }
   state.legacyRejections.noteWrite();
   return { ok: false, message: readonlyWriteMessageOf(verdict.reason) };
-}
-
-/* 冻结即停写（设计 §2A.3）：只有读台账、裁定、退出、终止与手动接管可越过冻结。 */
-function frozenRefusalOf(state, collabId) {
-  const local = state.collabs.get(collabId);
-  if (local === undefined || localStateOf(local) !== 'frozen') {
-    return null;
-  }
-  return '协作已冻结：写操作已暂停——仅允许读台账 / 裁定 / 退出 / 终止';
 }
 
 /* 裁定成功后清除冻结原因（冻结已解除/终结；载体与成员记录同步清理）。 */
@@ -1430,8 +1558,8 @@ function withFreezeCleared(state, collabId, run) {
 }
 
 /* 治理写按**调用席位**授权（设计 §3.4/§5.1「站长＝会话」）：同机成员席不得 end/invite/裁定/移交。
- * 无显式会话标识时保留整机兼容（M6 工具面尚未全量穿 sessionId；接线后由 seatAuthRefusalOf 收紧），
- * 讨论无站长语义、无席位表的历史路径同样不拦。 */
+ * 缺显式会话标识默认拒绝；仅构造选项 legacySessionlessWrites 可供尚未穿参的旧调用方显式开启兼容。
+ * 讨论无站长语义、无席位表的历史路径不在此层拦截。 */
 function seatGovernedWrite(state, input, run, options = {}) {
   return guardedWrite(state, input?.collabId, () => seatAuthRefusalOf(state, input, options) ?? run(), options);
 }
@@ -1441,11 +1569,15 @@ function seatAuthRefusalOf(state, input, { key = 'sessionId', managerOnly = true
   if (subject === null) {
     return null;
   }
+  if (subject.refusal !== undefined) {
+    return subject.refusal;
+  }
   return seatRoleRefusalOf(subject.seat, managerOnly);
 }
 
-/* 授权对象：本机已知、managed、有席位表且调用方显式给了会话标识，才有可核对对象；
- * 其余情形返回 null＝不在此层拦截（讨论无站长、旧路径无席位、工具面尚未穿参）。 */
+/* 授权对象：本机已知、managed、有席位表时必须有显式会话标识——没有标识就没有可核对席位，
+ * 不得按整机或「唯一席位」推断（绕过工具面的调用方同样收口）。显式兼容旁路由构造选项开启，
+ * 仅供旧调用方/旧夹具；讨论无站长、旧路径无席位仍返回 null＝不在此层拦截。 */
 function seatAuthSubjectOf(state, input, key) {
   const local = state.collabs.get(input?.collabId);
   if (local === undefined || localModeOf(local) === 'forum' || seatsOfLocal(local).size === 0) {
@@ -1453,7 +1585,10 @@ function seatAuthSubjectOf(state, input, key) {
   }
   const sessionId = input?.[key];
   if (!validSessionId(sessionId)) {
-    return null;
+    if (state.legacySessionlessWrites === true) {
+      return null;
+    }
+    return { refusal: { ok: false, message: '本会话无会话标识（CLAUDE_CODE_SESSION_ID 缺失）——不能执行协作治理操作；请重开会话或检查客户端环境' } };
   }
   return { seat: localSeatOfLocal(local, sessionId) };
 }
@@ -1483,7 +1618,7 @@ function readonlyWriteMessageOf(reason) {
 
 /* 新建的成功收尾：席位登记（本机席位态的唯一写点之一）＋载体文件。
  * 无会话标识不得创建（设计 §1.1）：没有站长席位就没有可派生的站长，邀请与注入全部失效。
- * 设计 §8 要求 carrier 先于台账；createCollab 属 M3 且内部直接落台账，本层只能在其后补写——
+ * 设计 §8 要求 carrier 先于台账；createCollab 属出站层且内部直接落台账，本层只能在其后补写——
  * 写失败时立即写 recovery 标记（不留「无 carrier、有 member.json」的目录，否则重启会被判 legacy
  * 永久归档），本次创建按失败收口。 */
 function createNow(state, input) {
@@ -1523,13 +1658,13 @@ function createNowSync(state, input) {
   return result;
 }
 
-/* 创建后台账读回自检（跨属主集成面）：M3 的台账写入形态尚未切到 M1 形态时，本层先把
+/* 创建后台账读回自检（跨属主集成面）：台账写入形态尚未切到当前形态时，本层先把
  * 「重启后读不回」这件事变成可见计数，而不是等下一次重启把台账判损坏。 */
 function noteLedgerReadback(state, collabId) {
   const loaded = loadLedger(state.dataDir, collabId);
   if (loaded.ledger === null) {
     state.counters.createLedgerUnreadable++;
-    state.log.warn('新建协作的台账读回失败（重启将判损坏，待台账写面切到 M1 形态）', { collabId });
+    state.log.warn('新建协作的台账读回失败（重启将判损坏，待台账写面完成迁移）', { collabId });
   }
 }
 
@@ -1672,7 +1807,7 @@ function addCarrierOriginator(local, carrier) {
   }
 }
 
-/* 离开/结束的席位清理：成功结果之后执行（离席广播与标记由 M5 负责，本层只维护本机席位态）。
+/* 离开/结束的席位清理：成功结果之后执行（离席广播与标记由生命周期层负责，本层只维护本机席位态）。
  * 离席按席位处理：同机另一成员席仍活跃时，整机兼容记录不得被标成 left（localStateOf 已按席位读）。 */
 function leaveNow(state, input) {
   const local = state.collabs.get(input?.collabId);
@@ -1717,7 +1852,7 @@ function leaveRefusalOf(local, sessionId) {
   return null;
 }
 
-/* 站长席可离席（设计 §3.4）：先触发自动移交（M5）；无接手者＝直接终态，移交失败＝如实拒绝，
+/* 站长席可离席（设计 §3.4）：先触发自动移交（生命周期层）；无接手者＝直接终态，移交失败＝如实拒绝，
  * 不让旧站长征询半途消失。 */
 function managerLeaveRefusalOf(state, local, seat, input) {
   if (!isManagerLeaving(local, seat)) {
@@ -1800,7 +1935,7 @@ function noteSeatRemoval(state, collabId, sessionId, outcome) {
     state.counters.seatFileRemoveFailures++;
     state.log.warn('席位文件删除失败（重启可能复活该席位）', { collabId, sessionId });
   }
-  /* 离席/席位移除必须释放未确认的两段式记录（M4 契约）：否则同键再次入席被旧 joining 挡住。 */
+  /* 离席/席位移除必须释放未确认的两段式记录（加入域契约）：否则同键再次入席被旧 joining 挡住。 */
   try {
     state.join?.releaseJoining?.(collabId, sessionId);
   } catch (error) {
@@ -1902,7 +2037,7 @@ async function injectSeatedFrame(state, collabId, local, seat, frame, msgId) {
   return { ok: true, staged: true };
 }
 
-/* 邀请的无席位直投：受邀会话的桥在线即交付；离线不暂存（没有席位可挂），由 M4 的挂起邀请
+/* 邀请的无席位直投：受邀会话的桥在线即交付；离线不暂存（没有席位可挂），由加入域的挂起邀请
  * 在目标注册时补投。 */
 async function injectVirtualInvite(state, collabId, seat, frame) {
   if (await deliverToSeatNow(state, seat, frame)) {
@@ -2012,7 +2147,7 @@ function noteSeatOutcome(seat, msgId, outcome) {
 }
 
 /* 暂存（设计 §5.5）：宽限内断连的席位帧进内存，同 sessionId 重连补投；超限丢最旧并计数。
- * 丢帧必须同时释放 msgId 去重：否则发送方重试同一 msgId 会被判 duplicate（M3 计为成功），消息永久丢失。 */
+ * 丢帧必须同时释放 msgId 去重：否则发送方重试同一 msgId 会被判 duplicate（出站层计为成功），消息永久丢失。 */
 function stageSeatFrame(state, local, seat, frame) {
   state.stagedSeq++;
   seat.staged.push({ frame, seq: state.stagedSeq });
@@ -2187,7 +2322,7 @@ function unregisterBridgeNow(state, sessionId, bridgeId) {
     }
     seat.bridgeId = null;
     cleared++;
-    /* 桥断开＝席位会话结束起点（M5 的宽限计时/自动移交判据）。 */
+    /* 桥断开＝席位会话结束起点（宽限计时/自动移交判据）。 */
     try {
       noteSeatClosed(state, local.collabId, sessionId);
     } catch (error) {

@@ -2,21 +2,23 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { makeTempDir, waitFor } from './helpers.js';
-import { seedSessionCollab } from './helpers/session-participants.js';
+import { makeLedger, seedSessionCollab } from './helpers/session-participants.js';
 import { createCollabService } from '../src/collab/service.js';
+import { ledgerDigest } from '../src/collab/store.js';
 import { carrierFilePath } from '../src/paths.js';
 
 /* 站长交接的补面（collab-takeover 用例集的续篇）：无实例拒绝面、握手的模式覆盖面、宽限/失联判定、
  * 显式移交在途挂起与到期解挂、自动移交的目标侧接受与签发（via=auto）。
  *
- * 已删除用例清单（设计依据）：
- * - 「站长席位收到在途抢接握手视图 → 暂停写」：v3 收集窗口/在途抢接视图已删除（设计 §2A 整节
- *   取代 v3 §2A；§0.4 明确删除候选优先序与收集窗口）。handshake 载荷不再携 takeover 视图。
- * - 「成员收到生效抢接握手视图 → 收敛」：同上，抢接生效改由 manager-changed(via=takeover) 受理（A3）。
- * - 「汇总报告」两条（过期忽略 / 更高优先候选让位）：report 帧与优先序均属已删除语义（§0.4）。
+ * 已删除用例 → 设计依据 / 替代覆盖：
+ * - 站长席位收到在途抢接握手视图 → 暂停写：v3 收集窗口/在途抢接视图已删除（§2A 整节取代 v3 §2A；
+ *   §0.4 删除候选优先序与收集窗口）；handshake 载荷不再携 takeover 视图。
+ * - 成员收到生效抢接握手视图 → 收敛：同上；抢接生效改由 manager-changed(via=takeover) 受理（A3）。
+ * - 汇总报告两条（过期忽略 / 更高优先候选让位）：report 帧与优先序均属已删除语义（§0.4）。
+ * - 失联判定与投递队列解耦 / 失联用户提示：仍有效，已在本文件补回运行中的断言。
  *
- * 夹具形态：新台账（managerTerm/joinSeqNext/manager.sessionId/席位 joinSeq）+ carrier(session-seats)
- * + seats/；协作域帧携 cap=2 与 from.sessionId（设计 §1.1/§2.1/§5.1）。 */
+ * 夹具形态（consume-only）：新台账 + carrier(session-seats) + seats/ 预置；本文件不经
+ * create/invite/join 的产品路径。协作域帧携 cap=2 与 from.sessionId（§1.1/§2.1/§5.1）。 */
 
 const COLLAB = 'collab-followup';
 const MGR = { instanceId: 'inst-a', sessionId: 'sess-a', identityName: '甲机' };
@@ -189,17 +191,55 @@ test('失联判定：探测失败达时限 → 冻结 manager-offline 并落载�
   harness.service.start();
   await waitFor(() => (harness.service.list().collabs[0].managerOffline === true ? true : null), { timeoutMs: 3000 });
   assert.equal(harness.service.stats().managerOffline >= 1, true);
+  assert.equal(harness.notified.some((frame) => /冻结|失联/.test(frame.payload.text) && frame.payload.text.includes('ws_take_over')), true, '冻结提示含手动接管指引');
   await waitFor(() => (freezeReasonOnDisk(harness.dir) === 'manager-offline' ? true : null), { timeoutMs: 3000 });
   assert.equal(harness.service.list().collabs[0].state, 'frozen', '冻结即转只读态');
+  assert.equal(harness.service.list().collabs[0].sessions.freezeReason, 'manager-offline', '冻结原因可读');
   const blockedWrite = await harness.service.send({ collabId: COLLAB, text: '冻结期消息', type: 'issue', sessionId: MEM.sessionId });
   assert.equal(blockedWrite.ok, false, '冻结即停写');
-  assert.ok(blockedWrite.message.includes('暂停'), blockedWrite.message);
+  assert.ok(/冻结|暂停/.test(blockedWrite.message), blockedWrite.message);
   probeScript.push({ reachable: true, rttMs: 1 });
   await waitFor(() => (harness.service.list().collabs[0].managerOffline === false ? true : null), { timeoutMs: 3000 });
   assert.equal(harness.service.stats().managerRecovered >= 1, true, '恢复应答计数');
+  /* 恢复后的权威台账（现任站长同 term 更高版本）解除冻结并清除持久化原因。 */
+  const refreshed = makeLedger({
+    collabId: COLLAB,
+    name: '交接协作',
+    status: 'active',
+    managerTerm: 1,
+    version: 4,
+    manager: MGR,
+    members: membersOf(),
+  });
+  await receive(harness.service, frameOf('snapshot', MGR, {
+    kind: 'data',
+    managerTerm: 1,
+    version: 4,
+    digest: ledgerDigest(refreshed),
+    ledger: refreshed,
+  }));
+  assert.equal(harness.service.list().collabs[0].state, 'active', '恢复后按权威快照解除冻结');
+  assert.equal(freezeReasonOnDisk(harness.dir), null, '冻结原因随恢复清除');
 });
 
-test('显式移交在途：offer 发出即挂起常规写；到期自动解挂（不残留）', async (t) => {
+test('失联判定与投递队列解耦：消息入队不改变探测结论', async (t) => {
+  const probeScript = [{ reachable: false, reason: '超时' }];
+  const harness = makeHarness(t, {
+    role: 'member',
+    probe: async () => probeScript.shift() ?? { reachable: false, reason: '超时' },
+  });
+  const queued = await harness.service.send({ collabId: COLLAB, text: '站长离线期间的消息', type: 'issue', sessionId: MEM.sessionId });
+  assert.equal(queued.ok, true, '离线期间消息仍受理入队');
+  assert.equal(harness.service.list().collabs[0].managerOffline, false, '入队本身不改变失联读数');
+  harness.service.start();
+  await waitFor(() => (harness.service.list().collabs[0].managerOffline === true ? true : null), { timeoutMs: 3000 });
+  assert.equal(harness.service.stats().managerOffline >= 1, true, '探测结论只由探测证据决定');
+  probeScript.push({ reachable: true, rttMs: 1 });
+  await waitFor(() => (harness.service.list().collabs[0].managerOffline === false ? true : null), { timeoutMs: 3000 });
+  assert.equal(harness.service.stats().managerRecovered >= 1, true);
+});
+
+test('显式移交在途：offer 发出即挂起常规写；到期自动解挂（不残留）', { timeout: 10000 }, async (t) => {
   const harness = makeHarness(t, {
     probe: async () => ({ reachable: true, rttMs: 1 }),
     config: { handoverConfirmTimeoutMs: 40 },
@@ -239,8 +279,13 @@ test('自动移交目标侧：auto-offer 匹配 offer → 自动接受并以新�
   assert.ok(offer, 'offer 定向发出');
   assert.equal(autoOffer.fromSessionId, MGR.sessionId);
   assert.equal(offer.to.instanceId, MEM.instanceId);
+  assert.equal(manager.service.list().collabs[0].suspended, true, '原站长发出 offer 即停写');
+  const managerBlocked = await manager.service.send({ collabId: COLLAB, text: '自动移交等待期消息', type: 'issue', sessionId: MGR.sessionId });
+  assert.equal(managerBlocked.ok, false, '原站长等待期不得继续写');
 
   await receive(member.service, frameOf('notice', MGR, autoOffer.payload));
+  assert.equal(member.service.list().collabs[0].role, 'member', '目标收到 auto-offer 不自行提升');
+  assert.equal(member.service.list().collabs[0].version, 3, '目标台账未变');
   await receive(member.service, frameOf('handover', MGR, offer.payload, MGR_ENDPOINT.address));
   await waitFor(() => (member.service.list().collabs[0].role === 'manager' ? true : null), { timeoutMs: 3000 });
   const ledger = (await member.service.view({ collabId: COLLAB })).ledger;

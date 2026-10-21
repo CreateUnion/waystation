@@ -1041,7 +1041,7 @@ test('describe / count / stats：描述器含名称与模式、缺省 null、计
   assert.deepEqual(service.describe(collabId), { name: '联调项目', mode: 'managed' });
   assert.equal(service.describe('collab-none'), null);
   assert.equal(service.count(), 1);
-  await service.withdraw({ collabId });
+  await service.withdraw({ collabId, sessionId: SELF_SEAT });
   assert.equal(service.count(), 0);
   assert.equal(service.stats().byState.terminated, 1);
 });
@@ -1277,15 +1277,15 @@ test('治理工具守卫：讨论实例四入口（裁定 / 合流裁定 / 移�
 
   /* managed 直通：原逻辑照旧执行（不误报讨论文案）。 */
   const managed = service.create({ name: '协作甲', topic: '主题', targets: [targetOf('b')] });
-  const decided = await service.decide({ collabId: managed.collabId, choice: 'terminate' });
+  const decided = await service.decide({ collabId: managed.collabId, choice: 'terminate', sessionId: SELF_SEAT });
   assert.equal(decided.ok, false);
   assert.ok(decided.message.includes('冻结'), decided.message);
   assert.ok(!decided.message.includes('讨论模式无此操作'));
-  const merged = await service.decideMerge({ collabId: managed.collabId, mergeOffer: 'accept' });
+  const merged = await service.decideMerge({ collabId: managed.collabId, mergeOffer: 'accept', sessionId: SELF_SEAT });
   assert.ok(merged.message.includes('合流'), merged.message);
-  const handed = await service.handover({ collabId: managed.collabId, target: 'inst-b' });
+  const handed = await service.handover({ collabId: managed.collabId, target: 'inst-b', sessionId: SELF_SEAT });
   assert.ok(handed.message.includes('移交'), handed.message);
-  const taken = await service.takeOver({ collabId: managed.collabId });
+  const taken = await service.takeOver({ collabId: managed.collabId, sessionId: SELF_SEAT });
   assert.ok(taken.message.includes('无需') && taken.message.includes('接管'), taken.message);
 
   /* 未知 collabId 照旧（守卫不臆造协作）。 */

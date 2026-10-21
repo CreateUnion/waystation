@@ -814,7 +814,7 @@ function buildComponents(state) {
     dataDir: state.dataDir,
     config,
     self: state.self,
-    /* 治理帧自报端点与单调钟（M5）：移交/接管的 endpoint 与超时判定不得用墙钟。 */
+    /* 治理帧自报端点与单调钟（生命周期层）：移交/接管的 endpoint 与超时判定不得用墙钟。 */
     selfEndpoint: { address: primaryLanAddressOf(), port: config.port },
     monoClock: () => performance.now(),
     send: (message) => dispatch.send(message),
@@ -870,7 +870,7 @@ function injectionSeatWiringOf(state) {
 }
 
 /* 服务侧投递出口：机器级提示走注入路由；本机席位旁路经路由的每席 push（不经过 dispatch.send）。
- * 查询面也在此接上——M6 的「机器级状态＋本机席位明细」不得私接 net 内部结构（契约 M3 → M6）。 */
+ * 查询面也在此接上——工具面的「机器级状态＋本机席位明细」不得私接 net 内部结构（契约：出站/入站层 → 工具面）。 */
 function deliveryWiringOf(state) {
   return {
     notify: (frame) => state.routing.notify(frame),
@@ -914,7 +914,7 @@ export function inboundHooksOf(state) {
     /* 链一投递（渲染在核心、桥不渲染不解析）：autoDeliver 关闭＝不注入钩子——
      * 消息停留第二档，由会话经 ws_check_inbox 拉取（既有降级语义零变）。 */
     ...(config.autoDeliver ? { deliverToSession: (frame) => state.routing.deliverToSession(frame) } : {}),
-    /* 席位扇出面（M2 运行时）：两件齐备即启用逐席 toSessions 扇出与本机旁路暂存/补投。
+    /* 席位扇出面（运行时席位面）：两件齐备即启用逐席 toSessions 扇出与本机旁路暂存/补投。
      * listSeats 含邀请目标（受邀未入席会话按桥注册面直投），注入面自行按帧类型隔离。 */
     listSeats: (collabId) => state.collab?.listInjectableTargets?.(collabId) ?? state.collab?.listLocalSeats?.(collabId) ?? [],
     injectSeat: (collabId, sessionId, frame) => state.collab?.injectLocalSeat?.(collabId, sessionId, frame) ?? { ok: false, reason: 'collab-service-missing' },
