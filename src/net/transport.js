@@ -24,6 +24,7 @@ export function createTransport({ port, bindAddress = '0.0.0.0', log }) {
       oversizedFrames: 0,
       protocolViolations: 0,
       socketErrors: 0,
+      writeFailures: 0,
       dialTotal: 0,
       dialFailures: 0,
       dialTimeouts: 0,
@@ -246,8 +247,10 @@ function handleLine(state, connection, line) {
   return true;
 }
 
-/* 连接句柄：send 只做「序列化 + 一行写入」，写失败交给 socket error 通道；
- * deliver 在未注册帧回调时计数丢弃（拨号连接在注册前先收帧的窗口）。 */
+/* 连接句柄：send 做「序列化 + 一行写入」，返回 false 表示这次写入注定丢失；
+ * deliver 在未注册帧回调时计数丢弃（拨号连接在注册前先收帧的窗口）。
+ * 返回布尔而非只计数：调用方（发送调度）据此把连接移出池并重拨——socket 已销毁时 write 是静默空写，
+ * 不返回失败就等于把「连不上」误报成「已发出」。 */
 function createConnection(socket, counters) {
   /** @type {null | ((frame: object) => void)} */
   let frameSink = null;
@@ -256,10 +259,11 @@ function createConnection(socket, counters) {
   return {
     remoteAddress: typeof socket.remoteAddress === 'string' ? socket.remoteAddress : '',
     send(frame) {
-      counters.framesOut++;
-      /* 对端已关闭（FIN）或本地已销毁的 socket 上 write 是静默丢弃：Node 流语义，不走 'error' 事件；
-       * 只有真实在途失败（如 RST）才落到 socket error 计数。死对端检测以 onClose / 'close' 事件为准。 */
-      socket.write(JSON.stringify(frame) + '\n');
+      return writeFrame(socket, frame, counters);
+    },
+    /** 连接自证仍可写：'close' 事件滞后于 socket 失效的窗口里，调用方靠它拒绝复用死连接。 */
+    isOpen() {
+      return !socket.destroyed && !socket.writableEnded;
     },
     onFrame(callback) {
       frameSink = callback;
@@ -283,4 +287,20 @@ function createConnection(socket, counters) {
       }
     },
   };
+}
+
+/* 一行写入：socket 已销毁/结束或序列化失败即返回 false，并计入写失败。 */
+function writeFrame(socket, frame, counters) {
+  if (socket.destroyed || socket.writableEnded) {
+    counters.writeFailures++;
+    return false;
+  }
+  try {
+    socket.write(JSON.stringify(frame) + '\n');
+    counters.framesOut++;
+    return true;
+  } catch {
+    counters.writeFailures++;
+    return false;
+  }
 }

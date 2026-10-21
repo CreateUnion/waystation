@@ -42,6 +42,7 @@ export function createOutbox({ dataDir, collabId, config, log }) {
     headFor: (peerInstanceId) => headFor(state, peerInstanceId),
     enqueue: (input) => enqueue(state, input),
     markAttempt: (msgId, ts) => markAttempt(state, msgId, ts),
+    retryNow: (msgId, ts) => retryNow(state, msgId, ts),
     markAcked: (msgId, ts) => markAcked(state, msgId, ts),
     markSessionDelivered: (msgId, ts) => markSessionDelivered(state, msgId, ts),
     prune: (now) => prune(state, now),
@@ -163,6 +164,18 @@ function markAttempt(state, msgId, ts) {
   entry.attempts++;
   const waiting = entry.attempts <= state.config.retryFastCount ? state.config.retryIntervalMs : state.config.retrySlowIntervalMs;
   entry.nextAttemptAt = ts + waiting;
+  writeRecord(state, entry);
+  return true;
+}
+
+/* 提前重试（调用方限频）：业务层再次投递同一对端时，把队头的退避拨回当下。
+ * 只动 queued 条目（已确认/终态没有退避语义）；落盘保持「重启后不带着旧退避等待」。 */
+function retryNow(state, msgId, ts) {
+  const entry = state.entries.get(msgId);
+  if (entry === undefined || entry.state !== 'queued' || entry.nextAttemptAt <= ts) {
+    return false;
+  }
+  entry.nextAttemptAt = ts;
   writeRecord(state, entry);
   return true;
 }

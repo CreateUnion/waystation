@@ -378,9 +378,7 @@ test('治理验收：失联抢接（ws_take_over 全链，成员会话发起）'
 /* 旧站长重启降级：§2A.8⑥ 要求重启后按 handshake 学到更高任期并向新站长取快照采纳。
  * 授权链绑定「快照来源机器本人的直连 handshake 应答」与其报告的 term/manager/managerEndpoint；
  * D15 定向重发持续到 ack 或被更高任期取代（时长不低于失联判定窗口）。 */
-test('治理验收：原站长重启握手降级（旧站长按更高任期退回成员）', {
-  skip: 'M5 侧已修（握手证据快照采纳、D15 重发持续到 ack）；e2e 仍红于 M3 传输层：旧站长重启后对端继续复用指向已杀核心的旧 TCP 连接（B framesOut 增长、dialTotal 不再增长，A2 只收到 ack），重发的 manager-changed 与握手应答均到不了重启核——需 M3 连接失效检测/重拨后解封',
-}, async (t) => {
+test('治理验收：原站长重启握手降级（旧站长按更高任期退回成员）', { timeout: 120000 }, async (t) => {
   const studio = await startStudio(t);
   const { a, b, homeA, portA, inboxA } = studio;
   await a.close();

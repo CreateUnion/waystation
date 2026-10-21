@@ -72,7 +72,8 @@ function buildState({ dataDir, config, transport, self, log, onRelayedReport = n
     inFlight: new Set(),       // 单元键（一次只投一条）
     pendingDials: new Set(),   // 在途拨号 promise（stop 收口等它们落地，不留无主连接）
     unitDials: new Map(),      // 单元键 → 在途拨号 promise（并发同单元投递共享同一次拨号）
-    connections: new Map(),    // 单元键 → { connection, collabId, peer }
+    connections: new Map(),    // 单元键 → { connection, collabId, peer, address, port }
+    wakeAt: new Map(),         // 单元键 → 上次因新入队唤醒队头退避的时刻（限频用）
     pendingPings: new Map(),   // ping msgId → { resolve, startedAt, timer }
     directRecords: new Map(),  // 直投 msgId → 投递记录（短时保留；查询行集来源）
     directWaiters: new Map(),  // 直投 msgId → { resolve, timer }（单次尝试的 ack 等待面）
@@ -94,6 +95,7 @@ function emptyCounters() {
     pongsUnknown: 0,
     sendsRejected: 0,
     deliveryFailures: 0,
+    staleConnections: 0,
     expiredTotal: 0,
     clientFramesDropped: 0,
     directRejected: 0,
@@ -132,6 +134,7 @@ async function stop(state) {
     held.connection.close();
   }
   state.connections.clear();
+  state.wakeAt.clear();
   for (const pending of state.pendingPings.values()) {
     clearTimeout(pending.timer);
     pending.resolve(null);
@@ -193,7 +196,32 @@ function send(state, { collabId, to, type, payload, from, fromSessionId, toSessi
     return result;
   }
   state.entryIndex.set(msgId, collabId);
+  wakeUnit(state, collabId, to.instanceId);
   return { ok: true, msgId, tier: 'queued' };
+}
+
+/* 新入队＝业务层对同一对端的再次投递意图（典型：D15 的 manager-changed 重发）：把单元队头的退避
+ * 拨回当下，让重发真的重新拨号。不做这一步，队头在慢退避里等满一轮，后续重发全被 FIFO 挡在后面——
+ * 对端重启回来后本可秒级恢复，却要等满一次慢退避。
+ * 限频：同一单元两次唤醒至少间隔 retryIntervalMs，退避不得被高频入队退化成忙拨。
+ * 队头本就到期时不动（下一 tick 自然会投），也不消耗唤醒配额。 */
+function wakeUnit(state, collabId, peer) {
+  const outbox = state.outboxes.get(collabId);
+  if (outbox === undefined) {
+    return;
+  }
+  const now = Date.now();
+  const head = outbox.headFor(peer);
+  if (head === undefined || head.nextAttemptAt <= now) {
+    return;
+  }
+  const key = `${collabId}:${peer}`;
+  const last = state.wakeAt.get(key);
+  if (last !== undefined && now - last < state.config.retryIntervalMs) {
+    return;
+  }
+  state.wakeAt.set(key, now);
+  outbox.retryNow(head.msgId, now);
 }
 
 /* 协作域帧的签发席位（硬闸门）：cap=2 帧必须带合法 from.sessionId——不得以本机身份兜底
@@ -386,16 +414,21 @@ async function attemptDirectDelivery(state, key, record) {
     record.reason = '调度器已停止——直投中止';
     return 'stopped';
   }
+  /** @type {any} */
+  let connection = null;
   try {
-    const connection = await obtainConnection(state, key, record.collabId, record);
+    connection = await obtainConnection(state, key, record.collabId, record);
     if (connection === null || state.stopped) {
       record.reason = '调度器已停止——直投中止';
       return 'stopped';
     }
-    connection.send(frameOf(state, record.collabId, record));
+    if (connection.send(frameOf(state, record.collabId, record)) === false) {
+      throw new Error('连接已失效（写入失败）');
+    }
     state.counters.directAttempts++;
     record.attempts++;
   } catch (error) {
+    invalidateHeldConnection(state, key, connection);
     record.attempts++;
     record.reason = `拨号失败：${error.message}`;
     state.counters.deliveryFailures++;
@@ -769,8 +802,10 @@ function startDelivery(state, key, collabId, outbox, peer, now) {
 async function deliverHead(state, collabId, outbox, entry) {
   const key = `${collabId}:${entry.to.instanceId}`;
   let attempted = false;
+  /** @type {any} */
+  let connection = null;
   try {
-    const connection = await obtainConnection(state, key, collabId, entry);
+    connection = await obtainConnection(state, key, collabId, entry);
     if (connection === null || state.stopped) {
       return;   // 停止收口后醒来的投递：新拨号连接已就地关闭、复用连接已被 stop 关闭——不发帧、不计尝试
     }
@@ -778,10 +813,13 @@ async function deliverHead(state, collabId, outbox, entry) {
       closeConnectionIfIdle(state, collabId, entry.to.instanceId);   // await 期间已被 ack / 过期：不发帧、不计尝试
       return;
     }
-    connection.send(frameOf(state, collabId, entry));
+    if (connection.send(frameOf(state, collabId, entry)) === false) {
+      throw new Error('连接已失效（写入失败）');
+    }
     state.counters.attempts++;
     attempted = true;
   } catch (error) {
+    invalidateHeldConnection(state, key, connection);
     state.counters.deliveryFailures++;
     state.log.warn('投递失败，按节律重试', { msgId: entry.msgId, peer: entry.to.instanceId, reason: error.message });
     attempted = true;
@@ -792,16 +830,52 @@ async function deliverHead(state, collabId, outbox, entry) {
   }
 }
 
+/* 拨号前决定「复用还是重拨」：
+ * - 本条目已经在这条单元上失败过（attempts > 0）→ 重试＝半开嫌疑，主动重拨；
+ * - 连接自证已失效（socket 已销毁/关闭，'close' 事件尚未落地）→ 丢弃重拨；
+ * - 池内连接拨向的端点已不是本条目的目标（改投 / 对端换端口）→ 丢弃重拨，避免发错机器；
+ * - 其余复用：同单元连续消息走同一连接（按需建立、可复用）。 */
 async function obtainConnection(state, key, collabId, entry) {
   const held = state.connections.get(key);
-  if (held !== undefined && entry.attempts === 0) {
-    return held.connection;   // 复用：同单元的连续消息走同一连接（按需建立、可复用）
-  }
   if (held !== undefined) {
-    held.connection.close();  // 重试 = 半开嫌疑：重拨后再发
+    const staleReason = connectionStaleReasonOf(held, entry);
+    if (staleReason === null && entry.attempts === 0) {
+      return held.connection;
+    }
+    held.connection.close();
     state.connections.delete(key);
+    if (staleReason !== null) {
+      state.counters.staleConnections++;
+      state.log.warn('池内连接不可复用，改为重新拨号', { peer: entry.to.instanceId, reason: staleReason });
+    }
   }
   return dialForUnit(state, key, collabId, entry);
+}
+
+/* 池内连接的失效判据（null＝可复用）：端点漂移与 socket 已死都不得再写——写进去只会静默丢帧。 */
+function connectionStaleReasonOf(held, entry) {
+  if (typeof held.connection.isOpen === 'function' && held.connection.isOpen() === false) {
+    return '连接已经失效（socket 已销毁或关闭）';
+  }
+  if (held.address !== entry.to.address || held.port !== entry.to.port) {
+    return `目标端点已变化（池内 ${held.address}:${held.port}）`;
+  }
+  return null;
+}
+
+/* 写失败或拨号失败后把该连接移出池：下一次投递必须重新拨号，而不是继续往死连接里写。
+ * 只摘除「仍是池里那条」的连接——并发路径可能已经换上新的，不得误关。 */
+function invalidateHeldConnection(state, key, connection) {
+  if (connection === null) {
+    return;
+  }
+  const held = state.connections.get(key);
+  if (held === undefined || held.connection !== connection) {
+    return;
+  }
+  held.connection.close();
+  state.connections.delete(key);
+  state.counters.staleConnections++;
 }
 
 /* 拨号去重（同单元共享在途拨号）：并发的同单元投递（帖直投与队列调度可同时触达同一对端）
@@ -837,7 +911,8 @@ async function performDial(state, key, collabId, entry) {
       state.connections.delete(key);
     }
   });
-  state.connections.set(key, { connection, collabId, peer: entry.to.instanceId });
+  /* 端点随连接登记：复用前比对当前条目的目标，改投 / 对端换端口后旧连接不得再被写。 */
+  state.connections.set(key, { connection, collabId, peer: entry.to.instanceId, address: entry.to.address, port: entry.to.port });
   return connection;
 }
 
