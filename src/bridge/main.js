@@ -10,7 +10,7 @@ import { createCoreLink } from './ipc-client.js';
 import { createSessionWriter } from './session-writer.js';
 
 /* 桥组合根（设计 §2.1/§2.2）：stdio MCP 门面＋工具目录/转发＋本会话注入口写入＋核心连接监督。
- * 桥只做两件半事：21 工具的目录（不依赖核心即答）与调用转发、注入写入（复用适配器写面）、
+ * 桥只做两件半事：22 工具的目录（不依赖核心即答）与调用转发、注入写入（复用适配器写面）、
  * 核心不可达时的 ws_status 差错合成（「纯转发件」原则的唯一登记例外）。桥不读不写数据根
  * （只读 run/core.json），不认识协作、不认识网络、不认识数据。 */
 
