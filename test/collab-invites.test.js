@@ -485,6 +485,44 @@ test('pending 恢复：超容量按终态优先/最早过期裁剪，重复键�
   assert.equal(reloaded.restore([{ ...records[0], expiresAt: 'soon' }], { capacity: 2 }).rejected, 1);
 });
 
+test('pending 恢复：capacity 只作本次恢复上限，不改运行期容量', () => {
+  const pending = createPendingInvites({ now: () => NOW, capacity: 4 });
+  const records = [
+    pendingRecord({ inviteId: 'inv-a', expiresAt: NOW + 100, state: 'open', acceptedSessions: [] }),
+    pendingRecord({ inviteId: 'inv-b', expiresAt: NOW + 200, state: 'open', acceptedSessions: [] }),
+  ];
+  assert.deepEqual(pending.restore(records, { capacity: 1 }), { ok: true, restored: 1, rejected: 1 });
+  const first = pending.applyPendingInvite(pendingRecord({ inviteId: 'inv-c', expiresAt: NOW + 3000 }));
+  const second = pending.applyPendingInvite(pendingRecord({ inviteId: 'inv-d', expiresAt: NOW + 4000 }));
+  assert.deepEqual([first.ok, first.evicted, first.evictedCount], [true, null, 0]);
+  assert.deepEqual([second.ok, second.evicted, second.evictedCount], [true, null, 0]);
+  assert.equal(pending.list().length, 3, '运行期容量仍为 4，恢复上限不得收紧后续写入');
+});
+
+test('pending 恢复：超限优先裁终态并计 reclaimed', () => {
+  const pending = createPendingInvites({ now: () => NOW });
+  const records = [
+    pendingRecord({ inviteId: 'inv-open', expiresAt: NOW + 5000, state: 'open', acceptedSessions: [] }),
+    pendingRecord({ inviteId: 'inv-consumed', expiresAt: NOW + 100, state: 'consumed', acceptedSessions: ['session-a1'] }),
+  ];
+  assert.deepEqual(pending.restore(records, { capacity: 1 }), { ok: true, restored: 1, rejected: 1 });
+  assert.deepEqual([pending.stats().reclaimed, pending.stats().dropped], [1, 0]);
+  assert.equal(pendingGet(pending, 'inv-open').state, 'open', '终态先裁，不丢仍有效的 open 邀请');
+});
+
+test('applyPendingInvite：超限账一次写入收敛并回报 evictedCount', () => {
+  const pending = createPendingInvites({ now: () => NOW, capacity: 2 });
+  pending.restore([
+    pendingRecord({ inviteId: 'inv-1', expiresAt: NOW + 100, state: 'open', acceptedSessions: [] }),
+    pendingRecord({ inviteId: 'inv-2', expiresAt: NOW + 200, state: 'open', acceptedSessions: [] }),
+    pendingRecord({ inviteId: 'inv-3', expiresAt: NOW + 300, state: 'open', acceptedSessions: [] }),
+  ], { capacity: 3 });
+  const applied = pending.applyPendingInvite(pendingRecord({ inviteId: 'inv-new', expiresAt: NOW + 9000 }));
+  assert.deepEqual([applied.ok, applied.evicted, applied.evictedState, applied.evictedCount], [true, 'inv-2', 'open', 2]);
+  assert.deepEqual(pending.list().map((record) => record.inviteId), ['inv-3', 'inv-new']);
+  assert.equal(pending.stats().dropped, 2);
+});
+
 test('pending 重放：expire 后重复邀请帧不复活记录', () => {
   const { clock, pending } = pendingAt();
   pending.applyPendingInvite(pendingRecord({ expiresAt: NOW + 100 }));
@@ -624,6 +662,23 @@ test('confirmJoining：名单已含本席（alreadyMember）时跳过容量，�
   assert.equal(joining.confirmJoining(second.joinId, 'session-b2', confirmArgs(joining, second.joinId, { alreadyMember: true, activeSeats: 32 })).member, true);
 });
 
+test('confirmJoining：alreadyMember 跳过过期判定，非 alreadyMember 的过期 grant 仍 expired', () => {
+  const { clock, joining } = joiningAt(NOW, { joiningTtlMs: 100 });
+  const crashed = joining.beginJoining(joinInput({ sessionId: 'session-a1' }));
+  const stale = joining.beginJoining(joinInput({ sessionId: 'session-b2' }));
+  clock.set(NOW + 100);
+  assert.equal(joining.confirmJoining(crashed.joinId, 'session-a1',
+    { instanceId: 'inst-b', managerTerm: 1, alreadyMember: true }).reason, 'instance-mismatch', '跳过过期不等于跳过席位校验');
+  assert.equal(joining.confirmJoining(crashed.joinId, 'session-a1',
+    { instanceId: 'inst-a', managerTerm: 2, alreadyMember: true }).reason, 'manager-changed', '跳过过期不等于跳过任期校验');
+  const replayed = joining.confirmJoining(crashed.joinId, 'session-a1',
+    { instanceId: 'inst-a', managerTerm: 1, activeSeats: 32, alreadyMember: true });
+  assert.equal(replayed.member, true, '名单已含本席时不得因 grant 过期回 expired');
+  assert.equal(joining.get(crashed.joinId).confirmed, true);
+  assert.equal(joining.confirmJoining(stale.joinId, 'session-b2', confirmArgs(joining, stale.joinId)).reason, 'expired');
+  assert.equal(joining.get(stale.joinId), null, '非 alreadyMember 的过期 grant 仍删除并回 expired');
+});
+
 test('unconfirmJoining：名单写入失败可回滚后重试', () => {
   const { joining } = joiningAt();
   const { joinId } = joining.beginJoining(joinInput());
@@ -680,6 +735,16 @@ test('expireJoining：未确认超时清除并回传身份，已确认保留', (
   clock.set(NOW + 300);
   assert.equal(joining.confirmJoining(fresh.joinId, 'session-c3', confirmArgs(joining, fresh.joinId)).reason, 'expired');
   assert.equal(joining.get(fresh.joinId), null);
+});
+
+test('expireJoining：同键过期后可重新 begin', () => {
+  const { clock, joining } = joiningAt(NOW, { joiningTtlMs: 100 });
+  const first = joining.beginJoining(joinInput());
+  clock.set(NOW + 100);
+  assert.deepEqual(joining.expireJoining().joinIds, [first.joinId]);
+  const second = joining.beginJoining(joinInput());
+  assert.deepEqual([second.ok, second.reused, second.joinId === first.joinId], [true, false, false]);
+  assert.equal(joining.confirmJoining(second.joinId, 'session-a1', confirmArgs(joining, second.joinId)).member, true);
 });
 
 test('invalidateForManagerChange：未确认作废并回传身份，已确认保留', () => {
@@ -765,6 +830,66 @@ test('joining 恢复：重复键/坏字段拒收，超容量保留最新 grant',
   assert.deepEqual(registry.restore([records[1], { ...records[1], joinId: 'join-9' }], { collabId: COLLAB }),
     { ok: true, restored: 1, rejected: 1 });
   assert.equal(registry.restore([{ ...records[0], managerTerm: 0 }], { collabId: COLLAB }).rejected, 1);
+});
+
+test('joining 恢复裁剪：按 expiresAt 保留有效期更长者（TTL 配置变化）', () => {
+  const registry = createJoiningRegistry({ now: () => NOW, maxJoining: 1 });
+  const base = { instanceId: 'inst-a', managerTerm: 1, grantVersion: 1 };
+  const records = [
+    { joinId: 'join-short', sessionId: 'session-a1', requestedAt: NOW + 10, expiresAt: NOW + 20, ...base },
+    { joinId: 'join-long', sessionId: 'session-b2', requestedAt: NOW, expiresAt: NOW + 5000, ...base },
+  ];
+  assert.deepEqual(registry.restore(records, { collabId: COLLAB, maxJoining: 1 }), { ok: true, restored: 1, rejected: 1 });
+  assert.equal(registry.find(COLLAB, 'session-b2').joinId, 'join-long', 'TTL 变短后的新 grant 不得挤掉仍有效的旧 grant');
+  assert.equal(registry.find(COLLAB, 'session-a1'), null);
+});
+
+test('joining 恢复：maxJoining 只作本次恢复上限，不改运行期上限', () => {
+  const registry = createJoiningRegistry({ now: () => NOW, maxJoining: 3 });
+  const base = { instanceId: 'inst-a', managerTerm: 1, grantVersion: 1, requestedAt: NOW, expiresAt: NOW + 1000 };
+  const records = [
+    { joinId: 'join-1', sessionId: 'session-a1', ...base },
+    { joinId: 'join-2', sessionId: 'session-b2', ...base },
+  ];
+  assert.deepEqual(registry.restore(records, { collabId: COLLAB, maxJoining: 1 }), { ok: true, restored: 1, rejected: 1 });
+  assert.equal(registry.beginJoining(joinInput({ sessionId: 'session-b2' })).ok, true);
+  assert.equal(registry.beginJoining(joinInput({ sessionId: 'session-c3' })).ok, true, '恢复后继续 begin 仍按运行期上限 3');
+  assert.equal(registry.beginJoining(joinInput({ sessionId: 'session-d4' })).reason, 'capacity');
+});
+
+test('joining 恢复：非数组/坏 id/坏时间戳拒收，整表替换不留半份账', () => {
+  const registry = createJoiningRegistry({ now: () => NOW });
+  assert.equal(registry.restore('nope', { collabId: COLLAB }).reason, 'invalid');
+  const base = {
+    joinId: 'join-1',
+    instanceId: 'inst-a',
+    sessionId: 'session-a1',
+    managerTerm: 1,
+    grantVersion: 1,
+    requestedAt: NOW,
+    expiresAt: NOW + 1000,
+  };
+  for (const bad of [
+    { ...base, joinId: 'bad id' },
+    { ...base, instanceId: '' },
+    { ...base, requestedAt: -1 },
+    { ...base, requestedAt: 'now' },
+    { ...base, expiresAt: NOW - 1 },
+  ]) {
+    assert.equal(registry.restore([bad], { collabId: COLLAB }).rejected, 1);
+  }
+  assert.deepEqual(registry.list(), []);
+});
+
+test('joining 恢复：list() 形态带同值 collabId 可回灌', () => {
+  const source = createJoiningRegistry({ now: () => NOW });
+  const pending = source.beginJoining(joinInput({ sessionId: 'session-b2' }));
+  source.beginJoining(joinInput({ sessionId: 'session-a1' }));
+  const snapshot = source.list();
+  const registry = createJoiningRegistry({ now: () => NOW });
+  assert.deepEqual(registry.restore(snapshot, { collabId: COLLAB }), { ok: true, restored: 2, rejected: 0 });
+  assert.equal(registry.find(COLLAB, 'session-b2').joinId, pending.joinId);
+  assert.deepEqual(registry.list(), snapshot);
 });
 
 test('find/release/rejoin 面：非法参数与未登记席位', () => {

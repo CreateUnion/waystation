@@ -6,8 +6,9 @@ import { ID_PATTERN, MAX_ACTIVE_SEATS } from '../net/protocol.js';
  * 站长侧 joining（已发 grant、待 confirm 的席位）。本模块只做状态判定与去重，不写盘、不发帧、不读服务层：
  * 持久化与网络投递由接线方按返回的 reason 决定，判定逻辑因此可在 PC 上单测。
  * 时间一律经注入时钟推进（调用参数可覆盖），过期判定与容量淘汰因此确定可复现。
- * 作用域：每协作一个实例（invites.json / pending-invites.json / joins.json 位于协作目录，键不含 collabId），
- * 不得跨协作复用；入口的 collabId 校验只是串台防线，不是复用支持。
+ * 作用域：每协作一个实例（invites.json / pending-invites.json / joins.json 位于协作目录），不得跨协作复用；
+ * invites/pending 的唯一键不含 collabId，joining 的席位键含 collabId（同 sessionId 在不同协作各自成 grant）；
+ * 入口的 collabId 校验只是串台防线，不是复用支持。
  * 返回的 reason 是模块内部词表；只有 JOIN_DENY_REASONS 可直接进 join-deny，其余按接线语义转成快照/本地错误
  * （joinDenyReasonOf 只做兜底映射；already-member 须由接线回快照，不得当 deny 投递，见设计 §4.4.6）。 */
 
@@ -820,7 +821,9 @@ function pruneTerminalPending(state, at) {
 }
 
 /* 重启恢复：整表替换；状态与 acceptedSessions 原样恢复，会话级拒绝不持久化（见 invites restore 说明）。
- * 文件可能被旧版本/手工编辑成超容量：按同一「终态优先、再最早过期」策略裁回 capacity，超出部分计入 rejected。 */
+ * 文件可能被旧版本/手工编辑成超容量：按同一「终态优先、再最早过期」策略裁回选项上限，超出部分计入 rejected。
+ * options.capacity 只作本次恢复的裁剪上限，不写回运行期容量：调用方传入的是一次性限制，
+ * 写回会让后续 apply 永久按更小的上限淘汰。 */
 function restorePending(state, records, options) {
   if (!Array.isArray(records)) {
     return failure('invalid');
@@ -838,7 +841,6 @@ function restorePending(state, records, options) {
     restored.set(key, record);
   }
   rejected += trimPendingRestored(state, restored, limit);
-  state.capacity = limit;
   state.records = restored;
   state.declines.clear();
   return { ok: true, restored: restored.size, rejected };
@@ -1073,7 +1075,7 @@ function createJoining(state, prepared, at) {
  * grantVersion 仅记录、version 推进不影响受理（设计 §4.4.7 版本校验口径）。
  * activeSeats 口径＝共享名单当前活跃席位数，**不含本席**（本席确认后才入名单）；必填，缺省即 invalid。
  * 顺序：confirmJoining → 写共享名单 → 失败 unconfirmJoining → 重试；幂等 member:true 时由接线重做名单写入。
- * alreadyMember=true 表示名单已含本席（崩溃后重放），跳过容量检查，但实例/会话/term 仍校验。 */
+ * alreadyMember=true 表示名单已含本席（崩溃后重放），跳过容量与过期检查，但实例/会话/term 仍校验。 */
 function confirmJoining(state, joinId, sessionId, input) {
   const record = joiningOf(state, joinId);
   if (record === undefined) {
@@ -1139,16 +1141,17 @@ function settledConfirmOf(record, joinId) {
 }
 
 /* confirm 的拒绝面：过期（顺手删记录）与活跃席位容量不足；除过期外失败保留 joining。
- * 名单已含本席（alreadyMember）或记录已确认时跳过容量；名单写入失败必须由接线调 unconfirmJoining 回滚。 */
+ * 名单已含本席（alreadyMember）时跳过容量与过期：崩溃重放可能慢于 TTL，已入名单的席位
+ * 不得因 grant 过期拿 expired（接线会据此误投 join-deny）。身份/任期校验在此之前已完成。
+ * 名单写入失败必须由接线调 unconfirmJoining 回滚。 */
 function confirmBlockOf(state, record, input, alreadyMember) {
-  const at = clockOf(state, input?.now);
-  if (at >= record.expiresAt) {
+  if (alreadyMember) {
+    return null;
+  }
+  if (clockOf(state, input?.now) >= record.expiresAt) {
     removeJoining(state, record.joinId, record);
     state.counters.expired++;
     return failure('expired');
-  }
-  if (alreadyMember) {
-    return null;
   }
   const activeSeats = activeSeatsOf(input.activeSeats);
   if (activeSeats === null) {
@@ -1281,7 +1284,8 @@ function joiningIdentityOf(record) {
 /* 重启恢复：只吃 joins.json 的 pendingJoins 形态（collabId 由调用方按协作目录注入）。
  * 设计形态不含 confirmed/confirmedAt/collabId：confirmed 缺省 false；已确认席位以共享名单为准，
  * 不从 joins.json 恢复，confirmed:true 的记录一律拒收。整表替换并重建席位键索引；
- * 重复 joinId/席位键与坏字段计入 rejected；超过 maxJoining 时保留 requestedAt 最新的 grant，其余拒收。 */
+ * 重复 joinId/席位键与坏字段计入 rejected；超过 maxJoining 时保留 expiresAt 最晚的 grant，其余拒收。
+ * options.maxJoining 只作本次恢复的裁剪上限，不写回运行期上限：一次性限制不得改变后续 begin 的容量判定。 */
 function restoreJoining(state, records, options) {
   if (!Array.isArray(records)) {
     return failure('invalid');
@@ -1291,7 +1295,7 @@ function restoreJoining(state, records, options) {
     return failure('invalid');
   }
   const limit = isPositiveInt(options?.maxJoining) ? options.maxJoining : state.maxJoining;
-  const kept = joinAcceptedOf(state, records, collabId);
+  const kept = joinAcceptedOf(records, collabId);
   const byJoinId = new Map();
   const byKey = new Map();
   let rejected = kept.rejected;
@@ -1307,11 +1311,10 @@ function restoreJoining(state, records, options) {
   rejected += trimJoiningTo(byJoinId, byKey, limit);
   state.byJoinId = byJoinId;
   state.byKey = byKey;
-  state.maxJoining = limit;
   return { ok: true, restored: byJoinId.size, rejected };
 }
 
-function joinAcceptedOf(state, records, collabId) {
+function joinAcceptedOf(records, collabId) {
   const accepted = [];
   let rejected = 0;
   for (const raw of records) {
@@ -1326,7 +1329,8 @@ function joinAcceptedOf(state, records, collabId) {
 }
 
 /* 设计形态：{joinId,instanceId,sessionId,managerTerm,grantVersion,requestedAt,expiresAt}。
- * 兼容模块 list() 里多出的 collabId（必须与注入值一致）；confirmed 只接受缺省或 false。 */
+ * 兼容模块 list() 里多出的 collabId（必须与注入值一致）；confirmed 只接受缺省或 false
+ * （形态校验在 restoredJoiningFieldsOk 里统一做，此处不再重复复核）。 */
 function restoredJoiningOf(raw, collabId) {
   if (!isPlainRecord(raw)) {
     return null;
@@ -1336,9 +1340,6 @@ function restoredJoiningOf(raw, collabId) {
     return null;
   }
   if (raw.collabId !== undefined && asId(raw.collabId) !== collabId) {
-    return null;
-  }
-  if (raw.confirmed !== undefined && raw.confirmed !== false) {
     return null;
   }
   return {
@@ -1375,13 +1376,17 @@ function restoredJoiningFieldsOk(raw) {
   return raw.confirmed === undefined || raw.confirmed === false;
 }
 
-/* 超限恢复按「最新 grant 优先」裁剪：requestedAt 大者保留，同刻按 joinId 稳定排序。 */
+/* 超限恢复按「有效期更长者优先」裁剪：expiresAt 大者保留，同刻再比 requestedAt，最后按 joinId 稳定排序。
+ * 不按 requestedAt 优先：跨重启改动 TTL 后，请求更晚不代表仍有效更久，按请求时刻会先丢有效期更长的 grant。 */
 function trimJoiningTo(byJoinId, byKey, limit) {
   if (byJoinId.size <= limit) {
     return 0;
   }
   const ordered = [...byJoinId.values()]
-    .sort((left, right) => right.requestedAt - left.requestedAt || left.joinId.localeCompare(right.joinId));
+    .sort((left, right) =>
+      right.expiresAt - left.expiresAt
+      || right.requestedAt - left.requestedAt
+      || left.joinId.localeCompare(right.joinId));
   const keep = new Set(ordered.slice(0, limit).map((record) => record.joinId));
   let trimmed = 0;
   for (const [joinId, record] of [...byJoinId]) {
