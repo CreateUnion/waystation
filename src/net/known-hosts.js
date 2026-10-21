@@ -12,6 +12,11 @@ export const MAX_KNOWN_HOSTS = 64;
  * 超限截断保证条目与整文件体积皆有界。 */
 export const MAX_KNOWN_SESSIONS = 32;
 
+/* 能力证据来源（设计 §7.2 证据分级，2026-10-21 用户裁定）：只有直连单播 probe-ack 是新鲜权威证据，
+ * 可把已知支持态降级；扫描、自介、转达帧的缺字段只继承。来源随能力一起落盘，供展示面说明结论从哪来。 */
+export const PARTICIPANTS_SOURCE_PROBE = 'probe';
+export const PARTICIPANTS_SOURCE_SCAN = 'scan';
+
 /* 能力三态的呈现口径（设计 §7.2；`ws_list_hosts` 的「支持 / 不支持 / 未知」由此单一权威产出）：
  * 2＝对端声明支持；0＝对端应答存在但缺字段（旧版）；字段缺席＝从未观测到（未知）。 */
 /**
@@ -45,7 +50,8 @@ const PERSIST_MIN_INTERVAL_MS = 5000;
  * 存储 1→2 版：旧条目（键=地址、无 port）按锚点端口解释——旧版站点全部取默认端口，默认配置下语义等价。
  * 存储 2→3 版：条目增可选 `sessions`（对端活跃会话短码，见会话级管理设计 §1）——旧条目缺字段＝未知，
  * 与「对端报了零会话」（空数组）是两个语义，不混同；不引入文件级迁移（下一次写入即 v3 形态）。
- * 存储 3→4 版：条目增可选 `participants`（会话级参与者能力，2＝支持、0＝不支持、缺席＝未知，见设计 §7.2）；
+ * 存储 3→4 版：条目增可选 `participants`（会话级参与者能力，2＝支持、0＝不支持、缺席＝未知，见设计 §7.2）
+ * 与其证据字段 `source`（probe＝直连单播权威证据 / scan＝扫描、自介、转达）与 `checkedAt`（观测时间）；
  * 旧条目缺字段同样按未知读取，下一次写入即 v4 形态。
  * 写入失败只告警不抛出：清单是发现辅助，丢失不得影响主流程（健壮性硬性要求）。 */
 export function createKnownHosts({ dataDir, log, persistMinIntervalMs = PERSIST_MIN_INTERVAL_MS }) {
@@ -85,6 +91,7 @@ function lookup(state, instanceId) {
 
 /* 按实例标识取能力（扫描合并的继承来源）：同一实例多地址时支持态优先——
  * 能力是「这台机器装了什么版本」的属性，一处确认支持即整机支持；未知与不支持都不覆盖它。
+ * 直连探测证据会同步实例全部端点（见 remember），因此支持态优先不会与探测结论分叉。
  * 未见过 / 未知返回 undefined。 */
 function participantsOf(state, instanceId) {
   if (typeof instanceId !== 'string' || instanceId === '') {
@@ -167,14 +174,14 @@ function quarantine(state) {
 }
 
 function remember(state, entry) {
-  const { address, port, instanceId, identityName, sessions: sessionInput, participants: participantsInput } = entry;
+  const { address, port, instanceId, identityName, sessions: sessionInput, participants: participantsInput, source: sourceInput } = entry;
   if (typeof address !== 'string' || isIP(address) === 0 || !isPort(port)) {
     state.counters.invalidEntries++;
     state.log.warn('忽略非法来源地址或端口（不入清单）', { address: String(address), port: String(port) });
     return;
   }
   state.counters.remembered++;
-  /** @type {{ address: string, port: number, instanceId: string, identityName: string, lastSeenAt: string, sessions?: string[], participants?: number }} */
+  /** @type {{ address: string, port: number, instanceId: string, identityName: string, lastSeenAt: string, sessions?: string[], participants?: number, source?: string, checkedAt?: string }} */
   const stored = {
     address,
     port,
@@ -184,10 +191,13 @@ function remember(state, entry) {
   };
   const key = keyOf(stored);
   const held = state.hosts.get(key);
-  mergeOptionalFields(held, stored, sessionInput, participantsInput);
+  const merged = mergeOptionalFields(held, stored, sessionInput, participantsInput, sourceInput);
   const isNewKey = held === undefined;
   state.hosts.delete(key);
   state.hosts.set(key, stored);
+  if (merged !== null && merged.fresh) {
+    applyProbeEvidence(state, stored, merged.evidence);
+  }
   evictOverflow(state);
   if (isNewKey || Date.now() - state.lastPersistMs >= state.persistMinIntervalMs) {
     persist(state);
@@ -197,8 +207,9 @@ function remember(state, entry) {
 /* 会话段与能力段的合并口径（与扫描结果面同一纪律）：明确申报即覆盖，未报或无法整形＝
  * 这份没有可用的情报 → 继承同键既有值（限同实例）。探测与启动自介既不携 sessions 也不携
  * participants，且远比 250ms 写节流稀疏——不继承就会「对端每扫一次 / 重启自介一次，本机清单里
- * 它的会话短码与能力就消失一次」。探测只证明「这台机器在此」，不是「它没有会话 / 不支持协作」。 */
-function mergeOptionalFields(held, stored, sessionInput, participantsInput) {
+ * 它的会话短码与能力就消失一次」。探测只证明「这台机器在此」，不是「它没有会话 / 不支持协作」。
+ * 返回值区分「新观测」与「继承」：只有新观测才允许把证据升级为整机口径。 */
+function mergeOptionalFields(held, stored, sessionInput, participantsInput, sourceInput) {
   const sessions = boundedSessions(sessionInput);
   if (sessions !== null) {
     stored.sessions = sessions;
@@ -207,9 +218,68 @@ function mergeOptionalFields(held, stored, sessionInput, participantsInput) {
      * 这一台的情报——键碰撞下不继承（宁缺勿错认）。 */
     stored.sessions = held.sessions;
   }
-  const participants = mergedParticipants(held, stored, participantsInput);
-  if (participants !== undefined) {
-    stored.participants = participants;
+  const fresh = participantsEvidenceOf(participantsInput, sourceInput);
+  const evidence = fresh ?? inheritedParticipantsOf(held, stored);
+  if (evidence === null) {
+    return null;
+  }
+  stored.participants = evidence.participants;
+  if (evidence.source !== undefined) {
+    stored.source = evidence.source;
+  }
+  if (evidence.checkedAt !== undefined) {
+    stored.checkedAt = evidence.checkedAt;
+  }
+  return { evidence, fresh: fresh !== null };
+}
+
+/* 能力证据归一（设计 §7.2 证据分级）：
+ * - 显式 2 恒升级（任何来源）；
+ * - 直连探测（source=probe）的 0/缺字段＝新鲜权威证据，可降级已知支持态；
+ * - 其余（扫描/自介/转达的缺字段、非法值、无来源的 0）＝这份没有可用情报，交继承。 */
+/** @returns {{ participants: number, source: string, checkedAt: string } | null} */
+function participantsEvidenceOf(value, sourceInput) {
+  const source = sourceInput === PARTICIPANTS_SOURCE_PROBE ? PARTICIPANTS_SOURCE_PROBE : PARTICIPANTS_SOURCE_SCAN;
+  if (isParticipantsCapability(value)) {
+    return { participants: PARTICIPANTS_CAPABILITY, source, checkedAt: new Date().toISOString() };
+  }
+  if (source === PARTICIPANTS_SOURCE_PROBE && (value === 0 || value === undefined)) {
+    return { participants: 0, source: PARTICIPANTS_SOURCE_PROBE, checkedAt: new Date().toISOString() };
+  }
+  return null;
+}
+
+/* 继承证据：只允许同键同实例；没有旧值＝未知（不落字段）。
+ * 来源/观测时间随能力原样继承——继承不是一次新的观测，不得刷新证据时间。 */
+/** @returns {{ participants: number, source?: string, checkedAt?: string } | null} */
+function inheritedParticipantsOf(held, stored) {
+  if (held === undefined || held.instanceId !== stored.instanceId || held.participants === undefined) {
+    return null;
+  }
+  /** @type {{ participants: number, source?: string, checkedAt?: string }} */
+  const inherited = { participants: held.participants };
+  if (isParticipantsSource(held.source)) {
+    inherited.source = held.source;
+  }
+  if (isCheckedAt(held.checkedAt)) {
+    inherited.checkedAt = held.checkedAt;
+  }
+  return inherited;
+}
+
+/* 直连探测是整机级权威证据：同一实例的全部历史端点同步收敛——
+ * 否则旧地址残留的 2 会让 participantsOf 与探测结论再次分叉。 */
+function applyProbeEvidence(state, stored, evidence) {
+  if (evidence.source !== PARTICIPANTS_SOURCE_PROBE || stored.instanceId === '') {
+    return;
+  }
+  for (const entry of state.hosts.values()) {
+    if (entry.instanceId !== stored.instanceId) {
+      continue;
+    }
+    entry.participants = evidence.participants;
+    entry.source = evidence.source;
+    entry.checkedAt = evidence.checkedAt;
   }
 }
 
@@ -250,7 +320,7 @@ function validateEntry(entry) {
   if (!isPort(port)) {
     return null;
   }
-  /** @type {{ address: string, port: number, instanceId: string, identityName: string, lastSeenAt: string, sessions?: string[], participants?: number }} */
+  /** @type {{ address: string, port: number, instanceId: string, identityName: string, lastSeenAt: string, sessions?: string[], participants?: number, source?: string, checkedAt?: string }} */
   const checked = {
     address: entry.address,
     port,
@@ -258,6 +328,12 @@ function validateEntry(entry) {
     identityName: boundedText(entry.identityName),
     lastSeenAt: storedLastSeenAt(entry.lastSeenAt),
   };
+  return withOptionalFields(checked, entry);
+}
+
+/* 加法字段的存储级底线（会话段形态宽容、能力值域见 storedParticipants）：
+ * 形态不合格的加法字段一律不落，条目骨架有效即保留。 */
+function withOptionalFields(checked, entry) {
   const sessions = boundedSessions(entry.sessions);
   if (sessions !== null) {
     checked.sessions = sessions;
@@ -265,6 +341,12 @@ function validateEntry(entry) {
   const participants = storedParticipants(entry.participants);
   if (participants !== null) {
     checked.participants = participants;
+    if (isParticipantsSource(entry.source)) {
+      checked.source = entry.source;
+    }
+    if (isCheckedAt(entry.checkedAt)) {
+      checked.checkedAt = entry.checkedAt;
+    }
   }
   return checked;
 }
@@ -274,7 +356,7 @@ function storedLastSeenAt(value) {
   return typeof value === 'string' && !Number.isNaN(Date.parse(value)) ? value : new Date(0).toISOString();
 }
 
-/* 能力段的形态底线：只认 2（支持）与 0（不支持），其余一律按未知（返回 null，调用方不落字段）。
+/* 能力段的存储底线：只认 2（支持）与 0（不支持），其余一律按未知（返回 null，调用方不落字段）。
  * 未知与「不支持」是两个语义：前者是没观测到，后者是观测到旧版应答。 */
 function storedParticipants(value) {
   if (isParticipantsCapability(value)) {
@@ -283,19 +365,12 @@ function storedParticipants(value) {
   return value === 0 ? 0 : null;
 }
 
-/* 能力合并：未报（undefined / 非法形态）继承同实例旧值——探测与启动自介不携能力，不能把已知态抹成未知；
- * 已确立的支持态不被缺字段的旧版应答降级（一次丢失/旧版应答不足以推翻整机的版本事实，设计 §7.2「不覆盖已知」）。
- * 继承限同实例：同键换主时上一台的能力不是这一台的情报。 */
-function mergedParticipants(held, stored, input) {
-  const observed = storedParticipants(input);
-  const known = held !== undefined && held.instanceId === stored.instanceId ? held.participants : undefined;
-  if (observed === null) {
-    return known;
-  }
-  if (observed === 0 && known === PARTICIPANTS_CAPABILITY) {
-    return known;
-  }
-  return observed;
+function isParticipantsSource(value) {
+  return value === PARTICIPANTS_SOURCE_PROBE || value === PARTICIPANTS_SOURCE_SCAN;
+}
+
+function isCheckedAt(value) {
+  return typeof value === 'string' && value.length <= 40 && !Number.isNaN(Date.parse(value));
 }
 
 /* 会话段的形态底线：数组即短码化并截断（对外一律短码——短码化是唯一权威的呈现加工）；

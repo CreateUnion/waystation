@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import dgram from 'node:dgram';
 import { networkInterfaces } from 'node:os';
 import {
+  CAPABILITY_PROBE_RETRY_BACKOFF_MS,
   DISCOVERY_REPLY_MIN_INTERVAL_MS,
   JOIN_KNOCK_RETRY_COUNT,
   JOIN_KNOCK_RETRY_INTERVAL_MS,
@@ -11,6 +12,7 @@ import {
   broadcastTargets,
   createDiscovery,
   fitJoinAckDatagram,
+  fitJoinKnockDatagram,
   fitProbeAckDatagram,
 } from '../src/net/discovery.js';
 import { createKnownHosts, participantsStateOf } from '../src/net/known-hosts.js';
@@ -50,24 +52,40 @@ async function startNode(t, { self, bindAddress, collabCount = 0, port, segmentB
 /* 伪对端：绑定到指定回环地址与发现端口，收到探测后以固定实例标识回发应答（delayMs 模拟稍晚应答）。
  * 两个真实节点写不出同一实例标识——「同实例多地址合并」只能靠伪对端构造。
  * ackPort 缺省 = 绑定端口（今版站点自报端口形态）；null = 应答不带端口字段（旧实现形态）。
- * participants 缺省 = 应答不带能力字段（旧版对端形态）；2 = 今版对端。
- * probesReceived 暴露收到的探测计数，供启动自介用例断言。 */
-function startFakePeer(t, { port, address, delayMs = 0, ackPort, participants, instanceId = SELF_B.instanceId, identityName = '主机乙' }) {
+ * participants 缺省 = 应答不带能力字段（旧版对端形态）；2 = 今版对端；其余值原样回发（非法值用例）。
+ * throttleMs > 0 = 模拟真实节点的 probeReplyAt 限流（窗口内的探测不应答；旧对端不认识 purpose）。
+ * setParticipants 供「对端降级/升级」用例在运行中切换应答形态；occupyThrottle 供限流用例确定性地占用窗口。 */
+function startFakePeer(t, { port, address, delayMs = 0, ackPort, participants, instanceId = SELF_B.instanceId, identityName = '主机乙', throttleMs = 0 }) {
   const socket = dgram.createSocket({ type: 'udp4', reuseAddr: false });
   t.after(() => socket.close());
-  const peer = { probesReceived: 0 };
+  let currentParticipants = participants;
+  let lastProbeAt = 0;
+  const peer = {
+    probesReceived: 0,
+    setParticipants: (value) => {
+      currentParticipants = value;
+    },
+    occupyThrottle: () => {
+      lastProbeAt = Date.now();
+    },
+  };
   socket.on('message', (buffer, rinfo) => {
     if (JSON.parse(buffer.toString('utf8')).type !== 'probe') {
       return;
     }
     peer.probesReceived++;
+    const now = Date.now();
+    if (throttleMs > 0 && now - lastProbeAt < throttleMs) {
+      return;
+    }
+    lastProbeAt = now;
     const ack = Buffer.from(JSON.stringify({
       v: 1,
       type: 'probe-ack',
       instanceId,
       identityName,
       collabCount: 2,
-      ...(participants === undefined ? {} : { participants }),
+      ...(currentParticipants === undefined ? {} : { participants: currentParticipants }),
       ...(ackPort === null ? {} : { port: ackPort ?? port }),
     }));
     setTimeout(() => socket.send(ack, rinfo.port, rinfo.address), delayMs);
@@ -465,8 +483,9 @@ const JOIN_REPLY = {
   originator: { instanceId: 'inst-org', identityName: '发起人' },
 };
 
-/* 伪敲门对端：收到敲门后按序数决定是否应答（replyOnOrdinal=false 恒不应答）；应答回指收到敲门的 knockId。 */
-function startKnockPeer(t, { port, address, replyOnOrdinal = 1, overrides = {} }) {
+/* 伪敲门对端：收到敲门后按序数决定是否应答（replyOnOrdinal=false 恒不应答；replyEach=true 每发都应答，
+ * 供「同一对端参与两次敲门」用例）；应答回指收到敲门的 knockId。delayMs 供「多成员先后应答」用例控制到达次序。 */
+function startKnockPeer(t, { port, address, replyOnOrdinal = 1, replyEach = false, overrides = {}, delayMs = 0 }) {
   const socket = dgram.createSocket({ type: 'udp4', reuseAddr: false });
   t.after(() => socket.close());
   const peer = { knocksReceived: 0 };
@@ -476,7 +495,7 @@ function startKnockPeer(t, { port, address, replyOnOrdinal = 1, overrides = {} }
       return;
     }
     peer.knocksReceived++;
-    if (peer.knocksReceived !== replyOnOrdinal) {
+    if (!replyEach && peer.knocksReceived !== replyOnOrdinal) {
       return;
     }
     const ack = Buffer.from(JSON.stringify({
@@ -493,7 +512,7 @@ function startKnockPeer(t, { port, address, replyOnOrdinal = 1, overrides = {} }
       port,
       ...overrides,
     }));
-    socket.send(ack, rinfo.port, rinfo.address);
+    setTimeout(() => socket.send(ack, rinfo.port, rinfo.address), delayMs);
   });
   return new Promise((resolve, reject) => {
     socket.once('error', reject);
@@ -1108,7 +1127,7 @@ test('发现面加法字段：probe-ack / join-knock / join-ack / join-resolve-a
   assert.equal(b.node.stats().probesAnswered, 1);
 });
 
-test('扫描能力三态：participants:2＝支持、旧版缺字段＝不支持；扫描结果与清单同口径', { timeout: 15000 }, async (t) => {
+test('扫描能力三态：participants:2＝支持、缺字段且无已知＝未知（扫描不臆造不支持）；扫描结果与清单同口径', { timeout: 15000 }, async (t) => {
   const port = await pickFreePort();
   const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port });
   await startFakePeer(t, { port, address: '127.0.0.2', participants: 2 });
@@ -1119,13 +1138,15 @@ test('扫描能力三态：participants:2＝支持、旧版缺字段＝不支持
   const supported = hosts.find((entry) => entry.instanceId === SELF_B.instanceId);
   const legacy = hosts.find((entry) => entry.instanceId === SELF_C.instanceId);
   assert.equal(supported.participants, 2, '今版对端＝支持');
-  assert.equal(legacy.participants, 0, '响应存在但缺字段＝旧版/不支持');
+  assert.equal(Object.hasOwn(legacy, 'participants'), false, '扫描缺字段只继承：无已知时保持未知（取证靠直连单播探测）');
   const storedSupported = a.knownHosts.list().find((entry) => entry.address === '127.0.0.2');
   const storedLegacy = a.knownHosts.list().find((entry) => entry.address === '127.0.0.3');
   assert.equal(storedSupported.participants, 2, '清单记录支持态');
-  assert.equal(storedLegacy.participants, 0, '清单记录不支持态（不留作未知）');
+  assert.equal(storedSupported.source, 'scan', '扫描证据来源');
+  assert.ok(!Number.isNaN(Date.parse(storedSupported.checkedAt)));
+  assert.equal(Object.hasOwn(storedLegacy, 'participants'), false, '扫描缺字段不落不支持（与结果面同口径）');
   assert.equal(participantsStateOf(storedSupported), 'supported');
-  assert.equal(participantsStateOf(storedLegacy), 'unsupported');
+  assert.equal(participantsStateOf(storedLegacy), 'unknown');
 });
 
 test('扫描合并继承：同实例后到的缺字段应答不抹掉本窗口已学到的支持态', { timeout: 15000 }, async (t) => {
@@ -1140,7 +1161,7 @@ test('扫描合并继承：同实例后到的缺字段应答不抹掉本窗口�
   assert.equal(hosts[0].participants, 2, '实时扫描结果不覆盖已知（后到的缺字段应答按继承）');
 });
 
-test('单播能力探测：支持 / 不支持 / 无响应＝未知；结果收敛进清单并计数', { timeout: 20000 }, async (t) => {
+test('单播能力探测：支持 / 不支持 / 无应答＝未知；结果先写清单再返回并计数', { timeout: 20000 }, async (t) => {
   const portA = await pickFreePort();
   const portB = await pickFreePort();
   const portC = await pickFreePort();
@@ -1156,16 +1177,159 @@ test('单播能力探测：支持 / 不支持 / 无响应＝未知；结果收�
   });
   const supported = await a.node.probeCapability({ address: '127.0.0.2', port: portB });
   assert.equal(supported.capability, 'supported');
+  assert.equal(supported.participants, 2, '结果与清单同源：能力值直接回带');
   assert.equal(supported.responder.instanceId, SELF_B.instanceId);
   const unsupported = await a.node.probeCapability({ address: '127.0.0.3', port: portC });
   assert.equal(unsupported.capability, 'unsupported');
+  assert.equal(unsupported.participants, 0);
   assert.equal(unsupported.responder.instanceId, SELF_C.instanceId);
   const unknown = await a.node.probeCapability({ address: '127.0.0.4', port: portD, timeoutMs: 150 });
   assert.equal(unknown.capability, 'unknown');
   assert.equal(unknown.responder, null);
-  assert.equal(a.node.stats().capabilityProbesSent, 3);
-  assert.equal(a.knownHosts.list().find((entry) => entry.address === '127.0.0.2').participants, 2, '探测把未知收敛为支持并写入清单');
-  assert.equal(a.knownHosts.list().find((entry) => entry.address === '127.0.0.3').participants, 0, '探测把未知收敛为不支持并写入清单');
+  assert.equal(a.node.stats().capabilityProbesSent, 4, '无应答目标首发＋退避重试各一发');
+  assert.equal(a.node.stats().capabilityProbesRetried, 1);
+  assert.equal(a.node.stats().capabilityProbesTimedOut, 1);
+  assert.equal(a.node.stats().capabilityProbesInFlight, 0);
+  const storedSupported = a.knownHosts.list().find((entry) => entry.address === '127.0.0.2');
+  const storedUnsupported = a.knownHosts.list().find((entry) => entry.address === '127.0.0.3');
+  assert.equal(storedSupported.participants, 2, '探测把未知收敛为支持并写入清单');
+  assert.equal(storedSupported.source, 'probe', '直连探测证据来源');
+  assert.ok(!Number.isNaN(Date.parse(storedSupported.checkedAt)));
+  assert.equal(storedUnsupported.participants, 0, '探测把未知收敛为不支持并写入清单');
+  assert.equal(storedUnsupported.source, 'probe');
+  assert.equal(participantsStateOf(storedUnsupported), 'unsupported');
+  assert.ok(!a.knownHosts.list().some((entry) => entry.address === '127.0.0.4'), '无应答不写清单（未知不是不支持）');
+});
+
+test('单播能力探测走 probe/probe-ack 族：请求携 purpose:capability、不携 participants', { timeout: 20000 }, async (t) => {
+  const portA = await pickFreePort();
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port: portA });
+  const { raw, received } = await startRawPeer(t);
+  const targetPort = raw.address().port;
+  const pending = a.node.probeCapability({ address: '127.0.0.1', port: targetPort, instanceId: SELF_B.instanceId });
+  await waitFor(() => received.length >= 1);
+  assert.equal(received[0].type, 'probe', '复用 probe 族，不新增 capability-probe 数据报类型');
+  assert.equal(received[0].purpose, 'capability', '新对端据此跳过探测应答限流；旧对端忽略未知字段');
+  assert.equal(received[0].participants, undefined, '请求不携能力（只有应答判定三态）');
+  raw.send(Buffer.from(JSON.stringify({
+    v: 1, type: 'probe-ack', instanceId: SELF_B.instanceId, identityName: '主机乙', collabCount: 2, port: targetPort, participants: 2,
+  })), portA, '127.0.0.1');
+  const result = await pending;
+  assert.equal(result.capability, 'supported');
+  assert.deepEqual(result.responder, { instanceId: SELF_B.instanceId, identityName: '主机乙', address: '127.0.0.1', port: targetPort });
+});
+
+test('单播能力探测按 instanceId 关联：同 IP 不同实例/错地址的应答不串户', { timeout: 20000 }, async (t) => {
+  const portA = await pickFreePort();
+  const portB = await pickFreePort();
+  const portD = await pickFreePort();
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port: portA });
+  await startFakePeer(t, { port: portB, address: '127.0.0.2', participants: 2, instanceId: SELF_B.instanceId });
+  const mismatch = await a.node.probeCapability({ address: '127.0.0.2', port: portB, instanceId: SELF_C.instanceId, timeoutMs: 120 });
+  assert.equal(mismatch.capability, 'unknown', '同 IP 应答的实例标识不符：不得按来源地址归户');
+  assert.equal(mismatch.responder, null);
+  assert.ok(a.node.stats().capabilityProbesMismatched >= 2, '首发与重试各有一份不符应答被拒');
+  const matched = await a.node.probeCapability({ address: '127.0.0.2', port: portB, instanceId: SELF_B.instanceId });
+  assert.equal(matched.capability, 'supported');
+  assert.equal(matched.responder.instanceId, SELF_B.instanceId);
+  // 无 instanceId：只认目标端点（地址＋端口同时相等）的原样答复；错地址的主动应答被忽略
+  const silent = dgram.createSocket({ type: 'udp4', reuseAddr: false });
+  t.after(() => silent.close());
+  await new Promise((resolve, reject) => {
+    silent.once('error', reject);
+    silent.bind({ port: portD, address: '127.0.0.4', exclusive: true }, resolve);
+  });
+  const stray = dgram.createSocket({ type: 'udp4', reuseAddr: false });
+  t.after(() => stray.close());
+  await new Promise((resolve, reject) => {
+    stray.once('error', reject);
+    stray.bind({ port: 0, address: '127.0.0.3' }, resolve);
+  });
+  const pending = a.node.probeCapability({ address: '127.0.0.4', port: portD, timeoutMs: 100 });
+  setTimeout(() => {
+    stray.send(Buffer.from(JSON.stringify({
+      v: 1, type: 'probe-ack', instanceId: SELF_B.instanceId, identityName: '主机乙', collabCount: 2, port: stray.address().port, participants: 2,
+    })), portA, '127.0.0.1');
+  }, 10);
+  const strayed = await pending;
+  assert.equal(strayed.capability, 'unknown', '错地址的应答不构成目标证据');
+  assert.equal(strayed.responder, null);
+});
+
+test('单播能力探测重试覆盖旧对端的 250ms 应答限流（退避 ≥300ms）', { timeout: 20000 }, async (t) => {
+  const portA = await pickFreePort();
+  const portB = await pickFreePort();
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port: portA });
+  const peer = await startFakePeer(t, { port: portB, address: '127.0.0.2', participants: 2, throttleMs: DISCOVERY_REPLY_MIN_INTERVAL_MS });
+  assert.ok(CAPABILITY_PROBE_RETRY_BACKOFF_MS >= DISCOVERY_REPLY_MIN_INTERVAL_MS, '退避必须跨过目标侧的应答限流窗');
+  peer.occupyThrottle();   // 模拟上一发普通探测（扫描/自介）刚占用窗口
+  const result = await a.node.probeCapability({ address: '127.0.0.2', port: portB, instanceId: SELF_B.instanceId, timeoutMs: 120 });
+  assert.equal(result.capability, 'supported', '首发被限流吞掉，退避后的重发仍拿到应答');
+  assert.ok(peer.probesReceived >= 2, `首发被限流、重发被应答（实际 ${peer.probesReceived}）`);
+  assert.equal(a.node.stats().capabilityProbesRetried, 1);
+  assert.equal(a.node.stats().capabilityProbesTimedOut, 0);
+});
+
+test('真实节点能力探测：purpose:capability 跳过对端 250ms 探测应答限流（扫描后立即探测仍有应答）', { timeout: 20000 }, async (t) => {
+  const portA = await pickFreePort();
+  const portB = await pickFreePort();
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port: portA });
+  const b = await startNode(t, { self: SELF_B, bindAddress: '127.0.0.2', port: portB });
+  a.knownHosts.remember({ address: '127.0.0.2', port: portB });
+  await a.node.scan({ windowMs: 50 });   // 扫描刚打到 B：其 probeReplyAt 窗口已记账
+  assert.ok(b.node.stats().probesAnswered >= 1);
+  const result = await a.node.probeCapability({ address: '127.0.0.2', port: portB, instanceId: SELF_B.instanceId, timeoutMs: 150 });
+  assert.equal(result.capability, 'supported', '新对端按 purpose 跳过限流：首发即有应答');
+  assert.equal(result.participants, 2);
+  assert.equal(a.node.stats().capabilityProbesSent, 1, '真实新节点无需退避重试');
+  assert.equal(a.node.stats().capabilityProbesRetried, 0);
+  assert.equal(a.knownHosts.participantsOf(SELF_B.instanceId), 2);
+  const stored = a.knownHosts.list().find((entry) => entry.address === '127.0.0.2');
+  assert.equal(stored.source, 'probe', '真实应答同样按直连探测证据落盘');
+  assert.ok(!Number.isNaN(Date.parse(stored.checkedAt)));
+});
+
+test('直连探测证据分级：缺字段把已确立的支持态降级为不支持，返回值与清单同源', { timeout: 20000 }, async (t) => {
+  const portA = await pickFreePort();
+  const portB = await pickFreePort();
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port: portA });
+  const peer = await startFakePeer(t, { port: portB, address: '127.0.0.2', participants: 2 });
+  a.knownHosts.remember({ address: '127.0.0.2', port: portB, instanceId: SELF_B.instanceId, identityName: '主机乙', participants: 2 });
+  a.knownHosts.remember({ address: '127.0.0.9', port: portB, instanceId: SELF_B.instanceId, identityName: '主机乙', participants: 2 });
+  assert.equal(a.knownHosts.participantsOf(SELF_B.instanceId), 2);
+  peer.setParticipants(undefined);   // 对端降级到旧版：应答缺字段
+  const result = await a.node.probeCapability({ address: '127.0.0.2', port: portB, instanceId: SELF_B.instanceId });
+  assert.equal(result.capability, 'unsupported');
+  assert.equal(result.participants, 0);
+  assert.equal(a.knownHosts.participantsOf(SELF_B.instanceId), 0, '探测结论与清单同源（不再「探测说不支持、清单说支持」）');
+  const stored = a.knownHosts.list().find((entry) => entry.address === '127.0.0.2');
+  assert.equal(stored.participants, 0);
+  assert.equal(stored.source, 'probe');
+  assert.equal(participantsStateOf(stored), 'unsupported');
+  assert.equal(a.knownHosts.list().find((entry) => entry.address === '127.0.0.9').participants, 0, '同实例历史端点同步降级');
+});
+
+test('非法 participants 值：线路层计数留痕，扫描/探测/存储统一按未知（不读成不支持）', { timeout: 20000 }, async (t) => {
+  const portA = await pickFreePort();
+  const port = await pickFreePort();
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port: portA });
+  await startFakePeer(t, { port, address: '127.0.0.2', participants: 3 });
+  await startFakePeer(t, { port, address: '127.0.0.3', instanceId: SELF_C.instanceId, identityName: '主机丙', participants: '2' });
+  a.knownHosts.remember({ address: '127.0.0.2', port });
+  a.knownHosts.remember({ address: '127.0.0.3', port });
+  const hosts = await a.node.scan({ windowMs: 300 });
+  const invalidNumber = hosts.find((entry) => entry.instanceId === SELF_B.instanceId);
+  const invalidString = hosts.find((entry) => entry.instanceId === SELF_C.instanceId);
+  assert.equal(Object.hasOwn(invalidNumber, 'participants'), false, '非法值不产生能力结论（未知）');
+  assert.equal(Object.hasOwn(invalidString, 'participants'), false);
+  assert.equal(Object.hasOwn(a.knownHosts.list().find((entry) => entry.address === '127.0.0.2'), 'participants'), false, '存储层同为未知');
+  assert.ok(a.node.stats().invalidParticipants >= 2, '线路层计数留痕');
+  const probe = await a.node.probeCapability({ address: '127.0.0.2', port, instanceId: SELF_B.instanceId });
+  assert.equal(probe.capability, 'unknown');
+  assert.equal(probe.responder.instanceId, SELF_B.instanceId);
+  assert.equal(probe.participants, undefined);
+  assert.ok(a.node.stats().invalidParticipants >= 3);
+  assert.equal(Object.hasOwn(a.knownHosts.list().find((entry) => entry.address === '127.0.0.2'), 'participants'), false, '非法值不写能力字段');
 });
 
 test('单播能力探测参数：非法地址 / 端口 / 窗口 / 实例标识抛 TypeError（编程错误快速暴露）', { timeout: 15000 }, async (t) => {
@@ -1177,6 +1341,7 @@ test('单播能力探测参数：非法地址 / 端口 / 窗口 / 实例标识�
   await assert.rejects(a.node.probeCapability({ ...target, port: 0 }), TypeError);
   await assert.rejects(a.node.probeCapability({ ...target, timeoutMs: 0 }), TypeError);
   await assert.rejects(a.node.probeCapability({ ...target, instanceId: 42 }), TypeError);
+  await assert.rejects(a.node.probeCapability({ ...target, instanceId: '' }), TypeError);
 });
 
 test('旧版对端缺能力字段：join-ack 与按名解析结果记 0（不支持）', { timeout: 15000 }, async (t) => {
@@ -1192,6 +1357,67 @@ test('旧版对端缺能力字段：join-ack 与按名解析结果记 0（不支
   await startResolvePeer(t, { port: portC, address: '127.0.0.4', replies: [{ found: false }] });
   const result = await a.node.requestJoinResolve({ name: '联调讨论', address: '127.0.0.4', port: portC, timeoutMs: 300 });
   assert.equal(result.participants, 0, '旧版解析应答缺字段＝不支持');
+});
+
+test('join-ack 多应答按目标实例取：首答旧成员不掩盖后答新成员的支持态，结果与 responder 一致', { timeout: 20000 }, async (t) => {
+  const portA = await pickFreePort();
+  const portB = await pickFreePort();
+  const portC = await pickFreePort();
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port: portA, knockOptions: KNOCK_TIMINGS });
+  await startKnockPeer(t, { port: portB, address: '127.0.0.2', replyEach: true, delayMs: 0 });
+  await startKnockPeer(t, { port: portC, address: '127.0.0.3', replyEach: true, delayMs: 120, overrides: { instanceId: SELF_C.instanceId, identityName: '主机丙', participants: 2 } });
+  a.knownHosts.remember({ address: '127.0.0.2', port: portB });
+  a.knownHosts.remember({ address: '127.0.0.3', port: portC });
+  const replies = await a.node.requestJoin({ name: '联调讨论' });
+  assert.equal(replies.length, 1, '同一讨论合并为一行');
+  assert.equal(replies[0].participants, 2, '后答新成员的支持态覆盖先答旧成员的缺字段证据');
+  assert.equal(replies[0].responder.instanceId, SELF_C.instanceId, '能力与 responder 绑定同一条应答（不盲取首个）');
+  const targeted = await a.node.requestJoin({ name: '联调讨论', instanceId: SELF_B.instanceId });
+  assert.equal(targeted.length, 1);
+  assert.equal(targeted[0].responder.instanceId, SELF_B.instanceId, '指定目标实例：只采信该实例的应答');
+  assert.equal(targeted[0].participants, 0, '目标实例为旧版：不支持');
+});
+
+test('解析多应答按目标实例取：不符实例的应答不采信', { timeout: 15000 }, async (t) => {
+  const portA = await pickFreePort();
+  const portB = await pickFreePort();
+  const a = await startNode(t, { self: SELF_A, bindAddress: '127.0.0.1', port: portA });
+  await startResolvePeer(t, { port: portB, address: '127.0.0.2', replies: [{ found: true, collabId: 'collab-b', name: '联调讨论' }] });
+  const mismatch = await a.node.requestJoinResolve({ name: '联调讨论', address: '127.0.0.2', port: portB, timeoutMs: 300, instanceId: SELF_C.instanceId });
+  assert.equal(mismatch, null, '目标实例不符：应答不归户（单播应答者不可冒充目标）');
+  const matched = await a.node.requestJoinResolve({ name: '联调讨论', address: '127.0.0.2', port: portB, timeoutMs: 300, instanceId: SELF_B.instanceId });
+  assert.equal(matched.collabId, 'collab-b');
+  assert.equal(matched.participants, 0, '同一应答的缺字段证据＝不支持');
+  assert.equal(matched.responder.instanceId, SELF_B.instanceId);
+});
+
+test('fitJoinKnockDatagram：超预算先截身份名（讨论名是命中依据、不可截），截无可截弃发', async (t) => {
+  const knock = {
+    v: 1, type: 'join-knock', instanceId: 'i'.repeat(64), identityName: '名'.repeat(64),
+    knockId: 'k'.repeat(36), name: '讨'.repeat(64), participants: 2,
+  };
+  const fitted = fitJoinKnockDatagram(knock);
+  assert.ok(Buffer.byteLength(JSON.stringify(fitted)) <= 512, '整形后不超数据报预算');
+  assert.equal(fitted.name, knock.name, '讨论名是命中依据：原样保留');
+  assert.equal(fitted.identityTruncated, true);
+  assert.ok(fitted.identityName.length > 0 && fitted.identityName.length < 64, '身份名按码位截断（UTF-8 安全）');
+  assert.equal(fitJoinKnockDatagram({ ...knock, name: '讨'.repeat(100) }), null, '讨论名本身撑爆预算：弃发交调用方计数');
+  // 线上形态：中文长名节点敲门时，对端收到的仍是合法 ≤512B 数据报（讨论名完整）
+  const portA = await pickFreePort();
+  const longSelf = { instanceId: SELF_A.instanceId, identityName: '名'.repeat(64) };
+  const a = await startNode(t, { self: longSelf, bindAddress: '127.0.0.1', port: portA, knockOptions: KNOCK_TIMINGS });
+  const { raw, received } = await startRawPeer(t);
+  a.knownHosts.remember({ address: '127.0.0.1', port: raw.address().port });
+  const sent = await a.node.requestJoin({ name: '讨'.repeat(64) });
+  assert.deepEqual(sent, [], '伪对端不应答：空清单');
+  const knockDatagrams = received.filter((item) => item.type === 'join-knock');
+  assert.ok(knockDatagrams.length >= 1, '整形后的敲门仍应发出');
+  for (const datagram of knockDatagrams) {
+    assert.ok(Buffer.byteLength(JSON.stringify(datagram)) <= 512);
+    assert.equal(datagram.name, '讨'.repeat(64), '讨论名不被截断');
+    assert.equal(datagram.identityTruncated, true);
+  }
+  assert.equal(a.node.stats().joinKnockRequestsSkipped, 0);
 });
 
 test('体积整形保留能力字段：probe-ack 先弃会话、join-ack 先截主题、resolve-ack 先弃名称', () => {

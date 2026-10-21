@@ -330,16 +330,20 @@ test('会话段与全量标识混入：只采字符串短码，非字符串项�
   assert.deepEqual(hosts.list()[0].sessions, ['9f8e7d6c', 'ab12cd34'], '非字符串与空串不入清单（对端整形的良心不由本层假设）');
 });
 
-test('remember 存 participants：2＝支持、0＝不支持、缺字段＝未知；未报继承、已确立支持态不被旧版应答降级', (t) => {
+test('remember 存 participants：2＝支持、0＝不支持、缺字段＝未知；扫描缺字段只继承、显式 2 恒升级', (t) => {
   const { dir, hosts } = makeHosts(t);
   hosts.remember({ address: '10.0.0.1', port: 7321, instanceId: 'inst-a', participants: 2 });
   assert.equal(hosts.list()[0].participants, 2);
+  assert.equal(hosts.list()[0].source, 'scan', '非直连探测来源记为扫描证据');
+  assert.ok(!Number.isNaN(Date.parse(hosts.list()[0].checkedAt)));
   hosts.remember({ address: '10.0.0.1', port: 7321, instanceId: 'inst-a' });   // 探测 / 启动自介：不携能力
   assert.equal(hosts.list()[0].participants, 2, '未报字段＝这份没有情报，继承已知（探测不得抹掉能力）');
-  hosts.remember({ address: '10.0.0.1', port: 7321, instanceId: 'inst-a', participants: 0 });   // 旧版应答缺字段
-  assert.equal(hosts.list()[0].participants, 2, '缺字段的旧版应答不推翻已确立的支持态（不覆盖已知）');
-  hosts.remember({ address: '10.0.0.2', port: 7321, instanceId: 'inst-b', participants: 0 });
-  assert.equal(hosts.list().find((entry) => entry.address === '10.0.0.2').participants, 0, '从未支持过的旧版对端＝不支持');
+  hosts.remember({ address: '10.0.0.1', port: 7321, instanceId: 'inst-a', participants: 0 });   // 扫描/转达缺字段
+  assert.equal(hosts.list()[0].participants, 2, '扫描/转达来源的缺字段证据只继承，不降级已确立的支持态');
+  hosts.remember({ address: '10.0.0.1', port: 7321, instanceId: 'inst-a', participants: 3 });
+  assert.equal(hosts.list()[0].participants, 2, '非法值按无情报继承，不得读成不支持');
+  hosts.remember({ address: '10.0.0.2', port: 7321, instanceId: 'inst-b', participants: 0, source: 'probe' });
+  assert.equal(hosts.list().find((entry) => entry.address === '10.0.0.2').participants, 0, '直连探测缺字段＝不支持');
   hosts.remember({ address: '10.0.0.2', port: 7321, instanceId: 'inst-b', participants: 2 });
   assert.equal(hosts.list().find((entry) => entry.address === '10.0.0.2').participants, 2, '升级后重新申报支持＝覆盖不支持');
   hosts.remember({ address: '10.0.0.3', port: 7321, instanceId: 'inst-c' });
@@ -348,8 +352,31 @@ test('remember 存 participants：2＝支持、0＝不支持、缺字段＝未�
   assert.equal(Object.hasOwn(hosts.list().find((entry) => entry.address === '10.0.0.3'), 'participants'), false, '非法形态按未知；条目本身仍有效');
   const onDisk = JSON.parse(readFileSync(join(dir, KNOWN_HOSTS_FILE_NAME), 'utf8'));
   assert.equal(onDisk.version, 4, '存储版本升 4');
-  assert.equal(onDisk.hosts.find((entry) => entry.address === '10.0.0.1').participants, 2, '能力随清单落盘');
+  const storedA = onDisk.hosts.find((entry) => entry.address === '10.0.0.1');
+  assert.equal(storedA.participants, 2, '能力随清单落盘');
+  assert.equal(storedA.source, 'scan', '证据来源随清单落盘');
+  assert.ok(!Number.isNaN(Date.parse(storedA.checkedAt)), '观测时间随清单落盘');
   assert.equal(Object.hasOwn(onDisk.hosts.find((entry) => entry.address === '10.0.0.3'), 'participants'), false, '未知不落字段（重载后仍是未知）');
+});
+
+test('直连探测证据（source=probe）：缺字段可把支持态降级为不支持，并同步同实例全部端点', (t) => {
+  const { dir, hosts } = makeHosts(t);
+  hosts.remember({ address: '10.0.0.1', port: 7321, instanceId: 'inst-a', participants: 2 });
+  hosts.remember({ address: '10.0.0.2', port: 7321, instanceId: 'inst-a', participants: 2 });
+  hosts.remember({ address: '10.0.0.3', port: 7321, instanceId: 'inst-b', participants: 2 });
+  assert.equal(hosts.participantsOf('inst-a'), 2);
+  hosts.remember({ address: '10.0.0.1', port: 7321, instanceId: 'inst-a', participants: 0, source: 'probe' });
+  assert.equal(hosts.participantsOf('inst-a'), 0, '直连探测可降级：聚合结论与探测同源');
+  assert.equal(hosts.list().find((entry) => entry.address === '10.0.0.2').participants, 0, '同实例历史端点同步降级（旧地址的 2 不得兜底）');
+  assert.equal(hosts.list().find((entry) => entry.address === '10.0.0.3').participants, 2, '其他实例不受影响');
+  const downgraded = hosts.list().find((entry) => entry.address === '10.0.0.1');
+  assert.equal(downgraded.source, 'probe');
+  assert.ok(!Number.isNaN(Date.parse(downgraded.checkedAt)));
+  hosts.remember({ address: '10.0.0.1', port: 7321, instanceId: 'inst-a', participants: 2 });
+  assert.equal(hosts.participantsOf('inst-a'), 2, '显式 2 恒升级（另一地址的 0 不阻断整机支持态）');
+  const onDisk = JSON.parse(readFileSync(join(dir, KNOWN_HOSTS_FILE_NAME), 'utf8'));
+  assert.equal(onDisk.hosts.find((entry) => entry.address === '10.0.0.1').participants, 2);
+  assert.equal(onDisk.hosts.find((entry) => entry.address === '10.0.0.1').source, 'scan', '升级证据来源随最新观测');
 });
 
 test('participants 继承限同实例：同键换主时上一台的能力不落到新实例', (t) => {
@@ -362,31 +389,42 @@ test('participants 继承限同实例：同键换主时上一台的能力不落�
   assert.equal(hosts.list().find((entry) => entry.address === '10.0.0.10').participants, 2, '同实例未报仍继承（守卫不误伤）');
 });
 
-test('v4 载入：participants 2/0 原样保留、非法值与缺字段按未知；下一次写入即 v4 形态', (t) => {
+test('v4 载入：participants 2/0 与 source/checkedAt 原样保留、非法值与缺字段按未知；下一次写入即 v4 形态', (t) => {
   const dir = makeTempDir(t);
   writeFileSync(join(dir, KNOWN_HOSTS_FILE_NAME), JSON.stringify({
     version: 4,
     hosts: [
-      { address: '10.0.0.1', port: 7321, instanceId: 'i1', identityName: '甲', lastSeenAt: '2026-01-01T00:00:00.000Z', participants: 2 },
-      { address: '10.0.0.2', port: 7321, instanceId: 'i2', identityName: '乙', lastSeenAt: '2026-01-01T00:00:00.000Z', participants: 0 },
+      { address: '10.0.0.1', port: 7321, instanceId: 'i1', identityName: '甲', lastSeenAt: '2026-01-01T00:00:00.000Z', participants: 2, source: 'probe', checkedAt: '2026-01-02T00:00:00.000Z' },
+      { address: '10.0.0.2', port: 7321, instanceId: 'i2', identityName: '乙', lastSeenAt: '2026-01-01T00:00:00.000Z', participants: 0, source: 'scan', checkedAt: '2026-01-03T00:00:00.000Z' },
       { address: '10.0.0.3', port: 7321, instanceId: 'i3', identityName: '丙', lastSeenAt: '2026-01-01T00:00:00.000Z', participants: 1 },
       { address: '10.0.0.4', port: 7321, instanceId: 'i4', identityName: '丁', lastSeenAt: '2026-01-01T00:00:00.000Z' },
+      { address: '10.0.0.6', port: 7321, instanceId: 'i6', identityName: '己', lastSeenAt: '2026-01-01T00:00:00.000Z', participants: 2, source: 'bogus', checkedAt: 'not-a-time' },
+      { address: '10.0.0.7', port: 7321, instanceId: 'i7', identityName: '庚', lastSeenAt: '2026-01-01T00:00:00.000Z', source: 'probe', checkedAt: '2026-01-04T00:00:00.000Z' },
     ],
   }));
   const { hosts } = makeHosts(t, { dataDir: dir });
   const byAddress = new Map(hosts.list().map((entry) => [entry.address, entry]));
   assert.equal(byAddress.get('10.0.0.1').participants, 2);
+  assert.equal(byAddress.get('10.0.0.1').source, 'probe');
+  assert.equal(byAddress.get('10.0.0.1').checkedAt, '2026-01-02T00:00:00.000Z');
   assert.equal(byAddress.get('10.0.0.2').participants, 0, '不支持态随清单载入');
+  assert.equal(byAddress.get('10.0.0.2').source, 'scan');
   assert.equal(Object.hasOwn(byAddress.get('10.0.0.3'), 'participants'), false, '非法值按未知（条目仍有效）');
   assert.equal(Object.hasOwn(byAddress.get('10.0.0.4'), 'participants'), false, '旧条目缺字段＝未知');
+  assert.equal(byAddress.get('10.0.0.6').participants, 2, '能力值合法即保留');
+  assert.equal(Object.hasOwn(byAddress.get('10.0.0.6'), 'source'), false, '非法来源不落字段');
+  assert.equal(Object.hasOwn(byAddress.get('10.0.0.6'), 'checkedAt'), false, '非法时间不落字段');
+  assert.equal(Object.hasOwn(byAddress.get('10.0.0.7'), 'participants'), false, '无能力值时不孤立保留来源字段');
+  assert.equal(Object.hasOwn(byAddress.get('10.0.0.7'), 'source'), false);
   assert.equal(hosts.stats().invalidEntries, 0, '能力字段形态宽容：条目骨架有效即保留');
   hosts.remember({ address: '10.0.0.5', port: 7321 });
   const onDisk = JSON.parse(readFileSync(join(dir, KNOWN_HOSTS_FILE_NAME), 'utf8'));
   assert.equal(onDisk.version, 4);
   assert.equal(onDisk.hosts.find((entry) => entry.address === '10.0.0.1').participants, 2, '重写保留已载入的能力');
+  assert.equal(onDisk.hosts.find((entry) => entry.address === '10.0.0.1').source, 'probe', '重写保留证据来源');
 });
 
-test('participantsStateOf / participantsOf：三态映射与按实例取最近值', (t) => {
+test('participantsStateOf / participantsOf：三态映射与按实例「支持态优先」（不看 lastSeenAt）', (t) => {
   assert.equal(participantsStateOf({ participants: 2 }), 'supported');
   assert.equal(participantsStateOf({ participants: 0 }), 'unsupported');
   assert.equal(participantsStateOf({}), 'unknown');
@@ -394,10 +432,10 @@ test('participantsStateOf / participantsOf：三态映射与按实例取最近�
   const { hosts } = makeHosts(t);
   assert.equal(hosts.participantsOf('inst-x'), undefined);
   assert.equal(hosts.participantsOf(''), undefined);
-  hosts.remember({ address: '10.0.0.1', port: 7321, instanceId: 'inst-x', participants: 0 });
+  hosts.remember({ address: '10.0.0.1', port: 7321, instanceId: 'inst-x', participants: 0, source: 'probe' });
   hosts.remember({ address: '10.0.0.2', port: 7321, instanceId: 'inst-y', participants: 2 });
   assert.equal(hosts.participantsOf('inst-x'), 0);
   assert.equal(hosts.participantsOf('inst-y'), 2);
   hosts.remember({ address: '10.0.0.3', port: 7321, instanceId: 'inst-x', participants: 2 });
-  assert.equal(hosts.participantsOf('inst-x'), 2, '同一实例多地址：一处确认支持即整机支持');
+  assert.equal(hosts.participantsOf('inst-x'), 2, '同一实例多地址：一处确认支持即整机支持（显式 2 恒升级）');
 });
