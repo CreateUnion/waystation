@@ -1,6 +1,7 @@
 import { MAX_FRAME_BYTES, MAX_TOPIC_CHARS, isPresentationText } from '../net/protocol.js';
 import { isPostEntryShape, displayOrderOf } from './posts.js';
-import { foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, persistMember, primarySeatOf, selfJoinedOf } from './local.js';
+import { archiveLocalSeatsOfState, foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, persistMember, primarySeatOf, selfJoinedOf } from './local.js';
+import { forgetMuteBaselinesOfCollab } from './mute.js';
 import { applyEndpoint, checkRelayRecovery, endpointFor, mutateLedger, notifyLocal, startJoinReplay, stopJoinReplay, stopJoinReplays } from './outgoing.js';
 import { foldMemberEvents } from './members.js';
 import { isPeerShape, isTimestamp } from './model.js';
@@ -516,9 +517,10 @@ function mergeForumState(state, local, metaState) {
     if (local.member.archivedAt === undefined) {
       local.member.archivedAt = new Date().toISOString();
     }
-    /* 与 end 帧入口（handleEnd）同口径：本地转归档即清静音——不清则重入
+    /* 与 end 帧入口（handleEnd）同口径：本地转归档即归档席位并清静音基线——不清则重入
      * （receiveRepeatInvite 复用既有记录）时带着幽灵静音，用户从未对重入后的协作设过静音。 */
-    local.mute.clear();
+    archiveLocalSeatsOfState(state, local);
+    forgetMuteBaselinesOfCollab(state, local.collabId);
     stopJoinReplay(state, local);
     state.counters.syncTerminalsIn++;
     state.log.info('经对表学到讨论终态——本地转归档', { collabId: local.collabId, state: metaState });

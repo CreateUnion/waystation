@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
-import { collabFilePath } from '../src/paths.js';
+import { collabFilePath, seatFilePath } from '../src/paths.js';
 import { makeTempDir, waitFor } from './helpers.js';
 import { createCollabService } from '../src/collab/service.js';
 import { SYNC_REQUEST_MAX, SYNC_REQUEST_WINDOW_MS } from '../src/collab/gate.js';
@@ -505,28 +505,62 @@ test('发起人退出（leave 自播）：成员表出表、讨论存续（成�
 /* —— end 双通道与终态吸收 —— */
 
 /* 归档后的重入探测（receiveRepeatInvite 复用路径）：已加入者的重邀为幂等并集吸收——记录面不动、
- * 不复活静音（静音文件不复活、帖注入判定不静音）。 */
-async function assertReentryKeepsNoMute(made, collabId, self, expectedState) {
+ * 不复活退役的静音文件（静音权威是席位文件的 muted；席位归档面见紧随其后的产品缺陷用例）。 */
+async function assertReentryKeepsArchived(made, collabId, self, expectedState) {
   const roster = [peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port), peer(SELF_B.instanceId, SELF_B.identityName, SELF_B.port), peer(self.instanceId, self.identityName, self.port)];
   await receive(made.service, inviteFrame({ collabId, mode: 'forum', manager: peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port), members: roster }));
   assert.equal(made.service.list().collabs[0].state, expectedState, '已加入者重邀幂等：记录面不动');
-  assert.equal(existsSync(collabFilePath(made.dir, collabId, MUTE_FILE_NAME)), false, '重入不复活静音文件');
-  assert.equal(made.service.hooks.sessionGate(collabFrame('post', collabId, peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port), {})).suppress, false, '重入后帖注入判定：不静音');
+  assert.equal(existsSync(collabFilePath(made.dir, collabId, MUTE_FILE_NAME)), false, '重入不复活退役静音文件');
+}
+
+/* C 受邀并以会话级链路加入（同意门挑战 → confirmToken → join 自播一跳送达 A），此后离线：
+ * 本用例不让任何帧到达 C，回归时只能靠对表学终态。 */
+async function makeOfflineForumMemberC(t, wire, { a, collabId, selfA, selfB }) {
+  const selfC = { instanceId: 'inst-c', identityName: '主机丙', port: 17323 };
+  const seatOfC = sessionOf(selfC.instanceId);
+  const madeC = makeService(t, { self: selfC, sendDirect: wire.sendDirectFor(selfC), syncPeerPicker: () => [selfA.instanceId] });
+  wire.register(selfC, madeC.service);
+  await receive(madeC.service, inviteFrame({ collabId, mode: 'forum', manager: peer(selfA.instanceId, selfA.identityName, selfA.port), members: [peer(selfA.instanceId, selfA.identityName, selfA.port), peer(selfB.instanceId, selfB.identityName, selfB.port), peer(selfC.instanceId, selfC.identityName, selfC.port)], endpoints: { [selfA.instanceId]: { address: '127.0.0.1', port: selfA.port } } }));
+  /* 会话级同意门：首次决定只签发挑战（零状态变更），携 confirmToken 重试才生效。 */
+  const challenge = await madeC.service.approve({ collabId, approve: true, sessionId: seatOfC });
+  assert.equal(challenge.needsUserConfirmation, true, '首次同意只发挑战');
+  const consented = await madeC.service.approve({ collabId, approve: true, sessionId: seatOfC, confirmToken: challenge.confirmToken });
+  assert.equal(consented.ok, true, consented.message);
+  assert.equal(consented.joined, true, '讨论同意即加入');
+  /* join 链路：自播 join 由本会话席位签发，手工一跳送达 A（应答条件：请求方在成员表内）。 */
+  const joinMessage = sentOf(madeC.sent, 'join', collabId)[0];
+  assert.ok(joinMessage !== undefined, '同意后自播 join');
+  assert.equal(joinMessage.fromSessionId, seatOfC, 'join 由本会话席位签发');
+  await wire.hop(a.service, joinMessage, selfC);
+  return { selfC, madeC, seatOfC };
+}
+
+/* 终态吸收：陈旧副本（meta=active）不把 completed 回退；归档后新帖照拒。 */
+async function assertTerminalAbsorbed(madeC, a, selfA, collabId) {
+  const staleBundle = {
+    v: 1,
+    type: 'history-bundle',
+    msgId: `stale-${randomUUID()}`,
+    from: { instanceId: selfA.instanceId, identityName: selfA.identityName, port: selfA.port },
+    collabId,
+    ts: new Date().toISOString(),
+    payload: { cursor: null, more: false, posts: [], overlap: [], meta: { state: 'active', name: '讨论甲', topic: '议题' }, members: [], endpoints: {} },
+  };
+  assert.equal((await receive(madeC.service, staleBundle)).ok, true);
+  assert.equal(madeC.service.list().collabs[0].state, 'completed', '任何来源不得把终态回退到先前状态');
+  const latePost = forumPostFrame(collabId, AUTHOR_U, { postId: 'post-late', seq: 9, text: '结束后的帖' }, new Date(BASE_MS + 9000).toISOString());
+  assert.equal((await receive(a.service, latePost)).ok, false, '归档后新帖照拒');
+  assert.equal(a.service.stats().lateDropped >= 1, true);
 }
 
 test('end 双通道：在线广播即归档；离线者回归经 bundle 元状态学 end → 本地转归档；终态吸收不回退', async (t) => {
   const { wire, selfA, selfB, a, b, collabId } = await makeForumPair(t);
   await injectPosts(a.service, collabId, postsOf(2));
-  /* C 受邀并加入，但此后「离线」（不投递任何帧给 C）。 */
-  const selfC = { instanceId: 'inst-c', identityName: '主机丙', port: 17323 };
-  const madeC = makeService(t, { self: selfC, sendDirect: wire.sendDirectFor(selfC), syncPeerPicker: () => [selfA.instanceId] });
-  wire.register(selfC, madeC.service);
-  await receive(madeC.service, inviteFrame({ collabId, mode: 'forum', manager: peer(selfA.instanceId, selfA.identityName, selfA.port), members: [peer(selfA.instanceId, selfA.identityName, selfA.port), peer(selfB.instanceId, selfB.identityName, selfB.port), peer(selfC.instanceId, selfC.identityName, selfC.port)], endpoints: { [selfA.instanceId]: { address: '127.0.0.1', port: selfA.port } } }));
-  await madeC.service.approve({ collabId, approve: true });
-  await receive(a.service, joinFrameOf(collabId, peer(selfC.instanceId, selfC.identityName, selfC.port)));
-  /* 默认静音写点（同意邀请）仍落旧静音文件（席位静音迁移尚未覆盖该写点，按 ISSUE 记录）；
-   * 本用例钉住的是「归档路径不得留下幽灵静音文件」——无论走 end 帧还是 bundle 学终态都须清掉。 */
-  assert.equal(existsSync(collabFilePath(madeC.dir, collabId, MUTE_FILE_NAME)), true, '同意路径已写默认静音');
+  const { selfC, madeC, seatOfC } = await makeOfflineForumMemberC(t, wire, { a, collabId, selfA, selfB });
+  /* 静音权威＝席位文件的 muted（mute.json 退役、留盘不读写）：同意加入的默认静音落 C 的席位。 */
+  const seatOfCFile = JSON.parse(readFileSync(seatFilePath(madeC.dir, collabId, seatOfC), 'utf8'));
+  assert.equal(seatOfCFile.muted, true, '同意路径默认静音落席位文件');
+  assert.equal(existsSync(collabFilePath(madeC.dir, collabId, MUTE_FILE_NAME)), false, 'mute.json 不写入（静音权威=席位）');
   /* 发起人结束：广播 end（豁免 TTL/上限）；在线者 B 经广播通道。 */
   const ended = await a.service.end({ collabId });
   assert.equal(ended.ok, true);
@@ -539,27 +573,32 @@ test('end 双通道：在线广播即归档；离线者回归经 bundle 元状�
   const outcome = await syncWhenIdle(madeC.service, collabId);
   assert.equal(outcome.ok, true, JSON.stringify(outcome));
   assert.equal(madeC.service.list().collabs[0].state, 'completed', '经 bundle 元状态学到 end → 本地转归档');
-  assert.equal(existsSync(collabFilePath(madeC.dir, collabId, MUTE_FILE_NAME)), false, '经 bundle 学终态转归档即清静音（与 end 帧入口同口径）');
+  assert.equal(existsSync(collabFilePath(madeC.dir, collabId, MUTE_FILE_NAME)), false, 'mute.json 全程不写入（静音权威=席位文件）');
   assert.equal((await madeC.service.view({ collabId })).posts.length, 2, '归档后回填仍可达');
   assert.equal(madeC.service.stats().syncTerminalsIn, 1);
-  /* 终态吸收：陈旧副本（meta=active）不把 completed 回退。 */
-  const staleBundle = {
+  await assertTerminalAbsorbed(madeC, a, selfA, collabId);
+  /* 重入（receiveRepeatInvite 复用路径）：复用既有记录与 store 不复活退役静音文件。 */
+  await assertReentryKeepsArchived(madeC, collabId, selfC, 'completed');
+});
+
+/* 终态席位归档的静音面（设计 §3.4/§5.4、契约 §8）：经 bundle 学到的终态须与 end 帧入口同口径——
+ * 本机席位写 archivedAt、归档席位退出静音聚合；否则重入复用既有席位时旧静音复活。 */
+test('经 bundle 学终态：本机席位归档并退出静音聚合（重入不复活静音）', async (t) => {
+  const { selfA, b, collabId } = await makeForumPair(t);
+  const terminal = {
     v: 1,
     type: 'history-bundle',
-    msgId: `stale-${randomUUID()}`,
-    from: { instanceId: selfA.instanceId, identityName: selfA.identityName, port: selfA.port },
+    msgId: `terminal-${randomUUID()}`,
+    from: { instanceId: selfA.instanceId, sessionId: sessionOf(selfA.instanceId), identityName: selfA.identityName, port: selfA.port },
     collabId,
     ts: new Date().toISOString(),
-    payload: { cursor: null, more: false, posts: [], overlap: [], meta: { state: 'active', name: '讨论甲', topic: '议题' }, members: [], endpoints: {} },
+    payload: { cursor: null, more: false, posts: [], overlap: [], meta: { state: 'completed', name: '讨论甲', topic: '议题' }, members: [], endpoints: {} },
   };
-  assert.equal((await receive(madeC.service, staleBundle)).ok, true);
-  assert.equal(madeC.service.list().collabs[0].state, 'completed', '任何来源不得把终态回退到先前状态');
-  /* 归档后新帖照拒。 */
-  const latePost = forumPostFrame(collabId, AUTHOR_U, { postId: 'post-late', seq: 9, text: '结束后的帖' }, new Date(BASE_MS + 9000).toISOString());
-  assert.equal((await receive(a.service, latePost)).ok, false, '归档后新帖照拒');
-  assert.equal(a.service.stats().lateDropped >= 1, true);
-  /* 重入（receiveRepeatInvite 复用路径）：复用既有记录与 store 不携带幽灵静音。 */
-  await assertReentryKeepsNoMute(madeC, collabId, selfC, 'completed');
+  assert.equal((await receive(b.service, terminal)).ok, true);
+  assert.equal(b.service.list().collabs[0].state, 'completed', '经 bundle 学到终态');
+  const seat = JSON.parse(readFileSync(seatFilePath(b.dir, collabId, sessionOf(SELF_B.instanceId)), 'utf8'));
+  assert.equal(typeof seat.archivedAt, 'string', '终态归档本机席位（与 end 帧入口同口径）');
+  assert.equal(b.service.hooks.sessionGate(collabFrame('post', collabId, peer(SELF_A.instanceId, SELF_A.identityName, SELF_A.port), {})).suppress, false, '归档席位退出静音聚合（重入后帖注入不静音）');
 });
 
 /* —— 无应答与限流 —— */

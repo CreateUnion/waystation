@@ -159,6 +159,14 @@ function snapshotFrame(collabId, from, version) {
 const SEED_AT = '2026-10-21T08:00:00.000Z';
 const SELF_SEAT = 'sess-self';
 
+/* 0.2.0 同意门：首次决定只发挑战（不产生状态变更），携 confirmToken 重试才生效。
+ * 同意以调用会话为单位——会话标识决定入席的席位。 */
+async function approveInviteWithConsentOf(service, collabId, sessionId, approve = true, reason = undefined) {
+  const challenge = await service.approve({ collabId, approve, reason, sessionId });
+  assert.equal(challenge.needsUserConfirmation, true, '同意 / 拒绝须用户确认（0.2.0 同意门）');
+  return service.approve({ collabId, approve, reason, sessionId, confirmToken: challenge.confirmToken });
+}
+
 function writeSeedCollab(dir, { collabId, mode, status, name, topic, members, manager = null, endpoints = {} }) {
   mkdirSync(collabDir(dir, collabId), { recursive: true });
   const carrier = {
@@ -405,7 +413,7 @@ test('invite 到达：成员记录建立（proposed / decision null / 有效期�
   assert.equal(listed[0].expired, false);
   assert.equal(Date.parse(listed[0].expiresAt) - Date.parse(listed[0].invitedAt), DAY);
   assert.ok(remembered.some((entry) => entry.instanceId === 'inst-a' && entry.address === '127.0.0.1'));
-  const approved = await service.approve({ collabId: 'collab-9', approve: true });
+  const approved = await approveInviteWithConsentOf(service, 'collab-9', SELF_SEAT);
   assert.equal(approved.ok, true);
 });
 
@@ -417,7 +425,7 @@ test('邀请过期仅标注：状态与决策不变、过期后仍可回应', as
   assert.equal(entry.expired, true, '超过注入的有效期即标注过期');
   assert.equal(entry.state, 'proposed', '过期不改状态（过期不算拒绝）');
   assert.equal(entry.decision, null);
-  const approved = await service.approve({ collabId: 'collab-exp', approve: true });
+  const approved = await approveInviteWithConsentOf(service, 'collab-exp', SELF_SEAT);
   assert.equal(approved.ok, true, '过期后仍可回应（只标注、不拦截）');
   assert.equal(sentOf(sent, 'approve', 'collab-exp').length, 1);
 });
@@ -463,14 +471,14 @@ test('approve：同意发帧并记 decision；同向重复幂等（不重复发�
   const { service, sent } = makeService(t);
   const framed = inviteFrame({ collabId: 'collab-9' });
   await receive(service, framed);
-  await service.approve({ collabId: 'collab-9', approve: true });
+  await approveInviteWithConsentOf(service, 'collab-9', SELF_SEAT);
   assert.equal(sentOf(sent, 'approve', 'collab-9').length, 1);
-  const again = await service.approve({ collabId: 'collab-9', approve: true });
+  const again = await service.approve({ collabId: 'collab-9', approve: true, sessionId: SELF_SEAT });
   assert.equal(again.ok, true);
   assert.equal(sentOf(sent, 'approve', 'collab-9').length, 1);
-  const flip = await service.approve({ collabId: 'collab-9', approve: false });
+  const flip = await service.approve({ collabId: 'collab-9', approve: false, sessionId: SELF_SEAT });
   assert.equal(flip.ok, false);
-  const declined = await service.approve({ collabId: 'collab-10', approve: false, reason: '人手不足' });
+  const declined = await service.approve({ collabId: 'collab-10', approve: false, reason: '人手不足', sessionId: SELF_SEAT });
   assert.equal(declined.ok, false);   // 未收到该邀请
 });
 
@@ -478,7 +486,7 @@ test('decline：拒绝帧携带 reason；decision 定格 declined', async (t) =>
   const { service, sent } = makeService(t);
   const framed = inviteFrame({ collabId: 'collab-9' });
   await receive(service, framed);
-  const result = await service.approve({ collabId: 'collab-9', approve: false, reason: ' 人手不足 ' });
+  const result = await approveInviteWithConsentOf(service, 'collab-9', SELF_SEAT, false, ' 人手不足 ');
   assert.equal(result.ok, true);
   assert.equal(result.decision, 'declined');
   const frames = sentOf(sent, 'decline', 'collab-9');
@@ -534,7 +542,7 @@ test('邀请确认门：挑战绑定协作——他协作的令牌无效', async
 test('重入（成员侧·已拒绝）：managed 再收邀请 → 重新定格提议面（旧决策清空），同意门可再次入席', async (t) => {
   const { service, dir } = makeService(t);
   await receive(service, inviteFrame({ collabId: 'collab-rejoin' }));
-  await service.approve({ collabId: 'collab-rejoin', approve: false, reason: '暂时不参与' });
+  await approveInviteWithConsentOf(service, 'collab-rejoin', SELF_SEAT, false, '暂时不参与');
   assert.equal(memberOf(dir, 'collab-rejoin').decision, 'declined');
   const rejectedBefore = service.stats().invitesRejected;
   const admitted = await receive(service, inviteFrame({ collabId: 'collab-rejoin', topic: '重入主题' }));
@@ -544,7 +552,7 @@ test('重入（成员侧·已拒绝）：managed 再收邀请 → 重新定格�
   assert.equal(member.decision, null, '旧拒绝决策清空（重走同意门）');
   assert.equal(member.topic, '重入主题', '主题随最新邀请定格');
   assert.equal(service.stats().invitesRejected, rejectedBefore, '可重入终局不再计入拒绝');
-  const approved = await service.approve({ collabId: 'collab-rejoin', approve: true });
+  const approved = await approveInviteWithConsentOf(service, 'collab-rejoin', SELF_SEAT);
   assert.equal(approved.ok, true);
   assert.equal(approved.decision, 'approved', '重入后同意门照常生效');
 });
@@ -552,7 +560,7 @@ test('重入（成员侧·已拒绝）：managed 再收邀请 → 重新定格�
 test('重入（成员侧·已退出）：left 的协作再收邀请 → 清归档标记、重走同意门', async (t) => {
   const { service, dir } = makeService(t);
   await receive(service, inviteFrame({ collabId: 'collab-left-rejoin' }));
-  await service.approve({ collabId: 'collab-left-rejoin', approve: true });
+  assert.equal((await approveInviteWithConsentOf(service, 'collab-left-rejoin', SELF_SEAT)).decision, 'approved', '夹具前置：本机已同意');
   const left = await service.leave({ collabId: 'collab-left-rejoin' });
   assert.equal(left.ok, true, left.message);
   const leftMember = memberOf(dir, 'collab-left-rejoin');
@@ -569,7 +577,7 @@ test('重入（成员侧·已退出）：left 的协作再收邀请 → 清归�
 test('重入边界（成员侧）：已加入（active）的 managed 重复邀请照旧拒绝——成员面零变更', async (t) => {
   const { service, dir } = makeService(t);
   await receive(service, inviteFrame({ collabId: 'collab-active-again' }));
-  await service.approve({ collabId: 'collab-active-again', approve: true });
+  assert.equal((await approveInviteWithConsentOf(service, 'collab-active-again', SELF_SEAT)).decision, 'approved', '夹具前置：本机已同意');
   const before = memberOf(dir, 'collab-active-again');
   const rejectedBefore = service.stats().invitesRejected;
   await receive(service, inviteFrame({ collabId: 'collab-active-again' }));
@@ -661,7 +669,8 @@ test('同意门迟到守卫：已撤回 / 已回应的成员不被迟到回应�
 async function activeTwoMemberCollab(t, service, { collabId = 'collab-x' } = {}) {
   const framed = inviteFrame({ collabId, manager: peer('inst-a', '主机甲'), members: [peer('inst-a', '主机甲'), peer('inst-self', '本机', 17321)] });
   await receive(service, framed);
-  await service.approve({ collabId, approve: true });
+  const approved = await approveInviteWithConsentOf(service, collabId, SELF_SEAT);
+  assert.equal(approved.decision, 'approved', '夹具前置：本机已同意');
   await receive(service, collabFrame('notice', collabId, peer('inst-a', '主机甲'), { event: 'established', version: 2 }));
   return collabId;
 }
@@ -955,7 +964,7 @@ test('文本预校验：越界 topic 拒绝且本地台账零变更；stop / 拒
 
   const memberSide = makeService(t);
   await receive(memberSide.service, inviteFrame({ collabId: 'collab-text' }));
-  const badDecline = await memberSide.service.approve({ collabId: 'collab-text', approve: false, reason: 'x'.repeat(201) });
+  const badDecline = await approveInviteWithConsentOf(memberSide.service, 'collab-text', SELF_SEAT, false, 'x'.repeat(201));
   assert.equal(badDecline.ok, false);
   const listed = memberSide.service.list().collabs[0];
   assert.equal(listed.decision, null, '校验失败不得先定格决策');
@@ -1495,7 +1504,7 @@ test('载入兼容：缺 mode 的旧成员记录 / 旧台账 / 旧邀请一律�
   assert.equal(memberSide.service.list().collabs.find((entry) => entry.collabId === 'collab-new').mode, 'forum');
 });
 
-test('ws_invite：向既有讨论发邀请帧（模式随载荷、折叠成员表并入目标去重、重复邀请幂等、不改本地成员表）', async (t) => {
+test('ws_invite：向既有讨论发邀请帧（模式随载荷、名单为席位条目、目标机走 targets、重复邀请幂等、不改本地成员表）', async (t) => {
   const { service, sent } = makeService(t);
   const collabId = createForum(service);
   await receiveJoin(service, collabId, peer('inst-b', '主机b'));
@@ -1510,15 +1519,16 @@ test('ws_invite：向既有讨论发邀请帧（模式随载荷、折叠成员�
   assert.equal(invites[0].payload.name, '讨论甲');
   assert.equal(invites[0].payload.topic, '议题');
   assert.deepEqual(invites[0].payload.members, [
-    { instanceId: 'inst-b', identityName: '主机b' },
-    { instanceId: 'inst-self', identityName: '本机' },
-    { instanceId: 'inst-c', identityName: '主机c' },
-  ], '名单 = 折叠成员表 ∪ 本次目标（折叠按实例标识排序：已加入者 + 发起人 + 被邀者）');
+    { instanceId: 'inst-b', sessionId: 'sess-inst-b', identityName: '主机b' },
+    { instanceId: 'inst-self', sessionId: 'sess-self', identityName: '本机' },
+  ], '名单 = 已加入席位的协议条目（instanceId + sessionId + identityName）');
+  assert.deepEqual(invites[0].payload.targets, [{ instanceId: 'inst-c' }], '被邀目标机只走 targets，不混入名单');
   assert.equal(invites[0].payload.endpoints['inst-b'].port, 17321, '讨论邀请随带端点表（被邀者据此取得寻址信息）');
   const again = await service.invite({ collabId, targets: [target] });
   assert.equal(again.ok, true, '重复邀请幂等（重发帧、不报错）');
   const second = sentOf(sent, 'invite', collabId)[1];
-  assert.equal(new Set(second.payload.members.map((entry) => entry.instanceId)).size, 3, '并集去重（协议层拒绝重复名单）');
+  assert.deepEqual(second.payload.members, invites[0].payload.members, '名单不因邀请目标增长（席位键去重）');
+  assert.deepEqual(second.payload.targets, [{ instanceId: 'inst-c' }], '重复邀请同样只描述目标机');
   const entry = service.list().collabs[0];
   assert.equal(entry.memberCount, 2, '邀请动作不改本地成员表（成员关系由加入事件推进）');
   assert.equal(entry.mode, 'forum', '模式创建时定死、不可变');
@@ -1546,7 +1556,7 @@ test('ws_invite（managed）：站长可邀请新机器加入既有协作——�
 test('ws_invite（managed）：非站长拒绝——成员会话请让目标走 ws_join', async (t) => {
   const { service } = makeService(t);
   await receive(service, inviteFrame({ collabId: 'collab-member' }));
-  await service.approve({ collabId: 'collab-member', approve: true });
+  assert.equal((await approveInviteWithConsentOf(service, 'collab-member', SELF_SEAT)).decision, 'approved', '夹具前置：本机已同意');
   const result = await service.invite({ collabId: 'collab-member', targets: [targetOf('c')] });
   assert.equal(result.ok, false);
   assert.match(result.message, /只有站长/);
@@ -1638,7 +1648,7 @@ test('ws_invite：未知 / 归档 / 未加入 / 目标形态一律明确拒绝�
 test('讨论成员侧邀请链：任何成员可邀请——同意加入后由本地记录构造邀请帧（T1 交接闭合）', async (t) => {
   const memberSide = makeService(t);
   await receive(memberSide.service, inviteFrame({ collabId: 'collab-f8', mode: 'forum' }));
-  const approved = await memberSide.service.approve({ collabId: 'collab-f8', approve: true });
+  const approved = await approveInviteWithConsentOf(memberSide.service, 'collab-f8', SELF_SEAT);
   assert.equal(approved.ok, true, approved.message);
   assert.equal(approved.joined, true, '讨论同意即加入（join 生效不依赖邀请者）');
   assert.equal(memberSide.service.list().collabs[0].state, 'active', '本地转进行中');
@@ -1648,7 +1658,10 @@ test('讨论成员侧邀请链：任何成员可邀请——同意加入后由�
   assert.equal(invite.payload.mode, 'forum');
   assert.equal(invite.payload.name, '联调项目', '名取本地记录');
   assert.equal(invite.payload.topic, '发布联调', '主题取本地记录（邀请载荷定格——T1 缺口闭合）');
-  assert.deepEqual(invite.payload.members.map((entry) => entry.instanceId).sort(), ['inst-c', 'inst-self'], '名单 = 折叠成员表（本机已加入）∪ 目标');
+  assert.deepEqual(invite.payload.members, [
+    { instanceId: 'inst-self', sessionId: SELF_SEAT, identityName: '本机' },
+  ], '名单 = 已入席的本机席位条目（目标机不混入）');
+  assert.deepEqual(invite.payload.targets, [{ instanceId: 'inst-c' }], '被邀目标机只走 targets');
   assert.equal(memberSide.service.stats().forumJoinsOut, 1, '同意后自播 join');
   const joinFrames = sentOf(memberSide.sent, 'join', 'collab-f8');
   assert.ok(joinFrames.length >= 1, 'join 自播发出');
@@ -1721,7 +1734,9 @@ test('主动加入：成员侧命中（已加入、发起人已知）→ 应答�
   const frame = inviteFrame({ collabId: 'collab-f-knock', mode: 'forum', name: '讨论甲' });
   frame.payload.originator = { instanceId: 'inst-a', identityName: '主机甲' };
   await receive(memberSide.service, frame);
-  await memberSide.service.approve({ collabId: 'collab-f-knock', approve: true });
+  const joined = await approveInviteWithConsentOf(memberSide.service, 'collab-f-knock', SELF_SEAT);
+  assert.equal(joined.ok, true);
+  assert.equal(joined.joined, true, '讨论同意即入席（join 链路）');
   const replies = memberSide.service.joinKnock(joinKnockOf('讨论甲'));
   assert.deepEqual(replies, [{
     collabId: 'collab-f-knock',
@@ -1734,7 +1749,7 @@ test('主动加入：成员侧命中（已加入、发起人已知）→ 应答�
 
   const noOriginator = makeService(t);
   await receive(noOriginator.service, inviteFrame({ collabId: 'collab-f-knock', mode: 'forum', name: '讨论甲' }));
-  await noOriginator.service.approve({ collabId: 'collab-f-knock', approve: true });
+  assert.equal((await approveInviteWithConsentOf(noOriginator.service, 'collab-f-knock', SELF_SEAT)).joined, true, '讨论同意即入席（join 链路）');
   assert.deepEqual(noOriginator.service.joinKnock(joinKnockOf('讨论甲')), [], '发起人标识未知：不代发残缺应答');
   assert.equal(noOriginator.service.stats().joinKnockAckSkipped, 1, '跳过一份计数留痕');
   assert.equal(noOriginator.notices.length, 1, '提示照发（放行路径不依赖应答内容）');
@@ -1963,8 +1978,8 @@ test('讨论双节点并发发帖：真实 join 装配（自播 + 对表拉回�
   wire.register(selfB, madeB.service);
   const collabId = createForum(madeA.service, { targets: [{ instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17322 }] });
   await receive(madeB.service, inviteFrame({ collabId, mode: 'forum', manager: peer('inst-a', '主机甲'), members: [peer('inst-a', '主机甲'), peer('inst-b', '主机乙', 17322)] }));
-  /* B 同意即加入（自播 join）；join 是广播（入队路径）——手工投给 A（一跳、无应答）。 */
-  const approved = await madeB.service.approve({ collabId, approve: true });
+  /* B 同意即加入（自播 join）；join 是广播——手工投给 A（一跳、无应答）。席位标识取邀请名单里本机的条目（peer 派生）。 */
+  const approved = await approveInviteWithConsentOf(madeB.service, collabId, 'sess-inst-b');
   assert.equal(approved.ok, true, approved.message);
   const joinMessage = sentOf(madeB.sent, 'join', collabId)[0];
   assert.ok(joinMessage !== undefined, '同意后自播 join 帧');
@@ -2017,7 +2032,7 @@ test('讨论视图：显示序按 ts 排序（同刻按 postId 兜底）、折�
 test('讨论发帖（邀请未携发起人标识的旧形态）：中继未知 → 降级直投——端点未知成员如实标注待对表、不影响其余成员投出', async (t) => {
   const made = makeService(t);
   await receive(made.service, inviteFrame({ collabId: 'collab-f3', mode: 'forum', members: [peer('inst-a', '主机甲'), peer('inst-self', '本机', 17321), peer('inst-c', '主机丙')] }));
-  assert.equal((await made.service.approve({ collabId: 'collab-f3', approve: true })).ok, true, '成员侧同意即加入');
+  assert.equal((await approveInviteWithConsentOf(made.service, 'collab-f3', SELF_SEAT)).ok, true, '成员侧同意即加入');
   /* 成员表经 join 事件并入：甲（端点可学）与丙（来源地址缺失——端点未知）。 */
   await receiveJoin(made.service, 'collab-f3', peer('inst-a', '主机甲'));
   await receiveJoin(made.service, 'collab-f3', peer('inst-c', '主机丙'), { remoteAddress: '' });
