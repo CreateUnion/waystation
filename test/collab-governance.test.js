@@ -308,7 +308,7 @@ test('任期分叉的成员席出口：terminate 可终止本方分支，merge /
   assert.equal(member.sent.length, 0, '本地归档不广播');
 });
 
-test('裁定执行帧接收：终止命中本机条；本机更早数据时拒绝被并入', async (t) => {
+test('裁定执行帧接收：终止命中本机条（同 collabId 副本转终止）', async (t) => {
   const harness = makeManagerHarness(t);
   await freezeViaBroadcast(harness);
   await receive(harness.service, frameOf('decision', RIVAL, {
@@ -579,6 +579,8 @@ test('移交全链：目标确认后旧站长降级（保留只读台账与快�
   assert.equal(b.service.list().collabs[0].role, 'member', '目标确认不自行提升');
   const changed = await finishOnSource(a, accept);
   assert.ok(changed, '旧站长签发 manager-changed');
+  const changeFrames = a.sent.filter((frame) => frame.type === 'notice' && frame.payload?.event === 'manager-changed');
+  assert.deepEqual(changeFrames.map((frame) => frame.to.instanceId).sort(), [MEM.instanceId, RIVAL.instanceId].sort(), '变更广播覆盖全部活跃成员机器（不只发给目标）');
   assert.equal(changed.payload.via, 'handover');
   assert.equal(changed.payload.term, 2);
   assert.equal(changed.payload.version, 4);

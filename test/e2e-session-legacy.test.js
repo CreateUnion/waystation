@@ -59,8 +59,12 @@ test('旧协作：写门拒绝（发送 / 邀请 / 结束 / 入站帧），旧�
   const sent = await node.service.send({ collabId: COLLAB_ID, text: '写门测试', sessionId: 'seat-new' });
   assert.equal(sent.ok, false, '旧协作拒绝发送');
   assert.match(String(sent.message), /旧版|只读/, String(sent.message));
-  assert.equal((await node.service.invite({ collabId: COLLAB_ID, targets: [{ instanceId: 'inst-x', identityName: '丙机', address: '127.0.0.1', port: 24300 }] })).ok, false);
-  assert.equal((await node.service.end({ collabId: COLLAB_ID, sessionId: 'seat-new' })).ok, false);
+  const invited = await node.service.invite({ collabId: COLLAB_ID, targets: [{ instanceId: 'inst-x', identityName: '丙机', address: '127.0.0.1', port: 24300 }] });
+  assert.equal(invited.ok, false, '旧协作拒绝邀请');
+  assert.match(String(invited.message), /旧版|只读/, `邀请拒绝原因须指向旧版/只读：${invited.message}`);
+  const ended = await node.service.end({ collabId: COLLAB_ID, sessionId: 'seat-new' });
+  assert.equal(ended.ok, false, '旧协作拒绝结束');
+  assert.match(String(ended.message), /旧版|只读/, `结束拒绝原因须指向旧版/只读：${ended.message}`);
 
   const acks = await feedSessionFrame(node, legacyNoticeFrame());
   assert.equal(acks.length, 0, '旧协作入站帧不确认');

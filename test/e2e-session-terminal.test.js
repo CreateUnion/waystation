@@ -91,20 +91,18 @@ async function assertStillActive(node) {
   assert.equal(view.ledger?.status, 'active', '终态快照被拒：本地台账不得转终态');
   assert.equal(view.ledger?.manager?.sessionId, MANAGER.sessionId, '站长不得被 manager:null 覆盖');
   assert.equal(view.ledger?.members?.length, 3, '名单不得被清空');
-  assert.notEqual(node.service.stats().terminalAdoptions, 1, '不得记终态采纳');
+  assert.equal(node.service.stats().terminalAdoptions ?? 0, 0, '不得记终态采纳（必须精确为 0）');
 }
 
 test('成员发 term+1 / manager:null 终态快照：拒绝且不改本地状态', { timeout: TIMEOUT_MS }, async (t) => {
   const node = await startMember(t);
   await feedSessionFrame(node, terminalSnapshotFrame(ATTACKER));
-  await new Promise((resolve) => setTimeout(resolve, 100));
   await assertStillActive(node);
 });
 
 test('同 term 非站长发终态快照：同样拒绝（来源权威不足）', { timeout: TIMEOUT_MS }, async (t) => {
   const node = await startMember(t);
   await feedSessionFrame(node, terminalSnapshotFrame(ATTACKER, 1));
-  await new Promise((resolve) => setTimeout(resolve, 100));
   await assertStillActive(node);
 });
 

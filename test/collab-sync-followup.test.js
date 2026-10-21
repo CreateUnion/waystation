@@ -128,6 +128,8 @@ function makeService(t, overrides = {}) {
     syncSoftBundleBytes: 512 * 1024,
     joinReplayIntervalsMs: overrides.joinReplayIntervalsMs ?? [10, 20, 40],
   });
+  /* 统一收尾：定时器/等待面随用例结束关闭（显式提前 close 的用例可重复调用）。 */
+  t.after(() => service.close());
   return { service, sent, direct, notices, dir, self, config };
 }
 
@@ -138,9 +140,9 @@ function makeWire() {
   let serial = 0;
   const build = (message, fromSelf) => {
     serial++;
-    const from = { instanceId: fromSelf.instanceId, identityName: fromSelf.identityName, port: fromSelf.port };
+    const from = { instanceId: fromSelf.instanceId, sessionId: sessionOf(fromSelf.instanceId), identityName: fromSelf.identityName, port: fromSelf.port };
     const ts = typeof message.createdAt === 'string' ? message.createdAt : new Date().toISOString();
-    return { v: 1, type: message.type, msgId: `wire-${serial}`, from, to: message.to, collabId: message.collabId, ts, payload: message.payload };
+    return { v: 1, cap: 2, type: message.type, msgId: `wire-${serial}`, from, to: message.to, collabId: message.collabId, ts, payload: message.payload };
   };
   const addressOf = (self) => `127.0.0.${self.port - 17320}`;
   const deliver = (target, frame, sourceAddress) => Promise.resolve().then(() => receive(target.service, frame, sourceAddress)).catch(() => {});

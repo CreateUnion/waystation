@@ -65,6 +65,8 @@ function makeService(t, overrides = {}) {
   /* 会话标识适配（0.2.0）：旧调用式 create/approve 未穿会话标识——本机 self 只有一席，
    * 统一补上并按同意门登记一次性豁免，使 join/approve 出站帧携 fromSessionId。 */
   adaptSessionCalls(service, sessionOf(self.instanceId));
+  /* 统一收尾：定时器/等待面随用例结束关闭（显式提前 close 的用例可重复调用）。 */
+  t.after(() => service.close());
   return { service, sent, direct, notices, dir, self, config };
 }
 
@@ -408,7 +410,7 @@ test('对表两件套署名：history-request 与 history-bundle 均携 fromSess
     .filter((frame) => frame.from.instanceId === SELF_A.instanceId).at(-1);
   assert.ok(request, '发起人已发出拉取请求');
   assert.equal(request.from.sessionId, sessionOf(SELF_A.instanceId), '请求由本机席位签发');
-  /* 应答方向：B 的请求打到发起人 A，A 的 bundle 由 A 的席位签发（M5 契约：两件套补 fromSessionId）。 */
+  /* 应答方向：B 的请求打到发起人 A，A 的 bundle 由 A 的席位签发（设计 §5.1：两件套补 fromSessionId）。 */
   await receive(a.service, {
     v: 1,
     cap: 2,
@@ -453,13 +455,15 @@ test('join 未收敛重播（对表自愈）：递增间隔有界；拉回的表
   assert.equal(joinCount(), afterConverge, '对端表已含自己：重播停止（不再增殖）');
 });
 
-/* 入队帧 → 上线帧（保持 payload 与 from；msgId 换新——模拟重播/重投的新副本）。 */
+/* 入队帧 → 上线帧（保持 payload 与 from；msgId 换新——模拟重播/重投的新副本）。
+ * 与 makeWire/collabFrame 同形：cap=2、from.sessionId（设计 §1.1/§5.1）。 */
 function joinFrameMessage(message, fromSelf) {
   return {
     v: 1,
+    cap: 2,
     type: message.type,
     msgId: `replay-${randomUUID()}`,
-    from: { instanceId: fromSelf.instanceId, identityName: fromSelf.identityName, port: fromSelf.port },
+    from: { instanceId: fromSelf.instanceId, sessionId: sessionOf(fromSelf.instanceId), identityName: fromSelf.identityName, port: fromSelf.port },
     collabId: message.collabId,
     ts: new Date().toISOString(),
     payload: message.payload,
@@ -520,8 +524,8 @@ test('end 双通道：在线广播即归档；离线者回归经 bundle 元状�
   await receive(madeC.service, inviteFrame({ collabId, mode: 'forum', manager: peer(selfA.instanceId, selfA.identityName, selfA.port), members: [peer(selfA.instanceId, selfA.identityName, selfA.port), peer(selfB.instanceId, selfB.identityName, selfB.port), peer(selfC.instanceId, selfC.identityName, selfC.port)], endpoints: { [selfA.instanceId]: { address: '127.0.0.1', port: selfA.port } } }));
   await madeC.service.approve({ collabId, approve: true });
   await receive(a.service, joinFrameOf(collabId, peer(selfC.instanceId, selfC.identityName, selfC.port)));
-  /* 默认静音写点（同意邀请）仍落旧静音文件（ISSUE：M4 尚未切到席位静音）；本用例钉住的是
-   * 「归档路径不得留下幽灵静音文件」——无论走 end 帧还是 bundle 学终态都须清掉。 */
+  /* 默认静音写点（同意邀请）仍落旧静音文件（席位静音迁移尚未覆盖该写点，按 ISSUE 记录）；
+   * 本用例钉住的是「归档路径不得留下幽灵静音文件」——无论走 end 帧还是 bundle 学终态都须清掉。 */
   assert.equal(existsSync(collabFilePath(madeC.dir, collabId, MUTE_FILE_NAME)), true, '同意路径已写默认静音');
   /* 发起人结束：广播 end（豁免 TTL/上限）；在线者 B 经广播通道。 */
   const ended = await a.service.end({ collabId });
@@ -741,8 +745,8 @@ test('会话注入分流：拉取两件套帧从不注入（含回填帖）；ma
 
 /* —— 成员侧邀请端到端与跨重启基线 —— */
 
-test('任何成员可邀请端到端：成员侧构造邀请 → 被邀同意 → join → 回填（T1 交接闭合）', {
-  /* 产品缺陷 ISSUE（M9 归因）：受邀加入的讨论会话不落本地席位（approve 的论坛路径不建席位），
+test('任何成员可邀请端到端：成员侧构造邀请 → 被邀同意 → join → 回填（讨论邀请链闭合）', {
+  /* 产品缺陷 ISSUE：受邀加入的讨论会话不落本地席位（approve 的论坛路径不建席位），
    * 且 `join.request` 的在席接线收尾未 await（`joinRequestNow` 对 async 域调用判 ok 恒假），
    * 于是成员侧没有签发邀请的身份（inviteSenderSeatOf 要求活跃席位）。夹具无法在不改 src 的
    * 前提下造出该身份——本用例待缺陷修复后恢复（覆盖由 e2e-session-invites 的受邀入席链兜底）。 */

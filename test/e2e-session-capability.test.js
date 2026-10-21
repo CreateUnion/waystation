@@ -7,17 +7,29 @@ import { waitFor } from './helpers.js';
 
 /* 能力闸门与证据分级：旧对端（缺 participants）拒绝协作、未知先探测、直连探测可把已知支持
  * 降级为不支持、扫描/自介的缺字段只继承。
- * 长操作声明：不需要 UDP 的用例在进程内直接驱动；真实单播探测用例受 LAN 隔离闸控制（默认跳过），
- * 单用例超时上限 30s。 */
+ * 闸门落服务层：用例必须注入 probeCapability（未注入＝服务的单测/降级面，不设闸）。
+ * 长操作声明：不需要 UDP 的用例在进程内直接驱动；真实单播探测用例受 LAN 隔离闸控制（默认跳过，
+ * 启用时发现面也只绑 127.0.0.1），单用例超时上限 30s。 */
 
 const TIMEOUT_MS = 30000;
 const LAN_ENABLED = process.env.WAYSTATION_LAN_E2E === '1';
-const LAN_SKIP = LAN_ENABLED ? false : 'LAN 发现隔离未就绪：真实 UDP 探测用例默认跳过（设置 WAYSTATION_LAN_E2E=1 启用）';
+const LAN_SKIP = LAN_ENABLED ? false : 'LAN 发现隔离闸：真实 UDP 探测用例默认跳过（设置 WAYSTATION_LAN_E2E=1 启用）';
 
 const PEER = { instanceId: 'inst-cap-peer', identityName: '对端机', address: '127.0.0.1', port: 24100 };
 
-async function startGateNode(t) {
-  return startSessionNode(t, { identityName: '本机', online: ['seat-manager'] });
+async function startGateNode(t, probeCapability = null) {
+  return startSessionNode(t, { identityName: '本机', online: ['seat-manager'], probeCapability });
+}
+
+/* 探测面替身：记录每次探测入参，按给定三态作答（也接受函数形态按目标动态作答）。 */
+function capabilityStub(answer) {
+  const calls = [];
+  const probe = async (options) => {
+    calls.push(options);
+    return typeof answer === 'function' ? answer(options) : answer;
+  };
+  probe.calls = calls;
+  return probe;
 }
 
 function rememberPeer(node, participants, source = 'scan') {
@@ -57,7 +69,10 @@ test('缺字段继承：扫描不带 participants 不覆盖已知支持态；直
 });
 
 test('能力闸门：已知不支持的对端拒绝建立协作 / 邀请（旧节点不支持会话级席位）', { timeout: TIMEOUT_MS }, async (t) => {
-  const node = await startGateNode(t);
+  const probe = capabilityStub(async () => {
+    throw new Error('已知不支持时不得再探测');
+  });
+  const node = await startGateNode(t, probe);
   rememberPeer(node, 0, 'probe');
   const created = await node.service.create({
     name: '旧节点协作',
@@ -68,10 +83,21 @@ test('能力闸门：已知不支持的对端拒绝建立协作 / 邀请（旧�
   });
   assert.equal(created.ok, false, '已知不支持的对端不得进入协作');
   assert.match(String(created.message), /不支持|旧版|旧节点/, String(created.message));
+  assert.equal(probe.calls.length, 0, '已知不支持不重复探测');
+
+  const invited = await node.service.invite({
+    collabId: 'collab-not-created',
+    targets: [targetOfPeer()],
+    sessionId: 'seat-manager',
+  });
+  assert.equal(invited.ok, false, '邀请同样过能力闸门');
+  assert.match(String(invited.message), /不支持|旧版|旧节点/, String(invited.message));
+  assert.equal(probe.calls.length, 0, '邀请闸门同样不重复探测');
 });
 
-test('能力闸门：未知对端先探测再判定（不得直接按支持协作）', { timeout: TIMEOUT_MS }, async (t) => {
-  const node = await startGateNode(t);
+test('能力闸门：未知对端先探测再判定（探测不支持即拒，已知支持不重复探测）', { timeout: TIMEOUT_MS }, async (t) => {
+  const probe = capabilityStub({ capability: 'unsupported' });
+  const node = await startGateNode(t, probe);
   node.knownHosts.remember({
     address: PEER.address,
     port: PEER.port,
@@ -87,7 +113,22 @@ test('能力闸门：未知对端先探测再判定（不得直接按支持协�
     sessionId: 'seat-manager',
   });
   assert.equal(created.ok, false, '未知能力不得直接建立协作——先单播探测');
-  assert.match(String(created.message), /未知|探测|不支持/, String(created.message));
+  assert.match(String(created.message), /不支持|探测|无法确认/, String(created.message));
+  assert.equal(probe.calls.length, 1, '未知目标先探测一次');
+  assert.equal(probe.calls[0].instanceId, PEER.instanceId);
+  assert.equal(probe.calls[0].address, PEER.address);
+  assert.equal(probe.calls[0].port, PEER.port);
+
+  rememberPeer(node, 2, 'probe');
+  const allowed = await node.service.create({
+    name: '已确认支持',
+    topic: '能力闸门',
+    targets: [targetOfPeer()],
+    mode: 'managed',
+    sessionId: 'seat-manager',
+  });
+  assert.equal(allowed.ok, true, String(allowed.message));
+  assert.equal(probe.calls.length, 1, '已知支持不重复探测');
 });
 
 /* 真实单播探测（无广播）：对端发现面应答 probe-ack 携 participants:2；

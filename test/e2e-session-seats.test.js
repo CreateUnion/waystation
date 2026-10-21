@@ -157,6 +157,8 @@ test('同机双席：两席各自发出，对端按发件席记账且互不串�
   const inboxB = member.inbound.checkInbox({ collabId: COLLAB_ID, sessionId: 'seat-peer-b', limit: 50 });
   assert.equal(inboxA.total, 2, '甲席收件流水只含发给它的两条');
   assert.equal(inboxB.total, 2, '乙席收件流水同样各一份');
+  assert.deepEqual(inboxA.messages.map((entry) => entry.from.sessionId).sort(), ['seat-helper', 'seat-manager'], '收件流水按发件席记账');
+  assert.deepEqual(inboxB.messages.map((entry) => entry.from.sessionId).sort(), ['seat-helper', 'seat-manager'], '乙席同样按发件席记账');
   const ledger = await readLedger(member, COLLAB_ID);
   assert.deepEqual(ledger.members.map((seat) => seat.sessionId).sort(), ['seat-helper', 'seat-manager', 'seat-peer-a', 'seat-peer-b']);
 });
@@ -167,7 +169,22 @@ test('同机双席：一席离席后另一席保留并照常收发', { timeout: 
   assert.equal(left.ok, true, String(left.message));
   assert.equal(manager.service.listLocalSeats(COLLAB_ID).some((seat) => seat.sessionId === 'seat-helper'), false);
   assert.equal(manager.service.listLocalSeats(COLLAB_ID).some((seat) => seat.sessionId === 'seat-manager'), true);
+  const ledger = await readLedger(manager, COLLAB_ID);
+  assert.equal(ledger.members.some((seat) => seat.sessionId === 'seat-helper'), false, '站长名单移除离席席位');
   const sent = await manager.service.send({ collabId: COLLAB_ID, text: '站长席仍在线', sessionId: 'seat-manager' });
   assert.equal(sent.ok, true, String(sent.message));
   await waitForInjection(member, 'seat-peer-a', (list) => list.some((entry) => entry.payload?.text === '站长席仍在线'));
+});
+
+test('同机双席：静音按会话生效，另一席照收（治理/邀请豁免另测）', { timeout: TIMEOUT_MS }, async (t) => {
+  const { manager } = await startDuo(t);
+  const muted = await manager.service.setMute({ collabId: COLLAB_ID, sessionId: 'seat-helper', muted: true });
+  assert.equal(muted.ok, true, String(muted.message));
+  assert.equal((await manager.service.send({ collabId: COLLAB_ID, text: '静音期通告', sessionId: 'seat-manager' })).ok, true);
+  assert.equal(injectionTextsOf(manager, 'seat-helper').includes('静音期通告'), false, '静音席位不注入内容消息');
+
+  const unmuted = await manager.service.setMute({ collabId: COLLAB_ID, sessionId: 'seat-helper', muted: false });
+  assert.equal(unmuted.ok, true, String(unmuted.message));
+  assert.equal((await manager.service.send({ collabId: COLLAB_ID, text: '取消静音后', sessionId: 'seat-manager' })).ok, true);
+  await waitForInjection(manager, 'seat-helper', (list) => list.some((entry) => entry.payload?.text === '取消静音后'));
 });
