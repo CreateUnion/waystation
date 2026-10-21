@@ -165,20 +165,86 @@ function bridgeIdOfSession(state, sessionId) {
   return held instanceof Map ? (held.get(sessionId) ?? null) : null;
 }
 
-/* 创建邀请的发送面：逐目标发 invite（单条入队失败只如实标注，不回滚已建协作）；
- * 讨论邀请同携发起人实例标识（= 中继归属；创建者即发起人——与增邀 ws_invite 同款）。 */
+/* 创建邀请的发送面：managed 先为每个目标落邀请簿记再发帧——帧携 inviteId，受邀会话才能走
+ * approve 两段式（设计 §4.2/§4.4）。簿记写失败不发；发送失败撤回该条，不留「可接受却已无人
+ * 投递」的 open 记录。forum 无邀请簿记（D18），载荷与返回条目都不出现 inviteId。
+ * 建协目标经形态校验排除本机（targetsRejectionOf），因此这里只有远端目标；同机邀请走
+ * join.createInvite 的核内旁路。单条失败只如实标注，不回滚已建协作。 */
 function inviteInitialTargets(state, ledger, targets, collabMode, local, sessionId) {
   const invited = [];
   for (const target of targets) {
-    const payload = applyInviteNaming(invitePayloadOf(ledger, [], forumEndpointsOf(collabMode, local)), target);
-    if (collabMode === 'forum') {
-      payload.originator = { instanceId: state.self.instanceId, identityName: state.self.identityName };
+    const opened = collabMode === 'forum'
+      ? { ok: true, inviteId: undefined }
+      : initialInviteRecordOf(state, ledger.collabId, target, sessionId);
+    if (opened.ok !== true) {
+      invited.push({ instanceId: target.instanceId, ok: false, reason: opened.reason });
+      continue;
     }
+    const payload = initialInvitePayloadOf(state, ledger, target, collabMode, local, opened.inviteId);
     const result = sendTo(state, ledger.collabId, target.instanceId, { address: target.address, port: target.port }, 'invite', payload, { fromSessionId: sessionId });
-    invited.push({ instanceId: target.instanceId, ok: result.ok === true, msgId: result.msgId, reason: result.reason });
+    if (result.ok !== true && opened.inviteId !== undefined) {
+      withdrawInitialInviteRecordOf(state, ledger.collabId, opened.inviteId);
+    }
+    invited.push(invitedEntryOf(target, opened, result));
     state.counters.invitesSent++;
   }
   return invited;
+}
+
+/* 首邀簿记：加入域是邀请记录的唯一写者，出站层只经其最小 API 开/撤记录。
+ * state.join 缺失只出现在直调 createCollab 的单元状态（非服务装配）——按旧行为发帧，
+ * 生产组合根恒定装配加入域，不会走到这个兜底。 */
+function initialInviteRecordOf(state, collabId, target, managerSessionId) {
+  const open = state.join?.openInitialInvite;
+  if (typeof open !== 'function') {
+    return { ok: true, inviteId: undefined };
+  }
+  const opened = open({
+    collabId,
+    managerSessionId,
+    targetInstanceId: target.instanceId,
+    targetSessionId: target.targetSessionId,
+  });
+  return opened?.ok === true
+    ? { ok: true, inviteId: opened.inviteId, expiresAt: opened.expiresAt }
+    : { ok: false, reason: opened?.message ?? '邀请簿记写入失败——邀请未发出' };
+}
+
+function withdrawInitialInviteRecordOf(state, collabId, inviteId) {
+  const withdraw = state.join?.withdrawInitialInvite;
+  if (typeof withdraw !== 'function') {
+    return;
+  }
+  const withdrawn = withdraw({ collabId, inviteId });
+  if (withdrawn?.ok !== true) {
+    state.log.warn('未投递邀请的簿记撤回失败（记录可能仍为 open）', {
+      collabId,
+      inviteId,
+      reason: withdrawn?.reason ?? '撤回面未返回结果',
+    });
+  }
+}
+
+function initialInvitePayloadOf(state, ledger, target, collabMode, local, inviteId) {
+  const payload = applyInviteNaming(invitePayloadOf(ledger, [], forumEndpointsOf(collabMode, local)), target);
+  if (collabMode === 'forum') {
+    payload.originator = { instanceId: state.self.instanceId, identityName: state.self.identityName };
+    return payload;
+  }
+  if (inviteId !== undefined) {
+    payload.inviteId = inviteId;
+  }
+  return payload;
+}
+
+/* 返回条目：inviteId/expiresAt 是加法字段，既有 instanceId/ok/msgId/reason 不变。 */
+function invitedEntryOf(target, opened, result) {
+  const entry = { instanceId: target.instanceId, ok: result.ok === true, msgId: result.msgId, reason: result.reason };
+  if (opened.inviteId !== undefined) {
+    entry.inviteId = opened.inviteId;
+    entry.expiresAt = opened.expiresAt;
+  }
+  return entry;
 }
 
 /* 指名会话随邀请帧（会话级加入 §3 发送面）：targets 项带 targetSessionId 即写入载荷顶层

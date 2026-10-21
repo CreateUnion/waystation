@@ -475,6 +475,9 @@ function joinApiOf(state) {
     isGranted: (collabId, sessionId) => state.join.isGranted(collabId, sessionId),
     /* 邀请簿记面（加入域 → 工具面）：邀请由站长会话发起/撤回，接受与确认由目标会话发起。 */
     createInvite: (input) => seatGovernedWrite(state, { ...input, sessionId: input?.managerSessionId }, () => createInviteWithCapability(state, input)),
+    /* 建协首邀的簿记面（出站层 → 加入域）：不在工具面，写前校验由加入域按站长席位完成。 */
+    openInitialInvite: (input) => state.join.openInitialInvite(input),
+    withdrawInitialInvite: (input) => state.join.withdrawInitialInvite(input),
     withdrawInvite: (input) => seatGovernedWrite(state, { ...input, sessionId: input?.managerSessionId }, () => state.join.withdrawInvite(input)),
     acceptInvite: (input) => guardedWrite(state, input?.collabId, () => state.join.acceptInvite(input)),
     /* 签名与加入域契约一致：confirmJoining(joinId, sessionId, {instanceId,managerTerm,activeSeats?})。 */

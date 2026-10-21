@@ -155,13 +155,22 @@ function denyFrame(collabId, reqMsgId, reason, from = peer('inst-a', '主机甲'
   return { v: 1, type: 'join-deny', msgId: `msg-deny-${seq}`, from: { ...from }, collabId, ts: new Date().toISOString(), payload };
 }
 
-/* 本机为成员的协作记录（真邀请 + 真同意——成员记录走既有入席路径，不是手造形态）。 */
+/* 本机为成员的协作记录（真邀请 + 真同意——成员记录走既有入席路径，不是手造形态）。
+ * 同意必须由具体会话发起并经用户确认门：先取一次性挑战，再携令牌重试。 */
 async function activeMemberCollab(t, made, collabId, manager = peer('inst-a', '主机甲')) {
   const admitted = await receive(made.service, inviteFrame({ collabId, manager }));
   assert.equal(admitted.ok, true, '邀请过准入');
-  const approved = await made.service.approve({ collabId, approve: true });
+  const approved = await approveWithConsentOf(made.service, collabId, 'self-seat-1');
   assert.equal(approved.ok, true, `同意入席：${approved.message ?? ''} ${approved.reason ?? ''}`);
   return collabId;
+}
+
+async function approveWithConsentOf(service, collabId, sessionId, approve = true) {
+  const challenge = await service.approve({ collabId, approve, sessionId });
+  if (challenge.needsUserConfirmation !== true) {
+    return challenge;
+  }
+  return service.approve({ collabId, approve, sessionId, confirmToken: challenge.confirmToken });
 }
 
 function applicationsOf(dir) {
@@ -1104,7 +1113,7 @@ test('讨论敲门登记：本机收到该讨论的邀请并同意后，请求�
   /* 放行者（另一端）发来讨论邀请：本机注册协作；同意门落地时请求会话接线。 */
   const admitted = await receive(made.service, inviteFrame({ collabId: 'collab-f', name: '联调讨论', mode: 'forum' }), '127.0.0.1');
   assert.equal(admitted.ok, true, admitted.reason);
-  const approved = await made.service.approve({ collabId: 'collab-f', approve: true });
+  const approved = await approveWithConsentOf(made.service, 'collab-f', 'forumses-1');
   assert.equal(approved.ok, true, approved.message);
   assert.equal(approved.joined, true, '既有同意门行为不动');
   await new Promise((resolve) => setTimeout(resolve, 10));   // 接线在同意门之后（宏任务让位：写点先落放行者席位）
@@ -1117,7 +1126,7 @@ test('讨论敲门登记：本机收到该讨论的邀请并同意后，请求�
 test('讨论敲门登记：无登记的讨论同意后不额外接线（既有行为不动）', async (t) => {
   const made = makeService(t);
   await receive(made.service, inviteFrame({ collabId: 'collab-g', name: '旁路讨论', mode: 'forum' }), '127.0.0.1');
-  const approved = await made.service.approve({ collabId: 'collab-g', approve: true });
+  const approved = await approveWithConsentOf(made.service, 'collab-g', 'forumses-1');
   assert.equal(approved.ok, true, approved.message);
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(made.bindings.entries().length, 0, '无登记＝不接线（服务面无写点时零绑定）');
@@ -1244,7 +1253,7 @@ test('讨论敲门登记：放行来得太晚（越过申请时限）＝不再�
   clockMs += 60000;   // 放行远超申请时限
   const admitted = await receive(made.service, inviteFrame({ collabId: 'collab-f', name: '联调讨论', mode: 'forum' }), '127.0.0.1');
   assert.equal(admitted.ok, true, admitted.reason);
-  const approved = await made.service.approve({ collabId: 'collab-f', approve: true });
+  const approved = await approveWithConsentOf(made.service, 'collab-f', 'forumses-1');
   assert.equal(approved.ok, true, approved.message);
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(made.bindings.entries().length, 0, '登记过期＝不接线（陈旧放行不改席位）');
@@ -1355,14 +1364,14 @@ test('讨论敲门登记：接线未落地（绑定表瞬态不可用）＝登�
   const realSet = store.set;
   delete store.set;   // 瞬态：绑定表不可用（接线未落地）
   await receive(made.service, inviteFrame({ collabId: 'collab-f', name: '联调讨论', mode: 'forum' }), '127.0.0.1');
-  const first = await made.service.approve({ collabId: 'collab-f', approve: true });
+  const first = await approveWithConsentOf(made.service, 'collab-f', 'forumses-1');
   assert.equal(first.ok, true, first.message);
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(made.bindings.get('collab-f'), null, '绑定表不可用＝接线未落地');
   store.set = realSet;   // 面恢复
   /* 同名讨论的再次落地：登记未被首次失败吃掉，请求会话照常持席。 */
   await receive(made.service, inviteFrame({ collabId: 'collab-f2', name: '联调讨论', mode: 'forum' }), '127.0.0.1');
-  const second = await made.service.approve({ collabId: 'collab-f2', approve: true });
+  const second = await approveWithConsentOf(made.service, 'collab-f2', 'forumses-1');
   assert.equal(second.ok, true, second.message);
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(made.bindings.get('collab-f2')?.sessionId, 'forumses-1', '登记保留＝下次落地仍接线');
@@ -1462,7 +1471,7 @@ test('非站长机器收到申请：回 join-deny（指路站长）——申请�
   /* 成员机：持成员记录（受邀 → 同意入席）。 */
   const memberMaker = makeService(t, { self: peer('inst-b', '主机乙', 17400) });
   await receive(memberMaker.service, inviteFrame({ collabId: 'collab-x', manager: peer('inst-a', '主机甲'), self: peer('inst-b', '主机乙', 17400) }), '127.0.0.1');
-  assert.equal((await memberMaker.service.approve({ collabId: 'collab-x', approve: true })).ok, true);
+  assert.equal((await approveWithConsentOf(memberMaker.service, 'collab-x', 'member-seat-1')).ok, true);
   /* 申请人：按名解析指向该成员机（运行态里解析面已不答，这里模拟「被引到这里」的历史路径）→ 直投申请。 */
   const applicant = makeService(t, {
     self: peer('inst-c', '主机丙', 17600),

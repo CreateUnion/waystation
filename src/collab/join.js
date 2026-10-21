@@ -94,6 +94,8 @@ export function createJoinDomain({ state, send = null, openViewer = null, log = 
 function sessionJoinApiOf(joinState) {
   return {
     createInvite: (input) => createInviteOf(joinState, input ?? {}),
+    openInitialInvite: (input) => openInitialInviteOf(joinState, input ?? {}),
+    withdrawInitialInvite: (input) => withdrawInitialInviteOf(joinState, input ?? {}),
     acceptInvite: (input) => acceptInviteOf(joinState, input ?? {}),
     requestJoin: (input) => requestJoinOf(joinState, input ?? {}),
     approveJoin: (input) => approveJoinOf(joinState, input ?? {}),
@@ -1685,6 +1687,75 @@ function invitePayloadV2Of(joinState, local, inviteId, target, managerSessionId)
     targets: [target],
     members: seatMembersOf(joinState, local, managerSessionId),
   };
+}
+
+/* 建协首邀的最小簿记面（设计 §4.1）：出站层在发送前为每个 managed 目标开一条 open 记录并落盘，
+ * 拿到 inviteId 才能组出可两段式同意的邀请。写入失败返回明确原因，调用方不得发出邀请——
+ * 发得出去却无人能校验的记录会让受邀会话的 approve 永远被拒。 */
+function openInitialInviteOf(joinState, input) {
+  const context = initialInviteContextOf(joinState, input);
+  if (context.ok !== true) {
+    return context;
+  }
+  const { collabId, target } = /** @type {any} */ (context);
+  const books = booksOf(joinState, collabId);
+  const ttl = Number.isInteger(input.ttl) && input.ttl > 0 ? input.ttl : books.invites.ttlMs;
+  const opened = books.invites.book.openInvite({
+    targetInstanceId: target.instanceId,
+    targetSessionId: target.targetSessionId,
+    ttl,
+    now: joinState.now(),
+  });
+  if (opened.ok !== true) {
+    return failureMessage('邀请记录生成失败（目标形态不符）', { reason: opened.reason });
+  }
+  const saved = books.invites.save();
+  if (saved.ok === true) {
+    return { ok: true, inviteId: opened.inviteId, expiresAt: opened.expiresAt };
+  }
+  books.invites.book.withdrawInvite(opened.inviteId);
+  return failureMessage(`邀请簿记写入失败：${saved.reason}——邀请未发出（避免重启后无从校验）`, { reason: 'bookkeeping-write-failed' });
+}
+
+/* 建协首邀簿记的前置：协作在册、managed、签发者是本站长、目标形态合法。 */
+function initialInviteContextOf(joinState, input) {
+  const collabId = idOf(input.collabId);
+  const managerSessionId = idOf(input.managerSessionId);
+  const target = inviteTargetOf(input);
+  if (collabId === null || managerSessionId === null || target === null) {
+    return failureMessage('参数非法：需要 collabId、站长会话标识与邀请目标');
+  }
+  const local = joinState.state.collabs.get(collabId);
+  if (local === undefined) {
+    return failureMessage('本机没有该协作（collabId 不存在）');
+  }
+  if (localModeOf(local) === 'forum') {
+    return failureMessage('讨论无邀请簿记：forum 不生成、不返回 inviteId（设计 D18）', { code: 'forum-no-invite' });
+  }
+  if (!isManagerSession(joinState, local, managerSessionId)) {
+    return failureMessage('只有站长会话可以建立邀请记录');
+  }
+  return { ok: true, collabId, managerSessionId, target };
+}
+
+/* 未投递邀请的撤回（建协首邀的失败收口）：只关 open 记录，已关闭/已撤回按记录状态如实回报。
+ * 调用方据返回值决定是否留痕，不得把「记录已不可撤」误当发送成功。 */
+function withdrawInitialInviteOf(joinState, input) {
+  const collabId = idOf(input.collabId);
+  const inviteId = idOf(input.inviteId);
+  if (collabId === null || inviteId === null) {
+    return failureMessage('参数非法：需要 collabId 与 inviteId');
+  }
+  const books = booksOf(joinState, collabId);
+  const withdrawn = books.invites.book.withdrawInvite(inviteId);
+  if (withdrawn.ok !== true) {
+    return failureMessage(`邀请撤回失败：${withdrawn.reason}`, { reason: withdrawn.reason });
+  }
+  const saved = books.invites.save();
+  if (saved.ok !== true) {
+    return failureMessage(`邀请簿记撤回写入失败：${saved.reason}`, { reason: 'bookkeeping-write-failed' });
+  }
+  return { ok: true, inviteId, withdrawn: true, idempotent: withdrawn.idempotent === true };
 }
 
 async function createInviteOf(joinState, input) {

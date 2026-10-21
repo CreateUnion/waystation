@@ -274,7 +274,7 @@ function admitInvite(state, frame, meta) {
     state.counters.invitesRejected++;
     return { ok: false, reason: '邀请来源为本机（拒绝自邀 / 冒名 from）' };
   }
-  if (!members.some((member) => member.instanceId === frame.from.instanceId)) {
+  if (!inviteSourceAdmits(frame, members)) {
     state.counters.invitesRejected++;
     return { ok: false, reason: '邀请来源不在名单中（来源身份与名单不符）' };
   }
@@ -297,6 +297,23 @@ function admitInvite(state, frame, meta) {
   }
   rememberInviteSource(state, source, now);
   return { ok: true };
+}
+
+/* 邀请来源席位校验（设计 §2.2/D13）：帧携 from.sessionId 且 members 是席位条目时，必须存在
+ * 同一 (instanceId, sessionId) 的条目——实例判据会让同机未入席会话借站长机器身份通过来源校验。
+ * members 仍是旧版实例条目（无 sessionId，只有绕过协议校验的直喂夹具能构造）或无 from.sessionId
+ * 的旧帧退回实例判据；协议层已强制 0.2.0 邀请的 members 为席位条目，网络面不会走该兜底。 */
+function inviteSourceAdmits(frame, members) {
+  const instanceId = frame.from?.instanceId;
+  const sessionId = typeof frame.from?.sessionId === 'string' && frame.from.sessionId !== '' ? frame.from.sessionId : null;
+  if (sessionId !== null && members.some((member) => member.instanceId === instanceId && isSeatIdOf(member))) {
+    return members.some((member) => member.instanceId === instanceId && member.sessionId === sessionId);
+  }
+  return members.some((member) => member.instanceId === instanceId);
+}
+
+function isSeatIdOf(member) {
+  return typeof member.sessionId === 'string' && member.sessionId !== '';
 }
 
 /* 邀请目标机器：targets 存在时只看 targets（唯一性键 instanceId + targetSessionId）；
