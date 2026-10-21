@@ -727,15 +727,16 @@ test('讨论分支（在席）：本机接线立即生效（写绑定 origin:joi
   const created = made.service.create({ name: '联调讨论', topic: '主题', mode: 'forum', targets: [endpoint('inst-b', '主机乙')] });
   assert.equal(created.ok, true, created.message);
   made.opened.length = 0;   // 建协的触发 A 已记账：本用例只判讨论接线那一支（不开页）
-  const result = await made.service.join.request({ name: '联调讨论', sessionId: 'forumses-1' });
+  /* 讨论在席按席位判定：创建会话本身在席，直接接线；同机其他会话须敲门/放行（见下一用例）。 */
+  const result = await made.service.join.request({ name: '联调讨论', sessionId: 'session-a' });
   assert.equal(result.ok, true, result.message);
   assert.equal(result.bound, true, '在席＝接线立即（无批准门）');
   const binding = made.bindings.get(created.collabId);
-  assert.equal(binding.sessionId, 'forumses-1');
+  assert.equal(binding.sessionId, 'session-a');
   assert.equal(binding.origin, 'join');
   assert.deepEqual(sentOf(made.direct, 'join-request'), [], '讨论不经申请帧');
   assert.deepEqual(made.opened, [], '讨论接线不开协作页（无「进入即见」要求）');
-  assert.equal(made.service.list({ sessionId: 'forumses-1' }).collabs[0].sessionBound, true);
+  assert.equal(made.service.list({ sessionId: 'session-a' }).collabs[0].sessionBound, true);
 });
 
 test('讨论分支（未在席）：按名敲门封装（复用敲门原语）——有应答＝等待放行，无应答如实明示', async (t) => {
@@ -1188,10 +1189,10 @@ test('申请（异常面·续）：按名解析抛错 / 应答形态不全 / 站
   assert.equal(unmapped.ok, false);
   assert.match(unmapped.message, /端点未知/);
   assert.equal(sentOf(noEndpoint.direct, 'join-request').length, 0);
-  /* 绑定表未注入：讨论在席的接线未落地＝如实报错（不是假成功）。 */
+  /* 绑定表未注入：讨论在席的接线未落地＝如实报错（不是假成功）。用创建会话验证在席面。 */
   const bare = makeService(t, { bindings: null });
   const forum = bare.service.create({ name: '联调讨论', topic: '主题', mode: 'forum', targets: [endpoint('inst-b', '主机乙')] });
-  const unbound = await bare.service.join.request({ name: '联调讨论', sessionId: 'forumses-1' });
+  const unbound = await bare.service.join.request({ name: '联调讨论', sessionId: 'session-a' });
   assert.equal(unbound.ok, false);
   assert.match(unbound.message, /绑定表/);
   assert.equal(bare.service.list().collabs.find((row) => row.collabId === forum.collabId).sessionBound, false);
