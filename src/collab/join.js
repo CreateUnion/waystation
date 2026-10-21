@@ -2,8 +2,12 @@ import { randomUUID } from 'node:crypto';
 import { isIP } from 'node:net';
 import {
   ID_PATTERN, MAX_ACTIVE_SEATS, MAX_REASON_CHARS, MAX_TOPIC_CHARS, PROTOCOL_VERSION,
-  isIdentityName, isPresentationText, newMsgId, withCollabCapability,
+  isCollabMode, isIdentityName, isPresentationText, newMsgId, withCollabCapability,
 } from '../net/protocol.js';
+import {
+  CARRIER_FORMAT_INVITE_STUB, CARRIER_FORMAT_SESSION_SEATS, CARRIER_VERSION, readCarrier, readCarrierFormat, writeCarrier,
+} from './carrier.js';
+import { collabDir } from '../paths.js';
 import {
   createInvitesFileStore, createJoiningFileStore, createJoinApplicationsStore, createJoinsStore, createPendingInvitesFileStore,
 } from './joins.js';
@@ -19,7 +23,7 @@ import { createMembersStore } from './members.js';
 import { createCounterStore } from './counter.js';
 import { createMuteStore } from './mute.js';
 import { createInjectedStore } from './injected.js';
-import { ledgerDigest } from './store.js';
+import { ledgerDigest, loadMember } from './store.js';
 import { isSessionShortCode, matchSessionByToken, shortSessionId } from '../util/short-id.js';
 
 /* 加入域服务（会话级加入 §2/§4）：会话申请 / 站长批准 / 接线 / 拒绝呈现 ＋ 讨论直连。
@@ -1481,7 +1485,7 @@ function bridgeSessionIdsOf(state) {
 
 function sendRemoteSeatFrame(joinState, { collabId, instanceId, sessionId, type, payload, fromSessionId }) {
   const local = joinState.state.collabs.get(collabId);
-  const endpoint = local === undefined ? undefined : endpointFor(joinState.state, local, instanceId);
+  const endpoint = endpointForJoinOf(joinState, collabId, local, instanceId);
   if (endpoint === undefined) {
     return { ok: false, reason: '端点未知（先扫描或等对方联系）' };
   }
@@ -1717,10 +1721,24 @@ async function acceptInviteOf(joinState, input) {
     return alreadyAcceptedInviteOf(books, { collabId, inviteId, sessionId });
   }
   const manager = visible[0].fromManager;
-  if (manager.instanceId === joinState.state.self.instanceId && isManagerSession(joinState, local, manager.sessionId)) {
-    return acceptLocalInviteOf(joinState, { collabId, inviteId, sessionId, manager, books });
+  const result = manager.instanceId === joinState.state.self.instanceId && isManagerSession(joinState, local, manager.sessionId)
+    ? await acceptLocalInviteOf(joinState, { collabId, inviteId, sessionId, manager, books })
+    : await acceptRemoteInviteOf(joinState, { collabId, inviteId, sessionId, manager, books });
+  if (result.ok === true) {
+    markMemberAcceptedOf(joinState, collabId);
   }
-  return acceptRemoteInviteOf(joinState, { collabId, inviteId, sessionId, manager, books });
+  return result;
+}
+
+/* 本机成员记录的同意落点（0.2.0 邀请接受）：决定状态归整机兼容记录；席位态与快照收敛
+ * 各自由席位文件与快照采纳面维护。 */
+function markMemberAcceptedOf(joinState, collabId) {
+  const local = joinState.state.collabs.get(collabId);
+  if (local?.member === null || typeof local?.member !== 'object' || local.member.decision === 'approved') {
+    return;
+  }
+  local.member.decision = 'approved';
+  persistMember(joinState.state, local);
 }
 
 /* 同会话重复接受＝幂等成功（不产生第二席）；记录已被接受后 matchPending 不再冒泡，这里补回判据。 */
@@ -2455,9 +2473,14 @@ function ensureLocalForGrantOf(joinState, frame, context, application) {
   if (held !== undefined) {
     return held;
   }
-  const created = provisionalLocalOf(joinState, context.collabId, frame.payload?.manager ?? {});
+  const dir = collabDir(joinState.state.dataDir, context.collabId);
+  const stub = /** @type {any} */ (readCarrier(dir)).carrier;
+  const created = provisionalLocalOf(joinState, context.collabId, frame.payload?.manager ?? {}, stub);
   seedManagerEndpointOf(joinState, created, context.managerInstanceId, application);
   joinState.state.collabs.set(context.collabId, created);
+  /* 先落合法载体再写成员记录：只有 member.json 的目录会被判 0.1.x 归档；
+   * 记录形态也要先合法（name/topic 不得为空），否则重启读不回。 */
+  ensureSessionSeatsCarrierOf(joinState, created, frame.payload);
   persistMember(joinState.state, created);
   joinState.log.warn('收到加入授权但本机无该协作记录——已建最小参与记录（元数据待快照补齐）', {
     collabId: context.collabId, joinId: context.joinId,
@@ -2468,9 +2491,11 @@ function ensureLocalForGrantOf(joinState, frame, context, application) {
 /* 站长端点（回执寻址）：申请台账定格的端点优先，缺省退回已知主机清单。 */
 function seedManagerEndpointOf(joinState, local, managerInstanceId, application) {
   const fromApplication = endpointPairOf(application?.managerAddress, application?.managerPort);
-  const endpoint = fromApplication ?? lookupHostOf(joinState, managerInstanceId);
+  const endpoint = fromApplication ?? endpointForJoinOf(joinState, local.collabId, local, managerInstanceId) ?? null;
   if (endpoint !== null) {
     local.endpoints.set(managerInstanceId, endpoint);
+    /* 成员记录里的端点表是重启后的回执寻址来源（会话内 Map 不落盘）：两边同写，重启不丢。 */
+    local.member.endpoints = { ...local.member.endpoints, [managerInstanceId]: endpoint };
   }
 }
 
@@ -2480,9 +2505,30 @@ function endpointPairOf(address, port) {
     : null;
 }
 
-function provisionalLocalOf(joinState, collabId, manager) {
+/* 加入域的端点取数：内存协作记录 → 盘上成员记录 → 已知主机清单。
+ * 邀请占位目录重启后尚未载入内存（invite-stub 不参与注册表），但成员记录里已经存着
+ * 邀请来源端点——接受邀请与冷启动回执都要靠它，不得只看内存。 */
+function endpointForJoinOf(joinState, collabId, local, instanceId) {
+  const inMemory = local === undefined ? undefined : endpointFor(joinState.state, local, instanceId);
+  if (inMemory !== undefined) {
+    return inMemory;
+  }
+  const record = loadMember(joinState.state.dataDir, collabId);
+  const stored = record?.endpoints?.[instanceId];
+  const pair = endpointPairOf(stored?.address, stored?.port);
+  if (pair !== null) {
+    return pair;
+  }
+  return lookupHostOf(joinState, instanceId) ?? undefined;
+}
+
+/** @param {any} carrier */
+function provisionalLocalOf(joinState, collabId, manager, carrier = null) {
   const base = { dataDir: joinState.state.dataDir, collabId, log: joinState.log };
   const managerName = isIdentityName(manager.identityName) ? manager.identityName : manager.instanceId;
+  /* 邀请占位载体带着真实名称与主题时优先采用；邀请丢失/乱序时以协作标识占位——
+   * 两者都必须是合法呈现文本，否则成员记录读不回。 */
+  const name = isIdentityName(carrier?.name) ? carrier.name : collabId;
   const now = new Date(joinState.now()).toISOString();
   return {
     collabId,
@@ -2492,9 +2538,9 @@ function provisionalLocalOf(joinState, collabId, manager) {
       collabId,
       role: 'member',
       state: 'proposed',
-      name: collabId,
-      topic: '',
-      mode: 'managed',
+      name,
+      topic: isPresentationText(carrier?.topic, MAX_TOPIC_CHARS) ? carrier.topic : name,
+      mode: isCollabMode(carrier?.mode) ? carrier.mode : 'managed',
       manager: { instanceId: manager.instanceId, identityName: managerName },
       roster: [{ instanceId: manager.instanceId, identityName: managerName }],
       endpoints: {},
@@ -2573,6 +2619,8 @@ async function beginLocalJoiningOf(joinState, local, application, joinId, payloa
     muted: true,
     unverified: false,
   }, seatOptions);
+  /* 席位已落盘＝真正入席开始：邀请占位载体换成 session-seats，重启后按成员目录加载。 */
+  ensureSessionSeatsCarrierOf(joinState, local, payload);
   clearApplications(joinState, application.collabId, application.sessionId);
   const sent = await sendSeatFrame(joinState, {
     collabId: application.collabId,
@@ -2705,6 +2753,9 @@ function registerPendingInviteOf(joinState, input) {
 function handleInviteFrameOf(joinState, frame) {
   const inviteId = idOf(frame?.payload?.inviteId);
   if (inviteId === null) {
+    /* 不带 inviteId 的邀请（0.1.x 对端 / 讨论）：没有挂起邀请簿记，但事件面仍会建本地参与记录——
+     * 同样落 invite-stub 载体，否则这个目录重启时会被判成旧版协作归档。 */
+    ensureInviteStubCarrierOf(joinState, frame);
     return { ok: true, ignored: 'forum-no-invite' };
   }
   const managerSessionId = idOf(frame?.from?.sessionId);
@@ -2715,17 +2766,127 @@ function handleInviteFrameOf(joinState, frame) {
   if (target.ok !== true) {
     return target;
   }
-  return registerPendingInviteOf(joinState, {
+  const registered = registerPendingInviteOf(joinState, {
     collabId: frame.collabId,
     inviteId,
     fromManager: { instanceId: frame.from.instanceId, sessionId: managerSessionId },
     targetSessionId: target.sessionId,
     now: joinState.now(),
   });
+  if (registered.ok === true) {
+    ensureInviteStubCarrierOf(joinState, frame);
+  }
+  return registered;
+}
+
+/* 邀请落点的载体（设计 §4.2）：挂起邀请尚未真正入席，目录先以 invite-stub 标记——
+ * 只有 member.json 的目录在重启时会被判成 0.1.x 协作并归档只读。已有载体不改写：
+ * 重复邀请与已入席目录不得被降级回邀请形态。 */
+function ensureInviteStubCarrierOf(joinState, frame) {
+  const collabId = idOf(frame?.collabId);
+  if (collabId === null) {
+    return;
+  }
+  if (hasActiveLocalParticipationOf(joinState, collabId)) {
+    return;
+  }
+  const dir = collabDir(joinState.state.dataDir, collabId);
+  if (readCarrierFormat(dir) !== null) {
+    return;
+  }
+  const payload = frame?.payload ?? {};
+  const name = isIdentityName(payload.name) ? payload.name : collabId;
+  const carrier = {
+    format: CARRIER_FORMAT_INVITE_STUB,
+    version: CARRIER_VERSION,
+    collabId,
+    name,
+    topic: isPresentationText(payload.topic, MAX_TOPIC_CHARS) ? payload.topic : name,
+    mode: isCollabMode(payload.mode) ? payload.mode : 'managed',
+    endpoints: {},
+    snapshotVersion: 0,
+    createdAt: new Date(joinState.now()).toISOString(),
+  };
+  writeCarrierQuietlyOf(joinState, dir, carrier);
+}
+
+/* 已在册的活跃参与（站长台账 / 席位）不得被一条重复邀请降级成邀请占位：
+ * invite-stub 目录重启时按「未真正入席」读取，会把活协作藏起来。 */
+function hasActiveLocalParticipationOf(joinState, collabId) {
+  const held = joinState.state.collabs.get(collabId);
+  return held !== undefined && (held.ledger !== null || held.role === 'manager' || seatsOfLocal(held).size > 0);
+}
+
+/* 真正入席的目录形态（设计 §4.2/§6.2）：受邀目录的 invite-stub 在拿到 grant 后原子换成
+ * session-seats，否则该目录重启后仍按邀请占位读取，成员席位与快照不会被加载。
+ * 已有 session-seats 载体时保留原档（元数据补齐由成员记录承担，避免每次入席重写载体）。 */
+function ensureSessionSeatsCarrierOf(joinState, local, payload) {
+  const dir = collabDir(joinState.state.dataDir, local.collabId);
+  if (readCarrierFormat(dir) === CARRIER_FORMAT_SESSION_SEATS) {
+    return;
+  }
+  writeCarrierQuietlyOf(joinState, dir, sessionSeatsCarrierOf(joinState, local, payload));
+}
+
+function sessionSeatsCarrierOf(joinState, local, payload) {
+  const member = local.member ?? {};
+  const name = isIdentityName(member.name) ? member.name : local.collabId;
+  const manager = carrierManagerOf(payload);
+  return {
+    format: CARRIER_FORMAT_SESSION_SEATS,
+    version: CARRIER_VERSION,
+    collabId: local.collabId,
+    name,
+    topic: isPresentationText(member.topic, MAX_TOPIC_CHARS) ? member.topic : name,
+    mode: isCollabMode(member.mode) ? member.mode : 'managed',
+    endpoints: carrierEndpointsOf(local),
+    ...(manager === null ? {} : { manager }),
+    snapshotVersion: local.snapshot?.version ?? local.ledger?.version ?? 0,
+    createdAt: new Date(joinState.now()).toISOString(),
+  };
+}
+
+/* 载体里的站长条目须带任期（0.2.0 起 term 是必填面）；grant 载荷缺任期时省略该字段，
+ * 由后续快照/对表补齐，不臆造 term。 */
+function carrierManagerOf(payload) {
+  const manager = payload?.manager;
+  const sessionId = idOf(manager?.sessionId);
+  if (idOf(manager?.instanceId) === null || sessionId === null || !Number.isInteger(payload?.managerTerm) || payload.managerTerm < 1) {
+    return null;
+  }
+  return {
+    instanceId: manager.instanceId,
+    sessionId,
+    identityName: isIdentityName(manager.identityName) ? manager.identityName : manager.instanceId,
+    term: payload.managerTerm,
+  };
+}
+
+function carrierEndpointsOf(local) {
+  const endpoints = {};
+  for (const [instanceId, endpoint] of local.endpoints ?? []) {
+    const pair = endpointPairOf(endpoint?.address, endpoint?.port);
+    if (idOf(instanceId) !== null && pair !== null) {
+      endpoints[instanceId] = pair;
+    }
+  }
+  return endpoints;
+}
+
+function writeCarrierQuietlyOf(joinState, dir, carrier) {
+  try {
+    writeCarrier(dir, carrier);
+    return true;
+  } catch (error) {
+    joinState.state.counters.persistFailures++;
+    joinState.log.warn('协作载体写入失败（内存态继续）', { collabId: carrier.collabId, reason: error.message });
+    return false;
+  }
 }
 
 /* 收到邀请的指名目标：本机可唯一解析的短码换成全量会话标识后落盘（补投与可见性比较按全量
- * 标识）；解析不出时原样保留，由比较面的短码口径兜底（会话晚注册也能看到）。 */
+ * 标识）；未命中时原样保留，由比较面的短码口径兜底（会话晚注册也能看到）。歧义必须拒绝：
+ * 回落原 token 会让多个会话都看到本应只给一个会话的邀请。 */
 function resolveIncomingTargetOf(joinState, frame) {
   const raw = namedTargetTokenOf(joinState, frame);
   if (raw === undefined || raw === null) {
@@ -2736,7 +2897,16 @@ function resolveIncomingTargetOf(joinState, frame) {
     return failureMessage('邀请载荷的 targetSessionId 形态非法');
   }
   const sessions = injectableSessionsOf(joinState, frame.collabId).map((sessionId) => ({ sessionId }));
-  return { ok: true, sessionId: matchSessionByToken(sessions, token) ?? token };
+  if (sessions.some((entry) => entry.sessionId === token)) {
+    return { ok: true, sessionId: token };
+  }
+  const shortHits = isSessionShortCode(token)
+    ? sessions.filter((entry) => shortSessionId(entry.sessionId) === token)
+    : [];
+  if (shortHits.length > 1) {
+    return failureMessage(`邀请载荷的 targetSessionId 短码（${token}）有歧义：在本机命中 ${shortHits.length} 个会话——无法确定指名目标，请改用完整会话标识`);
+  }
+  return { ok: true, sessionId: shortHits[0]?.sessionId ?? token };
 }
 
 /* 指名目标的取数面：0.2.0 邀请把目标写在 targets[]（按机器定位），旧版面带顶层 targetSessionId。

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { DIGEST_PATTERN, ID_PATTERN, MAX_COLLAB_MEMBERS, MAX_TOPIC_CHARS, isCollabMode, isIdentityName, isPort, isPresentationText } from '../net/protocol.js';
-import { PENDING_INVITES_FILE_NAME } from '../paths.js';
+import { PENDING_INVITES_FILE_NAME, SEATS_DIR_NAME } from '../paths.js';
 import { writeJsonAtomic } from '../storage.js';
 import { CARRIER_FILE_NAME, CARRIER_FORMAT_INVITE_STUB, readCarrier, readCarrierFormat } from './carrier.js';
 import { MEMBERS_FILE_NAME } from './members.js';
@@ -83,9 +83,36 @@ function carrierKind(dir, carrier) {
   if (carrier.format === CARRIER_FORMAT_INVITE_STUB) {
     return { kind: 'invite-stub', detail: CARRIER_FILE_NAME };
   }
-  return ledgerWritten(dir)
+  return sessionSeatsWritten(dir)
     ? { kind: 'session-seats', detail: CARRIER_FILE_NAME }
     : { kind: 'recovery', detail: 'carrier-without-ledger' };
+}
+
+/* 会话级成员目录只有 carrier ＋ seats/（＋ snapshot.json）——共享台账只由站长写，
+ * 不能拿「无台账」判半写。判据限定「成员记录 role=member 且已有参与面证据」：
+ * 站长目录丢了台账仍必须判半写只读（不得沿用旧正判定），成员目录才有席位/快照无台账的合法形态。 */
+function sessionSeatsWritten(dir) {
+  if (ledgerWritten(dir)) {
+    return true;
+  }
+  return memberRoleOf(dir) === 'member' && (seatsWritten(dir) || existsSync(join(dir, SNAPSHOT_FILE_NAME)));
+}
+
+/* 只取角色作判档线索；形态校验归加载面（本文件不复用新形态校验器）。 */
+function memberRoleOf(dir) {
+  try {
+    return JSON.parse(readFileSync(join(dir, MEMBER_FILE_NAME), 'utf8'))?.role ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function seatsWritten(dir) {
+  try {
+    return readdirSync(join(dir, SEATS_DIR_NAME)).length > 0;
+  } catch {
+    return false;
+  }
 }
 
 /* 零字节台账按「尚未落」处理：非终态的合法台账至少有一行（状态/名单），空文件只能是半写。 */

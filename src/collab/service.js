@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { SEATS_DIR_NAME, collabDir, collabFilePath } from '../paths.js';
+import { PENDING_INVITES_FILE_NAME, SEATS_DIR_NAME, collabDir, collabFilePath } from '../paths.js';
 import { appendLine } from '../storage.js';
 import { LEDGER_FILE_NAME, MEMBER_FILE_NAME, listLocalCollabIds, loadLedger, loadMember, loadSnapshot, quarantineLedger } from './store.js';
 import { isArchived, withDefaultMode } from './model.js';
@@ -21,7 +21,7 @@ import { createJoinsStore } from './joins.js';
 import { consumeInviteChallenge, consumeInviteWaiver, grantInviteWaiver, issueInviteChallenge } from './consent.js';
 import { JOIN_REQUEST_RETRY_MAX_MS, JOIN_REQUEST_RETRY_MS, JOIN_REQUEST_TTL_MS, createJoinDomain, resolveJoinTarget } from './join.js';
 import { ID_PATTERN, POST_KINDS } from '../net/protocol.js';
-import { shortSessionId } from '../util/short-id.js';
+import { matchSessionByToken, shortSessionId } from '../util/short-id.js';
 import { decideAdmission, frozenWriteRefusalOf, managerFreezeReasonOf, SYNC_REQUEST_MAX, SYNC_REQUEST_WINDOW_MS } from './gate.js';
 import { handleEvent, maybeEstablish } from './events.js';
 import { localModeOf, localNameOf, localRosterOf, localStateOf, localTopicOf, persistLedger, persistMember } from './local.js';
@@ -565,7 +565,9 @@ async function consumeFrame(state, frame, meta) {
     state.counters.eventsHandled++;
     noteContentMessage(state, frame);
     const consumed = await handleEvent(state, frame, meta);
-    return consumed === undefined ? joinFrameResult(state, frame) : consumed;
+    /* 加入域的三帧处理已异步化（直投发确认要等 resolve）：必须 await 到结果再回给接收管线，
+     * 否则服务层的席位收尾与建立判定恒不执行。 */
+    return consumed === undefined ? await joinFrameResult(state, frame) : consumed;
   } catch (error) {
     state.counters.eventFailures++;
     state.log.error('协作事件处理异常（已隔离）', { type: frame?.type, collabId: frame?.collabId, reason: error?.message });
@@ -592,8 +594,8 @@ function joinFrameResult(state, frame) {
   return undefined;
 }
 
-function joinGrantResult(state, frame) {
-  const result = state.join.handleJoinGrant(frame);
+async function joinGrantResult(state, frame) {
+  const result = await state.join.handleJoinGrant(frame);
   /* 批准回执到达＝申请人会话获准：补本机席位，seatMode 的注入面才看得见它。 */
   if (result?.ok === true) {
     ensureSeatAfterJoin(state, frame.collabId, result.sessionId ?? frame.payload?.sessionId, 'member');
@@ -601,8 +603,8 @@ function joinGrantResult(state, frame) {
   return result;
 }
 
-function joinConfirmResult(state, frame) {
-  const result = state.join.handleJoinConfirm(frame);
+async function joinConfirmResult(state, frame) {
+  const result = await state.join.handleJoinConfirm(frame);
   /* 确认写名单后由建立判定推进 proposed→active（建立规则）。 */
   const local = state.collabs.get(frame.collabId);
   if (result?.action === 'join-confirmed' && local !== undefined) {
@@ -1353,9 +1355,10 @@ function namedInviteTargetOf(state, collabId, local) {
   return typeof target === 'string' && target !== '' ? target : null;
 }
 
-/* 点头会话与指名的比对：全标识精确命中，短码（对外表示）唯一前缀命中。 */
+/* 点头会话与指名的比对：完整标识全等 / 8 位短码全等（精确匹配，不做前缀展开）。
+ * 与邀请记录、接收侧共用 matchSessionByToken 的同一口径，避免同一短码在不同面判出不同结果。 */
 function targetSessionMatches(target, sessionId) {
-  return sessionId !== null && (sessionId === target || sessionId.startsWith(target));
+  return sessionId !== null && (sessionId === target || matchSessionByToken([{ sessionId }], target) === sessionId);
 }
 
 /* 内存成员记录补学（记录文件有而内存态无的指名标记）：成员记录随后会被整写（回应落地等），
@@ -1506,11 +1509,14 @@ function legacyWriteVerdictOf(state, collabId, dir, kind) {
   return { ok: false, reason: 'legacy' };
 }
 
-/* 邀请落点形态：只有成员记录、没有台账与席位目录（本进程刚建立的待回应邀请）。 */
+/* 邀请落点形态：有成员记录、没有共享台账，且尚未真正入席。
+ * 两段式签发 grant 后先写 seats/ 再收确认，故有席位目录时必须以挂起邀请在场为判据；
+ * 没有席位目录的旧版邀请落点（0.1.x 对端不带 inviteId）仍按落点放行。 */
 function isInviteLandingDir(dir) {
-  return existsSync(join(dir, MEMBER_FILE_NAME))
-    && !existsSync(join(dir, LEDGER_FILE_NAME))
-    && !existsSync(join(dir, SEATS_DIR_NAME));
+  if (!existsSync(join(dir, MEMBER_FILE_NAME)) || existsSync(join(dir, LEDGER_FILE_NAME))) {
+    return false;
+  }
+  return existsSync(join(dir, PENDING_INVITES_FILE_NAME)) || !existsSync(join(dir, SEATS_DIR_NAME));
 }
 
 function rememberReadonly(state, collabId, verdict) {
@@ -2013,11 +2019,14 @@ async function injectPreparedSeat(state, collabId, sessionId, prepared, frame) {
 const LOCAL_PROTOCOL_FRAME_TYPES = new Set(['join-grant', 'join-deny', 'join-confirm', 'snapshot']);
 
 async function receiveLocalProtocolFrame(state, collabId, frame) {
-  const admitted = await gateFrame(state, frame, { remoteAddress: 'local', sessionId: frame?.from?.sessionId ?? null });
+  const sessionId = frame?.from?.sessionId ?? null;
+  const admitted = await gateFrame(state, frame, { remoteAddress: 'local', sessionId });
   if (admitted?.ok !== true) {
     return { ok: false, reason: admitted?.reason ?? 'admission-rejected' };
   }
-  await consumeFrame(state, frame, { remoteAddress: 'local' });
+  /* 端点学习只认网络来源：本机注入的帧不是对端可达证据，meta 不携 remoteAddress，
+   * 否则成员记录里的站长端点会被覆盖成「local」，后续直投以非法地址被拒。 */
+  await consumeFrame(state, frame, { sessionId });
   state.counters.seatsInjected++;
   return { ok: true, delivered: true };
 }

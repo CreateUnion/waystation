@@ -5,9 +5,12 @@ import { dirname } from 'node:path';
 import { createJoinDomain } from '../src/collab/join.js';
 import { createJoinApplicationsStore } from '../src/collab/joins.js';
 import { decideAdmission } from '../src/collab/gate.js';
-import { isLedgerShape } from '../src/collab/model.js';
+import { isLedgerShape, isMemberRecordShape } from '../src/collab/model.js';
 import { COLLAB_CAPABILITY, MAX_ACTIVE_SEATS, validateMessage } from '../src/net/protocol.js';
-import { invitesFilePath, pendingInvitesFilePath, joinsFilePath } from '../src/paths.js';
+import { carrierFilePath, collabDir, collabFilePath, invitesFilePath, pendingInvitesFilePath, joinsFilePath } from '../src/paths.js';
+import { MEMBER_FILE_NAME, loadMember } from '../src/collab/store.js';
+import { classifyCollabDir, isLegacyCollab } from '../src/collab/legacy.js';
+import { MIGRATION_FILE_NAME } from '../src/collab/migration.js';
 import { makeTempDir, waitFor } from './helpers.js';
 
 /* M4 接线（0.2.0 会话级邀请与两段式入席）的判别面：邀请簿记 inviteId 全链路、指名/不指名、
@@ -754,6 +757,78 @@ test('冷启动 E2E：按名解析申请 → 站长批准（先补邀请）→ g
   await waitFor(() => pair.manager.local.ledger.members.some((row) => row.sessionId === 'app-session-1' && row.state === 'member') ? true : null, { timeoutMs: 3000 });
   assertBothSeatedOf(pair);
 });
+
+test('冷启动记录形态：合法 session-seats 载体＋成员记录可读回；重启判档不落 legacy、不写归档标记', async (t) => {
+  const applicant = applicantHarnessOf(t);
+  applicant.state.joinApplications.add({
+    collabId: COLLAB, sessionId: 'app-session-1', managerInstanceId: MANAGER_INSTANCE, msgId: 'apply-2', sentAt: NOW,
+    managerAddress: '127.0.0.1', managerPort: 17321,
+  });
+  const result = await applicant.join.handleJoinGrant(joinGrantFrame('join-cold-2'));
+  assert.equal(result.ok, true, result.reason);
+
+  const carrier = readJson(carrierFilePath(applicant.dir, COLLAB));
+  assert.equal(carrier.format, 'session-seats', '冷启动即落合格载体（不是只有 member.json）');
+  assert.equal(carrier.name, COLLAB, '无邀请时以协作标识作占位名称');
+  assert.equal(carrier.topic, COLLAB, '主题占位不得为空串');
+  assert.equal(Number.isInteger(carrier.version), true);
+  assert.equal(typeof carrier.createdAt, 'string');
+
+  const record = readJson(collabFilePath(applicant.dir, COLLAB, MEMBER_FILE_NAME));
+  assert.equal(isMemberRecordShape(record), true, '成员记录过形态校验');
+  assert.equal(record.topic !== '', true);
+  assert.notEqual(loadMember(applicant.dir, COLLAB), null, '重启加载面可读回成员记录');
+  assert.equal(classifyCollabDir(collabDir(applicant.dir, COLLAB)).kind, 'session-seats', '目录判档为成员目录');
+  assert.equal(isLegacyCollab(collabDir(applicant.dir, COLLAB)), false);
+  assert.equal(existsSync(collabFilePath(applicant.dir, COLLAB, MIGRATION_FILE_NAME)), false, '不得写归档标记');
+});
+
+test('邀请落点载体：挂起邀请目录写 invite-stub，判档不落 legacy', (t) => {
+  const made = makeHarness(t);
+  const stubCollab = 'collab-stub-landing';
+  const registered = made.join.handleInviteFrame(inviteFrameWithTargetOf('invite-stub-1', stubCollab));
+  assert.equal(registered.ok, true, registered.message);
+  const carrier = readJson(carrierFilePath(made.dir, stubCollab));
+  assert.equal(carrier.format, 'invite-stub');
+  assert.equal(carrier.snapshotVersion, 0);
+  assert.equal(classifyCollabDir(collabDir(made.dir, stubCollab)).kind, 'invite-stub');
+  assert.equal(isLegacyCollab(collabDir(made.dir, stubCollab)), false);
+});
+
+test('已入席协作收到重复邀请：invite-stub 不得覆盖/降级既有 session-seats 载体', async (t) => {
+  const applicant = applicantHarnessOf(t);
+  applicant.state.joinApplications.add({
+    collabId: COLLAB, sessionId: 'app-session-1', managerInstanceId: MANAGER_INSTANCE, msgId: 'apply-dup', sentAt: NOW,
+    managerAddress: '127.0.0.1', managerPort: 17321,
+  });
+  const granted = await applicant.join.handleJoinGrant(joinGrantFrame('join-dup-1'));
+  assert.equal(granted.ok, true, granted.reason);
+  assert.equal(readJson(carrierFilePath(applicant.dir, COLLAB)).format, 'session-seats');
+  applicant.join.handleInviteFrame(inviteFrameWithTargetOf('invite-dup-1', COLLAB));
+  assert.equal(readJson(carrierFilePath(applicant.dir, COLLAB)).format, 'session-seats', '重复邀请不得把活协作降级成邀请占位');
+});
+
+test('收到指名邀请：短码在本机命中多个会话＝拒绝，不回落原 token、不登记挂起', (t) => {
+  const made = makeHarness(t);
+  made.state.listLocalSeats = () => [{ sessionId: 'abcdef12-one' }, { sessionId: 'abcdef12-two' }];
+  const result = made.join.handleInviteFrame(inviteFrameWithTargetOf('invite-amb-1', COLLAB, 'abcdef12'));
+  assert.equal(result.ok, false, '歧义必须拒绝');
+  assert.match(result.message, /多个会话|歧义/);
+  assert.equal(existsSync(pendingInvitesFilePath(made.dir, COLLAB)), false, '拒收不登记挂起邀请');
+});
+
+function inviteFrameWithTargetOf(inviteId, collabId, targetSessionId = 'app-session-1') {
+  return {
+    v: 1, cap: COLLAB_CAPABILITY, type: 'invite', msgId: `inv-${inviteId}`,
+    from: { instanceId: 'inst-x', identityName: '主机甲', port: 17321, sessionId: 'mgr-x' },
+    collabId, ts: new Date(NOW).toISOString(),
+    payload: {
+      name: '邀请项目', topic: '主题', mode: 'managed', inviteId,
+      targets: [{ instanceId: MANAGER_INSTANCE, targetSessionId }],
+      members: [{ instanceId: 'inst-x', sessionId: 'mgr-x', identityName: '主机甲' }],
+    },
+  };
+}
 
 /* 两台机的域级联调：申请人首次接触（无本地记录），帧经用例自建的投递面互投。 */
 function coldStartPairOf(t) {

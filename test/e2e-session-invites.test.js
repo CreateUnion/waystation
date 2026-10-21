@@ -1,18 +1,23 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { invitesFilePath, joinsFilePath, pendingInvitesFilePath } from '../src/paths.js';
 import {
   bringSessionOnline,
+  closeSessionNode,
   injectionsOf,
-  injectionTextsOf,
   linkSessionNodes,
+  makeTempRoot,
   startSessionNode,
   targetOf,
   waitForInjection,
 } from './helpers/session-participants.js';
-import { waitFor } from './helpers.js';
+import { waitFor, waitForRebindable } from './helpers.js';
 
-/* 邀请的真实链路：站长建协作 → 对端收到邀请 → 同意门（确认挑战）→ 两段式入席。
+/* 邀请的真实链路（设计 §4）：站长建协作 → 邀请经真实回环 TCP 进入受邀核的 inbound
+ * （准入 → 写门 → pending-invites 落盘 → 扇出注入）→ 受邀会话 acceptInvite 携 inviteId
+ * → 站长签发 join-grant → 受邀核 join-confirm → 站长写名单并回快照。
+ * 断言覆盖 inviteId、from.sessionId、到站帧与落盘文件；不经 hooks.consume 绕过管线。
  * 长操作声明：两节点进程内运行、邀请与确认均走真实回环 TCP；通常 < 20s，单用例超时上限 60s。 */
 
 const TIMEOUT_MS = 60000;
@@ -39,100 +44,169 @@ async function createCollab(manager, member, name, extraTarget = {}) {
   return created.collabId;
 }
 
-async function approveWithConsent(member, collabId, sessionId) {
-  const first = await member.service.approve({ collabId, approve: true, sessionId });
-  if (first.needsUserConfirmation !== true) {
-    return first;
+/* 0.2.0 邀请入口（M4）：生成 inviteId ＋ invites.json 簿记，再经 sendDirect 投目标机。 */
+async function sendInvite(manager, collabId, member, targetSessionId) {
+  const invited = await manager.service.join.createInvite({
+    collabId,
+    managerSessionId: 'seat-manager',
+    targetInstanceId: member.self.instanceId,
+    ...(targetSessionId === undefined ? {} : { targetSessionId }),
+  });
+  assert.equal(invited.ok, true, String(invited.message));
+  assert.match(String(invited.inviteId), /^inv-/, '邀请必须生成 inviteId');
+  return invited;
+}
+
+function invitesOf(node, sessionId) {
+  return injectionsOf(node, sessionId).filter((entry) => entry.type === 'invite');
+}
+
+function waitInviteOrNull(node, sessionId, predicate = () => true) {
+  return waitForInjection(node, sessionId, (list) => list.some((entry) => entry.type === 'invite' && predicate(entry)), { timeoutMs: 8000 })
+    .catch(() => null);
+}
+
+function readJson(file) {
+  return JSON.parse(readFileSync(file, 'utf8'));
+}
+
+function readJsonOrNull(file) {
+  try {
+    return readJson(file);
+  } catch {
+    return null;
   }
-  return member.service.approve({ collabId, approve: true, sessionId, confirmToken: first.confirmToken });
 }
 
-function inviteArrived(node, sessionId) {
-  return injectionsOf(node, sessionId).some((entry) => entry.type === 'invite');
-}
-
-/* 受邀会话收到的邀请（真实链路；准入缺陷时为空——断言前给有界等窗，不无界等待）。 */
-async function waitInviteOrNull(node, sessionId) {
-  return waitForInjection(node, sessionId, (list) => list.some((entry) => entry.type === 'invite'), { timeoutMs: 5000 }).catch(() => null);
-}
-
-test('指名邀请：只有目标会话收到邀请，同机其他会话一条不投', { timeout: TIMEOUT_MS }, async (t) => {
+test('指名邀请：邀请帧携 inviteId / from.sessionId，只投目标会话且落盘登记', { timeout: TIMEOUT_MS }, async (t) => {
   const { manager, member } = await startPair(t);
   const collabId = await createCollab(manager, member, '指名邀请', { targetSessionId: 'seat-b2' });
-  await waitInviteOrNull(member, 'seat-b2');
-  assert.equal(inviteArrived(member, 'seat-b2'), true, '目标会话应收到邀请（受邀未入席会话可注入）');
-  await new Promise((resolve) => setTimeout(resolve, 300));
-  assert.equal(injectionTextsOf(member, 'seat-b1').length, 0, '非目标会话不得收到邀请');
-  const listed = member.service.list().collabs.find((entry) => entry.collabId === collabId);
-  assert.ok(listed !== undefined, '受邀会话可读取待回应邀请');
+  const invited = await sendInvite(manager, collabId, member, 'seat-b2');
+  await waitInviteOrNull(member, 'seat-b2', (entry) => entry.payload?.inviteId === invited.inviteId);
+  const arrived = invitesOf(member, 'seat-b2').find((entry) => entry.payload?.inviteId === invited.inviteId);
+  assert.ok(arrived !== undefined, '目标会话应收到携 inviteId 的邀请（受邀未入席会话可注入）');
+  assert.equal(arrived.frame.from.sessionId, 'seat-manager', '邀请帧必须携发件会话');
+  assert.equal(arrived.frame.from.instanceId, manager.self.instanceId);
+  assert.deepEqual(arrived.payload.targets, [{ instanceId: member.self.instanceId, targetSessionId: 'seat-b2' }], 'targets 描述目标机器与指名会话');
+  assert.ok(arrived.payload.members.some((seat) => seat.instanceId === manager.self.instanceId && seat.sessionId === 'seat-manager'), 'members 含发起人席位（席位键形态）');
+  assert.equal(arrived.payload.members.some((seat) => seat.instanceId === member.self.instanceId), false, '受邀未入席者不在 members');
+
+  const book = readJson(invitesFilePath(manager.home, collabId));
+  const record = book.invites.find((entry) => entry.inviteId === invited.inviteId);
+  assert.ok(record !== undefined, 'invites.json 登记邀请记录');
+  assert.deepEqual(record.targets, [{ instanceId: member.self.instanceId, targetSessionId: 'seat-b2' }]);
+  assert.equal(record.state, 'open');
+
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(invitesOf(member, 'seat-b1').length, 0, '非目标会话不得收到指名的 0.2.0 邀请');
 });
 
-test('受邀会话申请入席：两段式成席，重复同意不产生第二个席位', { timeout: TIMEOUT_MS }, async (t) => {
+test('受邀会话 acceptInvite：inviteId → approve → join-grant → join-confirm 两段式成席', { timeout: TIMEOUT_MS }, async (t) => {
   const { manager, member } = await startPair(t);
   const collabId = await createCollab(manager, member, '同意入席', { targetSessionId: 'seat-b2' });
-  await deliverInviteDirect(member, manager, collabId, '同意入席', { targetSessionId: 'seat-b2' });
-  assert.equal((await approveWithConsent(member, collabId, 'seat-b2')).ok, true);
-  await joinByRequest(manager, member, collabId, 'seat-b2');
-  const again = await member.service.approve({ collabId, approve: true, sessionId: 'seat-b2' });
-  assert.equal(again.ok, true, '同一会话重复同意按幂等处置');
-  const seats = member.service.listLocalSeats(collabId).filter((seat) => seat.sessionId === 'seat-b2' && seat.state === 'member');
-  assert.equal(seats.length, 1, '同会话只能接受一次（不得重复成席）');
+  const invited = await sendInvite(manager, collabId, member, 'seat-b2');
+  await waitInviteOrNull(member, 'seat-b2', (entry) => entry.payload?.inviteId === invited.inviteId);
+
+  const managerRosterBefore = await manager.service.view({ collabId });
+  assert.equal(managerRosterBefore.ledger.members.some((seat) => seat.sessionId === 'seat-b2'), false, '接受前不在共享名单');
+
+  const accepted = await member.service.join.acceptInvite({ collabId, inviteId: invited.inviteId, sessionId: 'seat-b2' });
+  assert.equal(accepted.ok, true, String(accepted.message));
+  assert.equal(accepted.inviteId, invited.inviteId);
+
+  const grant = await waitFor(() => manager.sentFrames.find((frame) => frame.type === 'join-grant'
+    && frame.payload?.joinId !== undefined) ?? null, { timeoutMs: 8000 });
+  assert.equal(grant.from?.sessionId ?? grant.fromSessionId, 'seat-manager', 'join-grant 由站长席位签发');
+  assert.deepEqual(grant.toSessions, ['seat-b2']);
+
+  const confirm = await waitFor(() => member.sentFrames.find((frame) => frame.type === 'join-confirm'
+    && frame.payload?.joinId === grant.payload.joinId) ?? null, { timeoutMs: 8000 });
+  assert.equal(confirm.from?.sessionId ?? confirm.fromSessionId, 'seat-b2', 'join-confirm 由申请人会话签发');
+
+  await waitFor(async () => {
+    const view = await manager.service.view({ collabId });
+    return view.ledger?.members.some((seat) => seat.instanceId === member.self.instanceId && seat.sessionId === 'seat-b2') ? true : null;
+  }, { timeoutMs: 8000 });
+  await waitFor(() => member.service.localSeatOf(collabId, 'seat-b2')?.unverified === false ? true : null, { timeoutMs: 8000 });
+  const seat = member.service.localSeatOf(collabId, 'seat-b2');
+  assert.equal(seat.state, 'member');
+  assert.equal(seat.role, 'member');
+
+  const book = readJson(invitesFilePath(manager.home, collabId));
+  const record = book.invites.find((entry) => entry.inviteId === invited.inviteId);
+  assert.ok(record.acceptedSessions.some((entry) => entry.sessionId === 'seat-b2'), '已 joined 的会话登记到 acceptedSessions');
+  assert.deepEqual(readJson(joinsFilePath(manager.home, collabId)).pendingJoins, [], '已确认席位不残留在 joins.json');
+
+  const again = await member.service.join.acceptInvite({ collabId, inviteId: invited.inviteId, sessionId: 'seat-b2' });
+  assert.equal(again.ok, true, '重复同意按幂等处置');
+  const seats = member.service.listLocalSeats(collabId).filter((entry) => entry.sessionId === 'seat-b2');
+  assert.equal(seats.length, 1, '同会话只能成席一次');
+  const roster = (await manager.service.view({ collabId })).ledger.members.filter((entry) => entry.sessionId === 'seat-b2');
+  assert.equal(roster.length, 1, '站长名单同样只有一行');
 });
 
-test('受邀机两个会话各自申请：同机多席按会话计，互不挤占', { timeout: TIMEOUT_MS }, async (t) => {
+test('受邀机两个会话各自同意：同一不指名 inviteId 产出两席，互不挤占', { timeout: TIMEOUT_MS }, async (t) => {
   const { manager, member } = await startPair(t);
   const collabId = await createCollab(manager, member, '同机多席');
-  await deliverInviteDirect(member, manager, collabId, '同机多席');
-  await joinByRequest(manager, member, collabId, 'seat-b1');
-  await joinByRequest(manager, member, collabId, 'seat-b2');
-  const seats = member.service.listLocalSeats(collabId).filter((seat) => seat.state === 'member').map((seat) => seat.sessionId).sort();
-  assert.deepEqual(seats, ['seat-b1', 'seat-b2'], '同机两个会话各自成席');
+  const invited = await sendInvite(manager, collabId, member);
+  await waitInviteOrNull(member, 'seat-b1', (entry) => entry.payload?.inviteId === invited.inviteId);
+  await waitInviteOrNull(member, 'seat-b2', (entry) => entry.payload?.inviteId === invited.inviteId);
+  assert.equal(invitesOf(member, 'seat-b1').some((entry) => entry.payload?.inviteId === invited.inviteId), true);
+  assert.equal(invitesOf(member, 'seat-b2').some((entry) => entry.payload?.inviteId === invited.inviteId), true);
+
+  for (const sessionId of ['seat-b1', 'seat-b2']) {
+    const accepted = await member.service.join.acceptInvite({ collabId, inviteId: invited.inviteId, sessionId });
+    assert.equal(accepted.ok, true, String(accepted.message));
+  }
+  await waitFor(async () => {
+    const view = await manager.service.view({ collabId });
+    const sessions = view.ledger?.members.map((seat) => seat.sessionId) ?? [];
+    return sessions.includes('seat-b1') && sessions.includes('seat-b2') ? true : null;
+  }, { timeoutMs: 10000 });
+  await waitFor(() => member.service.listLocalSeats(collabId).filter((seat) => seat.state === 'member' && seat.unverified !== true).length === 2 ? true : null, { timeoutMs: 10000 });
+
+  const ledger = (await manager.service.view({ collabId })).ledger;
+  const rows = ledger.members.filter((seat) => ['seat-b1', 'seat-b2'].includes(seat.sessionId));
+  assert.deepEqual(rows.map((seat) => seat.sessionId).sort(), ['seat-b1', 'seat-b2']);
+  assert.equal(new Set(rows.map((seat) => seat.joinSeq)).size, 2, '两席各自分配入席序号');
+  const book = readJson(invitesFilePath(manager.home, collabId));
+  const record = book.invites.find((entry) => entry.inviteId === invited.inviteId);
+  assert.deepEqual(record.acceptedSessions.map((entry) => entry.sessionId).sort(), ['seat-b1', 'seat-b2']);
 });
 
-async function joinByRequest(manager, member, collabId, sessionId) {
-  const requested = await member.service.join.request({ collabId, sessionId });
-  assert.equal(requested.ok, true, String(requested.message));
-  await waitFor(() => manager.service.join.pendingJoinsOf(collabId).some((record) => record.sessionId === sessionId) ? true : null, { timeoutMs: 5000 });
-  const approved = await manager.service.join.approve({ collabId, sessionId, approve: true, approvedBy: 'seat-manager', managerSessionId: 'seat-manager' });
-  assert.equal(approved.ok, true, String(approved.message));
-  await waitFor(() => member.service.localSeatOf(collabId, sessionId)?.state === 'member' ? true : null, { timeoutMs: 8000 });
-  await waitFor(() => manager.service.view({ collabId }).then((view) => view.ledger?.members?.some((seat) => seat.sessionId === sessionId) ? true : null), { timeoutMs: 8000 });
-}
+test('目标会话离线：邀请落 pending-invites，核重启后仍可接受并入席', { timeout: TIMEOUT_MS }, async (t) => {
+  const manager = await startSessionNode(t, { identityName: '甲机', online: ['seat-manager'] });
+  /* 数据根由用例持有：首个节点关停时不能删除它，重启节点要接着用同一份盘上状态。 */
+  const home = makeTempRoot(t);
+  let member = await startSessionNode(t, { home, identityName: '乙机', online: ['seat-b1'] });
+  linkSessionNodes(manager, member);
+  await bringSessionOnline(manager, 'seat-manager');
+  await bringSessionOnline(member, 'seat-b1');
+  const port = member.port;
 
-test('不指名邀请：同机两个会话各自成席（一机多席按会话计）', { timeout: TIMEOUT_MS }, async (t) => {
-  const { manager, member } = await startPair(t);
-  const collabId = await createCollab(manager, member, '不指名邀请');
-  await waitInviteOrNull(member, 'seat-b1');
-  await waitInviteOrNull(member, 'seat-b2');
-  assert.equal(inviteArrived(member, 'seat-b1') && inviteArrived(member, 'seat-b2'), true, '不指名邀请应投目标机全部活跃会话');
-  assert.equal((await approveWithConsent(member, collabId, 'seat-b1')).ok, true);
-  assert.equal((await approveWithConsent(member, collabId, 'seat-b2')).ok, true);
+  const collabId = await createCollab(manager, member, '离线补投');
+  const invited = await sendInvite(manager, collabId, member, 'seat-b2');
+  const pendingFile = pendingInvitesFilePath(home, collabId);
   await waitFor(() => {
-    const seats = member.service.listLocalSeats(collabId).filter((seat) => seat.state === 'member');
-    return seats.length === 2 ? true : null;
-  }, { timeoutMs: 15000 });
-});
+    const book = readJsonOrNull(pendingFile);
+    return book?.invites?.some((entry) => entry.inviteId === invited.inviteId) ? true : null;
+  }, { timeoutMs: 8000 });
+  assert.equal(invitesOf(member, 'seat-b2').length, 0, '离线会话本次没有注入');
 
-/* 准入缺陷（邀请载荷的 members 只含发起人、目标在 targets 中）当前会拒收真实邀请；
- * 本用例只在受邀侧直接走消费面，验证下游同意门与两段式入席本身可用——
- * 与上用例的准入失败分开归因，避免一个缺陷掩盖后半段链路的结论。 */
-async function deliverInviteDirect(member, manager, collabId, name, { targetSessionId } = {}) {
-  const payload = {
-    name,
-    topic: `${name} 主题`,
-    mode: 'managed',
-    members: [{ instanceId: manager.self.instanceId, sessionId: 'seat-manager', identityName: manager.self.identityName }],
-    targets: [{ instanceId: member.self.instanceId, ...(targetSessionId ? { targetSessionId } : {}) }],
-    ...(targetSessionId ? { targetSessionId } : {}),
-  };
-  await member.service.hooks.consume({
-    v: 1,
-    cap: 2,
-    type: 'invite',
-    msgId: randomUUID(),
-    collabId,
-    from: { instanceId: manager.self.instanceId, sessionId: 'seat-manager', identityName: manager.self.identityName, port: manager.port },
-    ts: new Date().toISOString(),
-    payload,
-  }, { remoteAddress: '127.0.0.1' });
-}
+  const instanceId = member.self.instanceId;
+  await closeSessionNode(member);
+  await waitForRebindable(port);
+  member = await startSessionNode(t, { home, port, identityName: '乙机', instanceId, online: ['seat-b1'] });
+  const restored = member.service.join.pendingInvitesFor({ collabId, sessionId: 'seat-b2', inviteId: invited.inviteId });
+  assert.equal(restored.length, 1, '挂起邀请随 pending-invites.json 恢复（桥注册补投的登记面）');
+  assert.equal(restored[0].inviteId, invited.inviteId);
+
+  await bringSessionOnline(member, 'seat-b1');
+  const accepted = await member.service.join.acceptInvite({ collabId, inviteId: invited.inviteId, sessionId: 'seat-b2' });
+  assert.equal(accepted.ok, true, String(accepted.message));
+  await waitFor(async () => {
+    const view = await manager.service.view({ collabId });
+    return view.ledger?.members.some((seat) => seat.sessionId === 'seat-b2') ? true : null;
+  }, { timeoutMs: 10000 });
+  await waitFor(() => member.service.localSeatOf(collabId, 'seat-b2')?.unverified === false ? true : null, { timeoutMs: 10000 });
+});

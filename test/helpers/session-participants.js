@@ -13,11 +13,11 @@ import { createKnownHosts } from '../../src/net/known-hosts.js';
 import { createTransport } from '../../src/net/transport.js';
 import { pickFreePort, repoRoot, waitFor } from '../helpers.js';
 
-/* 会话级参与者场景（席位名单 / 台账 / 时钟 / 旧版安装包）的测试夹具：
- * 只产出纯数据与可注入时钟，不 import 协作运行时模块——e2e 与模块测试共用同一组形态，
- * 避免各用例自行拼装 §2.1 名单条目时出现字段漂移。
- * 第二部分提供进程内双节点装配：真实 service / dispatch / transport / inbound，
- * 只把会话桥投递替换为记录面（桥 IPC 属组合根，e2e 断言的是本机旁路与网络链路）。 */
+/* 会话级参与者场景的测试夹具，分两部分：
+ * 第一部分是纯数据构造（席位名单 / 台账 / 时钟 / 旧版安装包）——不 import 协作运行时：
+ *   e2e 与模块测试共用同一组形态，避免各用例自行拼装 §2.1 名单条目时出现字段漂移；
+ * 第二部分是进程内双节点装配（本文件下方）：真实 service / dispatch / transport / inbound，
+ *   只把会话桥投递替换为记录面（桥 IPC 属组合根，e2e 断言的是本机旁路与网络链路）。 */
 
 /* 固定基准时刻与名单加入步长：夹具必须可复现——取 Date.now() 会让快照/digest 类断言
  * 每次运行都不同，失败也无法重放。 */
@@ -332,29 +332,46 @@ export function sessionNodeConfig(overrides = {}) {
   };
 }
 
-/* 节点装配：临时根先建、清理钩子先注册——任何构造中途失败都不会遗留目录或定时器。 */
+/* 节点装配：临时根先建、清理钩子先注册——任何构造中途失败都不会遗留目录或定时器。
+ * spec.home 复用既有数据根（核重启用例：状态必须跨进程实例保留，清理交给用例的 makeTempRoot）；
+ * spec.probeCapability 注入服务层能力闸门的探测面（未注入＝服务按「单测/降级」不设闸）。 */
 export async function startSessionNode(t, spec = {}) {
-  const home = mkdtempSync(join(tmpdir(), 'waystation-session-e2e-'));
+  const node = await newNodeOf(spec);
+  t.after(() => closeSessionNode(node));
+  if (typeof spec.seed === 'function') {
+    spec.seed(node.home);
+  }
+  await buildSessionNode(node);
+  return node;
+}
+
+/* 数据根与端口需要 await/分支，其余字段是纯映射：拆成两步把单函数复杂度留在上限内。 */
+async function newNodeOf(spec) {
+  const ownsHome = spec.home === undefined;
+  const home = ownsHome ? mkdtempSync(join(tmpdir(), 'waystation-session-e2e-')) : spec.home;
   const port = spec.port ?? await pickFreePort();
-  const identityName = spec.identityName ?? NODE_IDENTITY;
-  const node = {
-    home,
-    port,
-    config: sessionNodeConfig({ ...(spec.config ?? {}), port, identityName }),
-    self: { instanceId: spec.instanceId ?? `inst-${randomUUID().slice(0, 8)}`, identityName, port },
+  return nodeStateOf(spec, { ownsHome, home, port, identityName: spec.identityName ?? NODE_IDENTITY });
+}
+
+function nodeStateOf(spec, base) {
+  return {
+    home: base.home,
+    ownsHome: base.ownsHome,
+    port: base.port,
+    config: sessionNodeConfig({ ...(spec.config ?? {}), port: base.port, identityName: base.identityName }),
+    self: { instanceId: spec.instanceId ?? `inst-${randomUUID().slice(0, 8)}`, identityName: base.identityName, port: base.port },
     online: new Set(spec.online ?? []),
     deliveries: new Map(),
     sentFrames: [],
     notices: [],
+    /* 注入面故障注入（D11 重复帧补扇出用例）：列出的会话注入返回 null，扇出保留为 pending。 */
+    failInjectFor: new Set(spec.failInjectFor ?? []),
     discoveryEnabled: spec.discovery === true,
+    discoveryBindAddress: spec.discoveryBindAddress ?? '127.0.0.1',
+    probeCapability: spec.probeCapability ?? null,
+    now: spec.now ?? null,
     log: quietLog(),
   };
-  t.after(() => closeSessionNode(node));
-  if (typeof spec.seed === 'function') {
-    spec.seed(home);
-  }
-  await buildSessionNode(node);
-  return node;
 }
 
 async function buildSessionNode(node) {
@@ -371,6 +388,8 @@ async function buildSessionNode(node) {
   if (node.discoveryEnabled) {
     node.discovery = createDiscovery({
       port: node.port,
+      /* LAN 用例只在显式开启时运行：绑定回环，保证即便跑起来也不向真实网卡广播/应答。 */
+      bindAddress: node.discoveryBindAddress,
       instanceId: node.self.instanceId,
       identityName: node.self.identityName,
       getCollabCount: () => node.service.count(),
@@ -404,6 +423,10 @@ function createNodeService(node) {
     send: (message) => node.dispatch.send(message),
     sendDirect: (message) => node.dispatch.sendDirect(message),
     knownHosts: node.knownHosts,
+    /* 生产组合根恒定注入能力探测面；e2e 默认不注入时服务不设闸，能力用例必须显式注入。 */
+    probeCapability: node.probeCapability,
+    /* 假时钟（移交时限语义用例）：不注入时服务用 Date.now；注入了才让用例推进「已过期」。 */
+    now: node.now,
     notify: (frame) => {
       node.notices.push(frame);
       return true;
@@ -432,7 +455,12 @@ function createNodeInbound(node) {
       sessionDelivered: (frame) => node.service.hooks.sessionDelivered(frame),
       deliverToSession: (frame) => deliverToEverySeat(node, frame),
       listSeats: (collabId) => node.service.listInjectableTargets(collabId),
-      injectSeat: (collabId, sessionId, frame) => node.service.injectLocalSeat(collabId, sessionId, frame),
+      injectSeat: (collabId, sessionId, frame) => {
+        if (node.failInjectFor.has(sessionId)) {
+          return null;
+        }
+        return node.service.injectLocalSeat(collabId, sessionId, frame);
+      },
     },
   });
 }
@@ -455,11 +483,21 @@ function deliverToEverySeat(node, frame) {
   return delivered;
 }
 
-async function closeSessionNode(node) {
+/* 显式关闭（核重启用例需要「先关停、再以同一数据根换一个实例」）：收尾钩子会重复调用，
+ * 因此清理必须幂等；复用外部传入的数据根时不得删除（状态要留给重启后的节点）。 */
+export async function closeSessionNode(node) {
+  if (node.closed === true) {
+    return;
+  }
+  node.closed = true;
+  node.online.clear();
   await quietClose(() => node.discovery?.close());
   await quietClose(() => node.service?.close());
   await quietClose(() => node.dispatch?.stop());
   await quietClose(() => node.transport?.close());
+  if (node.ownsHome === false) {
+    return;
+  }
   try {
     rmSync(node.home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   } catch (error) {
@@ -507,6 +545,11 @@ export function targetOf(node, extra = {}) {
   };
 }
 
+/* 端点描述符：种子写的成员端点表与 known-hosts 同形（127.0.0.1 回环）。 */
+export function endpointOf(node) {
+  return { address: '127.0.0.1', port: node.port };
+}
+
 export function injectionsOf(node, sessionId) {
   return node.deliveries.get(sessionId) ?? [];
 }
@@ -530,11 +573,32 @@ export async function bringSessionOffline(node, sessionId) {
   return node.service.unregisterBridgeEntry(sessionId, `bridge-${sessionId}`);
 }
 
-/* 直接喂帧（模拟对端直连）：走真实接收管线（准入 → 落盘 → 消费 → 扇出）。 */
+/* 直接喂帧（模拟对端直连）：走真实接收管线（准入 → 落盘 → 消费 → 扇出）。
+ * onFrame 只把处理链登记到内部 chain，不返回等待面；用例需要「喂完即断言」时必须等管线收敛——
+ * 以计数快照连续两次不变作为静止判据（有界，最多 1s）。 */
 export async function feedSessionFrame(node, frame, { remoteAddress = '127.0.0.1' } = {}) {
   const acks = [];
-  await node.inbound.onFrame({ remoteAddress, send: (out) => acks.push(out) }, frame);
+  node.inbound.onFrame({ remoteAddress, send: (out) => acks.push(out) }, frame);
+  await settleInbound(node);
   return acks;
+}
+
+async function settleInbound(node) {
+  let previous = inboundProgressOf(node);
+  for (let round = 0; round < 25; round++) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const current = inboundProgressOf(node);
+    if (current === previous) {
+      return;
+    }
+    previous = current;
+  }
+}
+
+function inboundProgressOf(node) {
+  const counters = node.inbound.stats();
+  delete counters.frames;   // frames 在 onFrame 入口同步自增，不能作为「处理完成」的信号
+  return JSON.stringify(counters);
 }
 
 /* 种子协作：新形态 carrier + 台账 + 快照 + 席位文件（真实加载路径；不写旧形态字段）。 */
