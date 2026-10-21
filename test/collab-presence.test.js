@@ -96,7 +96,8 @@ test('applySeatPresence：传输对端必须等于原发机器；缺 peer 证据
 
 test('applySeatPresence：forum 只放行当前中继转发的列表（真实 payload 形态）', () => {
   const table = createPresenceTable();
-  const notice = { ...listNotice('inst-a', ['session-a']), payload: { originMsgId: 'origin-1' } };
+  /* 真实中继把 originMsgId 合并进 payload 顶层；notice 就是该 payload。 */
+  const notice = { ...listNotice('inst-a', ['session-a']), originMsgId: 'origin-1' };
   const rejected = applyList(table, notice, NOW, {
     peerInstanceId: 'inst-r',
     mode: 'managed',
@@ -128,6 +129,31 @@ test('applySeatPresence：forum 只放行当前中继转发的列表（真实 pa
   });
   assert.deepEqual(currentRelay.refreshed, [{ instanceId: 'inst-a', sessionId: 'session-a' }]);
   assert.equal(presenceOf(table, 'inst-a', 'session-a').lastSeenAt, NOW);
+});
+
+test('applySeatPresence：嵌套 payload.originMsgId 的转达副本走同一转达判定', () => {
+  const table = createPresenceTable();
+  const nested = { ...listNotice('inst-a', ['session-a']), payload: { originMsgId: 'origin-2' } };
+  const nestedRelay = applyList(table, nested, NOW, {
+    peerInstanceId: 'inst-r',
+    mode: 'forum',
+    relayPeerInstanceId: 'inst-r',
+    currentRelayPeerInstanceId: 'inst-r',
+  });
+  assert.deepEqual(nestedRelay.refreshed, [{ instanceId: 'inst-a', sessionId: 'session-a' }]);
+  assert.equal(applyList(table, nested, NOW, {
+    peerInstanceId: 'inst-r',
+    mode: 'managed',
+  }).reason, 'relay-rejected');
+});
+
+test('applySeatPresence：now 必须显式传入（单调钟），非法载荷返回可计数 reason', () => {
+  const table = createPresenceTable();
+  const notice = listNotice('inst-a', ['session-a']);
+  assert.equal(applySeatPresence(table, notice, undefined, { peerInstanceId: 'inst-a' }).reason, 'now-missing');
+  assert.equal(applySeatPresence(table, notice, Number.NaN, { peerInstanceId: 'inst-a' }).reason, 'now-missing');
+  assert.equal(applySeatPresence(table, null, NOW).reason, 'notice-invalid');
+  assert.equal(table.size, 0);
 });
 
 test('applyDirectFrame：直连来源刷新，payload / 顶层 originMsgId 的转达帧不刷新', () => {
@@ -202,6 +228,23 @@ test('applyDirectFrame：非法来源不写入、不抛异常', () => {
   assert.equal(table.size, 0);
 });
 
+test('applyDirectFrame：now 缺失 → now-missing，不写表', () => {
+  const table = createPresenceTable();
+  const frame = { collabId: COLLAB, from: { instanceId: 'inst-a', sessionId: 'session-a' }, at: NOW };
+  assert.equal(applyDirectFrame(table, frame, undefined, { peerInstanceId: 'inst-a' }).reason, 'now-missing');
+  assert.equal(applyDirectFrame(table, frame, Number.NaN, { peerInstanceId: 'inst-a' }).reason, 'now-missing');
+  assert.equal(table.size, 0);
+});
+
+test('刷新时刻不因时钟回退而回拨（单调钟纪律）', () => {
+  const table = createPresenceTable();
+  applyList(table, listNotice('inst-a', ['session-a']), NOW);
+  applyList(table, listNotice('inst-a', ['session-a']), NOW - 5000);
+  assert.equal(presenceOf(table, 'inst-a', 'session-a').lastSeenAt, NOW);
+  applyDirect(table, { collabId: COLLAB, from: { instanceId: 'inst-a', sessionId: 'session-a' } }, NOW - 1000);
+  assert.equal(presenceOf(table, 'inst-a', 'session-a').lastSeenAt, NOW);
+});
+
 test('expireSeats：超时项保留为 tombstone 且只返回一次，刷新后恢复', () => {
   const table = createPresenceTable();
   applyList(table, listNotice('inst-a', ['session-a']), NOW);
@@ -225,6 +268,7 @@ test('expireSeats：超时项保留为 tombstone 且只返回一次，刷新后�
 test('isReachable：端点/超时证据缺失按不可达，unlisted/expired/超时为不可达', () => {
   const table = createPresenceTable();
   const absent = { collabId: COLLAB, instanceId: 'inst-a', sessionId: 'session-a' };
+  assert.equal(isReachable(table, absent, { timeoutMs: TIMEOUT, hasEndpoint: true }), false, '缺 now → 不可达');
   assert.equal(isReachable(table, absent, { now: NOW, timeoutMs: TIMEOUT, hasEndpoint: true }), true);
   assert.equal(isReachable(table, absent, { now: NOW, timeoutMs: TIMEOUT, hasEndpoint: false }), false);
   assert.equal(isReachable(table, absent, { now: NOW, timeoutMs: TIMEOUT }), false);
@@ -232,6 +276,7 @@ test('isReachable：端点/超时证据缺失按不可达，unlisted/expired/超
   assert.equal(isReachable(table, absent, { now: NOW, timeoutMs: TIMEOUT, hasEndpoint: true, departed: true }), false);
   applyList(table, listNotice('inst-a', ['session-a']), NOW);
   assert.equal(isReachable(table, absent, { now: NOW + 1000, timeoutMs: TIMEOUT, hasEndpoint: true }), true);
+  assert.equal(isReachable(table, absent, { timeoutMs: TIMEOUT, hasEndpoint: true }), false, '缺 now 无法判新鲜 → 不可达');
   assert.equal(isReachable(table, absent, { now: NOW + TIMEOUT, timeoutMs: TIMEOUT, hasEndpoint: true }), false);
   applyList(table, listNotice('inst-a', ['session-other']), NOW + 2000);
   assert.equal(isReachable(table, absent, { now: NOW + 2000, timeoutMs: TIMEOUT, hasEndpoint: true }), false);

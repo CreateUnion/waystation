@@ -4,31 +4,39 @@
  * state 只含共享台账的任期面：{managerTerm, manager:{instanceId,sessionId,identityName,term}|null, version, managerWindow?}。
  * 入参帧须先过协议层形态校验；本模块只做受理语义判定。
  *
- * ctx 接线契约（缺省一律按拒绝/不采纳处理，防止接线漏传导致 fail-open）：
- * - now：本地毫秒时刻，窗口与超时比较；缺省 Date.now()。
- * - localFrozen：null | manager-offline | manager-pending | manager-fork；缺省视为活跃。
+ * ctx 接线契约（除 localFrozen 外，缺证据一律按拒绝/不采纳处理，防止接线漏传导致 fail-open）：
+ * - now：墙钟毫秒，必须与 Date.parse(effectiveAt/windowEndsAt) 同基；缺省 Date.now()。
+ *   协议时间戳一律按墙钟解析，不得传单调钟（presence 的 now 才是单调钟，两者不得共用同一变量）。
+ * - localFrozen：null | manager-offline | manager-pending | manager-fork；**缺省（null/undefined）＝活跃**。
+ *   这是唯一 fail-open 的字段：冻结由接线层显式传递，缺省表示本地未冻结，不表示「缺证据」。
+ *   取值域外（如接线私有的 'auto-no-successor'）本函数不识别、按活跃处理；接线层必须先映射到上述三态。
  * - memberSeats 或 isMemberSeat：A3/A4 与 offline catch-up 的成员资格；缺省 → source-not-member。
  * - managerReachable:false / managerDeparted:true：A4 站长不可达证据；缺省 → manager-reachability-unknown。
  *   只有探测完成/已判离席才可传，不得把该字段的缺省值当成 false 传入。
- * - autoOffers / autoOffer：A2 本地 offer 记录；缺省 → auto-offer-missing 并请求快照走 A10。
+ * - autoOffers / autoOffer：A2 与 A10 离线追赶的本地 offer 记录；缺省 → auto-offer-missing / 快照不可追赶。
  * - autoInFlight：A4 未解决 auto 在途；缺省 false。
  * - pendingOfferId / pendingTarget：manager-pending 正在等待的 offer/目标；缺省 → pending-offer-mismatch。
- * - acceptedManager：{term,manager,source}——本核按 A1–A4 采纳过的更高 term manager；source 为受理该变更的
- *   签发席位。只用于更高 term 快照 catch-up，且快照来源必须等于 source；同 term 快照不认该记录。
- * - handshakeHighest：{term,version,manager}——本轮 handshake 最高 pair；offline catch-up 缺省 → 冻结。
+ * - acceptedManager：{term,manager,source}——本核按 A1–A4 受理过的更高 term manager，source 为受理该变更的
+ *   签发席位。正常流里采纳与状态推进同步完成，此时同 term 快照走「来源＝现任站长」；本记录服务两类窗口：
+ *   ① 已受理但本地状态尚未推进（落盘/重启间隙）；② 本地已进入终态后，经受理的新站长恢复权威台账。
+ *   快照来源必须等于 source，manager 必须等于快照 manager；同 term 名单快照不认该记录。
+ * - handshakeHighest：{term,version,manager}——本轮 handshake 最高 pair；offline catch-up 与
+ *   终态恢复缺省 → 冻结/拒收；终态 pair 的 manager 为 null。
  * - authorizedEvidence：{via,authorizedAt,term,manager}——fork 收敛证据，必须绑定快照；缺省/不匹配 → 保持冻结。
- * - pendingCatchupExpired / rejectedChangeFrom：快照先到的超时/已拒变更证据；缺省保持 pending（接线须在超时后置位）。
  * - suspended / handoverTarget：显式移交等待中的目标席位；缺省 → 不按 handover-pending 受理。
  * - windowBaseAt：本地开窗生效时刻（§2A.6 收敛基准）；缺省退回绝对 endsAt 并封顶。
- * - sessionTakeoverWindowMs / windowSkewMs：窗口配置；缺省 60000 / 10000。
+ * - sessionTakeoverWindowMs / windowSkewMs：窗口配置；缺省 60000 / 10000；windowMs:0 视为未提供。
  * - ledgerDigestOf(ledger) 或 digestVerified:true：快照完整性唯一入口；digestVerified 只能由已重算 digest 的接线置位。
  * - from：快照入口的传输对端席位（帧无 from 时）；manager-changed 必须自带 from。
  * - syncExpired：A6 对表超时。
- * 快照的 auto 追赶三证据只从 frame.ledger.events 读取（auto-offer、via=auto 的 manager-changed、旧站长 leave），
- * 不接受外部 ctx 拼装；事件形态见 hasAutoCatchupEvidence。
+ *
+ * 快照入站形态：帧（或 payload）必须携 managerTerm/version/digest/ledger；台账携 managerWindow 时帧必须携
+ * 同值 managerWindow（生产方义务在快照发送端，缺字段会被协议层按坏帧拒收）。台账 manager:null 只按终态台账受理
+ * （status 须为 completed/terminated）。auto 离线追赶只认 ctx.autoOffers 中本机已收的匹配记录
+ * （baseTerm/prevManager/target）；快照台账 events 不作为证据——无签名时事件可自造（2026-10-21 裁定）。
  *
  * 返回的 actions 由接线层执行：adopt / request-snapshot / open-window / close-window / clear-freeze /
- * freeze / report / handshake / ack / ack-snapshot-stored / store-pending-catchup / count-reject。 */
+ * freeze / report / handshake / ack / ack-snapshot-stored / count-reject。 */
 
 import { isManagerTerm } from '../net/protocol.js';
 
@@ -38,7 +46,6 @@ export { compareSnapshot } from './model.js';
 
 const isTerm = isManagerTerm;
 const CHANGE_VIAS = ['handover', 'auto', 'takeover', 'takeover-manual'];
-const AUTO_CATCHUP_LEAVE_REASON = 'manager-session-closed';
 const MANAGER_FORK = 'manager-fork';
 const DEFAULT_WINDOW_MS = 60000;
 const DEFAULT_WINDOW_SKEW_MS = 10000;
@@ -61,6 +68,11 @@ function isVersion(value) {
   return Number.isInteger(value) && value >= 1;
 }
 
+/* 终态判定只认台账 status：manager:null 必须与终态状态同时出现，否则按形态损坏拒收。 */
+function isTerminalStatus(status) {
+  return status === 'completed' || status === 'terminated';
+}
+
 function timeOf(value) {
   return typeof value === 'string' ? Date.parse(value) : Number.NaN;
 }
@@ -70,12 +82,15 @@ function nowOf(ctx) {
 }
 
 /* 调用方既可能传 ctx（sessionTakeoverWindowMs），也可能传 helper 选项（windowMs）；
- * 两个名字都认，避免配置窗口 >60s 时被静默回落成默认值。 */
+ * 两个名字都认，避免配置窗口 >60s 时被静默回落成默认值。
+ * 0/负数视为未提供（不是「零窗口」），继续看下一个来源，防止 windowMs:0 盖掉有效配置。 */
 function windowMsOf(options) {
-  const direct = Number.isFinite(options.windowMs) ? options.windowMs : undefined;
-  const configured = Number.isFinite(options.sessionTakeoverWindowMs) ? options.sessionTakeoverWindowMs : undefined;
+  const direct = Number.isFinite(options.windowMs) && options.windowMs > 0 ? options.windowMs : undefined;
+  const configured = Number.isFinite(options.sessionTakeoverWindowMs) && options.sessionTakeoverWindowMs > 0
+    ? options.sessionTakeoverWindowMs
+    : undefined;
   const value = direct === undefined ? configured : direct;
-  return value !== undefined && value > 0 ? value : DEFAULT_WINDOW_MS;
+  return value === undefined ? DEFAULT_WINDOW_MS : value;
 }
 
 function skewMsOf(options) {
@@ -211,6 +226,10 @@ function snapshotStateOf(frame) {
   }
   const window = ledger.managerWindow;
   if (window !== undefined && !isWindowShape(window)) {
+    return null;
+  }
+  /* manager:null 只按终态台账受理：非终态状态或残留窗口都不得进入终态分支。 */
+  if (ledger.manager === null && (!isTerminalStatus(ledger.status) || window !== undefined)) {
     return null;
   }
   return {
@@ -555,7 +574,8 @@ function acceptSnapshot(state, frame, ctx) {
     return acceptTerminalSnapshot(state, snapshot, frame, ctx);
   }
   if (state.manager === null) {
-    return rejected(state, 'no-local-manager');
+    /* 本地终态不是永久终点：经受理的更高 term 权威台账可以覆盖（设计 §3.4）。 */
+    return acceptSnapshotAfterTerminal(state, snapshot, frame, ctx);
   }
   return acceptNonTerminalSnapshot(state, snapshot, frame, ctx);
 }
@@ -585,29 +605,118 @@ function acceptNonTerminalSnapshot(state, snapshot, frame, ctx) {
   return acceptHigherSnapshot(state, snapshot, frame, ctx);
 }
 
-/* 终态台账（manager:null）允许参与收敛（设计 §3.4 / D17）：本地活跃时只接受 term+1 且来源为成员，
- * 本地已终态时按 version 幂等/推进；同 term 活跃→终态视为分叉，不做静默改写。 */
+/* 终态台账（manager:null）的受理权威（设计 §3.4，2026-10-21 裁定）：
+ * 活跃态只认来源＝本地现任站长（同 term，version 更新）或经 A1–A4 受理的更高 term 新站长；
+ * 任意成员/同 term 非站长/来源不明一律拒收并计数，且不得以冻结活跃核的方式制造远程 DoS。
+ * 冻结态不得被终态快照解除；manager-offline 只认本地现任站长（视为站长恢复）。 */
 function acceptTerminalSnapshot(state, snapshot, frame, ctx) {
+  const source = sourceOf(frame, ctx);
+  const gate = terminalFrozenGate(state, snapshot, source, ctx);
+  if (gate !== null) {
+    return gate;
+  }
+  if (snapshot.managerTerm < state.managerTerm) {
+    return rejected(state, 'term-behind');
+  }
+  if (state.manager === null) {
+    return acceptTerminalAfterTerminal(state, snapshot, source, ctx);
+  }
+  if (snapshot.managerTerm === state.managerTerm) {
+    return acceptSameTermTerminal(state, snapshot, source, ctx);
+  }
+  return acceptHigherTerminal(state, snapshot, source, ctx);
+}
+
+function terminalFrozenGate(state, snapshot, source, ctx) {
+  if (ctx.localFrozen === 'manager-fork') {
+    return rejected(state, 'frozen-manager-fork');
+  }
+  if (ctx.localFrozen === 'manager-pending') {
+    return rejected(state, 'frozen-manager-pending');
+  }
+  if (ctx.localFrozen === 'manager-offline') {
+    return terminalOfflineGate(state, snapshot, source);
+  }
+  return null;
+}
+
+/* offline 冻结下终态快照只认本地现任站长（同 term），视为站长恢复；其他来源保持冻结。 */
+function terminalOfflineGate(state, snapshot, source) {
+  if (state.manager !== null
+    && snapshot.managerTerm === state.managerTerm
+    && sameSeat(source, state.manager)) {
+    return null;
+  }
+  return rejected(state, 'snapshot-source-not-manager');
+}
+
+/* 同 term 活跃→终态：唯一合法来源是本地现任站长本人，且必须推进 version。
+ * 非站长来源只拒收计数，不冻结——否则任一成员可远程停写活跃核。 */
+function acceptSameTermTerminal(state, snapshot, source, ctx) {
+  if (!sameSeat(source, state.manager)) {
+    return rejected(state, 'snapshot-source-not-manager');
+  }
+  if (snapshot.version <= state.version) {
+    return rejected(state, 'version-not-newer');
+  }
+  return accepted(terminalNextState(snapshot), 'snapshot-terminal-accepted', terminalAdoptActions(state, freezeNote(ctx)));
+}
+
+/* 活跃态的更高 term 终态：只认经 A1–A4 受理过的新站长（acceptedManager 绑定 term/manager/source）。 */
+function acceptHigherTerminal(state, snapshot, source, ctx) {
+  if (snapshot.managerTerm !== state.managerTerm + 1
+    || !isAcceptedTerminalSource(ctx.acceptedManager, snapshot.managerTerm, source)) {
+    return rejected(state, 'snapshot-terminal-untrusted', { actions: ['count-reject', 'request-snapshot'] });
+  }
+  return accepted(terminalNextState(snapshot), 'snapshot-terminal-accepted', terminalAdoptActions(state, freezeNote(ctx)));
+}
+
+/* 本地已终态时，终态快照只做本地只读副本的 version 收敛（§3.4：同样无站长的核可采用）；
+ * 更高 term 的终态必须有权威证据，防止成员用伪造终态台账把本地 term 永久钉高。 */
+function acceptTerminalAfterTerminal(state, snapshot, source, ctx) {
+  if (snapshot.managerTerm === state.managerTerm) {
+    return terminalVersionResult(state, snapshot);
+  }
+  const authorized = isAcceptedTerminalSource(ctx.acceptedManager, snapshot.managerTerm, source)
+    || matchesHandshakeHighest(snapshot, ctx.handshakeHighest);
+  if (!authorized) {
+    return rejected(state, 'snapshot-terminal-untrusted', { actions: ['count-reject', 'request-snapshot'] });
+  }
+  return accepted(terminalNextState(snapshot), 'snapshot-terminal-accepted', ['adopt']);
+}
+
+/* 更高 term 的终态来源：记录里的 manager 与来源必须是同一新站长席位（source 由受理时记录）。 */
+function isAcceptedTerminalSource(value, term, source) {
+  return isPlainObject(value)
+    && value.term === term
+    && isRef(value.manager)
+    && isRef(value.source)
+    && sameSeat(value.manager, source)
+    && sameSeat(value.source, source);
+}
+
+/* 本地终态后的非终态权威台账恢复（设计 §3.4：更高 term 权威台账覆盖本地终态，不得永久拒收）：
+ * 来源必须可绑定到经受理的权威——A1–A4 受理记录 / handover 目标 / 本地 auto-offer / handshake 最高 pair。 */
+function acceptSnapshotAfterTerminal(state, snapshot, frame, ctx) {
+  const source = sourceOf(frame, ctx);
   if (snapshot.managerTerm < state.managerTerm) {
     return rejected(state, 'term-behind');
   }
   if (snapshot.managerTerm === state.managerTerm) {
-    if (state.manager !== null) {
-      return frozen(state, 'snapshot-same-term-conflict');
+    /* 同 term 的 manager 冲突按 A12 处理：只有本核受理过的 A1–A4 记录能证明它不是分叉。 */
+    if (!isAcceptedManagerSeat(ctx.acceptedManager, snapshot, source) || snapshot.version <= state.version) {
+      return rejected(state, 'snapshot-not-authorized', { actions: ['count-reject', 'request-snapshot'] });
     }
-    return terminalVersionResult(state, snapshot);
+    return accepted(snapshotNextState(snapshot), 'snapshot-terminal-overridden', ['adopt']);
   }
-  if (state.manager === null) {
-    return terminalVersionResult(state, snapshot);
+  const authorized = isAcceptedManagerSeat(ctx.acceptedManager, snapshot, source)
+    || handoverPendingMatches(ctx, source, snapshot)
+    || hasLocalAutoOfferCatchup(state, snapshot, source, ctx)
+    || matchesHandshakeHighest(snapshot, ctx.handshakeHighest);
+  if (!authorized) {
+    return rejected(state, 'snapshot-not-authorized', { actions: ['count-reject', 'request-snapshot'] });
   }
-  if (snapshot.managerTerm !== state.managerTerm + 1) {
-    return frozen(state, 'snapshot-untrusted-higher-term');
-  }
-  if (!isMemberSource(ctx, sourceOf(frame, ctx))) {
-    return rejected(state, 'source-not-member');
-  }
-  const actions = state.managerWindow === undefined ? ['adopt'] : ['adopt', 'close-window'];
-  return accepted(terminalNextState(snapshot), 'snapshot-terminal-accepted', actions);
+  return accepted(snapshotNextState(snapshot), 'snapshot-terminal-overridden', ['adopt']);
 }
 
 function terminalVersionResult(state, snapshot) {
@@ -622,6 +731,19 @@ function terminalVersionResult(state, snapshot) {
 
 function terminalNextState(snapshot) {
   return { managerTerm: snapshot.managerTerm, manager: null, version: snapshot.version };
+}
+
+function terminalAdoptActions(state, extras = []) {
+  const actions = ['adopt'];
+  if (state.managerWindow !== undefined) {
+    actions.push('close-window');
+  }
+  for (const extra of extras) {
+    if (!actions.includes(extra)) {
+      actions.push(extra);
+    }
+  }
+  return actions;
 }
 
 /* 同 term 快照只允许现任站长 / 已受理过的新站长签发；窗口以本地为准：
@@ -723,11 +845,14 @@ function acceptOfflineCatchup(state, snapshot, frame, ctx) {
   return frozen(state, 'snapshot-catchup-mismatch');
 }
 
+/* handshake 最高 pair 与快照一致性：终态 pair 的 manager 为 null（设计 §3.4 的本地只读终态）。 */
 function matchesHandshakeHighest(snapshot, highest) {
-  return isPlainObject(highest)
-    && highest.term === snapshot.managerTerm
-    && highest.version === snapshot.version
-    && sameSeat(highest.manager, snapshot.manager);
+  if (!isPlainObject(highest)
+    || highest.term !== snapshot.managerTerm
+    || highest.version !== snapshot.version) {
+    return false;
+  }
+  return snapshot.manager === null ? highest.manager === null : sameSeat(highest.manager, snapshot.manager);
 }
 
 /* 分叉冻结只接受能收敛到快照本身的授权证据：证据的 term/manager 必须与快照一致，
@@ -758,14 +883,16 @@ function acceptHigherSnapshot(state, snapshot, frame, ctx) {
   if (handoverPendingMatches(ctx, source, snapshot)) {
     return accepted(snapshotNextState(snapshot), 'snapshot-handover-accepted', ['adopt']);
   }
-  if (hasAutoCatchupEvidence(state, snapshot, source, frame)) {
+  if (hasLocalAutoOfferCatchup(state, snapshot, source, ctx)) {
     return accepted(snapshotNextState(snapshot), 'snapshot-auto-catchup-accepted', ['adopt']);
   }
-  return pendingOrFrozenSnapshot(state, snapshot, source, ctx);
+  /* A10：其余来源一律拒绝并冻结，不得「经快照转正」（设计 §2A.2 A10）。 */
+  return frozen(state, 'snapshot-untrusted-higher-term');
 }
 
 /* acceptedManager 必须绑定来源席位：记录里没有 source 或来源不符一律不认，
- * 防止任意成员借历史记录给同 term/更高 term 快照背书。 */
+ * 防止任意成员借历史记录给同 term/更高 term 快照背书。
+ * 本分支服务「已受理未采纳」窗口：记录 term 可以领先本地 state（例如采纳后落盘/重启间隙）。 */
 function isAcceptedManagerSeat(value, snapshot, source) {
   return isPlainObject(value)
     && value.term === snapshot.managerTerm
@@ -790,77 +917,20 @@ function handoverPendingTarget(ctx) {
   return null;
 }
 
-/* 离线错过 auto-offer 的追赶路径（设计 §2A.2 A10）：三证据必须来自快照台账自身
- * （frame.ledger.events，随 digest 一起受完整性校验），不能由外部 ctx 拼装：
- * auto-offer 的 baseTerm/prevManager/target、via=auto 的 manager-changed、旧站长 leave/manager-session-closed。
- * 同时要求任期连续（快照 term=本地+1），term 跳变交由 handshake 对表。 */
-function hasAutoCatchupEvidence(state, snapshot, source, frame) {
+/* A10 离线追赶（2026-10-21 裁定）：只认本机已收的匹配 auto-offer，快照台账 events 一律不作为证据
+ * （无签名时同成员可自造事件并自算 digest）。匹配面：baseTerm＝本地 term、target＝快照 manager、
+ * 来源＝target；本地仍知站长时 prevManager 也须一致。term 跳变交 handshake 对表。 */
+function hasLocalAutoOfferCatchup(state, snapshot, source, ctx) {
   if (snapshot.managerTerm !== state.managerTerm + 1) {
     return false;
   }
   if (!sameSeat(source, snapshot.manager)) {
     return false;
   }
-  const events = ledgerEventsOf(frame);
-  const offer = events.find((event) => eventTypeOf(event) === 'auto-offer'
-    && autoOfferEventMatches(event, state, snapshot));
-  if (offer === undefined) {
-    return false;
-  }
-  const change = events.find((event) => eventTypeOf(event) === 'manager-changed'
-    && autoChangeEventMatches(event, state, snapshot, offer));
-  if (change === undefined) {
-    return false;
-  }
-  return events.some((event) => leaveEventMatches(event, state.manager));
-}
-
-function ledgerEventsOf(frame) {
-  const events = isPlainObject(frame.ledger) ? frame.ledger.events : undefined;
-  return Array.isArray(events) ? events : [];
-}
-
-function eventTypeOf(event) {
-  return isPlainObject(event) ? (event.type ?? event.event) : undefined;
-}
-
-function autoOfferEventMatches(event, state, snapshot) {
-  return event.baseTerm === state.managerTerm
-    && sameSeat(event.prevManager, state.manager)
-    && sameSeat(event.target, snapshot.manager);
-}
-
-function autoChangeEventMatches(event, state, snapshot, offer) {
-  return event.via === 'auto'
-    && event.offerId === offer.offerId
-    && event.term === snapshot.managerTerm
-    && sameSeat(event.prevManager, state.manager)
-    && sameSeat(event.manager, snapshot.manager);
-}
-
-function leaveEventMatches(event, seat) {
-  if (!isPlainObject(event) || event.reason !== AUTO_CATCHUP_LEAVE_REASON) {
-    return false;
-  }
-  return sameSeat(isPlainObject(event.seat) ? event.seat : event, seat);
-}
-
-/* 活跃态收到未受理来源的更高 term 快照：term=本地+1 且来源自称新站长时先暂存等变更；
- * 来源已有被拒变更或等待超时则冻结，绝不「经快照转正」（设计 §2A.2 A10 取舍）。 */
-function pendingOrFrozenSnapshot(state, snapshot, source, ctx) {
-  if (isRef(ctx.rejectedChangeFrom) && sameSeat(ctx.rejectedChangeFrom, source)) {
-    return frozen(state, 'snapshot-after-rejected-change');
-  }
-  if (snapshot.managerTerm === state.managerTerm + 1 && sameSeat(source, snapshot.manager)) {
-    if (ctx.pendingCatchupExpired === true) {
-      return frozen(state, 'snapshot-catchup-timeout');
-    }
-    return rejected(state, 'snapshot-awaiting-change', {
-      actions: ['store-pending-catchup'],
-      pendingCatchup: true,
-    });
-  }
-  return frozen(state, 'snapshot-untrusted-higher-term');
+  return autoOffersOf(ctx).some((offer) => isPlainObject(offer)
+    && offer.baseTerm === state.managerTerm
+    && sameSeat(offer.target, snapshot.manager)
+    && (state.manager === null || sameSeat(offer.prevManager, state.manager)));
 }
 
 function autoOffersOf(ctx) {

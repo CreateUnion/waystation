@@ -7,15 +7,21 @@
  * - 超时只用本地接收时刻（调用方传入 now）；帧自带时间只作偏斜参考，不进入 lastSeenAt；
  * - 过期项保留为 tombstone（expired=true），避免「删掉即无记录即可达」的 fail-open。
  *
- * 调用契约（缺证据一律拒绝，防止接线漏传导致 fail-open）：
- * - now：本地接收时刻（单调钟）。
- * - applyDirectFrame(...,{peerInstanceId})：传输对端实例，必须等于 frame.from.instanceId；
- *   缺省 → peer-missing，不匹配 → peer-mismatch。
- * - applySeatPresence(...,{peerInstanceId, mode, relayPeerInstanceId, currentRelayPeerInstanceId})：
- *   直连要求 peerInstanceId === notice.instanceId；forum 中继转发的列表要求
- *   peerInstanceId === relayPeerInstanceId === currentRelayPeerInstanceId（relayPeerInstanceId 是连接对端＝转达者，
- *   不是原发机器；notice.instanceId 仍是原发机器）。managed/旧中继/缺 peer → relay-rejected 或 peer-missing。
- * - isReachable / autoSuccessorCandidates：hasEndpoint 必须显式 true/false、timeoutMs>0；
+ * 调用契约（缺证据一律拒绝并返回 reason，防止接线漏传导致 fail-open）：
+ * - now：本地接收时刻，**单调钟**；不得用墙钟（term.js 才用墙钟），也不得取帧内 sentAt/at。
+ *   缺失/非有限数 → now-missing；不得回落 Date.now()（墙钟与单调钟混用会让超时判定跳变）。
+ * - applySeatPresence(table, notice, now, options)：notice 是 seat-presence **载荷**（不是帧），
+ *   形态 {collabId,instanceId,sessions:[sessionId...],sentAt?}；非法 → notice-invalid。
+ *   直连：options.peerInstanceId 是传输连接对端实例（来自连接层，不得取帧内 from），必须等于 notice.instanceId；
+ *         缺 → peer-missing，不符 → peer-mismatch。
+ *   forum 中继转发的副本（notice 顶层或 notice.payload 带 originMsgId）：要求
+ *         options.mode === 'forum'、options.relayPeerInstanceId 是转达该副本的连接对端、
+ *         relayPeerInstanceId === options.currentRelayPeerInstanceId（本机记录的当前中继），
+ *         且 options.peerInstanceId === relayPeerInstanceId；否则 relay-rejected / peer-mismatch。
+ *         副本的 notice.instanceId 仍是原发机器，不是中继。
+ * - applyDirectFrame(table, frame, now, options)：frame 为完整协作帧；options.peerInstanceId 是连接对端，
+ *   必须等于 frame.from.instanceId；转达副本（顶层或 payload.originMsgId）不刷新，返回 relayed。
+ * - isReachable / autoSuccessorCandidates：hasEndpoint 必须显式 true/false、timeoutMs>0、now 有限；
  *   缺省按不可达（fail-closed）。expired/unlisted 优先于 lastSeenAt。 */
 
 const KEY_SEPARATOR = '\u0000';
@@ -64,10 +70,13 @@ export function createPresenceTable() {
  * 因此列表内的席位刷新 lastSeenAt，列表外的同机旧席位只标记、不刷新。
  * 转达的 seat-presence 默认拒收；forum 只放行「本机记录的当前中继」转发的那一份。 */
 export function applySeatPresence(table, notice, now, options = {}) {
-  const at = Number.isFinite(now) ? now : Date.now();
-  if (!isPresenceNotice(notice)) {
-    return { refreshed: [], unlisted: [] };
+  if (!Number.isFinite(now)) {
+    return { refreshed: [], unlisted: [], reason: 'now-missing' };
   }
+  if (!isPresenceNotice(notice)) {
+    return { refreshed: [], unlisted: [], reason: 'notice-invalid' };
+  }
+  const at = now;
   const sourceRejection = presenceSourceRejection(notice, options);
   if (sourceRejection !== null) {
     return { refreshed: [], unlisted: [], reason: sourceRejection };
@@ -128,9 +137,10 @@ function freshEntry(notice, sessionId, at) {
   };
 }
 
+/* 单调钟下不应回退；仍取 max 与直连路径一致，时钟源接错时不把已见时刻往回拨。 */
 function refreshEntry(entry, at) {
-  entry.lastSeenAt = at;
-  entry.lastPresenceListAt = at;
+  entry.lastSeenAt = Math.max(entry.lastSeenAt, at);
+  entry.lastPresenceListAt = Math.max(entry.lastPresenceListAt, at);
   entry.unlisted = false;
   entry.expired = false;
   delete entry.expiredAt;
@@ -153,7 +163,10 @@ function markUnlisted(table, collabId, instanceId, listed, at) {
  * 用转达副本刷新会让「原发机器已离线」被无限期掩盖。
  * lastSeenAt 一律用本地接收时刻；帧自带 at 只记录为 reportedAt 供偏斜诊断。 */
 export function applyDirectFrame(table, frame, now, options = {}) {
-  const at = Number.isFinite(now) ? now : Date.now();
+  if (!Number.isFinite(now)) {
+    return { refreshed: false, reason: 'now-missing' };
+  }
+  const at = now;
   if (originOf(frame) !== null) {
     return { refreshed: false, reason: 'relayed' };
   }
@@ -235,13 +248,7 @@ export function isReachable(table, seat, options = {}) {
   if (key === null) {
     return false;
   }
-  if (optionValue(options.departed, seat) === true) {
-    return false;
-  }
-  if (optionValue(options.hasEndpoint, seat) !== true) {
-    return false;
-  }
-  if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
+  if (!reachabilityEvidenceOk(seat, options)) {
     return false;
   }
   const entry = table.get(key);
@@ -252,6 +259,17 @@ export function isReachable(table, seat, options = {}) {
     return false;
   }
   return isFreshEntry(entry, options);
+}
+
+/* 端点/超时/时钟/离席证据缺一不可：缺失按不可达（fail-closed），避免漏传参数静默放行。 */
+function reachabilityEvidenceOk(seat, options) {
+  if (!Number.isFinite(options.now) || !Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
+    return false;
+  }
+  if (optionValue(options.departed, seat) === true) {
+    return false;
+  }
+  return optionValue(options.hasEndpoint, seat) === true;
 }
 
 function reachableKeyOf(seat) {
@@ -265,8 +283,7 @@ function reachableKeyOf(seat) {
 }
 
 function isFreshEntry(entry, options) {
-  const at = Number.isFinite(options.now) ? options.now : Date.now();
-  return at - entry.lastSeenAt < options.timeoutMs;
+  return options.now - entry.lastSeenAt < options.timeoutMs;
 }
 
 /* 自动移交目标（设计 §2A.5）：除旧站长外的活跃席位，按 (joinSeq,sessionId) 升序取可达者。

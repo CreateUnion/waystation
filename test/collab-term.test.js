@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ledgerDigest } from '../src/collab/store.js';
+import { isLedgerShape } from '../src/collab/model.js';
+import { newMsgId, PROTOCOL_VERSION, validateMessage, withCollabCapability } from '../src/net/protocol.js';
 import {
   acceptManagerChange,
   clearManagerWindow,
@@ -13,9 +15,11 @@ import {
 
 const NOW = Date.parse('2026-10-21T10:00:00.000Z');
 const DIGEST = 'a'.repeat(64);
+const COLLAB_ID = 'collab-m5-term';
 const SEAT_A = { instanceId: 'inst-a', sessionId: 'session-a', identityName: '甲机' };
 const SEAT_B = { instanceId: 'inst-b', sessionId: 'session-b', identityName: '乙机' };
 const SEAT_C = { instanceId: 'inst-c', sessionId: 'session-c', identityName: '丙机' };
+const SEAT_D = { instanceId: 'inst-d', sessionId: 'session-d', identityName: '丁机' };
 const ENDPOINT = { address: '127.0.0.1', port: 46000 };
 
 function iso(ms) {
@@ -24,6 +28,18 @@ function iso(ms) {
 
 function seatRef(seat) {
   return { instanceId: seat.instanceId, sessionId: seat.sessionId };
+}
+
+function rosterRow(seat, role, joinSeq) {
+  return {
+    instanceId: seat.instanceId,
+    sessionId: seat.sessionId,
+    identityName: seat.identityName,
+    role,
+    state: 'member',
+    joinSeq,
+    joinedAt: iso(NOW - 60000),
+  };
 }
 
 function stateOf({ term = 1, version = 10, manager = SEAT_A, window } = {}) {
@@ -52,18 +68,62 @@ function changeOf(overrides = {}) {
   };
 }
 
-function snapshotOf({ term = 2, version = 11, manager = SEAT_B, from = SEAT_B, window, events } = {}) {
+function defaultRoster(manager, members) {
+  if (members !== undefined) {
+    return members;
+  }
+  if (manager === null) {
+    return [];
+  }
+  return [rosterRow(manager, 'manager', 1), rosterRow(SEAT_D, 'member', 2)];
+}
+
+/* 台账构造器：默认产出能通过 isLedgerShape 的 managed 台账（M1 形态），
+ * 让每个快照用例证明的不只是纯函数分支，而是可上线的入站形态。 */
+function ledgerOf({ term = 2, version = 11, manager = SEAT_B, status = 'active', members, window, events } = {}) {
+  const roster = defaultRoster(manager, members);
   const ledger = {
-    managerTerm: term,
     version,
+    collabId: COLLAB_ID,
+    name: '联调项目',
+    topic: '任期判决',
+    status,
+    managerTerm: term,
+    joinSeqNext: 3,
     manager: manager === null ? null : { ...manager, term },
-    members: [],
-    ...(events === undefined ? {} : { events }),
+    members: roster,
+    board: [],
+    createdAt: iso(NOW - 120000),
+    updatedAt: iso(NOW - 60000),
   };
   if (window !== undefined) {
     ledger.managerWindow = window;
   }
-  const frame = { kind: 'data', managerTerm: term, version, digest: ledgerDigest(ledger), ledger, from: { ...from } };
+  if (events !== undefined) {
+    ledger.events = events;
+  }
+  return ledger;
+}
+
+function snapshotOf({ term = 2, version = 11, manager = SEAT_B, from = SEAT_B, window, status, events, members, digest } = {}) {
+  const ledger = ledgerOf({
+    term,
+    version,
+    manager,
+    status: status ?? (manager === null ? 'completed' : 'active'),
+    members,
+    window,
+    events,
+  });
+  assert.equal(isLedgerShape(ledger), true, `快照台账必须通过 isLedgerShape: ${JSON.stringify(ledger).slice(0, 160)}`);
+  const frame = {
+    kind: 'data',
+    managerTerm: term,
+    version,
+    digest: digest ?? ledgerDigest(ledger),
+    ledger,
+    from: { ...from },
+  };
   if (window !== undefined) {
     frame.managerWindow = window;
   }
@@ -120,10 +180,10 @@ function accepts(result) {
   assert.equal(result.accepted, true, `期望受理，实际 ${result.reason}`);
 }
 
-function rejects(result, reason) {
-  assert.equal(result.accepted, false, `期望拒收，实际受理 ${result.reason}`);
+function rejects(result, reason, message) {
+  assert.equal(result.accepted, false, message ?? `期望拒收，实际受理 ${result.reason}`);
   if (reason !== undefined) {
-    assert.equal(result.reason, reason);
+    assert.equal(result.reason, reason, message);
   }
 }
 
@@ -158,6 +218,29 @@ function windowState(overrides = {}) {
 
 function manualCtx(extra = {}) {
   return { now: NOW, memberSeats: [SEAT_C], managerReachable: false, ...extra };
+}
+
+function wireEnvelope(payload, from = SEAT_A) {
+  return withCollabCapability({
+    v: PROTOCOL_VERSION,
+    type: 'snapshot',
+    msgId: newMsgId(),
+    collabId: COLLAB_ID,
+    ts: iso(NOW),
+    from: { instanceId: from.instanceId, sessionId: from.sessionId, identityName: from.identityName },
+    payload,
+  });
+}
+
+function wirePayloadOf(frame) {
+  return {
+    kind: 'data',
+    version: frame.version,
+    managerTerm: frame.managerTerm,
+    digest: frame.digest,
+    ledger: frame.ledger,
+    ...(frame.managerWindow === undefined ? {} : { managerWindow: frame.managerWindow }),
+  };
 }
 
 test('A1 handover：来源旧站长、term+1、version 更新 → 受理、关旧窗、不开窗', () => {
@@ -469,10 +552,10 @@ test('冻结态门控：fork 拒收所有 term+1；pending 只接受在途 offer
   }), 'pending-offer-mismatch');
 });
 
-test('终态：manager:null 收到同 term 变更/快照 → 只拒收、不冻结', () => {
+test('本地终态：同 term 变更/非授权快照只拒收，不永久拒收也不冻结', () => {
   const terminal = stateOf({ manager: null });
   rejects(acceptManagerChange(terminal, changeOf({ term: 1, manager: SEAT_A, from: SEAT_A }), { now: NOW }), 'no-local-manager');
-  rejects(acceptManagerChange(terminal, snapshotOf({ term: 1, version: 10, manager: SEAT_A, from: SEAT_A }), snapshotCtx()), 'no-local-manager');
+  rejects(acceptManagerChange(terminal, snapshotOf({ term: 1, version: 10, manager: SEAT_A, from: SEAT_A }), snapshotCtx()), 'snapshot-not-authorized');
 });
 
 test('A10 快照：来源＝本地现任站长 → 受理更高 term', () => {
@@ -495,12 +578,16 @@ test('A10 快照：已受理过的新站长（绑定来源）与 handover-pendin
   const frame = snapshotOf({ manager: SEAT_C, from: SEAT_C });
   const record = { term: 2, manager: seatRef(SEAT_C), source: seatRef(SEAT_C) };
   accepts(acceptManagerChange(stateOf(), frame, snapshotCtx({ acceptedManager: record })));
-  rejects(acceptManagerChange(stateOf(), frame, snapshotCtx({
+  const wrongSource = acceptManagerChange(stateOf(), frame, snapshotCtx({
     acceptedManager: { ...record, source: seatRef(SEAT_B) },
-  })));
-  rejects(acceptManagerChange(stateOf(), frame, snapshotCtx({
+  }));
+  rejects(wrongSource);
+  assert.equal(wrongSource.freezeReason, 'manager-fork');
+  const missingSource = acceptManagerChange(stateOf(), frame, snapshotCtx({
     acceptedManager: { term: 2, manager: seatRef(SEAT_C) },
-  })));
+  }));
+  rejects(missingSource);
+  assert.equal(missingSource.freezeReason, 'manager-fork');
   rejects(acceptManagerChange(stateOf(), snapshotOf({ term: 1, version: 11, manager: SEAT_A, from: SEAT_C }), snapshotCtx({
     acceptedManager: { term: 1, manager: seatRef(SEAT_A), source: seatRef(SEAT_A) },
   })), 'snapshot-source-not-manager');
@@ -508,38 +595,50 @@ test('A10 快照：已受理过的新站长（绑定来源）与 handover-pendin
   accepts(acceptManagerChange(stateOf(), target, snapshotCtx({
     suspended: { state: 'handover-pending', target: seatRef(SEAT_B) },
   })));
-  rejects(acceptManagerChange(stateOf(), target, snapshotCtx({
+  const wrongTarget = acceptManagerChange(stateOf(), target, snapshotCtx({
     suspended: { state: 'handover-pending', target: seatRef(SEAT_C) },
-  })));
+  }));
+  rejects(wrongTarget);
+  assert.equal(wrongTarget.freezeReason, 'manager-fork');
   rejects(acceptManagerChange(stateOf(), target, snapshotCtx({ suspended: 'handover-pending' })));
 });
 
-test('A10 快照：auto 追赶三证据只从快照台账 events 取且任期连续', () => {
-  const frame = snapshotOf({ events: catchupEvents() });
-  accepts(acceptManagerChange(stateOf(), frame, snapshotCtx()));
-  const externalOnly = acceptManagerChange(stateOf(), snapshotOf(), snapshotCtx({
-    autoCatchup: { offer: autoOfferOf(), change: { via: 'auto', offerId: 'offer-auto', term: 2 }, leave: {} },
+test('A10 追赶（I-3）：只认本机已收的匹配 auto-offer，快照自造 events + 自算 digest 一律拒绝并冻结', () => {
+  const state = stateOf();
+  const forgedEvents = catchupEvents({
+    offer: { target: seatRef(SEAT_C) },
+    change: { manager: seatRef(SEAT_C) },
+  });
+  const forged = snapshotOf({ term: 2, version: 11, manager: SEAT_C, from: SEAT_C, events: forgedEvents });
+  const byEventsOnly = acceptManagerChange(state, forged, snapshotCtx({ memberSeats: [SEAT_C] }));
+  rejects(byEventsOnly);
+  assert.equal(byEventsOnly.freezeReason, 'manager-fork', '台账事件不构成来源证据（无签名可自造）');
+  assert.equal(byEventsOnly.nextState.manager.sessionId, SEAT_A.sessionId);
+  const localOffer = autoOfferOf({ target: seatRef(SEAT_C) });
+  const catchup = acceptManagerChange(state, forged, snapshotCtx({ autoOffers: [localOffer] }));
+  accepts(catchup);
+  assert.equal(catchup.nextState.manager.sessionId, SEAT_C.sessionId);
+  const wrongTarget = acceptManagerChange(state, forged, snapshotCtx({ autoOffers: [autoOfferOf()] }));
+  rejects(wrongTarget);
+  assert.equal(wrongTarget.freezeReason, 'manager-fork');
+  const wrongBase = acceptManagerChange(state, forged, snapshotCtx({
+    autoOffers: [autoOfferOf({ target: seatRef(SEAT_C), baseTerm: 2 })],
   }));
-  rejects(externalOnly);
-  assert.equal(externalOnly.pendingCatchup, true, '外部 ctx 三证据不得替代台账 events');
-  const missingLeave = snapshotOf({ events: catchupEvents().slice(0, 2) });
-  rejects(acceptManagerChange(stateOf(), missingLeave, snapshotCtx()));
-  rejects(acceptManagerChange(stateOf(), snapshotOf({ events: catchupEvents({ change: { term: 3 } }) }), snapshotCtx()));
-  rejects(acceptManagerChange(stateOf(), snapshotOf({ events: catchupEvents({ change: { via: 'takeover' } }) }), snapshotCtx()));
-  rejects(acceptManagerChange(stateOf(), snapshotOf({ events: catchupEvents({ leave: { reason: 'manager-lost' } }) }), snapshotCtx()));
-  rejects(acceptManagerChange(stateOf(), snapshotOf({ events: catchupEvents({ offer: { baseTerm: 2 } }) }), snapshotCtx()));
-  const jumpEvents = catchupEvents({ offer: { target: seatRef(SEAT_C) }, change: { term: 3, manager: seatRef(SEAT_C) } });
-  const termJump = snapshotOf({ term: 3, manager: SEAT_C, from: SEAT_C, events: jumpEvents });
-  assert.equal(acceptManagerChange(stateOf(), termJump, snapshotCtx()).freezeReason, 'manager-fork');
+  rejects(wrongBase);
+  assert.equal(wrongBase.freezeReason, 'manager-fork');
+  const wrongPrev = acceptManagerChange(state, forged, snapshotCtx({
+    autoOffers: [autoOfferOf({ target: seatRef(SEAT_C), prevManager: seatRef(SEAT_B) })],
+  }));
+  rejects(wrongPrev);
+  assert.equal(wrongPrev.freezeReason, 'manager-fork');
 });
 
-test('A10 快照：来源不明的 term+1 暂存等变更，超时/已拒变更/term 跳变 → 冻结', () => {
+test('A10 快照：未受理来源的更高 term（含自称新站长）→ 拒收并冻结，不经快照转正', () => {
   const frame = snapshotOf({ manager: SEAT_C, from: SEAT_C });
-  const pending = acceptManagerChange(stateOf(), frame, snapshotCtx());
-  rejects(pending, 'snapshot-awaiting-change');
-  assert.equal(pending.pendingCatchup, true);
-  assert.equal(acceptManagerChange(stateOf(), frame, snapshotCtx({ pendingCatchupExpired: true })).freezeReason, 'manager-fork');
-  assert.equal(acceptManagerChange(stateOf(), frame, snapshotCtx({ rejectedChangeFrom: SEAT_C })).freezeReason, 'manager-fork');
+  const result = acceptManagerChange(stateOf(), frame, snapshotCtx({ memberSeats: [SEAT_C] }));
+  rejects(result);
+  assert.equal(result.freezeReason, 'manager-fork');
+  assert.ok(result.actions.includes('count-reject'));
   const jump = snapshotOf({ term: 4, manager: SEAT_C, from: SEAT_C });
   assert.equal(acceptManagerChange(stateOf(), jump, snapshotCtx()).freezeReason, 'manager-fork');
 });
@@ -621,20 +720,130 @@ test('A13/A14：同 term 同 version 幂等、低 term 拒收', () => {
   rejects(acceptManagerChange(stateOf({ term: 2, version: 12 }), snapshotOf({ term: 1, version: 9, manager: SEAT_A, from: SEAT_A }), snapshotCtx()), 'term-behind');
 });
 
-test('终态快照：活跃态按 term+1 且成员来源收敛到 manager:null；同 term 转终态冻结', () => {
+test('终态快照 C-1：成员用更高 term 的 manager:null 结束协作 → 拒绝且不改状态', () => {
   const state = stateOf();
-  const terminalFrame = snapshotOf({ term: 2, version: 11, manager: null, from: SEAT_B });
-  const result = acceptManagerChange(state, terminalFrame, snapshotCtx({ memberSeats: [SEAT_B] }));
-  accepts(result);
-  assert.equal(result.nextState.manager, null);
-  assert.equal(result.nextState.managerTerm, 2);
-  const sameTerm = snapshotOf({ term: 1, version: 11, manager: null, from: SEAT_B });
-  assert.equal(acceptManagerChange(state, sameTerm, snapshotCtx({ memberSeats: [SEAT_B] })).freezeReason, 'manager-fork');
-  const localTerminal = stateOf({ term: 2, version: 10, manager: null });
-  accepts(acceptManagerChange(localTerminal, snapshotOf({ term: 2, version: 11, manager: null, from: SEAT_B }), snapshotCtx()));
-  rejects(acceptManagerChange(state, terminalFrame, snapshotCtx({ memberSeats: [] })), 'source-not-member');
-  const jump = snapshotOf({ term: 3, version: 12, manager: null, from: SEAT_B });
-  assert.equal(acceptManagerChange(state, jump, snapshotCtx({ memberSeats: [SEAT_B] })).freezeReason, 'manager-fork');
+  const attack = snapshotOf({ term: 2, version: 11, manager: null, from: SEAT_B });
+  const result = acceptManagerChange(state, attack, snapshotCtx({ memberSeats: [SEAT_B] }));
+  rejects(result, 'snapshot-terminal-untrusted');
+  assert.equal(result.freezeReason, undefined, '不得让成员远程冻结活跃核');
+  assert.ok(result.actions.includes('count-reject'));
+  assert.equal(result.nextState.manager.sessionId, SEAT_A.sessionId);
+  assert.equal(result.nextState.managerTerm, 1);
+});
+
+test('终态快照：同 term 活跃核只接受现任站长；成员副本拒绝且不冻结', () => {
+  const state = stateOf({ window: { windowBaseTerm: 1, windowEndsAt: iso(NOW + 30000) } });
+  const byMember = acceptManagerChange(state, snapshotOf({ term: 1, version: 11, manager: null, from: SEAT_B }), snapshotCtx({ memberSeats: [SEAT_B] }));
+  rejects(byMember, 'snapshot-source-not-manager');
+  assert.equal(byMember.freezeReason, undefined);
+  assert.ok(byMember.actions.includes('count-reject'));
+  const byManager = acceptManagerChange(state, snapshotOf({ term: 1, version: 11, manager: null, from: SEAT_A }), snapshotCtx());
+  accepts(byManager);
+  assert.equal(byManager.nextState.manager, null);
+  assert.equal(byManager.nextState.managerTerm, 1);
+  assert.equal(byManager.nextState.version, 11);
+  assert.ok(byManager.actions.includes('adopt'));
+  assert.ok(byManager.actions.includes('close-window'));
+  rejects(acceptManagerChange(state, snapshotOf({ term: 1, version: 10, manager: null, from: SEAT_A }), snapshotCtx()), 'version-not-newer');
+});
+
+test('终态快照：更高 term 只认经 A1–A4 受理的新站长（acceptedManager 绑定来源）', () => {
+  const record = { term: 2, manager: seatRef(SEAT_C), source: seatRef(SEAT_C) };
+  const frame = snapshotOf({ term: 2, version: 11, manager: null, from: SEAT_C });
+  accepts(acceptManagerChange(stateOf(), frame, snapshotCtx({ acceptedManager: record })));
+  rejects(acceptManagerChange(stateOf(), frame, snapshotCtx({
+    acceptedManager: { ...record, source: seatRef(SEAT_B) },
+  })), 'snapshot-terminal-untrusted');
+  rejects(acceptManagerChange(stateOf(), frame, snapshotCtx({
+    acceptedManager: { term: 2, manager: seatRef(SEAT_C) },
+  })), 'snapshot-terminal-untrusted');
+  rejects(acceptManagerChange(stateOf(), frame, snapshotCtx({ memberSeats: [SEAT_C] })), 'snapshot-terminal-untrusted');
+});
+
+test('终态快照：fork/pending 不得被解除；offline 仅认本地现任站长（视为站长恢复）', () => {
+  const terminal = snapshotOf({ term: 1, version: 11, manager: null, from: SEAT_A });
+  rejects(acceptManagerChange(stateOf(), terminal, snapshotCtx({ localFrozen: 'manager-fork' })), 'frozen-manager-fork');
+  rejects(acceptManagerChange(stateOf(), terminal, snapshotCtx({ localFrozen: 'manager-pending' })), 'frozen-manager-pending');
+  const offlineByMember = acceptManagerChange(stateOf(), snapshotOf({ term: 1, version: 11, manager: null, from: SEAT_B }), snapshotCtx({
+    localFrozen: 'manager-offline',
+    memberSeats: [SEAT_B],
+  }));
+  rejects(offlineByMember, 'snapshot-source-not-manager');
+  assert.equal(offlineByMember.actions.includes('clear-freeze'), false);
+  assert.equal(offlineByMember.nextState.manager.sessionId, SEAT_A.sessionId);
+  const offlineByManager = acceptManagerChange(stateOf(), terminal, snapshotCtx({ localFrozen: 'manager-offline' }));
+  accepts(offlineByManager);
+  assert.ok(offlineByManager.actions.includes('clear-freeze'));
+});
+
+test('终态不可逆（I-2）：经受理的更高 term 非终态权威台账可覆盖本地终态', () => {
+  const terminalState = stateOf({ term: 2, version: 11, manager: null });
+  const frame = snapshotOf({ term: 3, version: 12, manager: SEAT_C, from: SEAT_C });
+  const unauthorized = acceptManagerChange(terminalState, frame, snapshotCtx());
+  rejects(unauthorized, 'snapshot-not-authorized');
+  assert.ok(unauthorized.actions.includes('request-snapshot'));
+  const record = { term: 3, manager: seatRef(SEAT_C), source: seatRef(SEAT_C) };
+  const restored = acceptManagerChange(terminalState, frame, snapshotCtx({ acceptedManager: record }));
+  accepts(restored);
+  assert.equal(restored.nextState.managerTerm, 3);
+  assert.equal(restored.nextState.manager.sessionId, SEAT_C.sessionId);
+  const byHandshake = acceptManagerChange(terminalState, frame, snapshotCtx({
+    handshakeHighest: { term: 3, version: 12, manager: seatRef(SEAT_C) },
+  }));
+  accepts(byHandshake);
+  const sameTerm = snapshotOf({ term: 2, version: 12, manager: SEAT_C, from: SEAT_C });
+  rejects(acceptManagerChange(terminalState, sameTerm, snapshotCtx()), 'snapshot-not-authorized');
+  rejects(acceptManagerChange(terminalState, sameTerm, snapshotCtx({
+    handshakeHighest: { term: 2, version: 12, manager: seatRef(SEAT_C) },
+  })), 'snapshot-not-authorized', '同 term 冲突不得靠 handshake 覆盖');
+  accepts(acceptManagerChange(terminalState, sameTerm, snapshotCtx({
+    acceptedManager: { term: 2, manager: seatRef(SEAT_C), source: seatRef(SEAT_C) },
+  })));
+  const auto = snapshotOf({ term: 3, version: 12, manager: SEAT_B, from: SEAT_B });
+  accepts(acceptManagerChange(terminalState, auto, snapshotCtx({
+    autoOffers: [autoOfferOf({ baseTerm: 2, prevManager: seatRef(SEAT_C), target: seatRef(SEAT_B) })],
+  })));
+});
+
+test('终态副本收敛：同 term 按 version 推进；更高 term 必须有权威证据（防 term 钉高）', () => {
+  const terminalState = stateOf({ term: 2, version: 11, manager: null });
+  const sameTerm = snapshotOf({ term: 2, version: 12, manager: null, from: SEAT_B });
+  const advanced = acceptManagerChange(terminalState, sameTerm, snapshotCtx({ memberSeats: [SEAT_B] }));
+  accepts(advanced);
+  assert.equal(advanced.nextState.version, 12);
+  rejects(acceptManagerChange(terminalState, snapshotOf({ term: 2, version: 11, manager: null, from: SEAT_B }), snapshotCtx()), 'snapshot-idempotent');
+  rejects(acceptManagerChange(terminalState, snapshotOf({ term: 2, version: 10, manager: null, from: SEAT_B }), snapshotCtx()), 'version-behind');
+  const higher = snapshotOf({ term: 9, version: 20, manager: null, from: SEAT_B });
+  rejects(acceptManagerChange(terminalState, higher, snapshotCtx({ memberSeats: [SEAT_B] })), 'snapshot-terminal-untrusted');
+  const byHandshake = acceptManagerChange(terminalState, higher, snapshotCtx({
+    handshakeHighest: { term: 9, version: 20, manager: null },
+  }));
+  accepts(byHandshake);
+  assert.equal(byHandshake.nextState.managerTerm, 9);
+});
+
+test('终态形态：manager:null 必须携终态 status，且不得残留窗口', () => {
+  const activeNull = ledgerOf({ term: 2, version: 11, manager: null, status: 'active' });
+  const activeFrame = {
+    kind: 'data',
+    managerTerm: 2,
+    version: 11,
+    digest: ledgerDigest(activeNull),
+    ledger: activeNull,
+    from: { ...SEAT_B },
+  };
+  rejects(acceptManagerChange(stateOf(), activeFrame, snapshotCtx({ memberSeats: [SEAT_B] })), 'frame-invalid');
+  const terminalWindow = { windowBaseTerm: 2, windowEndsAt: iso(NOW + 30000) };
+  const withWindow = ledgerOf({ term: 2, version: 11, manager: null, status: 'completed', window: terminalWindow });
+  rejects(acceptManagerChange(stateOf(), {
+    kind: 'data',
+    managerTerm: 2,
+    version: 11,
+    managerWindow: terminalWindow,
+    digest: ledgerDigest(withWindow),
+    ledger: withWindow,
+    from: { ...SEAT_B },
+  }, snapshotCtx({ memberSeats: [SEAT_B] })), 'frame-invalid');
 });
 
 test('快照窗口：帧/台账不一致按损坏拒收；同刻不同格式不误判；远期窗口拒收', () => {
@@ -647,6 +856,7 @@ test('快照窗口：帧/台账不一致按损坏拒收；同刻不同格式不�
   const ledgerOnly = { ...base };
   delete ledgerOnly.managerWindow;
   rejects(acceptManagerChange(state, ledgerOnly, snapshotCtx()), 'snapshot-corrupt');
+  /* 纯函数层防御：协议层 sameManagerWindow 用原始字符串比较（同一时刻不同序列化在入站即被拒）。 */
   const sameInstant = { ...base, managerWindow: { ...localWindow, windowEndsAt: new Date(NOW + 30000).toISOString().replace('.000Z', 'Z') } };
   accepts(acceptManagerChange(state, sameInstant, snapshotCtx()));
   const far = snapshotOf({ term: 1, version: 11, manager: SEAT_A, from: SEAT_A, window: { windowBaseTerm: 1, windowEndsAt: iso(NOW + 120000) } });
@@ -687,6 +897,23 @@ test('窗口配置：sessionTakeoverWindowMs=120s 驱动 A2 剩余与 A3 59/61s 
   }), 'window-closed');
 });
 
+test('窗口配置：windowMs:0 视为未提供，不覆盖 sessionTakeoverWindowMs=120s', () => {
+  assert.equal(managerWindowRemaining({ windowBaseTerm: 2, windowEndsAt: iso(NOW + 120000) }, NOW, {
+    baseAt: NOW,
+    windowMs: 0,
+    sessionTakeoverWindowMs: 120000,
+  }), 120000);
+  const frame = changeOf({ via: 'auto', from: SEAT_B, offerId: 'offer-auto', windowEndsAt: iso(NOW + 120000) });
+  const result = acceptManagerChange(stateOf(), frame, {
+    now: NOW,
+    autoOffers: [autoOfferOf()],
+    windowMs: 0,
+    sessionTakeoverWindowMs: 120000,
+  });
+  accepts(result);
+  assert.equal(result.windowRemaining, 120000);
+});
+
 test('digestVerified:true 是显式旁路；需重算 digest 的接线才可置位', () => {
   const frame = snapshotOf({ from: SEAT_A });
   rejects(acceptManagerChange(stateOf(), frame, { now: NOW }), 'digest-unverified');
@@ -703,6 +930,28 @@ test('A3 授权分支拒绝未来 authorizedAt（伪造远期窗口时）', () =
   });
   const frame = takeoverFrame({ authorizedAt: iso(farEnd - 1000) });
   rejects(acceptManagerChange(state, frame, { now: NOW, memberSeats: [SEAT_C] }), 'window-closed');
+});
+
+test('真实链路：validateMessage 通过后由 acceptManagerChange 受理；终态攻击同样走真实形态', () => {
+  const state = stateOf();
+  const window = { windowBaseTerm: 2, windowEndsAt: iso(NOW + 60000) };
+  const frame = snapshotOf({ term: 2, version: 11, manager: SEAT_B, from: SEAT_A, window });
+  const valid = wireEnvelope(wirePayloadOf(frame), SEAT_A);
+  assert.deepEqual(validateMessage(valid), { ok: true });
+  const accepted = acceptManagerChange(state, { ...valid.payload, from: valid.from }, snapshotCtx());
+  accepts(accepted);
+  assert.equal(accepted.nextState.manager.sessionId, SEAT_B.sessionId);
+  assert.deepEqual(accepted.nextState.managerWindow, window);
+  const attack = snapshotOf({ term: 2, version: 11, manager: null, from: SEAT_B });
+  const attackWire = wireEnvelope(wirePayloadOf(attack), SEAT_B);
+  assert.deepEqual(validateMessage(attackWire), { ok: true });
+  rejects(acceptManagerChange(state, { ...attackWire.payload, from: attackWire.from }, snapshotCtx({
+    memberSeats: [SEAT_B],
+  })), 'snapshot-terminal-untrusted');
+  const missingTerm = wireEnvelope({ kind: 'data', version: 11, digest: frame.digest, ledger: frame.ledger });
+  assert.equal(validateMessage(missingTerm).ok, false, '快照生产端必须携 managerTerm（I-4）');
+  const missingWindow = wireEnvelope({ kind: 'data', version: 11, managerTerm: 2, digest: frame.digest, ledger: frame.ledger });
+  assert.equal(validateMessage(missingWindow).ok, false, '台账带窗口时帧必须携同值 managerWindow（I-4）');
 });
 
 test('compareSnapshot：排序/冲突/幂等，且与任期判决分类一致', () => {
