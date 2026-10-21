@@ -1,19 +1,23 @@
-/* 任期内核（设计 §2A.2 / §2A.10）：站长变更与快照的受理判决。
+/* 任期内核（设计 §2A.2 / §2A.6 / §2A.10）：站长变更与快照的受理判决。
  * 纯逻辑：只读 state/ctx、返回 {accepted,nextState,freezeReason,actions,reason}，不写盘、不发帧。
  *
  * state 只含共享台账的任期面：{managerTerm, manager:{instanceId,sessionId,identityName,term}|null, version, managerWindow?}。
- * 冻结态、auto-offer 记录、名单/可达性等外部证据经 ctx 传入——判决与证据收集分开，便于在 PC 上单测。
- * 返回的 actions 是接线层要执行的动作：adopt / request-snapshot / open-window / close-window /
- * clear-freeze / freeze / report / handshake / ack / ack-snapshot-stored / store-pending-catchup / count-reject。 */
+ * 入参帧须先过协议层形态校验；本模块只做受理语义判定。冻结态、auto-offer、名单/可达性等证据经 ctx 传入。
+ * 返回的 actions 由接线层执行：adopt / request-snapshot / open-window / close-window / clear-freeze /
+ * freeze / report / handshake / ack / ack-snapshot-stored / store-pending-catchup / count-reject。 */
+
+import { isManagerTerm } from '../net/protocol.js';
 
 /* 快照排序判据在名单内核已实现（按 (managerTerm,version)；同 term 不同 manager 报冲突）；
- * 任期模块复用同一实现，避免两份排序逻辑分叉。 */
+ * 任期模块复用同一出口，避免两份排序逻辑分叉。 */
 export { compareSnapshot } from './model.js';
 
-const MAX_MANAGER_TERM = 2147483647;
+const isTerm = isManagerTerm;
 const CHANGE_VIAS = ['handover', 'auto', 'takeover', 'takeover-manual'];
-const AUTO_CATCHUP_LEAVE_REASONS = ['manager-lost', 'manager-session-closed'];
+const AUTO_CATCHUP_LEAVE_REASON = 'manager-session-closed';
 const MANAGER_FORK = 'manager-fork';
+const DEFAULT_WINDOW_MS = 60000;
+const DEFAULT_WINDOW_SKEW_MS = 10000;
 
 function isPlainObject(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -29,10 +33,6 @@ function isPeer(value) {
   return isRef(value) && typeof value.identityName === 'string' && value.identityName !== '';
 }
 
-function isTerm(value) {
-  return Number.isInteger(value) && value >= 1 && value <= MAX_MANAGER_TERM;
-}
-
 function isVersion(value) {
   return Number.isInteger(value) && value >= 1;
 }
@@ -41,10 +41,30 @@ function timeOf(value) {
   return typeof value === 'string' ? Date.parse(value) : Number.NaN;
 }
 
+function nowOf(ctx) {
+  return Number.isFinite(ctx.now) ? ctx.now : Date.now();
+}
+
+function windowMsOf(ctx) {
+  const value = ctx.sessionTakeoverWindowMs;
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_WINDOW_MS;
+}
+
+function skewMsOf(ctx) {
+  const value = ctx.windowSkewMs;
+  return Number.isFinite(value) && value >= 0 ? value : DEFAULT_WINDOW_SKEW_MS;
+}
+
 function sameSeat(left, right) {
   return isRef(left) && isRef(right)
     && left.instanceId === right.instanceId
     && left.sessionId === right.sessionId;
+}
+
+function sameWindow(left, right) {
+  return isPlainObject(left) && isPlainObject(right)
+    && left.windowBaseTerm === right.windowBaseTerm
+    && left.windowEndsAt === right.windowEndsAt;
 }
 
 function isWindowShape(window) {
@@ -64,13 +84,17 @@ function isChangeShape(frame) {
   if (!isPlainObject(frame) || !CHANGE_VIAS.includes(frame.via)) {
     return false;
   }
-  if (!isTerm(frame.term) || !isVersion(frame.version) || !isPeer(frame.manager) || !isRef(frame.prevManager)) {
-    return false;
-  }
-  if (typeof frame.digest !== 'string' || frame.digest === '') {
-    return false;
-  }
-  return isPlainObject(frame.endpoint) && Number.isFinite(timeOf(frame.effectiveAt));
+  return isChangeSeatShape(frame) && isChangeEvidenceShape(frame);
+}
+
+function isChangeSeatShape(frame) {
+  return isTerm(frame.term) && isVersion(frame.version) && isPeer(frame.manager)
+    && isRef(frame.prevManager) && isRef(frame.from);
+}
+
+function isChangeEvidenceShape(frame) {
+  return typeof frame.digest === 'string' && frame.digest !== ''
+    && isPlainObject(frame.endpoint) && Number.isFinite(timeOf(frame.effectiveAt));
 }
 
 function sourceOf(frame, ctx) {
@@ -80,8 +104,8 @@ function sourceOf(frame, ctx) {
   return isRef(ctx.from) ? ctx.from : null;
 }
 
-function accepted(nextState, reason, actions) {
-  return { accepted: true, nextState, actions, reason };
+function accepted(nextState, reason, actions, extra = {}) {
+  return { accepted: true, nextState, actions, reason, ...extra };
 }
 
 function rejected(state, reason, extra = {}) {
@@ -93,9 +117,10 @@ function idempotent(state, reason, actions) {
   return { accepted: false, nextState: state, actions, reason, idempotent: true };
 }
 
-/* 冻结只作为判决结果返回：状态形态不含冻结字段，由接线层把 freezeReason 落到协作共享态。 */
+/* 冻结只作为判决结果返回：状态形态不含冻结字段，由接线层把 freezeReason 落到协作共享态。
+ * 冻结结论同时是「拒收」，故 actions 带上计数（A5 要求「拒收并计数」）。 */
 function frozen(state, reason) {
-  return { accepted: false, nextState: state, actions: ['freeze', 'report'], reason, freezeReason: MANAGER_FORK };
+  return { accepted: false, nextState: state, actions: ['count-reject', 'freeze', 'report'], reason, freezeReason: MANAGER_FORK };
 }
 
 /* manager-pending 在目标签发 auto 帧到达时解除；manager-fork 只能靠更高 term 对表或用户裁定。 */
@@ -171,6 +196,18 @@ function snapshotLedgerHeadMatches(ledger, frame) {
   return ledger.managerTerm === frame.managerTerm && ledger.version === frame.version;
 }
 
+/* 快照完整性（设计 §2A.1/A1）：digest 由接收方重算，纯判定层只接受显式验证结果；
+ * 未提供验证器/未标记已验证的台账不得采纳（fail-closed）。 */
+function snapshotDigestVerified(frame, ctx) {
+  if (ctx.digestVerified === true) {
+    return true;
+  }
+  if (typeof ctx.ledgerDigestOf !== 'function') {
+    return false;
+  }
+  return ctx.ledgerDigestOf(frame.ledger) === frame.digest;
+}
+
 export function acceptManagerChange(state, frame, ctx = {}) {
   if (isPlainObject(frame) && (frame.kind === 'data' || isPlainObject(frame.ledger))) {
     return acceptSnapshot(state, frame, ctx);
@@ -181,6 +218,9 @@ export function acceptManagerChange(state, frame, ctx = {}) {
 function acceptChange(state, frame, ctx) {
   if (!isStateShape(state) || !isChangeShape(frame)) {
     return rejected(state, 'frame-invalid');
+  }
+  if (state.manager === null) {
+    return rejected(state, 'no-local-manager');
   }
   const relation = changeTermRelation(state, frame, ctx);
   if (relation !== null) {
@@ -207,15 +247,9 @@ function changeTermRelation(state, frame, ctx) {
 }
 
 function changePrecheck(state, frame, ctx) {
-  if (state.manager === null) {
-    return rejected(state, 'no-local-manager');
-  }
   const frozenBlock = changeFrozenBlock(state, frame, ctx);
   if (frozenBlock !== null) {
     return frozenBlock;
-  }
-  if (sourceOf(frame, ctx) === null) {
-    return rejected(state, 'source-missing');
   }
   if (frame.version <= state.version) {
     return rejected(state, 'version-not-newer');
@@ -230,15 +264,32 @@ function changePrecheck(state, frame, ctx) {
 }
 
 /* 分叉冻结不接受单一 term+1 变更（双方轮流向 +1 竞争），只等更高 term 对表或用户裁定；
- * manager-pending 只等目标签发的那一帧 auto，其它来源的同 term 竞争一律拒收（设计 §2A.3）。 */
+ * manager-pending 只接受本核在等的那一份 auto offer/目标，不得换目标（设计 §2A.5⑤）。 */
 function changeFrozenBlock(state, frame, ctx) {
   if (ctx.localFrozen === 'manager-fork') {
     return rejected(state, 'frozen-manager-fork');
   }
-  if (ctx.localFrozen === 'manager-pending' && frame.via !== 'auto') {
-    return rejected(state, 'frozen-manager-pending');
+  if (ctx.localFrozen === 'manager-pending') {
+    if (frame.via !== 'auto') {
+      return rejected(state, 'frozen-manager-pending');
+    }
+    if (!matchesPendingOffer(frame, ctx)) {
+      return rejected(state, 'pending-offer-mismatch');
+    }
   }
   return null;
+}
+
+function matchesPendingOffer(frame, ctx) {
+  const hasOfferId = typeof ctx.pendingOfferId === 'string' && ctx.pendingOfferId !== '';
+  const hasTarget = isRef(ctx.pendingTarget);
+  if (!hasOfferId && !hasTarget) {
+    return false;
+  }
+  if (hasOfferId && frame.offerId !== ctx.pendingOfferId) {
+    return false;
+  }
+  return !hasTarget || sameSeat(frame.manager, ctx.pendingTarget);
 }
 
 /* 同 term 同 manager 是幂等回执；帧 version 更高说明本地名单落后，顺带向来源补拉快照。 */
@@ -252,6 +303,9 @@ function acceptSameTerm(state, frame) {
 
 function acceptTermGap(state, frame, ctx) {
   if (ctx.syncExpired === true) {
+    if (ctx.localFrozen === 'manager-pending') {
+      return rejected(state, 'manager-pending-timeout', { actions: ['report'] });
+    }
     return frozen(state, 'term-gap-sync-timeout');
   }
   return rejected(state, 'term-gap', { actions: ['handshake', 'request-snapshot'], needsSync: true });
@@ -294,19 +348,43 @@ function acceptAuto(state, frame, ctx) {
   if (typeof frame.offerId !== 'string' || frame.offerId === '') {
     return rejected(state, 'offer-missing');
   }
-  if (!Number.isFinite(timeOf(frame.windowEndsAt))) {
-    return rejected(state, 'window-missing');
+  const windowProblem = autoWindowProblem(frame, ctx);
+  if (windowProblem !== null) {
+    return rejected(state, windowProblem);
   }
   if (!hasMatchingAutoOffer(ctx, frame)) {
     return rejected(state, 'auto-offer-missing');
   }
   const window = { windowBaseTerm: frame.term, windowEndsAt: frame.windowEndsAt };
+  const remaining = managerWindowRemaining(window, nowOf(ctx), {
+    windowMs: windowMsOf(ctx),
+    skewMs: skewMsOf(ctx),
+    baseAt: timeOf(frame.effectiveAt),
+  });
   const actions = ['adopt', 'open-window', 'request-snapshot', ...freezeNote(ctx)];
-  return accepted(stateFromChange(frame, window), 'auto-accepted', actions);
+  return accepted(stateFromChange(frame, window), 'auto-accepted', actions, { windowRemaining: remaining });
+}
+
+/* 签发者给出的窗口不得超过配置时长 + 允许偏斜；远期 windowEndsAt 一律按坏帧拒收，
+ * 否则「1 分钟纠错窗」会被签发者任意延长（设计 §2A.6）。 */
+function autoWindowProblem(frame, ctx) {
+  const effectiveAt = timeOf(frame.effectiveAt);
+  const endsAt = timeOf(frame.windowEndsAt);
+  if (!Number.isFinite(endsAt)) {
+    return 'window-missing';
+  }
+  if (endsAt < effectiveAt) {
+    return 'window-invalid';
+  }
+  return endsAt - effectiveAt > windowMsOf(ctx) + skewMsOf(ctx) ? 'window-invalid' : null;
 }
 
 function acceptTakeover(state, frame, ctx) {
-  if (!isMemberSource(ctx, sourceOf(frame, ctx))) {
+  const source = sourceOf(frame, ctx);
+  if (!sameSeat(source, frame.manager)) {
+    return frozen(state, 'takeover-source-not-manager');
+  }
+  if (!isMemberSource(ctx, source)) {
     return frozen(state, 'source-not-member');
   }
   if (frame.windowBaseTerm !== state.managerTerm) {
@@ -318,18 +396,22 @@ function acceptTakeover(state, frame, ctx) {
   if (!Number.isFinite(timeOf(frame.authorizedAt))) {
     return rejected(state, 'authorized-at-missing');
   }
-  if (!windowAcceptsTakeover(state.managerWindow, frame.authorizedAt, ctx.now)) {
+  if (!windowAcceptsTakeover(state.managerWindow, frame.authorizedAt, ctx)) {
     return rejected(state, 'window-closed');
   }
   return accepted(stateFromChange(frame), 'takeover-accepted', adoptActions(state, freezeNote(ctx)));
 }
 
 function acceptTakeoverManual(state, frame, ctx) {
-  const blockReason = manualBlockReason(ctx);
+  const source = sourceOf(frame, ctx);
+  if (!sameSeat(source, frame.manager)) {
+    return frozen(state, 'takeover-manual-source-not-manager');
+  }
+  const blockReason = manualBlockReason(state, ctx);
   if (blockReason !== null) {
     return rejected(state, blockReason);
   }
-  if (!isMemberSource(ctx, sourceOf(frame, ctx))) {
+  if (!isMemberSource(ctx, source)) {
     return frozen(state, 'source-not-member');
   }
   if (!Number.isFinite(timeOf(frame.authorizedAt))) {
@@ -338,6 +420,9 @@ function acceptTakeoverManual(state, frame, ctx) {
   if (ctx.managerReachable === true) {
     return rejected(state, 'manager-reachable');
   }
+  if (!managerDownEvidence(ctx)) {
+    return rejected(state, 'manager-reachability-unknown');
+  }
   return accepted(
     stateFromChange(frame),
     'takeover-manual-accepted',
@@ -345,10 +430,15 @@ function acceptTakeoverManual(state, frame, ctx) {
   );
 }
 
-/* 手动接管的前提是站长不可达，但「本地已冻结」不是受理前提（设计 §2A.7）：
- * 这里只拦未解决的 auto 在途，避免与另一个 term+1 竞争；分叉/等待态由公共门控处理。 */
-function manualBlockReason(ctx) {
-  if (ctx.autoInFlight === true || hasUnexpiredAutoOffer(ctx)) {
+/* 手动接管的前提是站长不可达（本地冻结、探测不可达或已判离席），「本地已冻结」不是受理前提。
+ * 可达性证据缺失时拒绝（fail-closed），由接线层补探测后再发起。 */
+function managerDownEvidence(ctx) {
+  return ctx.managerReachable === false || ctx.managerDeparted === true || ctx.localFrozen === 'manager-offline';
+}
+
+/* 只拦与当前任期相关、尚未过期的 auto 在途；上一任期残留的 offer 不阻塞手动接管。 */
+function manualBlockReason(state, ctx) {
+  if (ctx.autoInFlight === true || hasUnexpiredAutoOffer(state, ctx)) {
     return 'auto-in-flight';
   }
   return null;
@@ -364,17 +454,28 @@ function isMemberSource(ctx, source) {
   if (Array.isArray(ctx.memberSeats)) {
     return ctx.memberSeats.some((seat) => sameSeat(seat, source));
   }
-  return true;
+  return false;
 }
 
-function windowAcceptsTakeover(window, authorizedAt, now) {
+/* §2A.6：窗口以签发时长为本，偏移按事件时刻收敛；回拨/远期窗口都不得延长纠错窗。
+ * baseAt 由接线层取自签发帧 effectiveAt（或本地开窗时刻）；缺失时退回绝对 endsAt 并封顶。 */
+function windowAcceptsTakeover(window, authorizedAt, ctx) {
   const endsAt = timeOf(window.windowEndsAt);
-  const nowMs = Number.isFinite(now) ? now : Date.now();
-  if (nowMs < endsAt) {
+  const nowMs = nowOf(ctx);
+  const windowMs = windowMsOf(ctx);
+  const skewMs = skewMsOf(ctx);
+  const remaining = managerWindowRemaining(window, nowMs, {
+    windowMs,
+    skewMs,
+    baseAt: ctx.windowBaseAt,
+  });
+  if (remaining > 0 && endsAt - nowMs <= windowMs + skewMs) {
     return true;
   }
   const authorizedAtMs = timeOf(authorizedAt);
-  return Number.isFinite(authorizedAtMs) && authorizedAtMs <= endsAt;
+  return Number.isFinite(authorizedAtMs)
+    && authorizedAtMs <= endsAt
+    && endsAt - authorizedAtMs <= windowMs + skewMs;
 }
 
 function acceptSnapshot(state, frame, ctx) {
@@ -382,22 +483,41 @@ function acceptSnapshot(state, frame, ctx) {
   if (!isStateShape(state) || snapshot === null) {
     return rejected(state, 'frame-invalid');
   }
+  if (!snapshotDigestVerified(frame, ctx)) {
+    return rejected(state, 'digest-unverified');
+  }
+  if (state.manager === null) {
+    return rejected(state, 'no-local-manager');
+  }
   if (snapshot.managerTerm < state.managerTerm) {
     return rejected(state, 'term-behind');
   }
   if (snapshot.managerTerm === state.managerTerm) {
-    return acceptSameTermSnapshot(state, snapshot);
+    return acceptSameTermSnapshot(state, snapshot, frame, ctx);
   }
-  const frozenResult = snapshotFrozenResult(state, snapshot, ctx);
+  const frozenResult = snapshotFrozenResult(state, snapshot, frame, ctx);
   if (frozenResult !== null) {
     return frozenResult;
   }
   return acceptHigherSnapshot(state, snapshot, frame, ctx);
 }
 
-function acceptSameTermSnapshot(state, snapshot) {
+/* 同 term 快照只允许现任站长 / 已受理过的新站长签发；窗口以本地为准：
+ * 快照未带窗口时保留本地窗口，快照窗口与本地不同视为台账分叉，绝不静默改写（A11/A12）。 */
+function acceptSameTermSnapshot(state, snapshot, frame, ctx) {
+  const frozenBlock = sameTermSnapshotFrozen(state, ctx);
+  if (frozenBlock !== null) {
+    return frozenBlock;
+  }
   if (!sameSeat(snapshot.manager, state.manager)) {
     return frozen(state, 'snapshot-same-term-conflict');
+  }
+  if (!sameTermSnapshotSourceAllowed(state, snapshot, frame, ctx)) {
+    return rejected(state, 'snapshot-source-not-manager');
+  }
+  const windowResult = sameTermWindowOf(state, snapshot);
+  if (windowResult.conflict) {
+    return frozen(state, 'snapshot-window-conflict');
   }
   if (snapshot.version < state.version) {
     return rejected(state, 'version-behind');
@@ -405,13 +525,60 @@ function acceptSameTermSnapshot(state, snapshot) {
   if (snapshot.version === state.version) {
     return idempotent(state, 'snapshot-idempotent', ['ack-snapshot-stored']);
   }
-  return accepted(snapshotNextState(snapshot), 'snapshot-version-accepted', ['adopt']);
+  return accepted(sameTermSnapshotState(state, snapshot, windowResult.window), 'snapshot-version-accepted', ['adopt']);
 }
 
-function snapshotFrozenResult(state, snapshot, ctx) {
+function sameTermSnapshotFrozen(state, ctx) {
+  if (ctx.localFrozen === 'manager-fork') {
+    return rejected(state, 'frozen-manager-fork');
+  }
+  if (ctx.localFrozen === 'manager-pending') {
+    return rejected(state, 'frozen-manager-pending');
+  }
+  return null;
+}
+
+function sameTermSnapshotSourceAllowed(state, snapshot, frame, ctx) {
+  const source = sourceOf(frame, ctx);
+  if (sameSeat(source, state.manager)) {
+    return true;
+  }
+  if (isAcceptedManagerSeat(ctx.acceptedManager, snapshot)) {
+    return true;
+  }
+  if (ctx.localFrozen === 'manager-offline') {
+    return isMemberSource(ctx, source);
+  }
+  return false;
+}
+
+function sameTermWindowOf(state, snapshot) {
+  const local = state.managerWindow;
+  if (local === undefined) {
+    return { window: undefined, conflict: false };
+  }
+  if (snapshot.managerWindow === undefined) {
+    return { window: local, conflict: false };
+  }
+  if (sameWindow(local, snapshot.managerWindow)) {
+    return { window: local, conflict: false };
+  }
+  return { window: undefined, conflict: true };
+}
+
+function sameTermSnapshotState(state, snapshot, window) {
+  return {
+    managerTerm: state.managerTerm,
+    manager: { ...state.manager },
+    version: snapshot.version,
+    ...(window === undefined ? {} : { managerWindow: { ...window } }),
+  };
+}
+
+function snapshotFrozenResult(state, snapshot, frame, ctx) {
   switch (ctx.localFrozen) {
     case 'manager-offline': {
-      return acceptOfflineCatchup(state, snapshot, ctx);
+      return acceptOfflineCatchup(state, snapshot, frame, ctx);
     }
     case 'manager-fork': {
       return acceptForkedCatchup(state, snapshot, ctx);
@@ -425,7 +592,10 @@ function snapshotFrozenResult(state, snapshot, ctx) {
   }
 }
 
-function acceptOfflineCatchup(state, snapshot, ctx) {
+function acceptOfflineCatchup(state, snapshot, frame, ctx) {
+  if (!isMemberSource(ctx, sourceOf(frame, ctx))) {
+    return rejected(state, 'source-not-member');
+  }
   if (matchesHandshakeHighest(snapshot, ctx.handshakeHighest)) {
     return accepted(snapshotNextState(snapshot), 'snapshot-catchup-accepted', ['adopt', 'clear-freeze']);
   }
@@ -439,15 +609,21 @@ function matchesHandshakeHighest(snapshot, highest) {
     && sameSeat(highest.manager, snapshot.manager);
 }
 
+/* 分叉冻结只接受能收敛到快照本身的授权证据：证据的 term/manager 必须与快照一致，
+ * 不能拿一份陈旧或别处的授权去解锁另一份快照（设计 §2A.10 不变量 5）。 */
 function acceptForkedCatchup(state, snapshot, ctx) {
-  const evidence = ctx.authorizedEvidence;
-  const authorized = isPlainObject(evidence)
-    && (evidence.via === 'takeover' || evidence.via === 'takeover-manual')
-    && Number.isFinite(timeOf(evidence.authorizedAt));
-  if (authorized) {
+  if (authorizedEvidenceMatches(ctx.authorizedEvidence, snapshot)) {
     return accepted(snapshotNextState(snapshot), 'snapshot-authorized-accepted', ['adopt', 'clear-freeze']);
   }
   return rejected(state, 'frozen-manager-fork');
+}
+
+function authorizedEvidenceMatches(evidence, snapshot) {
+  return isPlainObject(evidence)
+    && (evidence.via === 'takeover' || evidence.via === 'takeover-manual')
+    && Number.isFinite(timeOf(evidence.authorizedAt))
+    && evidence.term === snapshot.managerTerm
+    && sameSeat(evidence.manager, snapshot.manager);
 }
 
 function acceptHigherSnapshot(state, snapshot, frame, ctx) {
@@ -458,7 +634,7 @@ function acceptHigherSnapshot(state, snapshot, frame, ctx) {
   if (isAcceptedManagerSeat(ctx.acceptedManager, snapshot)) {
     return accepted(snapshotNextState(snapshot), 'snapshot-accepted-manager-accepted', ['adopt']);
   }
-  if (ctx.suspended === 'handover-pending' && sameSeat(source, snapshot.manager)) {
+  if (handoverPendingMatches(ctx, source, snapshot)) {
     return accepted(snapshotNextState(snapshot), 'snapshot-handover-accepted', ['adopt']);
   }
   if (hasAutoCatchupEvidence(state, snapshot, source, ctx)) {
@@ -473,9 +649,29 @@ function isAcceptedManagerSeat(value, snapshot) {
     && sameSeat(value.manager, snapshot.manager);
 }
 
-/* 离线错过 auto-offer 的追赶路径（设计 §2A.2 A10）：来源必须是快照内新站长，
- * 且 auto-offer、via=auto 的 manager-changed、旧站长 leave 三证据互相印证，缺一拒收。 */
+/* 显式移交等待中只向在途 offer 的目标取台账；来源/快照 manager 都必须等于该目标。 */
+function handoverPendingMatches(ctx, source, snapshot) {
+  const target = handoverPendingTarget(ctx);
+  return target !== null && sameSeat(source, target) && sameSeat(snapshot.manager, target);
+}
+
+function handoverPendingTarget(ctx) {
+  if (ctx.suspended === 'handover-pending') {
+    return isRef(ctx.handoverTarget) ? ctx.handoverTarget : null;
+  }
+  if (isPlainObject(ctx.suspended) && ctx.suspended.state === 'handover-pending') {
+    return isRef(ctx.suspended.target) ? ctx.suspended.target : null;
+  }
+  return null;
+}
+
+/* 离线错过 auto-offer 的追赶路径（设计 §2A.2 A10）：三证据必须与本地任期连续——
+ * offer.baseTerm=本地 term、快照/change term=本地+1，且 offer/change/leave 席位互相印证。
+ * 任一条不满足都不得直接采纳，term 跳变交由 handshake 对表。 */
 function hasAutoCatchupEvidence(state, snapshot, source, ctx) {
+  if (snapshot.managerTerm !== state.managerTerm + 1) {
+    return false;
+  }
   if (!sameSeat(source, snapshot.manager)) {
     return false;
   }
@@ -483,13 +679,14 @@ function hasAutoCatchupEvidence(state, snapshot, source, ctx) {
   if (!isPlainObject(offer) || !isPlainObject(change) || !isPlainObject(leave)) {
     return false;
   }
-  return autoChangeMatchesOffer(offer, change, state, snapshot)
+  return autoChangeMatchesOffer(state, snapshot, offer, change)
     && sameSeat(leave, state.manager)
-    && AUTO_CATCHUP_LEAVE_REASONS.includes(leave.reason);
+    && leave.reason === AUTO_CATCHUP_LEAVE_REASON;
 }
 
-function autoChangeMatchesOffer(offer, change, state, snapshot) {
-  return change.via === 'auto'
+function autoChangeMatchesOffer(state, snapshot, offer, change) {
+  return offer.baseTerm === state.managerTerm
+    && change.via === 'auto'
     && change.offerId === offer.offerId
     && change.term === snapshot.managerTerm
     && sameSeat(change.prevManager, state.manager)
@@ -527,9 +724,11 @@ function hasMatchingAutoOffer(ctx, frame) {
   return autoOffersOf(ctx).some((offer) => matchesAutoOffer(offer, frame, ctx.now));
 }
 
-function hasUnexpiredAutoOffer(ctx) {
-  const nowMs = Number.isFinite(ctx.now) ? ctx.now : Date.now();
-  return autoOffersOf(ctx).some((offer) => timeOf(offer?.expiresAt) > nowMs);
+function hasUnexpiredAutoOffer(state, ctx) {
+  const nowMs = nowOf(ctx);
+  return autoOffersOf(ctx).some((offer) => timeOf(offer?.expiresAt) > nowMs
+    && offer.baseTerm === state.managerTerm
+    && sameSeat(offer.prevManager, state.manager));
 }
 
 export function makeAutoOffer(input) {
@@ -573,8 +772,7 @@ function isOfferExpired(offer, now) {
   if (!Number.isFinite(endsAt)) {
     return true;
   }
-  const nowMs = Number.isFinite(now) ? now : Date.now();
-  return nowMs >= endsAt;
+  return nowOf({ now }) >= endsAt;
 }
 
 export function setManagerWindow(state, window) {
@@ -587,10 +785,20 @@ export function clearManagerWindow(state) {
   return next;
 }
 
-export function managerWindowRemaining(window, now) {
-  const endsAt = isWindowShape(window) ? timeOf(window.windowEndsAt) : Number.NaN;
-  if (!Number.isFinite(endsAt) || !Number.isFinite(now)) {
+/* 剩余时长：给了 baseAt 就按 §2A.6 的 elapsed clamp 公式；否则退回绝对 endsAt。
+ * 两条路径都封顶 windowMs + skew，墙钟回拨不能把剩余窗口拉长到超过一个纠错窗。 */
+export function managerWindowRemaining(window, now, options = {}) {
+  if (!isWindowShape(window) || !Number.isFinite(now)) {
     return 0;
   }
-  return Math.max(0, endsAt - now);
+  const windowMs = windowMsOf(options);
+  const skewMs = skewMsOf(options);
+  const endsAt = timeOf(window.windowEndsAt);
+  const byEnd = Math.max(0, endsAt - now);
+  const baseAt = Number.isFinite(options.baseAt) ? options.baseAt : Number.NaN;
+  if (Number.isFinite(baseAt)) {
+    const elapsed = Math.min(Math.max(now - baseAt, 0), windowMs + skewMs);
+    return Math.min(Math.max(0, windowMs - elapsed), byEnd);
+  }
+  return Math.min(byEnd, windowMs + skewMs);
 }

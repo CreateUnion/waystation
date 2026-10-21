@@ -29,6 +29,10 @@ function listOf(table) {
   return [...table.values()].map((entry) => `${entry.instanceId}/${entry.sessionId}`);
 }
 
+function listNotice(instanceId, sessions, sentAt = NOW) {
+  return { collabId: COLLAB, instanceId, sessions, sentAt: iso(sentAt) };
+}
+
 test('createPresenceTable：空表', () => {
   const table = createPresenceTable();
   assert.ok(table instanceof Map);
@@ -37,76 +41,118 @@ test('createPresenceTable：空表', () => {
 
 test('applySeatPresence：只刷新列表内席位，同机未列席位标 unlisted', () => {
   const table = createPresenceTable();
-  applySeatPresence(
-    table,
-    { collabId: COLLAB, instanceId: 'inst-a', sessions: ['session-a', 'session-a2'], sentAt: iso(NOW) },
-    NOW,
-  );
-  applySeatPresence(
-    table,
-    { collabId: COLLAB, instanceId: 'inst-b', sessions: ['session-b'], sentAt: iso(NOW) },
-    NOW,
-  );
+  applySeatPresence(table, listNotice('inst-a', ['session-a', 'session-a2']), NOW);
+  applySeatPresence(table, listNotice('inst-b', ['session-b']), NOW);
   assert.deepEqual(listOf(table).sort(), ['inst-a/session-a', 'inst-a/session-a2', 'inst-b/session-b']);
   const later = NOW + 30000;
-  const result = applySeatPresence(
-    table,
-    { collabId: COLLAB, instanceId: 'inst-a', sessions: ['session-a'], sentAt: iso(later) },
-    later,
-  );
+  const result = applySeatPresence(table, listNotice('inst-a', ['session-a'], later), later);
   assert.deepEqual(result.refreshed, [{ instanceId: 'inst-a', sessionId: 'session-a' }]);
   assert.deepEqual(result.unlisted, [{ instanceId: 'inst-a', sessionId: 'session-a2' }]);
   assert.equal(presenceOf(table, 'inst-a', 'session-a').lastSeenAt, later);
-  assert.equal(presenceOf(table, 'inst-a', 'session-a').lastPresenceListAt, later);
   assert.equal(presenceOf(table, 'inst-a', 'session-a2').lastSeenAt, NOW);
   assert.equal(presenceOf(table, 'inst-a', 'session-a2').unlisted, true);
   assert.equal(presenceOf(table, 'inst-b', 'session-b').lastSeenAt, NOW);
-  assert.equal(presenceOf(table, 'inst-b', 'session-b').unlisted, false);
 });
 
 test('applySeatPresence：重新列出的 unlisted 席位恢复可达', () => {
   const table = createPresenceTable();
-  applySeatPresence(table, { collabId: COLLAB, instanceId: 'inst-a', sessions: ['session-a', 'session-a2'], sentAt: iso(NOW) }, NOW);
-  applySeatPresence(table, { collabId: COLLAB, instanceId: 'inst-a', sessions: ['session-a'], sentAt: iso(NOW) }, NOW + 1000);
+  applySeatPresence(table, listNotice('inst-a', ['session-a', 'session-a2']), NOW);
+  applySeatPresence(table, listNotice('inst-a', ['session-a']), NOW + 1000);
   assert.equal(presenceOf(table, 'inst-a', 'session-a2').unlisted, true);
-  applySeatPresence(table, { collabId: COLLAB, instanceId: 'inst-a', sessions: ['session-a2'], sentAt: iso(NOW) }, NOW + 2000);
+  applySeatPresence(table, listNotice('inst-a', ['session-a2']), NOW + 2000);
   assert.equal(presenceOf(table, 'inst-a', 'session-a2').unlisted, false);
   assert.equal(presenceOf(table, 'inst-a', 'session-a2').lastSeenAt, NOW + 2000);
 });
 
-test('applySeatPresence：其它协作与其它机器的席位不受影响', () => {
+test('applySeatPresence：其它协作与其它机器的席位不受影响；空列表/非法形态忽略', () => {
   const table = createPresenceTable();
-  applySeatPresence(table, { collabId: COLLAB, instanceId: 'inst-a', sessions: ['session-a'], sentAt: iso(NOW) }, NOW);
-  applySeatPresence(table, { collabId: 'collab-2', instanceId: 'inst-a', sessions: ['session-a'], sentAt: iso(NOW) }, NOW);
-  const result = applySeatPresence(table, { collabId: COLLAB, instanceId: 'inst-a', sessions: ['session-other'], sentAt: iso(NOW) }, NOW + 1000);
+  applySeatPresence(table, listNotice('inst-a', ['session-a']), NOW);
+  applySeatPresence(table, { ...listNotice('inst-a', ['session-a']), collabId: 'collab-2' }, NOW);
+  const result = applySeatPresence(table, listNotice('inst-a', ['session-other']), NOW + 1000);
   assert.deepEqual(result.unlisted, [{ instanceId: 'inst-a', sessionId: 'session-a' }]);
   const other = [...table.values()].filter((entry) => entry.collabId === 'collab-2');
   assert.equal(other.length, 1);
   assert.equal(other[0].unlisted, false);
-  assert.equal(other[0].lastSeenAt, NOW);
+  assert.equal(applySeatPresence(table, listNotice('inst-b', []), NOW).refreshed.length, 0);
+  assert.equal(applySeatPresence(table, null, NOW).refreshed.length, 0);
 });
 
-test('applyDirectFrame：直连来源刷新，转达帧（originMsgId）不刷新', () => {
+test('applySeatPresence：forum 只放行当前中继转发的列表，managed 与旧中继一律拒收', () => {
+  const table = createPresenceTable();
+  const relayed = { ...listNotice('inst-a', ['session-a']), originMsgId: 'origin-1' };
+  const rejected = applySeatPresence(table, relayed, NOW, { mode: 'managed', relayInstanceId: 'inst-r' });
+  assert.equal(rejected.refreshed.length, 0);
+  assert.equal(rejected.reason, 'relay-rejected');
+  const oldRelay = applySeatPresence(table, relayed, NOW, {
+    mode: 'forum',
+    relayInstanceId: 'inst-old',
+    currentRelayInstanceId: 'inst-r',
+  });
+  assert.equal(oldRelay.reason, 'relay-rejected');
+  assert.equal(table.size, 0);
+  const currentRelay = applySeatPresence(table, relayed, NOW, {
+    mode: 'forum',
+    relayInstanceId: 'inst-r',
+    currentRelayInstanceId: 'inst-r',
+  });
+  assert.deepEqual(currentRelay.refreshed, [{ instanceId: 'inst-a', sessionId: 'session-a' }]);
+  assert.equal(presenceOf(table, 'inst-a', 'session-a').lastSeenAt, NOW);
+});
+
+test('applyDirectFrame：直连来源刷新，payload / 顶层 originMsgId 的转达帧不刷新', () => {
   const table = createPresenceTable();
   const direct = { collabId: COLLAB, from: { instanceId: 'inst-a', sessionId: 'session-a' }, at: NOW };
-  const first = applyDirectFrame(table, direct, NOW);
-  assert.equal(first.refreshed, true);
+  assert.equal(applyDirectFrame(table, direct, NOW).refreshed, true);
   assert.equal(presenceOf(table, 'inst-a', 'session-a').lastSeenAt, NOW);
   const later = NOW + 5000;
-  const relayed = {
+  const payloadRelay = {
     collabId: COLLAB,
     from: { instanceId: 'inst-a', sessionId: 'session-a' },
     at: later,
-    originMsgId: 'msg-origin-1',
+    payload: { originMsgId: 'msg-origin-1' },
   };
-  const second = applyDirectFrame(table, relayed, later);
-  assert.equal(second.refreshed, false);
-  assert.equal(second.reason, 'relayed');
+  assert.equal(applyDirectFrame(table, payloadRelay, later).reason, 'relayed');
+  const topRelay = { ...payloadRelay, payload: {}, originMsgId: 'msg-origin-2' };
+  assert.equal(applyDirectFrame(table, topRelay, later).reason, 'relayed');
   assert.equal(presenceOf(table, 'inst-a', 'session-a').lastSeenAt, NOW);
-  const fresh = { collabId: COLLAB, from: { instanceId: 'inst-b', sessionId: 'session-b' }, at: later };
-  const third = applyDirectFrame(table, fresh, later);
-  assert.equal(third.refreshed, true);
-  assert.equal(presenceOf(table, 'inst-b', 'session-b').lastSeenAt, later);
+  assert.equal(applyDirectFrame(table, {
+    collabId: COLLAB,
+    from: { instanceId: 'inst-b', sessionId: 'session-b' },
+  }, later).refreshed, true);
+});
+
+test('applyDirectFrame：lastSeenAt 只用本地接收时刻，远端未来时间不延长超时', () => {
+  const table = createPresenceTable();
+  const frame = {
+    collabId: COLLAB,
+    from: { instanceId: 'inst-a', sessionId: 'session-a' },
+    at: NOW + 1e12,
+  };
+  applyDirectFrame(table, frame, NOW);
+  const entry = presenceOf(table, 'inst-a', 'session-a');
+  assert.equal(entry.lastSeenAt, NOW);
+  assert.equal(entry.reportedAt, NOW + 1e12);
+  assert.equal(isReachable(table, { collabId: COLLAB, instanceId: 'inst-a', sessionId: 'session-a' }, {
+    now: NOW + TIMEOUT,
+    timeoutMs: TIMEOUT,
+    hasEndpoint: true,
+  }), false);
+});
+
+test('applyDirectFrame：不清除 unlisted，列表重新包含才恢复', () => {
+  const table = createPresenceTable();
+  applySeatPresence(table, listNotice('inst-a', ['session-a', 'session-a2']), NOW);
+  applySeatPresence(table, listNotice('inst-a', ['session-a']), NOW + 1000);
+  assert.equal(presenceOf(table, 'inst-a', 'session-a2').unlisted, true);
+  applyDirectFrame(table, { collabId: COLLAB, from: { instanceId: 'inst-a', sessionId: 'session-a2' } }, NOW + 2000);
+  assert.equal(presenceOf(table, 'inst-a', 'session-a2').unlisted, true);
+  assert.equal(isReachable(table, { collabId: COLLAB, instanceId: 'inst-a', sessionId: 'session-a2' }, {
+    now: NOW + 2000,
+    timeoutMs: TIMEOUT,
+    hasEndpoint: true,
+  }), false);
+  applySeatPresence(table, listNotice('inst-a', ['session-a', 'session-a2']), NOW + 3000);
+  assert.equal(presenceOf(table, 'inst-a', 'session-a2').unlisted, false);
 });
 
 test('applyDirectFrame：非法来源不写入、不抛异常', () => {
@@ -117,42 +163,43 @@ test('applyDirectFrame：非法来源不写入、不抛异常', () => {
   assert.equal(table.size, 0);
 });
 
-test('expireSeats：按 lastSeenAt 超时删除并返回被删席位', () => {
+test('expireSeats：超时项保留为 tombstone 且只返回一次，刷新后恢复', () => {
   const table = createPresenceTable();
-  applySeatPresence(table, { collabId: COLLAB, instanceId: 'inst-a', sessions: ['session-a'], sentAt: iso(NOW) }, NOW);
-  applySeatPresence(table, { collabId: COLLAB, instanceId: 'inst-b', sessions: ['session-b'], sentAt: iso(NOW) }, NOW + 1000);
-  const early = expireSeats(table, NOW + TIMEOUT - 1, TIMEOUT);
-  assert.deepEqual(early, []);
-  assert.equal(table.size, 2);
+  applySeatPresence(table, listNotice('inst-a', ['session-a']), NOW);
+  applySeatPresence(table, listNotice('inst-b', ['session-b']), NOW + 1000);
+  assert.deepEqual(expireSeats(table, NOW + TIMEOUT - 1, TIMEOUT), []);
   const expired = expireSeats(table, NOW + TIMEOUT, TIMEOUT);
   assert.deepEqual(expired.map((entry) => entry.sessionId), ['session-a']);
-  assert.equal(table.size, 1);
-  assert.equal(presenceOf(table, 'inst-b', 'session-b') !== undefined, true);
+  assert.equal(presenceOf(table, 'inst-a', 'session-a').expired, true);
+  assert.deepEqual(expireSeats(table, NOW + TIMEOUT + 1, TIMEOUT), []);
+  assert.equal(isReachable(table, { collabId: COLLAB, instanceId: 'inst-a', sessionId: 'session-a' }, {
+    now: NOW + TIMEOUT + 1,
+    timeoutMs: TIMEOUT,
+    hasEndpoint: true,
+  }), false);
+  applySeatPresence(table, listNotice('inst-a', ['session-a']), NOW + TIMEOUT + 2);
+  assert.equal(presenceOf(table, 'inst-a', 'session-a').expired, false);
 });
 
-test('isReachable：无记录按端点可达，有记录看 unlisted 与超时', () => {
+test('isReachable：端点/超时证据缺失按不可达，unlisted/expired/超时为不可达', () => {
   const table = createPresenceTable();
   const absent = { collabId: COLLAB, instanceId: 'inst-a', sessionId: 'session-a' };
-  assert.equal(isReachable(table, absent, { now: NOW, timeoutMs: TIMEOUT }), true);
+  assert.equal(isReachable(table, absent, { now: NOW, timeoutMs: TIMEOUT, hasEndpoint: true }), true);
   assert.equal(isReachable(table, absent, { now: NOW, timeoutMs: TIMEOUT, hasEndpoint: false }), false);
-  assert.equal(isReachable(table, absent, { now: NOW, timeoutMs: TIMEOUT, departed: true }), false);
-  applySeatPresence(table, { collabId: COLLAB, instanceId: 'inst-a', sessions: ['session-a'], sentAt: iso(NOW) }, NOW);
-  const present = { ...absent };
-  assert.equal(isReachable(table, present, { now: NOW + 1000, timeoutMs: TIMEOUT }), true);
-  assert.equal(isReachable(table, present, { now: NOW + TIMEOUT, timeoutMs: TIMEOUT }), false);
-  assert.equal(isReachable(table, present, { now: NOW + 1000, timeoutMs: TIMEOUT, departed: true }), false);
-  applySeatPresence(table, { collabId: COLLAB, instanceId: 'inst-a', sessions: ['session-other'], sentAt: iso(NOW) }, NOW + 2000);
-  assert.equal(isReachable(table, present, { now: NOW + 2000, timeoutMs: TIMEOUT }), false);
+  assert.equal(isReachable(table, absent, { now: NOW, timeoutMs: TIMEOUT }), false);
+  assert.equal(isReachable(table, absent, { now: NOW, hasEndpoint: true }), false);
+  assert.equal(isReachable(table, absent, { now: NOW, timeoutMs: TIMEOUT, hasEndpoint: true, departed: true }), false);
+  applySeatPresence(table, listNotice('inst-a', ['session-a']), NOW);
+  assert.equal(isReachable(table, absent, { now: NOW + 1000, timeoutMs: TIMEOUT, hasEndpoint: true }), true);
+  assert.equal(isReachable(table, absent, { now: NOW + TIMEOUT, timeoutMs: TIMEOUT, hasEndpoint: true }), false);
+  applySeatPresence(table, listNotice('inst-a', ['session-other']), NOW + 2000);
+  assert.equal(isReachable(table, absent, { now: NOW + 2000, timeoutMs: TIMEOUT, hasEndpoint: true }), false);
 });
 
 test('autoSuccessorCandidates：按 joinSeq/sessionId 排序，排除旧站长、manager 角色与不可达', () => {
   const table = createPresenceTable();
-  applySeatPresence(
-    table,
-    { collabId: COLLAB, instanceId: 'inst-a', sessions: ['session-a', 'session-c', 'session-u'], sentAt: iso(NOW) },
-    NOW,
-  );
-  applySeatPresence(table, { collabId: COLLAB, instanceId: 'inst-a', sessions: ['session-a', 'session-c'], sentAt: iso(NOW) }, NOW + 1000);
+  applySeatPresence(table, listNotice('inst-a', ['session-a', 'session-c', 'session-u']), NOW);
+  applySeatPresence(table, listNotice('inst-a', ['session-a', 'session-c']), NOW + 1000);
   const seats = [
     seat('inst-a', 'session-a', 6),
     seat('inst-a', 'session-c', 5),
@@ -180,9 +227,9 @@ test('autoSuccessorCandidates：按 joinSeq/sessionId 排序，排除旧站长�
   ]);
 });
 
-test('autoSuccessorCandidates：departed 过滤与已判离席/超时候选', () => {
+test('autoSuccessorCandidates：departed、超时与缺失端点过滤；空名单/缺 collabId 返回空', () => {
   const table = createPresenceTable();
-  applySeatPresence(table, { collabId: COLLAB, instanceId: 'inst-a', sessions: ['session-stale'], sentAt: iso(NOW) }, NOW);
+  applySeatPresence(table, listNotice('inst-a', ['session-stale']), NOW);
   const seats = [
     seat('inst-a', 'session-stale', 1),
     seat('inst-a', 'session-departed', 2),
@@ -193,13 +240,17 @@ test('autoSuccessorCandidates：departed 过滤与已判离席/超时候选', ()
     prevManager: null,
     now: NOW + TIMEOUT + 1,
     timeoutMs: TIMEOUT,
+    hasEndpoint: true,
     departed: (value) => value.sessionId === 'session-departed',
   });
   assert.deepEqual(candidates.map((value) => value.sessionId), ['session-ok']);
-});
-
-test('autoSuccessorCandidates：空名单与缺失 collabId 返回空数组', () => {
-  const table = createPresenceTable();
+  const noEndpoint = autoSuccessorCandidates(table, seats, {
+    collabId: COLLAB,
+    now: NOW,
+    timeoutMs: TIMEOUT,
+    hasEndpoint: false,
+  });
+  assert.deepEqual(noEndpoint, []);
   assert.deepEqual(autoSuccessorCandidates(table, [], { collabId: COLLAB, now: NOW }), []);
   assert.deepEqual(autoSuccessorCandidates(table, null, { collabId: COLLAB, now: NOW }), []);
   assert.deepEqual(autoSuccessorCandidates(table, [seat('inst-a', 'session-a', 1)], { now: NOW }), []);

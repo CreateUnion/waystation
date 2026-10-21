@@ -3,8 +3,9 @@
  *
  * 刷新纪律：
  * - seat-presence 按列表级刷新：只刷新 sessions 数组内的席位，同机未列出的旧席位标 unlisted；
- * - 其它协作帧只有直连来源才刷新，转达副本（originMsgId）不刷新原发送者；
- * - 超时用本地单调时刻（调用方传入 now），不读墙钟。 */
+ * - 其它协作帧只有直连来源才刷新，转达副本（payload.originMsgId）不刷新原发送者；
+ * - 超时只用本地接收时刻（调用方传入 now）；帧自带时间只作偏斜参考，不进入 lastSeenAt；
+ * - 过期项保留为 tombstone（expired=true），避免「删掉即无记录即可达」的 fail-open。 */
 
 const KEY_SEPARATOR = '\u0000';
 
@@ -33,19 +34,32 @@ function optionValue(value, seat) {
   return typeof value === 'function' ? value(seat) : value;
 }
 
+/* 真实转达副本把 originMsgId 放在 payload 里；顶层同名字段保留给本地调用方直传。 */
+function originOf(frame) {
+  if (typeof frame?.originMsgId === 'string' && frame.originMsgId !== '') {
+    return frame.originMsgId;
+  }
+  if (isPlainObject(frame?.payload) && typeof frame.payload.originMsgId === 'string' && frame.payload.originMsgId !== '') {
+    return frame.payload.originMsgId;
+  }
+  return null;
+}
+
 export function createPresenceTable() {
   return new Map();
 }
 
 /* 列表级刷新：同一台机器的列表是「该机当前有哪些活跃会话」的权威面，
- * 因此列表内的席位刷新 lastSeenAt，列表外的同机旧席位只标记、不刷新。 */
-export function applySeatPresence(table, notice, now) {
+ * 因此列表内的席位刷新 lastSeenAt，列表外的同机旧席位只标记、不刷新。
+ * 转达的 seat-presence 默认拒收；forum 只放行「本机记录的当前中继」转发的那一份。 */
+export function applySeatPresence(table, notice, now, options = {}) {
   const at = Number.isFinite(now) ? now : Date.now();
-  if (!isPlainObject(notice) || typeof notice.collabId !== 'string' || typeof notice.instanceId !== 'string') {
+  if (!isPresenceNotice(notice)) {
     return { refreshed: [], unlisted: [] };
   }
-  if (!isSessionList(notice.sessions)) {
-    return { refreshed: [], unlisted: [] };
+  const relayRejection = relayRejectionOf(notice, options);
+  if (relayRejection !== null) {
+    return { refreshed: [], unlisted: [], reason: relayRejection };
   }
   const listed = new Set(notice.sessions);
   const refreshed = [];
@@ -53,25 +67,52 @@ export function applySeatPresence(table, notice, now) {
     const key = keyOf(notice.collabId, notice.instanceId, sessionId);
     const entry = table.get(key);
     if (entry === undefined) {
-      table.set(key, {
-        collabId: notice.collabId,
-        instanceId: notice.instanceId,
-        sessionId,
-        lastSeenAt: at,
-        lastPresenceListAt: at,
-        sourceInstanceId: notice.instanceId,
-        unlisted: false,
-      });
+      table.set(key, freshEntry(notice, sessionId, at));
     } else {
-      entry.lastSeenAt = at;
-      entry.lastPresenceListAt = at;
-      entry.sourceInstanceId = notice.instanceId;
-      entry.unlisted = false;
+      refreshEntry(entry, at);
     }
     refreshed.push({ instanceId: notice.instanceId, sessionId });
   }
   const unlisted = markUnlisted(table, notice.collabId, notice.instanceId, listed, at);
   return { refreshed, unlisted };
+}
+
+function isPresenceNotice(notice) {
+  return isPlainObject(notice)
+    && typeof notice.collabId === 'string'
+    && typeof notice.instanceId === 'string'
+    && isSessionList(notice.sessions);
+}
+
+function relayRejectionOf(notice, options) {
+  if (originOf(notice) === null) {
+    return null;
+  }
+  const viaCurrentRelay = options.mode === 'forum'
+    && typeof options.relayInstanceId === 'string'
+    && options.relayInstanceId === options.currentRelayInstanceId;
+  return viaCurrentRelay ? null : 'relay-rejected';
+}
+
+function freshEntry(notice, sessionId, at) {
+  return {
+    collabId: notice.collabId,
+    instanceId: notice.instanceId,
+    sessionId,
+    lastSeenAt: at,
+    lastPresenceListAt: at,
+    sourceInstanceId: notice.instanceId,
+    unlisted: false,
+    expired: false,
+  };
+}
+
+function refreshEntry(entry, at) {
+  entry.lastSeenAt = at;
+  entry.lastPresenceListAt = at;
+  entry.unlisted = false;
+  entry.expired = false;
+  delete entry.expiredAt;
 }
 
 function markUnlisted(table, collabId, instanceId, listed, at) {
@@ -88,16 +129,18 @@ function markUnlisted(table, collabId, instanceId, listed, at) {
 }
 
 /* 直连帧才算证据：转达副本的 from 是原发者、连接来源是转达者，
- * 用转达副本刷新会让「原发机器已离线」被无限期掩盖。 */
+ * 用转达副本刷新会让「原发机器已离线」被无限期掩盖。
+ * lastSeenAt 一律用本地接收时刻；帧自带 at 只记录为 reportedAt 供偏斜诊断。 */
 export function applyDirectFrame(table, frame, now) {
   const at = Number.isFinite(now) ? now : Date.now();
-  if (isRelayedFrame(frame)) {
+  if (originOf(frame) !== null) {
     return { refreshed: false, reason: 'relayed' };
   }
-  const direct = directSourceOf(frame, at);
+  const direct = directSourceOf(frame);
   if (direct === null) {
     return { refreshed: false, reason: 'invalid' };
   }
+  const reportedAt = Number.isFinite(frame.at) ? frame.at : null;
   const key = keyOf(direct.collabId, direct.instanceId, direct.sessionId);
   const entry = table.get(key);
   if (entry === undefined) {
@@ -105,23 +148,23 @@ export function applyDirectFrame(table, frame, now) {
       collabId: direct.collabId,
       instanceId: direct.instanceId,
       sessionId: direct.sessionId,
-      lastSeenAt: direct.seenAt,
+      lastSeenAt: at,
       lastPresenceListAt: 0,
       sourceInstanceId: direct.instanceId,
       unlisted: false,
+      expired: false,
+      reportedAt,
     });
   } else {
-    entry.lastSeenAt = Math.max(entry.lastSeenAt, direct.seenAt);
-    entry.unlisted = false;
+    entry.lastSeenAt = Math.max(entry.lastSeenAt, at);
+    entry.expired = false;
+    delete entry.expiredAt;
+    entry.reportedAt = reportedAt;
   }
   return { refreshed: true };
 }
 
-function isRelayedFrame(frame) {
-  return isPlainObject(frame) && typeof frame.originMsgId === 'string' && frame.originMsgId !== '';
-}
-
-function directSourceOf(frame, at) {
+function directSourceOf(frame) {
   if (!isPlainObject(frame) || !isPlainObject(frame.from)) {
     return null;
   }
@@ -130,32 +173,30 @@ function directSourceOf(frame, at) {
   if (typeof collabId !== 'string' || typeof instanceId !== 'string' || typeof sessionId !== 'string') {
     return null;
   }
-  return {
-    collabId,
-    instanceId,
-    sessionId,
-    seenAt: Number.isFinite(frame.at) ? frame.at : at,
-  };
+  return { collabId, instanceId, sessionId };
 }
 
-/* 判离席由调用方决定；本函数只按单调时刻清理超时项并返回被移除的条目。 */
+/* 判离席由调用方决定；本函数把超时项标记为 tombstone 并返回被标记的条目。
+ * 保留条目是为了让「已过期」在表内可查，防止删掉后又被当成「从未收到列表 → 可达」。 */
 export function expireSeats(table, now, timeoutMs) {
   if (!Number.isFinite(now) || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     return [];
   }
   const expired = [];
-  for (const [key, entry] of [...table.entries()]) {
-    if (now - entry.lastSeenAt < timeoutMs) {
+  for (const entry of table.values()) {
+    if (entry.expired === true || now - entry.lastSeenAt < timeoutMs) {
       continue;
     }
-    table.delete(key);
+    entry.expired = true;
+    entry.expiredAt = now;
     expired.push({ ...entry });
   }
   return expired;
 }
 
 /* 可达性口径（设计 §2A.2「判定要件」）：有已知端点、不在已判离席集合，
- * 且在其机器最近一次 presence 列表内；列表从未收到时按「端点可达＋名单在册」处理。 */
+ * 且在其机器最近一次 presence 列表内；列表从未收到时按「端点可达＋名单在册」处理。
+ * 端点/超时证据缺失一律按不可达（fail-closed），避免漏传参数静默放行。 */
 export function isReachable(table, seat, options = {}) {
   const key = reachableKeyOf(seat);
   if (key === null) {
@@ -164,14 +205,17 @@ export function isReachable(table, seat, options = {}) {
   if (optionValue(options.departed, seat) === true) {
     return false;
   }
-  if (optionValue(options.hasEndpoint, seat) === false) {
+  if (optionValue(options.hasEndpoint, seat) !== true) {
+    return false;
+  }
+  if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
     return false;
   }
   const entry = table.get(key);
   if (entry === undefined) {
     return true;
   }
-  if (entry.unlisted === true) {
+  if (entry.expired === true || entry.unlisted === true) {
     return false;
   }
   return isFreshEntry(entry, options);
@@ -188,9 +232,6 @@ function reachableKeyOf(seat) {
 }
 
 function isFreshEntry(entry, options) {
-  if (!Number.isFinite(options.timeoutMs)) {
-    return true;
-  }
   const at = Number.isFinite(options.now) ? options.now : Date.now();
   return at - entry.lastSeenAt < options.timeoutMs;
 }
