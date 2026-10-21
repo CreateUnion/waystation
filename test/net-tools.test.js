@@ -11,7 +11,8 @@ import { listCollabsTool, createCollabTool, inviteTool, requestJoinTool, approve
 import { joinTool, approveJoinTool } from '../src/tools/join.js';
 import { decideTool, handoverTool, takeOverTool } from '../src/tools/governance.js';
 import { createNetStack } from '../src/net/stack.js';
-import { MAX_COLLAB_MEMBERS } from '../src/net/protocol.js';
+import { MAX_COLLAB_MEMBERS, PARTICIPANTS_CAPABILITY } from '../src/net/protocol.js';
+import { PARTICIPANTS_SOURCE_PROBE, createKnownHosts } from '../src/net/known-hosts.js';
 import { CONFIG_FILE_NAME, loadConfig } from '../src/config.js';
 import { createCollabService } from '../src/collab/service.js';
 import { createJoinsStore } from '../src/collab/joins.js';
@@ -492,6 +493,47 @@ function realCollabServiceOf(dir, log = quietLog()) {
   });
 }
 
+/* 能力闸门真服务夹具（设计 §7.2）：known-hosts 证据与能力探测桩都注入服务层。工具层的
+ * context.net 另用独立计数桩，断言工具不再自行探测；hosts 先 remember，再以 seed 建协作。 */
+function capabilityServiceOf(t, { hosts = [], probe = null } = {}) {
+  const dir = makeTempDir(t);
+  const knownHosts = createKnownHosts({ dataDir: dir, log: quietLog() });
+  for (const host of hosts) {
+    knownHosts.remember(host);
+  }
+  const probeCalls = [];
+  const probeCapability = async (options) => {
+    probeCalls.push(options);
+    return probe === null ? { ok: true, capability: 'supported' } : probe(options);
+  };
+  const sent = [];
+  const service = createCollabService({
+    dataDir: dir,
+    config: { inviteTtlMs: 24 * 60 * 60 * 1000 },
+    self: { instanceId: 'inst-self', identityName: '本机', port: 17321 },
+    send: (message) => {
+      sent.push(message);
+      return { ok: true, msgId: `q-${sent.length}` };
+    },
+    knownHosts,
+    probeCapability,
+    log: quietLog(),
+    syncPeerPicker: () => [],
+  });
+  return { service, knownHosts, probeCalls, probeCapability, sent };
+}
+
+function hostEvidenceOf(port, instanceId, identityName, participants, source = 'scan') {
+  return {
+    address: '127.0.0.1',
+    port,
+    instanceId,
+    identityName,
+    participants,
+    ...(source === null ? {} : { source }),
+  };
+}
+
 async function listEntryFor(collab, collabId, sessionId) {
   const context = { ...collabContextOf(collab), sessionId };
   const payload = JSON.parse((await listCollabsTool().handler({}, context)).content[0].text);
@@ -844,79 +886,124 @@ test('ws_invite：论坛无邀请簿记 → 整批回退旧邀请面（不产生
   assert.deepEqual(collab.calls.invite, [{ collabId: 'collab-f', targets: [target], sessionId: 'session-a-0123456789' }], '论坛回退旧邀请面（不产生 inviteId；调用会话照常穿参）');
 });
 
-test('ws_invite：加入域路径的能力闸门——不支持/未知的目标逐目标拒绝，不产生邀请记录', async () => {
-  const createCalls = [];
-  const collab = fakeService();
-  const probed = [];
+/* 能力判定的三种证据去向（设计 §7.2 证据分级）：已知支持零探测、已知不支持零探测、
+ * 未知恰好一次。闸门在服务层——工具层的 context.net 桩只用于证明「工具没有自己再探测」。
+ * 判定细节归 test/tool-capability-precheck.test.js；此处覆盖工具面的逐目标封装与旧面回退。 */
+async function capabilityInviteFixtureOf(t, hosts, probe) {
+  const built = capabilityServiceOf(t, { hosts, probe });
+  const sessionId = 'session-a-0123456789';
+  const created = await built.service.create({
+    name: '联调项目',
+    topic: '发布联调',
+    targets: [{ instanceId: 'inst-seed', identityName: '种子机', address: '127.0.0.1', port: 17001 }],
+    mode: 'managed',
+    sessionId,
+  });
+  assert.equal(created.ok, true, created.message);
+  assert.equal(built.probeCalls.length, 0, '已知支持的目标建协作时不探测');
+  built.sent.length = 0;
+  const toolProbes = [];
   const net = {
     probeCapability: async (options) => {
-      probed.push(options);
-      if (options.instanceId === 'inst-old') {
-        return { ok: true, capability: 'unsupported' };
-      }
-      if (options.instanceId === 'inst-quiet') {
-        return { ok: true, capability: 'unknown' };
-      }
+      toolProbes.push(options);
       return { ok: true, capability: 'supported' };
     },
   };
-  const context = { ...collabContextOf(collab), net, join: inviteJoinFakeOf(createCalls), sessionId: 'session-a-0123456789' };
+  return { built, sessionId, collabId: created.collabId, net, toolProbes };
+}
+
+function capabilityContextOf(fixture, createCalls) {
+  return {
+    ...collabContextOf(fixture.built.service),
+    join: {
+      createInvite: (input) => {
+        createCalls.push(input);
+        return fixture.built.service.join.createInvite(input);
+      },
+    },
+    net: fixture.net,
+    sessionId: fixture.sessionId,
+  };
+}
+
+test('ws_invite：加入域路径逐目标判定——已知支持/不支持零探测、未知探测一次、拒绝目标不产生邀请记录', async (t) => {
+  const fixture = await capabilityInviteFixtureOf(t, [
+    hostEvidenceOf(17001, 'inst-seed', '种子机', PARTICIPANTS_CAPABILITY),
+    hostEvidenceOf(17002, 'inst-known-ok', '已知支持机', PARTICIPANTS_CAPABILITY),
+    hostEvidenceOf(17003, 'inst-known-no', '已知不支持机', 0, PARTICIPANTS_SOURCE_PROBE),
+    hostEvidenceOf(17004, 'inst-unknown', '未知机'),
+  ], () => ({ ok: true, capability: 'supported' }));
+  const createCalls = [];
   const result = await inviteTool().handler({
-    collabId: 'collab-1',
+    collabId: fixture.collabId,
     targets: [
-      { instanceId: 'inst-new', identityName: '主机新', address: '127.0.0.2', port: 17321 },
-      { instanceId: 'inst-old', identityName: '旧版机', address: '127.0.0.3', port: 17321 },
-      { instanceId: 'inst-quiet', identityName: '无应答机', address: '127.0.0.4', port: 17321 },
+      { instanceId: 'inst-known-ok', identityName: '已知支持机', address: '127.0.0.1', port: 17002 },
+      { instanceId: 'inst-known-no', identityName: '已知不支持机', address: '127.0.0.1', port: 17003 },
+      { instanceId: 'inst-unknown', identityName: '未知机', address: '127.0.0.1', port: 17004 },
     ],
-  }, context);
-  assert.equal(result.isError, undefined, '支持的目标照常签发（逐目标语义）');
-  assert.deepEqual(probed.map((entry) => [entry.address, entry.port, entry.instanceId]), [
-    ['127.0.0.2', 17321, 'inst-new'],
-    ['127.0.0.3', 17321, 'inst-old'],
-    ['127.0.0.4', 17321, 'inst-quiet'],
-  ], '逐目标单播探测（地址/端口/实例标识为归户证据）');
-  assert.deepEqual(createCalls.map((entry) => entry.targetInstanceId), ['inst-new'], '不支持/未知的目标不产生邀请记录（不留已签发的误导）');
+  }, capabilityContextOf(fixture, createCalls));
+  assert.equal(result.isError, undefined, '有目标签发成功即逐目标语义');
+  assert.deepEqual(fixture.toolProbes, [], '工具层不得自行探测（判定归服务层）');
+  assert.deepEqual(fixture.built.probeCalls, [
+    { address: '127.0.0.1', port: 17004, instanceId: 'inst-unknown' },
+  ], '只有未知目标单播探测一次（地址/端口/实例标识为归户证据）');
+  assert.deepEqual(createCalls.map((entry) => entry.targetInstanceId), ['inst-known-ok', 'inst-known-no', 'inst-unknown'], '逐目标交服务层判定（工具层不预先过滤）');
+  assert.deepEqual(fixture.built.sent.filter((message) => message.type === 'invite').map((message) => message.to.instanceId), ['inst-known-ok', 'inst-unknown'], '已知不支持在服务层短路，不发邀请帧');
   const invited = JSON.parse(result.content[0].text).invited;
   assert.equal(invited[0].ok, true);
+  assert.equal(typeof invited[0].inviteId, 'string');
+  assert.equal(invited[1].ok, false);
   assert.ok(invited[1].reason.includes('不支持'), invited[1].reason);
-  assert.ok(invited[2].reason.includes('无法确认'), invited[2].reason);
+  assert.equal(invited[1].inviteId, undefined, '拒绝的目标不留已签发的误导');
+  assert.equal(invited[2].ok, true);
 });
 
-test('ws_invite：探测面降级 / 异常 → 能力按未知拒绝（不静默放行）', async () => {
+test('ws_invite：探测无结论 → 服务层 fail-closed 拒绝、原文案明确，工具层不重试', async (t) => {
+  const fixture = await capabilityInviteFixtureOf(t, [
+    hostEvidenceOf(17001, 'inst-seed', '种子机', PARTICIPANTS_CAPABILITY),
+    hostEvidenceOf(17005, 'inst-quiet', '静默机'),
+  ], () => ({ ok: false, message: '能力探测失败：发现面未启动' }));
   const createCalls = [];
-  const collab = fakeService();
-  let mode = 'degraded';
-  const net = {
-    probeCapability: async () => {
-      if (mode === 'throw') {
-        throw new Error('发现面未启动');
-      }
-      return { ok: false, message: '端口段全满——本地功能可用' };
-    },
-  };
-  const context = { ...collabContextOf(collab), net, join: inviteJoinFakeOf(createCalls), sessionId: 'session-a-0123456789' };
-  const target = { instanceId: 'inst-b', identityName: '主机乙', address: '127.0.0.2', port: 17321 };
-  const degraded = await inviteTool().handler({ collabId: 'collab-1', targets: [target] }, context);
-  assert.equal(degraded.isError, true);
-  assert.ok(degraded.content[0].text.includes('无法确认'), degraded.content[0].text);
-  mode = 'throw';
-  const thrown = await inviteTool().handler({ collabId: 'collab-1', targets: [target] }, context);
-  assert.equal(thrown.isError, true);
-  assert.ok(thrown.content[0].text.includes('发现面未启动'), thrown.content[0].text);
-  assert.equal(createCalls.length, 0, '能力未确认时不签发邀请');
+  const result = await inviteTool().handler({
+    collabId: fixture.collabId,
+    targets: [{ instanceId: 'inst-quiet', identityName: '静默机', address: '127.0.0.1', port: 17005 }],
+  }, capabilityContextOf(fixture, createCalls));
+  assert.equal(result.isError, true, '能力未确认不得放行');
+  const text = String(result.content[0].text);
+  assert.match(text, /无法确认/);
+  assert.match(text, /inst-quiet/);
+  assert.deepEqual(fixture.toolProbes, [], '工具层不得自行探测');
+  assert.equal(fixture.built.probeCalls.length, 1, '探测无结论只探测一次，不重试刷屏');
+  assert.equal(createCalls.length, 1, '逐目标交服务层判定');
+  assert.deepEqual(fixture.built.sent.filter((message) => message.type === 'invite'), [], '能力未确认时服务层不签发邀请帧');
 });
 
-test('ws_invite：旧邀请面的能力闸门整批前置（不支持目标 → 不触旧服务）', async () => {
-  const collab = fakeService();
-  const net = { probeCapability: async () => ({ ok: true, capability: 'unsupported' }) };
-  const context = { ...collabContextOf(collab), net, sessionId: 'session-a-0123456789' };
+test('ws_invite：旧邀请面同样由服务层证据链判定——已知不支持前置拒绝并保留工具面错误口径', async (t) => {
+  const fixture = await capabilityInviteFixtureOf(t, [
+    hostEvidenceOf(17001, 'inst-seed', '种子机', PARTICIPANTS_CAPABILITY),
+    hostEvidenceOf(17003, 'inst-old', '旧版机', 0, PARTICIPANTS_SOURCE_PROBE),
+  ]);
+  const legacyCalls = [];
+  const legacyInvite = fixture.built.service.invite;
+  fixture.built.service.invite = (input) => {
+    legacyCalls.push(input);
+    return legacyInvite(input);
+  };
+  const context = {
+    ...collabContextOf(fixture.built.service),
+    net: fixture.net,
+    sessionId: fixture.sessionId,
+  };
   const result = await inviteTool().handler({
-    collabId: 'collab-1',
-    targets: [{ instanceId: 'inst-old', identityName: '旧版机', address: '127.0.0.2', port: 17321 }],
+    collabId: fixture.collabId,
+    targets: [{ instanceId: 'inst-old', identityName: '旧版机', address: '127.0.0.1', port: 17003 }],
   }, context);
   assert.equal(result.isError, true);
   assert.ok(result.content[0].text.includes('不支持'), result.content[0].text);
-  assert.equal(collab.calls.invite.length, 0, '能力闸门先于旧邀请面');
+  assert.equal(legacyCalls.length, 1, '无加入域时回退旧邀请面（闸门在服务层）');
+  assert.deepEqual(fixture.toolProbes, [], '工具层不得自行探测');
+  assert.deepEqual(fixture.built.probeCalls, [], '已知不支持零探测');
+  assert.deepEqual(fixture.built.sent, [], '拒绝的目标不发邀请帧');
 });
 
 test('ws_invite / ws_withdraw_invite（真服务）：邀请簿记返回 inviteId，撤回按记录生效', async (t) => {
