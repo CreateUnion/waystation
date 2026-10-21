@@ -3,6 +3,7 @@ import { dirname } from 'node:path';
 import { writeJsonAtomic } from './storage.js';
 import { sessionFilePath } from './paths.js';
 import { ID_PATTERN } from './net/protocol.js';
+import { shortSessionId } from './util/short-id.js';
 
 /* 会话级状态文件写入端（状态栏「协作中」指示的机制载体）：把会话参与协作的快照写进
  * <主数据目录>/sessions/<sessionId>.json，读取端（scripts/statusline.js）按会话标识直接命中。
@@ -30,21 +31,49 @@ export function isIndicatedCollab(entry) {
 /* 指示条目的成形与指标合并（写入端快照的裁剪面）：清单条目按 collabId 并入观察面读数
  * （msgCount）——读数缺失或非有效值时字段缺省，读取端按「计数不可得则省略」处理（加性变更，
  * 状态文件版本不动）。静音态同走缺省口径（true 才带字段）：读取端缺字段按未静音——旧文件与
- * 新读取端、新文件与旧读取端两个方向都兼容。裁剪与合并同址的缘由：条目形态是写入端与读取端
- * 共用的唯一一份约定，组合根只负责取数、不再各自拼装字段。 */
-export function indicatedEntriesOf(entries, indicators) {
+ * 新读取端、新文件与旧读取端两个方向都兼容。
+ *
+ * 席位来源（0.2.0）：传入 sessionId 且条目携 sessions.localSeats 时，按短码命中「本会话的席位」，
+ * role/muted 取该席位；命不中＝本会话没有该协作的席位，条目剔除。未传 sessionId 或条目没有
+ * 席位表时沿用旧条目字段（组合根接线前的兼容路径，不改变状态文件版本）。 */
+export function indicatedEntriesOf(entries, indicators, sessionId = null) {
   const readings = new Map((indicators ?? []).map((reading) => [reading.collabId, reading.msgCount]));
-  return entries.map((entry) => {
-    const projected = { collabId: entry.collabId, name: entry.name, state: entry.state, role: entry.role, mode: entry.mode, memberCount: entry.memberCount };
-    if (entry.muted === true) {
-      projected.muted = true;
+  const projected = [];
+  for (const entry of entries) {
+    const seat = seatOfEntry(entry, sessionId);
+    if (seat === null) {
+      continue;
+    }
+    const item = {
+      collabId: entry.collabId,
+      name: entry.name,
+      state: entry.state,
+      role: seat === undefined ? entry.role : seat.role,
+      mode: entry.mode,
+      memberCount: entry.memberCount,
+    };
+    const muted = seat === undefined ? entry.muted === true : seat.muted === true;
+    if (muted) {
+      item.muted = true;
     }
     const msgCount = readings.get(entry.collabId);
     if (Number.isInteger(msgCount) && msgCount >= 0) {
-      projected.msgCount = msgCount;
+      item.msgCount = msgCount;
     }
-    return projected;
-  });
+    projected.push(item);
+  }
+  return projected;
+}
+
+/* 本会话在条目席位表中的席位：undefined＝无席位表/无会话标识（走旧字段兜底）；
+ * null＝席位表在场但没有本会话席位（条目不属于本会话）；对象＝命中席位。 */
+function seatOfEntry(entry, sessionId) {
+  const seats = entry?.sessions?.localSeats;
+  if (!Array.isArray(seats) || typeof sessionId !== 'string' || sessionId === '') {
+    return undefined;
+  }
+  const shortId = shortSessionId(sessionId);
+  return seats.find((seat) => seat !== null && typeof seat === 'object' && seat.sessionId === shortId) ?? null;
 }
 
 /**

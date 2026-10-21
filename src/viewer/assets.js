@@ -81,9 +81,9 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
   const NOT_READY_TEXT = '数据未就绪';
   const NOT_READY_ENTRY = '（数据未就绪）';
   /* 标题与静音横幅文案（设计 §3.3／§3.5 写死的要素；反引号属设计文档的 Markdown 代码标记，
-   * 页面按纯文本呈现命令名）。 */
+   * 页面按纯文本呈现命令名）。静音按本机席位聚合，不再是机器级单布尔。 */
   const DEFAULT_TITLE = 'waystation 观察窗';
-  const MUTE_BANNER_TEXT = '🔇 本协作已静音——消息不注入 AI 会话（观察窗照常显示）；要让本会话实时跟进，用 /ws-mute 取消静音';
+  const MUTE_BANNER_HINT = '——消息不注入静音席位所在会话（观察窗照常显示）；要让本会话实时跟进，用 /ws-mute 取消静音';
 
   /* 状态词表对齐终端查看器与状态栏的既有口径；词表外取值原样呈现，不自造词。 */
   const MODE_LABELS = new Map([['forum', '讨论'], ['managed', '协作']]);
@@ -94,6 +94,13 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     ['completed', '已结束'],
     ['terminated', '已终止'],
     ['left', '已退出'],
+  ]);
+  const SEAT_ROLE_LABELS = new Map([['manager', '站长'], ['member', '成员']]);
+  const SEAT_STATE_LABELS = new Map([['member', '在席'], ['joining', '入席中']]);
+  const FREEZE_REASON_LABELS = new Map([
+    ['manager-offline', '站长离线'],
+    ['manager-pending', '自动移交等待'],
+    ['manager-fork', '任期分叉'],
   ]);
 
   const state = {
@@ -294,7 +301,7 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     loadList();
   }
 
-  /* —— 会话可见面（本机获准/本机绑定、站长获准名单、远端发布）—— */
+  /* —— 会话席位视图（本机会员席位 / 远端成员 / 离席历史；静音按本机席位聚合）—— */
 
   /* 机器标识：身份名（台账名单/发现清单可查时）优先，缺失回退实例标识；两者都缺＝空串
    * （呈现端只在条目有短码时才会拼它）。字段一律 textContent 注入（对端可控）。 */
@@ -308,63 +315,131 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     return typeof entry.instanceId === 'string' ? entry.instanceId : '';
   }
 
-  /* 获准名单条目文本：机器＋会话短码。 */
-  function grantedTextOf(entry) {
+  /* 席位条目文本：机器名（或实例标识）＋会话短码＋角色＋状态＋入席序号；静音/待核实是加性标记。
+   * 短码与名称均由服务端数据面产出，这里只做文本拼接（textContent 注入）。 */
+  function seatTextOf(seat) {
+    const label = machineLabelOf(seat);
+    const code = typeof seat.sessionId === 'string' ? seat.sessionId : '';
+    const traits = [];
+    const roleLabel = SEAT_ROLE_LABELS.get(seat.role);
+    const stateLabel = SEAT_STATE_LABELS.get(seat.state);
+    if (roleLabel !== undefined) {
+      traits.push(roleLabel);
+    }
+    if (stateLabel !== undefined) {
+      traits.push(stateLabel);
+    }
+    if (Number.isInteger(seat.joinSeq)) {
+      traits.push('入席 ' + seat.joinSeq);
+    }
+    if (seat.unverified === true) {
+      traits.push('待核实');
+    }
+    if (seat.muted === true) {
+      traits.push('🔇静音');
+    }
+    const head = label === '' ? code : label + ' ' + code;
+    return traits.length === 0 ? head : head + '（' + traits.join('·') + '）';
+  }
+
+  /* 离席历史条目：机器＋短码＋原因（原样，证据可核对）＋离席时刻。 */
+  function departedTextOf(entry) {
     const label = machineLabelOf(entry);
     const code = typeof entry.sessionId === 'string' ? entry.sessionId : '';
-    return label === '' ? code : label + ' ' + code;
+    const head = label === '' ? code : label + ' ' + code;
+    const details = [];
+    if (typeof entry.reason === 'string' && entry.reason !== '') {
+      details.push(entry.reason);
+    }
+    if (typeof entry.at === 'string' && entry.at !== '') {
+      details.push(entry.at);
+    }
+    return head + '（' + (details.length === 0 ? '已离席' : details.join('·')) + '）';
   }
 
-  /* 发布条目文本：机器＋会话短码组；空数组＝如实报零（对端报了零会话，与「未报」不同）。 */
-  function publishedTextOf(entry) {
-    const label = machineLabelOf(entry);
-    const codes = Array.isArray(entry.sessions) ? entry.sessions : [];
-    const body = codes.length === 0 ? '0 个会话' : codes.join(' ');
-    return label === '' ? body : label + ' ' + body;
+  function freezeReasonLabelOf(reason) {
+    return FREEZE_REASON_LABELS.get(reason) ?? String(reason);
   }
 
-  /* 列表行会话摘要：本机绑定/获准短码＋站长获准名单（机器＋短码）＋远端发布台数。
-   * 数据面缺源＝该字段不在场（该段不出）；在场而空/null＝如实零/无。全无内容＝整段不出。 */
+  /* 本机席位静音聚合（设计 §10）：「N 席中 M 席静音」；无席位或无静音＝不出标记。 */
+  function mutedSummaryOf(sessions) {
+    const seats = sessions === null || sessions === undefined ? null : sessions.localSeats;
+    if (!Array.isArray(seats)) {
+      return null;
+    }
+    const muted = seats.filter((seat) => seat !== null && seat.muted === true).length;
+    return muted === 0 ? null : '🔇 ' + seats.length + ' 席中 ' + muted + ' 席静音';
+  }
+
+  function joinedTextOf(items, textOf, emptyText) {
+    return items.length === 0 ? emptyText : items.map(textOf).join('、');
+  }
+
+  /* 列表行会话摘要：只读标记/冻结原因/活跃席位数/本机/远端/离席/待办。
+   * 数据面缺源＝该字段不在场（该段不出）；在场而空数组＝如实零。全无内容＝整段不出。 */
   function sessionSummaryOf(sessions) {
     if (sessions === null || sessions === undefined) {
       return null;
     }
     const parts = [];
-    if (typeof sessions.localBound === 'string' && sessions.localBound !== '') {
-      parts.push('本机绑定 ' + sessions.localBound);
+    if (sessions.readOnly === true && sessions.legacy === true) {
+      parts.push('旧版·只读');
+    } else if (sessions.readOnly === true && sessions.recovery === true) {
+      parts.push('半写·只读');
     }
-    if (Array.isArray(sessions.localGranted)) {
-      parts.push(sessions.localGranted.length === 0 ? '本机获准 0 个会话' : '本机获准 ' + sessions.localGranted.join(' '));
+    if (typeof sessions.freezeReason === 'string' && sessions.freezeReason !== '') {
+      parts.push('冻结：' + freezeReasonLabelOf(sessions.freezeReason));
     }
-    if (Array.isArray(sessions.grantedRemote)) {
-      parts.push(sessions.grantedRemote.length === 0
-        ? '站长获准名单 0 个会话'
-        : '站长获准名单 ' + sessions.grantedRemote.map(grantedTextOf).join('、'));
+    if (Number.isInteger(sessions.activeSeatCount)) {
+      parts.push('活跃 ' + sessions.activeSeatCount + ' 席');
     }
-    if (Array.isArray(sessions.published) && sessions.published.length > 0) {
-      parts.push('远端发布 ' + sessions.published.length + ' 台');
+    if (Array.isArray(sessions.localSeats)) {
+      parts.push('本机 ' + sessions.localSeats.length + ' 席');
+    }
+    if (Array.isArray(sessions.remoteSeats)) {
+      parts.push('远端 ' + sessions.remoteSeats.length + ' 席');
+    }
+    if (Array.isArray(sessions.departed) && sessions.departed.length > 0) {
+      parts.push('离席 ' + sessions.departed.length);
+    }
+    if (Array.isArray(sessions.pendingInvites) && sessions.pendingInvites.length > 0) {
+      parts.push('待回应邀请 ' + sessions.pendingInvites.length);
+    }
+    if (Array.isArray(sessions.pendingJoins) && sessions.pendingJoins.length > 0) {
+      parts.push('待确认入席 ' + sessions.pendingJoins.length);
     }
     return parts.length === 0 ? null : '会话：' + parts.join('｜');
   }
 
-  /* 详情页会话区（成员机器×会话）：逐段一行——本机绑定/获准、站长获准名单、远端发布。
-   * 缺源（数据面缺字段）＝该行不出；全无内容＝整区不出（与列表行摘要同一省略口径）。 */
+  /* 详情页会话区：只读/冻结行＋本机会员席位/远端成员/离席历史三段（空段如实零）＋待办。
+   * 缺源（数据面缺字段）＝该行不出；全无内容＝整区不出。 */
   function sessionsBlockNode(sessions) {
     if (sessions === null || sessions === undefined) {
       return null;
     }
     const lines = [];
-    if (typeof sessions.localBound === 'string' && sessions.localBound !== '') {
-      lines.push('本机绑定：' + sessions.localBound);
+    if (sessions.readOnly === true && sessions.legacy === true) {
+      lines.push('旧版·只读');
+    } else if (sessions.readOnly === true && sessions.recovery === true) {
+      lines.push('半写·只读');
     }
-    if (Array.isArray(sessions.localGranted)) {
-      lines.push('本机获准：' + (sessions.localGranted.length === 0 ? '0 个会话' : sessions.localGranted.join(' ')));
+    if (typeof sessions.freezeReason === 'string' && sessions.freezeReason !== '') {
+      lines.push('冻结原因：' + freezeReasonLabelOf(sessions.freezeReason));
     }
-    if (Array.isArray(sessions.grantedRemote)) {
-      lines.push('站长获准名单：' + (sessions.grantedRemote.length === 0 ? '0 个会话' : sessions.grantedRemote.map(grantedTextOf).join('、')));
+    if (Array.isArray(sessions.localSeats)) {
+      lines.push('本机会员席位：' + joinedTextOf(sessions.localSeats, seatTextOf, '0 席'));
     }
-    if (Array.isArray(sessions.published) && sessions.published.length > 0) {
-      lines.push('远端发布：' + sessions.published.map(publishedTextOf).join('、'));
+    if (Array.isArray(sessions.remoteSeats)) {
+      lines.push('远端成员：' + joinedTextOf(sessions.remoteSeats, seatTextOf, '0 席'));
+    }
+    if (Array.isArray(sessions.departed)) {
+      lines.push('离席历史：' + joinedTextOf(sessions.departed, departedTextOf, '0 条'));
+    }
+    if (Array.isArray(sessions.pendingInvites) && sessions.pendingInvites.length > 0) {
+      lines.push('待回应邀请：' + sessions.pendingInvites.length + ' 条');
+    }
+    if (Array.isArray(sessions.pendingJoins) && sessions.pendingJoins.length > 0) {
+      lines.push('待确认入席：' + sessions.pendingJoins.length + ' 条');
     }
     if (lines.length === 0) {
       return null;
@@ -393,8 +468,9 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
       name.appendChild(el('span', 'collab-site', '站点#' + item.root.slice(1)));
     }
     row.appendChild(name);
-    if (item.muted === true) {
-      row.appendChild(el('span', 'collab-muted', '🔇'));
+    const muteText = mutedSummaryOf(item.sessions);
+    if (muteText !== null) {
+      row.appendChild(el('span', 'collab-muted', muteText));
     }
     appendText(row, ' — ');
     row.appendChild(el('span', 'collab-mode', modeLabel(item.mode)));
@@ -467,9 +543,10 @@ export const APP_JS = String.raw`/* 观察窗客户端：hash 路由（#/ 列表
     if (meta.topic !== null && meta.topic !== undefined && meta.topic !== '') {
       dom.banner.appendChild(el('div', 'banner-topic', meta.topic));
     }
-    /* 静音横幅随 meta 每拍重渲：false 时不渲染即天然移除（无需另写撤销路径）。 */
-    if (meta.muted === true) {
-      dom.banner.appendChild(el('div', 'banner-muted', MUTE_BANNER_TEXT));
+    /* 静音横幅按本机席位聚合，随 meta 每拍重渲：无静音席位时不渲染即天然移除。 */
+    const muteText = mutedSummaryOf(meta.sessions);
+    if (muteText !== null) {
+      dom.banner.appendChild(el('div', 'banner-muted', muteText + MUTE_BANNER_HINT));
     }
     /* 会话区同规随 meta 每拍重渲：数据面缺字段/无内容时整区不出。 */
     const sessions = sessionsBlockNode(meta.sessions);

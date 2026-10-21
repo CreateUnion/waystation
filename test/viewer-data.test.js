@@ -1,11 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { makeTempDir } from './helpers.js';
 import { createViewerData } from '../src/viewer/data.js';
-import { BINDINGS_FILE_NAME, COLLABS_DIR_NAME, CONFIG_FILE_NAME, JOINS_FILE_NAME, RUN_DIR_NAME, SITES_DIR_NAME } from '../src/paths.js';
+import { COLLABS_DIR_NAME, CONFIG_FILE_NAME, JOINS_FILE_NAME, SITES_DIR_NAME } from '../src/paths.js';
 import { KNOWN_HOSTS_FILE_NAME } from '../src/net/known-hosts.js';
 import { POSTS_FILE_NAME } from '../src/collab/posts.js';
 import { MEMBERS_FILE_NAME } from '../src/collab/members.js';
@@ -14,6 +14,15 @@ import { COUNTER_FILE_NAME } from '../src/collab/counter.js';
 import { MUTE_FILE_NAME } from '../src/collab/mute.js';
 import { INBOX_FILE_NAME } from '../src/net/inbound.js';
 import { OUTBOX_FILE_NAME } from '../src/net/outbox.js';
+
+/* 0.2.0 本地文件形态（M1/M8 尚未落地路径常量）：观察窗按设计 §6.2 的就地名字读取。 */
+const CARRIER_FILE_NAME = 'carrier.json';
+const SEATS_DIR_NAME = 'seats';
+const INVITES_FILE_NAME = 'invites.json';
+const PENDING_INVITES_FILE_NAME = 'pending-invites.json';
+const DEPARTED_FILE_NAME = 'departed.jsonl';
+const RECOVERY_FILE_NAME = 'recovery.json';
+const MIGRATION_FILE_NAME = 'migration.json';
 
 /* 只读数据层的判别用例：临时数据根（makeTempDir）＋手工落盘的文件流——绝不触碰真实 ~/.waystation。
  * 夹具一律以各模块导出的规范文件名常量为准（数据层就地定义的名字常量若与它们漂移，用例即红）。
@@ -30,11 +39,100 @@ function collabDirIn(dataDir, root, collabId) {
   return join(base, COLLABS_DIR_NAME, collabId);
 }
 
-function writeFiles(dir, files) {
+/* 夹具默认写成 0.2.0 目录（member.json 在场时补 carrier 标记）；legacy 专项用例传 { legacy: true }
+ * 保留旧形态，交给 M8 的只读读取器。 */
+function writeFiles(dir, files, options = {}) {
   mkdirSync(dir, { recursive: true });
-  for (const [name, content] of Object.entries(files)) {
-    writeFileSync(join(dir, name), content);
+  const withCarrier = options.legacy === true || files[MEMBER_FILE_NAME] === undefined || files[CARRIER_FILE_NAME] !== undefined
+    ? files
+    : { ...files, [CARRIER_FILE_NAME]: JSON.stringify(carrierForFiles(files)) };
+  for (const [name, content] of Object.entries(withCarrier)) {
+    const file = join(dir, name);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, content);
   }
+}
+
+/* 从同批夹具文件推导一份形态自洽的 carrier：名/主题/模式优先取台账（末条）或快照台账，
+ * 其次成员记录；只服务测试夹具，不参与生产读取。 */
+function carrierForFiles(files) {
+  const member = parseJsonOrNull(files[MEMBER_FILE_NAME]);
+  const current = carrierLedgerOf(files, member);
+  return {
+    format: 'session-seats',
+    version: 1,
+    ...carrierFieldsOf(member, current),
+    snapshotVersion: 1,
+    createdAt: T0,
+  };
+}
+
+function carrierFieldsOf(member, current) {
+  return {
+    collabId: carrierFieldOr(member, current, 'collabId', 'c-1'),
+    name: carrierFieldOr(current, member, 'name', '协作甲'),
+    topic: carrierFieldOr(current, member, 'topic', '主题'),
+    mode: carrierFieldOr(member, current, 'mode', 'managed'),
+    endpoints: member?.endpoints ?? {},
+    manager: carrierManagerOf(member, current),
+  };
+}
+
+function carrierFieldOr(first, second, key, fallback) {
+  return pickText(first?.[key], second?.[key]) ?? fallback;
+}
+
+function pickText(...values) {
+  for (const value of values) {
+    const text = textOrNull(value);
+    if (text !== null) {
+      return text;
+    }
+  }
+  return null;
+}
+
+/* 成员机以快照台账为现态来源（台账文件在成员机是过期副本）；站长机取台账末条。 */
+function carrierLedgerOf(files, member) {
+  const snapshotLedger = parseJsonOrNull(files[SNAPSHOT_FILE_NAME])?.ledger ?? null;
+  if (member !== null && member.role === 'member' && snapshotLedger !== null) {
+    return snapshotLedger;
+  }
+  return lastJsonlObject(files[LEDGER_FILE_NAME]) ?? snapshotLedger;
+}
+
+function carrierManagerOf(member, current) {
+  const manager = current?.manager ?? member?.manager ?? { instanceId: 'mgr-1', identityName: '甲机' };
+  return { ...manager, sessionId: manager.sessionId ?? 'session-manager-fx', term: manager.term ?? 1 };
+}
+
+function textOrNull(value) {
+  return typeof value === 'string' && value !== '' ? value : null;
+}
+
+function parseJsonOrNull(text) {
+  if (typeof text !== 'string') {
+    return null;
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function lastJsonlObject(text) {
+  if (typeof text !== 'string') {
+    return null;
+  }
+  const lines = text.split('\n').filter((line) => line.trim() !== '');
+  for (let index = lines.length - 1; index >= 0; index--) {
+    const parsed = parseJsonOrNull(lines[index]);
+    if (parsed !== null) {
+      return parsed;
+    }
+  }
+  return null;
 }
 
 function writeConfigAt(baseDir, identityName) {
@@ -91,6 +189,28 @@ function ledgerOf(over = {}) {
     name: '协作甲',
     topic: '主题甲',
     status: 'active',
+    managerTerm: 1,
+    joinSeqNext: 3,
+    manager: { instanceId: 'mgr-1', sessionId: '1111222233334444', identityName: '甲机', term: 1 },
+    members: [
+      { instanceId: 'mgr-1', sessionId: '1111222233334444', identityName: '甲机', role: 'manager', state: 'member', joinSeq: 1, joinedAt: T0 },
+      { instanceId: 'inst-b', sessionId: 'aaaabbbbccccdddd', identityName: '乙机', role: 'member', state: 'member', joinSeq: 2, joinedAt: T0 },
+    ],
+    board: [],
+    createdAt: T0,
+    updatedAt: T0,
+    ...over,
+  };
+}
+
+/* 0.1.x 旧台账形态（无 sessionId/joinSeq/managerTerm）：交给 M8 旧形态读取器。 */
+function legacyLedgerOf(over = {}) {
+  return {
+    version: 1,
+    collabId: 'c-1',
+    name: '协作甲',
+    topic: '主题甲',
+    status: 'active',
     manager: { instanceId: 'mgr-1', identityName: '甲机' },
     members: [
       { instanceId: 'mgr-1', identityName: '甲机', role: 'manager', state: 'member', joinedAt: T0 },
@@ -111,6 +231,150 @@ function snapshotOf(over = {}) {
     from: { instanceId: 'mgr-1', identityName: '甲机' },
     ledger: ledgerOf(),
     ...over,
+  };
+}
+
+/* 0.2.0 会话席位夹具：carrier 是目录形态标记，ledger 名单按 (instanceId, sessionId) 键。 */
+const LOCAL_MANAGER_SESSION = '1111222233334444';
+const LOCAL_MEMBER_SESSION = '9999888877776666';
+const REMOTE_MEMBER_SESSION = 'aaaabbbbccccdddd';
+const REMOTE_DEPARTED_SESSION = 'ccccddddeeeeffff';
+const PENDING_JOIN_SESSION = 'ddddeeeeffff0000';
+
+function carrierRecord(over = {}) {
+  return {
+    format: 'session-seats',
+    version: 1,
+    collabId: 'c-1',
+    name: '协作甲',
+    topic: '主题甲',
+    mode: 'managed',
+    endpoints: {},
+    manager: { instanceId: 'mgr-1', sessionId: LOCAL_MANAGER_SESSION, identityName: '甲机', term: 1 },
+    snapshotVersion: 1,
+    createdAt: T0,
+    ...over,
+  };
+}
+
+function seatRecord(over = {}) {
+  return {
+    version: 1,
+    sessionId: LOCAL_MANAGER_SESSION,
+    role: 'manager',
+    state: 'member',
+    joinSeq: 1,
+    joinedAt: T0,
+    muted: false,
+    ...over,
+  };
+}
+
+function sessionLedgerOf(over = {}) {
+  return ledgerOf({
+    managerTerm: 1,
+    joinSeqNext: 3,
+    manager: { instanceId: 'mgr-1', sessionId: LOCAL_MANAGER_SESSION, identityName: '甲机', term: 1 },
+    members: [
+      { instanceId: 'mgr-1', sessionId: LOCAL_MANAGER_SESSION, identityName: '甲机', role: 'manager', state: 'member', joinSeq: 1, joinedAt: T0 },
+      { instanceId: 'inst-b', sessionId: REMOTE_MEMBER_SESSION, identityName: '乙机', role: 'member', state: 'member', joinSeq: 2, joinedAt: T0 },
+    ],
+    ...over,
+  });
+}
+
+function writeSessionFixture(dataDir, collabId, files = {}) {
+  writeConfigAt(dataDir, '甲机');
+  writeFiles(collabDirIn(dataDir, 'main', collabId), {
+    [CARRIER_FILE_NAME]: JSON.stringify(carrierRecord({ collabId })),
+    [LEDGER_FILE_NAME]: jsonl(sessionLedgerOf({ collabId })),
+    [`${SEATS_DIR_NAME}/${LOCAL_MANAGER_SESSION}.json`]: JSON.stringify(seatRecord()),
+    ...files,
+  });
+}
+
+/* 完整席位视图夹具：双本机席位（一静音）＋远端成员＋离席历史＋待回应邀请/待确认入席＋冻结原因。 */
+function writeFullSessionFixture(dataDir) {
+  writeSessionFixture(dataDir, 'c-1', { ...fullSeatFiles(), ...fullInviteFiles() });
+  writeFileSync(join(dataDir, KNOWN_HOSTS_FILE_NAME), JSON.stringify({
+    version: 4,
+    hosts: [
+      { address: '10.0.0.9', port: 7323, instanceId: 'inst-c', identityName: '丙机', lastSeenAt: T0, sessions: [] },
+    ],
+  }));
+}
+
+function fullSeatFiles() {
+  return {
+    [`${SEATS_DIR_NAME}/${LOCAL_MEMBER_SESSION}.json`]: JSON.stringify(seatRecord({
+      sessionId: LOCAL_MEMBER_SESSION,
+      role: 'member',
+      joinSeq: 3,
+      muted: true,
+    })),
+    [LEDGER_FILE_NAME]: jsonl(sessionLedgerOf({ collabId: 'c-1', status: 'frozen', freezeReason: 'manager-offline' })),
+    [DEPARTED_FILE_NAME]: `${jsonl(
+      { instanceId: 'inst-c', sessionId: REMOTE_DEPARTED_SESSION, reason: 'manager-session-closed', term: 3, at: tsPlus(5000) },
+    )}${JSON.stringify({ bad: 'line' })}\n`,
+  };
+}
+
+function fullInviteFiles() {
+  return {
+    [PENDING_INVITES_FILE_NAME]: JSON.stringify({
+      version: 1,
+      invites: [
+        {
+          inviteId: 'inv-1',
+          collabId: 'c-1',
+          fromManager: { instanceId: 'inst-c', sessionId: REMOTE_DEPARTED_SESSION },
+          targetSessionId: REMOTE_MEMBER_SESSION,
+          expiresAt: tsPlus(60000),
+          state: 'open',
+          acceptedSessions: [],
+        },
+        { inviteId: 'inv-closed', collabId: 'c-1', state: 'consumed', expiresAt: tsPlus(1000) },
+      ],
+    }),
+    [INVITES_FILE_NAME]: JSON.stringify({
+      version: 1,
+      invites: [
+        { inviteId: 'inv-2', targets: [{ instanceId: 'inst-b', targetSessionId: REMOTE_MEMBER_SESSION }], createdAt: T0, expiresAt: tsPlus(90000), state: 'open' },
+        { inviteId: 'inv-3', targets: [], createdAt: T0, expiresAt: tsPlus(90000), state: 'closed' },
+      ],
+    }),
+    [JOINS_FILE_NAME]: JSON.stringify({
+      v: 2,
+      pendingJoins: [
+        { joinId: 'j-1', instanceId: 'inst-d', sessionId: PENDING_JOIN_SESSION, managerTerm: 1, grantVersion: 2, requestedAt: T0, expiresAt: tsPlus(30000) },
+      ],
+    }),
+  };
+}
+
+function fullSessionViewExpected() {
+  return {
+    localSeats: [
+      { identityName: '甲机', sessionId: '11112222', role: 'manager', state: 'member', joinSeq: 1, muted: false },
+      { identityName: '甲机', sessionId: '99998888', role: 'member', state: 'member', joinSeq: 3, muted: true },
+    ],
+    remoteSeats: [
+      { instanceId: 'inst-b', identityName: '乙机', sessionId: 'aaaabbbb', role: 'member', state: 'member', joinSeq: 2 },
+    ],
+    departed: [
+      { instanceId: 'inst-c', identityName: '丙机', sessionId: 'ccccdddd', reason: 'manager-session-closed', at: tsPlus(5000) },
+    ],
+    pendingInvites: [
+      { inviteId: 'inv-1', targetSessionId: 'aaaabbbb', fromInstanceId: 'inst-c', fromSessionId: 'ccccdddd', fromName: '丙机', expiresAt: tsPlus(60000) },
+      { inviteId: 'inv-2', expiresAt: tsPlus(90000) },
+    ],
+    pendingJoins: [
+      { sessionId: 'ddddeeee', expiresAt: tsPlus(30000) },
+    ],
+    activeSeatCount: 2,
+    localSeatCount: 2,
+    mutedSeatCount: 1,
+    freezeReason: 'manager-offline',
   };
 }
 
@@ -464,7 +728,8 @@ test('managed：站长席位——台账末条为名/态权威，人数取名单
     [COUNTER_FILE_NAME]: JSON.stringify({ v: 1, messageCount: 7 }),
   });
   const meta = createData(dataDir).readMeta('main', 'c-1', null);
-  assert.deepEqual(meta, {
+  const { sessions, ...metaCore } = meta;
+  assert.deepEqual(metaCore, {
     name: '协作甲改名',
     state: 'active',
     mode: 'managed',
@@ -480,8 +745,8 @@ test('managed：站长席位——台账末条为名/态权威，人数取名单
       reset: true,
     },
     skipped: 1,
-    muted: false,
   });
+  assert.equal(sessions.activeSeatCount, 2);
   const anchored = createData(dataDir).readMeta('main', 'c-1', '1:0');
   assert.equal(anchored.events.reset, false);
   assert.deepEqual(anchored.events.rows.map((row) => row.id), ['2:1', '3:2']);
@@ -518,9 +783,9 @@ test('managed：成员席位——仅 snapshot 为主体数据源（名单为邀
         status: 'frozen',
         topic: '主题乙',
         members: [
-          { instanceId: 'mgr-1', identityName: '甲机', role: 'manager', state: 'member', joinedAt: T0 },
-          { instanceId: 'inst-b', identityName: '乙机', role: 'member', state: 'member', joinedAt: T0 },
-          { instanceId: 'inst-c', identityName: '丙机', role: 'member', state: 'member', joinedAt: T0 },
+          { instanceId: 'mgr-1', sessionId: '1111222233334444', identityName: '甲机', role: 'manager', state: 'member', joinSeq: 1, joinedAt: T0 },
+          { instanceId: 'inst-b', sessionId: 'aaaabbbbccccdddd', identityName: '乙机', role: 'member', state: 'member', joinSeq: 2, joinedAt: T0 },
+          { instanceId: 'inst-c', sessionId: 'bbbbccccddddeeee', identityName: '丙机', role: 'member', state: 'member', joinSeq: 3, joinedAt: T0 },
         ],
       }),
     })),
@@ -649,7 +914,6 @@ test('null 语义：目录不存在／id 形态非法／root 非法 → null 不
     topic: null,
     events: { rows: [], reset: true },
     skipped: 0,
-    muted: false,
   });
   assert.equal(data.readFeed('s2', 'ok-1', null), null);   // sites 槽位目录不存在
   mkdirSync(collabDirIn(dataDir, 's2', 'ok-1'), { recursive: true });
@@ -658,9 +922,7 @@ test('null 语义：目录不存在／id 形态非法／root 非法 → null 不
 
 /* —— 列表（全根扫描） —— */
 
-test('listCollabs：主目录＋sites 双根（同名 id 两目录）、非 ID_PATTERN 目录忽略、updatedAt 最大者倒序', (t) => {
-  const dataDir = makeTempDir(t);
-  // main 根：c-1 讨论（两帖两事件）；c-2 协作（站长席位）；非法名目录与散文件应被忽略
+function writeListFixture(dataDir) {
   writeFiles(collabDirIn(dataDir, 'main', 'c-1'), {
     [POSTS_FILE_NAME]: jsonl(postEntry(), postEntry({ entryId: 'post-2', seq: 2, ts: tsPlus(500) })),
     [MEMBERS_FILE_NAME]: jsonl(
@@ -676,22 +938,38 @@ test('listCollabs：主目录＋sites 双根（同名 id 两目录）、非 ID_P
   });
   mkdirSync(join(dataDir, COLLABS_DIR_NAME, '非法名下划线'), { recursive: true });
   writeFileSync(join(dataDir, COLLABS_DIR_NAME, '散文件'), 'x');
-  // sites 根：同名 c-1 的成员席位（仅 snapshot；无 counter）
   writeFiles(collabDirIn(dataDir, 's2', 'c-1'), {
     [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ collabId: 'c-1', role: 'member', name: '成员乙' })),
     [SNAPSHOT_FILE_NAME]: JSON.stringify(snapshotOf({ ledger: ledgerOf({ name: '协作乙', status: 'proposed' }) })),
   });
-  mkdirSync(join(dataDir, SITES_DIR_NAME, 'README'), { recursive: true });   // 非数字目录忽略
-  // updatedAt 定格：把每个协作目录的全部文件 mtime 设为整秒（utimes 往返无损，最大者即该值）
+  mkdirSync(join(dataDir, SITES_DIR_NAME, 'README'), { recursive: true });
   stampAllFiles(collabDirIn(dataDir, 'main', 'c-1'), 1700000100);
   stampAllFiles(collabDirIn(dataDir, 'main', 'c-2'), 1700000200);
   stampAllFiles(collabDirIn(dataDir, 's2', 'c-1'), 1700000300);
+}
+
+test('listCollabs：主目录＋sites 双根（同名 id 两目录）、非 ID_PATTERN 目录忽略、updatedAt 最大者倒序', (t) => {
+  const dataDir = makeTempDir(t);
+  writeListFixture(dataDir);
   const { collabs } = createData(dataDir).listCollabs();
-  assert.deepEqual(collabs, [
-    { root: 's2', id: 'c-1', name: '成员乙', state: 'active', muted: false, mode: 'managed', memberCount: 2, count: null, updatedAt: 1700000300000 },
-    { root: 'main', id: 'c-2', name: '协作甲', state: 'frozen', muted: false, mode: 'managed', memberCount: 2, count: 5, updatedAt: 1700000200000 },
-    { root: 'main', id: 'c-1', name: '甲机', state: 'active', muted: false, mode: 'forum', memberCount: 2, count: 2, updatedAt: 1700000100000 },
+  assert.deepEqual(collabs.map((entry) => ({
+    root: entry.root,
+    id: entry.id,
+    name: entry.name,
+    state: entry.state,
+    mode: entry.mode,
+    memberCount: entry.memberCount,
+    count: entry.count,
+    updatedAt: entry.updatedAt,
+  })), [
+    { root: 's2', id: 'c-1', name: '成员乙', state: 'active', mode: 'managed', memberCount: 2, count: null, updatedAt: 1700000300000 },
+    { root: 'main', id: 'c-2', name: '协作甲', state: 'frozen', mode: 'managed', memberCount: 2, count: 5, updatedAt: 1700000200000 },
+    { root: 'main', id: 'c-1', name: '甲机', state: 'active', mode: 'forum', memberCount: 2, count: 2, updatedAt: 1700000100000 },
   ]);
+  assert.equal(collabs[0].sessions.activeSeatCount, 2);   // 成员席位取快照名单
+  assert.equal(collabs[1].sessions.activeSeatCount, 2);   // 站长席位取台账名单
+  assert.equal(collabs[1].sessions.remoteSeats.length, 1);   // 本机站长席不重复列为远端
+  assert.equal(collabs[2].sessions.activeSeatCount, 2);   // 讨论取成员事件折叠
 });
 
 test('listCollabs：updatedAt 同值以 id（再以 root）稳定序；sites 不存在＝正常；空根返回空清单', (t) => {
@@ -768,28 +1046,24 @@ test('缓存：缺失态不入缓存——文件随后出现即能读到；已�
   assert.deepEqual(data.readFeed('main', 'c-1', null).rows.map((row) => row.text), ['重建后的新内容']);
 });
 
-test('缓存：小 JSON 直读不缓存——counter/member/config/mute 同尺寸改写后即读到', (t) => {
+test('缓存：小 JSON 直读不缓存——counter/member/config 同尺寸改写后即读到', (t) => {
   const dataDir = makeTempDir(t);
   writeConfigAt(dataDir, '甲机');
   const dir = collabDirIn(dataDir, 'main', 'c-1');
   writeFiles(dir, {
     [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ collabId: 'c-1', role: 'member', name: '甲机' })),
     [COUNTER_FILE_NAME]: JSON.stringify({ v: 1, messageCount: 5 }),
-    [MUTE_FILE_NAME]: JSON.stringify({ v: 1, muted: false, baseline: null }),
     [OUTBOX_FILE_NAME]: jsonl(outboxRow()),
   });
   const data = createData(dataDir);
   assert.equal(data.readMeta('main', 'c-1', null).count, 5);
   assert.equal(data.readMeta('main', 'c-1', null).name, '甲机');
-  assert.equal(data.readMeta('main', 'c-1', null).muted, false);
   assert.equal(data.readFeed('main', 'c-1', null).rows[0].fromName, '甲机');
   writeFileSync(join(dir, COUNTER_FILE_NAME), JSON.stringify({ v: 1, messageCount: 7 }));
   writeFileSync(join(dir, MEMBER_FILE_NAME), JSON.stringify(memberRecord({ collabId: 'c-1', role: 'member', name: '乙机' })));
-  writeFileSync(join(dir, MUTE_FILE_NAME), JSON.stringify({ v: 1, muted: true, baseline: null }));   // 同尺寸改写
   writeConfigAt(dataDir, '乙机');
   assert.equal(data.readMeta('main', 'c-1', null).count, 7);
   assert.equal(data.readMeta('main', 'c-1', null).name, '乙机');
-  assert.equal(data.readMeta('main', 'c-1', null).muted, true);
   assert.equal(data.readFeed('main', 'c-1', null).rows[0].fromName, '乙机');
 });
 
@@ -811,57 +1085,41 @@ test('小 JSON 读故障（非缺失，位置是目录）留痕降级：warn 被
   assert.equal(String(warnings[0][1].file).endsWith(COUNTER_FILE_NAME), true);
 });
 
-/* —— 静音态（mute.json 纯读） —— */
+/* —— 会话级静音（按本机席位聚合，退役机器级 mute.json 布尔） —— */
 
-/* 协作夹具＋可选 mute.json：muteContent 为 null 时不落文件（缺失态），否则按原文写入（可给损坏文）。 */
-function writeMuteCollab(dataDir, collabId, muteContent) {
-  const files = { [LEDGER_FILE_NAME]: jsonl(ledgerOf({ collabId })) };
-  if (muteContent !== null) {
-    files[MUTE_FILE_NAME] = muteContent;
-  }
-  writeFiles(collabDirIn(dataDir, 'main', collabId), files);
-}
-
-test('muted：正常读取布尔（论坛/协作同面、baseline 不影响呈现）；缺失/损坏/形态不符一律 false', (t) => {
+test('静音：按本机席位聚合 mutedSeatCount；mute.json 的机器级布尔不再参与呈现', (t) => {
   const dataDir = makeTempDir(t);
-  writeMuteCollab(dataDir, 'c-on', JSON.stringify({ v: 1, muted: true, baseline: 3 }));
-  writeMuteCollab(dataDir, 'c-off', JSON.stringify({ v: 1, muted: false, baseline: null }));
-  writeMuteCollab(dataDir, 'c-none', null);
-  writeMuteCollab(dataDir, 'c-corrupt', '{不是 JSON');
-  writeMuteCollab(dataDir, 'c-shape', JSON.stringify({ v: 2, muted: true, baseline: null }));   // 版本不符＝形态不符
-  writeFiles(collabDirIn(dataDir, 'main', 'c-forum-on'), {
-    [MUTE_FILE_NAME]: JSON.stringify({ v: 1, muted: true, baseline: null }),
-    [POSTS_FILE_NAME]: jsonl(postEntry()),
-    [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ mode: 'forum', collabId: 'c-forum-on' })),
+  writeSessionFixture(dataDir, 'c-1', {
+    [`${SEATS_DIR_NAME}/${LOCAL_MEMBER_SESSION}.json`]: JSON.stringify(seatRecord({
+      sessionId: LOCAL_MEMBER_SESSION,
+      role: 'member',
+      joinSeq: 3,
+      muted: true,
+    })),
+    [MUTE_FILE_NAME]: JSON.stringify({ v: 1, muted: true, baseline: null }),   // 退役文件：留盘但不读
   });
   const data = createData(dataDir);
-  assert.equal(data.readMeta('main', 'c-on', null).muted, true);
-  assert.equal(data.readMeta('main', 'c-off', null).muted, false);
-  assert.equal(data.readMeta('main', 'c-none', null).muted, false);
-  assert.equal(data.readMeta('main', 'c-corrupt', null).muted, false);
-  assert.equal(data.readMeta('main', 'c-shape', null).muted, false);
-  assert.equal(data.readMeta('main', 'c-forum-on', null).muted, true);   // 讨论面同取数
-  const byId = new Map(data.listCollabs().collabs.map((entry) => [entry.id, entry.muted]));
-  assert.deepEqual([...byId.keys()].sort(), ['c-corrupt', 'c-forum-on', 'c-none', 'c-off', 'c-on', 'c-shape']);
-  assert.equal(byId.get('c-on'), true);
-  assert.equal(byId.get('c-forum-on'), true);
-  for (const id of ['c-off', 'c-none', 'c-corrupt', 'c-shape']) {
-    assert.equal(byId.get(id), false, id);
-  }
+  const entry = data.listCollabs().collabs[0];
+  const meta = data.readMeta('main', 'c-1', null);
+  assert.equal(entry.sessions.mutedSeatCount, 1);
+  assert.equal(entry.sessions.localSeatCount, 2);
+  assert.equal(meta.sessions.mutedSeatCount, 1);
+  assert.deepEqual(meta.sessions.localSeats.map((seat) => seat.muted), [false, true]);
+  assert.equal('muted' in entry, false, '列表条目不得再有机器级静音布尔');
+  assert.equal('muted' in meta, false, '详情 meta 不得再有机器级静音布尔');
 });
 
-test('muted：读故障（位置是目录）留痕并按 false 降级，不抛', (t) => {
+test('静音：席位文件缺失/损坏时按 0 席静音（不读 mute.json 兜底）', (t) => {
   const dataDir = makeTempDir(t);
-  const dir = collabDirIn(dataDir, 'main', 'c-1');
-  writeFiles(dir, { [LEDGER_FILE_NAME]: jsonl(ledgerOf({ collabId: 'c-1' })) });
-  mkdirSync(join(dir, MUTE_FILE_NAME), { recursive: true });   // 位置是目录：读取必抛（非 ENOENT）
-  const warnings = [];
-  const data = createViewerData({ dataDir, log: { warn: (...args) => warnings.push(args) } });
-  assert.equal(data.readMeta('main', 'c-1', null).muted, false);
-  assert.equal(data.listCollabs().collabs[0].muted, false);
-  assert.equal(warnings.length, 2);   // meta 与列表各现读一次，各留一条痕
-  assert.match(String(warnings[0][0]), /小 JSON 读取失败/);
-  assert.equal(String(warnings[0][1].file).endsWith(MUTE_FILE_NAME), true);
+  writeFiles(collabDirIn(dataDir, 'main', 'c-1'), {
+    [CARRIER_FILE_NAME]: JSON.stringify(carrierRecord({ collabId: 'c-1' })),
+    [LEDGER_FILE_NAME]: jsonl(sessionLedgerOf({ collabId: 'c-1' })),
+    [MUTE_FILE_NAME]: JSON.stringify({ v: 1, muted: true, baseline: null }),
+  });
+  const meta = createData(dataDir).readMeta('main', 'c-1', null);
+  assert.deepEqual(meta.sessions.localSeats, []);
+  assert.equal(meta.sessions.mutedSeatCount, 0);
+  assert.equal('muted' in meta, false);
 });
 
 test('工厂：接口键与 stats 形态（cacheHits/cacheMisses）', (t) => {
@@ -904,144 +1162,138 @@ test('大文件夹具：1500 行台账与 500 帖的正确性（线性量级，�
   assert.equal(data.readFeed('main', 'big-posts', 'post-249@inst-a').rows.length, 250);
 });
 
-/* —— 会话可见面（sessions 四视图） —— */
+/* —— 会话席位视图（本机会员席位 / 远端成员 / 离席历史） —— */
 
-/* 会话短码＝会话标识前 8 字符（util/short-id.js 唯一权威）：期望值逐字写死，切片口径漂移即红。
- * 获准条目的形态以 joins 模块的 isApprovalShape 为契约（instanceId/sessionId 过 ID_PATTERN）。 */
+test('sessions：成员按会话展示——本机席位（机器名＋短码＋角色＋状态＋joinSeq）、远端成员、离席历史、待回应邀请/待确认入席、冻结原因', (t) => {
+  const dataDir = makeTempDir(t);
+  writeFullSessionFixture(dataDir);
+  const data = createData(dataDir);
+  const expected = fullSessionViewExpected();
+  assert.deepEqual(data.listCollabs().collabs[0].sessions, expected);
+  const meta = data.readMeta('main', 'c-1', null);
+  assert.deepEqual(meta.sessions, expected);
+  assert.equal(meta.name, '协作甲');
+  assert.equal(meta.state, 'frozen');
+  assert.equal(meta.mode, 'managed');
+  assert.equal(meta.memberCount, 2);
+  assert.equal(meta.topic, '主题甲');
+  for (const retired of ['localBound', 'localGranted', 'grantedRemote', 'published']) {
+    assert.equal(retired in meta.sessions, false, `旧四视图字段应已移除：${retired}`);
+  }
+});
 
-test('sessions：站长席位——本机绑定取绑定表；站长名单＝全体批准记录，本机实例条目另单列本机获准', (t) => {
+test('sessions：本机席位来源可注入 listLocalSeats（M2 接口，优先于席位文件）；provider 异常回退文件并留痕', (t) => {
+  const dataDir = makeTempDir(t);
+  writeSessionFixture(dataDir, 'c-1');
+  const calls = [];
+  const injected = createViewerData({
+    dataDir,
+    log: { warn() {} },
+    listLocalSeats: (collabId) => {
+      calls.push(collabId);
+      return [{ sessionId: LOCAL_MEMBER_SESSION, role: 'member', state: 'member', joinSeq: 9, muted: true, unverified: true }];
+    },
+  });
+  assert.deepEqual(injected.listCollabs().collabs[0].sessions.localSeats, [
+    { identityName: '甲机', sessionId: '99998888', role: 'member', state: 'member', joinSeq: 9, muted: true, unverified: true },
+  ]);
+  assert.deepEqual(calls, ['c-1'], 'provider 以 collabId 调用');
+
+  const warnings = [];
+  const fallback = createViewerData({
+    dataDir,
+    log: { warn: (...args) => warnings.push(args) },
+    listLocalSeats: () => { throw new Error('席位表不可读'); },
+  });
+  assert.deepEqual(fallback.listCollabs().collabs[0].sessions.localSeats, [
+    { identityName: '甲机', sessionId: '11112222', role: 'manager', state: 'member', joinSeq: 1, muted: false },
+  ]);
+  assert.equal(warnings.some((entry) => String(entry[0]).includes('本机席位')), true);
+});
+
+test('sessions：席位文件逐条校验——坏 JSON／非法角色／文件名与标识不符一律跳过，不影响其余席位', (t) => {
+  const dataDir = makeTempDir(t);
+  writeSessionFixture(dataDir, 'c-1', {
+    [`${SEATS_DIR_NAME}/${LOCAL_MEMBER_SESSION}.json`]: JSON.stringify(seatRecord({
+      sessionId: LOCAL_MEMBER_SESSION,
+      role: 'member',
+      joinSeq: 2,
+    })),
+    [`${SEATS_DIR_NAME}/2222333344445555.json`]: '{不是 JSON',
+    [`${SEATS_DIR_NAME}/3333444455556666.json`]: JSON.stringify(seatRecord({ sessionId: '3333444455556666', role: 'emperor' })),
+    [`${SEATS_DIR_NAME}/不是标识.json`]: JSON.stringify(seatRecord()),
+    [`${SEATS_DIR_NAME}/4444555566667777.json`]: JSON.stringify(seatRecord({ sessionId: '8888999900001111' })),   // 文件键与内容不符
+  });
+  assert.deepEqual(createData(dataDir).listCollabs().collabs[0].sessions.localSeats, [
+    { identityName: '甲机', sessionId: '11112222', role: 'manager', state: 'member', joinSeq: 1, muted: false },
+    { identityName: '甲机', sessionId: '99998888', role: 'member', state: 'member', joinSeq: 2, muted: false },
+  ]);
+});
+
+test('sessions：旧协作（member.json，无 carrier 标记）＝legacy 只读；旧名单作远端成员、本机站长席不重复列出', (t) => {
   const dataDir = makeTempDir(t);
   writeFiles(collabDirIn(dataDir, 'main', 'c-1'), {
     [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ collabId: 'c-1' })),
-    [LEDGER_FILE_NAME]: jsonl(ledgerOf({ collabId: 'c-1' })),
-    [JOINS_FILE_NAME]: JSON.stringify({
-      v: 1,
-      pendingJoins: [],
-      approvals: [
-        { instanceId: 'inst-b', sessionId: 'abcdef0123456789', origin: 'grant', grantedAt: 1, approvedBy: '甲机' },
-        { instanceId: 'inst-unknown', sessionId: '00112233445566aa', origin: 'grant', grantedAt: 2, approvedBy: '甲机' },
-        { instanceId: 'mgr-1', sessionId: 'c0ffee1234567890', origin: 'create', grantedAt: 3, approvedBy: 'mgr-1' },
-      ],
-    }),
-  });
-  writeFiles(join(dataDir, RUN_DIR_NAME), {
-    [BINDINGS_FILE_NAME]: JSON.stringify({
-      'c-1': { sessionId: 'deadbeefcafe1234', bridgeId: 'b1', boundAt: 1, origin: 'create' },
-    }),
-  });
-  const entry = createData(dataDir).listCollabs().collabs[0];
-  assert.deepEqual(entry.sessions, {
-    localBound: 'deadbeef',
-    localGranted: ['c0ffee12'],
-    grantedRemote: [
-      { instanceId: 'inst-b', identityName: '乙机', sessionId: 'abcdef01' },   // 名单名从台账名单补齐
-      { instanceId: 'inst-unknown', sessionId: '00112233' },                   // 名单查无＝省略名（呈现端回退实例标识）
-      { instanceId: 'mgr-1', identityName: '甲机', sessionId: 'c0ffee12' },    // 本机实例条目仍在全体记录内
-    ],
-  });
-});
-
-test('sessions：参与记录形态不符（站长为 {}）＝按成员残骸处置——台账即本机获准（既有读法不变）', (t) => {
-  const dataDir = makeTempDir(t);
-  writeFiles(collabDirIn(dataDir, 'main', 'c-1'), {
-    [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ collabId: 'c-1', manager: {} })),
-    [LEDGER_FILE_NAME]: jsonl(ledgerOf({ collabId: 'c-1' })),
-    [JOINS_FILE_NAME]: JSON.stringify({
-      v: 1,
-      pendingJoins: [],
-      approvals: [{ instanceId: 'inst-b', sessionId: 'abcdef0123456789', origin: 'grant', grantedAt: 1, approvedBy: '甲机' }],
-    }),
-  });
-  const entry = createData(dataDir).listCollabs().collabs[0];
-  assert.deepEqual(entry.sessions, { localGranted: ['abcdef01'] }, '无效参与记录不被当作站长视角（宁按残骸读本机台账）');
-});
-
-test('sessions：成员席位——台账即本机获准（短码列表）；详情 meta 同视图在场', (t) => {
-  const dataDir = makeTempDir(t);
-  writeFiles(collabDirIn(dataDir, 's2', 'c-1'), {
-    [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ collabId: 'c-1', role: 'member', name: '成员乙' })),
-    [SNAPSHOT_FILE_NAME]: JSON.stringify(snapshotOf({ ledger: ledgerOf({ name: '协作乙' }) })),
-    [JOINS_FILE_NAME]: JSON.stringify({
-      v: 1,
-      pendingJoins: [{ instanceId: 'inst-x', sessionId: 'ffffeeee00001111', requestedAt: 3 }],
-      approvals: [{ instanceId: 'inst-me', sessionId: 'aabbcc0011223344', origin: 'grant', grantedAt: 4, approvedBy: '甲机' }],
-    }),
-  });
-  writeFiles(join(dataDir, SITES_DIR_NAME, '2', RUN_DIR_NAME), {
-    [BINDINGS_FILE_NAME]: JSON.stringify({
-      'c-1': { sessionId: '0011aabbccdd2233', bridgeId: 'b2', boundAt: 2, origin: 'grant' },
-    }),
-  });
+    [LEDGER_FILE_NAME]: jsonl(legacyLedgerOf({ collabId: 'c-1' })),
+  }, { legacy: true });
   const data = createData(dataDir);
-  const expected = { localBound: '0011aabb', localGranted: ['aabbcc00'] };
-  assert.deepEqual(data.listCollabs().collabs[0].sessions, expected);
-  assert.deepEqual(data.readMeta('s2', 'c-1', null).sessions, expected);   // 详情面同源同形
-  assert.equal(data.readMeta('s2', 'c-2', null), null);                    // 目录缺失不受影响
-});
-
-test('sessions：讨论无批准门——台账在手也不产获准段（不是「未获准」）；绑定照常在场', (t) => {
-  const dataDir = makeTempDir(t);
-  writeFiles(collabDirIn(dataDir, 'main', 'c-forum'), {
-    [POSTS_FILE_NAME]: jsonl(postEntry()),
-    [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ mode: 'forum', collabId: 'c-forum' })),
-    [JOINS_FILE_NAME]: JSON.stringify({
-      v: 1,
-      pendingJoins: [],
-      approvals: [{ instanceId: 'inst-b', sessionId: 'abcdef0123456789', origin: 'grant', grantedAt: 1, approvedBy: '甲机' }],
-    }),
-  });
-  writeFiles(join(dataDir, RUN_DIR_NAME), {
-    [BINDINGS_FILE_NAME]: JSON.stringify({
-      'c-forum': { sessionId: '1234567890abcdef', bridgeId: 'b1', boundAt: 1, origin: 'join' },
-    }),
-  });
-  const entry = createData(dataDir).listCollabs().collabs[0];
-  assert.deepEqual(entry.sessions, { localBound: '12345678' });
-  assert.equal('localGranted' in entry.sessions, false);
-  assert.equal('grantedRemote' in entry.sessions, false);
-});
-
-test('sessions：远端发布——known-hosts 会话短码（同实例择最近见过）；缺字段＝未报整条不出、空数组＝如实零；站点根各读各的', (t) => {
-  const dataDir = makeTempDir(t);
-  writeFiles(collabDirIn(dataDir, 'main', 'c-1'), { [LEDGER_FILE_NAME]: jsonl(ledgerOf({ collabId: 'c-1' })) });
-  writeFiles(collabDirIn(dataDir, 's2', 'c-1'), { [LEDGER_FILE_NAME]: jsonl(ledgerOf({ collabId: 'c-1' })) });
-  writeFileSync(join(dataDir, KNOWN_HOSTS_FILE_NAME), JSON.stringify({
-    version: 2,
-    hosts: [
-      { address: '10.0.0.9', port: 7323, instanceId: 'inst-r1', identityName: '远端甲', lastSeenAt: T0, sessions: ['1111aaaa'] },
-      { address: '10.0.0.9', port: 7333, instanceId: 'inst-r1', identityName: '远端甲', lastSeenAt: tsPlus(5000), sessions: ['1111aaaa', '2222bbbb'] },
-      { address: '10.0.0.10', port: 7323, instanceId: 'inst-r2', identityName: '远端乙', lastSeenAt: T0, sessions: [] },
-      { address: '10.0.0.11', port: 7323, instanceId: 'inst-r3', identityName: '远端丙', lastSeenAt: T0 },
-      { address: '10.0.0.12', port: 7323, instanceId: '', identityName: '无名', lastSeenAt: T0, sessions: ['3333cccc'] },
+  const expected = {
+    localSeats: [],
+    remoteSeats: [
+      { instanceId: 'inst-b', identityName: '乙机', role: 'member', state: 'member' },
     ],
-  }));
-  const byRoot = new Map(createData(dataDir).listCollabs().collabs.map((entry) => [entry.root, entry]));
-  assert.deepEqual(byRoot.get('main').sessions.published, [
-    { instanceId: 'inst-r1', identityName: '远端甲', sessions: ['1111aaaa', '2222bbbb'] },
-    { instanceId: 'inst-r2', identityName: '远端乙', sessions: [] },
-  ]);
-  assert.equal('sessions' in byRoot.get('s2'), false);   // 站点根读自己的 known-hosts.json（无源＝整段省略）
+    departed: [],
+    pendingInvites: [],
+    pendingJoins: [],
+    activeSeatCount: 2,
+    localSeatCount: 0,
+    mutedSeatCount: 0,
+    freezeReason: null,
+    legacy: true,
+    readOnly: true,
+  };
+  assert.deepEqual(data.listCollabs().collabs[0].sessions, expected);
+  const meta = data.readMeta('main', 'c-1', null);
+  assert.deepEqual(meta.sessions, expected);
+  assert.equal(meta.name, '协作甲', '旧协作摘要名取 M8 读取器');
+  assert.equal(meta.state, 'completed', '旧协作按 completed 只读展示');
+  assert.equal(meta.skipped, 0, '旧台账行不得被新形态校验计成坏行');
 });
 
-test('sessions：缺数据源则省略（无表/无台账/无清单＝无段）；损坏档案按无源降级；表在场无条目＝null 如实', (t) => {
+test('sessions：migration.json legacy 标记与 recovery.json 半写目录均按只读呈现', (t) => {
   const dataDir = makeTempDir(t);
-  writeFiles(collabDirIn(dataDir, 'main', 'c-bare'), { [LEDGER_FILE_NAME]: jsonl(ledgerOf({ collabId: 'c-bare' })) });
+  writeFiles(collabDirIn(dataDir, 'main', 'c-mig'), {
+    [MEMBER_FILE_NAME]: JSON.stringify(memberRecord({ collabId: 'c-mig' })),
+    [LEDGER_FILE_NAME]: jsonl(legacyLedgerOf({ collabId: 'c-mig' })),
+    [MIGRATION_FILE_NAME]: JSON.stringify({ legacy: true, archivedAt: T0, reason: '旧形态迁移' }),
+  }, { legacy: true });
+  writeFiles(collabDirIn(dataDir, 'main', 'c-half'), {
+    [CARRIER_FILE_NAME]: JSON.stringify(carrierRecord({ collabId: 'c-half' })),
+    [RECOVERY_FILE_NAME]: JSON.stringify({ state: 'half-created', at: T0, reason: '台账未落盘' }),
+  });
+  const byId = new Map(createData(dataDir).listCollabs().collabs.map((entry) => [entry.id, entry]));
+  assert.equal(byId.get('c-mig').sessions.legacy, true);
+  assert.equal(byId.get('c-mig').sessions.readOnly, true);
+  assert.equal(byId.get('c-mig').sessions.recovery, undefined);
+  assert.equal(byId.get('c-mig').state, 'completed');
+  assert.equal(byId.get('c-half').sessions.recovery, true);
+  assert.equal(byId.get('c-half').sessions.readOnly, true);
+  assert.equal(byId.get('c-half').sessions.legacy, undefined);
+});
+
+test('sessions：仅台账在手也产席位段（远端成员）；完全空目录不产段；台账损坏按无源降级', (t) => {
+  const dataDir = makeTempDir(t);
+  writeFiles(collabDirIn(dataDir, 'main', 'c-ledger'), { [LEDGER_FILE_NAME]: jsonl(ledgerOf({ collabId: 'c-ledger' })) });
   writeFiles(collabDirIn(dataDir, 'main', 'c-broken'), {
     [LEDGER_FILE_NAME]: jsonl(ledgerOf({ collabId: 'c-broken' })),
     [JOINS_FILE_NAME]: '{不是 JSON',
   });
-  const bare = new Map(createData(dataDir).listCollabs().collabs.map((entry) => [entry.id, entry]));
-  assert.equal('sessions' in bare.get('c-bare'), false);          // 三源全缺＝整段省略
-  assert.equal('sessions' in bare.get('c-broken'), false);
-  writeFiles(join(dataDir, RUN_DIR_NAME), {
-    [BINDINGS_FILE_NAME]: JSON.stringify({ 'c-else': { sessionId: 'abcdef0123456789' } }),
-  });
-  const partial = new Map(createData(dataDir).listCollabs().collabs.map((entry) => [entry.id, entry]));
-  assert.deepEqual(partial.get('c-bare').sessions, { localBound: null });     // 表在场而本协作无条目＝如实 null
-  assert.deepEqual(partial.get('c-broken').sessions, { localBound: null });   // 损坏台账＝无源（不产空名单）
-  writeFiles(join(dataDir, RUN_DIR_NAME), { [BINDINGS_FILE_NAME]: '{不是 JSON' });
-  const corrupt = new Map(createData(dataDir).listCollabs().collabs.map((entry) => [entry.id, entry]));
-  assert.equal('sessions' in corrupt.get('c-bare'), false);       // 表损坏＝无源
+  mkdirSync(collabDirIn(dataDir, 'main', 'c-empty'), { recursive: true });
+  const byId = new Map(createData(dataDir).listCollabs().collabs.map((entry) => [entry.id, entry]));
+  assert.equal(byId.get('c-ledger').sessions.remoteSeats.length, 2);
+  assert.equal(byId.get('c-ledger').sessions.legacy, undefined);
+  assert.equal(byId.get('c-broken').sessions.remoteSeats.length, 2);
+  assert.equal('sessions' in byId.get('c-empty'), false);
 });
 
 /* —— 只读白名单（静态自证） —— */
@@ -1055,28 +1307,24 @@ test('只读白名单：data.js 的 import 只含白名单符号（防未来漂�
   const expected = new Map([
     ['node:fs', ['readFileSync', 'readdirSync', 'statSync']],
     ['node:path', ['join']],
-    ['../paths.js', ['COLLABS_DIR_NAME', 'CONFIG_FILE_NAME', 'SITES_DIR_NAME', 'bindingsFilePath', 'collabDir', 'collabFilePath', 'joinsFilePath']],
+    ['../paths.js', ['COLLABS_DIR_NAME', 'CONFIG_FILE_NAME', 'SEATS_DIR_NAME', 'SITES_DIR_NAME', 'carrierFilePath', 'collabDir', 'collabFilePath', 'departedFilePath', 'invitesFilePath', 'joinsFilePath', 'pendingInvitesFilePath', 'recoveryFilePath']],
     ['../net/protocol.js', ['ID_PATTERN', 'MAX_MESSAGE_TEXT_CHARS', 'POST_KINDS', 'isIdentityName']],
     ['../collab/posts.js', ['isPostEntryShape']],
     ['../collab/members.js', ['foldMemberEvents', 'isMemberEventShape']],
     ['../collab/model.js', ['isLedgerShape', 'isTimestamp']],
     ['../collab/store.js', ['loadMember']],
-    ['../collab/mute.js', ['isMuteShape']],   // 纯判据符号；写面 createMuteStore 不在此列
-    ['../collab/joins.js', ['isApprovalShape', 'isJoinsShape']],   // 同上：纯判据符号；写面 createJoinsStore 不在此列
+    ['../collab/legacy.js', ['readLegacyCollab']],
     ['../util/short-id.js', ['shortSessionId']],
     ['./text.js', ['displayText']],
     ['./meta.js', ['metaViewOf']],
   ]);
   const actual = new Map();
-  for (const line of source.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('import ')) {
-      continue;
-    }
-    const matched = /^import\s*\{([^}]+)\}\s*from\s*'([^']+)';$/.exec(trimmed);
-    assert.notEqual(matched, null, `import 行不属白名单形态：${trimmed}`);
+  const importPattern = /import\s*\{([^}]+)\}\s*from\s*'([^']+)';/g;
+  for (const matched of source.matchAll(importPattern)) {
     actual.set(matched[2], matched[1].split(',').map((symbol) => symbol.trim()).filter((symbol) => symbol !== '').sort());
   }
+  const importCount = [...source.matchAll(/^import\s/gm)].length;
+  assert.equal(actual.size, importCount, '所有 import 行都必须属白名单形态（含多行 import）');
   assert.deepEqual([...actual.keys()].sort(), [...expected.keys()].sort());
   for (const [module, symbols] of actual) {
     assert.deepEqual(symbols, [...expected.get(module)].sort(), `模块 ${module} 引入了白名单之外的符号`);
@@ -1084,4 +1332,33 @@ test('只读白名单：data.js 的 import 只含白名单符号（防未来漂�
   const code = source.replace(/\/\*[\s\S]*?\*\//g, '');   // 注释剔除后再查动态引用（JSDoc 的 import() 类型注解不算）
   assert.equal(/import\s*\(/.test(code), false, '不得有动态 import');
   assert.equal(/require\s*\(/.test(code), false, '不得有 require');
+});
+
+test('只读白名单：数据面文件清单精确覆盖（carrier/seats/邀请/离席/发现/状态/台账/恢复/旧形态），bindings 已移除', () => {
+  const source = readFileSync(fileURLToPath(new URL('../src/viewer/data.js', import.meta.url)), 'utf8');
+  const matched = /const READ_FILE_NAMES = Object\.freeze\(\[([\s\S]*?)\]\);/.exec(source);
+  assert.notEqual(matched, null, 'data.js 必须声明 READ_FILE_NAMES 白名单');
+  const names = [...matched[1].matchAll(/'([^']+)'/g)].map((entry) => entry[1]);
+  assert.deepEqual(names, [
+    'config.json',
+    'posts.jsonl',
+    'members.jsonl',
+    'inbox.jsonl',
+    'outbox.jsonl',
+    'counter.json',
+    'ledger.jsonl',
+    'snapshot.json',
+    'carrier.json',
+    'seats',
+    'invites.json',
+    'pending-invites.json',
+    'joins.json',
+    'departed.jsonl',
+    'known-hosts.json',
+    'recovery.json',
+    'member.json',
+    'migration.json',
+    'sessions',
+  ]);
+  assert.equal(source.includes('bindings'), false, '绑定表已退役，不得留在读取面');
 });

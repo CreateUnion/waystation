@@ -70,6 +70,34 @@ test('指示条目投影：静音态只在 true 时带字段（缺字段按未�
   assert.deepEqual(projected[1], { collabId: 'collab-2', name: '照常', state: 'active', role: 'member', mode: 'managed', memberCount: 2 });
 });
 
+test('指示条目席位来源：按本会话命中 localSeats 取 role/muted；无对应席位＝本会话未参与、条目剔除', () => {
+  const entries = [
+    {
+      collabId: 'collab-1', name: '双席协作', state: 'active', role: 'manager', mode: 'managed', memberCount: 3, muted: false,
+      sessions: {
+        localSeats: [
+          { sessionId: '11112222', role: 'manager', state: 'member', joinSeq: 1, muted: false },
+          { sessionId: '33334444', role: 'member', state: 'member', joinSeq: 2, muted: true },
+        ],
+      },
+    },
+    {
+      collabId: 'collab-2', name: '别会话', state: 'active', role: 'manager', mode: 'managed', memberCount: 2,
+      sessions: { localSeats: [{ sessionId: '55556666', role: 'manager', state: 'member', joinSeq: 1, muted: false }] },
+    },
+    { collabId: 'collab-3', name: '旧来源', state: 'frozen', role: 'member', mode: 'managed', memberCount: 2, muted: true },
+  ];
+  const projected = indicatedEntriesOf(entries, [{ collabId: 'collab-1', msgCount: 4 }], '33334444-aaaa-bbbb-cccc-333344445555');
+  assert.deepEqual(projected, [
+    { collabId: 'collab-1', name: '双席协作', state: 'active', role: 'member', mode: 'managed', memberCount: 3, muted: true, msgCount: 4 },
+    { collabId: 'collab-3', name: '旧来源', state: 'frozen', role: 'member', mode: 'managed', memberCount: 2, muted: true },
+  ]);
+  const managerSeat = indicatedEntriesOf(entries, [], '11112222-aaaa-bbbb-cccc-111122223333');
+  assert.equal(managerSeat[0].role, 'manager');
+  assert.equal('muted' in managerSeat[0], false);
+  assert.deepEqual(managerSeat.map((entry) => entry.collabId), ['collab-1', 'collab-3'], '席位表在场但无本会话席位＝不出条目；无席位表的旧来源保留兜底');
+});
+
 test('归档条目不进指示面：归档与非归档混合清单 → 文件 collabs 仅保留非归档', (t) => {
   /* 与组合根收集接线同形：谓词过滤后进快照，断言落在指示面（文件 collabs）。
    * 该行为此前无任何断言（过滤内联于组合根，无独立观测面），本用例即其锁点——谓词判反即红。 */
@@ -267,57 +295,68 @@ after(() => {
   assert.equal(leakedPids.length, 0, `站点进程未被用例收尾（收尾钩子被跳过？）：${leakedPids.join(',')}——已兜底强制杀灭，检查用例清理`);
 });
 
-/* 成员记录磁盘夹具（会话状态文件的模式标签来自真实载入路径）：mode 缺省不写 = 旧版记录形态。 */
-function writeMemberFixture(home, { collabId, name, mode }) {
+/* 0.2.0 席位夹具：carrier + seats/<sessionId>.json + 台账（状态栏条目由本会话席位表驱动）。 */
+function writeSeatCollab(home, { collabId, sessionId, name, role = 'member', muted = false }) {
   const now = new Date().toISOString();
-  const record = {
-    collabId,
-    role: 'member',
-    state: 'proposed',
-    name,
-    manager: { instanceId: 'inst-a', identityName: '主机甲' },
-    roster: [{ instanceId: 'inst-a', identityName: '主机甲' }, { instanceId: 'inst-self', identityName: '本机' }],
-    endpoints: {},
-    invitedAt: now,
-    expiresAt: new Date(Date.parse(now) + 86400000).toISOString(),
-    decision: null,
-  };
-  if (mode !== undefined) {
-    record.mode = mode;
-  }
-  mkdirSync(join(home, 'collabs', collabId), { recursive: true });
-  writeFileSync(join(home, 'collabs', collabId, 'member.json'), JSON.stringify(record));
-}
-
-/* 绑定表磁盘夹具（单核写面按绑定归属过滤会话文件的 collabs：绑定源＝run/bindings.json）。
- * entries＝[collabId, sessionId] 对：归属可跨会话（负例＝绑到别的会话）。 */
-function writeBindingsFixture(home, entries) {
-  const now = new Date().toISOString();
-  const bindings = Object.fromEntries(entries.map(([collabId, sessionId], index) => [collabId, {
+  const dir = join(home, 'collabs', collabId);
+  mkdirSync(join(dir, 'seats'), { recursive: true });
+  writeFileSync(join(dir, 'carrier.json'), JSON.stringify(carrierFixtureOf({ collabId, name, now })));
+  writeFileSync(join(dir, 'ledger.jsonl'), `${JSON.stringify(ledgerFixtureOf({ collabId, sessionId, name, role, now }))}\n`);
+  writeFileSync(join(dir, 'seats', `${sessionId}.json`), JSON.stringify({
+    version: 1,
     sessionId,
-    bridgeId: `bridge-fixture-${index + 1}`,
-    boundAt: now,
-    origin: 'join',
-  }]));
-  mkdirSync(join(home, 'run'), { recursive: true });
-  writeFileSync(join(home, 'run', 'bindings.json'), JSON.stringify(bindings));
+    role,
+    state: 'member',
+    joinSeq: 2,
+    joinedAt: now,
+    muted,
+  }));
 }
 
-test('进程级：讨论参与随模式标签进入会话状态文件（缺 mode 的旧记录按 managed 解释；单核写面按绑定归属）', { timeout: 30000 }, async (t) => {
+function carrierFixtureOf({ collabId, name, now }) {
+  return {
+    format: 'session-seats',
+    version: 1,
+    collabId,
+    name,
+    topic: '主题',
+    mode: 'managed',
+    endpoints: {},
+    manager: { instanceId: 'inst-a', sessionId: 'session-manager-fx', identityName: '主机甲', term: 1 },
+    snapshotVersion: 1,
+    createdAt: now,
+  };
+}
+
+function ledgerFixtureOf({ collabId, sessionId, name, role, now }) {
+  return {
+    version: 1,
+    collabId,
+    name,
+    topic: '主题',
+    status: 'active',
+    managerTerm: 1,
+    joinSeqNext: 3,
+    manager: { instanceId: 'inst-a', sessionId: 'session-manager-fx', identityName: '主机甲', term: 1 },
+    members: [
+      { instanceId: 'inst-a', sessionId: 'session-manager-fx', identityName: '主机甲', role: 'manager', state: 'member', joinSeq: 1, joinedAt: now },
+      { instanceId: 'inst-self', sessionId, identityName: '本机', role, state: 'member', joinSeq: 2, joinedAt: now },
+    ],
+    board: [],
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+/* M2 接线前标记：状态栏 collabs 仍由 main.js 的旧绑定表过滤（bindings 已退役为注入来源），
+ * 席位表驱动的进程级断言待 M2 把 collabsBoundTo 切到 listLocalSeats/席位表后启用。 */
+test('进程级：会话状态文件按席位表过滤（本会话席位所在协作进入；无席位协作不进入）', { timeout: 30000 }, async (t) => {
   const home = makeStationDir(t);
   const port = await pickFreePort();
-  // viewerAutoOpen: false——起站夹具不拉起真实观察窗（配置驱动的主保障）
   writeFileSync(join(home, 'config.json'), JSON.stringify({ port, scanWindowMs: 300, dialTimeoutMs: 1500, viewerAutoOpen: false }));
-  writeMemberFixture(home, { collabId: 'collab-forum-fx', name: '联调讨论', mode: 'forum' });
-  writeMemberFixture(home, { collabId: 'collab-legacy-fx', name: '联调项目' });
-  /* 负例：第三条协作在册（成员文件在场）但绑定归属另一会话——不得进入本会话文件 */
-  writeMemberFixture(home, { collabId: 'collab-other-fx', name: '别会话项目' });
-  const sessionId = 'session-forum-fx';
-  writeBindingsFixture(home, [
-    ['collab-forum-fx', sessionId],
-    ['collab-legacy-fx', sessionId],
-    ['collab-other-fx', 'session-other-fx'],
-  ]);
+  const sessionId = 'session-seat-fx';
+  writeSeatCollab(home, { collabId: 'collab-seat-fx', sessionId, name: '本会话协作', muted: true });
+  writeSeatCollab(home, { collabId: 'collab-other-fx', sessionId: 'session-other-fx', name: '别会话协作' });
   const child = spawn(process.execPath, [join(repoRoot, 'src', 'index.js')], {
     cwd: repoRoot,
     env: { ...process.env, WAYSTATION_HOME: home, CLAUDE_CODE_SESSION_ID: sessionId, WAYSTATION_TEST_GRACE_MS: '1500' },
@@ -328,13 +367,11 @@ test('进程级：讨论参与随模式标签进入会话状态文件（缺 mode
   await waitFor(() => (existsSync(file) ? true : null), { timeoutMs: 15000 });
   const payload = JSON.parse(readFileSync(file, 'utf8'));
   const byId = Object.fromEntries(payload.collabs.map((entry) => [entry.collabId, entry]));
-  assert.equal(payload.collabs.length, 2, '绑定归属本会话的两条协作进入文件（per-session 过滤）');
-  assert.equal(byId['collab-other-fx'], undefined, '绑到别会话的协作被过滤（负例）');
-  assert.equal(byId['collab-forum-fx'].mode, 'forum', '讨论条目带模式标签');
-  assert.equal(byId['collab-forum-fx'].state, 'proposed');
-  /* 讨论的成员数 = 折叠成员表（成员事件并集折叠）——夹具只有名单、没有成员事件 → 0 人。 */
-  assert.equal(byId['collab-forum-fx'].memberCount, 0);
-  assert.equal(byId['collab-legacy-fx'].mode, 'managed', '缺 mode 的旧记录按 managed 解释');
+  assert.equal(payload.collabs.length, 1, '仅本会话席位所在协作进入文件');
+  assert.equal(byId['collab-other-fx'], undefined, '无本会话席位的协作被过滤（负例）');
+  assert.equal(byId['collab-seat-fx'].role, 'member', 'role 取本席位角色');
+  assert.equal(byId['collab-seat-fx'].muted, true, 'muted 取本席位');
+  assert.equal(byId['collab-seat-fx'].state, 'active');
   child.stdin.end();
   const exit = await new Promise((resolve) => {
     const timer = setTimeout(() => resolve(null), 15000);

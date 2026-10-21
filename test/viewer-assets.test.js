@@ -35,24 +35,34 @@ test('客户端脚本：服务端契约锚点齐备', () => {
   assert.ok(!APP_JS.includes('feed-direction'), '方向标（位置已表达方向，冗余）应已移除');
 });
 
-/* 会话可见面的字符串级契约：数据面字段名（sessions 四视图）与四段呈现标签、如实零措辞、
- * 类锚点——任一侧改名（服务端换字段、客户端换措辞）这里先红。 */
-test('客户端脚本：会话可见面锚点齐备（四视图字段、四段标签与零措辞）', () => {
+/* 会话席位视图的字符串级契约：数据面字段名（本机/远端/离席/邀请/冻结/只读）与三段呈现标签、
+ * 席位级静音聚合措辞、类锚点——任一侧改名（服务端换字段、客户端换措辞）这里先红。 */
+test('客户端脚本：会话席位视图锚点齐备（三段字段、只读标记、席位静音聚合）', () => {
   for (const anchor of [
     'sessions',
-    'localBound',
-    'localGranted',
-    'grantedRemote',
-    'published',
-    '本机绑定',
-    '本机获准',
-    '站长获准名单',
-    '远端发布',
-    '0 个会话',
+    'localSeats',
+    'remoteSeats',
+    'departed',
+    'pendingInvites',
+    'pendingJoins',
+    'freezeReason',
+    'legacy',
+    'readOnly',
+    '本机会员席位',
+    '远端成员',
+    '离席历史',
+    '待回应邀请',
+    '旧版·只读',
+    '席中',
+    '席静音',
+    'collab-muted',
     'collab-sessions',
     'banner-sessions',
   ]) {
     assert.ok(APP_JS.includes(anchor), '缺少锚点：' + anchor);
+  }
+  for (const retired of ['localBound', 'localGranted', 'grantedRemote', 'published', '本机绑定', '本机获准', '站长获准名单', '远端发布']) {
+    assert.equal(APP_JS.includes(retired), false, '旧四视图锚点应已移除：' + retired);
   }
   assert.ok(STYLE_CSS.includes('.collab-sessions'), '缺少列表行会话摘要样式');
   assert.ok(STYLE_CSS.includes('.banner-sessions'), '缺少详情页会话区样式');

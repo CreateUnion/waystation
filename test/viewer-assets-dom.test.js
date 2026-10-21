@@ -222,80 +222,113 @@ test('列表视图：空态文案', async () => {
   assert.equal(textOf(env.byId['list-view']), '本机暂无协作或讨论');
 });
 
-test('列表视图：muted 行加 🔇 标记，非静音行无标记', async () => {
+test('列表视图：本机席位有静音时显示「N 席中 M 席静音」聚合；全未静音无标记', async () => {
   const env = createEnv();
   await bootList(env, [
-    { root: 'main', id: 'demo', name: '演示', mode: 'managed', state: 'active', memberCount: 2, count: 5, updatedAt: 1760000000000, muted: true },
-    { root: 'main', id: 'calm', name: '平静', mode: 'managed', state: 'active', memberCount: 1, count: 1, updatedAt: 1760000001000, muted: false },
+    {
+      root: 'main', id: 'demo', name: '演示', mode: 'managed', state: 'active', memberCount: 2, count: 5, updatedAt: 1760000000000,
+      sessions: { localSeats: [{ sessionId: 'aaaa1111', muted: true }, { sessionId: 'bbbb2222', muted: false }] },
+    },
+    {
+      root: 'main', id: 'calm', name: '平静', mode: 'managed', state: 'active', memberCount: 1, count: 1, updatedAt: 1760000001000,
+      sessions: { localSeats: [{ sessionId: 'cccc3333', muted: false }] },
+    },
   ]);
   const rows = findAll(env.byId['list-view'], 'collab-row');
-  assert.equal(findAll(rows[0], 'collab-muted').length, 1, '静音行应有 🔇 标记');
-  assert.ok(textOf(rows[0]).includes('🔇'), textOf(rows[0]));
-  assert.equal(findAll(rows[1], 'collab-muted').length, 0, '非静音行不得出现标记');
+  assert.equal(findAll(rows[0], 'collab-muted').length, 1, '静音聚合应有标记');
+  assert.ok(textOf(rows[0]).includes('🔇 2 席中 1 席静音'), textOf(rows[0]));
+  assert.equal(findAll(rows[1], 'collab-muted').length, 0, '全未静音不得出现标记');
   assert.ok(!textOf(rows[1]).includes('🔇'), textOf(rows[1]));
 });
 
-test('列表视图：会话摘要段（本机绑定/获准短码、站长获准名单、远端发布台数）；缺段不渲染', async () => {
+test('列表视图：席位摘要段（活跃/本机/远端/离席/邀请/只读）；无 sessions 字段不渲染', async () => {
   const env = createEnv();
   await bootList(env, [
     {
       root: 'main', id: 'demo', name: '演示', mode: 'managed', state: 'active', memberCount: 2, count: 5, updatedAt: 1760000000000,
       sessions: {
-        localBound: 'aaaa1111',
-        localGranted: ['bbbb2222'],
-        grantedRemote: [{ instanceId: 'inst-b', identityName: '乙机', sessionId: 'cccc3333' }],
-        published: [{ instanceId: 'inst-c', identityName: '丙机', sessions: ['dddd4444'] }],
+        activeSeatCount: 3,
+        localSeats: [{ sessionId: 'aaaa1111' }],
+        remoteSeats: [{ instanceId: 'inst-b', identityName: '乙机', sessionId: 'cccc3333' }, { instanceId: 'inst-x', sessionId: 'dddd4444' }],
+        departed: [{ instanceId: 'inst-c', identityName: '丙机', sessionId: 'eeee5555', reason: 'manager-lost' }],
+        pendingInvites: [{ inviteId: 'inv-1' }],
+        pendingJoins: [],
+        freezeReason: 'manager-offline',
       },
     },
     { root: 'main', id: 'plain', name: '素面', mode: 'managed', state: 'active', memberCount: 1, count: 1, updatedAt: 1760000001000 },
-    { root: 'main', id: 'zero', name: '零获准', mode: 'managed', state: 'active', memberCount: 1, count: 1, updatedAt: 1760000002000, sessions: { localBound: null, localGranted: [] } },
-    { root: 'main', id: 'forum', name: '讨论一号', mode: 'forum', state: 'active', memberCount: 1, count: 2, updatedAt: 1760000003000, sessions: { localBound: 'eeee5555' } },
+    {
+      root: 'main', id: 'legacy', name: '旧协作', mode: 'managed', state: 'completed', memberCount: 2, count: 3, updatedAt: 1760000002000,
+      sessions: { activeSeatCount: 0, localSeats: [], remoteSeats: [], departed: [], pendingInvites: [], pendingJoins: [], freezeReason: null, legacy: true, readOnly: true },
+    },
   ]);
   const rows = findAll(env.byId['list-view'], 'collab-row');
   const full = textOf(rows[0]);
-  assert.ok(full.includes('会话：本机绑定 aaaa1111｜本机获准 bbbb2222｜站长获准名单 乙机 cccc3333｜远端发布 1 台'), full);
+  assert.ok(full.includes('会话：冻结：站长离线｜活跃 3 席｜本机 1 席｜远端 2 席｜离席 1｜待回应邀请 1'), full);
   assert.equal(findAll(rows[1], 'collab-sessions').length, 0, '无 sessions 字段＝无摘要段');
   assert.ok(!textOf(rows[1]).includes('会话：'), textOf(rows[1]));
-  assert.ok(textOf(rows[2]).includes('会话：本机获准 0 个会话'), textOf(rows[2]));
-  assert.ok(!textOf(rows[2]).includes('本机绑定'), '绑定 null＝该段不出：' + textOf(rows[2]));
-  const forum = textOf(rows[3]);
-  assert.ok(forum.includes('会话：本机绑定 eeee5555'), forum);
-  assert.ok(!forum.includes('本机获准') && !forum.includes('站长获准名单'), '讨论无批准门＝不产获准段：' + forum);
+  const legacy = textOf(rows[2]);
+  assert.ok(legacy.includes('旧版·只读'), legacy);
+  assert.ok(!legacy.includes('远端发布') && !legacy.includes('本机获准'), '旧四视图摘要不得出现：' + legacy);
 });
 
-test('详情成员区：sessions 四段一行一段（机器标签＋短码、零会话如实零）；缺段不出行、无内容不出区', async () => {
+test('详情成员区：本机会员席位/远端成员/离席历史三段（机器＋短码＋角色＋状态＋joinSeq）；冻结/只读行齐备', async () => {
   const env = createEnv();
   await bootDetail(env, { rows: [], reset: true, skipped: 0 }, metaBody({
     sessions: {
-      localBound: 'aaaa1111',
-      grantedRemote: [
-        { instanceId: 'inst-b', identityName: '乙机', sessionId: 'cccc3333' },
-        { instanceId: 'inst-x', sessionId: 'dddd4444' },
+      activeSeatCount: 3,
+      localSeats: [
+        { identityName: '甲机', sessionId: 'aaaa1111', role: 'manager', state: 'member', joinSeq: 1, muted: true },
       ],
-      published: [
-        { instanceId: 'inst-c', identityName: '丙机', sessions: ['eeee5555', 'ffff6666'] },
-        { instanceId: 'inst-y', identityName: '丁机', sessions: [] },
+      remoteSeats: [
+        { instanceId: 'inst-b', identityName: '乙机', sessionId: 'cccc3333', role: 'member', state: 'member', joinSeq: 2 },
+        { instanceId: 'inst-x', sessionId: 'dddd4444', role: 'member', state: 'joining' },
       ],
+      departed: [
+        { instanceId: 'inst-c', identityName: '丙机', sessionId: 'eeee5555', reason: 'manager-lost', at: TS_MORNING },
+      ],
+      pendingInvites: [{ inviteId: 'inv-1' }],
+      pendingJoins: [],
+      freezeReason: 'manager-fork',
     },
   }));
   assert.deepEqual(textLines(env.byId['banner'], 'session-line'), [
-    '本机绑定：aaaa1111',
-    '站长获准名单：乙机 cccc3333、inst-x dddd4444',
-    '远端发布：丙机 eeee5555 ffff6666、丁机 0 个会话',
+    '冻结原因：任期分叉',
+    '本机会员席位：甲机 aaaa1111（站长·在席·入席 1·🔇静音）',
+    '远端成员：乙机 cccc3333（成员·在席·入席 2）、inst-x dddd4444（成员·入席中）',
+    '离席历史：丙机 eeee5555（manager-lost·' + TS_MORNING + '）',
+    '待回应邀请：1 条',
   ]);
   const bare = createEnv();
   await bootDetail(bare, { rows: [], reset: true, skipped: 0 }, metaBody());   // 数据面无该字段
   assert.equal(findAll(bare.byId['banner'], 'banner-sessions').length, 0, '无 sessions 字段＝整区不出');
-  const empty = createEnv();
-  await bootDetail(empty, { rows: [], reset: true, skipped: 0 }, metaBody({ sessions: { localBound: null } }));
-  assert.equal(findAll(empty.byId['banner'], 'banner-sessions').length, 0, '无内容＝整区不出');
+});
+
+test('详情成员区：旧版只读标记与三段如实零（0 席/0 席/0 条）', async () => {
+  const env = createEnv();
+  await bootDetail(env, { rows: [], reset: true, skipped: 0 }, metaBody({
+    sessions: { localSeats: [], remoteSeats: [], departed: [], pendingInvites: [], pendingJoins: [], freezeReason: null, legacy: true, readOnly: true },
+  }));
+  assert.deepEqual(textLines(env.byId['banner'], 'session-line'), [
+    '旧版·只读',
+    '本机会员席位：0 席',
+    '远端成员：0 席',
+    '离席历史：0 条',
+  ]);
 });
 
 test('详情成员区：机器名与短码按文本注入（不触 innerHTML）', async () => {
   const env = createEnv();
   const hostile = '<img src=x onerror=1>';
   await bootDetail(env, { rows: [], reset: true, skipped: 0 }, metaBody({
-    sessions: { grantedRemote: [{ instanceId: 'inst-b', identityName: hostile, sessionId: 'cccc3333' }] },
+    sessions: {
+      localSeats: [],
+      remoteSeats: [{ instanceId: 'inst-b', identityName: hostile, sessionId: 'cccc3333', role: 'member', state: 'member' }],
+      departed: [],
+      pendingInvites: [],
+      pendingJoins: [],
+      freezeReason: null,
+    },
   }));
   const block = findAll(env.byId['banner'], 'banner-sessions')[0];
   assert.notEqual(block, undefined);
@@ -328,20 +361,39 @@ test('详情首屏：并发发起、横幅、跨日分隔、注入面分界', as
   assert.equal(findAll(env.byId['stream'], 'feed-time')[0].attrs.title, TS_MORNING, '悬停 title 为原始 ISO');
 });
 
-test('横幅：muted=true 显示静音提醒（含 /ws-mute 要素），翻回 false 即移除', async () => {
+test('横幅：本机席位静音聚合显示「N 席中 M 席静音」（含 /ws-mute 要素），全部取消即移除', async () => {
   const env = createEnv();
-  await bootDetail(env, { rows: [], reset: true, skipped: 0 }, metaBody({ muted: true }));
+  const mutedSeats = {
+    localSeats: [
+      { identityName: '甲机', sessionId: 'aaaa1111', role: 'manager', state: 'member', joinSeq: 1, muted: true },
+      { identityName: '甲机', sessionId: 'bbbb2222', role: 'member', state: 'member', joinSeq: 2, muted: false },
+    ],
+    remoteSeats: [],
+    departed: [],
+    pendingInvites: [],
+    pendingJoins: [],
+    freezeReason: null,
+  };
+  await bootDetail(env, { rows: [], reset: true, skipped: 0 }, metaBody({ sessions: mutedSeats }));
   const banner = textOf(env.byId['banner']);
-  assert.ok(banner.includes('🔇 本协作已静音'), banner);
-  assert.ok(banner.includes('消息不注入 AI 会话') && banner.includes('/ws-mute'), banner);
+  assert.ok(banner.includes('🔇 2 席中 1 席静音'), banner);
+  assert.ok(banner.includes('消息不注入静音席位所在会话') && banner.includes('/ws-mute'), banner);
   env.plan(
     { match: '/feed', body: { rows: [], reset: false, skipped: 0 } },
-    { match: '/meta', body: metaBody({ muted: false }) },
+    {
+      match: '/meta',
+      body: metaBody({
+        sessions: {
+          ...mutedSeats,
+          localSeats: mutedSeats.localSeats.map((seat) => ({ ...seat, muted: false })),
+        },
+      }),
+    },
   );
   env.timer();
   await env.flush();
   const after = textOf(env.byId['banner']);
-  assert.ok(!after.includes('🔇'), '取消静音后横幅必须移除：' + after);
+  assert.ok(!after.includes('🔇'), '全部取消静音后横幅必须移除：' + after);
   assert.ok(after.includes('【演示】进行中'), '常规横幅行不受影响：' + after);
 });
 
