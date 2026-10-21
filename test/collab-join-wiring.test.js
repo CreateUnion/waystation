@@ -1471,6 +1471,45 @@ test('终态拒绝回执（N-3）：已撤回 / 已过期邀请的 approve 回 j
   assert.equal(deliveredOf(expiring.sent, 'join-deny').at(-1).payload.reason, 'expired');
 });
 
+test('重复 approve：邀请 TTL 在 grant 窗口内到期时仍续发同一 grant，不回终态拒绝', async (t) => {
+  const made = makeHarness(t, { config: { inviteTtlMs: 1000 } });
+  const invite = await made.join.createInvite({
+    collabId: COLLAB, managerSessionId: MANAGER_SESSION, targetInstanceId: 'inst-a', targetSessionId: 'app-session-1',
+  });
+  const granted = await made.join.handleInviteApproval(inviteApprovalFrame(invite.inviteId, 'app-session-1'));
+  assert.equal(granted.ok, true, granted.message);
+  assert.equal(granted.joining, true);
+  made.advance(2000);
+  made.sent.length = 0;
+  const again = await made.join.handleInviteApproval(inviteApprovalFrame(invite.inviteId, 'app-session-1'));
+  assert.equal(again.ok, true, '在途 grant 有效时重复 approve 幂等成功');
+  assert.equal(again.joinId, granted.joinId, '续发同一 joinId，不重开在途记录');
+  assert.equal(deliveredOf(made.sent, 'join-grant').length, 1, '回执是续发的 join-grant');
+  assert.equal(deliveredOf(made.sent, 'join-deny').length, 0, '在途 grant 不得被打回终态拒绝');
+  const confirmed = await made.join.handleJoinConfirm(joinConfirmFrame(granted.joinId, 'app-session-1'));
+  assert.equal(confirmed.action, 'join-confirmed', '续发后 confirm 仍可入名单');
+});
+
+test('重复 approve：名单已含本席时幂等成功，不回终态拒绝也不重复入名单', async (t) => {
+  const made = makeHarness(t);
+  const invite = await made.join.createInvite({
+    collabId: COLLAB, managerSessionId: MANAGER_SESSION, targetInstanceId: 'inst-a', targetSessionId: 'app-session-1',
+  });
+  const granted = await made.join.handleInviteApproval(inviteApprovalFrame(invite.inviteId, 'app-session-1'));
+  assert.equal((await made.join.handleJoinConfirm(joinConfirmFrame(granted.joinId, 'app-session-1'))).action, 'join-confirmed');
+  made.sent.length = 0;
+  const again = await made.join.handleInviteApproval(inviteApprovalFrame(invite.inviteId, 'app-session-1'));
+  assert.equal(again.ok, true, '已入名单按幂等成功处置');
+  assert.equal(again.member, true);
+  assert.equal(again.alreadyMember, true);
+  assert.equal(deliveredOf(made.sent, 'join-deny').length, 0, '已成立的席位不得被误拒');
+  assert.equal(
+    made.local.ledger.members.filter((entry) => entry.sessionId === 'app-session-1').length,
+    1,
+    '名单不重复登记',
+  );
+});
+
 test('目标端撤回：挂起邀请置 withdrawn 并停投', async (t) => {
   const made = makeHarness(t);
   const invite = await made.join.createInvite({

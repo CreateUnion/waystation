@@ -1922,7 +1922,7 @@ test('主动加入：同名多讨论 → 各实例各自应答、逐一提示（
   assert.equal(notices.length, 2, '同一敲门在两实例各提示一行（放行按 collabId 执行）');
 });
 
-test('同机敲门放行指引指名请求会话（N-4）：本机回环可见登记时，指引给出 targetSessionId', async (t) => {
+test('同机敲门放行指引不指名：指引只给身份与端点，放行走未指名邀请由同意门定夺', async (t) => {
   const knocker = 'sess-knock-b';
   const made = makeService(t, {
     requestJoin: async ({ name }) => {
@@ -1939,8 +1939,8 @@ test('同机敲门放行指引指名请求会话（N-4）：本机回环可见�
   assert.equal(knocked.knocked, true);
   const notice = made.notices.find((frame) => frame.payload?.event === 'local-alert');
   assert.ok(notice !== undefined, '敲门命中发出放行指引');
-  assert.ok(notice.payload.text.includes(knocker), '放行指引指名请求会话');
-  assert.ok(notice.payload.text.includes('targetSessionId'), '指引给出 ws_invite 的指名参数');
+  assert.ok(notice.payload.text.includes('inst-self'), '指引带申请人身份（身份仍由敲门报文提供）');
+  assert.ok(!notice.payload.text.includes('targetSessionId'), '指引不再给出指名参数——放行按未指名邀请');
 });
 
 test('同机双会话（N-4）：未指名邀请被其他会话接受时不得替敲门者建席', async (t) => {
@@ -1970,7 +1970,7 @@ test('同机双会话（N-4）：未指名邀请被其他会话接受时不得�
   );
 });
 
-test('同机双会话 e2e（N-4）：B 敲门 → 指名放行 → B 有席位、join 事件、可发帖、对端可见', async (t) => {
+test('同机双会话 e2e：B 敲门 → B 自己接受未指名邀请 → B 有席位、join 事件、可发帖、对端可见', async (t) => {
   const collabId = 'collab-n4-named';
   const knocker = 'sess-knock-b';
   const made = makeService(t, {
@@ -1980,10 +1980,10 @@ test('同机双会话 e2e（N-4）：B 敲门 → 指名放行 → B 有席位�
   assert.equal(knocked.ok, true, knocked.message);
   assert.equal(knocked.knocked, true);
 
-  const targeted = inviteFrame({ collabId, name: '讨论甲', mode: 'forum', members: [peer('inst-a', '主机甲'), peer('inst-self', '本机', 17321)] });
-  targeted.payload.targets = [{ instanceId: 'inst-self', targetSessionId: knocker }];
-  targeted.payload.endpoints = { 'inst-a': { address: '127.0.0.1', port: 17321 } };
-  assert.equal((await receive(made.service, targeted)).ok, true);
+  const invite = inviteFrame({ collabId, name: '讨论甲', mode: 'forum', members: [peer('inst-a', '主机甲'), peer('inst-self', '本机', 17321)] });
+  invite.payload.endpoints = { 'inst-a': { address: '127.0.0.1', port: 17321 } };
+  assert.deepEqual(invite.payload.targets, undefined, '放行走未指名邀请（生产路径不再指名）');
+  assert.equal((await receive(made.service, invite)).ok, true);
   const bJoined = await approveInviteWithConsentOf(made.service, collabId, knocker);
   assert.equal(bJoined.ok, true, bJoined.message);
   assert.equal(bJoined.joined, true);

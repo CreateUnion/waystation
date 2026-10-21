@@ -263,7 +263,7 @@ function seatStateOf(options) {
     /* 本轮 leave 帧 msgId（进程内，不落盘）：核心退出冲刷时用于留痕与待发判定。 */
     stopLeaveMsgIds: new Set(),
     /* 邀请落点失败的帧标识（进程内）：sessionGate 据此抑制注入——该邀请已不可接受，
-     * 注入只会让用户看到一条无法回应的待办（M-5 注入面）。 */
+     * 注入只会让用户看到一条无法回应的待办。 */
     failedInviteFrames: new Set(),
   };
 }
@@ -1493,7 +1493,7 @@ async function acceptSeatInviteNow(state, input) {
  * 只在挂起记录确实不存在时才退回旧路径的「本机没有该协作」错误面。 */
 async function acceptSeatInviteWithoutLocalOf(state, input) {
   /* 已接受过的记录不再由 pendingInvitesFor 冒泡：重复接受（approve/grant 丢帧或重启后重试）
-   * 必须仍进入加入域，由 alreadyAcceptedInviteOf 决定幂等或重发 approve（C-3 / N-1）。 */
+   * 必须仍进入加入域，由 alreadyAcceptedInviteOf 决定幂等或重发 approve。 */
   const pending = pendingInviteRecordOf(state, input) ?? acceptedInviteRecordOf(state, input);
   if (pending === null) {
     return approveInvite(state, input);

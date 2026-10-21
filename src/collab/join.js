@@ -117,7 +117,6 @@ function sessionJoinApiOf(joinState) {
     pendingInviteList: (input) => pendingInviteListOf(joinState, input ?? {}),
     acceptedInvite: (input) => acceptedInviteOf(joinState, input ?? {}),
     pendingInviteCount: (at) => pendingInviteCountOf(joinState, at),
-    knockedSession: (name) => knockedSessionOf(joinState, name),
     registerPendingInvite: (input) => registerPendingInviteOf(joinState, input ?? {}),
     handleInviteFrame: (frame) => handleInviteFrameOf(joinState, frame),
     handleInviteApproval: (frame) => handleInviteApprovalOf(joinState, frame),
@@ -757,8 +756,8 @@ function rosterJoinSeqOf(local, sessionId) {
 }
 
 async function knockByName(joinState, name, sessionId) {
-  /* 登记先于敲门：发现层若把敲门回送到本机（同机讨论 / 回环），放行指引才能按
-   * (instanceId, sessionId) 指名请求会话；敲门失败时撤掉本次登记（不留没发出去的申请）。 */
+  /* 登记先于敲门：登记是同意门落地时把席位交回请求会话的凭据——放行可能在敲门返回前就到
+   * （同机旁路），先登记才不会漏接线；敲门失败时撤掉本次登记（不留没发出去的申请）。 */
   const registration = rememberKnock(joinState, name, sessionId);
   const knocked = await knockOf(joinState, name);
   if (knocked.ok !== true) {
@@ -782,12 +781,6 @@ function forgetKnock(joinState, name, registration) {
   if (joinState.knocks.get(name) === registration) {
     joinState.knocks.delete(name);
   }
-}
-
-/* 登记在册的请求会话（放行指引的指名面）：无登记 / 形态坏一律 null。 */
-function knockedSessionOf(joinState, name) {
-  const registered = typeof name === 'string' ? joinState.knocks.get(name) : undefined;
-  return registered !== undefined && isIdentityName(registered.sessionId) ? registered.sessionId : null;
 }
 
 /* 同意门落地后的收口（服务在讨论邀请被批准时调用）：该讨论名登记在册的请求会话接线——放行者
@@ -1364,7 +1357,7 @@ function rosterRowsOf(local) {
 /* 名单已含本席（崩溃重放 / 重复 confirm 的短路判据）：只认共享名单 / 快照。
  * 本地席位文件不是成员权威——站长台账重建或回退到不含该席的快照后，旧席位文件仍可能写着
  * member；把它当成员会让批准与 confirm 短路而不写共享名单，形成「本机可见、对端不可见」的
- * 双权威分叉（I-10）。本地席位只服务「同 joinId 崩溃重放」的确认重发（resendConfirmForGrantOf
+ * 双权威分叉：本地席位只服务「同 joinId 崩溃重放」的确认重发（resendConfirmForGrantOf
  * 按 joinId 匹配），不参与成员判定。 */
 function isRosterMember(local, instanceId, sessionId) {
   if (local === undefined || idOf(instanceId) === null || idOf(sessionId) === null) {
@@ -1916,7 +1909,7 @@ function markMemberAcceptedOf(joinState, collabId) {
 
 /* 同会话重复接受：记录已被接受后 matchPending 不再冒泡，这里补回判据。
  * 已真正成席（席位 member 且 unverified 已清）＝幂等成功；尚未成席（approve/grant 丢帧）时
- * 必须重发 approve——只回「已接受」会让用户在没有席位的情况下无从恢复（C-3）。 */
+ * 必须重发 approve——只回「已接受」会让用户在没有席位的情况下无从恢复。 */
 async function alreadyAcceptedInviteOf(joinState, books, { collabId, inviteId, sessionId }) {
   const record = books.pending.store.get({ collabId, inviteId });
   if (record === null || !record.acceptedSessions.includes(sessionId)) {
@@ -2022,7 +2015,7 @@ async function sendDeclineFrameOf(joinState, { collabId, inviteId, sessionId, re
     : { ...base, delivery: sent, note: `拒绝已本地生效；decline 帧未送达：${sent.reason}` };
 }
 
-/* 同机拒绝的簿记收口（N-2）：先直接调用发起侧拒绝处理（等价于核内收到 decline 帧），
+/* 同机拒绝的簿记收口：先直接调用发起侧拒绝处理（等价于核内收到 decline 帧），
  * 不依赖「帧注入未入席会话」这条不存在的地面；随后照旧把帧交给本机邀请者会话
  * （展示与拒绝计数面——同机旁路的既有投递语义不变）。 */
 async function localDeclineDeliveryOf(joinState, { base, collabId, inviteId, sessionId, reason, manager }) {
@@ -2099,7 +2092,7 @@ function forgetInviteAcceptanceOf(joinState, collabId, sessionId) {
 }
 
 /* 同机接受：两段式成功后才消费挂起邀请——先消费再批准会让 grant 发送/名单提交的瞬态失败
- * 把邀请一次烧掉（重试只剩「已接受（幂等）」）。失败保留 pending 供重试（C-3）。 */
+ * 把邀请一次烧掉（重试只剩「已接受（幂等）」）。失败保留 pending 供重试。 */
 async function acceptLocalInviteOf(joinState, { collabId, inviteId, sessionId, manager, books }) {
   rememberInviteAcceptanceOf(joinState, { collabId, sessionId, managerInstanceId: joinState.state.self.instanceId });
   const approved = await approveInviteForSeat(joinState, {
@@ -2130,20 +2123,23 @@ async function approveInviteForSeat(joinState, input) {
     return failureMessage('只有站长会话可以批准邀请');
   }
   const books = booksOf(joinState, input.collabId);
+  /* 既成事实优先于邀请记录状态（设计 §4.4.6）：名单已含本席、或该会话的 grant 仍在途时，
+   * 重复 approve 是重试而非新申请——邀请 TTL 到期/已接受只说明「不能再新开一次入席」，
+   * 不得据此把已成立的席位或仍有效的 grant 打回终态（目标端会据此回滚席位，造成名单与席位分叉）。 */
+  if (isRosterMember(local, input.instanceId, input.sessionId)) {
+    return { ok: true, member: true, alreadyMember: true, inviteId: input.inviteId };
+  }
+  const existing = books.joining.registry.find(input.collabId, input.sessionId);
+  if (existing !== null && joinState.now() < existing.expiresAt) {
+    return existing.instanceId === input.instanceId
+      ? grantSeatOf(joinState, local, books, existing, input.managerSessionId, input.inviteId)
+      : failureMessage('同一会话已有其他实例的在途 grant——拒绝覆盖（instance-mismatch）', { reason: 'instance-mismatch' });
+  }
   const matched = books.invites.book.matchInvite(input.inviteId, {
     instanceId: input.instanceId, sessionId: input.sessionId, now: joinState.now(),
   });
   if (matched.ok !== true) {
     return failureMessage(`邀请不可用：${matched.reason}`, { reason: matched.reason });
-  }
-  if (isRosterMember(local, input.instanceId, input.sessionId)) {
-    return { ok: true, member: true, alreadyMember: true, inviteId: input.inviteId };
-  }
-  const existing = books.joining.registry.find(input.collabId, input.sessionId);
-  if (existing !== null) {
-    return existing.instanceId === input.instanceId
-      ? grantSeatOf(joinState, local, books, existing, input.managerSessionId, input.inviteId)
-      : failureMessage('同一会话已有其他实例的在途 grant——拒绝覆盖（instance-mismatch）', { reason: 'instance-mismatch' });
   }
   const begun = await beginSeatJoiningOf(joinState, local, books, {
     collabId: input.collabId, instanceId: input.instanceId, sessionId: input.sessionId,
@@ -3390,8 +3386,8 @@ function inviteTargetsJoiningOf(record, joining) {
     && (target.targetSessionId === undefined || target.targetSessionId === joining.sessionId));
 }
 
-/* 撤回帧：目标端据此清挂起记录。同机目标不投帧（未入席会话没有可投面，N-2）——直接清本机
- * 挂起记录并同步本地参与记录的撤回结论。远端投递结果只留痕（撤回已在本地生效）。 */
+/* 撤回帧：目标端据此清挂起记录。同机目标不投帧（未入席会话没有可投面）——直接清本机
+ * 挂起记录；本机参与记录是站长侧副本，不随邀请撤回改写。远端投递结果只留痕（撤回已在本地生效）。 */
 function notifyWithdrawnTargetsOf(joinState, collabId, record, managerSessionId) {
   if (record === null) {
     return;
@@ -3414,16 +3410,13 @@ function notifyWithdrawnTargetsOf(joinState, collabId, record, managerSessionId)
   }
 }
 
-/* 同机撤回的本地收口：清挂起记录并同步本地参与记录（与远端 handleWithdrawInbound 同口径）。 */
+/* 同机撤回的本地收口：清掉本机的挂起邀请记录（发起侧记录由调用方关闭）。
+ * 同机旁路只在站长本机发生，本机参与记录恒为 manager，没有成员侧决定需要同步；
+ * 远端目标的成员记录由 handleWithdrawInbound 面处置。 */
 function applyLocalWithdrawOf(joinState, { collabId, inviteId }) {
   const cleared = withdrawPendingInviteOf(joinState, { collabId, inviteId });
   if (cleared.ok !== true) {
     joinState.log.warn('同机撤回清理挂起邀请失败', { collabId, inviteId, reason: cleared.reason });
-  }
-  const local = joinState.state.collabs.get(collabId);
-  if (local !== undefined && local.role === 'member' && (local.member?.decision ?? null) === null) {
-    local.member.decision = 'withdrawn';
-    persistMember(joinState.state, local);
   }
 }
 
@@ -3870,7 +3863,7 @@ function replayInviteFrameOf(joinState, collabId, record) {
 }
 
 /* 站长侧收到受邀会话的 approve（approve 携 inviteId 时由事件面转交本域签发 grant）。
- * 终态拒绝必须回执（N-3）：目标端已消费挂起邀请并停在「已接受、待授权」，没有 grant 也不会
+ * 终态拒绝必须回执：目标端已消费挂起邀请并停在「已接受、待授权」，没有 grant 也不会
  * 自行收敛——不回收据就是用户可见死胡同。 */
 async function handleInviteApprovalOf(joinState, frame) {
   const context = inviteApprovalContextOf(joinState, frame);

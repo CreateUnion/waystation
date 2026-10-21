@@ -284,8 +284,8 @@ function inviteLandingFailureOf(state, frame) {
   state.log.warn('邀请落点登记失败——中止本次邀请落地（不建本地参与记录）', {
     collabId: frame.collabId, reason: recorded.reason ?? recorded.message ?? 'unknown',
   });
-  /* 标记落点失败的帧：入站管线的会话注入不接受 invite 的 sessionDeliver 声明，改由
-   * sessionGate 读本标记抑制注入（M-5）。 */
+  /* 标记落点失败的帧：落点失败的事实只有本机知道，帧内的 sessionDeliver 声明可能在上游
+   * 路径丢失；会话注入面改读本标记，确保失败邀请不会再以「待回应的待办」出现在会话里。 */
   noteInviteLandingOutcome(state, frame, true);
   return { ok: false, reason: recorded.reason ?? 'invite-landing-failed', sessionDeliver: false };
 }
@@ -541,9 +541,11 @@ function conflictParticipantsOf(local, conflict) {
 
 /* 同意帧携 inviteId（会话级邀请）：转加入域的批准面签发 join-grant；无 inviteId 的旧形态
  * 或讨论实例仍走本地回应记账。 */
-function handleApproveResponse(state, frame) {
+async function handleApproveResponse(state, frame) {
   if (typeof frame.payload?.inviteId === 'string' && typeof state.join?.handleInviteApproval === 'function') {
-    const result = state.join.handleInviteApproval(frame);
+    /* 加入域是异步面：必须等它真正给出结论再判空，否则 Promise 恒真，形态异常的帧
+     * 永远不会回落到下面的记账路径。 */
+    const result = await state.join.handleInviteApproval(frame);
     if (result !== null && result !== undefined) {
       return result;
     }
@@ -1572,7 +1574,7 @@ function oldManagerBypassEligible(state, local, termState, change) {
   if (local.role !== 'manager' || change.via !== 'takeover-manual') {
     return false;
   }
-  /* pending/fork 只读等待期间不得被第三方 takeover-manual 解除；未过期 auto 在途同理（J-N-05）。 */
+  /* pending/fork 只读等待期间不得被第三方 takeover-manual 解除；未过期 auto 在途同理。 */
   if (m5RuntimeOf(state).frozen.has(local.collabId) || unexpiredAutoInFlight(state, local)) {
     return false;
   }

@@ -1738,6 +1738,19 @@ test('M4 接线：invite 登记挂起邀请、approve 携 inviteId 转加入域�
   assert.equal(unverified.seats.get('sess-self').unverified, false, '快照含本席即清除 unverified');
 });
 
+test('approve 帧：加入域返回 null（形态异常）时回落到既有邀请回应记账', async (t) => {
+  const local = localOf({ role: 'manager', seats: [seatOf('sess-a', 'manager', 1)] });
+  const harness = stateOf(t, local, {
+    state: {
+      counters: { approvalsIn: 0 },
+      join: { handleInviteApproval: async () => null },
+    },
+  });
+  const frame = frameOf('approve', { inviteId: 'inv-null' }, { instanceId: 'inst-b', identityName: '乙' });
+  await handleEvent(harness.state, frame, { remoteAddress: '10.0.0.2' });
+  assert.equal(harness.state.counters.approvalsIn, 1, '加入域不处置的 approve 仍计入邀请回应');
+});
+
 test('sync 两件套：应答帧携 fromSessionId（0.2.0 帧身份）', async (t) => {
   const ledger = ledgerOf({ mode: 'forum', members: [{ instanceId: 'inst-b', sessionId: 'sess-b', identityName: '乙' }] });
   const local = localOf({ ledger, seats: [seatOf('sess-f')], endpoints: [['inst-b', { address: '10.0.0.7', port: 17321 }]] });

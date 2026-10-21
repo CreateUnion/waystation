@@ -558,14 +558,9 @@ export function handleJoinKnock(state, knock) {
       continue;
     }
     state.counters.joinKnockMatches++;
-    /* 放行指引指名请求会话（设计 §4.5）：同机敲门登记里能拿到 sessionId，放行者据此用
-     * ws_invite 的 targetSessionId 指名回复；远端敲门报文不含会话标识，此时按未指名指引。 */
-    const knockedSessionId = typeof state.join?.knockedSession === 'function'
-      ? state.join.knockedSession(knock.name)
-      : null;
     /* 应答判据＝该协作的绑定会话是否活跃（经提示面的路由结论表达）：无接收者不回 join-ack——
      * 如实表达无人值守，避免对端得到「有人应答但无人放行」的悬置态；休眠期丢弃由路由面留痕。 */
-    if (notifyLocal(state, local, joinKnockNoticeText(knock, localNameOf(local), knockedSessionId)) === false) {
+    if (notifyLocal(state, local, joinKnockNoticeText(knock, localNameOf(local))) === false) {
       state.log.warn('敲门命中但该协作无活跃绑定会话——不回应答（无人值守）', { collabId: local.collabId });
       continue;
     }
@@ -607,14 +602,12 @@ function joinKnockReplyOf(state, local) {
   };
 }
 
-/* 放行指引文案：申请人身份（含实例标识）与来源端点（放行时作 ws_invite 的 targets 项）、讨论名；
- * 能拿到请求会话时一并指名（targetSessionId），放行只投该会话、不广播给同机其他会话。
- * 同意门仍在申请人一侧——本机放行只是发出正式邀请。 */
-function joinKnockNoticeText(knock, name, knockedSessionId = null) {
-  const target = typeof knockedSessionId === 'string' && knockedSessionId !== ''
-    ? `，targetSessionId 用 ${knockedSessionId}（只投该会话）`
-    : '';
-  return `收到加入申请：「${knock.identityName}」（实例 ${knock.instanceId}，端点 ${knock.address}:${knock.port}）想加入讨论「${name}」——放行 = 本机用 ws_invite 邀请它（targets 用该身份与端点${target}），随后由对方的同意门定夺`;
+/* 放行指引文案：申请人身份（含实例标识）与来源端点（放行时作 ws_invite 的 targets 项）、讨论名。
+ * 指引不指名会话：敲门报文只带机器身份，同机回环的自答又会被发现层丢弃，指名的唯一来源是一份
+ * 可能已过期的本地登记，照它写 targetSessionId 会把邀请投到对端并不存在的会话。放行按未指名
+ * 邀请发出，由同意门决定哪个会话入席；同意权始终在申请人一侧。 */
+function joinKnockNoticeText(knock, name) {
+  return `收到加入申请：「${knock.identityName}」（实例 ${knock.instanceId}，端点 ${knock.address}:${knock.port}）想加入讨论「${name}」——放行 = 本机用 ws_invite 邀请它（targets 用该身份与端点），随后由对方的同意门定夺`;
 }
 
 export function approveInvite(state, { collabId, approve, reason, sessionId, confirmToken }) {
