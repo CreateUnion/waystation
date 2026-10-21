@@ -8,7 +8,7 @@ import { createInjectedStore } from './injected.js';
 import { appendLedger, ledgerDigest } from './store.js';
 import { collabDir, ensureDir } from '../paths.js';
 import { archiveLocalSeatsOfState, isLocalArchivedState, localModeOf, localStateOf, persistMember, persistSnapshot, rememberKnownHost, retiredMuteHandle, selfJoinedOf, upsertLocalSeat } from './local.js';
-import { matchConflictCollabs, noteForumGovernanceIgnored } from './gate.js';
+import { matchConflictCollabs, memberSeatAdmits, noteForumGovernanceIgnored } from './gate.js';
 import { applyEndpoint, applyFreezeLocally, broadcastFreeze, downgradeToMember, endpointFor, governanceTargets, memberIdsOf, mutateLedger, notifyLocal, relayGovernance, relayRedistribute, selfIsRelay, sendTo, stopJoinReplay } from './outgoing.js';
 import { applyIncomingJoin, applyIncomingLeave, handleHistoryBundle, handleHistoryRequest } from './sync.js';
 import {
@@ -578,14 +578,16 @@ function handlePost(state, frame) {
   return undefined;
 }
 
-/* 投稿转达触发（中继侧）：标记命中 + 本机即中继 + 投稿人 ∈ 折叠成员表（单一取数面）才转达。
- * 非成员不转达并计数——防任意知 collabId 者借中继把一帧放大为全员直投与会话注入（帖子本身的
- * 受理 / 落盘 / 去重照旧：全信任模型的内容面不变，只堵 1→N 的放大路径）。 */
+/* 投稿转达触发（中继侧）：标记命中 + 本机即中继 + 投稿人在折叠成员表内（单一取数面）才转达。
+ * 投稿人是会话（设计 §2.2）：帧携 sessionId 时按席位判，同机未入席会话不得借机器身份被转达；
+ * 旧帧无 sessionId 才退回实例判据。非成员不转达并计数——防任意知 collabId 者借中继把一帧
+ * 放大为全员直投与会话注入（帖子本身的受理 / 落盘 / 去重照旧：全信任模型的内容面不变，
+ * 只堵 1→N 的放大路径）。 */
 function handleRelaySubmission(state, local, frame) {
   if (frame.payload.relay !== true || frame.from.instanceId === state.self.instanceId || !selfIsRelay(state, local)) {
     return;
   }
-  if (!local.members.includes(frame.from.instanceId)) {
+  if (!memberSeatAdmits(local, frame.from)) {
     state.counters.relaySubmissionsRejected++;
     return;
   }

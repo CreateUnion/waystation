@@ -133,6 +133,16 @@ function admitByLocalState(state, local, frame) {
   return { ok: false, reason: '协作已结束（或已退出）：消息丢弃并计数留痕' };
 }
 
+/* 成员准入的席位判据（设计 §2.2「成员＝会话」）：帧携 sessionId 时，折叠成员表里必须存在
+ * 同一 (instanceId, sessionId) 的席位行；无 sessionId 的旧帧才退回实例判据（旧档案可读）。
+ * 不得用实例行顶替席位行——同机第二个未入席会话会借机器身份通过准入，拿到历史或借中继放大。
+ * 折叠表本身按席位分组，旧事件行没有 sessionId，天然无法冒充某个会话。 */
+export function memberSeatAdmits(local, from) {
+  const sessionId = typeof from?.sessionId === 'string' && from.sessionId !== '' ? from.sessionId : null;
+  return local.members.fold().some((member) => member.instanceId === from?.instanceId
+    && (sessionId === null || member.sessionId === sessionId));
+}
+
 /* 讨论的 join 与拉取两件套（设计 §5.1/§5.3）：论坛专属类型——managed 实例收到即类型语义不符
  * 拒绝并计数；两件套在**归档后仍放行**（只读回填通道不因归档关闭，白名单与分支同点表达），
  * 且两者都要求请求方在本地折叠成员表内（非成员拒绝并计数）；join 在归档后不改变任何状态
@@ -161,9 +171,9 @@ function admitForumChannel(state, local, frame, meta) {
     state.counters.syncRequestsRejected++;
     return { ok: false, reason: '拉取应答方不在本机的可达成员面内（折叠成员表 / 邀请者引用 / 端点表——拒绝并计数）' };
   }
-  if (!local.members.includes(frame.from.instanceId)) {
+  if (!memberSeatAdmits(local, frame.from)) {
     state.counters.syncRequestsRejected++;
-    state.log.warn('拉取请求方不在本机折叠成员表内（拒绝）', { collabId: frame.collabId, from: frame.from?.instanceId });
+    state.log.warn('拉取请求方不在本机折叠成员表内（拒绝）', { collabId: frame.collabId, from: frame.from.instanceId, sessionId: frame.from.sessionId });
     return { ok: false, reason: '拉取请求方不在本机折叠成员表内（拒绝并计数）' };
   }
   if (!withinRequestRate(state, meta)) {
