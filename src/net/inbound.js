@@ -753,12 +753,15 @@ async function noteDelivered(state, frame, connection, meta) {
  * （拉取两件套的通道分流不在此回报：请求-应答经发送侧的换源 / 下轮节拍收敛，不给终态回报）。
  * 帖支的终态回执另设前件「该帖曾实际注入会话」（consume 依服务域持久标记给出 wasInjected）：
  * 静音期到达的首份副本未注入，其重复副本若照旧回报终态，就绕过了「未注入 + 会话主动查」的兜底。
- * join 支维持「重复副本仍回报终态」现状（join 按重播轮次按条重发，首份副本的处置已在先）。 */
+ * join 支维持「重复副本仍回报终态」现状（join 按重播轮次按条重发，首份副本的处置已在先）。
+ * seat-presence 虽同在 SESSION_GATED_TYPES（抑制注入），但没有「重复副本」语义：心跳从未进任何
+ * 会话，按 join 支回报 session 档是假事实，还会让每次心跳在双方队列各留一条回报条目（0.2.1 实测
+ * 每 30s 一条、约 4 小时占满 500 条配额）——显式排除，只认帖与 join。 */
 function isAbsorbedDuplicate(frame, consumed) {
   if (frame.type === 'post') {
     return consumed?.sessionDeliver === false && consumed?.wasInjected === true;
   }
-  return SESSION_GATED_TYPES.has(frame.type) && consumed?.sessionDeliver === false;
+  return frame.type === 'join' && consumed?.sessionDeliver === false;
 }
 
 /* 会话注入的分流面（讨论模式的机制，互不越界）：
@@ -773,7 +776,8 @@ function isAbsorbedDuplicate(frame, consumed) {
  * ④ 静音栅栏（runDeliver 内的独立分支）：由服务钩子 sessionGate 声明——本层不掌握模式与
  *    静音态，只认 { suppress: true }；被抑制帧不进会话也不回报（维持第二档，会话主动查兜底）。 */
 /* seat-presence 是机器级心跳：consume 声明不投会话时必须采信，否则每个席位都会收到心跳帧
- * （治理「待办」价值为零，且会让会话收件箱被心跳噪声淹没）。 */
+ * （治理「待办」价值为零，且会让会话收件箱被心跳噪声淹没）。心跳只抑制注入、不产生投递回报
+ * ——回报口径见 isAbsorbedDuplicate（只认帖与 join）。 */
 const SESSION_GATED_TYPES = new Set(['post', 'join', 'seat-presence']);
 const CHANNEL_ROUTED_TYPES = new Set(['history-request', 'history-bundle']);
 

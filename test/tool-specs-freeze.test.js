@@ -273,7 +273,9 @@ async function sendMessageDefaultType() {
  * ws_list_collabs / ws_list_hosts / ws_check_inbox / ws_delivery_status 换会话级返回面；
  * 其余描述同步会话级语义与短码口径。按「须人批准的对外变更」规程整体重冻，
  * md5 由 29aee52b9ad324f5797c9f4ccd2eb6fb（15641 字符）更新为 bfab27e380b87efe842d5a8cf6f747a8（16585 字符）。
- * 工具数与顺序（22 项）未变。 */
+ * 邀请确认豁免扩展（用户 2026-10-22 裁定：会话级免确认、只免同意）：ws_allow_next_invite 增可选
+ * mode（once 缺省 / session / off / status），工具数与顺序不变；按同一规程重冻，
+ * md5 更新为 407fd7053df63c5605987143b7811113（16947 字符）。 */
 const FROZEN_LIST_JSON = `[
   {
     "name": "ws_status",
@@ -453,10 +455,21 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_allow_next_invite",
-    "description": "登记一次性邀请确认豁免：仅当用户明确表示「下一次邀请无需确认」时调用；下一次同意 / 拒绝邀请将直接生效并消耗豁免（核心重启后失效）。不适用于移交 / 接管等治理确认——那些一律走各自的一次性令牌",
+    "description": "邀请确认豁免（仅邀请，不用于移交 / 接管等治理确认）。mode=once（缺省）：登记一次性豁免，下一次同意 / 拒绝邀请直接生效并消耗；mode=session：开启本会话持续免确认——本会话同意邀请直接生效（拒绝仍需确认），直到会话结束、核心重启或 mode=off；mode=off：关闭会话级免确认；mode=status：查询本会话开关态。所有豁免均为纯内存态，核心重启后失效",
     "inputSchema": {
       "type": "object",
-      "properties": {}
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "once",
+            "session",
+            "off",
+            "status"
+          ],
+          "description": "豁免模式（可选，缺省 once）：once＝一次性；session＝本会话持续免同意；off＝关闭；status＝查询"
+        }
+      }
     }
   },
   {

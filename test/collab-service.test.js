@@ -653,6 +653,55 @@ test('邀请确认门：拒绝同样需要确认；一次性豁免让下一次�
   assert.equal(gated.needsUserConfirmation, true, '豁免已消耗：下一次重新需要确认');
 });
 
+test('会话级免确认：mode=session 连续同意不再逐条确认，拒绝仍需确认，off 撤销', async (t) => {
+  const { service } = makeService(t);
+  const enabled = await service.allowNextInvite({ sessionId: 'session-auto', mode: 'session' });
+  assert.equal(enabled.ok, true);
+  assert.equal(enabled.enabled, true);
+
+  await receive(service, inviteFrame({ collabId: 'collab-auto-1' }));
+  const first = await service.approve({ collabId: 'collab-auto-1', approve: true, sessionId: 'session-auto' });
+  assert.equal(first.ok, true, '会话级豁免：同意直接生效');
+  assert.equal(first.decision, 'approved');
+
+  await receive(service, inviteFrame({ collabId: 'collab-auto-2', name: '第二协作' }));
+  const second = await service.approve({ collabId: 'collab-auto-2', approve: true, sessionId: 'session-auto' });
+  assert.equal(second.ok, true, '会话级豁免不消耗：本会话后续同意继续免确认');
+
+  await receive(service, inviteFrame({ collabId: 'collab-auto-3', name: '第三协作' }));
+  const decline = await service.approve({ collabId: 'collab-auto-3', approve: false, reason: '不参与', sessionId: 'session-auto' });
+  assert.equal(decline.needsUserConfirmation, true, '拒绝仍走确认门（会话级豁免只免同意）');
+
+  const status = await service.allowNextInvite({ sessionId: 'session-auto', mode: 'status' });
+  assert.equal(status.enabled, true, 'status 查询当前会话的开关态');
+  const off = await service.allowNextInvite({ sessionId: 'session-auto', mode: 'off' });
+  assert.equal(off.ok, true);
+  assert.equal(off.enabled, false);
+
+  await receive(service, inviteFrame({ collabId: 'collab-auto-4', name: '第四协作' }));
+  const gated = await service.approve({ collabId: 'collab-auto-4', approve: true, sessionId: 'session-auto' });
+  assert.equal(gated.needsUserConfirmation, true, 'off 之后恢复逐条确认');
+});
+
+test('会话级免确认：只作用于登记会话；席位邀请路径（带 inviteId）同样只免同意', async (t) => {
+  const { service } = makeService(t);
+  await service.allowNextInvite({ sessionId: 'session-owner', mode: 'session' });
+  await receive(service, inviteFrame({ collabId: 'collab-iso' }));
+
+  const other = await service.approve({ collabId: 'collab-iso', approve: true, sessionId: 'session-other' });
+  assert.equal(other.needsUserConfirmation, true, '同机其他会话不受影响');
+
+  const seatApproved = await service.approve({
+    collabId: 'collab-iso', inviteId: 'inv-missing', approve: true, sessionId: 'session-owner',
+  });
+  assert.notEqual(seatApproved.needsUserConfirmation, true, '席位邀请路径：同意不过确认门');
+
+  const seatDeclined = await service.approve({
+    collabId: 'collab-iso', inviteId: 'inv-missing', approve: false, sessionId: 'session-owner',
+  });
+  assert.equal(seatDeclined.needsUserConfirmation, true, '席位邀请路径：拒绝仍需确认');
+});
+
 test('邀请确认门：挑战绑定协作——他协作的令牌无效', async (t) => {
   const { service } = makeService(t);
   await receive(service, inviteFrame({ collabId: 'collab-x' }));

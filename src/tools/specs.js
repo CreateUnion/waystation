@@ -121,10 +121,16 @@ export const WS_APPROVE_INVITE_SPEC = {
 
 export const WS_ALLOW_NEXT_INVITE_SPEC = {
   name: 'ws_allow_next_invite',
-  description: '登记一次性邀请确认豁免：仅当用户明确表示「下一次邀请无需确认」时调用；下一次同意 / 拒绝邀请将直接生效并消耗豁免（核心重启后失效）。不适用于移交 / 接管等治理确认——那些一律走各自的一次性令牌',
+  description: '邀请确认豁免（仅邀请，不用于移交 / 接管等治理确认）。mode=once（缺省）：登记一次性豁免，下一次同意 / 拒绝邀请直接生效并消耗；mode=session：开启本会话持续免确认——本会话同意邀请直接生效（拒绝仍需确认），直到会话结束、核心重启或 mode=off；mode=off：关闭会话级免确认；mode=status：查询本会话开关态。所有豁免均为纯内存态，核心重启后失效',
   inputSchema: {
     type: 'object',
-    properties: {},
+    properties: {
+      mode: {
+        type: 'string',
+        enum: ['once', 'session', 'off', 'status'],
+        description: '豁免模式（可选，缺省 once）：once＝一次性；session＝本会话持续免同意；off＝关闭；status＝查询',
+      },
+    },
   },
 };
 

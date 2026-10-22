@@ -56,8 +56,8 @@ function makeCommandsDir(home, files) {
   return commandsDir;
 }
 
-test('仓库命令源：七个文件存在且带受管标记（防源集合与标记漂移）', () => {
-  for (const name of ['ws-collab.md', 'ws-discuss.md', 'ws-list.md', 'ws-mute.md', 'ws-purge.md', 'ws-view.md', 'ws-join.md']) {
+test('仓库命令源：八个文件存在且带受管标记（防源集合与标记漂移）', () => {
+  for (const name of ['ws-collab.md', 'ws-discuss.md', 'ws-list.md', 'ws-mute.md', 'ws-purge.md', 'ws-view.md', 'ws-join.md', 'ws-auto-accept-invites.md']) {
     const filePath = join(repoRoot, 'scripts', 'claude-commands', name);
     assert.equal(existsSync(filePath), true, `缺少命令源文件：${name}`);
     const text = readFileSync(filePath, 'utf8');
@@ -89,6 +89,16 @@ test('ws-purge 命令文：先停核心及其拒绝语义、复起路径齐备�
   assert.ok(text.includes('先停止本机核心'), '必须写明执行时会先停核心（单核：核心持有被删目录）');
   assert.ok(text.includes('拒绝清理'), '必须写明核心拒停时的拒绝语义（不得绕过）');
   assert.ok(text.includes('自动拉起新核心'), '必须写明停核后会话下一次工具调用自动拉起新核心');
+});
+
+test('ws-auto-accept-invites 命令文：开关三态、只免同意、失效边界齐备（防正文漂移）', () => {
+  const text = readFileSync(join(repoRoot, 'scripts', 'claude-commands', 'ws-auto-accept-invites.md'), 'utf8');
+  assert.ok(text.includes('ws_allow_next_invite'), '必须写明底层工具入口');
+  assert.ok(text.includes("mode: 'session'") || text.includes('mode'), '必须写明 mode 参数');
+  assert.ok(text.includes('off'), '必须写明手动关闭路径');
+  assert.ok(text.includes('status'), '必须写明状态查询路径');
+  assert.ok(text.includes('拒绝'), '必须写明拒绝仍要确认（只免同意）');
+  assert.ok(text.includes('核心重启'), '必须写明核心重启失效的边界');
 });
 
 test('ws-list 命令文：本机行与同机标注规则齐备（防正文漂移）', () => {

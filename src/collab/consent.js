@@ -56,6 +56,21 @@ export function consumeInviteWaiver(state, { sessionId }) {
   return true;
 }
 
+/* 会话级免确认（只免「同意」）：用户在会话内显式开启后，本会话的同意邀请不再逐条确认；
+ * 拒绝邀请仍走确认门。按 sessionId 登记、纯内存态——会话结束（新会话新标识）自然失效，
+ * 核心重启亦失效（沿用「宁多问一次」的安全口径）。 */
+export function grantSessionAutoAccept(state, { sessionId }) {
+  state.inviteConsent.autoAccept.add(sessionId);
+}
+
+export function revokeSessionAutoAccept(state, { sessionId }) {
+  return state.inviteConsent.autoAccept.delete(sessionId);
+}
+
+export function hasSessionAutoAccept(state, { sessionId }) {
+  return state.inviteConsent.autoAccept.has(sessionId);
+}
+
 function pruneExpired(table, now) {
   for (const [key, held] of table) {
     if (held.expiresAt <= now) {

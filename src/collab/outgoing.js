@@ -6,7 +6,7 @@ import { createMembersStore } from './members.js';
 import { createCounterStore, notifyIndicatorChange } from './counter.js';
 import { forgetMuteBaselinesOfCollab } from './mute.js';
 import { createInjectedStore } from './injected.js';
-import { consumeInviteChallenge, consumeInviteWaiver, issueInviteChallenge } from './consent.js';
+import { consumeInviteChallenge, consumeInviteWaiver, hasSessionAutoAccept, issueInviteChallenge } from './consent.js';
 import { ledgerDigest, removeLedgerFile } from './store.js';
 import { archiveLocalSeatsOfState, currentManagerIdOf, emitOwnMemberEvent, foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, localTopicOf, memberStateFor, persistLedger, persistMember, persistSnapshot, relayDepartedOf, relayPeerOf, rememberKnownHost, retiredMuteHandle, selfJoinedOf, upsertLocalSeat } from './local.js';
 import { matchConflictCollabs } from './gate.js';
@@ -588,18 +588,22 @@ export function approveInvite(state, { collabId, approve, reason, sessionId, con
   }
   /* 用户确认门（2026-10-19 产品裁定）：带会话标识的决定必须先拿一次性确认挑战或豁免。
    * 首次调用只签发挑战、不改任何状态——代理须把邀请转述给用户并取得明确同意后携令牌重试。 */
-  const consent = inviteConsentGate(state, local, sessionId, confirmToken);
+  const consent = inviteConsentGate(state, local, sessionId, confirmToken, approve);
   if (consent !== null) {
     return consent;
   }
   return applyInviteDecision(state, local, approve, wanted, reason, sessionId);
 }
 
-/* 确认门判定：无会话标识（服务直调/旧路径）不设门；有豁免直接放行；有有效挑战放行；
- * 否则签发新挑战并返回需要用户确认的结构化结果（邀请摘要供代理转述）。 */
-function inviteConsentGate(state, local, sessionId, confirmToken) {
+/* 确认门判定：无会话标识（服务直调/旧路径）不设门；会话级免同意（仅同意）直接放行；
+ * 有一次性豁免直接放行；有有效挑战放行；否则签发新挑战并返回需要用户确认的结构化结果
+ * （邀请摘要供代理转述）。 */
+function inviteConsentGate(state, local, sessionId, confirmToken, approve) {
   if (typeof sessionId !== 'string' || sessionId === '') {
     return null;
+  }
+  if (approve === true && hasSessionAutoAccept(state, { sessionId })) {
+    return null;   // 会话级免确认只免「同意」：拒绝始终是有后果的用户决定
   }
   if (consumeInviteWaiver(state, { sessionId })) {
     return null;
@@ -613,7 +617,7 @@ function inviteConsentGate(state, local, sessionId, confirmToken) {
     needsUserConfirmation: true,
     confirmToken: token,
     invite: inviteSummaryOf(local),
-    message: '同意 / 拒绝邀请需要用户明确确认：请把邀请信息转述给用户，取得明确同意后携带 confirmToken 重试；若用户明确表示下一次无需确认，可先用 ws_allow_next_invite 登记一次性豁免',
+    message: '同意 / 拒绝邀请需要用户明确确认：请把邀请信息转述给用户，取得明确同意后携带 confirmToken 重试；若用户明确表示下一次无需确认，可先用 ws_allow_next_invite 登记一次性豁免（mode=once），或按用户要求开启会话级免同意（mode=session）',
   };
 }
 

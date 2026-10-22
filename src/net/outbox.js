@@ -1,7 +1,7 @@
 import { collabDir, collabFilePath, ensureDir } from '../paths.js';
 import { ANCHOR_PORT } from '../site.js';
 import { appendLine, loadLines, replaceFile } from '../storage.js';
-import { DELIVERY_EXEMPT_TYPES, ID_PATTERN, MAX_ACTIVE_SEATS, isPort } from './protocol.js';
+import { ACK_TERMINAL_TYPES, DELIVERY_EXEMPT_TYPES, ID_PATTERN, MAX_ACTIVE_SEATS, isPort } from './protocol.js';
 
 export const OUTBOX_FILE_NAME = 'outbox.jsonl';
 const STATES = ['queued', 'acked', 'session', 'expired'];
@@ -77,11 +77,23 @@ function load(state) {
       state.counters.corruptRecords++;   // 结构非法或不属于本协作：视同损坏记录跳过
       continue;
     }
+    settleAckTerminal(checked);
     state.entries.set(checked.msgId, checked);
   }
   if (loaded.entries.length > state.entries.size) {
     compact(state);   // 有折叠出的历史行：就地压缩
   }
+}
+
+/* 存量归一：旧版本把 delivery-status 停在 acked（等一个按协议永远不会到来的 session 档回报）。
+ * 载入时按「确认即终态」口径收口——升级重启即释放被积压占用的配额，不依赖手工清队列。
+ * ackedAt 缺失的旧记录以 createdAt 作终态时刻，随既有 TTL 回收路径自然淘汰。 */
+function settleAckTerminal(entry) {
+  if (entry.state !== 'acked' || !ACK_TERMINAL_TYPES.includes(entry.type)) {
+    return;
+  }
+  entry.state = 'session';
+  entry.deliveredAt = entry.ackedAt ?? entry.createdAt;
 }
 
 function unfinishedOf(state) {
@@ -185,8 +197,15 @@ function markAcked(state, msgId, ts) {
   if (entry === undefined || entry.state !== 'queued') {
     return false;
   }
-  entry.state = 'acked';
   entry.ackedAt = new Date(ts).toISOString();
+  if (ACK_TERMINAL_TYPES.includes(entry.type)) {
+    /* 确认即终态（设计 §10「ack 是递归的终端」）：接收侧不投会话、不回报，等 session 档是等不到的——
+     * 直接收口，避免条目按 7 天保留期占用配额。 */
+    entry.state = 'session';
+    entry.deliveredAt = entry.ackedAt;
+  } else {
+    entry.state = 'acked';
+  }
   writeRecord(state, entry);
   return true;
 }

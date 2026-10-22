@@ -1766,6 +1766,18 @@ test('工具返回口径：22 工具成功载荷均为含 ok:true 的 JSON 对�
   }
 });
 
+test('ws_allow_next_invite：mode 参数透传（缺省保持一次性 / session / off / status）', async () => {
+  const collab = fakeService({ allowNextInvite: { ok: true, enabled: true, note: '已开启' } });
+  const context = governedContextOf(collab);
+  const result = await allowNextInviteTool().handler({ mode: 'session' }, context);
+  assert.equal(result.isError, undefined);
+  assert.deepEqual(collab.calls.allowNextInvite, [{ sessionId: 'session-a-0123456789', mode: 'session' }]);
+  assert.equal(JSON.parse(result.content[0].text).ok, true);
+
+  await allowNextInviteTool().handler({}, context);
+  assert.deepEqual(collab.calls.allowNextInvite[1], { sessionId: 'session-a-0123456789' }, '缺省保持一次性豁免');
+});
+
 /* —— 网络装配面（工具面接线）：能力探测转调与 instanceId 透传 ——
  * 未知先探测的闸门在服务层；工具层拿到的只是这里的转调面（不直接触达发现组件）。 */
 

@@ -199,6 +199,61 @@ test('状态推进：未知 msgId 与重复调用均为无操作（幂等、不�
   assert.equal(outbox.entries()[0].state, 'acked');
 });
 
+test('delivery-status：ack 即终态（接收侧不投会话、不回报），不占队列配额', (t) => {
+  const { outbox } = makeOutbox(t);   // queueMaxPerCollab = 3
+  const reports = [1, 2, 3].map(() => sendInput({
+    type: 'delivery-status',
+    payload: { refMsgId: newMsgId(), tier: 'session' },
+  }));
+  for (const report of reports) {
+    assert.deepEqual(outbox.enqueue(report), { ok: true });
+  }
+  const ackedAt = Date.now();
+  for (const report of reports) {
+    assert.equal(outbox.markAcked(report.msgId, ackedAt), true);
+  }
+  for (const report of reports) {
+    const entry = outbox.entries().find((candidate) => candidate.msgId === report.msgId);
+    assert.equal(entry.state, 'session', '回报帧的 ack 是递归终端：直接收口为终态');
+    assert.equal(entry.deliveredAt, new Date(ackedAt).toISOString());
+  }
+  assert.equal(outbox.stats().unfinished, 0, '回报帧不再计入未完成（不占配额）');
+  assert.deepEqual(outbox.enqueue(sendInput({ type: 'notice' })), { ok: true }, '后续普通消息可入队');
+});
+
+test('载入：历史 acked delivery-status 归一为终态（存量心跳回报积压不占配额）', (t) => {
+  const dir = makeTempDir(t);
+  const file = join(dir, COLLABS_DIR_NAME, 'collab-1', OUTBOX_FILE_NAME);
+  mkdirSync(join(dir, COLLABS_DIR_NAME, 'collab-1'), { recursive: true });
+  const createdAt = '2026-10-22T03:17:49.046Z';
+  const ackedAt = '2026-10-22T03:17:49.180Z';
+  const record = {
+    msgId: newMsgId(),
+    collabId: 'collab-1',
+    to: { instanceId: 'inst-b', address: '127.0.0.2', port: 7321 },
+    type: 'delivery-status',
+    payload: { refMsgId: newMsgId(), tier: 'session' },
+    governance: false,
+    state: 'acked',
+    attempts: 1,
+    createdAt,
+    nextAttemptAt: 1792639079088,
+    ackedAt,
+  };
+  writeFileSync(file, JSON.stringify(record) + '\n');
+  const outbox = createOutbox({
+    dataDir: dir,
+    collabId: 'collab-1',
+    config: testConfig({ queueMaxPerCollab: 1 }),
+    log: quietLog(),
+  });
+  const entry = outbox.entries()[0];
+  assert.equal(entry.state, 'session', '载入即按 ack 终端收口（0.2.1 存量积压的修复路径）');
+  assert.equal(entry.deliveredAt, ackedAt);
+  assert.equal(outbox.stats().unfinished, 0);
+  assert.deepEqual(outbox.enqueue(sendInput()), { ok: true }, '存量回报不占配额');
+});
+
 test('载入：非本协作/结构非法记录跳过并计数', (t) => {
   const dir = makeTempDir(t);
   const file = join(dir, COLLABS_DIR_NAME, 'collab-1', OUTBOX_FILE_NAME);

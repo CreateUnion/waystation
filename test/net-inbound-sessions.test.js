@@ -447,7 +447,7 @@ test('仅暂存（无实际注入）时回报签发席位取原帧发件席位�
   assert.equal(reportsOf(mixed.dispatch)[0].from.sessionId, 'sess-b1', '有实际注入时用首个注入席位签发');
 });
 
-test('seat-presence：consume 声明不投会话即抑制注入（机器级心跳不进会话）', async (t) => {
+test('seat-presence：consume 声明不投会话即抑制注入，且不产生投递回报（心跳从未进会话）', async (t) => {
   const { inbound, dispatch, inject } = makeInbound(t, {
     hooks: { consume: () => ({ sessionDeliver: false }) },
   });
@@ -459,7 +459,8 @@ test('seat-presence：consume 声明不投会话即抑制注入（机器级心�
   assert.equal(connection.sent.filter((entry) => entry.type === 'ack').length, 1, '心跳照常确认');
   assert.deepEqual(inject.calls, [], '不得把心跳注入任何会话');
   assert.equal(inbound.stats().sessionSuppressed >= 1, true);
-  await waitFor(() => reportsOf(dispatch).length === 1);
+  await new Promise((resolve) => setTimeout(resolve, 20));   // 抑制路径无回报：等一个事件循环余量后断言仍为零
+  assert.deepEqual(reportsOf(dispatch), [], '心跳未投递 → 不得回报 session 档（否则每次心跳在双方队列各留一条回报）');
 });
 
 test('seat-presence：forum 准入白名单放行（讨论心跳不被类型语义拒）', () => {

@@ -70,6 +70,12 @@ export const GOVERNANCE_TYPES = ['freeze', 'unfreeze', 'decision', 'takeover-ini
  * 拉取两件套（history-*）为短生命周期请求-应答，明确**不泛化豁免**：无应答即换源或下轮对表。 */
 export const DELIVERY_EXEMPT_TYPES = [...GOVERNANCE_TYPES, 'end', 'join', 'leave'];
 
+/* 确认即终态的帧类型（设计 §10「ack 是递归的终端」）：delivery-status 的接收侧不落盘 inbox、
+ * 不投会话，也不为回报再产生回报——发送方永远不会收到针对它的 session 档回报。
+ * 发送队列据此在 ack 时直接收口为终态：停在 acked 会按 7 天保留期持续占用单协作配额
+ * （心跳回报可在数小时内占满 500 条，普通消息全部被拒），见 outbox 的 markAcked / settleAckTerminal。 */
+export const ACK_TERMINAL_TYPES = ['delivery-status'];
+
 /* 传输类帧不带 collabId（可达性探测与链路确认没有协作归属）；其余类型均属协作域、必须携带。 */
 export const TRANSPORT_TYPES = ['ping', 'pong', 'ack'];
 

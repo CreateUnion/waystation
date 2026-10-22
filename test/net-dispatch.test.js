@@ -351,7 +351,7 @@ test('send 拒绝传输类帧（ping/pong/ack）：即时通道不入队（防�
   assert.equal(dispatch.deliveryStatus({}).length, 0, '拒绝不产生队列条目');
 });
 
-test('回报以 ack 收敛：条目推进至 at-peer 且单元队头释放（后续消息不被阻塞）', { timeout: 15000 }, async (t) => {
+test('回报以 ack 收敛：条目收口为 session 终态且单元队头释放（后续消息不被阻塞）', { timeout: 15000 }, async (t) => {
   const transport = createFakeTransport();
   // 长重传间隔：断言以「同一连接上的后续帧」为准——排除重传（重拨换连接）的干扰
   const { dispatch } = makeDispatch(t, { transport, config: testConfig({ retryIntervalMs: 5000, retrySlowIntervalMs: 6000 }) });
@@ -362,8 +362,10 @@ test('回报以 ack 收敛：条目推进至 at-peer 且单元队头释放（后
   dispatch.start();
   await waitFor(() => transport.connections[0]?.frames.length === 1);
   assert.equal(transport.connections[0].frames[0].type, 'delivery-status');
-  dispatch.onAck(report.msgId);   // 对方驿站对回报帧的链路确认
-  assert.equal(dispatch.deliveryStatus({ msgId: report.msgId })[0].tier, 'at-peer', '回报条目离开 queued（不再作为队头重传）');
+  dispatch.onAck(report.msgId);   // 对方驿站对回报帧的链路确认（回报帧的递归终端）
+  const settled = dispatch.deliveryStatus({ msgId: report.msgId })[0];
+  assert.equal(settled.tier, 'session', '回报帧 ack 即终态：不再等一个永远不会到来的 session 档回报');
+  assert.ok(settled.deliveredAt !== null);
   await waitFor(() => transport.connections[0].frames.length === 2);
   assert.equal(transport.connections[0].frames[1].msgId, followUp.msgId, '队头释放：该单元后续消息照常投递');
 });

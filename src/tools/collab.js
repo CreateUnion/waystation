@@ -241,12 +241,15 @@ export function approveInviteTool() {
   };
 }
 
-/* 一次性邀请确认豁免（用户明确说「下一次无需确认」时调用）：下一次同意 / 拒绝邀请直接生效。 */
+/* 邀请确认豁免：mode 缺省＝一次性；session / off / status 供会话级开关与查询。
+ * 拒绝邀请始终走确认门——会话级开关只免「同意」。 */
 export function allowNextInviteTool() {
   return {
     ...WS_ALLOW_NEXT_INVITE_SPEC,
     handler: async (args, context) => {
-      return resultOf(await context.collab.allowNextInvite({ sessionId: context.sessionId }));
+      const mode = typeof args?.mode === 'string' ? args.mode : undefined;
+      const input = mode === undefined ? { sessionId: context.sessionId } : { sessionId: context.sessionId, mode };
+      return resultOf(await context.collab.allowNextInvite(input));
     },
   };
 }

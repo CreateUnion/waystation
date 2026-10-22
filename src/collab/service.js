@@ -21,7 +21,7 @@ import { createCounterStore, notifyIndicatorChange } from './counter.js';
 import { forgetMuteBaseline, forgetMuteBaselinesOfCollab, rememberMuteBaselineIfAbsent, takeMuteBaseline } from './mute.js';
 import { createInjectedStore } from './injected.js';
 import { createJoinsStore } from './joins.js';
-import { consumeInviteChallenge, consumeInviteWaiver, grantInviteWaiver, issueInviteChallenge } from './consent.js';
+import { consumeInviteChallenge, consumeInviteWaiver, grantInviteWaiver, grantSessionAutoAccept, hasSessionAutoAccept, issueInviteChallenge, revokeSessionAutoAccept } from './consent.js';
 import { JOIN_REQUEST_RETRY_MAX_MS, JOIN_REQUEST_RETRY_MS, JOIN_REQUEST_TTL_MS, createJoinDomain, resolveJoinTarget } from './join.js';
 import { ID_PATTERN, POST_KINDS } from '../net/protocol.js';
 import { matchSessionByToken, shortSessionId } from '../util/short-id.js';
@@ -360,7 +360,7 @@ function runtimeMaps() {
     syncRequestWindow: new Map(),   // 来源地址 → 窗口内请求时刻（请求类入站限流）
     joinRequestWindow: new Map(),   // 来源地址 → 上次受理时刻（加入申请的入站限频，与邀请限频相互独立）
     relayDown: new Set(),      // 中继降级态的 collabId 集（探测不可达置位；恢复检测清除）
-    inviteConsent: { challenges: new Map(), waivers: new Map() },   // 邀请决定确认门（挑战 / 一次性豁免，纯内存态）
+    inviteConsent: { challenges: new Map(), waivers: new Map(), autoAccept: new Set() },   // 邀请决定确认门（挑战 / 一次性豁免 / 会话级免同意，纯内存态）
   };
 }
 
@@ -1394,14 +1394,34 @@ function statsOf(state) {
  * 新人不必等下一个周期节拍（默认 60s）才看到历史。让出到微任务边界再起：本机这一回合的外发
  * 次序为 join 自播先、对表请求后（应答方准入按「请求方在成员表内」把关——请求先到会被拒）。
  * 点头前先过指名判定（指名邀请只有该会话能点头）。 */
-/* 一次性邀请确认豁免（用户明确表示「下一次邀请无需确认」时由工具面登记；核心重启即失效）。 */
+/* 邀请确认豁免（工具面登记；核心重启即失效）：缺省 once＝一次性；session＝本会话持续免同意；
+ * off＝关闭持续豁免；status＝查询。拒绝邀请始终走确认门——会话级开关只免「同意」。 */
 function allowNextInviteOf(state, input) {
   const sessionId = typeof input?.sessionId === 'string' && input.sessionId !== '' ? input.sessionId : null;
   if (sessionId === null) {
     return { ok: false, message: '无会话标识——无法登记邀请确认豁免' };
   }
-  grantInviteWaiver(state, { sessionId });
-  return { ok: true, note: '已登记一次性豁免：下一次同意 / 拒绝邀请将直接生效（消耗后失效；核心重启亦失效）' };
+  return applyInviteWaiverMode(state, sessionId, input?.mode ?? 'once');
+}
+
+function applyInviteWaiverMode(state, sessionId, mode) {
+  if (mode === 'once') {
+    grantInviteWaiver(state, { sessionId });
+    return { ok: true, enabled: false, note: '已登记一次性豁免：下一次同意 / 拒绝邀请将直接生效（消耗后失效；核心重启亦失效）' };
+  }
+  if (mode === 'session') {
+    grantSessionAutoAccept(state, { sessionId });
+    return { ok: true, enabled: true, note: '已开启会话级免确认：本会话同意邀请将直接生效（拒绝仍需确认）；会话结束、核心重启或用 off 关闭' };
+  }
+  if (mode === 'off') {
+    revokeSessionAutoAccept(state, { sessionId });
+    return { ok: true, enabled: false, note: '已关闭会话级免确认：同意邀请恢复逐条确认' };
+  }
+  if (mode === 'status') {
+    const enabled = hasSessionAutoAccept(state, { sessionId });
+    return { ok: true, enabled, note: enabled ? '会话级免确认已开启（只免同意；拒绝仍需确认）' : '会话级免确认未开启' };
+  }
+  return { ok: false, message: `mode 非法（可取值：once / session / off / status）：${String(mode)}` };
 }
 
 function approveNow(state, input) {
@@ -1592,6 +1612,9 @@ function inviteAcceptanceConsentOf(state, { collabId, sessionId, confirmToken, a
   if (typeof sessionId !== 'string' || sessionId === '') {
     return null;
   }
+  if (approve === true && hasSessionAutoAccept(state, { sessionId })) {
+    return null;   // 会话级免确认只免「同意」：拒绝始终是有后果的用户决定
+  }
   if (consumeInviteWaiver(state, { sessionId }) || consumeInviteChallenge(state, { sessionId, collabId, token: confirmToken })) {
     return null;
   }
@@ -1600,7 +1623,7 @@ function inviteAcceptanceConsentOf(state, { collabId, sessionId, confirmToken, a
     needsUserConfirmation: true,
     confirmToken: issueInviteChallenge(state, { sessionId, collabId }),
     invite,
-    message: `${approve === false ? '拒绝' : '同意'}邀请需要用户明确确认：请把邀请信息转述给用户，取得明确同意后携带 confirmToken 重试；若用户明确表示下一次无需确认，可先用 ws_allow_next_invite 登记一次性豁免`,
+    message: `${approve === false ? '拒绝' : '同意'}邀请需要用户明确确认：请把邀请信息转述给用户，取得明确同意后携带 confirmToken 重试；若用户明确表示下一次无需确认，可先用 ws_allow_next_invite 登记一次性豁免（mode=once），或按用户要求开启会话级免同意（mode=session）`,
   };
 }
 
