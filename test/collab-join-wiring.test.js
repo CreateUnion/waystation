@@ -1092,7 +1092,7 @@ function gateStateOf(selfInstanceId) {
 
 /* —— 论坛接线后的本机席位 —— */
 
-test('论坛在席加入：接线成功即补本机席位（member、默认静音），已有席位不覆盖角色', async (t) => {
+test('论坛在席加入：接线成功即补本机席位（member、默认不静音），已有席位不覆盖角色', async (t) => {
   const made = makeHarness(t);
   const bindings = new Map();
   made.state.bindings = { set: (collabId, entry) => bindings.set(collabId, entry) };
@@ -1120,7 +1120,7 @@ test('论坛在席加入：接线成功即补本机席位（member、默认静�
   const created = forum.seats.get('forum-session-1');
   assert.ok(created !== undefined, '已加入的论坛会话拥有本机席位');
   assert.equal(created.role, 'member');
-  assert.equal(created.muted, true, '默认静音写席位，不写退役 mute.json');
+  assert.equal(created.muted, false, '默认不静音写席位，不写退役 mute.json');
   assert.equal(forum.seats.get(MANAGER_SESSION).role, 'manager', '已有席位（发起人）不被覆盖');
 });
 

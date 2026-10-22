@@ -7,11 +7,11 @@ import { createCollabService } from '../src/collab/service.js';
 import { MUTE_FILE_NAME } from '../src/collab/mute.js';
 import { approveInviteTool, createCollabTool } from '../src/tools/collab.js';
 
-/* 入席默认静音（安静默认期设计 §3.1/§3.3，0.2.0 会话级席位口径）的判别用例面：三入口入席即静音
- * （managed 创建 / 讨论创建 / 同意加入）、受邀未同意不静音、拒绝后无席位与退役 mute.json 残留、
- * 存量旧版协作不追溯、重入闭环（退出删除席位静音 → 重新同意再静音）、基线口径与取消摘要、
- * 成功载荷的 notice 提醒（要素齐备、既有字段原样）。静音权威是 seats/<sessionId>.json——
- * 写点一旦挂到记录创建 / 成员落盘这类宽调用点，本文件前两组用例立刻翻红。 */
+/* 入席默认值（2026-10-22 用户裁定：新席位默认不静音，managed 与讨论一致）的判别用例面：
+ * 三入口入席不静音（managed 创建 / 讨论创建 / 同意加入）、受邀未同意不静音、拒绝后无席位与
+ * 退役 mute.json 残留、存量旧版协作不追溯、重入仍不静音、显式静音的基线口径与取消摘要、
+ * 成功载荷不再带默认静音 notice。静音权威是 seats/<sessionId>.json——新席位写 muted:false，
+ * 显式 ws_set_mute 才置 true。 */
 
 const DAY = 24 * 60 * 60 * 1000;
 const SELF_A = { instanceId: 'inst-a', identityName: '主机甲', port: 17321, sessionId: 'sess-peer-a' };
@@ -190,35 +190,35 @@ function writeLegacyCollab(dir, collabId) {
   }));
 }
 
-test('三入口入席即静音：managed 创建与讨论创建（席位文件落盘）', (t) => {
+test('新席位默认不静音：managed 创建与讨论创建（席位文件落盘）', (t) => {
   const made = makeService(t);
   const managedId = made.service.create({ name: '协作甲', topic: '主题', targets: [targetOf(SELF_B)], sessionId: MANAGER_SESSION }).collabId;
-  assert.equal(suppressedOf(made.service, { type: 'progress', collabId: managedId }, MANAGER_SESSION), true, 'managed 创建：内容消息不注入本会话');
+  assert.equal(suppressedOf(made.service, { type: 'progress', collabId: managedId }, MANAGER_SESSION), false, 'managed 创建：内容消息照常注入本会话');
   const managedSeat = seatFileOf(made.dir, managedId, MANAGER_SESSION);
-  assert.equal(managedSeat.muted, true, '席位文件 muted=true（入席默认静音）');
+  assert.equal(managedSeat.muted, false, '席位文件 muted=false（新席位默认不静音）');
   assert.equal(managedSeat.role, 'manager', '创建会话即站长席位');
   assert.equal(existsSync(mutePath(made.dir, managedId)), false, '不再写退役 mute.json');
   const forumId = made.service.create({ name: '讨论甲', topic: '议题', mode: 'forum', targets: [targetOf(SELF_B)], sessionId: MANAGER_SESSION }).collabId;
-  assert.equal(suppressedOf(made.service, { type: 'post', collabId: forumId }, MANAGER_SESSION), true, '讨论创建：实时帖不注入本会话');
-  assert.equal(seatFileOf(made.dir, forumId, MANAGER_SESSION).muted, true, '讨论创建同样落席位静音');
+  assert.equal(suppressedOf(made.service, { type: 'post', collabId: forumId }, MANAGER_SESSION), false, '讨论创建：实时帖照常注入本会话');
+  assert.equal(seatFileOf(made.dir, forumId, MANAGER_SESSION).muted, false, '讨论创建同样不静音');
   assert.equal(existsSync(mutePath(made.dir, forumId)), false, '讨论创建不写退役 mute.json');
 });
 
-test('三入口入席即静音：同意邀请（讨论与协作两条链路）', async (t) => {
+test('新席位默认不静音：同意邀请（讨论与协作两条链路）', async (t) => {
   const made = makeService(t);
   const forumId = 'collab-approve-forum';
   await receive(made.service, inviteFrame({ collabId: forumId, mode: 'forum' }));
   const forumJoin = await approveWithConsent(made.service, { collabId: forumId, sessionId: MEMBER_SESSION });
   assert.equal(forumJoin.ok, true, forumJoin.message);
-  assert.equal(suppressedOf(made.service, { type: 'post', collabId: forumId }), true, '讨论：同意即默认静音');
-  assert.equal(seatFileOf(made.dir, forumId, MEMBER_SESSION).muted, true, '讨论同意：静音落本会话席位');
+  assert.equal(suppressedOf(made.service, { type: 'post', collabId: forumId }), false, '讨论：同意后不静音');
+  assert.equal(seatFileOf(made.dir, forumId, MEMBER_SESSION).muted, false, '讨论同意：席位 muted=false');
   assert.equal(existsSync(mutePath(made.dir, forumId)), false, '讨论同意不写退役 mute.json');
   const managed = made.service.create({ name: '协作甲', topic: '主题', targets: [targetOf(SELF_B)], sessionId: MANAGER_SESSION });
   const inviteId = await inviteSeatOf(made, managed.collabId, { managerSessionId: MANAGER_SESSION, memberSessionId: MEMBER_SESSION });
   const seatJoin = await approveWithConsent(made.service, { collabId: managed.collabId, sessionId: MEMBER_SESSION, inviteId });
   assert.equal(seatJoin.ok, true, seatJoin.message);
-  assert.equal(suppressedOf(made.service, { type: 'progress', collabId: managed.collabId }), true, '协作：同意即默认静音');
-  assert.equal(seatFileOf(made.dir, managed.collabId, MEMBER_SESSION).muted, true, '协作同意：静音落本会话席位');
+  assert.equal(suppressedOf(made.service, { type: 'progress', collabId: managed.collabId }), false, '协作：同意后不静音');
+  assert.equal(seatFileOf(made.dir, managed.collabId, MEMBER_SESSION).muted, false, '协作同意：席位 muted=false');
   assert.equal(existsSync(mutePath(made.dir, managed.collabId)), false, '协作同意不写退役 mute.json');
 });
 
@@ -248,7 +248,7 @@ test('存量协作不追溯：旧版目录载入后不静音、不补写席位�
   assert.equal(existsSync(mutePath(dir, collabId)), false, '载入不写退役 mute.json');
 });
 
-test('重入闭环：退出删除席位静音 → 重新受邀同意 → 默认再静音', async (t) => {
+test('重入不改变默认：退出删除席位 → 重新受邀同意 → 仍默认不静音', async (t) => {
   const made = makeService(t);
   const created = made.service.create({ name: '协作甲', topic: '主题', targets: [targetOf(SELF_B)], sessionId: MANAGER_SESSION });
   const collabId = created.collabId;
@@ -258,9 +258,9 @@ test('重入闭环：退出删除席位静音 → 重新受邀同意 → 默认�
     inviteId: await inviteSeatOf(made, collabId, { managerSessionId: MANAGER_SESSION, memberSessionId: MEMBER_SESSION }),
   });
   assert.equal(existsSync(seatPath(made.dir, collabId, MEMBER_SESSION)), true, '首次入席：本会话席位已落盘');
-  assert.equal(seatFileOf(made.dir, collabId, MEMBER_SESSION).muted, true, '首次入席：席位静音为真');
+  assert.equal(seatFileOf(made.dir, collabId, MEMBER_SESSION).muted, false, '首次入席：席位不静音');
   assert.equal(made.service.leave({ collabId, sessionId: MEMBER_SESSION }).ok, true);
-  assert.equal(existsSync(seatPath(made.dir, collabId, MEMBER_SESSION)), false, '退出：席位文件（含静音）随席位删除');
+  assert.equal(existsSync(seatPath(made.dir, collabId, MEMBER_SESSION)), false, '退出：席位文件随席位删除');
   assert.equal(existsSync(mutePath(made.dir, collabId)), false, '退出不写退役 mute.json');
   const rejoined = await approveWithConsent(made.service, {
     collabId,
@@ -269,30 +269,33 @@ test('重入闭环：退出删除席位静音 → 重新受邀同意 → 默认�
   });
   assert.equal(rejoined.ok, true, rejoined.message);
   assert.equal(existsSync(seatPath(made.dir, collabId, MEMBER_SESSION)), true, '重入：本会话席位再次落盘');
-  assert.equal(seatFileOf(made.dir, collabId, MEMBER_SESSION).muted, true, '重入：默认静音再次落盘');
-  assert.equal(suppressedOf(made.service, { type: 'progress', collabId }), true, '重入后内容注入判定：静音');
+  assert.equal(seatFileOf(made.dir, collabId, MEMBER_SESSION).muted, false, '重入：仍默认不静音');
+  assert.equal(suppressedOf(made.service, { type: 'progress', collabId }), false, '重入后内容照常注入');
 });
 
-test('基线口径与取消摘要：基线 = 入席时刻读数，摘要只计静音期新增', async (t) => {
+test('显式静音的基线口径与取消摘要：基线 = 设静音时刻读数', async (t) => {
   const made = makeService(t);
   const fromA = SELF_A;
   const fromB = SELF_B;
   const forumId = 'collab-baseline-forum';
   await receive(made.service, inviteFrame({ collabId: forumId, mode: 'forum' }));
   await approveWithConsent(made.service, { collabId: forumId, sessionId: MEMBER_SESSION });
-  /* 基线在入席时刻取当下累计读数并入进程内（不落盘）：此刻为 0。 */
-  await receive(made.service, postFrameOf(forumId, fromA, { postId: 'post-q1', postSeq: 1, text: '静音期一' }));
-  await receive(made.service, postFrameOf(forumId, fromA, { postId: 'post-q2', postSeq: 2, text: '静音期二' }));
-  assert.equal((await made.service.view({ collabId: forumId })).posts.length, 2, '静音期内容照常落盘（只做减法）');
+  await receive(made.service, postFrameOf(forumId, fromA, { postId: 'post-q1', postSeq: 1, text: '静音前一' }));
+  await receive(made.service, postFrameOf(forumId, fromA, { postId: 'post-q2', postSeq: 2, text: '静音前二' }));
+  assert.equal((await made.service.view({ collabId: forumId })).posts.length, 2, '静音前内容照常落盘');
+  assert.equal((await made.service.setMute({ collabId: forumId, sessionId: MEMBER_SESSION, muted: true })).ok, true);
+  await receive(made.service, postFrameOf(forumId, fromA, { postId: 'post-q3', postSeq: 3, text: '静音期一' }));
   assert.equal((await made.service.setMute({ collabId: forumId, sessionId: MEMBER_SESSION, muted: false })).ok, true);
-  assert.ok(made.notices.at(-1).payload.text.includes('静音期间本讨论新增 2 条'), made.notices.at(-1).payload.text);
+  assert.ok(made.notices.at(-1).payload.text.includes('静音期间本讨论新增 1 条'), made.notices.at(-1).payload.text);
   const managedId = made.service.create({ name: '协作甲', topic: '主题', targets: [targetOf(SELF_B)], sessionId: MANAGER_SESSION }).collabId;
-  await receive(made.service, contentFrame('progress', managedId, fromB, { text: '静音期进度一' }));
+  await receive(made.service, contentFrame('progress', managedId, fromB, { text: '静音前进度' }));
+  assert.equal((await made.service.setMute({ collabId: managedId, sessionId: MANAGER_SESSION, muted: true })).ok, true);
+  await receive(made.service, contentFrame('progress', managedId, fromB, { text: '静音期进度' }));
   assert.equal((await made.service.setMute({ collabId: managedId, sessionId: MANAGER_SESSION, muted: false })).ok, true);
   assert.ok(made.notices.at(-1).payload.text.includes('静音期间本协作新增 1 条'), made.notices.at(-1).payload.text);
 });
 
-test('非布尔真值同意：讨论链路的入席、默认静音与提醒同谓词（服务 API 直调）', async (t) => {
+test('非布尔真值同意：讨论链路的入席生效且不静音（服务 API 直调）', async (t) => {
   const made = makeService(t);
   const forumId = 'collab-truthy-forum';
   await receive(made.service, inviteFrame({ collabId: forumId, mode: 'forum' }));
@@ -300,31 +303,30 @@ test('非布尔真值同意：讨论链路的入席、默认静音与提醒同�
   assert.equal(joined.ok, true, String(joined.message));
   assert.equal(joined.decision, 'approved', '按真值判定为同意（既有判据不变）');
   assert.equal(joined.joined, true, '入席生效');
-  assert.equal(suppressedOf(made.service, { type: 'post', collabId: forumId }), true, '默认静音跟着生效');
-  assert.equal(seatFileOf(made.dir, forumId, MEMBER_SESSION).muted, true, '席位落盘形态一致');
-  assert.equal(typeof joined.notice, 'string', '提醒跟着生效（不得只剩半套）');
-  assert.ok(joined.notice.includes('已默认静音'), joined.notice);
+  assert.equal(suppressedOf(made.service, { type: 'post', collabId: forumId }), false, '默认不静音');
+  assert.equal(seatFileOf(made.dir, forumId, MEMBER_SESSION).muted, false, '席位落盘 muted=false');
+  assert.equal(Object.hasOwn(joined, 'notice'), false, '不再带默认静音提醒');
 });
 
-test('幂等重入不重写静音：显式取消后重复同意成功但无提醒（用户意愿不被覆盖）', async (t) => {
+test('幂等重入不覆盖用户显式静音：重复同意成功且不改静音', async (t) => {
   const made = makeService(t);
   const created = made.service.create({ name: '协作甲', topic: '主题', targets: [targetOf(SELF_B)], sessionId: MANAGER_SESSION });
   const collabId = created.collabId;
   const inviteId = await inviteSeatOf(made, collabId, { managerSessionId: MANAGER_SESSION, memberSessionId: MEMBER_SESSION });
   const first = await approveWithConsent(made.service, { collabId, sessionId: MEMBER_SESSION, inviteId });
   assert.equal(first.ok, true, String(first.message));
-  assert.equal(seatFileOf(made.dir, collabId, MEMBER_SESSION).muted, true, '首次同意：席位静音已写入');
-  assert.equal((await made.service.setMute({ collabId, sessionId: MEMBER_SESSION, muted: false })).ok, true);
-  assert.equal(seatFileOf(made.dir, collabId, MEMBER_SESSION).muted, false, '已显式取消静音');
+  assert.equal(seatFileOf(made.dir, collabId, MEMBER_SESSION).muted, false, '首次同意：席位默认不静音');
+  assert.equal((await made.service.setMute({ collabId, sessionId: MEMBER_SESSION, muted: true })).ok, true);
+  assert.equal(seatFileOf(made.dir, collabId, MEMBER_SESSION).muted, true, '已显式设静音');
   const second = await approveWithConsent(made.service, { collabId, sessionId: MEMBER_SESSION, inviteId });
   assert.equal(second.ok, true, '重复同意：幂等成功（未改口）');
   assert.equal(second.idempotent, true, '重复接受按幂等结果返回');
   assert.equal(Object.hasOwn(second, 'notice'), false, '本次没有任何写入：不给提醒');
-  assert.equal(seatFileOf(made.dir, collabId, MEMBER_SESSION).muted, false, '用户取消的静音不被覆盖');
-  assert.equal(suppressedOf(made.service, { type: 'progress', collabId }), false, '内容照常注入本会话');
+  assert.equal(seatFileOf(made.dir, collabId, MEMBER_SESSION).muted, true, '用户显式静音不被覆盖');
+  assert.equal(suppressedOf(made.service, { type: 'progress', collabId }), true, '内容按显式静音抑制');
 });
 
-test('受邀期内容不进同意后的静音窗口：基线 = 入席时刻累计（无席位不可预设静音）', async (t) => {
+test('显式静音窗口基线 = 设静音时刻（受邀期内容不计入）', async (t) => {
   const made = makeService(t);
   const collabId = 'collab-invite-window';
   await receive(made.service, inviteFrame({ collabId, mode: 'forum' }));
@@ -332,28 +334,26 @@ test('受邀期内容不进同意后的静音窗口：基线 = 入席时刻累�
   assert.equal((await made.service.view({ collabId })).posts.length, 1, '受邀期内容照常落盘');
   const joined = await approveWithConsent(made.service, { collabId, sessionId: MEMBER_SESSION });
   assert.equal(joined.ok, true, String(joined.message));
-  assert.equal(seatFileOf(made.dir, collabId, MEMBER_SESSION).muted, true, '同意即默认静音');
+  assert.equal(seatFileOf(made.dir, collabId, MEMBER_SESSION).muted, false, '同意后默认不静音');
+  assert.equal((await made.service.setMute({ collabId, sessionId: MEMBER_SESSION, muted: true })).ok, true);
   await receive(made.service, postFrameOf(collabId, SELF_A, { postId: 'post-q2', postSeq: 2, text: '静音期帖' }));
   assert.equal((await made.service.setMute({ collabId, sessionId: MEMBER_SESSION, muted: false })).ok, true);
-  assert.ok(made.notices.at(-1).payload.text.includes('静音期间本讨论新增 1 条'), '窗口基线＝入席时刻读数（受邀期内容不计入）');
+  assert.ok(made.notices.at(-1).payload.text.includes('静音期间本讨论新增 1 条'), '窗口基线＝设静音时刻读数（受邀期内容不计入）');
 });
 
-test('成功载荷的 notice：创建与同意各增一字段，既有字段原样', async (t) => {
+test('成功载荷不再带默认静音 notice：创建与同意字段原样', async (t) => {
   const made = makeService(t);
   const created = payloadOf(await callCollabTool(createCollabTool(), { name: '协作甲', topic: '主题', targets: [targetOf(SELF_B)] }, made.service, MANAGER_SESSION));
   assert.equal(created.ok, true, '既有字段原样');
   assert.equal(typeof created.collabId, 'string', '既有字段：collabId');
   assert.equal(Array.isArray(created.invited), true, '既有字段：invited');
-  assert.ok(created.notice.includes('已默认静音'), '要素：已默认静音');
-  assert.ok(created.notice.includes('不注入本会话'), '要素：消息不注入本会话');
-  assert.ok(created.notice.includes('/ws-view'), '要素：实时观看走观察窗');
-  assert.ok(created.notice.includes('/ws-mute') && created.notice.includes('取消静音'), '要素：可取消静音');
+  assert.equal(Object.hasOwn(created, 'notice'), false, '默认不静音：无默认静音提醒');
   const collabId = 'collab-notice-member';
   await receive(made.service, inviteFrame({ collabId, mode: 'forum' }));
   const agreed = payloadOf(await callApproveToolWithConsent(made.service, { collabId, approve: true }, MEMBER_SESSION));
   assert.equal(agreed.decision, 'approved', '既有字段原样');
   assert.equal(agreed.joined, true, '既有字段：joined');
-  assert.equal(agreed.notice, created.notice, '同一提醒文案（单一权威）');
+  assert.equal(Object.hasOwn(agreed, 'notice'), false, '同意载荷无默认静音提醒');
 });
 
 test('失败与拒绝载荷不带 notice：错误路径是纯文案、拒绝不入席', async (t) => {

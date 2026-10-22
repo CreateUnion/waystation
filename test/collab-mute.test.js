@@ -266,7 +266,7 @@ async function unmuteAll(made, collabId) {
 }
 
 /* 本机讨论（两席）：远端发起人先邀请本机会话甲、同意；再指名邀请会话乙、同意。
- * 讨论成员粒度＝会话——每次同意由该会话自己发 join 事件并落本会话席位（默认静音由被测面自证）。 */
+ * 讨论成员粒度＝会话——每次同意由该会话自己发 join 事件并落本会话席位（新席位默认不静音）。 */
 function namedForumInviteOf({ collabId, name, targetSessionId }) {
   const frame = inviteFrame({ collabId, name });
   frame.payload.targets = [{ instanceId: SELF_INSTANCE.instanceId, targetSessionId }];
@@ -346,16 +346,14 @@ async function sendForumPost(made, collabId, text) {
   assert.equal(sent.ok, true, sent.message);
 }
 
-test('静音开关：入席默认静音、显式取消后不抑制、席位落盘形态、重建服务后仍静音、校验面明确报错', async (t) => {
+test('静音开关：新席位默认不静音、显式设静音后抑制、席位落盘形态、重建服务后仍静音、校验面明确报错', async (t) => {
   const made = makeService(t);
   const collabId = await makeForum(made, { name: '联调项目' });
-  assert.equal(seatOf(made.service, collabId, MANAGER_SESSION).muted, true, '发起席位入席即默认静音');
-  assert.equal(seatOf(made.service, collabId, MEMBER_SESSION).muted, true, '同机加入席位同样默认静音');
-  assert.equal(suppressedOf(made.service, { type: 'post', collabId }, MEMBER_SESSION), true, '默认静音期内容不注入');
-  await unmuteAll(made, collabId);
-  assert.equal(suppressedOf(made.service, { type: 'post', collabId }, MEMBER_SESSION), false, '显式取消静音后不抑制');
-  assert.equal(made.service.list({ sessionId: MEMBER_SESSION }).collabs[0].muted, false, '清单行按本机席位聚合静音态');
+  assert.equal(seatOf(made.service, collabId, MANAGER_SESSION).muted, false, '发起席位默认不静音');
+  assert.equal(seatOf(made.service, collabId, MEMBER_SESSION).muted, false, '同机加入席位默认不静音');
+  assert.equal(suppressedOf(made.service, { type: 'post', collabId }, MEMBER_SESSION), false, '默认不静音：内容照常注入');
   assert.deepEqual(made.service.setMute({ collabId, sessionId: MEMBER_SESSION, muted: true }), { ok: true, collabId, muted: true });
+  assert.equal(suppressedOf(made.service, { type: 'post', collabId }, MEMBER_SESSION), true, '显式静音后内容不注入');
   assert.equal(seatOf(made.service, collabId, MEMBER_SESSION).muted, true, '切换后本席即时反映');
   assert.equal(made.service.list({ sessionId: MEMBER_SESSION }).collabs[0].muted, true, '清单行聚合随席位切换');
   const seatRecord = JSON.parse(readFileSync(seatPath(made.dir, collabId, MEMBER_SESSION), 'utf8'));
@@ -376,7 +374,7 @@ test('静音开关：入席默认静音、显式取消后不抑制、席位落�
   assert.ok(noSeat.message.includes('没有席位'), noSeat.message);
 });
 
-test('论坛受邀同意：默认静音落到本会话席位（席位文件是唯一权威，不写退役 mute.json）', async (t) => {
+test('论坛受邀同意：默认不静音落到本会话席位（席位文件是唯一权威，不写退役 mute.json）', async (t) => {
   const made = makeService(t);
   const collabId = 'collab-forum-approve-seat';
   const admitted = await receive(made.service, inviteFrame({ collabId }));
@@ -384,11 +382,11 @@ test('论坛受邀同意：默认静音落到本会话席位（席位文件是�
   await approveWithConsent(made.service, { collabId, sessionId: MEMBER_SESSION });
   const seat = seatOf(made.service, collabId, MEMBER_SESSION);
   assert.ok(seat !== null, '论坛同意即建本会话席位');
-  assert.equal(seat.muted, true, '默认静音落席位（listLocalSeats 可见）');
+  assert.equal(seat.muted, false, '默认不静音落席位（listLocalSeats 可见）');
   const record = JSON.parse(readFileSync(seatPath(made.dir, collabId, MEMBER_SESSION), 'utf8'));
-  assert.equal(record.muted, true, '席位文件 muted=true（默认静音落盘）');
+  assert.equal(record.muted, false, '席位文件 muted=false（默认不静音落盘）');
   assert.equal(existsSync(mutePath(made.dir, collabId)), false, '不再写退役 mute.json');
-  assert.equal(suppressedOf(made.service, { type: 'post', collabId }, MEMBER_SESSION), true, '同意后即时按席位静音');
+  assert.equal(suppressedOf(made.service, { type: 'post', collabId }, MEMBER_SESSION), false, '同意后内容照常注入');
 });
 
 test('静音兜底不抑治理帧：同名讨论静音时，未知 collabId 的治理帧仍放行（设计 §5.4）', async (t) => {

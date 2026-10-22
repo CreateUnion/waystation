@@ -2131,7 +2131,7 @@ function creatorSeatOf(sessionId) {
     state: 'member',
     joinSeq: 1,
     joinedAt: new Date().toISOString(),
-    muted: true,
+    muted: false,
     unverified: false,
   };
 }
@@ -2357,7 +2357,7 @@ function ensureSeatAfterJoin(state, collabId, sessionId, role) {
     state: 'member',
     joinSeq: joinSeqOf(local, sessionId),
     joinedAt: new Date().toISOString(),
-    muted: true,
+    muted: false,
     unverified: false,
   }, {
     persist: true,

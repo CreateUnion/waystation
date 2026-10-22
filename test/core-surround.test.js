@@ -523,7 +523,10 @@ test('整链·per-session 过滤（真核＋真工具调用）：绑定随会话
   await joinSecondSeat(core, a, b, created.collabId, 'sess-bravo-2');
   await waitFor(() => (collabsOf(fileB).some((entry) => entry.collabId === created.collabId) ? true : null), { timeoutMs: 12000 });
   assert.equal(collabsOf(fileB).find((entry) => entry.collabId === created.collabId).role, 'member', '状态栏取 B 自己的成员席位角色');
-  assert.equal(collabsOf(fileB).find((entry) => entry.collabId === created.collabId).muted, true, '入席默认静音随会话呈现');
+  assert.equal('muted' in collabsOf(fileB).find((entry) => entry.collabId === created.collabId), false, '新席位默认不静音（会话文件不带 muted）');
+  const muted = await callAndWait(b, 'ws_set_mute', { collabId: created.collabId, muted: true });
+  assert.equal(muted.ok, true, muted.message);
+  await waitFor(() => (collabsOf(fileB).find((entry) => entry.collabId === created.collabId)?.muted === true ? true : null), { timeoutMs: 12000 });
   /* 调用会话断开 → 文件删除；B 的会话文件与其席位状态不受影响。 */
   a.client.send({ type: 'bye', reason: 'session-end' });
   await a.client.close();
@@ -579,12 +582,15 @@ test('整链·状态栏同机双席：会话文件按本会话席位呈现角色
   const entryB = entryOf(fileB, collabId);
   assert.equal(entryA.role, 'manager', '状态栏取本会话（站长）席位角色');
   assert.equal(entryB.role, 'member', '同机另一会话取自己的成员席位角色');
-  /* 席位级静音：站长席取消静音后，本会话文件不再带 🔇，成员席仍静音。 */
+  /* 席位级静音：成员席显式设静音后带 🔇；站长席保持默认不静音，取消静音不影响成员席。 */
+  const mutedMember = core.context.collab.setMute({ collabId, muted: true, sessionId: 'seat-b-0002' });
+  assert.equal(mutedMember.ok, true, mutedMember.message);
+  await waitFor(() => (entryOf(fileB, collabId)?.muted === true ? true : null), { timeoutMs: 15000 });
   const unmuted = core.context.collab.setMute({ collabId, muted: false, sessionId: 'seat-a-0001' });
   assert.equal(unmuted.ok, true, unmuted.message);
   await waitFor(() => (entryOf(fileA, collabId).muted !== true ? true : null), { timeoutMs: 15000 });
-  assert.equal(entryOf(fileA, collabId).muted === true, false, '站长席已取消静音');
-  assert.equal(entryOf(fileB, collabId).muted, true, '成员席静音不受影响（不得按整机聚合）');
+  assert.equal(entryOf(fileA, collabId).muted === true, false, '站长席保持默认不静音');
+  assert.equal(entryOf(fileB, collabId).muted, true, '成员席显式静音不受影响（不得按整机聚合）');
 });
 
 /* —— 整链·ws_list_hosts 本机段（真核＋真 IPC） —— */

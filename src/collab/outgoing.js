@@ -4,11 +4,11 @@ import { MAX_FORUM_MEMBERS, MAX_LOCAL_COLLABS, canTransition, isArchived, newCol
 import { createPostsStore, displayOrderOf, newPostId } from './posts.js';
 import { createMembersStore } from './members.js';
 import { createCounterStore, notifyIndicatorChange } from './counter.js';
-import { forgetMuteBaselinesOfCollab, rememberMuteBaselineIfAbsent } from './mute.js';
+import { forgetMuteBaselinesOfCollab } from './mute.js';
 import { createInjectedStore } from './injected.js';
 import { consumeInviteChallenge, consumeInviteWaiver, issueInviteChallenge } from './consent.js';
 import { ledgerDigest, removeLedgerFile } from './store.js';
-import { archiveLocalSeatsOfState, currentManagerIdOf, emitOwnMemberEvent, foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localSeatOfLocal, localStateOf, localTopicOf, memberStateFor, persistLedger, persistMember, persistSnapshot, relayDepartedOf, relayPeerOf, rememberKnownHost, retiredMuteHandle, seatsOfLocal, selfJoinedOf, upsertLocalSeat } from './local.js';
+import { archiveLocalSeatsOfState, currentManagerIdOf, emitOwnMemberEvent, foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, localTopicOf, memberStateFor, persistLedger, persistMember, persistSnapshot, relayDepartedOf, relayPeerOf, rememberKnownHost, retiredMuteHandle, selfJoinedOf, upsertLocalSeat } from './local.js';
 import { matchConflictCollabs } from './gate.js';
 import { CARRIER_FORMAT_INVITE_STUB, CARRIER_FORMAT_SESSION_SEATS, readCarrier, writeCarrier } from './carrier.js';
 import { collabDir } from '../paths.js';
@@ -29,48 +29,10 @@ const MESSAGING_MEMBER_STATES = ['invited', 'approved', 'member'];
 const RELAYED_ORIGINS_MAX = 256;
 
 /* 本机该协作的内容累计读数（讨论 = 帖子列表 size（含回填帖）、managed = 内容消息计数）。
- * 静音基线与取消摘要、入席默认静音的基线都必须经这一处取数——两处各算一次必然分叉，
- * 随后就是「默认静音的窗口起点与 /ws-mute 对不上」这类难查的错位。 */
+ * 显式静音的基线与取消摘要都必须经这一处取数——两处各算一次必然分叉，
+ * 随后就是「静音窗口起点与 /ws-mute 对不上」这类难查的错位。 */
 export function contentCountOf(local) {
   return localModeOf(local) === 'forum' ? local.posts.size() : local.counter.count();
-}
-
-/* 提醒文案（设计 §3.3 的承载形态）：要素写死——已默认静音／消息不注入本会话／实时观看走
- * 观察窗（/ws-view）／要本会话实时跟进用 /ws-mute 取消静音。随成功载荷的 notice 字段承载；
- * 与静音写入同谓词产出（工具层只做输出封装，不另立一份「本次是否写了静音」的判定）。 */
-const DEFAULT_MUTE_NOTICE = '已默认静音——消息不注入本会话；实时观看走观察窗（/ws-view），要本会话实时跟进用 /ws-mute 取消静音';
-
-/* 入席默认静音（设计 §3.1）：本机成为参与者时把默认静音落到**本会话席位**（席位文件的 muted
- * 是唯一权威，契约 §8），基线 = 写入时刻的当下累计读数（进程内按席位记录）。
- * 返回本次是否真写了（前态未静音或基线首次建立即本次落笔）——提醒据此如实给，不虚报。
- * 只在「创建成功」与「同意加入成功」两处调用——挂到记录创建 / 成员落盘这类宽调用点，
- * 会把受邀未同意者也静音（本机不同意还被静音的故障形态）。
- * managed 两段式在同意时尚未建席：基线按调用会话先记下，席位由加入域建席时落 muted:true。 */
-function applyDefaultMute(state, local, sessionId) {
-  const target = defaultMuteSessionOf(local, sessionId);
-  if (target === null) {
-    return false;
-  }
-  const firstApplication = rememberMuteBaselineIfAbsent(state, local.collabId, target, contentCountOf(local));
-  const seat = localSeatOfLocal(local, target);
-  if (seat === null) {
-    return firstApplication;
-  }
-  const wrote = seat.muted !== true;
-  if (wrote) {
-    seat.muted = true;
-    upsertLocalSeat(local, { sessionId: target, muted: true }, { persist: true, dataDir: state.dataDir });
-  }
-  return wrote || firstApplication;
-}
-
-/* 默认静音的落点：调用会话自己的席位；无会话标识时仅在恰一席的兼容路径下取该席。 */
-function defaultMuteSessionOf(local, sessionId) {
-  if (typeof sessionId === 'string' && sessionId !== '') {
-    return sessionId;
-  }
-  const seats = [...seatsOfLocal(local).values()];
-  return seats.length === 1 ? seats[0].sessionId : null;
 }
 
 /* 获准台账不在本模块落笔：joins.json 的单一写者是加入域（凭 v2 形态整档写）。
@@ -109,10 +71,8 @@ export function createCollab(state, { name, topic, targets, mode, sessionId }) {
   }
   const invited = initialInvitesOf(state, local, ledger, targets, collabMode, sessionId);
   state.counters.collabsCreated++;
-  applyDefaultMute(state, local, sessionId);   // 写点一：创建成功（邀请发送结果不影响入席事实）
   state.openViewer?.({ root: state.viewerRoot, id: ledger.collabId });   // 触发 A：建立即开该协作页（开关在出口内现读）
-  /* 新建实例的静音状态必为空（新 collabId 无旧文件），写点一的默认静音必然落笔——提醒同发。 */
-  return { ok: true, collabId: ledger.collabId, invited, notice: DEFAULT_MUTE_NOTICE };
+  return { ok: true, collabId: ledger.collabId, invited };
 }
 
 /* 创建路径的持久化结果（与运行态路径不同：这里写失败必须中止创建）。返回失败原因或 null。 */
@@ -251,7 +211,7 @@ function persistCreatorSeat(state, local, sessionId) {
     state: 'member',
     joinSeq: 1,
     joinedAt: new Date().toISOString(),
-    muted: true,
+    muted: false,
     unverified: false,
   }, { persist: true, dataDir: state.dataDir, bridgeId: bridgeIdOfSession(state, sessionId) });
   const persisted = (local.seatPersistFailures ?? 0) === before;
@@ -671,10 +631,9 @@ function inviteSummaryOf(local) {
   };
 }
 
-/* 表态的落地与入席副作用（设计 §3.1/§3.3）：分派到讨论 / 协作各自的实现；同意且实现成功时
- * 写默认静音、给一行提醒。入席、写静音、提醒三者同谓词——判据取**决策结果**（wanted）而非
- * 原始入参的真值：服务 API 直调传非布尔真值时入席照旧生效，静音与提醒必须跟着生效，
- * 不得只剩半套（拒绝、参数非法、端点未知等分支则一律不写，不留残留）。
+/* 表态的落地与入席副作用（设计 §3.3）：分派到讨论 / 协作各自的实现；同意且实现成功时
+ * 打开观察窗。判据取**决策结果**（wanted）而非原始入参的真值：服务 API 直调传非布尔真值时
+ * 入席照旧生效（拒绝、参数非法、端点未知等分支则一律不写，不留残留）。
  * 获准台账不在此处写：joins.json 的单一写者是加入域（v2 整档写），本模块只经加入域接口使用。 */
 function applyInviteDecision(state, local, approve, wanted, reason, sessionId) {
   const result = localModeOf(local) === 'forum'
@@ -683,11 +642,8 @@ function applyInviteDecision(state, local, approve, wanted, reason, sessionId) {
   if (wanted !== 'approved' || result.ok !== true) {
     return result;
   }
-  const wrote = applyDefaultMute(state, local, sessionId);   // 写点二：同意加入成功
   state.openViewer?.({ root: state.viewerRoot, id: local.collabId });   // 触发 A：同意入席即开该协作页（开关在出口内现读）
-  /* 提醒只在本次真的写了静音时给：幂等重入的早返回根本到不了这里（本次什么都没写），
-   * 说「已默认静音」会与事实相反。 */
-  return wrote ? { ...result, notice: DEFAULT_MUTE_NOTICE } : result;
+  return result;
 }
 
 /* 讨论的邀请回应（设计 §5.1/§5.4）：同意 = 加入**立即生效**——本地转进行中、自播 join
@@ -752,7 +708,6 @@ function ensureJoinedSeatOf(state, local, sessionId) {
     state: 'member',
     joinSeq: 1,
     joinedAt: new Date().toISOString(),
-    muted: true,
   }, { persist: true, dataDir: state.dataDir, bridgeId: bridgeIdOfSession(state, target) });
 }
 
@@ -2523,7 +2478,7 @@ function applyManagerSeatRoles(state, local, ledger) {
     state: 'member',
     joinSeq: row.joinSeq,
     joinedAt: row.joinedAt,
-    muted: true,
+    muted: false,
     unverified: false,
   }, { persist: true, dataDir: state.dataDir, bridgeId: bridgeIdOfSession(state, managerSessionId) });
 }

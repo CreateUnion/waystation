@@ -290,7 +290,7 @@ test('即时刷新：静音开关同样不等心跳——muted 随指示面进�
   const station = makeObservedStation(t);
   const created = station.service.create({ name: '联调项目', topic: '发布联调', targets: [target('inst-b')], sessionId: SESSION_ID });
   station.writer.start();
-  station.service.setMute({ collabId: created.collabId, sessionId: SESSION_ID, muted: false });   // 新建即默认静音：显式取「未静音」基线
+  station.service.setMute({ collabId: created.collabId, sessionId: SESSION_ID, muted: false });   // 新席位默认不静音：显式确认「未静音」状态
   assert.equal('muted' in station.entryOf(created.collabId), false, '未静音：字段缺省（加性口径——旧读取端不受扰）');
   const before = station.refreshes();
   station.service.setMute({ collabId: created.collabId, sessionId: SESSION_ID, muted: true });

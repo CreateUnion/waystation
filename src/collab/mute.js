@@ -138,8 +138,8 @@ function clear(state) {
 }
 
 /* —— 静音摘要基线（进程内，按席位） ——
- * 键 = collabId + sessionId：同机两席各算各的窗口，互不清空。基线只在静音写入点记录
- * （默认静音 / ws_set_mute 设静音），取消时算 N 并删除；进程重启后内存表为空，
+ * 键 = collabId + sessionId：同机两席各算各的窗口，互不清空。基线只在显式设静音时记录
+ * （ws_set_mute(true)），取消时算 N 并删除；进程重启后内存表为空，
  * 取消静音按「基线缺失」降级（不虚构数字），不新增持久化字段。 */
 
 function baselinesOf(state) {
@@ -154,7 +154,7 @@ function baselineKeyOf(collabId, sessionId) {
 }
 
 /* 首次进入静音窗口时记下当前累计；重复设静音不重置（窗口仍从首次算起）。
- * 返回是否本次新记（调用方据此判断「默认静音是否首次落地」）。 */
+ * 返回是否本次新记（供调用方按需判断基线来源）。 */
 export function rememberMuteBaselineIfAbsent(state, collabId, sessionId, currentCount) {
   const baselines = baselinesOf(state);
   const key = baselineKeyOf(collabId, sessionId);

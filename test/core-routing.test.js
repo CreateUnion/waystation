@@ -993,14 +993,16 @@ test('wiring·链一全链：准入→落盘→消费→投递→第三档（回
   assert.equal(harness.reports.length, 1, '未注入不发第三档');
 });
 
-test('wiring·席位级静音：入席默认静音抑制内容类推送；取消后照常注入', async (t) => {
+test('wiring·席位级静音：显式设静音抑制内容类推送；取消后照常注入', async (t) => {
   const harness = makeWiring(t);
   const { service, registry, out, inbound } = harness;
   const recordA = bridgeRecord('bridge-a', 'session-a');
   registry.register(recordA);
   const created = await callTool(harness, 'ws_create_collab', { name: '项目甲', topic: '主题', targets: [TARGET_PEER] }, recordA);
   const collabId = created.collabId;
-  assert.equal(service.localSeatOf(collabId, 'session-a').muted, true, '创建会话席位默认静音');
+  assert.equal(service.localSeatOf(collabId, 'session-a').muted, false, '创建会话席位默认不静音');
+  await callTool(harness, 'ws_set_mute', { collabId, muted: true }, recordA);
+  assert.equal(service.localSeatOf(collabId, 'session-a').muted, true, '显式设静音');
 
   const connection = connectionStub();
   inbound.onFrame(connection, sampleFrame(collabId));
@@ -1024,6 +1026,7 @@ test('wiring·取消静音摘要恰一条：座位级开关切换向调用者桥
   const created = await callTool(harness, 'ws_create_collab', { name: '项目甲', topic: '主题', targets: [TARGET_PEER] }, recordA);
   const collabId = created.collabId;
 
+  await callTool(harness, 'ws_set_mute', { collabId, muted: true }, recordA);
   const payload = await callTool(harness, 'ws_set_mute', { collabId, muted: false }, recordA);
   assert.equal(payload.ok, true);
   assert.equal('notice' in payload, false, '同席调用：无归属/指引 notice');
@@ -1042,11 +1045,12 @@ test('wiring·写类调用不再夺席：席位表是唯一来源（无席位会
   const recordB = bridgeRecord('bridge-b', 'session-b');
   registry.register(recordB);
 
+  assert.equal(service.setMute({ collabId, sessionId: 'session-a', muted: true }).ok, true, '前置：站长席显式设静音');
   const refused = await callTool(harness, 'ws_set_mute', { collabId, muted: false }, recordB);
   assert.equal(refused.ok, false, '静音按席位：无席位会话不得改他人席位');
   assert.match(refused.message, /没有席位/);
   assert.equal(service.localSeatOf(collabId, 'session-b'), null, '写类调用不创建席位');
-  assert.equal(service.localSeatOf(collabId, 'session-a').muted, true, '站长席静音不被他人改动');
+  assert.equal(service.localSeatOf(collabId, 'session-a').muted, true, '站长席显式静音不被他人改动');
   assert.equal(router.bindings.get(collabId).sessionId, 'session-a', '绑定仍是创建会话（不因他人写类调用转移）');
   assert.equal(pushFramesOf(out, 'bridge-b').length, 0, '拒绝路径不产生注入');
 });

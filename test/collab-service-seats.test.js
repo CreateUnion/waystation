@@ -9,6 +9,7 @@ import { readCarrierFormat } from '../src/collab/carrier.js';
 import { readMigration, readRecovery } from '../src/collab/migration.js';
 import { seatFilePath } from '../src/paths.js';
 import { ledgerDigest } from '../src/collab/store.js';
+import { localSeatOfLocal, upsertLocalSeat } from '../src/collab/local.js';
 
 /* M2 运行时席位与本地投递：席位载入/派生、本机旁路、暂存补投、桥注册、核心存续、legacy/recovery 写门、
  * 绑定表退役与新建协作的载体/席位落盘。夹具直接落新形态文件（M1 台账形态 + M8 载体标记）。 */
@@ -202,6 +203,17 @@ test('席位载入：双席、站长席派生、角色从席位派生（local.ro
   assert.equal(entry.muted, true, '静音按席位聚合（站长席静音）');
   assert.deepEqual(reloaded.listLocalSeats('collab-none'), []);
   reloaded.close();
+});
+
+test('席位合并保留既有静音：省略 muted 不覆盖 true，新席位默认 false', () => {
+  const local = {
+    collabId: 'collab-mute-merge',
+    seats: new Map([['sess-existing', { sessionId: 'sess-existing', role: 'member', state: 'member', muted: true }]]),
+  };
+  upsertLocalSeat(local, { sessionId: 'sess-existing', state: 'member', joinSeq: 2 });
+  assert.equal(localSeatOfLocal(local, 'sess-existing').muted, true, '既有席位显式静音不被写路径覆盖');
+  upsertLocalSeat(local, { sessionId: 'sess-new', role: 'member', state: 'member' });
+  assert.equal(localSeatOfLocal(local, 'sess-new').muted, false, '新席位省略 muted 时默认不静音');
 });
 
 test('本机旁路：同机双席各自注入、同 msgId 去重、发送会话不给自己投递', async (t) => {

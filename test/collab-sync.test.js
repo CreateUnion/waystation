@@ -559,9 +559,9 @@ test('end 双通道：在线广播即归档；离线者回归经 bundle 元状�
   const { wire, selfA, selfB, a, b, collabId } = await makeForumPair(t);
   await injectPosts(a.service, collabId, postsOf(2));
   const { selfC, madeC, seatOfC } = await makeOfflineForumMemberC(t, wire, { a, collabId, selfA, selfB });
-  /* 静音权威＝席位文件的 muted（mute.json 退役、留盘不读写）：同意加入的默认静音落 C 的席位。 */
+  /* 静音权威＝席位文件的 muted（mute.json 退役、留盘不读写）：同意加入默认不静音落 C 的席位。 */
   const seatOfCFile = JSON.parse(readFileSync(seatFilePath(madeC.dir, collabId, seatOfC), 'utf8'));
-  assert.equal(seatOfCFile.muted, true, '同意路径默认静音落席位文件');
+  assert.equal(seatOfCFile.muted, false, '同意路径默认不静音落席位文件');
   assert.equal(existsSync(collabFilePath(madeC.dir, collabId, MUTE_FILE_NAME)), false, 'mute.json 不写入（静音权威=席位）');
   /* 发起人结束：广播 end（豁免 TTL/上限）；在线者 B 经广播通道。 */
   const ended = await a.service.end({ collabId });

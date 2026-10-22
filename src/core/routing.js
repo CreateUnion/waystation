@@ -264,7 +264,7 @@ function jsonObjectOf(result) {
   return isPlainObject(parsed) ? parsed : null;
 }
 
-/** notice 附加（不改 schema：复用安静默认的 notice 字段先例）：只改 JSON 对象载荷的
+/** notice 附加（不改 schema：复用既有 notice 字段先例）：只改 JSON 对象载荷的
  * 成功结果；与既有 notice 并置（互不覆盖）。解析不出即原样返回——notice 是附属面，不得弄坏主结果。 */
 export function attachNotice(result, notices) {
   if (!Array.isArray(notices) || notices.length === 0) {

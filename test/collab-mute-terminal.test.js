@@ -108,7 +108,9 @@ function contentFrameOf(collabId) {
 test('结束协作：本机席位归档（archivedAt 落盘、不删除），退出注入/静音聚合/状态栏；重启仍可读', async (t) => {
   const made = makeService(t);
   const collabId = await makeManaged(made);
-  assert.equal(seatOf(made.service, collabId, MANAGER_SESSION)?.muted, true, '前置：默认静音已落席位');
+  assert.equal(seatOf(made.service, collabId, MANAGER_SESSION)?.muted, false, '前置：新席位默认不静音');
+  assert.equal(made.service.setMute({ collabId, sessionId: MANAGER_SESSION, muted: true }).ok, true, '前置：显式设静音');
+  assert.equal(seatOf(made.service, collabId, MANAGER_SESSION)?.muted, true, '前置：显式静音已落席位');
   const ended = made.service.end({ collabId, sessionId: MANAGER_SESSION });
   assert.equal(ended.ok, true, ended.message);
 
@@ -216,7 +218,7 @@ test('无会话 approve 被拒绝且不升级目录：invite-stub 保持原状�
   assert.equal(classifyCollabDir(collabDir(made.dir, collabId)).kind, 'session-seats', '带会话同意后目录正常升级');
   const seat = seatOf(made.service, collabId, MEMBER_SESSION);
   assert.ok(seat !== null, '带会话同意建席');
-  assert.equal(seat.muted, true, '默认静音同步落席位');
+  assert.equal(seat.muted, false, '默认不静音同步落席位');
 });
 
 test('能力探测异常 fail-closed：按「无法确认目标能力」拒绝并计数，不穿出调用链', async (t) => {

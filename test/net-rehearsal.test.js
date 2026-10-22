@@ -623,7 +623,7 @@ test('协作预演：离线续投（乙离线期间排队、重开后续投并�
     const listed = await a.command({ cmd: 'list_collabs' });
     return listed.collabs.some((entry) => entry.collabId === created.collabId && entry.state === 'active');
   }, { timeoutMs: 15000 });
-  /* 入席默认静音（本用例断言面 = 会话收到 → 档位推进）：显式取消静音，断言不依赖系统默认值。 */
+  /* 本用例断言面 = 会话收到 → 档位推进：显式取消静音，断言不依赖系统默认值。 */
   assert.equal((await b.command({ cmd: 'set_mute', collabId: created.collabId, muted: false })).ok, true);
   await b.command({ cmd: 'exit' });
   await waitForRebindable(port + 1);

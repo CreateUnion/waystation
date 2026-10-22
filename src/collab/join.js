@@ -693,7 +693,7 @@ function ensureBoundSeatOf(joinState, local, sessionId) {
     state: 'member',
     joinSeq: rosterJoinSeqOf(local, sessionId),
     joinedAt: new Date(joinState.now()).toISOString(),
-    muted: true,
+    muted: false,
     unverified: false,
   }, seatWriteOptionsOf(joinState, sessionId));
 }
@@ -2709,7 +2709,6 @@ function markLocalSeatMemberOf(joinState, local, record, joinSeq) {
     state: 'member',
     joinSeq,
     joinedAt: new Date(joinState.now()).toISOString(),
-    muted: true,
     unverified: false,
   }, seatWriteOptionsOf(joinState, record.sessionId));
 }
@@ -2978,7 +2977,6 @@ async function beginLocalJoiningOf(joinState, local, application, joinId, payloa
     grantVersion: payload.version,
     managerTerm: payload.managerTerm,
     joinedAt: new Date(joinState.now()).toISOString(),
-    muted: true,
     unverified: false,
   }, seatOptions);
   /* 席位已落盘＝真正入席开始：邀请占位载体换成 session-seats，重启后按成员目录加载。 */

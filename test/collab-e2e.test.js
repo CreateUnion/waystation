@@ -213,7 +213,7 @@ async function waitState(client, collabId, state) {
   }, { timeoutMs: 20000 });
 }
 
-/* 入席默认静音的显式取消：凡本用例要求消息照常注入本会话的入席方都要先取消。 */
+/* 入席默认不静音；需要注入的入席方仍显式取消一次，断言不依赖系统默认值。 */
 async function unmuteForInjection(client, collabId) {
   const called = await callTool(client, 'ws_set_mute', { collabId, muted: false });
   assert.equal(called.isError, false, String(called.payload));

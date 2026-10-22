@@ -929,8 +929,8 @@ test('真核 e2e（本机自批链）：建协 → 新会话申请 → 待批准
     name: '进程内环', topic: '主题', targets: [{ instanceId: 'inst-peer', identityName: '对端', address: '127.0.0.1', port: peerPort }],
   });
   assert.equal(created.ok, true, created.message);
-  /* 建协即默认静音（注入栅栏）：本链路验的是「按绑定注入」而非静音，先取消静音；
-   * 静音切换本身会经调用者桥投一行摘要，故两侧已收帧一并清空，后续断言只判接线后的注入。 */
+  /* 新席位默认不静音；本链路验的是「按绑定注入」而非静音，仍显式取消一次以不依赖默认值；
+   * 若后续显式设过静音，取消会经调用者桥投一行摘要，故两侧已收帧一并清空，后续断言只判接线后的注入。 */
   const unmuted = await callAndWait(owner, 'ws_set_mute', { collabId: created.collabId, muted: false });
   assert.equal(unmuted.ok, true, unmuted.message);
   owner.frames.length = 0;
