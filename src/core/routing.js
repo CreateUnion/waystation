@@ -430,13 +430,22 @@ function applyAdoptOf(state, { tool, args, caller, now = null }) {
     return noAdopt();
   }
   const collabId = collabIdOf(args);
-  if (collabId === null) {
+  /* dispatch 是纯内存本机域：没有 join / 获准台账（isGranted 对未知协作恒 false），
+   * adopt 语义不适用——不夺席、不出「先 ws_join 申请」指引、不计拒绝。成员身份由
+   * dispatch 域自身校验（非成员发送会被如实拒绝）。 */
+  if (collabId === null || isDispatchInstance(state, collabId)) {
     return noAdopt();
   }
   const sessionId = caller?.sessionId ?? null;
   if (!bindableCaller(sessionId, caller)) {
     return noAdopt();   // 无会话标识的桥本就不入席：指引文案对它不成立（另经 SESSIONLESS_NOTICE 说明）
   }
+  return adoptByStateOf(state, { collabId, sessionId, caller, now });
+}
+
+/* 席位面已接线（生产形态）走席位判据；兼容夹具仍可能只有绑定表——活跃绑定属异会话时
+ * 不夺席并给「席位被持有」指引，休眠/空绑定才进入获准判据。 */
+function adoptByStateOf(state, { collabId, sessionId, caller, now }) {
   if (typeof state.seatOf === 'function') {
     return adoptWithSeats(state, { collabId, sessionId, caller, now });
   }
@@ -491,6 +500,16 @@ function isForumInstance(state, collabId) {
     return state.describeCollab?.(collabId)?.mode === 'forum';
   } catch {
     return false;   // 描述器异常按 managed 解释（最严的一侧）
+  }
+}
+
+/* dispatch 与 forum 同为「无获准门」的容器，但 dispatch 不在 state.collabs 里：获准判据对
+ * 未知协作恒 false，若不在获准判据之前豁免，每次写类调用都会附一条误导性的 ws_join 指引。 */
+function isDispatchInstance(state, collabId) {
+  try {
+    return state.describeCollab?.(collabId)?.mode === 'dispatch';
+  } catch {
+    return false;   // 描述器异常按非 dispatch 解释（继续走获准判据）
   }
 }
 

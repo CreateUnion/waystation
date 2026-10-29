@@ -445,8 +445,9 @@ function dispatchTargetsArgOf(toSessionIds) {
   if (toSessionIds === undefined) {
     return { value: undefined };
   }
-  if (!Array.isArray(toSessionIds) || toSessionIds.some((id) => typeof id !== 'string' || id.trim() === '')) {
-    return { error: 'toSessionIds 非法：需要非空字符串数组' };
+  if (!Array.isArray(toSessionIds) || toSessionIds.length === 0
+    || toSessionIds.some((id) => typeof id !== 'string' || id.trim() === '')) {
+    return { error: 'toSessionIds 非法：需要非空字符串数组（省略即按绑定路由）' };
   }
   return { value: toSessionIds.map((id) => id.trim()) };
 }

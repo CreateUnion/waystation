@@ -413,6 +413,9 @@ function releaseSlaveIn(runtime, { sessionId, targetSessionId }) {
   record.slaves.delete(targetSessionId);
   record.grace.delete(targetSessionId);
   sendNotice(runtime, record, targetSessionId, 'master 已释放本会话——dispatch 收编结束', 'dispatch-released');
+  /* 释放后该会话不再属于本 dispatch（dispatchOf 也找不到它），待补投队列再无人 flush：
+   * 连刚排入的释放通知一起回收，避免内存滞留。主调用的通知走 master 队列，不受影响。 */
+  record.queues.delete(targetSessionId);
   sendNotice(runtime, record, sessionId, `已释放「${slave.name}」`, 'dispatch-member-left');
   return { ok: true, sessionId: targetSessionId };
 }
@@ -492,12 +495,27 @@ function deliverMessage(runtime, record, targets, message) {
 /* 路由判定：返回 { value: targets } 或 { error }。master 定向到非成员 / slave 越权回复 /
  * 非成员发送都必须如实拒绝——静默丢消息比拒绝更难排查。 */
 function sendTargetsOf(record, sessionId, toSessionIds) {
-  if (toSessionIds !== undefined && !Array.isArray(toSessionIds)) {
-    return { error: 'toSessionIds 非法：需要字符串数组' };
+  const refusal = toSessionIdsRefusalOf(toSessionIds);
+  if (refusal !== null) {
+    return { error: refusal };
   }
   return sessionId === record.masterSessionId
     ? masterTargetsOf(record, toSessionIds)
     : slaveTargetsOf(record, sessionId, toSessionIds);
+}
+
+/* toSessionIds 形状：未给＝按绑定路由（master 广播 / slave 回 master）；显式给出时必须是非空
+ * 字符串数组——空数组既不等于「省略」也不该落到误导性的「目标不在 dispatch 内」判定。 */
+function toSessionIdsRefusalOf(toSessionIds) {
+  if (toSessionIds === undefined) {
+    return null;
+  }
+  if (!Array.isArray(toSessionIds) || toSessionIds.length === 0) {
+    return 'toSessionIds 非法：需要非空字符串数组（省略即按绑定路由）';
+  }
+  return toSessionIds.every((id) => typeof id === 'string' && id.trim() !== '')
+    ? null
+    : 'toSessionIds 非法：需要非空字符串数组';
 }
 
 function masterTargetsOf(record, toSessionIds) {

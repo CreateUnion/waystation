@@ -59,6 +59,24 @@ test('end 清空 dispatch 并通知全员；leave 只移除自己', (t) => {
   assert.equal(node.notices.some((entry) => entry.payload?.event === 'dispatch-ended'), true);
 });
 
+test('显式空 toSessionIds / 空白元素拒绝；省略才按绑定路由', (t) => {
+  const { node, collabId } = setup(t);
+  assert.equal(node.service.dispatch.send({ collabId, sessionId: 'master-1', text: 'x', toSessionIds: [] }).ok, false, '空数组不等于省略');
+  assert.equal(node.service.dispatch.send({ collabId, sessionId: 'master-1', text: 'x', toSessionIds: [' '] }).ok, false, '空白会话标识拒绝');
+  assert.equal(node.service.dispatch.send({ collabId, sessionId: 'master-1', text: 'x', toSessionIds: ['worker-1'] }).ok, true);
+});
+
+test('release 释放后会回收该会话的待补投队列', (t) => {
+  const node = makeDispatchNode(t, { notifyResult: false });
+  const created = node.service.create({ mode: 'dispatch', name: '释放', sessionId: 'master-1' });
+  node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['worker-1'] });
+  node.service.dispatch.send({ collabId: created.collabId, sessionId: 'master-1', text: '排队', toSessionIds: ['worker-1'] });
+  const record = node.service.dispatch.dispatches.get(created.collabId);
+  assert.equal(record.queues.has('worker-1'), true, '前置：通知失败已入队');
+  node.service.dispatch.release({ sessionId: 'master-1', targetSessionId: 'worker-1' });
+  assert.equal(record.queues.has('worker-1'), false, '释放后队列回收');
+});
+
 test('通知失败时进有界队列，重连 flush', (t) => {
   const node = makeDispatchNode(t, { notifyResult: false });
   const created = node.service.create({ mode: 'dispatch', name: '队列', sessionId: 'master-1' });

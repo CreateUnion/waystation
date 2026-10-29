@@ -212,7 +212,8 @@ function isEventToken(value) {
 
 /* 零正文判定与叙述：类型控制事件（end/join/leave，载荷带机制字段也算）、notice 状态回执族（无 text 者）、
  * 一切空载荷帧——三类零正文面取一行中文叙述；有正文与带字段的控制帧返回 null，走原三行形态。
- * 措辞按模式感知（managed 称「协作」、其余称「讨论」）；模式不可得时按「讨论」默认（设计示例措辞）。 */
+ * 措辞按模式感知（managed 称「协作」、dispatch 称「dispatch」、其余称「讨论」）；
+ * 模式不可得时按「讨论」默认（设计示例措辞）。 */
 function zeroBodyNarrationOf(frame, collab) {
   if (frame.type === 'end' || frame.type === 'join' || frame.type === 'leave') {
     return `${frame.from.identityName}${CONTROL_EVENT_VERBS[frame.type]}${modeNounOf(collab)}`;

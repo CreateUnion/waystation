@@ -285,6 +285,28 @@ test('adopt 收紧：forum 豁免（讨论照旧夺席）；判据面未注入 /
   }
 });
 
+test('adopt 收紧：dispatch 豁免——写类调用不夺席、不出未获准指引、不计拒绝；managed 行为不变', (t) => {
+  const dispatchRouter = makeRouter(t, {
+    describeCollab: () => ({ name: '本机编排', mode: 'dispatch' }),
+    isGranted: () => false,
+  });
+  dispatchRouter.registry.register(bridgeRecord('bridge-b', 'session-b'));
+  const caller = { bridgeId: 'bridge-b', sessionId: 'session-b' };
+  for (const tool of ['ws_send_message', 'ws_end_collab', 'ws_leave_collab']) {
+    const outcome = dispatchRouter.router.applyAdopt({ tool, args: { collabId: 'collab-dispatch' }, caller });
+    assert.equal(outcome.adopted, false, `${tool}：dispatch 不夺席`);
+    assert.equal(outcome.notice, null, `${tool}：不得附「先 ws_join 申请」指引`);
+  }
+  assert.equal(dispatchRouter.router.bindings.get('collab-dispatch'), null, 'dispatch 不写注入绑定');
+  assert.equal(dispatchRouter.router.stats().adoptGrantRefusals, 0, 'dispatch 不计获准拒绝');
+
+  const managed = makeRouter(t, { isGranted: () => false });
+  managed.registry.register(bridgeRecord('bridge-c', 'session-c'));
+  const refused = managed.router.applyAdopt({ tool: 'ws_send_message', args: { collabId: 'collab-managed' }, caller: { bridgeId: 'bridge-c', sessionId: 'session-c' } });
+  assert.equal(refused.notice, ADOPT_GUIDANCE_NOTICE, 'managed 未获准仍附指引（行为不变）');
+  assert.equal(managed.router.stats().adoptGrantRefusals, 1, 'managed 拒绝计数不变');
+});
+
 test('工具归类表：写类（adopt 集）/ 纯读类 / 敲门 三类互斥且覆盖设计词表', () => {
   for (const name of ['ws_send_message', 'ws_set_mute', 'ws_decide', 'ws_handover', 'ws_take_over', 'ws_invite', 'ws_withdraw_invite', 'ws_end_collab', 'ws_leave_collab']) {
     assert.equal(classifyTool(name), 'write', `${name} ∈ 写类`);
@@ -699,6 +721,12 @@ function makeWiring(t, overrides = {}) {
     describeCollab: (collabId) => w.service.describe(collabId),
     /* 获准判据与核心组合根同源（谓词闭包运行期取服务）：装配面同形，判据面缺位的行为另有单测钉死。 */
     isGranted: (collabId, sessionId) => w.service.join.isGranted(collabId, sessionId),
+    /* 生产组合根还注入席位面（injectionSeatWiringOf）；默认不注入以免改变既有用例的绑定语义，
+     * 需要按生产形态验证 adopt 的用例显式开启。 */
+    ...(overrides.seatWiring === true ? {
+      seatsOf: (collabId) => w.service?.seatsForRouting?.(collabId) ?? [],
+      seatOf: (collabId, sessionId) => w.service?.seatForRouting?.(collabId, sessionId) ?? null,
+    } : {}),
     receiptTimeoutMs: overrides.receiptTimeoutMs,
     callTimeoutMs: overrides.callTimeoutMs,
   });
@@ -746,6 +774,10 @@ function createWiringService(w) {
     bindings: w.router.bindings,
     bridgeIdOf: (sessionId) => w.registry.find(sessionId)?.bridgeId ?? null,
     requestJoinResolve: w.overrides.requestJoinResolve ?? null,
+    /* dispatch 域消费的会话元数据面（缺省与生产同形：未注入＝空）——dispatch 用例经此处
+     * 注入 master/slave 角色，其余用例不受影响。 */
+    sessionMetaOf: w.overrides.sessionMetaOf ?? (() => null),
+    listSessionIds: w.overrides.listSessionIds ?? (() => []),
   });
 }
 
@@ -1078,6 +1110,33 @@ test('wiring·adopt 收紧：未获准会话的写类调用不夺席＋未获准
   const adopted = await callTool(harness, 'ws_set_mute', { collabId, muted: false }, recordB);
   assert.equal(adopted.ok, true, adopted.message ?? '获准入席后按本会话席位生效');
   assert.equal(harness.service.localSeatOf(collabId, 'session-b').muted, false);
+});
+
+test('wiring·dispatch 写类调用：adopt 不附未获准指引、不计拒绝计数（生产路径）', async (t) => {
+  const metaOf = (sessionId) => ({
+    sessionId,
+    role: sessionId === 'session-a' ? 'master' : (sessionId === 'session-b' ? 'slave' : 'none'),
+    name: sessionId,
+    kind: 'interactive',
+    entrypoint: 'cli',
+    status: 'idle',
+    metaUpdatedAt: Date.now(),
+  });
+  const harness = makeWiring(t, { sessionMetaOf: metaOf, listSessionIds: () => ['session-a', 'session-b'], seatWiring: true });
+  const { router, registry } = harness;
+  const recordA = bridgeRecord('bridge-a', 'session-a');
+  registry.register(recordA);
+  const created = await callTool(harness, 'ws_create_collab', { mode: 'dispatch', name: '本机编排' }, recordA);
+  assert.equal(created.ok, true, created.message);
+  assert.equal(
+    harness.service.dispatch.claim({ sessionId: 'session-a', sessionIds: ['session-b'] }).results[0].status,
+    'bound',
+    '前置：slave 已收编',
+  );
+  const sent = await callTool(harness, 'ws_send_message', { collabId: created.collabId, text: '执行', toSessionIds: ['session-b'], taskId: 't-1' }, recordA);
+  assert.equal(sent.ok, true, sent.message);
+  assert.equal('notice' in sent, false, 'dispatch 写类调用不得附「先 ws_join 申请」指引');
+  assert.equal(router.stats().adoptGrantRefusals, 0, 'dispatch 不计获准拒绝');
 });
 
 test('wiring·join-deny 呈现按申请会话寻址：拒绝提示投被拒会话的桥（未接线也投得到），其余桥不投', async (t) => {

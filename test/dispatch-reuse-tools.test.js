@@ -18,6 +18,11 @@ test('ws_send_message：dispatch 接受 toSessionIds / taskId / result', async (
   }, contextOf(node, 'master-1'));
   assert.equal(result.isError, undefined);
   assert.match(result.content[0].text, /"delivered": 1/);
+  const empty = await sendMessageTool().handler({
+    collabId: created.collabId, text: 'x', toSessionIds: [],
+  }, contextOf(node, 'master-1'));
+  assert.equal(empty.isError, true, '显式空数组不等于省略');
+  assert.match(empty.content[0].text, /toSessionIds 非法/);
 });
 
 test('ws_send_message：非 dispatch 拒绝 toSessionIds / taskId', async () => {
