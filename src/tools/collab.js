@@ -1,5 +1,5 @@
 import { isIP } from 'node:net';
-import { COLLAB_MODES, DEFAULT_COLLAB_MODE, ID_PATTERN, MAX_COLLAB_MEMBERS, POST_KINDS, isCollabMode, isIdentityName, isPort } from '../net/protocol.js';
+import { COLLAB_MODES, DEFAULT_COLLAB_MODE, ID_PATTERN, MAX_COLLAB_MEMBERS, POST_KINDS, isIdentityName, isPort } from '../net/protocol.js';
 import {
   WS_ALLOW_NEXT_INVITE_SPEC, WS_APPROVE_INVITE_SPEC, WS_CREATE_COLLAB_SPEC, WS_END_COLLAB_SPEC, WS_INVITE_SPEC, WS_LEAVE_COLLAB_SPEC,
   WS_LIST_COLLABS_SPEC, WS_REQUEST_JOIN_SPEC, WS_SEND_MESSAGE_SPEC, WS_SET_MUTE_SPEC, WS_VIEW_LEDGER_SPEC,
@@ -16,6 +16,9 @@ import {
 export const SEND_MESSAGE_TYPES = POST_KINDS;
 
 const MAX_TARGETS = MAX_COLLAB_MEMBERS - 1;   // 目标上限 = 名单上限减发起者本人（单一权威：protocol.MAX_COLLAB_MEMBERS）
+
+/* 创建模式：现有 LAN 协作模式之外加纯内存的 dispatch（不写入 COLLAB_MODES——LAN 协议不认它）。 */
+const CREATE_MODES = [...COLLAB_MODES, 'dispatch'];
 
 /* 清单的会话视角（本会话是否获准 / 是否绑定）要判在调用者身上：调用上下文已注入本会话标识，
  * 工具层只把它原样转交（判定归协作服务——无标识会话如实传空，由服务判否）。
@@ -60,14 +63,27 @@ export function createCollabTool() {
   return {
     ...WS_CREATE_COLLAB_SPEC,
     handler: async (args, context) => {
-      const name = trimmedString(args, 'name');
-      const topic = trimmedString(args, 'topic');
-      if (name === '' || topic === '') {
-        return errorResult('参数 name / topic 非法：需要非空白字符串（项目名与主题描述）');
-      }
       const mode = args.mode === undefined ? DEFAULT_COLLAB_MODE : args.mode;
-      if (!isCollabMode(mode)) {
-        return errorResult(`参数 mode 非法：可选值为 ${COLLAB_MODES.join(' / ')}（缺省 ${DEFAULT_COLLAB_MODE}）`);
+      if (!CREATE_MODES.includes(mode)) {
+        return errorResult(`参数 mode 非法：可选值为 ${CREATE_MODES.join(' / ')}（缺省 ${DEFAULT_COLLAB_MODE}）`);
+      }
+      const name = trimmedString(args, 'name');
+      if (name === '') {
+        return errorResult('参数 name 非法：需要非空白字符串');
+      }
+      /* dispatch 是纯内存本机编排：不接受 LAN 目标，主题可选；创建会话须为 master（服务判定）。 */
+      if (mode === 'dispatch') {
+        if (args.targets !== undefined) {
+          return errorResult('dispatch 模式不接受 targets：首建后用 ws_dispatch_claim 收编本机会话');
+        }
+        const dispatchTopic = trimmedString(args, 'topic');
+        return resultOf(await context.collab.create({
+          mode: 'dispatch', name, topic: dispatchTopic === '' ? undefined : dispatchTopic, sessionId: context.sessionId,
+        }));
+      }
+      const topic = trimmedString(args, 'topic');
+      if (topic === '') {
+        return errorResult('参数 topic 非法：managed / forum 需要非空白主题描述');
       }
       const targets = targetsArg(args);
       if (targets === null) {

@@ -233,13 +233,14 @@ test('会话级工具面：返回面与其余工具同步会话语义', () => {
   assert.ok(SPECS_BY_NAME.ws_approve_invite.description.includes('两段式'));
 });
 
-/* 参数面不回退（设计 §9）：除 ws_handover 因双角色放宽 target 外，既有必填项一律保持——
+/* 参数面不回退（设计 §9）：除 ws_handover 因双角色放宽 target、ws_create_collab 因 dispatch
+ * 模式改由 mode 分派必填项（topic / targets 仅 managed / forum 必填）外，既有必填项一律保持——
  * 工具面对外承诺的最小参数集不得静默缩水。 */
-test('既有必填项保持（ws_handover 双角色为例外）', () => {
+test('既有必填项保持（ws_handover 双角色、ws_create_collab 多模式为例外）', () => {
   const required = {
     ws_ping: ['address', 'port'],
     ws_check_inbox: ['collabId'],
-    ws_create_collab: ['name', 'topic', 'targets'],
+    ws_create_collab: ['name'],
     ws_approve_invite: ['collabId', 'approve'],
     ws_withdraw_invite: ['collabId'],
     ws_view_ledger: ['collabId'],

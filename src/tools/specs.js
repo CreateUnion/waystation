@@ -90,16 +90,16 @@ export const WS_LIST_COLLABS_SPEC = {
 
 export const WS_CREATE_COLLAB_SPEC = {
   name: 'ws_create_collab',
-  description: '发起协作或讨论（模式创建时定死、不可变）：创建会话即入席——managed 下本会话任站长（joinSeq=1），forum 下任发起人/中继；向选中目标并行发出邀请（对方在同意门点头后两段式入席）；targets 可带 targetSessionId 指名目标会话；目标取自 ws_list_hosts 的实例标识与端点',
+  description: '发起协作、讨论或本机 dispatch（模式创建时定死、不可变）：创建会话即入席——managed 下本会话任站长（joinSeq=1），forum 下任发起人/中继；向选中目标并行发出邀请（对方在同意门点头后两段式入席）；targets 可带 targetSessionId 指名目标会话；目标取自 ws_list_hosts 的实例标识与端点。dispatch 是纯内存本机多会话编排：仅启动期 WAYSTATION_ROLE=master 的会话可建，一个核心同时只允许一个，不接受 targets',
   inputSchema: {
     type: 'object',
     properties: {
       name: { type: 'string', description: '项目名（必填；同身份名呈现判据，≤64 字符）' },
-      topic: { type: 'string', description: '主题描述（必填；≤200 字符）' },
-      mode: { type: 'string', description: '模式（可选，缺省 managed）：managed / forum——forum（讨论）参与者至多 16（含发起人）' },
-      targets: { type: 'array', description: '被邀请目标（1–31 项；讨论模式至多 15 项）', items: TARGET_ITEM_SCHEMA },
+      topic: { type: 'string', description: '主题描述（managed / forum 必填；dispatch 可省；≤200 字符）' },
+      mode: { type: 'string', description: '模式（可选，缺省 managed）：managed / forum / dispatch——forum（讨论）参与者至多 16（含发起人）；dispatch 不进局域网、不保存历史' },
+      targets: { type: 'array', description: '被邀请目标（managed / forum 必填；dispatch 不接受；1–31 项；讨论模式至多 15 项）', items: TARGET_ITEM_SCHEMA },
     },
-    required: ['name', 'topic', 'targets'],
+    required: ['name'],
   },
 };
 

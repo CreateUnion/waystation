@@ -29,6 +29,7 @@ import {
   setSessionGate, takeConfirmGateNotices,
 } from './confirm-gate.js';
 import { JOIN_REQUEST_RETRY_MAX_MS, JOIN_REQUEST_RETRY_MS, JOIN_REQUEST_TTL_MS, createJoinDomain, resolveJoinTarget } from './join.js';
+import { createDispatchDomain } from './dispatch.js';
 import { ID_PATTERN, POST_KINDS } from '../net/protocol.js';
 import { matchSessionByToken, shortSessionId } from '../util/short-id.js';
 import { decideAdmission, frozenWriteRefusalOf, managerFreezeReasonOf, SYNC_REQUEST_MAX, SYNC_REQUEST_WINDOW_MS } from './gate.js';
@@ -122,6 +123,17 @@ export function createCollabService(options) {
   });
   /* 加入域自动批准成功后的通知面（通知注入与有界队列归服务层：加入域只管判定与批准）。 */
   state.onJoinAutoApproved = (event) => noteJoinAutoApproved(state, event);
+  /* dispatch 内存域（设计 §4）：与 managed / forum 同级但不进注册表、不写协作文件；
+   * 会话元数据与在册会话清单由组合根经桥注册面注入（未注入＝单测/降级，域内如实给空）。 */
+  state.dispatchDomain = createDispatchDomain({
+    state,
+    config: options.config,
+    log: state.log,
+    now: state.clock,
+    notify: (frame) => state.notify?.(frame) ?? false,
+    sessionMetaOf: pickOption(options, 'sessionMetaOf', () => null),
+    listSessionIds: pickOption(options, 'listSessionIds', () => []),
+  });
   loadRegistry(state);
   return apiOf(state);
 }
@@ -351,6 +363,7 @@ function joinStateOf(options) {
 function runtimeMaps() {
   return {
     collabs: new Map(),
+    dispatches: new Map(),   // dispatch 内存域（与 collabs 平行：不落盘、不进注册表）
     inviteWindow: new Map(),
     relayedOrigins: new Map(),
     pendingViews: new Map(),   // 值 = 该协作的等待面列表
@@ -388,6 +401,7 @@ function apiOf(state) {
     list: (input) => listCollabs(state, input),
     indicators: () => indicators(state),
     create: (input) => createNow(state, input),
+    ...dispatchApiOf(state),
     invite: (input) => seatGovernedWrite(state, input, () => inviteWithCapability(state, input)),
     joinKnock: (knock) => handleJoinKnock(state, knock),   // 发现层注入面（UDP 敲门命中 → 成员侧应答与本机放行提示）
     joinResolve: (input) => resolveJoinTarget(state, input ?? {}),   // 发现层注入面（按名解析的命中回调，组合根接入）
@@ -401,7 +415,6 @@ function apiOf(state) {
     end: (input) => seatGovernedWrite(state, input, () => endNow(state, input), { allowFrozen: true }),
     leave: (input) => guardedWrite(state, input?.collabId, () => leaveNow(state, input), { allowFrozen: true }),
     setMute: (input) => guardedWrite(state, input?.collabId, () => setMuteNow(state, input)),
-    view: (input) => viewLedger(state, input),
     ...lifecycleApiOf(state),
     describe: (collabId) => describeCollab(state, collabId),
     /* 本机旁路的机器级账在出站层（发送核写入）：查询必须先看它，再回落到注入的发送调度器查询。
@@ -410,11 +423,22 @@ function apiOf(state) {
     localSeatDeliveryOf: (msgId, sessionId) => outgoingLocalSeatDeliveryOf(state, msgId, sessionId),
     /* 核心退出对账面（只读）：本轮席位移除 / leave 帧计数 + 仍在 outbox 的待发 leave msgId。 */
     stopLeaveState: () => stopLeaveStateOf(state),
-    count: () => countLiveCollabs(state),
     sync: (input) => syncNow(state, input),
     stats: () => statsOf(state),
     close: () => closeService(state),
     ...seatApiOf(state),
+  };
+}
+
+/* dispatch 域入口（独立成组：与协作生命周期无关，避免 apiOf 超长）。
+ * view 先按 dispatch 分流——它没有台账，落到 viewLedger 会造出空台账或误报未知协作。 */
+function dispatchApiOf(state) {
+  return {
+    dispatch: state.dispatchDomain,
+    view: (input) => state.dispatchDomain.isDispatch(input?.collabId)
+      ? state.dispatchDomain.view(input.collabId)
+      : viewLedger(state, input),
+    count: () => countLiveCollabs(state) + state.dispatches.size,
   };
 }
 
@@ -1073,6 +1097,8 @@ function listCollabs(state, input) {
     collabs.push(legacyListEntryOf(collabId, summary));
   }
   appendInviteStubEntries(state, collabs, caller);
+  /* dispatch 条目与协作同列（纯内存）：agent 可见面不区分两种容器，模式字段即分派依据。 */
+  collabs.push(...state.dispatchDomain.list());
   return { collabs };
 }
 
@@ -1377,6 +1403,11 @@ function inviteViewOf(local, now) {
 
 /* 适配器描述器（上下文头项目名与模式）：本机已知协作的名称与模式；未知返回 null（头行退化为「身份名 时间戳」）。 */
 function describeCollab(state, collabId) {
+  /* dispatch 先判：它不在 state.collabs 里，但同样是本机已知容器（上下文头项目名与模式）。 */
+  const dispatched = state.dispatchDomain.describe(collabId);
+  if (dispatched !== null) {
+    return dispatched;
+  }
   const local = state.collabs.get(collabId);
   if (local === undefined) {
     return null;
@@ -2048,10 +2079,31 @@ function readonlyWriteMessageOf(reason) {
  * 中止创建；本层只在出站层成功后补登创建者席位，并兜底检查载体（缺失时写 recovery 标记，
  * 不留「无 carrier、有 member.json」的目录，否则重启会被判 legacy 永久归档）。 */
 function createNow(state, input) {
+  /* dispatch 是纯内存建域，与 LAN 目标无关：必须先于能力探测分流——生产组合根恒定注入
+   * probeCapability，先走探测会拿空 targets 空等两轮并被误拒。 */
+  const dispatched = createDispatchNow(state, input);
+  if (dispatched !== null) {
+    return dispatched;
+  }
   if (typeof state.probeCapability === 'function') {
     return createNowWithCapability(state, input);
   }
   return createNowSync(state, input);
+}
+
+/* dispatch 创建分支（createNow 与 createNowSync 共用同一判据）：非 dispatch 返回 null 交回原路径；
+ * dispatch 不接受 targets（首建后由 master 用 ws_dispatch_claim 收编），且必须有会话标识。 */
+function createDispatchNow(state, input) {
+  if (input?.mode !== 'dispatch') {
+    return null;
+  }
+  if (input.targets !== undefined) {
+    return { ok: false, message: 'dispatch 模式不接受 targets——首建后由 master 用 ws_dispatch_claim 收编' };
+  }
+  if (!validSessionId(input?.sessionId)) {
+    return { ok: false, message: '本会话无会话标识（CLAUDE_CODE_SESSION_ID 缺失）——不得创建 dispatch；请重开会话或检查客户端环境' };
+  }
+  return state.dispatchDomain.create(input);
 }
 
 async function createNowWithCapability(state, input) {
@@ -2074,6 +2126,11 @@ async function createNowWithCapability(state, input) {
 function createNowSync(state, input) {
   if (!validSessionId(input?.sessionId)) {
     return { ok: false, message: '本会话无会话标识（CLAUDE_CODE_SESSION_ID 缺失）——不得创建协作；请重开会话或检查客户端环境' };
+  }
+  /* 防御直调（createNow 已先分流）：dispatch 永不落到 createCollab（那会写协作目录）。 */
+  const dispatched = createDispatchNow(state, input);
+  if (dispatched !== null) {
+    return dispatched;
   }
   const result = createCollab(state, input);
   if (result?.ok !== true) {
