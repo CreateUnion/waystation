@@ -31,21 +31,14 @@ export function createStderrLog() {
 
 /* 转发 registry（server.js 消费的同一形态）：list＝规格单一权威的浅拷贝（按只读处理，
  * 桥侧不得变异——共享对象一旦就地改写会同时污染核心侧输出）；call＝经连接件转发。
- * dispatch 是本机纯内存能力：规格列表无条件暴露（桥不依赖核心即答），但调用在
- * 核心 welcome 未宣告 dispatch 能力位时由桥直接拒绝——旧核收到未知工具只会回泛化错误，
- * 用户无从知道该升级重开会话。 */
+ * dispatch 是本机纯内存能力：规格列表无条件暴露（桥不依赖核心即答），但调用在核心 welcome
+ * 未宣告 dispatch 能力位时由桥直接拒绝——旧核收到未知工具只会回泛化错误，用户无从知道该升级
+ * 重开会话。能力判定必须晚于 ensureCore：冷启 / 重连时 welcome 尚为 null，先看它会把
+ * 「核心还没起」误诊成「核心版本不支持」，并跳过 ensureCore 的等待契约。 */
 export function createForwardingRegistry({ link, version = BRIDGE_VERSION, app = APP_ROOT }) {
   return {
     list: () => TOOL_SPECS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
-    call: (name, args) => {
-      if (name.startsWith('ws_dispatch_') && link.state?.welcome?.dispatch !== 1) {
-        return {
-          content: [{ type: 'text', text: '当前核心版本不支持 dispatch——请升级并重开会话' }],
-          isError: true,
-        };
-      }
-      return forwardCall(link, name, args ?? {}, { version, app });
-    },
+    call: (name, args) => forwardCall(link, name, args ?? {}, { version, app }),
   };
 }
 
@@ -53,6 +46,12 @@ async function forwardCall(link, name, args, bridgeInfo) {
   const ensured = await link.ensureCore();
   if (!ensured.ok) {
     return failureResult(name, ensured, bridgeInfo);
+  }
+  if (name.startsWith('ws_dispatch_') && link.state?.welcome?.dispatch !== 1) {
+    return {
+      content: [{ type: 'text', text: '当前核心版本不支持 dispatch——请升级并重开会话' }],
+      isError: true,
+    };
   }
   const called = await link.call(name, args);
   return called.ok ? called.result : failureResult(name, called, bridgeInfo);

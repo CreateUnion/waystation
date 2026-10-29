@@ -47,7 +47,7 @@ test('tools/list 数据源＝规格单一权威（顺序与内容一致；返回
   assert.equal(registry.list().length, 27, '调用方变异不污染规格');
 });
 
-test('dispatch 能力位：核心未宣告 dispatch 时 registry 拒绝 ws_dispatch_*，宣告后照常转发', async () => {
+test('dispatch 能力位：已注册旧核未宣告 dispatch 时拒绝 ws_dispatch_*，不转发', async () => {
   const calls = [];
   const link = stubLink({
     call: async (name, args) => {
@@ -55,6 +55,7 @@ test('dispatch 能力位：核心未宣告 dispatch 时 registry 拒绝 ws_dispa
       return { ok: true, result: { content: [{ type: 'text', text: 'ok' }] } };
     },
   });
+  link.state.welcome = { app: '0.2.2' };
   const registry = createForwardingRegistry({ link });
   for (const name of ['ws_dispatch_scan', 'ws_dispatch_claim', 'ws_dispatch_approve', 'ws_dispatch_release']) {
     const refused = await registry.call(name, {});
@@ -62,10 +63,41 @@ test('dispatch 能力位：核心未宣告 dispatch 时 registry 拒绝 ws_dispa
     assert.match(refused.content[0].text, /核心版本不支持 dispatch/);
   }
   assert.deepEqual(calls, [], '能力位缺失时不得转发到核心');
-  link.state.welcome = { dispatch: 1 };
+});
+
+test('dispatch 能力位：冷启 / 重连由 ensureCore 注册后宣告 dispatch，照常转发', async () => {
+  const calls = [];
+  const link = stubLink({
+    call: async (name, args) => {
+      calls.push([name, args]);
+      return { ok: true, result: { content: [{ type: 'text', text: 'ok' }] } };
+    },
+  });
+  assert.equal(link.state.welcome, null, '前置：调用前尚未注册（冷启 / 重连）');
+  link.ensureCore = async () => {
+    link.state.welcome = { dispatch: 1 };
+    return { ok: true };
+  };
+  const registry = createForwardingRegistry({ link });
   const forwarded = await registry.call('ws_dispatch_scan', { sessionIds: ['s-1'] });
-  assert.equal(forwarded.isError, undefined);
+  assert.equal(forwarded.isError, undefined, '不得把「核心还没起」误诊成「核心版本不支持」');
   assert.deepEqual(calls, [['ws_dispatch_scan', { sessionIds: ['s-1'] }]], '能力位在场时原样转发');
+});
+
+test('dispatch 能力位：核心不可达走既有差错文案，不误报不支持 dispatch', async () => {
+  const calls = [];
+  const link = stubLink({
+    ensureCore: async () => ({ ok: false, kind: 'unreachable', message: '核心无应答或重启中，请重试' }),
+    call: async (name, args) => {
+      calls.push([name, args]);
+      return { ok: true, result: { content: [{ type: 'text', text: 'ok' }] } };
+    },
+  });
+  const result = await createForwardingRegistry({ link }).call('ws_dispatch_scan', {});
+  assert.equal(result.isError, true);
+  assert.equal(result.content[0].text, '核心无应答或重启中，请重试', '不可达走核心差错文案');
+  assert.doesNotMatch(result.content[0].text, /不支持 dispatch/);
+  assert.deepEqual(calls, [], '不可达时不转发');
 });
 
 test('核心不可达的 ws_status 合成：core.available=false＋reason＋桥来源静态信息，其余字段省略', async () => {

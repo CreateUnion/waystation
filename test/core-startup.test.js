@@ -399,8 +399,8 @@ async function connectBridge(t, home, token, bridgeId) {
     onFrame: (frame) => frames.push(frame),
   });
   t.after(() => client.close());
-  await client.connect();
-  return { client, frames };
+  const welcome = await client.connect();
+  return { client, frames, welcome };
 }
 
 test('换代受理（进程级）：首个 replace → 广播 core-restarting → 有序收尾（退出 0＋core.json 删）', { timeout: 30000 }, async (t) => {
@@ -410,7 +410,8 @@ test('换代受理（进程级）：首个 replace → 广播 core-restarting �
   // 收尾前留 300ms 观察窗（测试缝）：广播可被稳定观察；生产恒 0
   const { child } = spawnCore(t, home, { WAYSTATION_TEST_CHANGEOVER_DELAY_MS: '300' }, tmpdir());
   const record = await waitCoreReady(home);
-  const { client, frames } = await connectBridge(t, home, record.token, 'bridge-replacer-x');
+  const { client, frames, welcome } = await connectBridge(t, home, record.token, 'bridge-replacer-x');
+  assert.equal(welcome.dispatch, 1, '核心欢迎帧宣告 dispatch 能力位（桥据此决定是否转发 dispatch 工具）');
   assert.equal(client.send({ type: 'replace', reason: 'version-mismatch', wantApp: '0.1.0' }), true);
   const broadcast = await waitFor(() => frames.find((frame) => frame.type === 'core-restarting'), { timeoutMs: 5000 });
   assert.equal(broadcast.replacerBridgeId, 'bridge-replacer-x', '广播带发起桥标识（其余桥据此进等待态）');

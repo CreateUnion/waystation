@@ -521,7 +521,7 @@ export function callerSessionOf(context, toolName) {
   return { sessionId, refusal: null };
 }
 
-/* 工具返回口径（23 工具单一权威）：成功 = 顶层含 ok:true 的 JSON 对象（列表载荷用命名字段承载：
+/* 工具返回口径（27 工具单一权威）：成功 = 顶层含 ok:true 的 JSON 对象（列表载荷用命名字段承载：
  * hosts / rows / collabs）；失败 = errorResult 纯文案 + isError。新增工具一律照此。 */
 export function okResult(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };

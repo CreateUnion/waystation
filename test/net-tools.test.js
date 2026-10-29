@@ -9,6 +9,7 @@ import { statusTool } from '../src/tools/status.js';
 import { checkInboxTool } from '../src/tools/check-inbox.js';
 import { listCollabsTool, createCollabTool, inviteTool, requestJoinTool, approveInviteTool, allowNextInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, setMuteTool, leaveCollabTool, endCollabTool, SEND_MESSAGE_TYPES } from '../src/tools/collab.js';
 import { setConfirmGateTool } from '../src/tools/confirm-gate.js';
+import { dispatchApproveTool, dispatchClaimTool, dispatchReleaseTool, dispatchScanTool } from '../src/tools/dispatch.js';
 import { joinTool, approveJoinTool } from '../src/tools/join.js';
 import { decideTool, handoverTool, takeOverTool } from '../src/tools/governance.js';
 import { createNetStack } from '../src/net/stack.js';
@@ -59,6 +60,16 @@ async function callCollabTool(tool, args, collab) {
 /* 治理 / 邀请类工具以调用会话为席位主体：这些工具的用例一律带会话标识。 */
 function governedContextOf(collab, sessionId = 'session-a-0123456789') {
   return { ...collabContextOf(collab), sessionId };
+}
+
+/* dispatch 四工具与其余工具同一返回口径（成功载荷顶层 ok:true）：假 dispatch 域只回固定成功结果。 */
+function dispatchToolCases() {
+  return [
+    { tool: dispatchScanTool(), args: {}, context: governedContextOf({ dispatch: { scan: () => ({ ok: true, dispatchId: 'dispatch-1', sessions: [] }) } }) },
+    { tool: dispatchClaimTool(), args: { sessionIds: ['session-b-0123456789'] }, context: governedContextOf({ dispatch: { claim: () => ({ ok: true, results: [] }) } }) },
+    { tool: dispatchApproveTool(), args: { claimId: 'claim-1', approve: true }, context: governedContextOf({ dispatch: { approve: () => ({ ok: true, status: 'approved' }) } }) },
+    { tool: dispatchReleaseTool(), args: { sessionId: 'session-b-0123456789' }, context: governedContextOf({ dispatch: { release: () => ({ ok: true }) } }) },
+  ];
 }
 
 /* 假服务：记录调用、按用例注入响应——本文件的目的是工具层的参数形态与输出口径，
@@ -1730,7 +1741,7 @@ function fakeNet() {
   };
 }
 
-test('工具返回口径：23 工具成功载荷均为含 ok:true 的 JSON 对象（统一不变量）', async () => {
+test('工具返回口径：27 工具成功载荷均为含 ok:true 的 JSON 对象（统一不变量）', async () => {
   const net = fakeNet();
   const collab = fakeService();
   const join = fakeJoinService();
@@ -1747,6 +1758,7 @@ test('工具返回口径：23 工具成功载荷均为含 ok:true 的 JSON 对�
     { tool: approveInviteTool(), args: { collabId: 'collab-1', inviteId: 'inv-1', approve: true }, context: collabContextOf(collab) },
     { tool: allowNextInviteTool(), args: {}, context: collabContextOf(collab) },
     { tool: setConfirmGateTool(), args: { action: 'status', gate: 'invite' }, context: governedContextOf(collab) },
+    ...dispatchToolCases(),
     { tool: withdrawInviteTool(), args: { collabId: 'collab-1', target: 'inst-b' }, context: governedContextOf(collab) },
     { tool: viewLedgerTool(), args: { collabId: 'collab-1' }, context: collabContextOf(collab) },
     { tool: sendMessageTool(), args: { collabId: 'collab-1', text: '你好' }, context: collabContextOf(collab) },
@@ -1761,7 +1773,7 @@ test('工具返回口径：23 工具成功载荷均为含 ok:true 的 JSON 对�
     { tool: handoverTool(), args: { collabId: 'collab-1', target: 'inst-b', targetSessionId: 'sess-b' }, context: governedContextOf(governance) },
     { tool: takeOverTool(), args: { collabId: 'collab-1' }, context: governedContextOf(governance) },
   ];
-  assert.equal(cases.length, 23, '覆盖全部 23 工具');
+  assert.equal(cases.length, 27, '覆盖全部 27 工具');
   for (const { tool, args, context } of cases) {
     const result = await tool.handler(args, context);
     assert.equal(result.isError, undefined, tool.name);
