@@ -11,7 +11,7 @@ import { createSessionWriter } from './session-writer.js';
 import { bridgeMetaOf, createSessionMetaWatcher } from './session-meta.js';
 
 /* 桥组合根（设计 §2.1/§2.2）：stdio MCP 门面＋工具目录/转发＋本会话注入口写入＋核心连接监督。
- * 桥只做两件半事：23 工具的目录（不依赖核心即答）与调用转发、注入写入（复用适配器写面）、
+ * 桥只做两件半事：27 工具的目录（不依赖核心即答）与调用转发、注入写入（复用适配器写面）、
  * 核心不可达时的 ws_status 差错合成（「纯转发件」原则的唯一登记例外）。桥不读不写数据根
  * （只读 run/core.json），不认识协作、不认识网络、不认识数据。 */
 
@@ -30,11 +30,22 @@ export function createStderrLog() {
 }
 
 /* 转发 registry（server.js 消费的同一形态）：list＝规格单一权威的浅拷贝（按只读处理，
- * 桥侧不得变异——共享对象一旦就地改写会同时污染核心侧输出）；call＝经连接件转发。 */
+ * 桥侧不得变异——共享对象一旦就地改写会同时污染核心侧输出）；call＝经连接件转发。
+ * dispatch 是本机纯内存能力：规格列表无条件暴露（桥不依赖核心即答），但调用在
+ * 核心 welcome 未宣告 dispatch 能力位时由桥直接拒绝——旧核收到未知工具只会回泛化错误，
+ * 用户无从知道该升级重开会话。 */
 export function createForwardingRegistry({ link, version = BRIDGE_VERSION, app = APP_ROOT }) {
   return {
     list: () => TOOL_SPECS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
-    call: (name, args) => forwardCall(link, name, args ?? {}, { version, app }),
+    call: (name, args) => {
+      if (name.startsWith('ws_dispatch_') && link.state?.welcome?.dispatch !== 1) {
+        return {
+          content: [{ type: 'text', text: '当前核心版本不支持 dispatch——请升级并重开会话' }],
+          isError: true,
+        };
+      }
+      return forwardCall(link, name, args ?? {}, { version, app });
+    },
   };
 }
 

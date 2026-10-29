@@ -617,6 +617,9 @@ function welcomeFrameOf(state, bridges) {
     port: state.port,
     net: { available: net.available, degraded: !net.available },
     persistent: state.persistent,
+    /* 能力位（设计 §12）：桥据此判定能否转发 dispatch 工具——旧核不宣告即由桥拒绝，
+     * 不把「核心版本落后」降级成未知工具的泛化错误。 */
+    dispatch: 1,
     bridges,
   };
 }
@@ -764,7 +767,7 @@ function persistIdentityAndConfig(state) {
   writeCoreRecord(state);
 }
 
-/* 工具处理器注册（23 个）：核心持有注册表与启动期 context；调用者身份注入（per-request）与
+/* 工具处理器注册（27 个）：核心持有注册表与启动期 context；调用者身份注入（per-request）与
  * 执行面（IPC call 帧）在其交付物接入——本函数只做启动期单例装配。 */
 function registerTools() {
   const registry = createToolRegistry();

@@ -83,7 +83,23 @@ export const SYNC_REQUEST_WINDOW_MS = 10000;
 export const SYNC_REQUEST_MAX = 2;
 const SYNC_THROTTLE_TABLE_MAX = 64;
 
+/* dispatch 隔离专条（设计 §10）：dispatch 只存在于本机内存，LAN 帧即使 collabId 命中本机 dispatch
+ * 也一律拒绝并计数——隔离依据是「独立 Map + 本机 IPC + 显式拒绝」，不是可伪造的 from.instanceId。
+ * 判定前置于一切帧族分支：邀请 / join 回执 / 治理帧都不得借 dispatch 的 collabId 进入后续链路，
+ * 也不能退化成泛化的「未知 collabId」（无从区分隔离专条与名字打错）。 */
+function dispatchLanRefusalOf(state, frame) {
+  if (!state.dispatches?.has?.(frame.collabId)) {
+    return null;
+  }
+  state.counters.dispatchLanRejected = (state.counters.dispatchLanRejected ?? 0) + 1;
+  return { ok: false, reason: 'dispatch 只允许本机 IPC——LAN 帧不进入 dispatch' };
+}
+
 export function decideAdmission(state, frame, meta) {
+  return dispatchLanRefusalOf(state, frame) ?? decideAdmissionCore(state, frame, meta);
+}
+
+function decideAdmissionCore(state, frame, meta) {
   if (frame.type === 'invite') {
     return admitInvite(state, frame, meta);
   }

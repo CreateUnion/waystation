@@ -13,6 +13,7 @@ import { deliveryStatusTool } from '../src/tools/delivery-status.js';
 import { checkInboxTool } from '../src/tools/check-inbox.js';
 import { listCollabsTool, createCollabTool, approveInviteTool, allowNextInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, setMuteTool, leaveCollabTool, endCollabTool, inviteTool, requestJoinTool, SEND_MESSAGE_TYPES } from '../src/tools/collab.js';
 import { setConfirmGateTool } from '../src/tools/confirm-gate.js';
+import { dispatchApproveTool, dispatchClaimTool, dispatchReleaseTool, dispatchScanTool } from '../src/tools/dispatch.js';
 import { joinTool, approveJoinTool } from '../src/tools/join.js';
 import { decideTool, handoverTool, takeOverTool } from '../src/tools/governance.js';
 import { COLLAB_MODES, DEFAULT_COLLAB_MODE, MAX_ACTIVE_SEATS, MAX_IDENTITY_NAME_CHARS, MAX_MESSAGE_TEXT_CHARS, MAX_REASON_CHARS, MAX_TOPIC_CHARS } from '../src/net/protocol.js';
@@ -29,14 +30,18 @@ import { buildDefaults } from '../src/config.js';
 
 const propertiesOf = (name) => SPECS_BY_NAME[name].inputSchema.properties;
 
-/* 设计 §9 的 23 项工具清单（独立于 specs.js 登记，防「误换一项再重冻」自证）：
- * 表内 18 个单项 + 末行 5 项（status / ping / decide / withdraw / request_join）。 */
+/* 设计 §9 的 27 项工具清单（独立于 specs.js 登记，防「误换一项再重冻」自证）：
+ * 表内 22 个单项 + 末行 5 项（status / ping / decide / withdraw / request_join）。 */
 const DESIGN_SECTION_9_TOOLS = [
   'ws_create_collab',
   'ws_invite',
   'ws_approve_invite',
   'ws_allow_next_invite',
   'ws_set_confirm_gate',
+  'ws_dispatch_scan',
+  'ws_dispatch_claim',
+  'ws_dispatch_approve',
+  'ws_dispatch_release',
   'ws_join',
   'ws_approve_join',
   'ws_leave_collab',
@@ -70,6 +75,10 @@ const TOOL_FACTORIES = [
   approveInviteTool,
   allowNextInviteTool,
   setConfirmGateTool,
+  dispatchScanTool,
+  dispatchClaimTool,
+  dispatchApproveTool,
+  dispatchReleaseTool,
   withdrawInviteTool,
   viewLedgerTool,
   sendMessageTool,
@@ -93,9 +102,9 @@ function coreToolList() {
   return registry.list();
 }
 
-test('工具面冻结快照：23 项逐字节不变', () => {
+test('工具面冻结快照：27 项逐字节不变', () => {
   const listed = coreToolList();
-  assert.equal(listed.length, 23, '工具数为 23——增删工具属须人批准的对外变更');
+  assert.equal(listed.length, 27, '工具数为 27——增删工具属须人批准的对外变更');
   assert.equal(
     JSON.stringify(listed, null, 2),
     FROZEN_LIST_JSON,
@@ -103,15 +112,15 @@ test('工具面冻结快照：23 项逐字节不变', () => {
   );
 });
 
-test('规格模块：23 项无遗漏，按名索引与注册序一致', () => {
-  assert.equal(TOOL_SPECS.length, 23, '规格模块须与工具数一一对应');
+test('规格模块：27 项无遗漏，按名索引与注册序一致', () => {
+  assert.equal(TOOL_SPECS.length, 27, '规格模块须与工具数一一对应');
   assert.deepEqual(Object.keys(SPECS_BY_NAME), TOOL_SPECS.map((spec) => spec.name));
   assert.deepEqual(coreToolList().map((tool) => tool.name), TOOL_SPECS.map((spec) => spec.name));
 });
 
-test('规格模块：23 项与设计 §9 的工具清单逐名一致', () => {
-  assert.equal(DESIGN_SECTION_9_TOOLS.length, 23, '设计 §9 清单自身须为 23 项（18 单项 + 末行 5 项）');
-  assert.equal(new Set(DESIGN_SECTION_9_TOOLS).size, 23, '设计 §9 清单不得有重复名');
+test('规格模块：27 项与设计 §9 的工具清单逐名一致', () => {
+  assert.equal(DESIGN_SECTION_9_TOOLS.length, 27, '设计 §9 清单自身须为 27 项（22 单项 + 末行 5 项）');
+  assert.equal(new Set(DESIGN_SECTION_9_TOOLS).size, 27, '设计 §9 清单不得有重复名');
   assert.deepEqual([...Object.keys(SPECS_BY_NAME)].sort(), [...DESIGN_SECTION_9_TOOLS].sort(), '工具名与设计 §9 独立对照——误换一项再重冻会在这里变红');
 });
 
@@ -271,7 +280,7 @@ async function sendMessageDefaultType() {
   return sent.type;
 }
 
-/* 冻结基准：23 工具注册后 JSON.stringify(registry.list(), null, 2) 的全量输出（由当前树生成）。
+/* 冻结基准：27 工具注册后 JSON.stringify(registry.list(), null, 2) 的全量输出（由当前树生成）。
  * 文本级固化——缩进与换行也是比对范围，故整段贴在此处、不手工编辑。
  * 会话级参与者 0.2.0 工具面（22 项）：名单与参与者粒度按会话——ws_send_message 增 toSessionId、
  * ws_handover 增 targetSessionId/offerId/confirmToken/decision/reason 并放宽为双角色、
@@ -285,7 +294,11 @@ async function sendMessageDefaultType() {
  * md5 更新为 407fd7053df63c5605987143b7811113（16947 字符）。
  * 确认门工具面扩展（2026-10-29）：新增第 23 项 ws_set_confirm_gate（invite / join 两会话级与
  * 永久确认门，persistent 首次只发令牌）；按同一规程重冻，
- * md5 更新为 e28abe757bf2add0d411917610abb4b6（18361 字符）。 */
+ * md5 更新为 e28abe757bf2add0d411917610abb4b6（18361 字符）。
+ * dispatch 工具面扩展（2026-10-29）：新增第 24–27 项 ws_dispatch_scan / claim / approve / release
+ * （本机多会话编排：扫描、收编、确认、释放），并改写 ws_create_collab 的 mode/topic/targets 语义
+ * （dispatch 不接受 targets、topic 可省）；按同一规程重冻，
+ * md5 更新为 d605434e7866c2da292161b348efb485（21118 字符）。 */
 const FROZEN_LIST_JSON = `[
   {
     "name": "ws_status",
@@ -371,7 +384,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_create_collab",
-    "description": "发起协作或讨论（模式创建时定死、不可变）：创建会话即入席——managed 下本会话任站长（joinSeq=1），forum 下任发起人/中继；向选中目标并行发出邀请（对方在同意门点头后两段式入席）；targets 可带 targetSessionId 指名目标会话；目标取自 ws_list_hosts 的实例标识与端点",
+    "description": "发起协作、讨论或本机 dispatch（模式创建时定死、不可变）：创建会话即入席——managed 下本会话任站长（joinSeq=1），forum 下任发起人/中继；向选中目标并行发出邀请（对方在同意门点头后两段式入席）；targets 可带 targetSessionId 指名目标会话；目标取自 ws_list_hosts 的实例标识与端点。dispatch 是纯内存本机多会话编排：仅启动期 WAYSTATION_ROLE=master 的会话可建，一个核心同时只允许一个，不接受 targets",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -381,15 +394,15 @@ const FROZEN_LIST_JSON = `[
         },
         "topic": {
           "type": "string",
-          "description": "主题描述（必填；≤200 字符）"
+          "description": "主题描述（managed / forum 必填；dispatch 可省；≤200 字符）"
         },
         "mode": {
           "type": "string",
-          "description": "模式（可选，缺省 managed）：managed / forum——forum（讨论）参与者至多 16（含发起人）"
+          "description": "模式（可选，缺省 managed）：managed / forum / dispatch——forum（讨论）参与者至多 16（含发起人）；dispatch 不进局域网、不保存历史"
         },
         "targets": {
           "type": "array",
-          "description": "被邀请目标（1–31 项；讨论模式至多 15 项）",
+          "description": "被邀请目标（managed / forum 必填；dispatch 不接受；1–31 项；讨论模式至多 15 项）",
           "items": {
             "type": "object",
             "properties": {
@@ -424,9 +437,7 @@ const FROZEN_LIST_JSON = `[
         }
       },
       "required": [
-        "name",
-        "topic",
-        "targets"
+        "name"
       ]
     }
   },
@@ -529,6 +540,74 @@ const FROZEN_LIST_JSON = `[
     }
   },
   {
+    "name": "ws_dispatch_scan",
+    "description": "dispatch master 扫描本机已接入 waystation 的会话：会话名、role、kind、status、是否已被本 dispatch 收编。只返回本机在线会话，排除 master 自身；名字取 Claude Code 会话名，缺失回退会话短码",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "ws_dispatch_claim",
+    "description": "dispatch master 收编一个或多个本机会话：无头且带 WAYSTATION_ROLE=slave 的会话直接绑定；交互式会话返回 pending 并向目标注入首次确认；非交互式且无角色的会话拒绝。一个核心同一时刻只允许一个 dispatch，slave 独占",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sessionIds": {
+          "type": "array",
+          "description": "目标会话标识（1–32 项；取自 ws_dispatch_scan）",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "sessionIds"
+      ]
+    }
+  },
+  {
+    "name": "ws_dispatch_approve",
+    "description": "交互式 slave 确认 / 拒绝 master 的收编请求。第一次 approve:true 不带 confirmToken 时只返回 needsUserConfirmation 与一次性令牌；目标会话的模型把请求转述给本机用户，用户明确同意后携令牌重试才绑定。这是模型转述的确认，不是带外硬人工门",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "claimId": {
+          "type": "string",
+          "description": "收编申请标识（取自 master 的 ws_dispatch_claim 返回或注入提示）"
+        },
+        "approve": {
+          "type": "boolean",
+          "description": "true = 同意收编；false = 拒绝"
+        },
+        "confirmToken": {
+          "type": "string",
+          "description": "第一次 approve:true 返回的一次性令牌；用户确认后携此令牌重试"
+        }
+      },
+      "required": [
+        "claimId",
+        "approve"
+      ]
+    }
+  },
+  {
+    "name": "ws_dispatch_release",
+    "description": "dispatch master 释放单个 slave。释放后该会话不再接收 dispatch 消息；整体结束用 ws_end_collab，slave 自己退出用 ws_leave_collab",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "description": "要释放的 slave 会话标识（取自 ws_dispatch_scan）"
+        }
+      },
+      "required": [
+        "sessionId"
+      ]
+    }
+  },
+  {
     "name": "ws_withdraw_invite",
     "description": "撤回邀请（managed 仅站长；forum 仅撤回本机挂起记录并停止补投，已投出的邀请不可收回）：按 inviteId 撤回该条邀请记录；未给 inviteId 时按 target 精确匹配撤回该目标的一条邀请。inviteId 与 target 至少给一个，二者二选一——本工具不提供整条协作取消，结束协作请用 ws_end_collab",
     "inputSchema": {
@@ -570,7 +649,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_send_message",
-    "description": "发送协作域消息（发送者须为本机活跃且非 unverified 席位）：星型路由——成员发给站长，站长省略 to 即发全体成员；按目标机器去重、一机一帧，返回逐机器 msgId；席位宽限内断连的帧由本机核心暂存、重连后补投，判离席或冻结期丢弃，不保证送达。to＝目标实例/地址，配可选 toSessionId（会话，短码或完整标识，精确匹配；只给会话参数会被拒绝）。讨论模式为发帖（人人可见、to / toSessionId 一律拒绝）：默认经中继（发起人）投递（成员投稿至中继、由其转达全员），中继不可达时自动降级直投——返回的 route 字段如实标注本机走的路（relay/degraded/fanout）、results 为投稿或直投的受理态，成员级结果经中继聚合捎回、未达者由对方周期对表收敛",
+    "description": "发送协作域消息（发送者须为本机活跃且非 unverified 席位）：星型路由——成员发给站长，站长省略 to 即发全体成员；按目标机器去重、一机一帧，返回逐机器 msgId；席位宽限内断连的帧由本机核心暂存、重连后补投，判离席或冻结期丢弃，不保证送达。to＝目标实例/地址，配可选 toSessionId（会话，短码或完整标识，精确匹配；只给会话参数会被拒绝）。讨论模式为发帖（人人可见、to / toSessionId 一律拒绝）：默认经中继（发起人）投递（成员投稿至中继、由其转达全员），中继不可达时自动降级直投——返回的 route 字段如实标注本机走的路（relay/degraded/fanout）、results 为投稿或直投的受理态，成员级结果经中继聚合捎回、未达者由对方周期对表收敛。dispatch（纯内存本机编排）另走一套：消息只经本机核心投递、不落盘，type 取 task / progress / result / error，定向用 toSessionIds（省略即 master→全体已收编 slave、slave→master），可用 taskId 关联任务；不接受 to / toSessionId",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -584,15 +663,26 @@ const FROZEN_LIST_JSON = `[
         },
         "type": {
           "type": "string",
-          "description": "消息类型（可选，缺省 reply；可选值：topic / task / progress / issue / stop / reply）"
+          "description": "消息类型（可选，缺省 reply；managed / forum 可选值：topic / task / progress / issue / stop / reply；dispatch 可选值：task / progress / result / error，省略时 master＝task、slave＝result）"
         },
         "to": {
           "type": "string",
-          "description": "目标成员实例标识或地址（可选；须与 toSessionId 同时给出才能定向席位；协作：站长可选；成员省略即发给站长；讨论一律拒绝）"
+          "description": "目标成员实例标识或地址（可选；须与 toSessionId 同时给出才能定向席位；协作：站长可选；成员省略即发给站长；讨论一律拒绝；dispatch 不接受本参数）"
         },
         "toSessionId": {
           "type": "string",
-          "description": "目标会话（可选，须与 to 同时给出；短码或完整标识，精确匹配、不做前缀展开；歧义或无匹配即拒绝）——只投该机器上的这一会话；讨论一律拒绝"
+          "description": "目标会话（可选，须与 to 同时给出；短码或完整标识，精确匹配、不做前缀展开；歧义或无匹配即拒绝）——只投该机器上的这一会话；讨论与 dispatch 一律拒绝"
+        },
+        "toSessionIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "仅 dispatch：目标会话数组；省略时由核心按绑定路由（master→全体已收编 slave、slave→master）。managed / forum 使用会报错"
+        },
+        "taskId": {
+          "type": "string",
+          "description": "仅 dispatch：任务关联键（可选，1–64 字符），随消息投递给目标；managed / forum 使用会报错"
         }
       },
       "required": [

@@ -188,7 +188,7 @@ test('e2e：bin 入口等价可用（bin/waystation.js 与 src/index.js 同形�
   writeStationConfig(home, port);
   const { client } = await startBridgeClient(t, BIN_ENTRY, home);
   const { tools } = await client.listTools();
-  assert.equal(tools.length, 23);
+  assert.equal(tools.length, 27);
   const status = await callToolJson(client, 'ws_status');
   assert.equal(status.name, 'waystation');
   assert.equal(status.site.mode, 'single');

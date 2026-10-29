@@ -30,7 +30,7 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
 4. 可选：配置状态栏「协作中」指示（见后文「状态栏」节）——进入协作后状态栏显示当前协作。
 5. 可选：其他 MCP 客户端（如 opencode）见后文「其他 MCP 客户端」节。
 
-工具面共 **23 项**（扫描 / 探测 / 投递状态 / 收件流水 / 协作建撤进退与邀请 / 主动加入与批准 / 邀请确认 / **确认门开关** / 消息与台账 / 会话级静音 / 移交 / 接管（窗口内 / 手动）/ 裁定），完整清单与参数由 MCP 客户端在会话里展示。0.2.2 新增第 23 项 `ws_set_confirm_gate`（邀请 / 加入申请确认门，见「确认门开关」节）——**显式移交与接管**（窗口内 / 手动）确认仍复用 `ws_handover` / `ws_take_over` 的一次性确认令牌；**自动移交按预授权由目标核自动接受**，不弹目标确认。
+工具面共 **27 项**（扫描 / 探测 / 投递状态 / 收件流水 / 协作建撤进退与邀请 / 主动加入与批准 / 邀请确认 / **确认门开关** / **dispatch 编排** / 消息与台账 / 会话级静音 / 移交 / 接管（窗口内 / 手动）/ 裁定），完整清单与参数由 MCP 客户端在会话里展示。0.2.2 新增第 23 项 `ws_set_confirm_gate`（邀请 / 加入申请确认门，见「确认门开关」节）——**显式移交与接管**（窗口内 / 手动）确认仍复用 `ws_handover` / `ws_take_over` 的一次性确认令牌；**自动移交按预授权由目标核自动接受**，不弹目标确认。dispatch 模式另增第 24–27 项 `ws_dispatch_scan` / `ws_dispatch_claim` / `ws_dispatch_approve` / `ws_dispatch_release`（见「dispatch 模式（本机多会话编排）」节），并复用 `ws_send_message` / `ws_end_collab` 等既有工具。
 
 - **`ws_list_hosts` 列表含本机段**：载荷分两段——`self`＝本机自身（身份名、端口与**活跃终端**＝本机核心当前注册的会话，`sessionCount` 与 `sessions`，会话标识即 `CLAUDE_CODE_SESSION_ID`）＋ `hosts`＝其他驿站。**同机的其他数据根实例**（如「单机一核与桥」节逃生门的第二核）照常列出、带 `sameMachine: true` 标注（命令面呈现「本机·另一数据根」）——自机识别只按实例标识（同一数据根＝同一驿站，不重复列出），不按地址过滤。**远端条目另携会话段**：对端上报的活跃会话 `sessions`（**短码数组**——会话标识前 8 字符；缺字段＝对端未报、已如实省略，「对端没有活跃会话」与「对端没报」不混同——对端如实报零时是空数组在场）。如实边界：发现仍靠同一套机制（探测应答与启动自介写入的已知主机清单），**从未与本站点接触过、又不在扫描段内（默认 7321–7328）的同机实例扫不到**（不做地址枚举）。**能力闸门（0.2.0）**：远端条目另带 `participants` 能力（支持 / 不支持 / 未知）——0.2.0 只与「支持」的对端建立协作；旧版对端仍可被发现，但邀请 / 申请 / 建协作被明确拒绝（见「升级与迁移」节）。
 
@@ -74,7 +74,7 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
 - **查看**：`ws_view_ledger`（本地合并视图，标注「未与全员核对」）＋「讨论查看器」节的只读观战窗。离线期落下的帖子由你本机的周期对表自动追平；回填帖不进会话注入、只汇总一行（见披露⑤）。
 - **静音**：新建 / 加入后**默认不静音**（2026-10-22 起；见「静音（默认不静音）与观察窗自动打开」节）；设静音 / 取消用 `ws_set_mute` 或 `/ws-mute`——纯本机开关（不广播、对端无感），0.2.0 起**只改本席位**：同机其他会话不受影响，席位删除即清理。静音期实时内容不再注入本会话，结束 / 邀请 / 治理等待办照常注入。
 - **退出与结束**：成员退出用 `ws_leave_collab`（只退本会话席位）；**结束权归发起人**（`ws_end_collab`），结束 = 广播 end、全员归档。0.2.0 起全部活跃席位离席时，各核按心跳事实**本地**置 `completed`（只读判定，不写共享台账、不代写他人 `leave`）。
-- 以上都在现有工具面内（共 23 项）；本模式新增 `ws_invite`（任何成员可邀请）与 `ws_request_join`（主动加入的敲门入口，§5.6）两件，另增两模式通用的静音开关 `ws_set_mute`；会话级加入另增 `ws_join`（发起加入）与 `ws_approve_join`（站长批准 / 拒绝）两件，邀请确认另增 `ws_allow_next_invite`（一次性确认豁免）（见「会话级加入（申请/指名/可见性）」节）；其余复用既有工具。
+- 以上都在现有工具面内（共 27 项）；本模式新增 `ws_invite`（任何成员可邀请）与 `ws_request_join`（主动加入的敲门入口，§5.6）两件，另增两模式通用的静音开关 `ws_set_mute`；会话级加入另增 `ws_join`（发起加入）与 `ws_approve_join`（站长批准 / 拒绝）两件，邀请确认另增 `ws_allow_next_invite`（一次性确认豁免）（见「会话级加入（申请/指名/可见性）」节）；其余复用既有工具。
 
 **如实披露（讨论模式）**——以下是该模式取舍的全部代价，逐条列出（编号沿用设计文档）：
 
@@ -90,6 +90,28 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
 - **发起人退出的自然消亡**：发起人会话可退出（同普通成员）——退出即同时放弃结束权与中继职责：内容仍可继续（直投兜底、后进者经对表追平），但**不再有人能结束它**；全部会话离席后各核本地判 `completed`（只读终态，不写共享台账）。
 - **16 个活跃会话上限是邀请侧软约束**（代码常量 `MAX_FORUM_ACTIVE_SEATS`＝16，`src/net/protocol.js`）：本机折叠成员表（活跃会话）≥16 时拒绝发起新邀请；已有的 join 与合并不因超限被拒（保收敛）。并发场景允许**暂时到 17**——软约束的存量边界（设计未单列）。
 - **时钟序为近似序**：显示按时间戳排序；跨作者的时间戳仅近似（作者侧已强制单调，同作者内比较以作者序号为准）。
+
+## dispatch 模式（本机多会话编排）
+
+与协作 / 讨论并列的第三种模式：**只在本机**把多个 Claude Code 会话编成一个 master + 若干 slave 的执行组（例如 master 在微信侧统筹、worker 各自跑任务）。模式在创建时定死；**不接入局域网**——`mode: 'dispatch'` 的邀请帧在协议层即被拒绝，伪造的 dispatch task / progress / result / error 帧在准入层显式拒绝并计数。
+
+- **master**：由启动器（如 cc-connect）拉起，进程环境带 `WAYSTATION_ROLE=master`，并在 `append_system_prompt` 里交代职责，例如「你是 waystation master。会话启动后创建 dispatch 模式并扫描本机会话；用 @会话名 定向、不写 @ 群发；只推关键事件到微信，普通进度留在内存」。启动后由 master 会话调用 `ws_create_collab { mode: 'dispatch', name: 'dispatch' }` 创建——**角色只认启动期环境变量**，工具参数与聊天内容不能声明 master；一个核心同时只允许一个 dispatch，dispatch 不接受 `targets`。
+- **slave（交互式）**：人工正常打开 Claude Code 即可；首次被收编时核心向该会话注入确认提示，**需本机用户确认**后才绑定（可选 `WAYSTATION_ROLE=slave` 预授权、`WAYSTATION_MASTER=<master 名>` 限定主人）。
+- **slave（无头 / 服务拉起）**：必须带 `WAYSTATION_ROLE=slave` 才会被收编（无角色且不可交互 → 拒绝）。示例：
+
+  ```bash
+  WAYSTATION_ROLE=slave WAYSTATION_MASTER=master claude --name worker-1 \
+    -p --input-format stream-json --output-format stream-json --verbose \
+    --permission-mode dontAsk \
+    --allowed-tools "Read Grep Glob Bash Edit Write mcp__waystation__ws_send_message mcp__waystation__ws_check_inbox mcp__waystation__ws_status mcp__waystation__ws_leave_collab"
+  ```
+
+  `--allowed-tools` 必须包含 waystation MCP 工具（否则 `dontAsk` 下 worker 无法回执 / 查收件）；`claude --name` 设置会话名；长驻用 stream-json 输入，不要用一次性 `claude -p "任务"`。
+- **收编**：master 用 `ws_dispatch_scan` 扫描本机会话（名字 / kind / role / status / 已被谁收编），`ws_dispatch_claim { sessionIds }` 发起收编；交互式目标收到确认提示，`ws_dispatch_approve` 首次只返回一次性令牌、经本机用户确认后携令牌批准；`ws_dispatch_release { sessionId }` 释放。
+- **消息与结束**：复用 `ws_send_message`（dispatch 下可带 `toSessionIds` 与 `taskId`，类型限定 task / progress / result / error）与 `ws_end_collab`（master 结束并通知全员）。master 用 `@会话名` 定向、不写 `@` 群发；slave 回执默认回 master 并在正文带 `@来源`。实时细节只在内存与终端：台账 / 收件流水 / 观察窗历史不适用（`ws_view_ledger` / `ws_check_inbox` 明确回「不保存历史」）。
+- **纯内存、不保存历史**：dispatch 不进 `collabs/`（零文件：不建目录、不写 carrier / member / ledger / snapshot / outbox / inbox / invites / joins / seat / recovery / posts），核心重启或 dispatch 结束即消失，无回填、无恢复、无观察窗回放；`sessions/<sessionId>.json` 状态栏文件允许照常更新（它是本机会话状态，不是协作历史）。
+- **微信推送是 master / cc-connect 的集成责任**：waystation 不集成 cc-connect / 微信。以下行为仓库内无证据、需真机验证：无用户消息时 master 的输出是否会被 cc-connect 当作 push 转发；推送频率与 `burst_limit` / 24h 额度；`ret=-2` 的失败与重试。
+- **如实披露**：同机同用户信任边界——同用户的其他进程可以设置角色 / 连本地 IPC（更强隔离用不同 OS 账户运行 master / slave）；「交互式确认」是模型转述的提示，最终取决于该会话语义与用户行为；会话名与 `kind`（interactive / bg）取自 Claude Code 的私有字段与状态栏数据，字段缺失或不可读时按「未知 / 非交互」失败关闭处理。
 
 ## 会话级加入（申请/指名/可见性）
 

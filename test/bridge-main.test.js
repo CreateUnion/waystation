@@ -38,13 +38,34 @@ function stubLink(overrides = {}) {
 test('tools/list 数据源＝规格单一权威（顺序与内容一致；返回浅拷贝不共享数组）', () => {
   const registry = createForwardingRegistry({ link: stubLink(), version: '0.1.0', app: '/app' });
   const listed = registry.list();
-  assert.equal(listed.length, 23);
+  assert.equal(listed.length, 27);
   assert.deepEqual(listed.map((tool) => tool.name), TOOL_SPECS.map((tool) => tool.name), '注册序与规格一致');
   assert.deepEqual(listed, TOOL_SPECS, '条目内容与规格逐字段相同');
   const again = registry.list();
   assert.notEqual(listed, again, '每次返回新数组');
   listed.pop();
-  assert.equal(registry.list().length, 23, '调用方变异不污染规格');
+  assert.equal(registry.list().length, 27, '调用方变异不污染规格');
+});
+
+test('dispatch 能力位：核心未宣告 dispatch 时 registry 拒绝 ws_dispatch_*，宣告后照常转发', async () => {
+  const calls = [];
+  const link = stubLink({
+    call: async (name, args) => {
+      calls.push([name, args]);
+      return { ok: true, result: { content: [{ type: 'text', text: 'ok' }] } };
+    },
+  });
+  const registry = createForwardingRegistry({ link });
+  for (const name of ['ws_dispatch_scan', 'ws_dispatch_claim', 'ws_dispatch_approve', 'ws_dispatch_release']) {
+    const refused = await registry.call(name, {});
+    assert.equal(refused.isError, true, `${name} 在旧核心上必须拒绝`);
+    assert.match(refused.content[0].text, /核心版本不支持 dispatch/);
+  }
+  assert.deepEqual(calls, [], '能力位缺失时不得转发到核心');
+  link.state.welcome = { dispatch: 1 };
+  const forwarded = await registry.call('ws_dispatch_scan', { sessionIds: ['s-1'] });
+  assert.equal(forwarded.isError, undefined);
+  assert.deepEqual(calls, [['ws_dispatch_scan', { sessionIds: ['s-1'] }]], '能力位在场时原样转发');
 });
 
 test('核心不可达的 ws_status 合成：core.available=false＋reason＋桥来源静态信息，其余字段省略', async () => {
@@ -117,7 +138,7 @@ test('桥运行时：dataDir 取数据根解析；关闭转发到连接件', asy
     link,
   });
   assert.equal(runtime.dataDir, 'E:\\tmp\\bridge-home');
-  assert.equal(runtime.registry.list().length, 23);
+  assert.equal(runtime.registry.list().length, 27);
   await runtime.close();
   assert.equal(closed, 1);
 });
@@ -290,7 +311,7 @@ test('进程级：MCP 立即可答、核心启动失败降级文案、stdin 关�
   await client.connect(transport);
   childPid = transport.pid ?? null;
   const { tools } = await client.listTools();
-  assert.equal(tools.length, 23, 'tools/list 不依赖核心即答');
+  assert.equal(tools.length, 27, 'tools/list 不依赖核心即答');
   const called = await client.callTool({ name: 'ws_status', arguments: {} });
   assert.equal(called.isError, true);
   const payload = JSON.parse(called.content[0].text);
