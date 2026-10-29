@@ -141,6 +141,26 @@ function Invoke-Install {
     }
 }
 
+# cc-connect 存在性判定（任一命中即存在）：
+#   Windows 服务 cc-connect（测试缝 =1/nocc 时跳过本信号）→ ~\.cc-connect\config.toml →
+#   PATH 上的 cc-connect 命令 → npm 全局目录下 node_modules\cc-connect。
+function Test-CcConnectExists {
+    if ($script:TestSeam -eq 'nocc') { return $false }
+    if (-not $script:AssumeNoService) {
+        $svc = Get-Service -Name 'cc-connect' -ErrorAction SilentlyContinue
+        if ($svc) { return $true }
+    }
+    if (Test-Path (Join-Path $HomeDir '.cc-connect\config.toml')) { return $true }
+    $cmd = Get-Command 'cc-connect' -ErrorAction SilentlyContinue
+    if ($cmd) { return $true }
+    $npm = Invoke-Native -Command 'npm' -CommandArgs @('prefix', '-g')
+    if ($npm.ExitCode -eq 0) {
+        $prefix = ([string]($npm.Output | Select-Object -First 1)).Trim()
+        if ($prefix -ne '' -and (Test-Path (Join-Path $prefix 'node_modules\cc-connect'))) { return $true }
+    }
+    return $false
+}
+
 # ===== 主流程 =====
 
 if (-not (Test-Path (Join-Path $RepoRoot 'package.json')) -or -not (Test-Path (Join-Path $RepoRoot 'scripts\install.ps1'))) {
@@ -197,8 +217,21 @@ if (-not $installedFileExists) {
     }
 }
 
+Write-Step '2/3' 'cc-connect 检测'
+$ccExists = Test-CcConnectExists
+$ccStatusLine = ''
+if (-not $ccExists) {
+    Write-Warn '未检测到 cc-connect——waystation 本体（局域网协作）不受影响；但无法自动配置微信/QQ 多会话控制（dispatch master 入口）。'
+    Write-Note '如需该能力：安装 cc-connect 并完成平台对接后重跑本脚本即可补配。'
+    $ccStatusLine = '未检测到'
+} else {
+    Write-Note '已检测到 cc-connect'
+    $ccStatusLine = '已检测到'
+}
+
 Write-Step '3/3' '自检汇总'
 Write-Note "waystation：$wsStatusLine"
+Write-Note "cc-connect：$ccStatusLine"
 if ($script:PendingManual.Count -gt 0) {
     Write-Warn "待手动事项 $($script:PendingManual.Count) 项："
     foreach ($item in $script:PendingManual) { Write-Note "- $item" }

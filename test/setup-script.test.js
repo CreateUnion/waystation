@@ -106,3 +106,23 @@ test('已装版本不可解析：dry-run 报告重装询问', (t) => {
   assert.ok(result.stdout.includes('重装'), `应报告重装询问：${result.stdout}`);
   assertDryRunNoWrite(home, entriesBefore);
 });
+
+test('cc-connect 未检测到（nocc 缝）：打印缺失提醒', (t) => {
+  if (!powershellAvailable) { t.skip('powershell -File 不可用'); return; }
+  const { result } = runSetup(t, { args: ['-DryRun'], seam: 'nocc' });
+  assert.equal(result.status, 0);
+  assert.ok(result.stdout.includes('未检测到 cc-connect'), `应打印缺失提醒：${result.stdout}`);
+  assert.ok(result.stdout.includes('多会话控制'), `提醒应说明多会话控制不可用：${result.stdout}`);
+});
+
+test('cc-connect 已检测到（伪造 config 命中存在信号）：不打印缺失提醒', (t) => {
+  if (!powershellAvailable) { t.skip('powershell -File 不可用'); return; }
+  const home = makeTempDir(t);
+  const ccDir = join(home, '.cc-connect');
+  mkdirSync(ccDir, { recursive: true });
+  writeFileSync(join(ccDir, 'config.toml'), '[[projects]]\nname = "demo"\n', 'utf8');
+  const { result } = runSetup(t, { args: ['-DryRun'], home, seam: '1' });
+  assert.equal(result.status, 0);
+  assert.ok(result.stdout.includes('已检测到 cc-connect'), `应打印已检测到：${result.stdout}`);
+  assert.ok(!result.stdout.includes('未检测到 cc-connect'), '不应打印缺失提醒');
+});
