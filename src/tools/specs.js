@@ -1,4 +1,4 @@
-/* 工具规格单一权威：22 个工具的 name / description / inputSchema——形态即 registry.list() 的输出三元组
+/* 工具规格单一权威：23 个工具的 name / description / inputSchema——形态即 registry.list() 的输出三元组
  * （src/tools/registry.js）。核心用它注册 handler，桥用它应答 MCP tools/list——核心不在时桥也必须答得上，
  * 故本模块是纯数据：零 import、无运行时依赖，桥侧导入它不认识网络、不认识数据层。
  *

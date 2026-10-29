@@ -57,6 +57,17 @@ test('README：本机可见性与静音标记写入文档（列表本机段 / �
   assert.ok(text.includes('🔇'), '状态栏静音标记写入文档');
 });
 
+test('README：确认门命令、默认值与 join 自动走完边界齐备', () => {
+  const text = readFileSync(join(repoRoot, 'README.md'), 'utf8');
+  assert.ok(text.includes('/ws-invite-confirm'));
+  assert.ok(text.includes('/ws-join-confirm'));
+  assert.ok(text.includes('inviteConfirmation'));
+  assert.ok(text.includes('joinRequestConfirmation'));
+  assert.ok(text.includes('不指名'));
+  assert.ok(text.includes('自动走完'));
+  assert.ok(text.includes('旧命令'));
+});
+
 test('README：人类观察窗节齐备（命令/启动器/开关/日志排查/发送方提示/升级重跑）', () => {
   const text = readFileSync(join(repoRoot, 'README.md'), 'utf8');
   assert.ok(text.includes('/ws-view'), '观察窗命令（/ws-view）写入文档');

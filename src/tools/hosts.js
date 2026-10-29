@@ -10,7 +10,7 @@ import { WS_LIST_HOSTS_SPEC } from './specs.js';
  * 「零会话」与「没报」是两回事，不得混为一谈）；self＝本机自身（核心身份＋端口＋活跃终端会话，
  * 经上下文取值器现取——注册桥即活跃终端；此处维持全量会话记录不变）。
  * 本机地址无现成数据源，self 只报端口，不硬凑地址。
- * 返回口径：成功载荷顶层恒含 ok:true（22 工具统一约定，见 tools/collab.js）。 */
+ * 返回口径：成功载荷顶层恒含 ok:true（23 工具统一约定，见 tools/collab.js）。 */
 export function hostsTool() {
   return {
     ...WS_LIST_HOSTS_SPEC,

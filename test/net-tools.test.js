@@ -8,6 +8,7 @@ import { deliveryStatusTool } from '../src/tools/delivery-status.js';
 import { statusTool } from '../src/tools/status.js';
 import { checkInboxTool } from '../src/tools/check-inbox.js';
 import { listCollabsTool, createCollabTool, inviteTool, requestJoinTool, approveInviteTool, allowNextInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, setMuteTool, leaveCollabTool, endCollabTool, SEND_MESSAGE_TYPES } from '../src/tools/collab.js';
+import { setConfirmGateTool } from '../src/tools/confirm-gate.js';
 import { joinTool, approveJoinTool } from '../src/tools/join.js';
 import { decideTool, handoverTool, takeOverTool } from '../src/tools/governance.js';
 import { createNetStack } from '../src/net/stack.js';
@@ -68,6 +69,7 @@ const SERVICE_DEFAULTS = {
   invite: { ok: true, collabId: 'collab-1', invited: [{ instanceId: 'inst-b', ok: true, msgId: 'msg-1' }] },
   approve: { ok: true, decision: 'approved' },
   allowNextInvite: { ok: true, note: '已登记一次性豁免' },
+  setConfirmGate: { ok: true, gate: 'invite', scope: 'session', sessionValue: false, configValue: null, effectiveValue: false },
   withdraw: { ok: true, scope: 'single', withdrawn: ['inst-b'] },
   view: { ok: true, source: 'local', version: 2, ledger: { collabId: 'collab-1', version: 2 } },
   send: { ok: true, msgId: 'msg-9', tier: 'queued', note: '已排队' },
@@ -81,7 +83,7 @@ const SERVICE_DEFAULTS = {
 };
 
 function fakeService(responses = {}) {
-  const calls = { list: 0, listInputs: [], create: [], invite: [], approve: [], allowNextInvite: [], withdraw: [], view: [], send: [], setMute: [], end: [], leave: [] };
+  const calls = { list: 0, listInputs: [], create: [], invite: [], approve: [], allowNextInvite: [], setConfirmGate: [], withdraw: [], view: [], send: [], setMute: [], end: [], leave: [] };
   /* 调用记录 + 响应注入（未注入口径取默认值）：工具层一律 await 结果，同步返回等价。 */
   const record = (name, input) => {
     calls[name].push(input);
@@ -98,6 +100,7 @@ function fakeService(responses = {}) {
     invite: (input) => record('invite', input),
     approve: (input) => record('approve', input),
     allowNextInvite: (input) => record('allowNextInvite', input),
+    setConfirmGate: (input) => record('setConfirmGate', input),
     withdraw: (input) => record('withdraw', input),
     view: (input) => record('view', input),
     send: (input) => record('send', input),
@@ -1727,7 +1730,7 @@ function fakeNet() {
   };
 }
 
-test('工具返回口径：22 工具成功载荷均为含 ok:true 的 JSON 对象（统一不变量）', async () => {
+test('工具返回口径：23 工具成功载荷均为含 ok:true 的 JSON 对象（统一不变量）', async () => {
   const net = fakeNet();
   const collab = fakeService();
   const join = fakeJoinService();
@@ -1743,6 +1746,7 @@ test('工具返回口径：22 工具成功载荷均为含 ok:true 的 JSON 对�
     { tool: createCollabTool(), args: { name: '项目', topic: '主题', targets: [single] }, context: governedContextOf(collab) },
     { tool: approveInviteTool(), args: { collabId: 'collab-1', inviteId: 'inv-1', approve: true }, context: collabContextOf(collab) },
     { tool: allowNextInviteTool(), args: {}, context: collabContextOf(collab) },
+    { tool: setConfirmGateTool(), args: { action: 'status', gate: 'invite' }, context: governedContextOf(collab) },
     { tool: withdrawInviteTool(), args: { collabId: 'collab-1', target: 'inst-b' }, context: governedContextOf(collab) },
     { tool: viewLedgerTool(), args: { collabId: 'collab-1' }, context: collabContextOf(collab) },
     { tool: sendMessageTool(), args: { collabId: 'collab-1', text: '你好' }, context: collabContextOf(collab) },
@@ -1757,7 +1761,7 @@ test('工具返回口径：22 工具成功载荷均为含 ok:true 的 JSON 对�
     { tool: handoverTool(), args: { collabId: 'collab-1', target: 'inst-b', targetSessionId: 'sess-b' }, context: governedContextOf(governance) },
     { tool: takeOverTool(), args: { collabId: 'collab-1' }, context: governedContextOf(governance) },
   ];
-  assert.equal(cases.length, 22, '覆盖全部 22 工具');
+  assert.equal(cases.length, 23, '覆盖全部 23 工具');
   for (const { tool, args, context } of cases) {
     const result = await tool.handler(args, context);
     assert.equal(result.isError, undefined, tool.name);

@@ -459,7 +459,7 @@ function Show-SessionChecklist {
     Write-Step '指引' '会话期首检清单（脚本期无法代验，需在 Claude Code 会话里做）'
     Write-Note '1) 新开一个会话（会话启动时拉起会话桥；驿站核心按需自动启动）'
     Write-Note '2) 查看 MCP 连接：会话里执行 /mcp，waystation 应显示已连接'
-    Write-Note '3) 让 Claude 调用驿站工具：ws_status 应返回本站点状态；ws_list_hosts 应能扫到局域网在线站点；ws_list_collabs 应返回空清单（新装）——工具面共 22 项'
+    Write-Note '3) 让 Claude 调用驿站工具：ws_status 应返回本站点状态；ws_list_hosts 应能扫到局域网在线站点；ws_list_collabs 应返回空清单（新装）——工具面共 23 项'
     Write-Note "4) 单核：同机多终端共用一个核心（不再按终端分配端口/槽位）；跨机互扫用同一端口（缺省锚点 $($script:AnchorPort)）"
     Write-Note '5) 两台机器互扫可见后，再按设计验收场景走「建立协作」流程'
     Write-Note "6)（可选）状态栏「协作中」指示：把 $AppDir\scripts\statusline.js 配为 statusLine 命令（见 README 状态栏节）；进入协作后应显示「协作中：⋯」"
