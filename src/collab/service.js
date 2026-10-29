@@ -2462,6 +2462,64 @@ async function receiveLocalProtocolFrame(state, collabId, frame) {
   return { ok: true, delivered: true };
 }
 
+/* 投递事实面：只对「指名到本会话」且本会话 invite 门为 off 的邀请自动同意。
+ * 三个成功点覆盖在线直投、席位暂存补投、挂起邀请补投；staged 不算投递，因此不在这里触发。
+ * 内部签发并立即消费一次性挑战，复用 approveNow 的完整同意 / 入席 / 账号收尾路径。 */
+async function maybeAutoAcceptInviteOf(state, collabId, sessionId, frame) {
+  if (frame?.type !== 'invite' || !isNamedInviteForSessionOf(state, frame, sessionId)) {
+    return;
+  }
+  if (gateValueOf(state, sessionId, 'invite').effectiveValue !== false) {
+    return;
+  }
+  if (!await autoAcceptInviteNowOf(state, collabId, sessionId, frame)) {
+    return;
+  }
+  notifyAutoAcceptedInviteOf(state, collabId, sessionId);
+}
+
+/* 同意本体：签发并消费一次性挑战，异常与失败只留痕——自动同意不得打断投递主链。 */
+async function autoAcceptInviteNowOf(state, collabId, sessionId, frame) {
+  const confirmToken = issueInviteChallenge(state, { sessionId, collabId });
+  try {
+    const result = await guardedWrite(state, collabId, () => approveNow(state, {
+      collabId, sessionId, inviteId: inviteIdOfFrame(frame), approve: true, confirmToken,
+    }));
+    if (result?.ok === true) {
+      return true;
+    }
+    state.log.warn('自动同意邀请失败（保持待回应）', { collabId, sessionId, reason: result?.message });
+  } catch (error) {
+    state.counters.eventFailures++;
+    state.log.warn('自动同意邀请异常（已隔离）', { collabId, sessionId, reason: error?.message });
+  }
+  return false;
+}
+
+function inviteIdOfFrame(frame) {
+  const inviteId = frame?.payload?.inviteId;
+  return typeof inviteId === 'string' && inviteId !== '' ? inviteId : undefined;
+}
+
+function notifyAutoAcceptedInviteOf(state, collabId, sessionId) {
+  const local = state.collabs.get(collabId);
+  const name = local === undefined ? collabId : localNameOf(local);
+  notifyLocal(state, local ?? { collabId }, `已按设置自动同意邀请：${name}`, { targetSessionId: sessionId });
+}
+
+/* 指名判定要兼容两种帧形态：在线邀请写 payload.targetSessionId；挂起补投只写
+ * payload.targets[].targetSessionId（replayInviteFrameOf）。不指名邀请没有 targetSessionId，
+ * 一律不自动同意。 */
+function isNamedInviteForSessionOf(state, frame, sessionId) {
+  if (frame?.payload?.targetSessionId === sessionId) {
+    return true;
+  }
+  const targets = frame?.payload?.targets;
+  return Array.isArray(targets) && targets.some((target) =>
+    target?.targetSessionId === sessionId
+    && (target.instanceId === undefined || target.instanceId === state.self.instanceId));
+}
+
 /* 有席位目标的注入：先记运行态事实，桥在线直投、离线/补投中入暂存；两种结果都写本机投递账。 */
 async function injectSeatedFrame(state, collabId, local, seat, frame, msgId) {
   noteSeatInbox(seat, frame, msgId);
@@ -2470,6 +2528,7 @@ async function injectSeatedFrame(state, collabId, local, seat, frame, msgId) {
     state.counters.seatsInjected++;
     noteSeatOutcome(seat, msgId, 'injected');
     noteLocalDelivery(state, collabId, seat.sessionId, frame, 'injected');
+    await maybeAutoAcceptInviteOf(state, collabId, seat.sessionId, frame);
     return { ok: true, delivered: true };
   }
   stageSeatFrame(state, local, seat, frame);
@@ -2483,6 +2542,7 @@ async function injectVirtualInvite(state, collabId, seat, frame) {
   if (await deliverToSeatNow(state, seat, frame)) {
     state.counters.seatsInjected++;
     noteLocalDelivery(state, collabId, seat.sessionId, frame, 'injected');
+    await maybeAutoAcceptInviteOf(state, collabId, seat.sessionId, frame);
     return { ok: true, delivered: true };
   }
   return { ok: false, reason: 'seat-offline' };
@@ -2835,6 +2895,7 @@ async function flushStagedOf(state, local, seat) {
       forgetStagedOf(state, local.collabId, seat.sessionId, entry.frame?.msgId);
       noteSeatOutcome(seat, entry.frame?.msgId ?? null, 'injected');
       noteLocalDelivery(state, entry.frame?.collabId, seat.sessionId, entry.frame, 'injected');
+      await maybeAutoAcceptInviteOf(state, local.collabId, seat.sessionId, entry.frame);
     }
   } finally {
     seat.flushing = false;
