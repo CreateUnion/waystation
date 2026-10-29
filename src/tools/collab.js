@@ -1,5 +1,6 @@
 import { isIP } from 'node:net';
 import { COLLAB_MODES, DEFAULT_COLLAB_MODE, ID_PATTERN, MAX_COLLAB_MEMBERS, POST_KINDS, isIdentityName, isPort } from '../net/protocol.js';
+import { DISPATCH_MESSAGE_TYPES } from '../collab/dispatch.js';
 import {
   WS_ALLOW_NEXT_INVITE_SPEC, WS_APPROVE_INVITE_SPEC, WS_CREATE_COLLAB_SPEC, WS_END_COLLAB_SPEC, WS_INVITE_SPEC, WS_LEAVE_COLLAB_SPEC,
   WS_LIST_COLLABS_SPEC, WS_REQUEST_JOIN_SPEC, WS_SEND_MESSAGE_SPEC, WS_SET_MUTE_SPEC, WS_VIEW_LEDGER_SPEC,
@@ -349,7 +350,10 @@ export function sendMessageTool() {
       if (collabId === null) {
         return errorResult('参数 collabId 非法：需要非空白字符串');
       }
-      const parsed = sendMessageArgsOf(args);
+      /* dispatch 与 managed / forum 的参数面不同（toSessionIds / taskId 只属于 dispatch；
+       * dispatch 又不接受 to / toSessionId）：解析必须先按容器模式分流。 */
+      const dispatch = context.collab.dispatch?.isDispatch?.(collabId) === true;
+      const parsed = dispatch ? dispatchSendArgsOf(args) : sendMessageArgsOf(args);
       if (parsed.error !== undefined) {
         return errorResult(parsed.error);
       }
@@ -363,13 +367,14 @@ export function sendMessageTool() {
 /* 消息参数归一（正文 / 类型 / 定向）：定向席位 = 实例 + 会话两步，只给 toSessionId 时无法定位
  * 目标机器，工具层先拒（双字段必须成对）；歧义由服务层的 matchSessionByToken 语义兜底。 */
 function sendMessageArgsOf(args) {
-  const text = trimmedString(args, 'text');
-  if (text === '') {
-    return { error: '参数 text 非法：需要非空白字符串（消息正文）' };
+  const basics = messageBasicsOf(args);
+  if (basics.error !== undefined) {
+    return basics;
   }
-  const type = args.type === undefined ? 'reply' : args.type;
-  if (typeof type !== 'string' || !SEND_MESSAGE_TYPES.includes(type)) {
-    return { error: `参数 type 非法：可选值为 ${SEND_MESSAGE_TYPES.join(' / ')}（缺省 reply）` };
+  /* dispatch 专属字段不得被 managed / forum 静默忽略：忽略会造出「定向了却没定向」的假象。 */
+  const dispatchOnlyRefusal = dispatchOnlyFieldsRefusalOf(args);
+  if (dispatchOnlyRefusal !== null) {
+    return { error: dispatchOnlyRefusal };
   }
   const to = optionalTextArg(args, 'to');
   if (args.to !== undefined && to === '') {
@@ -382,7 +387,72 @@ function sendMessageArgsOf(args) {
   if (toSessionId.value !== undefined && to === undefined) {
     return { error: '参数非法：toSessionId 须与 to 同时给出（只给会话参数无法定位目标机器）' };
   }
-  return { value: { text, type, to, toSessionId: toSessionId.value } };
+  return { value: { text: basics.value.text, type: basics.value.type, to, toSessionId: toSessionId.value } };
+}
+
+/* 正文与类型（两模式共用）：type 缺省 reply，取值限协作类词表。 */
+function messageBasicsOf(args) {
+  const text = trimmedString(args, 'text');
+  if (text === '') {
+    return { error: '参数 text 非法：需要非空白字符串（消息正文）' };
+  }
+  const type = args.type === undefined ? 'reply' : args.type;
+  if (typeof type !== 'string' || !SEND_MESSAGE_TYPES.includes(type)) {
+    return { error: `参数 type 非法：可选值为 ${SEND_MESSAGE_TYPES.join(' / ')}（缺省 reply）` };
+  }
+  return { value: { text, type } };
+}
+
+function dispatchOnlyFieldsRefusalOf(args) {
+  return args.toSessionIds !== undefined || args.taskId !== undefined
+    ? 'toSessionIds / taskId 只用于 dispatch 模式；managed / forum 请用 to + toSessionId'
+    : null;
+}
+
+/* dispatch 参数面（纯本机内存域）：type 只认四类词表；定向用 toSessionIds 数组
+ * （省略即由核心按绑定路由：master→全体 slave、slave→master），不接受 to / toSessionId
+ * （实例 + 会话的两段式定位在单机域里没有意义）；taskId 是任务的关联键，≤64 字符。 */
+function dispatchSendArgsOf(args) {
+  const basics = dispatchBasicsOf(args);
+  if (basics.error !== undefined) {
+    return basics;
+  }
+  const targets = dispatchTargetsArgOf(args.toSessionIds);
+  if (targets.error !== undefined) {
+    return targets;
+  }
+  if (args.taskId !== undefined && !isDispatchTaskId(args.taskId)) {
+    return { error: 'taskId 非法：需要 1–64 字符的非空白字符串' };
+  }
+  return { value: { text: basics.value.text, type: args.type, toSessionIds: targets.value, taskId: args.taskId?.trim() } };
+}
+
+function dispatchBasicsOf(args) {
+  const text = trimmedString(args, 'text');
+  if (text === '') {
+    return { error: '参数 text 非法：需要非空白字符串（消息正文）' };
+  }
+  if (args.type !== undefined && !DISPATCH_MESSAGE_TYPES.includes(args.type)) {
+    return { error: `参数 type 非法：dispatch 可选值为 ${DISPATCH_MESSAGE_TYPES.join(' / ')}` };
+  }
+  if (args.to !== undefined || args.toSessionId !== undefined) {
+    return { error: 'dispatch 不接受 to / toSessionId——定向用 toSessionIds 数组，省略即由核心按绑定路由' };
+  }
+  return { value: { text } };
+}
+
+function dispatchTargetsArgOf(toSessionIds) {
+  if (toSessionIds === undefined) {
+    return { value: undefined };
+  }
+  if (!Array.isArray(toSessionIds) || toSessionIds.some((id) => typeof id !== 'string' || id.trim() === '')) {
+    return { error: 'toSessionIds 非法：需要非空字符串数组' };
+  }
+  return { value: toSessionIds.map((id) => id.trim()) };
+}
+
+function isDispatchTaskId(taskId) {
+  return typeof taskId === 'string' && taskId.trim() !== '' && taskId.length <= 64;
 }
 
 export function setMuteTool() {

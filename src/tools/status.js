@@ -36,6 +36,7 @@ export function statusTool() {
         } : {}),
         net,
         collab: context.collab.stats(),   // 协作服务计数（注册表状态分布 + 各类拒绝 / 丢弃计数）
+        dispatch: context.collab.dispatch?.status?.()?.dispatch ?? null,   // dispatch 内存域视图（无＝null）
         /* 身份未设置的会话级提示：启动时已把默认机器名落盘，字段只在本会话出现——命令面撞到就
          * 向用户转达一次（可代改 identityName，下次会话生效），不阻断主流程。标志是内存态，
          * 字段有值后不再带本字段。 */

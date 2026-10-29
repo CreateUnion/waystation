@@ -11,6 +11,8 @@ export const DISPATCH_QUEUE_MAX = 256;
 export const DISPATCH_CLAIM_TTL_MS = 10 * 60 * 1000;
 export const DISPATCH_META_FRESH_MS = 5 * 60 * 1000;
 export const DISPATCH_MEMBER_EVENT_DEBOUNCE_MS = 500;
+/* 桥断开宽限（与席位宽限同源配置，缺省与 service 的 DEFAULT_SEAT_GRACE_MS 对齐）。 */
+const DISPATCH_GRACE_MS = 60 * 1000;
 
 export function createDispatchDomain(deps) {
   const { state, now = Date.now } = deps;
@@ -34,7 +36,16 @@ export function createDispatchDomain(deps) {
     metaOf,
     isInteractiveOf,
     masterDispatchOf,
+    dispatchOf,
+    listSessionIds,
   };
+  return dispatchApiOf(runtime);
+}
+
+/* 域入口表：读面（list / status / isDispatch）＋写面（create / claim / send / end / leave / sweep）——
+ * 全部经 runtime 取注入面，闭包不直接捕获 deps。 */
+function dispatchApiOf(runtime) {
+  const { state, now, metaOf, isInteractiveOf, masterDispatchOf, dispatchOf, listSessionIds } = runtime;
   return {
     dispatches: state.dispatches,
     metaOf,
@@ -46,7 +57,12 @@ export function createDispatchDomain(deps) {
     claim: (input) => claimSessionsIn(runtime, input),
     approve: (input) => approveClaimIn(runtime, input),
     release: (input) => releaseSlaveIn(runtime, input),
-    sweep: (at = now()) => sweepClaimsIn(runtime, at),
+    send: (input) => sendMessageIn(runtime, input),
+    end: (input) => endDispatchIn(runtime, input),
+    leave: (input) => leaveDispatchIn(runtime, input),
+    noteBridgeOnline: (sessionId) => noteBridgeOnlineIn(runtime, sessionId),
+    noteBridgeClosed: (sessionId, at = now()) => noteBridgeClosedIn(runtime, sessionId, at),
+    sweep: (at = now()) => sweepDispatchesIn(runtime, at),
     list: () => listDispatchesIn(state),
     describe: (collabId) => describeDispatchIn(state, collabId),
     view: (collabId) => viewDispatchIn(state, collabId),
@@ -401,10 +417,205 @@ function releaseSlaveIn(runtime, { sessionId, targetSessionId }) {
   return { ok: true, sessionId: targetSessionId };
 }
 
-/* 申请 TTL 清扫（presence 节拍驱动；核心重启后 claims 随内存清空，不另有持久面）。 */
-function sweepClaimsIn(runtime, at) {
+/* —— 纯内存消息（send / end / leave）与桥生命周期 —— */
+
+/* 发送：master 可定向或广播给已收编 slave，slave 只能回 master（省略 toSessionIds 即回 master）。
+ * 投递唯一出口是 runtime.notify；notify 返回 false 时按目标入有界队列，桥重连（noteBridgeOnline）补投。
+ * 消息不落盘、不经 LAN 出站队列、不做本机席位注入——这是 dispatch 与 managed / forum 的根本差异。 */
+function sendMessageIn(runtime, { collabId, sessionId, text, type, toSessionIds, taskId }) {
+  const record = runtime.state.dispatches.get(collabId);
+  if (record === undefined) {
+    return dispatchLost();
+  }
+  const sender = runtime.metaOf(sessionId);
+  if (sender === null) {
+    return { ok: false, message: '调用会话不在本机注册表内' };
+  }
+  const targets = sendTargetsOf(record, sessionId, toSessionIds);
+  if (targets.error !== undefined) {
+    return { ok: false, message: targets.error };
+  }
+  const message = messageOf(record, { text, type, taskId, sessionId }, sender);
+  if (message.error !== undefined) {
+    return { ok: false, message: message.error };
+  }
+  return deliverMessage(runtime, record, targets.value, message.value);
+}
+
+/* 正文 / 类型 / taskId 的判定与出站文本组装。slave 的回复带 @来源——master 收到的是多条
+ * slave 消息混流，纯文本无法区分说话者。 */
+function messageOf(record, { text, type, taskId, sessionId }, sender) {
+  if (typeof text !== 'string' || text.trim() === '') {
+    return { error: 'text 非法：需要非空白字符串' };
+  }
+  const messageType = type === undefined
+    ? (sessionId === record.masterSessionId ? 'task' : 'result')
+    : type;
+  if (!DISPATCH_MESSAGE_TYPES.includes(messageType)) {
+    return { error: `type 非法：dispatch 可取值为 ${DISPATCH_MESSAGE_TYPES.join(' / ')}` };
+  }
+  if (taskId !== undefined && !isDispatchTaskId(taskId)) {
+    return { error: 'taskId 非法：需要 1–64 字符的非空白字符串' };
+  }
+  const outbound = sessionId === record.masterSessionId ? text : `@${sender.name} ${text}`;
+  return {
+    value: {
+      messageType, taskId: taskId ?? null, outbound, fromSessionId: sessionId, fromSessionName: sender.name,
+    },
+  };
+}
+
+function isDispatchTaskId(taskId) {
+  return typeof taskId === 'string' && taskId.trim() !== '' && taskId.length <= 64;
+}
+
+/* 投递循环：notify 成功即送达；失败入按目标分桶的有界队列（桥重连补投），不静默丢弃。 */
+function deliverMessage(runtime, record, targets, message) {
+  let delivered = 0;
+  let queued = 0;
+  for (const target of targets) {
+    const frame = noticeFrame(runtime, record, target, message.outbound, 'dispatch-message');
+    frame.payload.messageType = message.messageType;
+    frame.payload.taskId = message.taskId;
+    frame.payload.fromSessionId = message.fromSessionId;
+    frame.payload.fromSessionName = message.fromSessionName;
+    if (notifyOnce(runtime, frame)) {
+      delivered++;
+    } else {
+      enqueue(runtime, record, target, frame);
+      queued++;
+    }
+  }
+  return { ok: true, dispatchId: record.collabId, delivered, queued, targets };
+}
+
+/* 路由判定：返回 { value: targets } 或 { error }。master 定向到非成员 / slave 越权回复 /
+ * 非成员发送都必须如实拒绝——静默丢消息比拒绝更难排查。 */
+function sendTargetsOf(record, sessionId, toSessionIds) {
+  if (toSessionIds !== undefined && !Array.isArray(toSessionIds)) {
+    return { error: 'toSessionIds 非法：需要字符串数组' };
+  }
+  return sessionId === record.masterSessionId
+    ? masterTargetsOf(record, toSessionIds)
+    : slaveTargetsOf(record, sessionId, toSessionIds);
+}
+
+function masterTargetsOf(record, toSessionIds) {
+  const requested = toSessionIds !== undefined && toSessionIds.length > 0
+    ? [...new Set(toSessionIds)]
+    : [...record.slaves.keys()];
+  if (requested.length === 0) {
+    return { error: 'dispatch 内没有已收编的 slave' };
+  }
+  const invalid = requested.find((target) => !record.slaves.has(target));
+  return invalid === undefined
+    ? { value: requested }
+    : { error: `目标会话不在本 dispatch 内：${invalid}` };
+}
+
+function slaveTargetsOf(record, sessionId, toSessionIds) {
+  if (!record.slaves.has(sessionId)) {
+    return { error: '本会话不是该 dispatch 的成员' };
+  }
+  if (Array.isArray(toSessionIds) && toSessionIds.length > 0
+    && (toSessionIds.length !== 1 || toSessionIds[0] !== record.masterSessionId)) {
+    return { error: 'slave 只能回复 master，不能给其他 slave 发消息' };
+  }
+  return { value: [record.masterSessionId] };
+}
+
+/* 结束（master 专属）：先向每个 slave 与 master 发结束通知，再从内存域删除整条记录
+ * （队列随之回收；核心重启后本就没有持久面）。 */
+function endDispatchIn(runtime, { collabId, sessionId }) {
+  const record = runtime.state.dispatches.get(collabId);
+  if (record === undefined) {
+    return dispatchLost();
+  }
+  if (record.masterSessionId !== sessionId) {
+    return { ok: false, message: '只有 master 可以结束 dispatch' };
+  }
+  endDispatch(runtime, record, 'master-ended');
+  return { ok: true, collabId };
+}
+
+function endDispatch(runtime, record, reason) {
+  for (const sessionId of [...record.slaves.keys()]) {
+    sendNotice(runtime, record, sessionId, `dispatch「${record.name}」已结束（${reason}）`, 'dispatch-ended');
+  }
+  sendNotice(runtime, record, record.masterSessionId, `dispatch「${record.name}」已结束`, 'dispatch-ended');
+  clearTimeout(record.eventTimer);
+  runtime.state.dispatches.delete(record.collabId);
+}
+
+/* 退出（slave 专属）：只移除自己并通知 master；master 退出即「结束」，必须走 ws_end_collab。 */
+function leaveDispatchIn(runtime, { collabId, sessionId }) {
+  const record = runtime.state.dispatches.get(collabId);
+  if (record === undefined) {
+    return dispatchLost();
+  }
+  if (record.masterSessionId === sessionId) {
+    return { ok: false, message: 'master 不能被 leave——结束请用 ws_end_collab' };
+  }
+  const slave = record.slaves.get(sessionId);
+  if (slave === undefined) {
+    return { ok: false, message: '本会话不在该 dispatch 内' };
+  }
+  record.slaves.delete(sessionId);
+  record.grace.delete(sessionId);
+  record.queues.delete(sessionId);
+  sendNotice(runtime, record, record.masterSessionId, `「${slave.name}」已退出 dispatch`, 'dispatch-member-left');
+  return { ok: true, collabId };
+}
+
+/* 桥重连：撤销宽限并把断连期间排队的通知补投（notify 恢复后即可达）。 */
+function noteBridgeOnlineIn(runtime, sessionId) {
+  const record = runtime.dispatchOf(sessionId);
+  if (record === null) {
+    return;
+  }
+  record.grace.delete(sessionId);
+  flushQueue(runtime, record, sessionId);
+}
+
+/* 桥断开：登记宽限截止时刻，超时由 sweep 收口（master 超时＝整个 dispatch 结束）。 */
+function noteBridgeClosedIn(runtime, sessionId, at) {
+  const record = runtime.dispatchOf(sessionId);
+  if (record === null) {
+    return;
+  }
+  record.grace.set(sessionId, at + graceMsOf(runtime.config));
+}
+
+function graceMsOf(config) {
+  const value = config?.sessionSeatGraceMs;
+  return Number.isInteger(value) && value >= 0 ? value : DISPATCH_GRACE_MS;
+}
+
+/* 清扫（presence 节拍驱动）：过期收编申请 + 桥断开宽限超时。核心重启后两本内存账一起清空。 */
+function sweepDispatchesIn(runtime, at) {
   for (const record of [...runtime.state.dispatches.values()]) {
+    if (!runtime.state.dispatches.has(record.collabId)) {
+      continue;
+    }
     sweepClaimsOf(runtime, record, at);
+    sweepGraceOf(runtime, record, at);
+  }
+}
+
+function sweepGraceOf(runtime, record, at) {
+  for (const [sessionId, deadline] of [...record.grace]) {
+    if (deadline > at) {
+      continue;
+    }
+    if (sessionId === record.masterSessionId) {
+      endDispatch(runtime, record, 'master-timeout');
+      return;
+    }
+    const slave = record.slaves.get(sessionId);
+    record.slaves.delete(sessionId);
+    record.grace.delete(sessionId);
+    record.queues.delete(sessionId);
+    sendNotice(runtime, record, record.masterSessionId, `「${slave?.name ?? sessionId}」宽限超时离席`, 'dispatch-member-left');
   }
 }
 

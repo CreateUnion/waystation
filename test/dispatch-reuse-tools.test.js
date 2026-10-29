@@ -1,0 +1,40 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { makeDispatchNode } from './helpers/dispatch.js';
+import { sendMessageTool, viewLedgerTool } from '../src/tools/collab.js';
+import { checkInboxTool } from '../src/tools/check-inbox.js';
+import { deliveryStatusTool } from '../src/tools/delivery-status.js';
+
+function contextOf(node, sessionId) {
+  return { collab: node.service, sessionId, net: { checkInbox: () => ({ rows: [] }), deliveryStatus: () => [] } };
+}
+
+test('ws_send_message：dispatch 接受 toSessionIds / taskId / result', async (t) => {
+  const node = makeDispatchNode(t);
+  const created = node.service.create({ mode: 'dispatch', name: '工具', sessionId: 'master-1' });
+  node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['worker-1'] });
+  const result = await sendMessageTool().handler({
+    collabId: created.collabId, text: '执行', type: 'task', toSessionIds: ['worker-1'], taskId: 't-1',
+  }, contextOf(node, 'master-1'));
+  assert.equal(result.isError, undefined);
+  assert.match(result.content[0].text, /"delivered": 1/);
+});
+
+test('ws_send_message：非 dispatch 拒绝 toSessionIds / taskId', async () => {
+  const result = await sendMessageTool().handler({
+    collabId: 'collab-managed', text: 'x', toSessionIds: ['worker-1'], taskId: 't-1',
+  }, { collab: { dispatch: { isDispatch: () => false } }, sessionId: 'master-1', net: {} });
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /只用于 dispatch/);
+});
+
+test('dispatch 的 check_inbox / delivery_status / view_ledger 返回明确空结果', async (t) => {
+  const node = makeDispatchNode(t);
+  const created = node.service.create({ mode: 'dispatch', name: '工具', sessionId: 'master-1' });
+  const inbox = await checkInboxTool().handler({ collabId: created.collabId }, contextOf(node, 'master-1'));
+  assert.match(inbox.content[0].text, /不保存收件历史/);
+  const delivery = await deliveryStatusTool().handler({ collabId: created.collabId }, contextOf(node, 'master-1'));
+  assert.match(delivery.content[0].text, /无持久投递账/);
+  const ledger = await viewLedgerTool().handler({ collabId: created.collabId }, contextOf(node, 'master-1'));
+  assert.match(ledger.content[0].text, /不保存历史/);
+});

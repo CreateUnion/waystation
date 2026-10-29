@@ -411,9 +411,6 @@ function apiOf(state) {
     setConfirmGate: (input) => setConfirmGateOf(state, input),
     relayReport: (input) => applyRelayedReport(state, input),   // 网层回报注入面（转达副本达第三档 → 译回原作者）
     withdraw: (input) => seatGovernedWrite(state, input, () => withdrawInvite(state, input)),
-    send: (input) => guardedWrite(state, input?.collabId, () => sendMessage(state, input)),
-    end: (input) => seatGovernedWrite(state, input, () => endNow(state, input), { allowFrozen: true }),
-    leave: (input) => guardedWrite(state, input?.collabId, () => leaveNow(state, input), { allowFrozen: true }),
     setMute: (input) => guardedWrite(state, input?.collabId, () => setMuteNow(state, input)),
     ...lifecycleApiOf(state),
     describe: (collabId) => describeCollab(state, collabId),
@@ -435,6 +432,17 @@ function apiOf(state) {
 function dispatchApiOf(state) {
   return {
     dispatch: state.dispatchDomain,
+    /* dispatch 是纯内存域：不进 state.collabs，走既有写门会因「本机没有该协作」误拒——
+     * 发送 / 结束 / 退出先按 isDispatch 分流，判定与投递全在 dispatch 域内。 */
+    send: (input) => state.dispatchDomain.isDispatch(input?.collabId)
+      ? state.dispatchDomain.send(input)
+      : guardedWrite(state, input?.collabId, () => sendMessage(state, input)),
+    end: (input) => state.dispatchDomain.isDispatch(input?.collabId)
+      ? state.dispatchDomain.end(input)
+      : seatGovernedWrite(state, input, () => endNow(state, input), { allowFrozen: true }),
+    leave: (input) => state.dispatchDomain.isDispatch(input?.collabId)
+      ? state.dispatchDomain.leave(input)
+      : guardedWrite(state, input?.collabId, () => leaveNow(state, input), { allowFrozen: true }),
     view: (input) => state.dispatchDomain.isDispatch(input?.collabId)
       ? state.dispatchDomain.view(input.collabId)
       : viewLedger(state, input),
@@ -1435,7 +1443,7 @@ function statsOf(state) {
     const stateName = localStateOf(local);
     byState[stateName] = (byState[stateName] ?? 0) + 1;
   }
-  return { collabs: state.collabs.size, byState, ...state.counters, ...state.legacyRejections.read() };
+  return { collabs: state.collabs.size, dispatchCount: state.dispatches.size, byState, ...state.counters, ...state.legacyRejections.read() };
 }
 
 /* 邀请回应的驱动面（讨论）：同意即加入后立即起一轮回填对表（复用周期对表的同一入口）——

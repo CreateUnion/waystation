@@ -27,6 +27,14 @@ export function deliveryStatusTool() {
       /* 校验通过的值至多带首尾空白，透传前去除：查询按标识精确比对，带空白串会被当作不存在的标识、
        * 静默返回空列表——「没匹配上」与「该标识不存在」将不可区分。 */
       const query = { msgId: args.msgId?.trim(), collabId: args.collabId?.trim() };
+      /* dispatch 没有持久投递账（纯内存、无 outbox 行）：如实给空面 + 模式标记，
+       * 不落进栈查询面造出「查过但没有」的假象。 */
+      if (query.collabId !== undefined && context.collab?.dispatch?.isDispatch?.(query.collabId) === true) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          ok: true, rows: [], reportRows: 0, dispatch: true,
+          message: 'dispatch 无持久投递账（纯内存模式）',
+        }, null, 2) }] };
+      }
       const queried = machineRowsOf(context, query);
       const rows = queried.filter((row) => row.type !== REPORT_ROW_TYPE);
       const payload = { ok: true, rows, reportRows: queried.length - rows.length };

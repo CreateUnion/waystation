@@ -222,15 +222,17 @@ export const WS_VIEW_LEDGER_SPEC = {
 
 export const WS_SEND_MESSAGE_SPEC = {
   name: 'ws_send_message',
-  description: '发送协作域消息（发送者须为本机活跃且非 unverified 席位）：星型路由——成员发给站长，站长省略 to 即发全体成员；按目标机器去重、一机一帧，返回逐机器 msgId；席位宽限内断连的帧由本机核心暂存、重连后补投，判离席或冻结期丢弃，不保证送达。to＝目标实例/地址，配可选 toSessionId（会话，短码或完整标识，精确匹配；只给会话参数会被拒绝）。讨论模式为发帖（人人可见、to / toSessionId 一律拒绝）：默认经中继（发起人）投递（成员投稿至中继、由其转达全员），中继不可达时自动降级直投——返回的 route 字段如实标注本机走的路（relay/degraded/fanout）、results 为投稿或直投的受理态，成员级结果经中继聚合捎回、未达者由对方周期对表收敛',
+  description: '发送协作域消息（发送者须为本机活跃且非 unverified 席位）：星型路由——成员发给站长，站长省略 to 即发全体成员；按目标机器去重、一机一帧，返回逐机器 msgId；席位宽限内断连的帧由本机核心暂存、重连后补投，判离席或冻结期丢弃，不保证送达。to＝目标实例/地址，配可选 toSessionId（会话，短码或完整标识，精确匹配；只给会话参数会被拒绝）。讨论模式为发帖（人人可见、to / toSessionId 一律拒绝）：默认经中继（发起人）投递（成员投稿至中继、由其转达全员），中继不可达时自动降级直投——返回的 route 字段如实标注本机走的路（relay/degraded/fanout）、results 为投稿或直投的受理态，成员级结果经中继聚合捎回、未达者由对方周期对表收敛。dispatch（纯内存本机编排）另走一套：消息只经本机核心投递、不落盘，type 取 task / progress / result / error，定向用 toSessionIds（省略即 master→全体已收编 slave、slave→master），可用 taskId 关联任务；不接受 to / toSessionId',
   inputSchema: {
     type: 'object',
     properties: {
       collabId: { type: 'string', description: '协作标识' },
       text: { type: 'string', description: '消息正文（必填，≤4000 字符）' },
-      type: { type: 'string', description: '消息类型（可选，缺省 reply；可选值：topic / task / progress / issue / stop / reply）' },
-      to: { type: 'string', description: '目标成员实例标识或地址（可选；须与 toSessionId 同时给出才能定向席位；协作：站长可选；成员省略即发给站长；讨论一律拒绝）' },
-      toSessionId: { type: 'string', description: '目标会话（可选，须与 to 同时给出；短码或完整标识，精确匹配、不做前缀展开；歧义或无匹配即拒绝）——只投该机器上的这一会话；讨论一律拒绝' },
+      type: { type: 'string', description: '消息类型（可选，缺省 reply；managed / forum 可选值：topic / task / progress / issue / stop / reply；dispatch 可选值：task / progress / result / error，省略时 master＝task、slave＝result）' },
+      to: { type: 'string', description: '目标成员实例标识或地址（可选；须与 toSessionId 同时给出才能定向席位；协作：站长可选；成员省略即发给站长；讨论一律拒绝；dispatch 不接受本参数）' },
+      toSessionId: { type: 'string', description: '目标会话（可选，须与 to 同时给出；短码或完整标识，精确匹配、不做前缀展开；歧义或无匹配即拒绝）——只投该机器上的这一会话；讨论与 dispatch 一律拒绝' },
+      toSessionIds: { type: 'array', items: { type: 'string' }, description: '仅 dispatch：目标会话数组；省略时由核心按绑定路由（master→全体已收编 slave、slave→master）。managed / forum 使用会报错' },
+      taskId: { type: 'string', description: '仅 dispatch：任务关联键（可选，1–64 字符），随消息投递给目标；managed / forum 使用会报错' },
     },
     required: ['collabId', 'text'],
   },

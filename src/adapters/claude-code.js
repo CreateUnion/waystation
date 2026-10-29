@@ -215,8 +215,7 @@ function isEventToken(value) {
  * 措辞按模式感知（managed 称「协作」、其余称「讨论」）；模式不可得时按「讨论」默认（设计示例措辞）。 */
 function zeroBodyNarrationOf(frame, collab) {
   if (frame.type === 'end' || frame.type === 'join' || frame.type === 'leave') {
-    const noun = collab !== null && collab.mode === 'managed' ? '协作' : '讨论';
-    return `${frame.from.identityName}${CONTROL_EVENT_VERBS[frame.type]}${noun}`;
+    return `${frame.from.identityName}${CONTROL_EVENT_VERBS[frame.type]}${modeNounOf(collab)}`;
   }
   if (frame.type === 'notice') {
     return noticeNarrationOf(frame);
@@ -225,6 +224,14 @@ function zeroBodyNarrationOf(frame, collab) {
     return null;
   }
   return isEventToken(frame.type) ? `（系统事件：${frame.type}）` : '（系统事件）';
+}
+
+/* 控制事件的中文名词按容器模式取：dispatch 不能说成「讨论」或「协作」。 */
+function modeNounOf(collab) {
+  if (collab?.mode === 'managed') {
+    return '协作';
+  }
+  return collab?.mode === 'dispatch' ? 'dispatch' : '讨论';
 }
 
 /* notice 叙述：带 text 者返回 null 走原三行；无 text 的机制事件按回执叙述（特定事件名有专属措辞、
