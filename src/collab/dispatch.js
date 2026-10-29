@@ -6,7 +6,7 @@ import { shortSessionId } from '../util/short-id.js';
  * 状态全部在 state.dispatches（Map<collabId, record>）。本模块只做纯内存判定与组帧；
  * 消息投递经注入的 notify（routing.notify），不碰 LAN 出站队列 / 本机席位注入 / inbox 落盘。 */
 
-export const DISPATCH_MESSAGE_TYPES = ['topic', 'task', 'progress', 'issue', 'stop', 'reply', 'result', 'error'];
+export const DISPATCH_MESSAGE_TYPES = ['task', 'progress', 'result', 'error'];
 export const DISPATCH_QUEUE_MAX = 256;
 export const DISPATCH_CLAIM_TTL_MS = 10 * 60 * 1000;
 export const DISPATCH_META_FRESH_MS = 5 * 60 * 1000;
