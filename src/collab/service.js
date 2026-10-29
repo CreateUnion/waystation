@@ -2917,26 +2917,19 @@ async function registerBridgeNow(state, sessionId, bridgeId) {
   markConfirmGateOpen(state, sessionId);
   state.sessionBridges.set(sessionId, bridgeId);
   noteSessionRebound(state, sessionId);
-  let seats = 0;
-  const pendingSeats = [];
-  for (const local of state.collabs.values()) {
-    const seat = localSeatOfLocal(local, sessionId);
-    if (seat === null) {
-      continue;
-    }
-    seat.bridgeId = bridgeId;
-    seats++;
-    /* 先在同步回合内标 flushing：让出一拍期间新到的帧入暂存队尾，补投仍按到达序推进（不乱序）。 */
-    if (seat.staged.length > 0) {
-      seat.flushing = true;
-      pendingSeats.push({ local, seat });
-    }
-  }
+  const { seats, pendingSeats } = bindRegisteredSeatsOf(state, sessionId, bridgeId);
   /* 注册回执（welcome）由核心在 onRegister 回调返回后才写出发送（core/ipc.js registerBridge：
    * 先回调、后 sendToConn）；桥在握手完成前拒非 welcome 帧（「握手期收到 push」）。这里让出一拍，
    * 等 welcome 已在线路上后再 flush dispatch 队列 / 暂存席位 / 挂起邀请——否则帧被拒却已按
    * 「已送达 / 已补投」记账（dispatch 队列出队后不再重试，自动同意也不会再触发）。 */
   await seatFlushDelay();
+  /* 让出期内该会话可能已断开或被新桥顶替：注销路径会清桥登记并给 dispatch 起宽限，后到的注册
+   * 会改写 sessionBridges。此时本注册已是过期续体——尤其 noteBridgeOnline 会删掉断开方刚登记的
+   * 宽限（宽限内用户主动断开被误判为在线，slave 永不释放 / master 永不结束）。补投与通知归
+   * 当前注册或断开路径所有，这里直接收手；markConfirmGateOpen / prune 已在让出前完成，不回滚。 */
+  if (state.sessionBridges.get(sessionId) !== bridgeId) {
+    return { ok: false, reason: 'bridge-superseded' };
+  }
   /* 桥重连撤销 dispatch 宽限并补投断连期间排队的通知（dispatch 域未创建＝降级，跳过）。 */
   state.dispatchDomain?.noteBridgeOnline?.(sessionId);
   let flushed = 0;
@@ -2947,6 +2940,26 @@ async function registerBridgeNow(state, sessionId, bridgeId) {
   const invites = await replayPendingInvitesOnRegisterOf(state, sessionId);
   flushConfirmGateNoticesOf(state, sessionId);
   return { ok: true, seats, flushed, invites: invites.delivered };
+}
+
+/* 注册的同步段：把该会话在本机各协作的席位绑定到新桥，并标出有暂存的待补投席位。
+ * 暂存席位在让出一拍前就标 flushing——期间新到的帧入队尾，补投仍按到达序推进（不乱序）。 */
+function bindRegisteredSeatsOf(state, sessionId, bridgeId) {
+  let seats = 0;
+  const pendingSeats = [];
+  for (const local of state.collabs.values()) {
+    const seat = localSeatOfLocal(local, sessionId);
+    if (seat === null) {
+      continue;
+    }
+    seat.bridgeId = bridgeId;
+    seats++;
+    if (seat.staged.length > 0) {
+      seat.flushing = true;
+      pendingSeats.push({ local, seat });
+    }
+  }
+  return { seats, pendingSeats };
 }
 
 /* 桥注册回调（附属面）：核心重启对账据此认定「宽限内重绑过」；注入面异常不得影响注册主链。 */

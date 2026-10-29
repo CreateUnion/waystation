@@ -62,6 +62,31 @@ test('服务桥注册/注销接线：注销登记宽限，注册撤销宽限且�
   assert.equal(node.service.dispatch.status().dispatch.slaves.length, 1, '宽限不等于立即释放成员');
 });
 
+test('注册让出期内断开：迟到续体不得撤销宽限或补投队列，宽限后正常移除', async (t) => {
+  const node = makeDispatchNode(t, { notifyResult: false });
+  const created = node.service.create({ mode: 'dispatch', name: '窗口断连', sessionId: 'master-1' });
+  node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['worker-1'] });
+  const record = node.service.dispatch.dispatches.get(created.collabId);
+  node.service.dispatch.send({ collabId: created.collabId, sessionId: 'master-1', text: '断连排队', toSessionIds: ['worker-1'] });
+  assert.equal(record.queues.has('worker-1'), true, '前置：通知失败已入待补投队列');
+  const registering = node.service.registerBridgeEntry('worker-1', 'bridge-window');
+  node.service.unregisterBridgeEntry('worker-1', 'bridge-window');
+  assert.equal(record.grace.has('worker-1'), true, '断开即刻登记宽限');
+  const late = await registering;
+  assert.equal(late.ok, false, '让出期内被断开的注册续体不得收手为成功');
+  assert.equal(late.reason, 'bridge-superseded');
+  assert.equal(record.grace.has('worker-1'), true, '迟到续体不得撤销断开方登记的宽限（否则 slave 永不释放）');
+  assert.equal(record.queues.has('worker-1'), true, '迟到续体不得补投断连期间的队列');
+  node.advance(1100);
+  node.service.dispatch.sweep(node.now());
+  assert.equal(
+    node.service.dispatch.status().dispatch.slaves.some((slave) => slave.sessionId === 'worker-1'),
+    false,
+    '宽限超时后 slave 正常移除',
+  );
+  assert.equal(record.queues.has('worker-1'), false, '宽限超时回收待补投队列');
+});
+
 test('服务 presence 清扫接线：start 的清扫节拍收口超时 master', (t) => {
   const node = makeDispatchNode(t);
   node.service.create({ mode: 'dispatch', name: '节拍', sessionId: 'master-1' });
