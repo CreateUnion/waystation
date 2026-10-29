@@ -65,6 +65,30 @@ test('dispatch 能力位：已注册旧核未宣告 dispatch 时拒绝 ws_dispat
   assert.deepEqual(calls, [], '能力位缺失时不得转发到核心');
 });
 
+test('dispatch 能力位：旧核上 ws_create_collab{mode:dispatch} 同样拒绝，其余模式照常转发', async () => {
+  const calls = [];
+  const link = stubLink({
+    call: async (name, args) => {
+      calls.push([name, args]);
+      return { ok: true, result: { content: [{ type: 'text', text: 'ok' }] } };
+    },
+  });
+  link.state.welcome = { app: '0.2.2' };
+  const registry = createForwardingRegistry({ link });
+  const refused = await registry.call('ws_create_collab', { mode: 'dispatch', name: 'dispatch' });
+  assert.equal(refused.isError, true, '旧核创建 dispatch 必须显式拒绝，不得落到核心的泛化模式错误');
+  assert.match(refused.content[0].text, /核心版本不支持 dispatch/);
+  assert.deepEqual(calls, [], '能力位缺失时 dispatch 创建不得转发');
+  const managed = await registry.call('ws_create_collab', { mode: 'managed', name: 'collab' });
+  assert.equal(managed.isError, undefined, '非 dispatch 模式不受能力位闸门影响');
+  const legacy = await registry.call('ws_create_collab', { name: 'legacy' });
+  assert.equal(legacy.isError, undefined, '缺省模式（managed）不受能力位闸门影响');
+  assert.deepEqual(calls, [
+    ['ws_create_collab', { mode: 'managed', name: 'collab' }],
+    ['ws_create_collab', { name: 'legacy' }],
+  ], '其余模式原样转发');
+});
+
 test('dispatch 能力位：冷启 / 重连由 ensureCore 注册后宣告 dispatch，照常转发', async () => {
   const calls = [];
   const link = stubLink({

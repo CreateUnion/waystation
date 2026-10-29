@@ -2601,14 +2601,16 @@ function flushConfirmGateNoticesOf(state, sessionId) {
 
 /* 指名判定要兼容两种帧形态：在线邀请写 payload.targetSessionId；挂起补投只写
  * payload.targets[].targetSessionId（replayInviteFrameOf）。不指名邀请没有 targetSessionId，
- * 一律不自动同意。 */
+ * 一律不自动同意。目标值与投递面 / 点头面共用 matchSessionByToken 的同一口径：完整标识或
+ * 8 位短码都算指名到本会话（短码在接收侧已换成全量标识，但帧载荷仍保留原 token）。 */
 function isNamedInviteForSessionOf(state, frame, sessionId) {
-  if (frame?.payload?.targetSessionId === sessionId) {
+  const namedToSession = (token) => matchSessionByToken([{ sessionId }], token) === sessionId;
+  if (namedToSession(frame?.payload?.targetSessionId)) {
     return true;
   }
   const targets = frame?.payload?.targets;
   return Array.isArray(targets) && targets.some((target) =>
-    target?.targetSessionId === sessionId
+    namedToSession(target?.targetSessionId)
     && (target.instanceId === undefined || target.instanceId === state.self.instanceId));
 }
 
@@ -2913,12 +2915,10 @@ async function registerBridgeNow(state, sessionId, bridgeId) {
    * （过期＝会话覆盖应随之清除，不得因迟到的重连保留）。 */
   pruneConfirmGates(state, state.clock());
   markConfirmGateOpen(state, sessionId);
-  /* 桥重连撤销 dispatch 宽限并补投断连期间排队的通知（dispatch 域未创建＝降级，跳过）。 */
-  state.dispatchDomain?.noteBridgeOnline?.(sessionId);
   state.sessionBridges.set(sessionId, bridgeId);
   noteSessionRebound(state, sessionId);
   let seats = 0;
-  let flushed = 0;
+  const pendingSeats = [];
   for (const local of state.collabs.values()) {
     const seat = localSeatOfLocal(local, sessionId);
     if (seat === null) {
@@ -2926,12 +2926,21 @@ async function registerBridgeNow(state, sessionId, bridgeId) {
     }
     seat.bridgeId = bridgeId;
     seats++;
-    /* 注册回执（welcome）与桥的握手完成有先后：桥在握手完成前会拒 push。有暂存待补投时
-     * 让出一拍再冲，避免补投被「握手期拒帧」卡死到下次重连。 */
+    /* 先在同步回合内标 flushing：让出一拍期间新到的帧入暂存队尾，补投仍按到达序推进（不乱序）。 */
     if (seat.staged.length > 0) {
       seat.flushing = true;
-      await seatFlushDelay();
+      pendingSeats.push({ local, seat });
     }
+  }
+  /* 注册回执（welcome）由核心在 onRegister 回调返回后才写出发送（core/ipc.js registerBridge：
+   * 先回调、后 sendToConn）；桥在握手完成前拒非 welcome 帧（「握手期收到 push」）。这里让出一拍，
+   * 等 welcome 已在线路上后再 flush dispatch 队列 / 暂存席位 / 挂起邀请——否则帧被拒却已按
+   * 「已送达 / 已补投」记账（dispatch 队列出队后不再重试，自动同意也不会再触发）。 */
+  await seatFlushDelay();
+  /* 桥重连撤销 dispatch 宽限并补投断连期间排队的通知（dispatch 域未创建＝降级，跳过）。 */
+  state.dispatchDomain?.noteBridgeOnline?.(sessionId);
+  let flushed = 0;
+  for (const { local, seat } of pendingSeats) {
     flushed += await flushStagedOf(state, local, seat);
   }
   state.counters.seatBridgeRegistrations++;
@@ -2971,7 +2980,8 @@ async function replayPendingInvitesOnRegisterOf(state, sessionId) {
   }
 }
 
-/* 桥握手让位（毫秒级，仅在有暂存时付一次）。 */
+/* 桥握手让位（毫秒级）：每次注册付一次，覆盖 dispatch 队列 / 暂存席位 / 挂起邀请的全部补投面
+ * （原「仅暂存席位才延迟」并在这里，避免同一注册回合重复等待）。 */
 function seatFlushDelay() {
   return new Promise((resolve) => setTimeout(resolve, 50));
 }

@@ -33,6 +33,19 @@ test('无匹配 / 坏 JSON / 缺 sessionId 返回 null；角色只认环境变�
   assert.equal(bridgeMetaOf({ env: { WAYSTATION_ROLE: 'root' }, sessionId: 'sess-a' }).role, 'none');
 });
 
+test('空 / 空白 entrypoint 与 status 归一为 null（与 IPC 校验面同口径，避免整帧 hello 被拒）', (t) => {
+  const root = makeTempDir(t);
+  const dir = join(root, 'sessions');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, '1.json'), JSON.stringify({
+    sessionId: 'sess-a', name: '   ', kind: 'interactive', entrypoint: '', status: ' \t ',
+  }));
+  const meta = bridgeMetaOf({ env: { CLAUDE_CONFIG_DIR: root }, sessionId: 'sess-a' });
+  assert.equal(meta.entrypoint, null, '空串不得原样上报（IPC 的 isShortText 会拒空串，整帧 hello 失败）');
+  assert.equal(meta.status, null, '纯空白同样归一为 null');
+  assert.equal(meta.name, null, '空白名字维持既有的 null 口径');
+});
+
 test('watcher：文件变化时上报一次', async (t) => {
   const root = makeTempDir(t);
   const dir = join(root, 'sessions');

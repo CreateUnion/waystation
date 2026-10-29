@@ -111,12 +111,14 @@ function nameRankOf(raw) {
   return raw.nameSource === 'user' ? 1 : 0;
 }
 
+/* 文本字段一律归一：空串 / 纯空白 → null。IPC hello/register-update 的 isShortText 拒空串，
+ * 原样上报会让整帧被拒、该会话失去 waystation；name 早已按此口径。 */
 function sessionMetaFieldsOf(raw) {
   return {
     name: trimmedTextOf(raw.name),
     kind: kindOf(raw.kind),
-    entrypoint: typeof raw.entrypoint === 'string' ? raw.entrypoint : null,
-    status: typeof raw.status === 'string' ? raw.status : null,
+    entrypoint: trimmedTextOf(raw.entrypoint),
+    status: trimmedTextOf(raw.status),
   };
 }
 
@@ -140,8 +142,8 @@ function sessionReportOf(file) {
   return {
     name: file.name,
     kind: file.kind,
-    entrypoint: file.entrypoint,
-    status: file.status,
+    entrypoint: trimmedTextOf(file.entrypoint),
+    status: trimmedTextOf(file.status),
     metaUpdatedAt: file.updatedAt,
   };
 }

@@ -87,3 +87,17 @@ test('通知失败时进有界队列，重连 flush', (t) => {
   node.service.dispatch.noteBridgeOnline('worker-1');
   assert.equal(node.notices.some((entry) => entry.payload?.text === '先排队'), true);
 });
+
+test('桥注册补投在 welcome 之后：握手期 notify 未恢复也不出队丢失', async (t) => {
+  const node = makeDispatchNode(t, { notifyResult: false });
+  const created = node.service.create({ mode: 'dispatch', name: '握手重连', sessionId: 'master-1' });
+  node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['worker-1'] });
+  const sent = node.service.dispatch.send({ collabId: created.collabId, sessionId: 'master-1', text: '握手后排', toSessionIds: ['worker-1'] });
+  assert.equal(sent.queued, 1, '前置：notify 失败已入待补投队列');
+  /* 注册回合内（welcome 尚未写出）notify 仍会失败——若此刻 flush 会出队并按送达记账；
+   * 10ms 后恢复等价于「welcome 已写出、桥可收 push」。 */
+  setTimeout(() => node.setNotifyResult(true), 10);
+  await node.service.registerBridgeEntry('worker-1', 'bridge-worker-1');
+  assert.equal(node.notices.some((entry) => entry.payload?.text === '握手后排'), true, '注册让出握手期后队列应补投成功');
+  assert.equal(node.service.dispatch.dispatches.get(created.collabId).queues.has('worker-1'), false, '补投成功后待补投队列清空');
+});

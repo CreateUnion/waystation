@@ -47,7 +47,7 @@ async function forwardCall(link, name, args, bridgeInfo) {
   if (!ensured.ok) {
     return failureResult(name, ensured, bridgeInfo);
   }
-  if (name.startsWith('ws_dispatch_') && link.state?.welcome?.dispatch !== 1) {
+  if (isDispatchCallOf(name, args) && link.state?.welcome?.dispatch !== 1) {
     return {
       content: [{ type: 'text', text: '当前核心版本不支持 dispatch——请升级并重开会话' }],
       isError: true,
@@ -55,6 +55,13 @@ async function forwardCall(link, name, args, bridgeInfo) {
   }
   const called = await link.call(name, args);
   return called.ok ? called.result : failureResult(name, called, bridgeInfo);
+}
+
+/* dispatch 能力面：dispatch_* 工具与「创建 dispatch 模式」同属新核能力——旧核不宣告 dispatch 时
+ * 一律由桥直接拒绝（否则 ws_create_collab{mode:'dispatch'} 只会拿到核心的泛化模式错误）。
+ * ws_create_collab 仅 dispatch 模式受闸；managed/forum 是旧核既有能力，不得误伤。 */
+function isDispatchCallOf(name, args) {
+  return name.startsWith('ws_dispatch_') || (name === 'ws_create_collab' && args.mode === 'dispatch');
 }
 
 /* 核心不可达的差错载荷（设计 §8 写死）：ws_status 合成 core:{available:false, reason}

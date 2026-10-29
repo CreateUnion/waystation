@@ -93,7 +93,7 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
 
 ## dispatch 模式（本机多会话编排）
 
-与协作 / 讨论并列的第三种模式：**只在本机**把多个 Claude Code 会话编成一个 master + 若干 slave 的执行组（例如 master 在微信侧统筹、worker 各自跑任务）。模式在创建时定死；**不接入局域网**——`mode: 'dispatch'` 的邀请帧在协议层即被拒绝，伪造的 dispatch task / progress / result / error 帧在准入层显式拒绝并计数。
+与协作 / 讨论并列的第三种模式：**只在本机**把多个 Claude Code 会话编成一个 master + 若干 slave 的执行组（例如 master 在微信侧统筹、worker 各自跑任务）。模式在创建时定死；**不接入局域网**——`mode: 'dispatch'` 的邀请帧在协议层即被拒绝；伪造的 dispatch `task` / `progress` 帧在 dispatch 准入层显式拒绝并计入 `dispatchLanRejected`，`result` / `error` 不是协议帧类型，更早被协议类型白名单拒绝（同样丢弃，但不进该计数器）。
 
 - **master**：由启动器（如 cc-connect）拉起，进程环境带 `WAYSTATION_ROLE=master`，并在 `append_system_prompt` 里交代职责，例如「你是 waystation master。会话启动后创建 dispatch 模式并扫描本机会话；用 @会话名 定向、不写 @ 群发；只推关键事件到微信，普通进度留在内存」。启动后由 master 会话调用 `ws_create_collab { mode: 'dispatch', name: 'dispatch' }` 创建——**角色只认启动期环境变量**，工具参数与聊天内容不能声明 master；一个核心同时只允许一个 dispatch，dispatch 不接受 `targets`。
 - **slave（交互式）**：人工正常打开 Claude Code 即可；首次被收编时核心向该会话注入确认提示，**需本机用户确认**后才绑定（可选 `WAYSTATION_ROLE=slave` 预授权、`WAYSTATION_MASTER=<master 名>` 限定主人）。
