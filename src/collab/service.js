@@ -3369,6 +3369,9 @@ function setConfirmGateOf(state, rawInput) {
   }
   const scope = input.scope ?? 'session';
   if (input.action === 'status') {
+    /* 状态读面同时是宽限清理点：桥断开后超过宽限的会话覆盖必须在下一次查询时消失，
+     * 否则「临时免确认」会因无人清扫而长期滞留。 */
+    pruneConfirmGates(state, state.clock());
     return confirmGateStatusOf(state, sessionId, gate);
   }
   if (input.action === 'set') {

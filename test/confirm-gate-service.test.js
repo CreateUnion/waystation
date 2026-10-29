@@ -28,6 +28,23 @@ function makeService(t) {
   return { service, dataDir };
 }
 
+/* 宽限计时测试装配：5s 宽限 + 可控时钟（state.clock 由 options.now 注入）。 */
+function makeClockedService(t, clock) {
+  return createCollabService({
+    dataDir: makeTempDir(t),
+    config: sessionNodeConfig({ inviteConfirmation: true, joinRequestConfirmation: true, sessionSeatGraceMs: 5000 }),
+    self: { instanceId: 'inst-self', identityName: '本机', port: 7321 },
+    send: () => ({ ok: true, msgId: 'msg-1' }),
+    sendDirect: () => ({ ok: true, msgId: 'direct-1' }),
+    knownHosts: { remember: () => {}, lookup: () => undefined },
+    notify: () => true,
+    deliverSeat: () => true,
+    log: quietLog(),
+    syncPeerPicker: () => [],
+    now: clock,
+  });
+}
+
 test('status 返回两个门的三元值', (t) => {
   const { service } = makeService(t);
   const result = service.setConfirmGate({ action: 'status', sessionId: 'sess-a' });
@@ -89,6 +106,32 @@ test('set / clear 省略 gate 一律拒绝：不改状态、不落盘「undefine
   assert.equal(persistent.ok, false, '缺省 gate 的 persistent set 同样拒绝');
   assert.equal(persistent.needsUserConfirmation, undefined, '参数非法先于令牌签发');
   assert.equal(existsSync(join(dataDir, 'config.json')), false, '非法请求不得写 config.json（更不得写 "undefined" 键）');
+});
+
+test('服务：unregisterBridgeEntry 起宽限，status 在宽限后清理临时值', (t) => {
+  let now = 0;
+  const service = makeClockedService(t, () => now);
+  service.setConfirmGate({
+    action: 'set', gate: 'invite', requireConfirmation: false, scope: 'session', sessionId: 'sess-a',
+  });
+  service.unregisterBridgeEntry('sess-a', null);
+  now = 6001;
+  const status = service.setConfirmGate({ action: 'status', gate: 'invite', sessionId: 'sess-a' });
+  assert.equal(status.gates.invite.sessionValue, null, '宽限超时后临时覆盖已清理');
+});
+
+test('服务：旧桥迟到断开不给新桥打宽限，临时值保留', async (t) => {
+  let now = 0;
+  const service = makeClockedService(t, () => now);
+  await service.registerBridgeEntry('sess-a', 'bridge-old');
+  await service.registerBridgeEntry('sess-a', 'bridge-new');
+  service.setConfirmGate({
+    action: 'set', gate: 'invite', requireConfirmation: false, scope: 'session', sessionId: 'sess-a',
+  });
+  service.unregisterBridgeEntry('sess-a', 'bridge-old');
+  now = 6001;
+  const status = service.setConfirmGate({ action: 'status', gate: 'invite', sessionId: 'sess-a' });
+  assert.equal(status.gates.invite.sessionValue, false, '旧桥迟到断开不得触发宽限清理');
 });
 
 test('旧 ws_allow_next_invite 与新开关共用同一份会话状态', (t) => {

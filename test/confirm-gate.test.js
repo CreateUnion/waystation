@@ -156,6 +156,15 @@ test('永久令牌：非字符串 / 空令牌拒绝', () => {
   assert.equal(state.confirmGates.tokens.size, 0);
 });
 
+test('桥断开宽限：按 sessionSeatGraceMs 计时，超时清理后回落 config 默认', () => {
+  const state = fakeState({ sessionSeatGraceMs: 5000 });
+  setSessionGate(state, 'sess-a', 'invite', false, 0);
+  markConfirmGateClosed(state, 'sess-a', 1000);
+  assert.equal(pruneConfirmGates(state, 5000), 0);
+  assert.equal(pruneConfirmGates(state, 6001), 1);
+  assert.equal(gateValueOf(state, 'sess-a', 'invite').effectiveValue, true);
+});
+
 test('桥断开/重连：无会话条目时安全无操作；缺 sessionSeatGraceMs 时按 60s 宽限', () => {
   const state = fakeState();
   markConfirmGateClosed(state, 'sess-missing', 100);
