@@ -161,6 +161,107 @@ function Test-CcConnectExists {
     return $false
 }
 
+# —— cc-connect 注入内容（与 2026-10-30 已验证配置逐字一致；唯一权威在本文件） ——
+$script:AllowedToolsLines = @(
+    'allowed_tools = ['
+    '  "mcp__waystation__ws_status",'
+    '  "mcp__waystation__ws_list_collabs",'
+    '  "mcp__waystation__ws_create_collab",'
+    '  "mcp__waystation__ws_dispatch_scan",'
+    '  "mcp__waystation__ws_dispatch_claim",'
+    '  "mcp__waystation__ws_dispatch_release",'
+    '  "mcp__waystation__ws_send_message",'
+    '  "mcp__waystation__ws_end_collab",'
+    ']'
+)
+$script:AppendPromptLines = @(
+    'append_system_prompt = """你是 waystation dispatch master：启动环境已带 WAYSTATION_ROLE=master，可把任务分派给本机其他 Claude Code 会话并行执行。'
+    '需要多会话作业时：1) ws_create_collab {name, mode: dispatch} 创建（一个核心同时只允许一个）；2) ws_dispatch_scan 查看本机在线会话，ws_dispatch_claim 收编目标；交互式会话返回 pending 属正常，等对方用户确认，不要催促或重复发起；3) ws_send_message {collabId, type: task, toSessionIds, taskId} 下发任务，收 progress/result，type 只用 task/progress/result/error；4) 结束用 ws_dispatch_release 释放单个或 ws_end_collab 整体结束。'
+    '纪律：dispatch 消息只走本机核心不占微信额度；给用户的回复合并为一条汇总，不要逐条转发 slave 消息；slave 的 result 已含结论时不要重复追问；dispatch 是纯内存的，核心或 cc-connect 重启后需重建。"""'
+)
+
+# 文本级合并：对每个 [projects.agent.options] 段插入缺失键；返回实际发生合并的段数（dry-run 恒 0）。
+# 段界防线：候选段范围内 """ 计数为奇数 = 段界落在多行字符串内部 → 该段放弃自动合并并降级手动。
+# 写回用 UTF8Encoding($false)（无 BOM）；换行沿用文件既有风格；备份仅在实际合并时创建。
+function Merge-CcConfig([string]$ConfigPath) {
+    if (-not (Test-Path $ConfigPath)) {
+        Write-Warn '未找到 cc-connect 配置文件（config.toml）——cc-connect 可能尚未初始化'
+        if (-not $DryRun) {
+            Add-Manual '先完成 cc-connect 自身配置（平台对接），再重跑本脚本完成注入'
+        }
+        return 0
+    }
+    $raw = [System.IO.File]::ReadAllText($ConfigPath)
+    $newline = "`r`n"
+    if ($raw.IndexOf("`r`n") -lt 0) { $newline = "`n" }
+    $lines = $raw -split "`r?`n"
+    $sectionIdx = @()
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i].TrimStart() -match '^\[projects\.agent\.options\]$') { $sectionIdx += $i }
+    }
+    if ($sectionIdx.Count -eq 0) {
+        Write-Warn 'config.toml 中没有 [projects.agent.options] 段（结构未知）——不做自动合并'
+        if (-not $DryRun) {
+            Add-Manual '手工把 allowed_tools 与 append_system_prompt 加进 cc-connect config.toml 的 [projects.agent.options] 段'
+        }
+        return 0
+    }
+    $insertBlocks = @()
+    $changedSections = 0
+    for ($s = 0; $s -lt $sectionIdx.Count; $s++) {
+        $start = $sectionIdx[$s]
+        $end = $lines.Count
+        if ($s -lt $sectionIdx.Count - 1) { $end = $sectionIdx[$s + 1] }
+        $quoteCount = 0
+        for ($i = $start; $i -lt $end; $i++) {
+            $quoteCount += ([regex]::Matches($lines[$i], '"""')).Count
+        }
+        if ($quoteCount % 2 -eq 1) {
+            Write-Warn "第 $($start + 1) 行的 [projects.agent.options] 段含未闭合多行字符串——放弃该段自动合并"
+            if (-not $DryRun) {
+                Add-Manual '手工检查 config.toml 中未闭合的多行字符串后重跑，或手工注入 allowed_tools 与 append_system_prompt'
+            }
+            continue
+        }
+        $body = @()
+        for ($i = $start + 1; $i -lt $end; $i++) { $body += $lines[$i] }
+        $needTools = $null -eq ($body | Where-Object { $_ -match '^\s*allowed_tools\s*=' })
+        $needPrompt = $null -eq ($body | Where-Object { $_ -match '^\s*append_system_prompt\s*=' })
+        if (-not $needTools -and -not $needPrompt) {
+            Write-Note "第 $($start + 1) 行的 dispatch 配置：已配置，跳过"
+            continue
+        }
+        $insert = @()
+        if ($needTools) {
+            $insert += $script:AllowedToolsLines
+            Write-Note "第 $($start + 1) 行段：将注入 allowed_tools（8 项白名单）"
+        }
+        if ($needPrompt) {
+            $insert += $script:AppendPromptLines
+            Write-Note "第 $($start + 1) 行段：将注入 append_system_prompt（dispatch master 规则）"
+        }
+        $insertBlocks += @{ At = $start + 1; Lines = $insert }
+        $changedSections++
+    }
+    if ($changedSections -eq 0) { return 0 }
+    if ($DryRun) {
+        Write-Note "（dry-run）将备份并合并 config.toml（共 $changedSections 段），不写入"
+        return 0
+    }
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $backupPath = "$ConfigPath.bak-setup-$stamp"
+    Copy-Item -Force -Path $ConfigPath -Destination $backupPath
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    $out.AddRange([string[]]$lines)
+    $sorted = @($insertBlocks | Sort-Object { $_.At } -Descending)
+    foreach ($block in $sorted) {
+        $out.InsertRange([int]$block.At, [string[]]$block.Lines)
+    }
+    [System.IO.File]::WriteAllText($ConfigPath, ($out -join $newline), (New-Object System.Text.UTF8Encoding($false)))
+    Write-Note "已注入并备份：$backupPath"
+    return $changedSections
+}
+
 # ===== 主流程 =====
 
 if (-not (Test-Path (Join-Path $RepoRoot 'package.json')) -or -not (Test-Path (Join-Path $RepoRoot 'scripts\install.ps1'))) {
@@ -220,6 +321,7 @@ if (-not $installedFileExists) {
 Write-Step '2/3' 'cc-connect 检测'
 $ccExists = Test-CcConnectExists
 $ccStatusLine = ''
+$mergeChanged = 0
 if (-not $ccExists) {
     Write-Warn '未检测到 cc-connect——waystation 本体（局域网协作）不受影响；但无法自动配置微信/QQ 多会话控制（dispatch master 入口）。'
     Write-Note '如需该能力：安装 cc-connect 并完成平台对接后重跑本脚本即可补配。'
@@ -227,6 +329,8 @@ if (-not $ccExists) {
 } else {
     Write-Note '已检测到 cc-connect'
     $ccStatusLine = '已检测到'
+    $configPath = Join-Path $HomeDir '.cc-connect\config.toml'
+    $mergeChanged = Merge-CcConfig $configPath
 }
 
 Write-Step '3/3' '自检汇总'

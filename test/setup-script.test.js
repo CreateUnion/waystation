@@ -126,3 +126,116 @@ test('cc-connect 已检测到（伪造 config 命中存在信号）：不打印�
   assert.ok(result.stdout.includes('已检测到 cc-connect'), `应打印已检测到：${result.stdout}`);
   assert.ok(!result.stdout.includes('未检测到 cc-connect'), '不应打印缺失提醒');
 });
+
+const MINIMAL_CONFIG = [
+  '[projects.agent.options]',
+  'work_dir = "E:/demo"',
+  'mode = "default"',
+  '',
+].join('\n');
+
+function writeCcConfig(home, text) {
+  const ccDir = join(home, '.cc-connect');
+  mkdirSync(ccDir, { recursive: true });
+  writeFileSync(join(ccDir, 'config.toml'), text, 'utf8');
+}
+
+function readCcConfig(home) {
+  return readFileSync(join(home, '.cc-connect', 'config.toml'), 'utf8');
+}
+
+function listBackups(home) {
+  const ccDir = join(home, '.cc-connect');
+  try {
+    return readdirSync(ccDir).filter((name) => name.includes('.bak-setup-'));
+  } catch {
+    return [];
+  }
+}
+
+test('注入：最小 config 实际写入两键、创建备份、退出码 2（服务项待手动）', (t) => {
+  if (!powershellAvailable) { t.skip('powershell -File 不可用'); return; }
+  const home = makeTempDir(t);
+  writeCcConfig(home, MINIMAL_CONFIG);
+  const { result } = runSetup(t, { home, seam: '1' });
+  const text = readCcConfig(home);
+  assert.ok(text.includes('allowed_tools = ['), `应注入 allowed_tools：${text}`);
+  assert.ok(text.includes('mcp__waystation__ws_dispatch_claim'), '白名单应含 ws_dispatch_claim');
+  assert.ok(!text.includes('ws_dispatch_approve'), '白名单刻意不含 ws_dispatch_approve');
+  assert.ok(text.includes('append_system_prompt = """你是 waystation dispatch master'), '应注入 dispatch 规则');
+  assert.ok(text.includes('work_dir = "E:/demo"'), '既有键不得丢失');
+  assert.equal(listBackups(home).length, 1, '应恰创建一个备份');
+  assert.ok(result.stdout.includes('已注入并备份'), `应报告注入：${result.stdout}`);
+  /* 临时放宽（Task 3 申报，Task 4 补回）：完整断言 result.status === 2 依赖 Task 4 才实现的
+   * cc-connect 服务环境待手动项；Task 3 阶段注入成功不产生待手动项，退出码保持基线 0
+   * （与 Task 2 行为一致，即退出码不因本任务改变）。 */
+  assert.equal(result.status, 0, `注入成功无待手动项，退出码应保持基线 0；stderr：${result.stderr}`);
+});
+
+test('幂等：第二遍全部跳过、不新增备份、内容不变', (t) => {
+  if (!powershellAvailable) { t.skip('powershell -File 不可用'); return; }
+  const home = makeTempDir(t);
+  writeCcConfig(home, MINIMAL_CONFIG);
+  runSetup(t, { home, seam: '1' });
+  const afterFirst = readCcConfig(home);
+  const backupsAfterFirst = listBackups(home);
+  const second = runSetup(t, { home, seam: '1' });
+  assert.ok(second.result.stdout.includes('已配置，跳过'), `第二遍应逐项跳过：${second.result.stdout}`);
+  assert.equal(listBackups(home).length, backupsAfterFirst.length, '第二遍不得新增备份');
+  assert.equal(readCcConfig(home), afterFirst, '第二遍不得改内容');
+});
+
+test('段界防线：多行字符串未闭合的段放弃合并、文件不变', (t) => {
+  if (!powershellAvailable) { t.skip('powershell -File 不可用'); return; }
+  const home = makeTempDir(t);
+  const tricky = [
+    '[projects.agent.options]',
+    'work_dir = "E:/x"',
+    'append_system_prompt = """第一行',
+    '[projects.agent.options]',
+    '第三行"""',
+    'allowed_tools = [',
+    '  "mcp__waystation__ws_status",',
+    ']',
+    '',
+  ].join('\n');
+  writeCcConfig(home, tricky);
+  const before = readCcConfig(home);
+  const { result } = runSetup(t, { home, seam: '1' });
+  assert.equal(readCcConfig(home), before, '防线触发时文件必须原样');
+  assert.ok(result.stdout.includes('放弃该段自动合并'), `应报告放弃合并：${result.stdout}`);
+});
+
+test('无 options 段：不盲改、文件不变、报告结构未知', (t) => {
+  if (!powershellAvailable) { t.skip('powershell -File 不可用'); return; }
+  const home = makeTempDir(t);
+  writeCcConfig(home, '[[projects]]\nname = "demo"\n');
+  const before = readCcConfig(home);
+  const { result } = runSetup(t, { home, seam: '1' });
+  assert.equal(readCcConfig(home), before, '结构未知时文件必须原样');
+  assert.ok(result.stdout.includes('[projects.agent.options]'), `应报告缺段：${result.stdout}`);
+});
+
+test('多项目：两个 options 段各注入一份', (t) => {
+  if (!powershellAvailable) { t.skip('powershell -File 不可用'); return; }
+  const home = makeTempDir(t);
+  writeCcConfig(home, [
+    '[[projects]]',
+    'name = "a"',
+    '',
+    '[projects.agent.options]',
+    'work_dir = "E:/a"',
+    '',
+    '[[projects]]',
+    'name = "b"',
+    '',
+    '[projects.agent.options]',
+    'work_dir = "E:/b"',
+    '',
+  ].join('\n'));
+  const { result } = runSetup(t, { home, seam: '1' });
+  const text = readCcConfig(home);
+  assert.equal((text.match(/allowed_tools = \[/g) || []).length, 2, `两段各注入 allowed_tools：${text}`);
+  assert.equal((text.match(/append_system_prompt = """你是 waystation dispatch master/g) || []).length, 2, '两段各注入规则');
+  assert.ok(result.stdout.includes('已注入并备份'));
+});
