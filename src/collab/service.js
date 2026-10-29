@@ -25,7 +25,8 @@ import { createJoinsStore } from './joins.js';
 import { consumeInviteChallenge, consumeInviteWaiver, grantInviteWaiver, issueInviteChallenge } from './consent.js';
 import {
   clearSessionGate, confirmGateOverCap, consumeConfirmToken, createConfirmGateState, gateConfigKey, gateValueOf,
-  issueConfirmToken, markConfirmGateClosed, markConfirmGateOpen, pruneConfirmGates, setSessionGate,
+  issueConfirmToken, markConfirmGateClosed, markConfirmGateOpen, pruneConfirmGates, queueConfirmGateNotice,
+  setSessionGate, takeConfirmGateNotices,
 } from './confirm-gate.js';
 import { JOIN_REQUEST_RETRY_MAX_MS, JOIN_REQUEST_RETRY_MS, JOIN_REQUEST_TTL_MS, createJoinDomain, resolveJoinTarget } from './join.js';
 import { ID_PATTERN, POST_KINDS } from '../net/protocol.js';
@@ -119,6 +120,8 @@ export function createCollabService(options) {
     log: state.log,
     now: state.clock,
   });
+  /* 加入域自动批准成功后的通知面（通知注入与有界队列归服务层：加入域只管判定与批准）。 */
+  state.onJoinAutoApproved = (event) => noteJoinAutoApproved(state, event);
   loadRegistry(state);
   return apiOf(state);
 }
@@ -2507,6 +2510,28 @@ function notifyAutoAcceptedInviteOf(state, collabId, sessionId) {
   notifyLocal(state, local ?? { collabId }, `已按设置自动同意邀请：${name}`, { targetSessionId: sessionId });
 }
 
+/* 自动批准通知：站长桥在线直投；离线进有界队列（64），注册时按 sessionId 补投。
+ * 队列满只计 dropped，不阻塞批准主链。 */
+function noteJoinAutoApproved(state, { collabId, managerSessionId, applicantName }) {
+  const local = state.collabs.get(collabId);
+  const name = local === undefined ? collabId : localNameOf(local);
+  const text = `已按设置自动批准加入申请：${applicantName} → ${name}`;
+  const delivered = notifyLocal(state, local ?? { collabId }, text, { targetSessionId: managerSessionId });
+  if (delivered === false) {
+    const queued = queueConfirmGateNotice(state, { sessionId: managerSessionId, collabId, text });
+    if (!queued) {
+      state.counters.autoApprovalNoticesDropped = (state.counters.autoApprovalNoticesDropped ?? 0) + 1;
+    }
+  }
+}
+
+function flushConfirmGateNoticesOf(state, sessionId) {
+  for (const notice of takeConfirmGateNotices(state, sessionId)) {
+    const local = state.collabs.get(notice.collabId) ?? { collabId: notice.collabId };
+    notifyLocal(state, local, notice.text, { targetSessionId: sessionId });
+  }
+}
+
 /* 指名判定要兼容两种帧形态：在线邀请写 payload.targetSessionId；挂起补投只写
  * payload.targets[].targetSessionId（replayInviteFrameOf）。不指名邀请没有 targetSessionId，
  * 一律不自动同意。 */
@@ -2842,6 +2867,7 @@ async function registerBridgeNow(state, sessionId, bridgeId) {
   }
   state.counters.seatBridgeRegistrations++;
   const invites = await replayPendingInvitesOnRegisterOf(state, sessionId);
+  flushConfirmGateNoticesOf(state, sessionId);
   return { ok: true, seats, flushed, invites: invites.delivered };
 }
 

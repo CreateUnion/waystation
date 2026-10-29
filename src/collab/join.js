@@ -7,6 +7,7 @@ import {
 import {
   CARRIER_FORMAT_INVITE_STUB, CARRIER_FORMAT_SESSION_SEATS, CARRIER_VERSION, readCarrier, readCarrierFormat, writeCarrier,
 } from './carrier.js';
+import { gateValueOf } from './confirm-gate.js';
 import { collabDir } from '../paths.js';
 import {
   createInvitesFileStore, createJoiningFileStore, createJoinApplicationsStore, createJoinsStore, createPendingInvitesFileStore,
@@ -337,6 +338,7 @@ function addLocalPending(joinState, collabId, sessionId) {
   /* 同机申请也必须有「本机确实在等这家站长的回执」的申请记录：grant 经核内旁路回来时，
    * 加入域按它判断回执不是凭空可造的（与受邀同意补记的申请同一判据）。 */
   rememberLocalJoinApplicationOf(joinState, collabId, sessionId);
+  maybeAutoApprovePendingOf(joinState, collabId, sessionId);
   return {
     ok: true, collabId, sessionId, mode: 'managed', pending: true, local: true,
     note: '本机是该协作的站长——申请已进本机待批准面（本机任意会话可批；批准即接线本会话）',
@@ -863,6 +865,7 @@ function handleJoinRequest(joinState, frame) {
   /* 0.2.0 的待批准面只存内存（joins.json 的 pendingJoins 专用于未确认 joining）；
    * 旧 v1 待批准记录仍可读入，但不再新写——避免 v1 整档覆盖 v2 的在途 grant。 */
   rememberPendingRequestOf(joinState, collabId, pendingRecordOf(joinState, frame, ids));
+  maybeAutoApprovePendingOf(joinState, collabId, ids.sessionId);
   return { ok: true, action: 'join-requested', collabId, sessionId: ids.sessionId };
 }
 
@@ -1427,6 +1430,40 @@ function managerSessionOf(joinState, local) {
     return seat.sessionId;
   }
   return local?.role === 'manager' ? null : null;
+}
+
+/* 待批准记录写入后的自动批准（join 门 off）：必须在「待批准记录 + 本机申请台账」都写完之后触发，
+ * 否则本机 grant 可能先到、因找不到申请记录被丢弃。fire-and-forget 不改变同步写入口的返回形状；
+ * 找不到站长席位、门为 on、协作不存在一律保持待批准。 */
+function maybeAutoApprovePendingOf(joinState, collabId, sessionId) {
+  const state = joinState.state;
+  if (state.confirmGates === undefined) {
+    return;   // 单测直驱加入域未注入确认门状态：门恒为默认（on），不自动批准
+  }
+  const local = state.collabs.get(collabId);
+  if (local === undefined) {
+    return;
+  }
+  const managerSessionId = managerSessionOf(joinState, local);
+  if (managerSessionId === null || gateValueOf(state, managerSessionId, 'join').effectiveValue !== false) {
+    return;
+  }
+  const pending = pendingRequestsOf(joinState, collabId).find((record) => record.sessionId === sessionId);
+  const applicantName = typeof pending?.identityName === 'string' && pending.identityName.trim() !== ''
+    ? pending.identityName.trim()
+    : shortSessionId(sessionId);
+  void approveJoinOf(joinState, { collabId, sessionId, managerSessionId, approve: true })
+    .then((raw) => {
+      const result = /** @type {any} */ (raw);
+      if (result?.ok === true) {
+        state.onJoinAutoApproved?.({ collabId, managerSessionId, applicantSessionId: sessionId, applicantName, result });
+      } else {
+        joinState.log.warn('自动批准加入申请失败（保持待批准）', { collabId, sessionId, reason: result?.message });
+      }
+    })
+    .catch((error) => {
+      joinState.log.warn('自动批准加入申请异常（已隔离）', { collabId, sessionId, reason: error?.message });
+    });
 }
 
 /* 直投帧的签发会话：站长机固定站长席位，成员机取本机最早席位；无席位不臆造。 */
