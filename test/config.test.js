@@ -50,8 +50,10 @@ test('buildDefaults：标识名取传入主机名，形状完整', () => {
     'freezeUnresolvedMs',
     'handoverConfirmTimeoutMs',
     'identityName',
+    'inviteConfirmation',
     'inviteTtlMs',
     'joinConfirmTtlMs',
+    'joinRequestConfirmation',
     'joinRequestTtlMs',
     'logDir',
     'logMaxBytes',
@@ -611,4 +613,19 @@ test('validateCrossFields：移交确认时限与挂起邀请上限按组回落�
   const ok = validateCrossFields({ ...defaults });
   assert.equal(ok.handoverConfirmTimeoutMs, defaults.handoverConfirmTimeoutMs);
   assert.equal(ok.stagedMaxPerSeat, defaults.stagedMaxPerSeat);
+});
+
+test('确认门配置：false 生效，非法值回落 true 并告警', (t) => {
+  const dir = makeTempDir(t);
+  writeFileSync(join(dir, 'config.json'), JSON.stringify({
+    identityName: '确认门测试',
+    port: 7321,
+    inviteConfirmation: false,
+    joinRequestConfirmation: 'no',
+  }));
+  const warnings = [];
+  const { config } = loadConfig(dir, { warn: (line) => warnings.push(line) });
+  assert.equal(config.inviteConfirmation, false);
+  assert.equal(config.joinRequestConfirmation, true);
+  assert.ok(warnings.some((line) => line.includes('joinRequestConfirmation')));
 });

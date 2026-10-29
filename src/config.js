@@ -69,6 +69,10 @@ const FIELD_RULES = {
   freezeUnresolvedMs: { check: (value) => Number.isInteger(value) && value >= 60000 && value <= 30 * DAY_MS, reason: '需为 60000–2592000000 的整数（毫秒，上限 30 天）' },
   // 讨论的周期对表节拍（设计 §5.4 anti-entropy 默认 60s 可配）
   forumSyncIntervalMs: { check: (value) => Number.isInteger(value) && value >= 1000 && value <= 3600000, reason: '需为 1000–3600000 的整数（毫秒）' },
+  // 确认门默认值（0.3.0）：true＝邀请同意 / 加入批准需要人工确认；false＝自动同意 / 自动批准。
+  // 运行期可经 ws_set_confirm_gate 的 persistent scope 改写；会话级临时覆盖在服务内存里。
+  inviteConfirmation: { check: (value) => typeof value === 'boolean', reason: '需为布尔值' },
+  joinRequestConfirmation: { check: (value) => typeof value === 'boolean', reason: '需为布尔值' },
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -173,6 +177,7 @@ export function buildDefaults(hostName, options = {}) {
     freezeUnresolvedMs: 48 * 60 * 60 * 1000,
     // 讨论的周期对表节拍（设计 §5.4 明文默认 60s）：落后方按此节拍拉增量、对账与重播。
     forumSyncIntervalMs: 60000,
+    inviteConfirmation: true, joinRequestConfirmation: true,
   };
 }
 
