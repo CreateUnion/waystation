@@ -15,6 +15,7 @@ import { deliveryStatusTool } from '../tools/delivery-status.js';
 import { checkInboxTool } from '../tools/check-inbox.js';
 import { listCollabsTool, createCollabTool, inviteTool, requestJoinTool, approveInviteTool, allowNextInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, setMuteTool, leaveCollabTool, endCollabTool } from '../tools/collab.js';
 import { setConfirmGateTool } from '../tools/confirm-gate.js';
+import { dispatchApproveTool, dispatchClaimTool, dispatchReleaseTool, dispatchScanTool } from '../tools/dispatch.js';
 import { decideTool, handoverTool, takeOverTool } from '../tools/governance.js';
 import { approveJoinTool, joinTool } from '../tools/join.js';
 import { createKnownHosts } from '../net/known-hosts.js';
@@ -777,6 +778,10 @@ function registerTools() {
   registry.register(approveInviteTool());
   registry.register(allowNextInviteTool());
   registry.register(setConfirmGateTool());
+  registry.register(dispatchScanTool());
+  registry.register(dispatchClaimTool());
+  registry.register(dispatchApproveTool());
+  registry.register(dispatchReleaseTool());
   registry.register(withdrawInviteTool());
   registry.register(viewLedgerTool());
   registry.register(sendMessageTool());

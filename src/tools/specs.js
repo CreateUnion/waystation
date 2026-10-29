@@ -150,6 +150,50 @@ export const WS_SET_CONFIRM_GATE_SPEC = {
   },
 };
 
+export const WS_DISPATCH_SCAN_SPEC = {
+  name: 'ws_dispatch_scan',
+  description: 'dispatch master 扫描本机已接入 waystation 的会话：会话名、role、kind、status、是否已被本 dispatch 收编。只返回本机在线会话，排除 master 自身；名字取 Claude Code 会话名，缺失回退会话短码',
+  inputSchema: { type: 'object', properties: {} },
+};
+
+export const WS_DISPATCH_CLAIM_SPEC = {
+  name: 'ws_dispatch_claim',
+  description: 'dispatch master 收编一个或多个本机会话：无头且带 WAYSTATION_ROLE=slave 的会话直接绑定；交互式会话返回 pending 并向目标注入首次确认；非交互式且无角色的会话拒绝。一个核心同一时刻只允许一个 dispatch，slave 独占',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      sessionIds: { type: 'array', description: '目标会话标识（1–32 项；取自 ws_dispatch_scan）', items: { type: 'string' } },
+    },
+    required: ['sessionIds'],
+  },
+};
+
+export const WS_DISPATCH_APPROVE_SPEC = {
+  name: 'ws_dispatch_approve',
+  description: '交互式 slave 确认 / 拒绝 master 的收编请求。第一次 approve:true 不带 confirmToken 时只返回 needsUserConfirmation 与一次性令牌；目标会话的模型把请求转述给本机用户，用户明确同意后携令牌重试才绑定。这是模型转述的确认，不是带外硬人工门',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      claimId: { type: 'string', description: '收编申请标识（取自 master 的 ws_dispatch_claim 返回或注入提示）' },
+      approve: { type: 'boolean', description: 'true = 同意收编；false = 拒绝' },
+      confirmToken: { type: 'string', description: '第一次 approve:true 返回的一次性令牌；用户确认后携此令牌重试' },
+    },
+    required: ['claimId', 'approve'],
+  },
+};
+
+export const WS_DISPATCH_RELEASE_SPEC = {
+  name: 'ws_dispatch_release',
+  description: 'dispatch master 释放单个 slave。释放后该会话不再接收 dispatch 消息；整体结束用 ws_end_collab，slave 自己退出用 ws_leave_collab',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      sessionId: { type: 'string', description: '要释放的 slave 会话标识（取自 ws_dispatch_scan）' },
+    },
+    required: ['sessionId'],
+  },
+};
+
 export const WS_WITHDRAW_INVITE_SPEC = {
   name: 'ws_withdraw_invite',
   description: '撤回邀请（managed 仅站长；forum 仅撤回本机挂起记录并停止补投，已投出的邀请不可收回）：按 inviteId 撤回该条邀请记录；未给 inviteId 时按 target 精确匹配撤回该目标的一条邀请。inviteId 与 target 至少给一个，二者二选一——本工具不提供整条协作取消，结束协作请用 ws_end_collab',
@@ -347,6 +391,10 @@ export const TOOL_SPECS = [
   WS_APPROVE_INVITE_SPEC,
   WS_ALLOW_NEXT_INVITE_SPEC,
   WS_SET_CONFIRM_GATE_SPEC,
+  WS_DISPATCH_SCAN_SPEC,
+  WS_DISPATCH_CLAIM_SPEC,
+  WS_DISPATCH_APPROVE_SPEC,
+  WS_DISPATCH_RELEASE_SPEC,
   WS_WITHDRAW_INVITE_SPEC,
   WS_VIEW_LEDGER_SPEC,
   WS_SEND_MESSAGE_SPEC,

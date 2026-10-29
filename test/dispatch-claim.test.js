@@ -1,0 +1,123 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { makeDispatchNode } from './helpers/dispatch.js';
+
+function createDispatch(node) {
+  const created = node.service.create({ mode: 'dispatch', name: 'dispatch', sessionId: 'master-1' });
+  assert.equal(created.ok, true, String(created.message));
+  return created;
+}
+
+test('claim 判定表：无头 slave 直接绑定；交互式无角色待确认；非交互式无角色拒绝', (t) => {
+  const node = makeDispatchNode(t);
+  createDispatch(node);
+  const result = node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['worker-1', 'human-1', 'headless-1'] });
+  assert.equal(result.ok, true);
+  const byId = Object.fromEntries(result.results.map((entry) => [entry.sessionId, entry]));
+  assert.equal(byId['worker-1'].status, 'bound');
+  assert.equal(byId['human-1'].status, 'pending');
+  assert.equal(typeof byId['human-1'].claimId, 'string');
+  assert.equal(byId['headless-1'].status, 'rejected');
+});
+
+test('claim 拒绝：目标 role=master、WAYSTATION_MASTER 不匹配、master 自己', (t) => {
+  const node = makeDispatchNode(t, {
+    meta: [['other-master', { sessionId: 'other-master', role: 'master', name: 'other', kind: 'interactive', metaUpdatedAt: 0 }]],
+  });
+  createDispatch(node);
+  const result = node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['master-1', 'other-master'] });
+  assert.equal(result.results.find((entry) => entry.sessionId === 'master-1').status, 'rejected');
+  assert.equal(result.results.find((entry) => entry.sessionId === 'other-master').status, 'rejected');
+  node.meta.set('human-1', { ...node.meta.get('human-1'), masterName: 'someone-else' });
+  const mismatch = node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['human-1'] });
+  assert.equal(mismatch.results[0].status, 'rejected');
+});
+
+test('交互式首次 confirm：不带 token 签发，带 token 才绑定；拒绝直接释放', (t) => {
+  const node = makeDispatchNode(t);
+  createDispatch(node);
+  const claimed = node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['human-1'] });
+  const claimId = claimed.results[0].claimId;
+  const first = node.service.dispatch.approve({ sessionId: 'human-1', claimId, approve: true });
+  assert.equal(first.ok, false);
+  assert.equal(first.needsUserConfirmation, true);
+  assert.equal(typeof first.confirmToken, 'string');
+  const wrongSession = node.service.dispatch.approve({
+    sessionId: 'human-2', claimId, approve: true, confirmToken: first.confirmToken,
+  });
+  assert.equal(wrongSession.ok, false);
+  const bound = node.service.dispatch.approve({
+    sessionId: 'human-1', claimId, approve: true, confirmToken: first.confirmToken,
+  });
+  assert.equal(bound.ok, true);
+  assert.equal(bound.bound, true);
+  assert.equal(node.service.dispatch.status().dispatch.slaves.some((slave) => slave.sessionId === 'human-1'), true);
+  const reused = node.service.dispatch.approve({
+    sessionId: 'human-1', claimId, approve: true, confirmToken: first.confirmToken,
+  });
+  assert.equal(reused.ok, false, '一次性令牌：绑定后同一 claimId 不可重放');
+
+  const secondClaim = node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['human-1'] });
+  assert.equal(secondClaim.results[0].status, 'bound', '已收编幂等');
+  const other = node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['headless-1'] });
+  assert.equal(other.results[0].status, 'rejected');
+});
+
+test('交互式第一次 approve:false 直接拒绝；claim TTL 到期释放', (t) => {
+  const node = makeDispatchNode(t);
+  createDispatch(node);
+  const claimed = node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['human-1'] });
+  const claimId = claimed.results[0].claimId;
+  const rejected = node.service.dispatch.approve({ sessionId: 'human-1', claimId, approve: false });
+  assert.equal(rejected.ok, true);
+  assert.equal(node.service.dispatch.approve({ sessionId: 'human-1', claimId, approve: true }).ok, false, '已释放');
+
+  const again = node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['human-1'] });
+  node.advance(10 * 60 * 1000 + 1);
+  node.service.dispatch.sweep(node.now());
+  assert.equal(node.notices.some((frame) => frame.payload?.event === 'dispatch-claim-expired'), true, 'TTL 清扫须回收申请并留通知');
+  const expired = node.service.dispatch.approve({ sessionId: 'human-1', claimId: again.results[0].claimId, approve: true });
+  assert.equal(expired.ok, false);
+});
+
+test('release：master 释放；非 master 不能释放', (t) => {
+  const node = makeDispatchNode(t);
+  createDispatch(node);
+  node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['worker-1'] });
+  const denied = node.service.dispatch.release({ sessionId: 'human-1', targetSessionId: 'worker-1' });
+  assert.equal(denied.ok, false);
+  const released = node.service.dispatch.release({ sessionId: 'master-1', targetSessionId: 'worker-1' });
+  assert.equal(released.ok, true);
+  assert.equal(node.service.dispatch.status().dispatch.slaves.length, 0);
+});
+
+test('元数据：kind 保留 bg / unknown，只有 fresh interactive 才算交互式', (t) => {
+  const node = makeDispatchNode(t);
+  assert.equal(node.service.dispatch.metaOf('worker-1').kind, 'bg', '无头会话的 bg 不得被吞成 unknown');
+  assert.equal(node.service.dispatch.metaOf('master-1').kind, 'interactive');
+  node.meta.set('weird-1', { sessionId: 'weird-1', role: 'none', name: 'weird', kind: 'sdk', metaUpdatedAt: node.now() });
+  assert.equal(node.service.dispatch.metaOf('weird-1').kind, 'unknown', '未知 kind 回退 unknown');
+  assert.equal(node.service.dispatch.isInteractiveOf(node.service.dispatch.metaOf('worker-1')), false);
+  assert.equal(node.service.dispatch.isInteractiveOf(node.service.dispatch.metaOf('master-1')), true);
+  node.meta.get('master-1').metaUpdatedAt = node.now() - 5 * 60 * 1000 - 1;
+  assert.equal(node.service.dispatch.isInteractiveOf(node.service.dispatch.metaOf('master-1')), false, '元数据过期不再算交互式');
+});
+
+test('notify 接线：claim 向目标注入确认提示；release 通知双方', (t) => {
+  const node = makeDispatchNode(t);
+  createDispatch(node);
+  node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['human-1'] });
+  const prompt = node.notices.find((frame) => frame.payload?.event === 'dispatch-claim');
+  assert.ok(prompt, 'pending 收编必须向目标注入确认提示，不得静默无动作');
+  assert.equal(prompt.type, 'notice');
+  assert.equal(prompt.payload.targetSessionId, 'human-1');
+  assert.match(prompt.payload.text, /ws_dispatch_approve/);
+
+  node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['worker-1'] });
+  const released = node.service.dispatch.release({ sessionId: 'master-1', targetSessionId: 'worker-1' });
+  assert.equal(released.ok, true);
+  const targetNotice = node.notices.find((frame) => frame.payload?.event === 'dispatch-released');
+  const masterNotice = node.notices.find((frame) => frame.payload?.event === 'dispatch-member-left');
+  assert.equal(targetNotice?.payload.targetSessionId, 'worker-1');
+  assert.equal(masterNotice?.payload.targetSessionId, 'master-1');
+});

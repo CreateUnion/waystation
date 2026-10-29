@@ -253,6 +253,9 @@ test('既有必填项保持（ws_handover 双角色、ws_create_collab 多模式
     ws_approve_join: ['collabId', 'sessionId', 'approve'],
     ws_decide: ['collabId'],
     ws_take_over: ['collabId'],
+    ws_dispatch_claim: ['sessionIds'],
+    ws_dispatch_approve: ['claimId', 'approve'],
+    ws_dispatch_release: ['sessionId'],
   };
   for (const [name, expected] of Object.entries(required)) {
     assert.deepEqual(SPECS_BY_NAME[name].inputSchema.required, expected, `${name} 的必填项不得缩水`);
