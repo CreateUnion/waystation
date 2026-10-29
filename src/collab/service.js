@@ -3275,11 +3275,11 @@ function setConfirmGateOf(state, rawInput) {
   if (sessionId === '') {
     return { ok: false, message: '无会话标识——无法定位本会话的确认门' };
   }
-  const refusal = confirmGateArgsRefusalOf(input);
+  const gate = input.gate ?? 'both';
+  const refusal = confirmGateArgsRefusalOf(input, gate);
   if (refusal !== null) {
     return refusal;
   }
-  const gate = input.gate ?? 'both';
   const scope = input.scope ?? 'session';
   if (input.action === 'status') {
     return confirmGateStatusOf(state, sessionId, gate);
@@ -3294,19 +3294,19 @@ function setConfirmGateOf(state, rawInput) {
 
 /* 参数形态的单一校验面（入参已归一为非空对象）：错误文案与判定顺序即对外契约
  * （action → gate → both → scope → 布尔值）。 */
-function confirmGateArgsRefusalOf(input) {
+function confirmGateArgsRefusalOf(input, gate) {
   const action = input.action;
   if (!['set', 'status', 'clear'].includes(action)) {
     return { ok: false, message: `action 非法（可取值：set / status / clear）：${String(action)}` };
   }
-  const gateRefusal = confirmGateGateRefusalOf(input.gate ?? 'both');
+  const gateRefusal = confirmGateGateRefusalOf(gate);
   if (gateRefusal !== null) {
     return gateRefusal;
   }
   if (action === 'status') {
     return null;
   }
-  return action === 'set' ? confirmGateSetArgsRefusalOf(input) : confirmGateClearArgsRefusalOf(input);
+  return action === 'set' ? confirmGateSetArgsRefusalOf(input, gate) : confirmGateClearArgsRefusalOf(input, gate);
 }
 
 function confirmGateGateRefusalOf(gate) {
@@ -3327,8 +3327,8 @@ function confirmGateScopeRefusalOf(scope) {
   return null;
 }
 
-function confirmGateSetArgsRefusalOf(input) {
-  if (input.gate === 'both') {
+function confirmGateSetArgsRefusalOf(input, gate) {
+  if (gate === 'both') {
     return confirmGateBothRefusal();
   }
   const scopeRefusal = confirmGateScopeRefusalOf(input.scope ?? 'session');
@@ -3341,8 +3341,8 @@ function confirmGateSetArgsRefusalOf(input) {
   return null;
 }
 
-function confirmGateClearArgsRefusalOf(input) {
-  if (input.gate === 'both') {
+function confirmGateClearArgsRefusalOf(input, gate) {
+  if (gate === 'both') {
     return confirmGateBothRefusal();
   }
   return confirmGateScopeRefusalOf(input.scope ?? 'session');

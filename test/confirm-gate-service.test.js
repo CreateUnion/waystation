@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createCollabService } from '../src/collab/service.js';
 import { loadConfig } from '../src/config.js';
@@ -66,6 +66,29 @@ test('persistent：首次只发令牌，携令牌重试才落盘；先写盘后�
   assert.equal(second.effectiveValue, false);
   assert.equal(loadConfig(dataDir).config.joinRequestConfirmation, false);
   assert.match(readFileSync(join(dataDir, 'config.json'), 'utf8'), /"joinRequestConfirmation": false/);
+});
+
+test('set / clear 省略 gate 一律拒绝：不改状态、不落盘「undefined」键', (t) => {
+  const { service, dataDir } = makeService(t);
+  const set = service.setConfirmGate({
+    action: 'set', requireConfirmation: false, scope: 'session', sessionId: 'sess-a',
+  });
+  assert.equal(set.ok, false, '缺省 gate 不得被当作 both 合并设置');
+  const status = service.setConfirmGate({ action: 'status', sessionId: 'sess-a' });
+  assert.equal(status.gates.invite.sessionValue, null, '拒绝请求不得改会话状态');
+  assert.equal(status.gates.join.sessionValue, null, '拒绝请求不得改会话状态');
+  const clear = service.setConfirmGate({ action: 'clear', scope: 'session', sessionId: 'sess-a' });
+  assert.equal(clear.ok, false, '缺省 gate 的 clear 同样拒绝');
+  const explicitBoth = service.setConfirmGate({
+    action: 'set', gate: 'both', requireConfirmation: false, scope: 'session', sessionId: 'sess-a',
+  });
+  assert.equal(explicitBoth.ok, false, '显式 both 与缺省同判');
+  const persistent = service.setConfirmGate({
+    action: 'set', requireConfirmation: false, scope: 'persistent', sessionId: 'sess-a',
+  });
+  assert.equal(persistent.ok, false, '缺省 gate 的 persistent set 同样拒绝');
+  assert.equal(persistent.needsUserConfirmation, undefined, '参数非法先于令牌签发');
+  assert.equal(existsSync(join(dataDir, 'config.json')), false, '非法请求不得写 config.json（更不得写 "undefined" 键）');
 });
 
 test('旧 ws_allow_next_invite 与新开关共用同一份会话状态', (t) => {
