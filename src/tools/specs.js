@@ -134,6 +134,22 @@ export const WS_ALLOW_NEXT_INVITE_SPEC = {
   },
 };
 
+export const WS_SET_CONFIRM_GATE_SPEC = {
+  name: 'ws_set_confirm_gate',
+  description: '设置本机确认门：邀请同意是否必须人工确认（gate=invite）、作为站长收到加入申请是否必须人工批准（gate=join）。scope=session（缺省）只对当前会话生效，会话结束或核心重启即失效；scope=persistent 写入 config.json，对本机以后所有会话生效，首次调用只返回 needsUserConfirmation 与一次性 confirmToken——须向用户转述并取得明确同意后携令牌重试。action=status 返回本会话临时值 / config 永久值 / 当前生效值；action=clear 清除临时值，scope=persistent 时删除配置字段并回到默认 true。off 只免同意 / 批准，拒绝仍走人工确认',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      action: { type: 'string', enum: ['set', 'status', 'clear'], description: '操作类型' },
+      gate: { type: 'string', enum: ['invite', 'join', 'both'], description: '确认门（status 可省略，缺省 both；set / clear 必填且不能为 both）' },
+      requireConfirmation: { type: 'boolean', description: 'set 时必填：true＝需要人工确认；false＝免人工确认' },
+      scope: { type: 'string', enum: ['session', 'persistent'], description: '生效范围（set / clear 可选，缺省 session）' },
+      confirmToken: { type: 'string', description: 'persistent 的 set / clear 首次调用返回的一次性令牌；用户明确同意后携此令牌重试' },
+    },
+    required: ['action'],
+  },
+};
+
 export const WS_WITHDRAW_INVITE_SPEC = {
   name: 'ws_withdraw_invite',
   description: '撤回邀请（managed 仅站长；forum 仅撤回本机挂起记录并停止补投，已投出的邀请不可收回）：按 inviteId 撤回该条邀请记录；未给 inviteId 时按 target 精确匹配撤回该目标的一条邀请。inviteId 与 target 至少给一个，二者二选一——本工具不提供整条协作取消，结束协作请用 ws_end_collab',
@@ -330,6 +346,7 @@ export const TOOL_SPECS = [
   WS_CREATE_COLLAB_SPEC,
   WS_APPROVE_INVITE_SPEC,
   WS_ALLOW_NEXT_INVITE_SPEC,
+  WS_SET_CONFIRM_GATE_SPEC,
   WS_WITHDRAW_INVITE_SPEC,
   WS_VIEW_LEDGER_SPEC,
   WS_SEND_MESSAGE_SPEC,

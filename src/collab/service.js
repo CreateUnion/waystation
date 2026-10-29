@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { saveConfig } from '../config.js';
 import { PENDING_INVITES_FILE_NAME, SEATS_DIR_NAME, collabDir, collabFilePath } from '../paths.js';
 import { appendLine } from '../storage.js';
 import {
@@ -21,7 +22,11 @@ import { createCounterStore, notifyIndicatorChange } from './counter.js';
 import { forgetMuteBaseline, forgetMuteBaselinesOfCollab, rememberMuteBaselineIfAbsent, takeMuteBaseline } from './mute.js';
 import { createInjectedStore } from './injected.js';
 import { createJoinsStore } from './joins.js';
-import { consumeInviteChallenge, consumeInviteWaiver, grantInviteWaiver, grantSessionAutoAccept, hasSessionAutoAccept, issueInviteChallenge, revokeSessionAutoAccept } from './consent.js';
+import { consumeInviteChallenge, consumeInviteWaiver, grantInviteWaiver, issueInviteChallenge } from './consent.js';
+import {
+  clearSessionGate, confirmGateOverCap, consumeConfirmToken, createConfirmGateState, gateConfigKey, gateValueOf,
+  issueConfirmToken, markConfirmGateClosed, markConfirmGateOpen, pruneConfirmGates, setSessionGate,
+} from './confirm-gate.js';
 import { JOIN_REQUEST_RETRY_MAX_MS, JOIN_REQUEST_RETRY_MS, JOIN_REQUEST_TTL_MS, createJoinDomain, resolveJoinTarget } from './join.js';
 import { ID_PATTERN, POST_KINDS } from '../net/protocol.js';
 import { matchSessionByToken, shortSessionId } from '../util/short-id.js';
@@ -361,6 +366,7 @@ function runtimeMaps() {
     joinRequestWindow: new Map(),   // 来源地址 → 上次受理时刻（加入申请的入站限频，与邀请限频相互独立）
     relayDown: new Set(),      // 中继降级态的 collabId 集（探测不可达置位；恢复检测清除）
     inviteConsent: { challenges: new Map(), waivers: new Map(), autoAccept: new Set() },   // 邀请决定确认门（挑战 / 一次性豁免 / 会话级免同意，纯内存态）
+    confirmGates: createConfirmGateState(),   // 确认门会话覆盖 / 永久令牌 / 自动批准通知（纯内存态）
   };
 }
 
@@ -385,6 +391,7 @@ function apiOf(state) {
     join: joinApiOf(state),   // 会话级加入的处置面（工具层落点）
     approve: (input) => guardedWrite(state, input?.collabId, () => approveNow(state, input)),
     allowNextInvite: (input) => guardedWrite(state, input?.collabId, () => allowNextInviteOf(state, input)),
+    setConfirmGate: (input) => setConfirmGateOf(state, input),
     relayReport: (input) => applyRelayedReport(state, input),   // 网层回报注入面（转达副本达第三档 → 译回原作者）
     withdraw: (input) => seatGovernedWrite(state, input, () => withdrawInvite(state, input)),
     send: (input) => guardedWrite(state, input?.collabId, () => sendMessage(state, input)),
@@ -750,6 +757,13 @@ function startService(state) {
   /* 邀请/在途入席的生命周期清扫挂到既有 presence 节拍（takeover.runPresenceTick）：
    * 不新增定时器；清扫只触碰本机三本账，异常隔离不影响心跳。 */
   state.joinLifecycleSweep = () => {
+    pruneConfirmGates(state, state.clock());
+    if (confirmGateOverCap(state)) {
+      state.log.warn('确认门会话覆盖超过上限（在线会话不淘汰）', {
+        size: state.confirmGates.sessions.size,
+        max: 256,
+      });
+    }
     sweepJoinLifecycle(state).catch((error) => {
       state.counters.eventFailures++;
       state.log.warn('邀请生命周期清扫异常（已隔离）', { reason: error?.message });
@@ -1410,15 +1424,15 @@ function applyInviteWaiverMode(state, sessionId, mode) {
     return { ok: true, enabled: false, note: '已登记一次性豁免：下一次同意 / 拒绝邀请将直接生效（消耗后失效；核心重启亦失效）' };
   }
   if (mode === 'session') {
-    grantSessionAutoAccept(state, { sessionId });
+    setSessionGate(state, sessionId, 'invite', false, state.clock());
     return { ok: true, enabled: true, note: '已开启会话级免确认：本会话同意邀请将直接生效（拒绝仍需确认）；会话结束、核心重启或用 off 关闭' };
   }
   if (mode === 'off') {
-    revokeSessionAutoAccept(state, { sessionId });
+    setSessionGate(state, sessionId, 'invite', true, state.clock());
     return { ok: true, enabled: false, note: '已关闭会话级免确认：同意邀请恢复逐条确认' };
   }
   if (mode === 'status') {
-    const enabled = hasSessionAutoAccept(state, { sessionId });
+    const enabled = gateValueOf(state, sessionId, 'invite').effectiveValue === false;
     return { ok: true, enabled, note: enabled ? '会话级免确认已开启（只免同意；拒绝仍需确认）' : '会话级免确认未开启' };
   }
   return { ok: false, message: `mode 非法（可取值：once / session / off / status）：${String(mode)}` };
@@ -1612,7 +1626,7 @@ function inviteAcceptanceConsentOf(state, { collabId, sessionId, confirmToken, a
   if (typeof sessionId !== 'string' || sessionId === '') {
     return null;
   }
-  if (approve === true && hasSessionAutoAccept(state, { sessionId })) {
+  if (approve === true && gateValueOf(state, sessionId, 'invite').effectiveValue === false) {
     return null;   // 会话级免确认只免「同意」：拒绝始终是有后果的用户决定
   }
   if (consumeInviteWaiver(state, { sessionId }) || consumeInviteChallenge(state, { sessionId, collabId, token: confirmToken })) {
@@ -2743,6 +2757,10 @@ async function registerBridgeNow(state, sessionId, bridgeId) {
   if (!validSessionId(sessionId) || typeof bridgeId !== 'string' || bridgeId === '') {
     return { ok: false, reason: 'bad-bridge' };
   }
+  /* 重连即撤销宽限：先清已过期的宽限条目，避免陈旧宽限被这次注册「复活」成在线态
+   * （过期＝会话覆盖应随之清除，不得因迟到的重连保留）。 */
+  pruneConfirmGates(state, state.clock());
+  markConfirmGateOpen(state, sessionId);
   state.sessionBridges.set(sessionId, bridgeId);
   noteSessionRebound(state, sessionId);
   let seats = 0;
@@ -2905,13 +2923,22 @@ function listInjectableTargetsOf(state, collabId) {
   return targets;
 }
 
+/* 桥注销的绑定面：该桥是当前桥（或强制注销）才删除；宽限计时只挂给「删除后仍无当前桥」
+ * 的情形——条件在删除后读，旧桥迟到断开不得给新桥打宽限。 */
+function unregisterSessionBridgeOf(state, sessionId, bridgeId) {
+  if (bridgeId === null || state.sessionBridges.get(sessionId) === bridgeId) {
+    state.sessionBridges.delete(sessionId);
+  }
+  if (bridgeId === null || state.sessionBridges.get(sessionId) === undefined) {
+    markConfirmGateClosed(state, sessionId, state.clock());
+  }
+}
+
 function unregisterBridgeNow(state, sessionId, bridgeId) {
   if (!validSessionId(sessionId)) {
     return { ok: false, reason: 'bad-session' };
   }
-  if (bridgeId === null || state.sessionBridges.get(sessionId) === bridgeId) {
-    state.sessionBridges.delete(sessionId);
-  }
+  unregisterSessionBridgeOf(state, sessionId, bridgeId);
   let cleared = 0;
   for (const local of state.collabs.values()) {
     const seat = localSeatOfLocal(local, sessionId);
@@ -3237,5 +3264,155 @@ function emptyAdjudicationCounters() {
     handoverCompleted: 0,
     handoverRejected: 0,
     handoverTimeouts: 0,
+  };
+}
+
+/* 确认门工具面（2026-10-29）：set/status/clear。临时值只改内存；永久值先写 config.json，
+ * 写成功后改内存——不得出现「内存已改、盘上没改」。persistent 的 set/clear 首次只发令牌。 */
+function setConfirmGateOf(state, rawInput) {
+  const input = rawInput ?? {};
+  const sessionId = typeof input.sessionId === 'string' ? input.sessionId.trim() : '';
+  if (sessionId === '') {
+    return { ok: false, message: '无会话标识——无法定位本会话的确认门' };
+  }
+  const refusal = confirmGateArgsRefusalOf(input);
+  if (refusal !== null) {
+    return refusal;
+  }
+  const gate = input.gate ?? 'both';
+  const scope = input.scope ?? 'session';
+  if (input.action === 'status') {
+    return confirmGateStatusOf(state, sessionId, gate);
+  }
+  if (input.action === 'set') {
+    return setConfirmGateValueOf(state, {
+      sessionId, gate, value: input.requireConfirmation, scope, confirmToken: input.confirmToken,
+    });
+  }
+  return clearConfirmGateValueOf(state, { sessionId, gate, scope, confirmToken: input.confirmToken });
+}
+
+/* 参数形态的单一校验面（入参已归一为非空对象）：错误文案与判定顺序即对外契约
+ * （action → gate → both → scope → 布尔值）。 */
+function confirmGateArgsRefusalOf(input) {
+  const action = input.action;
+  if (!['set', 'status', 'clear'].includes(action)) {
+    return { ok: false, message: `action 非法（可取值：set / status / clear）：${String(action)}` };
+  }
+  const gateRefusal = confirmGateGateRefusalOf(input.gate ?? 'both');
+  if (gateRefusal !== null) {
+    return gateRefusal;
+  }
+  if (action === 'status') {
+    return null;
+  }
+  return action === 'set' ? confirmGateSetArgsRefusalOf(input) : confirmGateClearArgsRefusalOf(input);
+}
+
+function confirmGateGateRefusalOf(gate) {
+  if (gate !== 'invite' && gate !== 'join' && gate !== 'both') {
+    return { ok: false, message: `gate 非法（可取值：invite / join / both）：${String(gate)}` };
+  }
+  return null;
+}
+
+function confirmGateBothRefusal() {
+  return { ok: false, message: 'set / clear 必须指定 gate（invite 或 join）——两个门的方向与风险不同，不合并设置' };
+}
+
+function confirmGateScopeRefusalOf(scope) {
+  if (scope !== 'session' && scope !== 'persistent') {
+    return { ok: false, message: `scope 非法（可取值：session / persistent）：${String(scope)}` };
+  }
+  return null;
+}
+
+function confirmGateSetArgsRefusalOf(input) {
+  if (input.gate === 'both') {
+    return confirmGateBothRefusal();
+  }
+  const scopeRefusal = confirmGateScopeRefusalOf(input.scope ?? 'session');
+  if (scopeRefusal !== null) {
+    return scopeRefusal;
+  }
+  if (typeof input.requireConfirmation !== 'boolean') {
+    return { ok: false, message: 'requireConfirmation 非法：set 需要布尔值（true＝需要人工确认，false＝免确认）' };
+  }
+  return null;
+}
+
+function confirmGateClearArgsRefusalOf(input) {
+  if (input.gate === 'both') {
+    return confirmGateBothRefusal();
+  }
+  return confirmGateScopeRefusalOf(input.scope ?? 'session');
+}
+
+function confirmGateStatusOf(state, sessionId, gate) {
+  const gates = {};
+  for (const key of (gate === 'both' ? ['invite', 'join'] : [gate])) {
+    gates[key] = gateValueOf(state, sessionId, key);
+  }
+  return { ok: true, gates };
+}
+
+function setConfirmGateValueOf(state, { sessionId, gate, value, scope, confirmToken }) {
+  if (scope === 'persistent') {
+    const tokenResult = requireConfirmTokenOf(state, { sessionId, action: 'set', gate, value, confirmToken });
+    if (tokenResult !== null) {
+      return tokenResult;
+    }
+    const next = { ...state.config, [gateConfigKey(gate)]: value };
+    try {
+      saveConfig(state.dataDir, next);
+    } catch (error) {
+      return { ok: false, message: `写 config.json 失败（未改内存）：${error?.message ?? '未知原因'}` };
+    }
+    state.config[gateConfigKey(gate)] = value;
+    clearSessionGate(state, sessionId, gate);
+  } else {
+    setSessionGate(state, sessionId, gate, value, state.clock());
+  }
+  return { ok: true, gate, scope, ...gateValueOf(state, sessionId, gate) };
+}
+
+function clearConfirmGateValueOf(state, { sessionId, gate, scope, confirmToken }) {
+  if (scope === 'persistent') {
+    const tokenResult = requireConfirmTokenOf(state, { sessionId, action: 'clear', gate, value: undefined, confirmToken });
+    if (tokenResult !== null) {
+      return tokenResult;
+    }
+    const next = { ...state.config };
+    delete next[gateConfigKey(gate)];
+    try {
+      saveConfig(state.dataDir, next);
+    } catch (error) {
+      return { ok: false, message: `写 config.json 失败（未改内存）：${error?.message ?? '未知原因'}` };
+    }
+    state.config[gateConfigKey(gate)] = true;
+    clearSessionGate(state, sessionId, gate);
+  } else {
+    clearSessionGate(state, sessionId, gate);
+  }
+  return { ok: true, gate, scope, ...gateValueOf(state, sessionId, gate) };
+}
+
+/* 永久设置的确认令牌：首次只签发并返回摘要；携令牌重试才返回 null（放行）。 */
+function requireConfirmTokenOf(state, { sessionId, action, gate, value, confirmToken }) {
+  if (typeof confirmToken === 'string' && confirmToken !== '') {
+    if (!consumeConfirmToken(state, { sessionId, action, gate, value, token: confirmToken, now: state.clock() })) {
+      return { ok: false, message: '确认令牌无效、已过期或与本次操作不匹配——请重新发起' };
+    }
+    return null;
+  }
+  const token = issueConfirmToken(state, { sessionId, action, gate, value, now: state.clock() });
+  const verb = action === 'set'
+    ? (value === false ? '关闭' : '开启')
+    : '清除';
+  return {
+    ok: false,
+    needsUserConfirmation: true,
+    confirmToken: token,
+    summary: `将对本机所有会话${verb}「${gate === 'invite' ? '邀请人工确认' : '加入申请人工批准'}」——这是整机级设置，需用户明确同意后携令牌重试`,
   };
 }

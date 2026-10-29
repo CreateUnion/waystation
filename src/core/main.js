@@ -14,6 +14,7 @@ import { pingTool } from '../tools/ping.js';
 import { deliveryStatusTool } from '../tools/delivery-status.js';
 import { checkInboxTool } from '../tools/check-inbox.js';
 import { listCollabsTool, createCollabTool, inviteTool, requestJoinTool, approveInviteTool, allowNextInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, setMuteTool, leaveCollabTool, endCollabTool } from '../tools/collab.js';
+import { setConfirmGateTool } from '../tools/confirm-gate.js';
 import { decideTool, handoverTool, takeOverTool } from '../tools/governance.js';
 import { approveJoinTool, joinTool } from '../tools/join.js';
 import { createKnownHosts } from '../net/known-hosts.js';
@@ -741,7 +742,7 @@ function persistIdentityAndConfig(state) {
   writeCoreRecord(state);
 }
 
-/* 工具处理器注册（22 个）：核心持有注册表与启动期 context；调用者身份注入（per-request）与
+/* 工具处理器注册（23 个）：核心持有注册表与启动期 context；调用者身份注入（per-request）与
  * 执行面（IPC call 帧）在其交付物接入——本函数只做启动期单例装配。 */
 function registerTools() {
   const registry = createToolRegistry();
@@ -754,6 +755,7 @@ function registerTools() {
   registry.register(createCollabTool());
   registry.register(approveInviteTool());
   registry.register(allowNextInviteTool());
+  registry.register(setConfirmGateTool());
   registry.register(withdrawInviteTool());
   registry.register(viewLedgerTool());
   registry.register(sendMessageTool());

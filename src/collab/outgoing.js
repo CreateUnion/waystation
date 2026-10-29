@@ -6,7 +6,8 @@ import { createMembersStore } from './members.js';
 import { createCounterStore, notifyIndicatorChange } from './counter.js';
 import { forgetMuteBaselinesOfCollab } from './mute.js';
 import { createInjectedStore } from './injected.js';
-import { consumeInviteChallenge, consumeInviteWaiver, hasSessionAutoAccept, issueInviteChallenge } from './consent.js';
+import { consumeInviteChallenge, consumeInviteWaiver, issueInviteChallenge } from './consent.js';
+import { gateValueOf } from './confirm-gate.js';
 import { ledgerDigest, removeLedgerFile } from './store.js';
 import { archiveLocalSeatsOfState, currentManagerIdOf, emitOwnMemberEvent, foldedMembersOf, forumReachIdsOf, isLocalArchivedState, localModeOf, localNameOf, localRosterOf, localStateOf, localTopicOf, memberStateFor, persistLedger, persistMember, persistSnapshot, relayDepartedOf, relayPeerOf, rememberKnownHost, retiredMuteHandle, selfJoinedOf, upsertLocalSeat } from './local.js';
 import { matchConflictCollabs } from './gate.js';
@@ -602,7 +603,7 @@ function inviteConsentGate(state, local, sessionId, confirmToken, approve) {
   if (typeof sessionId !== 'string' || sessionId === '') {
     return null;
   }
-  if (approve === true && hasSessionAutoAccept(state, { sessionId })) {
+  if (approve === true && gateValueOf(state, sessionId, 'invite').effectiveValue === false) {
     return null;   // 会话级免确认只免「同意」：拒绝始终是有后果的用户决定
   }
   if (consumeInviteWaiver(state, { sessionId })) {

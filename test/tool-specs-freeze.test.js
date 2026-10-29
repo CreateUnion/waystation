@@ -12,6 +12,7 @@ import { pingTool } from '../src/tools/ping.js';
 import { deliveryStatusTool } from '../src/tools/delivery-status.js';
 import { checkInboxTool } from '../src/tools/check-inbox.js';
 import { listCollabsTool, createCollabTool, approveInviteTool, allowNextInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, setMuteTool, leaveCollabTool, endCollabTool, inviteTool, requestJoinTool, SEND_MESSAGE_TYPES } from '../src/tools/collab.js';
+import { setConfirmGateTool } from '../src/tools/confirm-gate.js';
 import { joinTool, approveJoinTool } from '../src/tools/join.js';
 import { decideTool, handoverTool, takeOverTool } from '../src/tools/governance.js';
 import { COLLAB_MODES, DEFAULT_COLLAB_MODE, MAX_ACTIVE_SEATS, MAX_IDENTITY_NAME_CHARS, MAX_MESSAGE_TEXT_CHARS, MAX_REASON_CHARS, MAX_TOPIC_CHARS } from '../src/net/protocol.js';
@@ -28,13 +29,14 @@ import { buildDefaults } from '../src/config.js';
 
 const propertiesOf = (name) => SPECS_BY_NAME[name].inputSchema.properties;
 
-/* 设计 §9 的 22 项工具清单（独立于 specs.js 登记，防「误换一项再重冻」自证）：
- * 表内 17 个单项 + 末行 5 项（status / ping / decide / withdraw / request_join）。 */
+/* 设计 §9 的 23 项工具清单（独立于 specs.js 登记，防「误换一项再重冻」自证）：
+ * 表内 18 个单项 + 末行 5 项（status / ping / decide / withdraw / request_join）。 */
 const DESIGN_SECTION_9_TOOLS = [
   'ws_create_collab',
   'ws_invite',
   'ws_approve_invite',
   'ws_allow_next_invite',
+  'ws_set_confirm_gate',
   'ws_join',
   'ws_approve_join',
   'ws_leave_collab',
@@ -67,6 +69,7 @@ const TOOL_FACTORIES = [
   createCollabTool,
   approveInviteTool,
   allowNextInviteTool,
+  setConfirmGateTool,
   withdrawInviteTool,
   viewLedgerTool,
   sendMessageTool,
@@ -90,9 +93,9 @@ function coreToolList() {
   return registry.list();
 }
 
-test('工具面冻结快照：22 项逐字节不变', () => {
+test('工具面冻结快照：23 项逐字节不变', () => {
   const listed = coreToolList();
-  assert.equal(listed.length, 22, '工具数为 22——增删工具属须人批准的对外变更');
+  assert.equal(listed.length, 23, '工具数为 23——增删工具属须人批准的对外变更');
   assert.equal(
     JSON.stringify(listed, null, 2),
     FROZEN_LIST_JSON,
@@ -100,15 +103,15 @@ test('工具面冻结快照：22 项逐字节不变', () => {
   );
 });
 
-test('规格模块：22 项无遗漏，按名索引与注册序一致', () => {
-  assert.equal(TOOL_SPECS.length, 22, '规格模块须与工具数一一对应');
+test('规格模块：23 项无遗漏，按名索引与注册序一致', () => {
+  assert.equal(TOOL_SPECS.length, 23, '规格模块须与工具数一一对应');
   assert.deepEqual(Object.keys(SPECS_BY_NAME), TOOL_SPECS.map((spec) => spec.name));
   assert.deepEqual(coreToolList().map((tool) => tool.name), TOOL_SPECS.map((spec) => spec.name));
 });
 
-test('规格模块：22 项与设计 §9 的工具清单逐名一致', () => {
-  assert.equal(DESIGN_SECTION_9_TOOLS.length, 22, '设计 §9 清单自身须为 22 项（17 单项 + 末行 5 项）');
-  assert.equal(new Set(DESIGN_SECTION_9_TOOLS).size, 22, '设计 §9 清单不得有重复名');
+test('规格模块：23 项与设计 §9 的工具清单逐名一致', () => {
+  assert.equal(DESIGN_SECTION_9_TOOLS.length, 23, '设计 §9 清单自身须为 23 项（18 单项 + 末行 5 项）');
+  assert.equal(new Set(DESIGN_SECTION_9_TOOLS).size, 23, '设计 §9 清单不得有重复名');
   assert.deepEqual([...Object.keys(SPECS_BY_NAME)].sort(), [...DESIGN_SECTION_9_TOOLS].sort(), '工具名与设计 §9 独立对照——误换一项再重冻会在这里变红');
 });
 
@@ -264,7 +267,7 @@ async function sendMessageDefaultType() {
   return sent.type;
 }
 
-/* 冻结基准：22 工具注册后 JSON.stringify(registry.list(), null, 2) 的全量输出（由当前树生成）。
+/* 冻结基准：23 工具注册后 JSON.stringify(registry.list(), null, 2) 的全量输出（由当前树生成）。
  * 文本级固化——缩进与换行也是比对范围，故整段贴在此处、不手工编辑。
  * 会话级参与者 0.2.0 工具面（22 项）：名单与参与者粒度按会话——ws_send_message 增 toSessionId、
  * ws_handover 增 targetSessionId/offerId/confirmToken/decision/reason 并放宽为双角色、
@@ -275,7 +278,10 @@ async function sendMessageDefaultType() {
  * md5 由 29aee52b9ad324f5797c9f4ccd2eb6fb（15641 字符）更新为 bfab27e380b87efe842d5a8cf6f747a8（16585 字符）。
  * 邀请确认豁免扩展（用户 2026-10-22 裁定：会话级免确认、只免同意）：ws_allow_next_invite 增可选
  * mode（once 缺省 / session / off / status），工具数与顺序不变；按同一规程重冻，
- * md5 更新为 407fd7053df63c5605987143b7811113（16947 字符）。 */
+ * md5 更新为 407fd7053df63c5605987143b7811113（16947 字符）。
+ * 确认门工具面扩展（2026-10-29）：新增第 23 项 ws_set_confirm_gate（invite / join 两会话级与
+ * 永久确认门，persistent 首次只发令牌）；按同一规程重冻，
+ * md5 更新为 e28abe757bf2add0d411917610abb4b6（18361 字符）。 */
 const FROZEN_LIST_JSON = `[
   {
     "name": "ws_status",
@@ -470,6 +476,52 @@ const FROZEN_LIST_JSON = `[
           "description": "豁免模式（可选，缺省 once）：once＝一次性；session＝本会话持续免同意；off＝关闭；status＝查询"
         }
       }
+    }
+  },
+  {
+    "name": "ws_set_confirm_gate",
+    "description": "设置本机确认门：邀请同意是否必须人工确认（gate=invite）、作为站长收到加入申请是否必须人工批准（gate=join）。scope=session（缺省）只对当前会话生效，会话结束或核心重启即失效；scope=persistent 写入 config.json，对本机以后所有会话生效，首次调用只返回 needsUserConfirmation 与一次性 confirmToken——须向用户转述并取得明确同意后携令牌重试。action=status 返回本会话临时值 / config 永久值 / 当前生效值；action=clear 清除临时值，scope=persistent 时删除配置字段并回到默认 true。off 只免同意 / 批准，拒绝仍走人工确认",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "set",
+            "status",
+            "clear"
+          ],
+          "description": "操作类型"
+        },
+        "gate": {
+          "type": "string",
+          "enum": [
+            "invite",
+            "join",
+            "both"
+          ],
+          "description": "确认门（status 可省略，缺省 both；set / clear 必填且不能为 both）"
+        },
+        "requireConfirmation": {
+          "type": "boolean",
+          "description": "set 时必填：true＝需要人工确认；false＝免人工确认"
+        },
+        "scope": {
+          "type": "string",
+          "enum": [
+            "session",
+            "persistent"
+          ],
+          "description": "生效范围（set / clear 可选，缺省 session）"
+        },
+        "confirmToken": {
+          "type": "string",
+          "description": "persistent 的 set / clear 首次调用返回的一次性令牌；用户明确同意后携此令牌重试"
+        }
+      },
+      "required": [
+        "action"
+      ]
     }
   },
   {
