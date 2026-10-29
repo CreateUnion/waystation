@@ -2,3 +2,6 @@ node_modules/
 poc/out/
 npm-debug.log*
 docs/logs/
+
+# 会话隔离工作树（harness 管理，勿入库）
+.claude/worktrees/
