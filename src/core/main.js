@@ -559,7 +559,7 @@ function dispatchCoreFrame(state, frame, record) {
 
 /* register-update 只改本连接的会话元数据：身份取 record（连接已认证），不认帧内 sessionId /
  * bridgeId，防止一个桥改别的会话。 */
-function applyRegisterUpdate(state, frame, record) {
+export function applyRegisterUpdate(state, frame, record) {
   if (record === null || record.sessionId === null) {
     return;
   }

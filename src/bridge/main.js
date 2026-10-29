@@ -78,6 +78,9 @@ export function createBridgeRuntime(options = {}) {
   });
   link.setRegisteredHandler?.((welcome, meta) => {
     log.info(meta.reborn ? '核心重生后重注册（连接已接续）' : '核心已注册', { corePid: welcome.corePid });
+    /* 「注册时上报一次」：hello 快照固定于运行时构造，断连期间的 /rename 不会被 watcher 补发
+     * （未注册时 sendRegisterUpdate 丢弃但基线已前移）——注册成功后现读一次最新元数据补上。 */
+    link.sendRegisterUpdate?.(bridgeMetaOf({ env, sessionId }));
   });
   return {
     env,

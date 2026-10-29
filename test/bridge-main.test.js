@@ -148,7 +148,39 @@ test('桥运行时：会话元数据变化经 sendRegisterUpdate 外送，close 
   t.mock.timers.tick(5000);
   assert.equal(updates.at(-1)?.name, 'after', '文件变化经 watcher 外送（5s 周期）');
   await runtime.close();
-  assert.equal(closed, 1, '关闭转发到连接件（watcher 同时停止）');
+  assert.equal(closed, 1, '关闭转发到连接件');
+  const reported = updates.length;
+  t.mock.timers.tick(5000);
+  assert.equal(updates.length, reported, '关闭后 watcher 不再上报');
+});
+
+test('重注册时补发断连期间变化的最新会话元数据', async (t) => {
+  const root = makeTempDir(t);
+  const dir = join(root, 'sessions');
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, '1.json');
+  writeFileSync(file, JSON.stringify({ sessionId: 'sess-meta', name: 'before', kind: 'interactive' }));
+  const updates = [];
+  const link = stubLink({
+    setRegisteredHandler(handler) {
+      link.registeredHandler = handler;
+    },
+    sendRegisterUpdate: (meta) => {
+      updates.push(meta);
+      return true;
+    },
+  });
+  const runtime = createBridgeRuntime({
+    env: { CLAUDE_CONFIG_DIR: root, CLAUDE_CODE_SESSION_ID: 'sess-meta' },
+    log: quietLog(),
+    writer: { deliver: async () => ({ ok: true }) },
+    link,
+    sessionMetaWatcher: false,
+  });
+  writeFileSync(file, JSON.stringify({ sessionId: 'sess-meta', name: 'after', kind: 'interactive' }));
+  link.registeredHandler({ corePid: 1 }, { reborn: true });
+  assert.equal(updates.at(-1)?.name, 'after', '注册后现读最新元数据补发（hello 快照不覆盖断连期变化）');
+  await runtime.close();
 });
 
 test('注入写面不可用：桥启动即告警（既有组合根「适配器不可用」告警的接续）', async () => {
@@ -184,6 +216,7 @@ test('桥运行时默认装配：真实连接件（数据根随环境）＋push 
     env: { WAYSTATION_HOME: 'E:\\tmp\\bridge-default-home', CLAUDE_CODE_SESSION_ID: 'session-default-1' },
     log: quietLog(),
     writer: { deliver: async () => ({ ok: true }) },
+    sessionMetaWatcher: false,   // 不读开发机真实 ~/.claude
   });
   assert.equal(runtime.dataDir, 'E:\\tmp\\bridge-default-home');
   assert.equal(typeof runtime.link.ensureCore, 'function');
@@ -231,13 +264,16 @@ test('stderr 日志面：warn/error 带桥前缀与结构化元数据（不写�
  * stdin 关闭 → 桥退场（进程消失）。真实核 e2e（1 桥＋1 核、call/result 等价）待核心接线就位后补跑。 */
 test('进程级：MCP 立即可答、核心启动失败降级文案、stdin 关闭即退场', { timeout: 40000 }, async (t) => {
   const home = makeTempDir(t);
+  const claudeConfig = makeTempDir(t);
   const mainUrl = pathToFileURL(fileURLToPath(new URL('../src/bridge/main.js', import.meta.url))).href;
   const code = `import { startBridge } from ${JSON.stringify(mainUrl)};\nawait startBridge();`;
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: ['--input-type=module', '-e', code],
     cwd: repoRoot,
-    env: { ...process.env, WAYSTATION_HOME: home, CLAUDE_CODE_SESSION_ID: 'session-bridge-proc-1' },
+    env: {
+      ...process.env, WAYSTATION_HOME: home, CLAUDE_CONFIG_DIR: claudeConfig, CLAUDE_CODE_SESSION_ID: 'session-bridge-proc-1',
+    },
   });
   let childPid = null;
   t.after(async () => {

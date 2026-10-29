@@ -575,8 +575,7 @@ function sendRegisterUpdate(state, meta) {
   if (!state.registered || state.client === null || meta === null || typeof meta !== 'object') {
     return false;
   }
-  state.client.send({ type: 'register-update', ...meta });
-  return true;
+  return state.client.send({ ...meta, type: 'register-update' });
 }
 
 /* 连接断开（含卡死判定与对端关闭）：清注册态、在途调用统一收口、进重生流（判陈旧后冷启）。
