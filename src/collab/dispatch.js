@@ -396,8 +396,8 @@ function bindApprovedClaim(runtime, record, claimId, sessionId) {
     return { ok: false, message: '目标会话已不在本机注册表内——请让 master 重新发起' };
   }
   record.claims.delete(claimId);
+  /* 加入事件统一由 bindSlave 入去抖队列——这里不再直发，避免同一成员被通知两次。 */
   bindSlave(runtime, record, target);
-  sendNotice(runtime, record, record.masterSessionId, `「${target.name}」已加入 dispatch`, 'dispatch-member-joined');
   return { ok: true, approved: true, bound: true, sessionId };
 }
 
@@ -416,6 +416,8 @@ function releaseSlaveIn(runtime, { sessionId, targetSessionId }) {
   /* 释放后该会话不再属于本 dispatch（dispatchOf 也找不到它），待补投队列再无人 flush：
    * 连刚排入的释放通知一起回收，避免内存滞留。主调用的通知走 master 队列，不受影响。 */
   record.queues.delete(targetSessionId);
+  /* 先把窗口内待发的加入事件送出去，保证 master 看到的顺序是「加入在前、离席在后」。 */
+  flushMemberEvents(runtime, record);
   sendNotice(runtime, record, sessionId, `已释放「${slave.name}」`, 'dispatch-member-left');
   return { ok: true, sessionId: targetSessionId };
 }
@@ -581,6 +583,7 @@ function leaveDispatchIn(runtime, { collabId, sessionId }) {
   record.slaves.delete(sessionId);
   record.grace.delete(sessionId);
   record.queues.delete(sessionId);
+  flushMemberEvents(runtime, record);
   sendNotice(runtime, record, record.masterSessionId, `「${slave.name}」已退出 dispatch`, 'dispatch-member-left');
   return { ok: true, collabId };
 }
@@ -620,7 +623,11 @@ function sweepDispatchesIn(runtime, at) {
   }
 }
 
+/* 宽限超时：master 超时＝整个 dispatch 结束（结束通知不合并）；slave 超时先移除再统一通告。
+ * 单个超时保持既有直发 member-left（同步语义）；同一节拍多个超时合并成一条成员事件，
+ * 避免一次清扫刷屏。 */
 function sweepGraceOf(runtime, record, at) {
+  const expired = [];
   for (const [sessionId, deadline] of [...record.grace]) {
     if (deadline > at) {
       continue;
@@ -633,7 +640,23 @@ function sweepGraceOf(runtime, record, at) {
     record.slaves.delete(sessionId);
     record.grace.delete(sessionId);
     record.queues.delete(sessionId);
-    sendNotice(runtime, record, record.masterSessionId, `「${slave?.name ?? sessionId}」宽限超时离席`, 'dispatch-member-left');
+    expired.push(slave?.name ?? sessionId);
+  }
+  notifyGraceTimeouts(runtime, record, expired);
+}
+
+function notifyGraceTimeouts(runtime, record, expired) {
+  if (expired.length === 0) {
+    return;
+  }
+  /* 先送窗口内待发的加入事件：成员先加入后超时，顺序不得倒置。 */
+  flushMemberEvents(runtime, record);
+  if (expired.length === 1) {
+    sendNotice(runtime, record, record.masterSessionId, `「${expired[0]}」宽限超时离席`, 'dispatch-member-left');
+    return;
+  }
+  for (const name of expired) {
+    queueMemberEvent(runtime, record, `「${name}」宽限超时离席`);
   }
 }
 
@@ -647,13 +670,44 @@ function sweepClaimsOf(runtime, record, at) {
   }
 }
 
-/* 绑定收尾：登记 slave、清宽限标记，并把断连期间排队的通知补投（notify 恢复后即可达）。 */
+/* 绑定收尾：登记 slave、清宽限标记，并把断连期间排队的通知补投（notify 恢复后即可达）。
+ * 加入事件入 500ms 去抖队列（批量收编时合并成一条），不再逐成员直发。 */
 function bindSlave(runtime, record, meta) {
   record.slaves.set(meta.sessionId, {
     sessionId: meta.sessionId, name: meta.name, kind: meta.kind, role: meta.role, boundAt: runtime.now(),
   });
   record.grace.delete(meta.sessionId);
   flushQueue(runtime, record, meta.sessionId);
+  queueMemberEvent(runtime, record, `「${meta.name}」已加入`);
+}
+
+/* 成员事件去抖：同一 500ms 窗口内的加入 / 批量离席文本合并成一条 dispatch-member-event 投给 master。
+ * 定时器 unref，不拖住进程；dispatch 结束时由 endDispatch 清除。离席的单个事件仍走既有直发
+ * （Task 2/5 的同步口径），但投递前会 flush 本队列，保证「先加入、后离席」的顺序。 */
+function queueMemberEvent(runtime, record, text) {
+  record.pendingEvents.push(text);
+  if (record.eventTimer !== null) {
+    return;
+  }
+  const timer = setTimeout(() => {
+    record.eventTimer = null;
+    flushMemberEvents(runtime, record);
+  }, DISPATCH_MEMBER_EVENT_DEBOUNCE_MS);
+  timer.unref?.();
+  record.eventTimer = timer;
+}
+
+function flushMemberEvents(runtime, record) {
+  if (record.pendingEvents.length === 0) {
+    return;
+  }
+  if (record.eventTimer !== null) {
+    clearTimeout(record.eventTimer);
+    record.eventTimer = null;
+  }
+  const text = record.pendingEvents.join('；');
+  record.pendingEvents.length = 0;
+  sendNotice(runtime, record, record.masterSessionId, text, 'dispatch-member-event');
 }
 
 function claimOf(state, claimId) {

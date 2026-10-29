@@ -792,6 +792,8 @@ function startService(state) {
   /* 邀请/在途入席的生命周期清扫挂到既有 presence 节拍（takeover.runPresenceTick）：
    * 不新增定时器；清扫只触碰本机三本账，异常隔离不影响心跳。 */
   state.joinLifecycleSweep = () => {
+    /* dispatch 宽限清扫搭同一节拍（不新增定时器）；纯内存域，重启即空。 */
+    state.dispatchDomain?.sweep?.(state.clock());
     pruneConfirmGates(state, state.clock());
     if (confirmGateOverCap(state)) {
       state.log.warn('确认门会话覆盖超过上限（在线会话不淘汰）', {
@@ -2911,6 +2913,8 @@ async function registerBridgeNow(state, sessionId, bridgeId) {
    * （过期＝会话覆盖应随之清除，不得因迟到的重连保留）。 */
   pruneConfirmGates(state, state.clock());
   markConfirmGateOpen(state, sessionId);
+  /* 桥重连撤销 dispatch 宽限并补投断连期间排队的通知（dispatch 域未创建＝降级，跳过）。 */
+  state.dispatchDomain?.noteBridgeOnline?.(sessionId);
   state.sessionBridges.set(sessionId, bridgeId);
   noteSessionRebound(state, sessionId);
   let seats = 0;
@@ -3086,11 +3090,20 @@ function unregisterSessionBridgeOf(state, sessionId, bridgeId) {
   }
 }
 
+/* dispatch 宽限与 confirm-gate 同一条件：桥清理后仍无当前桥才算断开——
+ * 旧桥迟到断开不得给新桥打宽限。 */
+function noteDispatchBridgeClosedOf(state, sessionId) {
+  if (state.sessionBridges.get(sessionId) === undefined) {
+    state.dispatchDomain?.noteBridgeClosed?.(sessionId, state.clock());
+  }
+}
+
 function unregisterBridgeNow(state, sessionId, bridgeId) {
   if (!validSessionId(sessionId)) {
     return { ok: false, reason: 'bad-session' };
   }
   unregisterSessionBridgeOf(state, sessionId, bridgeId);
+  noteDispatchBridgeClosedOf(state, sessionId);
   let cleared = 0;
   for (const local of state.collabs.values()) {
     const seat = localSeatOfLocal(local, sessionId);
