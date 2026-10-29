@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -118,6 +120,35 @@ test('桥运行时：dataDir 取数据根解析；关闭转发到连接件', asy
   assert.equal(runtime.registry.list().length, 23);
   await runtime.close();
   assert.equal(closed, 1);
+});
+
+test('桥运行时：会话元数据变化经 sendRegisterUpdate 外送，close 一并停 watcher', async (t) => {
+  const root = makeTempDir(t);
+  const dir = join(root, 'sessions');
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, '1.json');
+  writeFileSync(file, JSON.stringify({ sessionId: 'sess-meta', name: 'before', kind: 'interactive' }));
+  const updates = [];
+  let closed = 0;
+  const link = stubLink({
+    sendRegisterUpdate: (meta) => {
+      updates.push(meta);
+      return true;
+    },
+    close: async () => { closed++; },
+  });
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const runtime = createBridgeRuntime({
+    env: { CLAUDE_CONFIG_DIR: root, CLAUDE_CODE_SESSION_ID: 'sess-meta' },
+    log: quietLog(),
+    writer: { deliver: async () => ({ ok: true }) },
+    link,
+  });
+  writeFileSync(file, JSON.stringify({ sessionId: 'sess-meta', name: 'after', kind: 'interactive' }));
+  t.mock.timers.tick(5000);
+  assert.equal(updates.at(-1)?.name, 'after', '文件变化经 watcher 外送（5s 周期）');
+  await runtime.close();
+  assert.equal(closed, 1, '关闭转发到连接件（watcher 同时停止）');
 });
 
 test('注入写面不可用：桥启动即告警（既有组合根「适配器不可用」告警的接续）', async () => {

@@ -153,6 +153,25 @@ test('四态·无文件：冷启 spawn（detached/剥离会话私有环境）→
   assert.equal('CLAUDE_CODE_MESSAGING_TOKEN' in call.options.env, false, '会话凭据不出桥进程');
 });
 
+test('hello 携启动期会话元数据：注册记录的 role/name/kind 等来自 hello', { timeout: 15000 }, async (t) => {
+  const home = makeTempDir(t);
+  writeRecord(home);
+  const server = await startStubCore(t, home);
+  const link = linkFor(home, () => {
+    throw new Error('描述符就绪时不应冷启');
+  }, {
+    role: 'slave', masterName: 'boss', name: 'worker', kind: 'bg', entrypoint: 'cli', status: 'idle', metaUpdatedAt: 123,
+  });
+  t.after(() => link.close());
+  const outcome = await link.ensureCore();
+  assert.equal(outcome.ok, true);
+  const [record] = server.listBridges();
+  assert.deepEqual(
+    [record.role, record.masterName, record.name, record.kind, record.entrypoint, record.status, record.metaUpdatedAt],
+    ['slave', 'boss', 'worker', 'bg', 'cli', 'idle', 123],
+  );
+});
+
 test('四态·无文件且 spawn 失败：cold-start-failed（含 errno）→ 后台慢速重试、关闭后停止', { timeout: 15000 }, async (t) => {
   const home = makeTempDir(t);
   let attempts = 0;

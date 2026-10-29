@@ -8,6 +8,7 @@ import { createMcpServer } from '../server.js';
 import { TOOL_SPECS } from '../tools/specs.js';
 import { createCoreLink } from './ipc-client.js';
 import { createSessionWriter } from './session-writer.js';
+import { bridgeMetaOf, createSessionMetaWatcher } from './session-meta.js';
 
 /* 桥组合根（设计 §2.1/§2.2）：stdio MCP 门面＋工具目录/转发＋本会话注入口写入＋核心连接监督。
  * 桥只做两件半事：23 工具的目录（不依赖核心即答）与调用转发、注入写入（复用适配器写面）、
@@ -68,22 +69,10 @@ export function createBridgeRuntime(options = {}) {
   const log = options.log ?? createStderrLog();
   const dataDir = options.dataDir ?? resolveDataDir(env);
   const writer = options.writer ?? createSessionWriter({ env, log });
-  /* 启动力检（既有组合根的「会话投递适配器不可用」告警在此接续）：未检测到会话消息套接字＝
-   * 本会话收不到推送，消息停留第二档、可经 ws_check_inbox 拉取——该条件不静默。 */
-  if (writer.available?.() === false) {
-    log.warn('会话投递适配器不可用（未检测到会话消息套接字）——投递降级为会话主动查');
-  }
-  const link = options.link ?? createCoreLink({
-    dataDir,
-    env,
-    log,
-    app: BRIDGE_VERSION,
-    bridgeId: randomUUID(),
-    sessionId: sessionIdOf(env),
-    fastRetryMs: options.fastRetryMs,
-    callTimeoutMs: options.callTimeoutMs,
-    guardOptions: options.guardOptions,
-  });
+  warnIfWriterUnavailable(writer, log);
+  const sessionId = sessionIdOf(env);
+  const link = options.link ?? createCoreLink(linkOptionsOf({ options, env, log, dataDir, sessionId }));
+  const watcher = startSessionMetaWatcher(options, env, sessionId, link);
   link.setPushHandler((push) => {
     void deliverPush(link, writer, push, log);
   });
@@ -97,8 +86,48 @@ export function createBridgeRuntime(options = {}) {
     writer,
     link,
     registry: createForwardingRegistry({ link }),
-    close: () => link.close(),
+    close: async () => {
+      watcher?.close();
+      await link.close();
+    },
   };
+}
+
+/* 启动力检（既有组合根的「会话投递适配器不可用」告警在此接续）：未检测到会话消息套接字＝
+ * 本会话收不到推送，消息停留第二档、可经 ws_check_inbox 拉取——该条件不静默。 */
+function warnIfWriterUnavailable(writer, log) {
+  if (writer.available?.() === false) {
+    log.warn('会话投递适配器不可用（未检测到会话消息套接字）——投递降级为会话主动查');
+  }
+}
+
+/* 连接件构造参数：启动期会话元数据快照随 hello 上报（后续变化经 register-update）。 */
+function linkOptionsOf({ options, env, log, dataDir, sessionId }) {
+  return {
+    dataDir,
+    env,
+    log,
+    app: BRIDGE_VERSION,
+    bridgeId: randomUUID(),
+    sessionId,
+    ...bridgeMetaOf({ env, sessionId }),
+    fastRetryMs: options.fastRetryMs,
+    callTimeoutMs: options.callTimeoutMs,
+    guardOptions: options.guardOptions,
+  };
+}
+
+/* 会话元数据 watcher：与核心连接并行运行（未注册期间变化被 sendRegisterUpdate 丢弃，
+ * 注册后的变化外送 register-update；初次快照已随 hello 上报）。测试/注入链路可显式关闭。 */
+function startSessionMetaWatcher(options, env, sessionId, link) {
+  if (options.sessionMetaWatcher === false) {
+    return null;
+  }
+  return createSessionMetaWatcher({
+    env,
+    sessionId,
+    onChange: (meta) => link.sendRegisterUpdate?.(meta),
+  });
 }
 
 function sessionIdOf(env) {

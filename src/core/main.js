@@ -539,6 +539,10 @@ function closeBridgeEntry(state, record) {
  * 每次 call 必回恰一帧 result）；replace → 换代席（首个受理并收尾、其后一律回 replacing）。
  * 帧处理各自独立——执行面的 async 异常在此隔离（回调抛错契约：消费者自行兜底）。 */
 function dispatchCoreFrame(state, frame, record) {
+  if (frame.type === 'register-update') {
+    applyRegisterUpdate(state, frame, record);
+    return;
+  }
   if (frame.type === 'delivered') {
     state.routing.settleDelivered(frame);
     return;
@@ -551,6 +555,23 @@ function dispatchCoreFrame(state, frame, record) {
   if (frame.type === 'replace') {
     handleReplaceFrame(state, frame, record);
   }
+}
+
+/* register-update 只改本连接的会话元数据：身份取 record（连接已认证），不认帧内 sessionId /
+ * bridgeId，防止一个桥改别的会话。 */
+function applyRegisterUpdate(state, frame, record) {
+  if (record === null || record.sessionId === null) {
+    return;
+  }
+  /* role / masterName 只来自 hello 的启动期环境；register-update 不得改写——
+   * 否则同一个桥可以在注册后把自己升级成 master。其余字段按「帧里出现即覆盖」，
+   * 允许 null 把已消失的 Claude 会话信息清回未知。 */
+  for (const key of ['name', 'kind', 'entrypoint', 'status', 'metaUpdatedAt']) {
+    if (Object.hasOwn(frame, key)) {
+      record[key] = frame[key];
+    }
+  }
+  state.sessionStatus?.refresh?.();
 }
 
 /* 换代受理（设计 §5.2 步 1-2）：首个 replace 定 replacer（广播与收尾在席的受理回调里，恰一次）；
@@ -794,6 +815,39 @@ function buildContext(state) {
   };
 }
 
+/* 会话元数据提供者（dispatch 域消费）：注册表运行期现取——未装配/会话离线如实为 null；
+ * 字段缺失按未知值回退（kind 缺失按非交互式，失败关闭）。 */
+function sessionMetaOf(state, sessionId) {
+  const entry = state.bridges?.find?.(sessionId);
+  return entry === null || entry === undefined ? null : sessionMetaOfRecord(sessionId, entry.record);
+}
+
+function sessionMetaOfRecord(sessionId, record) {
+  return {
+    sessionId,
+    online: true,
+    role: record.role ?? 'none',
+    masterName: record.masterName ?? null,
+    name: record.name ?? null,
+    kind: record.kind ?? null,
+    entrypoint: record.entrypoint ?? null,
+    status: record.status ?? null,
+    metaUpdatedAt: record.metaUpdatedAt ?? 0,
+  };
+}
+
+function listSessionIds(state) {
+  return (state.bridges?.list?.() ?? []).map((entry) => entry.sessionId).filter((id) => typeof id === 'string');
+}
+
+/* 会话元数据提供者接线（dispatch 域消费）：注册表运行期现取，未装配相位为空。 */
+function sessionMetaWiringOf(state) {
+  return {
+    sessionMetaOf: (sessionId) => sessionMetaOf(state, sessionId),
+    listSessionIds: () => listSessionIds(state),
+  };
+}
+
 /* 启动序步骤五前置·组件构造（协作服务的构造内含注册表加载/恢复——复用既有实现，不另写加载器）。
  * 构造必须先于 net.start：入站帧处理依赖钩子成员（既有接线顺序，不是新语义）。
  * 注入路由先于协作服务构造（notify 注入面需要它，describeCollab 闭包运行期才取服务）；
@@ -828,6 +882,7 @@ function buildComponents(state) {
     pendingOutboundOf: (query) => dispatch.pendingOutboundOf(query),
     /* 桥注册证据（重启对账）：会话在宽限内重绑过即撤销该席位的待补发判定。 */
     onSessionRebound: (sessionId) => noteStopReconcileRebound(state, sessionId),
+    ...sessionMetaWiringOf(state),
     probe: (address, port) => dispatch.ping({ address, port }),
     reassign: (payload) => dispatch.reassignPeer(payload),
     ...deliveryWiringOf(state),

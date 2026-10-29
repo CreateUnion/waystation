@@ -71,6 +71,7 @@ export function createCoreLink(options = {}) {
     ensureCore: () => ensureCore(state),
     call: (tool, args) => callTool(state, tool, args),
     sendDelivered: (frame) => sendDelivered(state, frame),
+    sendRegisterUpdate: (meta) => sendRegisterUpdate(state, meta),
     setPushHandler: (handler) => {
       state.pushHandler = handler;
     },
@@ -102,6 +103,8 @@ function buildLinkState(options) {
     app: options.app,
     bridgeId: options.bridgeId ?? randomUUID(),
     sessionId: options.sessionId,
+    // 启动期会话元数据快照（hello 上报）；register-update 的变化由 bridge/main 的 watcher 外送
+    sessionMeta: sessionMetaOf(options),
     coreEntry: options.coreEntry ?? CORE_ENTRY_PATH,
     spawnFn: options.spawn ?? spawnChild,
     ...changeoverSettingsOf(options),
@@ -127,6 +130,20 @@ function buildLinkState(options) {
     rebirth: false,
     rapidAttempts: [],
     view: { registered: false, welcome: null, lastFailure: null, rebirth: false, rapidRetries: 0 },
+  };
+}
+
+/* 启动期会话元数据快照：字段缺省保持 undefined（helloFrameOf 只上非 undefined 字段——
+ * 非 Claude 客户端与旧测试路径不必制造空字段）。 */
+function sessionMetaOf(options) {
+  return {
+    role: options.role,
+    masterName: options.masterName,
+    name: options.name,
+    kind: options.kind,
+    entrypoint: options.entrypoint,
+    status: options.status,
+    metaUpdatedAt: options.metaUpdatedAt,
   };
 }
 
@@ -403,7 +420,9 @@ function createClientFor(state, record, token, flow) {
   let client = null;
   client = createIpcClient({
     dataDir: state.dataDir,
-    hello: { app: state.app, v: state.ipcV, token, bridgeId: state.bridgeId, sessionId: state.sessionId },
+    hello: {
+      app: state.app, v: state.ipcV, token, bridgeId: state.bridgeId, sessionId: state.sessionId, ...state.sessionMeta,
+    },
     onFrame: (frame) => {
       if (state.client === client) {
         handleFrame(state, frame);
@@ -548,6 +567,16 @@ function sendDelivered(state, frame) {
     return false;
   }
   return client.send(frame);
+}
+
+/* 会话元数据变化上报：未注册/无连接时静默丢弃（下一次 hello 仍携启动期快照）；
+ * 只外送变化字段，身份与会话归属由核心按连接记录判定（帧内不认 sessionId/bridgeId）。 */
+function sendRegisterUpdate(state, meta) {
+  if (!state.registered || state.client === null || meta === null || typeof meta !== 'object') {
+    return false;
+  }
+  state.client.send({ type: 'register-update', ...meta });
+  return true;
 }
 
 /* 连接断开（含卡死判定与对端关闭）：清注册态、在途调用统一收口、进重生流（判陈旧后冷启）。

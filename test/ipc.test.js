@@ -261,6 +261,7 @@ const CANONICAL_FRAMES = [
   { type: 'replace', reason: 'version-mismatch', wantApp: '0.2.0' },
   { type: 'replace', reason: 'manual' },
   { type: 'core-restarting', reason: 'version-mismatch', replacerBridgeId: 'bridge-1', targetApp: '0.2.0', deadlineMs: 10000 },
+  { type: 'register-update', role: 'slave', name: 'worker', kind: 'bg', status: 'idle', metaUpdatedAt: 1 },
   { type: 'ping' },
   { type: 'pong' },
   { type: 'bye', reason: 'session-end' },
@@ -271,7 +272,7 @@ test('帧往返：规范帧逐类型经 encode→解码→校验后与原文逐�
   assert.deepEqual(
     [...new Set(CANONICAL_FRAMES.map((frame) => frame.type))].sort(),
     [...FRAME_TYPES].sort(),
-    '11 种帧类型均须有规范帧与校验器（新增类型须同步本用例）',
+    '12 种帧类型均须有规范帧与校验器（新增类型须同步本用例）',
   );
   const frames = [];
   const refusals = [];
@@ -607,6 +608,26 @@ test('注册后：未知类型/方向错/形态不合 → 拒帧计数但连接�
   assert.equal(received[0].frame.id, 'call-good');
   assert.equal(received[0].record.bridgeId, 'bridge-2');
   assert.equal(server.state.refusedFrames, 3);
+  assert.equal(server.listBridges().length, 1, '拒帧不得牵连注册');
+});
+
+test('register-update：合法字段到达业务面，未知 role 拒帧且连接保持', async (t) => {
+  const cleanup = cleanupOf(t);
+  const root = makeTempDir(t);
+  const received = [];
+  const server = startServer(cleanup, root, { onFrame: (frame, record) => received.push({ frame, record }) });
+  await server.start();
+  const client = startClient(cleanup, root, { bridgeId: 'bridge-meta', sessionId: 'session-meta' });
+  await client.connect();
+
+  client.send({ type: 'register-update', role: 'slave', name: 'worker', kind: 'bg', status: 'idle', metaUpdatedAt: 1 });
+  await waitFor(() => received.some((entry) => entry.frame.type === 'register-update' && entry.frame.role === 'slave'));
+  assert.equal(received.at(-1).record.bridgeId, 'bridge-meta');
+
+  client.send({ type: 'register-update', role: 'root' });
+  client.send({ type: 'call', id: 'call-after', tool: 'ws_status', args: {} });
+  await waitFor(() => received.some((entry) => entry.frame.id === 'call-after'));
+  assert.equal(received.some((entry) => entry.frame.type === 'register-update' && entry.frame.role === 'root'), false);
   assert.equal(server.listBridges().length, 1, '拒帧不得牵连注册');
 });
 

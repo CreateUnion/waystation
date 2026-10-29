@@ -39,11 +39,11 @@ export const PEER_TIMEOUT_MS = 30_000;
 export const IPC_CONNECT_TIMEOUT_MS = 5000;
 export const IPC_HANDSHAKE_TIMEOUT_MS = 10000;
 
-/* 帧类型全集（设计 §2.4 帧表）：11 种、两端契约，未知类型一律拒。 */
-export const FRAME_TYPES = ['hello', 'welcome', 'call', 'result', 'push', 'delivered', 'replace', 'core-restarting', 'ping', 'pong', 'bye'];
+/* 帧类型全集（设计 §2.4 帧表）：12 种、两端契约，未知类型一律拒。 */
+export const FRAME_TYPES = ['hello', 'welcome', 'call', 'result', 'push', 'delivered', 'replace', 'core-restarting', 'register-update', 'ping', 'pong', 'bye'];
 
 /* 方向归属（帧表的「方向」列）：每端只接受自己方向入站的那批，其余按未知帧拒。 */
-const SERVER_INBOUND_TYPES = new Set(['call', 'delivered', 'replace', 'bye', 'ping', 'pong']);
+const SERVER_INBOUND_TYPES = new Set(['call', 'delivered', 'replace', 'register-update', 'bye', 'ping', 'pong']);
 const CLIENT_INBOUND_TYPES = new Set(['welcome', 'result', 'push', 'core-restarting', 'ping', 'pong']);
 
 const PLATFORMS = ['win32', 'linux', 'darwin'];
@@ -269,7 +269,40 @@ function checkHello(frame) {
   if (!isPlatform(frame.platform)) {
     return refuse('hello.platform 不在词表');
   }
-  return accepted(frame);
+  return checkSessionMetaFields(frame);
+}
+
+/* 会话元数据字段（hello 与 register-update 共用判据）：role / kind 走词表，文本字段按短文本
+ * 上界（null 表示「未知/已消失」），metaUpdatedAt 为非负有限数。 */
+function checkSessionMetaFields(frame) {
+  const refusal = checkSessionMetaVocabulary(frame) ?? checkSessionMetaText(frame) ?? checkSessionMetaTimestamp(frame);
+  return refusal ?? accepted(frame);
+}
+
+function checkSessionMetaVocabulary(frame) {
+  if (frame.role !== undefined && !['master', 'slave', 'none'].includes(frame.role)) {
+    return refuse('session-meta.role 不在词表');
+  }
+  if (frame.kind !== undefined && !['interactive', 'bg', 'unknown'].includes(frame.kind)) {
+    return refuse('session-meta.kind 不在词表');
+  }
+  return null;
+}
+
+function checkSessionMetaText(frame) {
+  for (const field of ['masterName', 'name', 'entrypoint', 'status']) {
+    if (frame[field] !== undefined && frame[field] !== null && !isShortText(frame[field])) {
+      return refuse(`session-meta.${field} 非法`);
+    }
+  }
+  return null;
+}
+
+function checkSessionMetaTimestamp(frame) {
+  if (frame.metaUpdatedAt !== undefined && (!Number.isFinite(frame.metaUpdatedAt) || frame.metaUpdatedAt < 0)) {
+    return refuse('session-meta.metaUpdatedAt 非法');
+  }
+  return null;
 }
 
 function checkWelcome(frame) {
@@ -428,6 +461,7 @@ const FRAME_CHECKERS = new Map([
   ['delivered', checkDelivered],
   ['replace', checkReplace],
   ['core-restarting', checkCoreRestarting],
+  ['register-update', checkSessionMetaFields],
   ['ping', checkHeartbeat],
   ['pong', checkHeartbeat],
   ['bye', checkBye],
@@ -720,6 +754,13 @@ function registerBridge(state, conn, hello) {
     platform: hello.platform,
     app: hello.app,
     v: hello.v,
+    role: hello.role ?? 'none',
+    masterName: hello.masterName ?? null,
+    name: hello.name ?? null,
+    kind: hello.kind ?? null,
+    entrypoint: hello.entrypoint ?? null,
+    status: hello.status ?? null,
+    metaUpdatedAt: hello.metaUpdatedAt ?? 0,
     send: (frame) => sendToConn(state, conn, frame),
     close: () => conn.socket.destroy(),
   };
@@ -842,7 +883,9 @@ function listBridges(state) {
  * 消费者须自行隔离。
  * @param {{
  *   dataDir: string,
- *   hello: { app: string, v?: number, token: string, bridgeId: string, sessionId?: string, pid?: number, platform?: string },
+ *   hello: { app: string, v?: number, token: string, bridgeId: string, sessionId?: string, pid?: number, platform?: string,
+ *     role?: string, masterName?: string | null, name?: string | null, kind?: string, entrypoint?: string | null,
+ *     status?: string | null, metaUpdatedAt?: number },
  *   onFrame?: (frame: any) => void,
  *   onStuck?: () => void,
  *   onClose?: (info: { reason: string }) => void,
@@ -967,8 +1010,17 @@ function helloFrameOf(state) {
   if (hello.sessionId !== undefined) {
     frame.sessionId = hello.sessionId;
   }
+  for (const field of SESSION_META_FIELDS) {
+    if (hello[field] !== undefined) {
+      frame[field] = hello[field];
+    }
+  }
   return frame;
 }
+
+/* hello 可选的会话元数据字段（register-update 的启动期快照）；undefined 不上帧——
+ * JSON 往返会丢 undefined，发送面不必制造空字段。 */
+const SESSION_META_FIELDS = ['role', 'masterName', 'name', 'kind', 'entrypoint', 'status', 'metaUpdatedAt'];
 
 /* Error 带 code 的构造（各处拒绝原因统一走本函数：code 供上层按类处置/定向文案）。 */
 function errorWithCode(code, message) {
