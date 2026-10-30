@@ -329,6 +329,19 @@ function claimTargetOf(runtime, record, masterSessionId, targetSessionId) {
     return { sessionId: targetSessionId, status: 'bound' };
   }
   if (runtime.isInteractiveOf(target)) {
+    /* claim 门 off（与邀请 / 加入门同族的第三道门）：收编免人工确认——直接绑定并注入
+     * 知情通知，不进 pending（本机设置已表态，master 手动 claim 与 autoClaim 同待遇）。 */
+    if (gateValueOf(runtime.state, targetSessionId, 'claim').effectiveValue === false) {
+      bindSlave(runtime, record, target);
+      sendNotice(
+        runtime,
+        record,
+        targetSessionId,
+        `已按本机设置自动同意 master「${record.masterName}」的收编（要退出用 ws_leave_collab）`,
+        'dispatch-claim-auto',
+      );
+      return { sessionId: targetSessionId, status: 'bound' };
+    }
     return pendingClaimOf(runtime, record, masterSessionId, targetSessionId);
   }
   return rejectedClaim(targetSessionId, '非交互式会话且未带 WAYSTATION_ROLE=slave——没有人可确认（可收编目标在 ws_dispatch_scan 中标 claimable: true）');
