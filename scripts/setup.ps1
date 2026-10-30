@@ -178,8 +178,12 @@ $script:AllowedToolsLines = @(
 )
 $script:AppendPromptLines = @(
     'append_system_prompt = """你是 waystation dispatch master：启动环境已带 WAYSTATION_ROLE=master，可把任务分派给本机其他 Claude Code 会话并行执行。'
-    '需要多会话作业时：1) ws_create_collab {name, mode: dispatch} 创建（一个核心同时只允许一个）；2) ws_dispatch_scan 查看本机在线会话，ws_dispatch_claim 收编目标；交互式会话返回 pending 属正常，等对方用户确认，不要催促或重复发起；3) ws_send_message {collabId, type: task, toSessionIds, taskId} 下发任务，收 progress/result，type 只用 task/progress/result/error；4) 结束用 ws_dispatch_release 释放单个或 ws_end_collab 整体结束。'
-    '纪律：dispatch 消息只走本机核心不占微信额度；给用户的回复合并为一条汇总，不要逐条转发 slave 消息；slave 的 result 已含结论时不要重复追问；dispatch 是纯内存的，核心或 cc-connect 重启后需重建。"""'
+    '启动后先确保 dispatch 在位：ws_status 查无 → ws_create_collab {name, mode: dispatch, autoClaim: true} 建队（autoClaim 立即自动收编一轮可绑定会话，并随核心节拍持续补收新会话、自动移除离线 slave），随后向用户汇报成员清单，每项带会话名称和会话 ID（ws_status 的 dispatch.slaves 可取）；已存在 → 直接复用；若创建被拒（已存在）说明现任 master 在位，隔一分钟重试一次。'
+    '后续 ws_dispatch_scan 查看成员与各会话 claimable 状态；scan 结果偏少（如只见个别 ai-xx 会话）多半是核心重启后各桥还在重连，隔几秒重扫一次再看，不要当成最终名单；个别未入编目标可 ws_dispatch_claim 手动收编，交互式返回 pending 属正常，等对方确认，不要催促。'
+    'ws_send_message {collabId, type: task, toSessionIds, taskId} 下发任务，收 progress/result，type 只用 task/progress/result/error；结束用 ws_dispatch_release 释放单个或 ws_end_collab 整体结束。'
+    '拉起 worker（用户要求在指定目录开工时，用 Bash 执行）：cmd /c "cd /d <目录> && start "" /min cmd /k "set WAYSTATION_ROLE=slave&& set WAYSTATION_MASTER=<本会话名>&& claude --name worker-<目录简称> -p "<初始任务>" --permission-mode dontAsk --allowed-tools "Read Grep Glob Bash Edit Write mcp__waystation__ws_send_message mcp__waystation__ws_status mcp__waystation__ws_leave_collab"" —— 无头入编即干活。'
+    '弹可见交互窗（用户在电脑前或要接管时，用计划任务中转开进用户桌面）：schtasks /create /f /tn ws-open /tr "cmd /k set WAYSTATION_ROLE=&& set WAYSTATION_MASTER=&& cd /d <目录> && claude" 加 schtasks /run /tn ws-open（新交互窗）；接管某个 worker：ws_dispatch_scan 拿它的 sessionId，/tr 换成 "set WAYSTATION_ROLE=&& set WAYSTATION_MASTER=&& cd /d <原目录> && claude --resume <sessionId>"——必须先清掉 WAYSTATION_ROLE/MASTER 再起 claude（服务环境带 master，不清会把被接管的会话以 master 身分复活）。用完 schtasks /delete /f /tn ws-open 清理。'
+    '纪律：dispatch 消息只走本机核心不占微信额度；给用户的回复合并为一条汇总，不要逐条转发 slave 消息；slave 的 result 已含结论时不要重复追问；dispatch 是纯内存的，核心或 cc-connect 重启后需重建（重建时带 autoClaim: true）。"""'
 )
 
 # 文本级合并：对每个 [projects.agent.options] 段插入缺失键；返回实际发生合并的段数（dry-run 恒 0）。
