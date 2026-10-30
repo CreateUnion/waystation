@@ -14,10 +14,11 @@ function fakeState(overrides = {}) {
   };
 }
 
-test('确认门默认值：两个门都要求人工确认', () => {
+test('确认门默认值：三个门都要求人工确认', () => {
   const config = buildDefaults('test-host');
   assert.equal(config.inviteConfirmation, true);
   assert.equal(config.joinRequestConfirmation, true);
+  assert.equal(config.dispatchClaimConfirmation, true);
 });
 
 test('优先级：会话覆盖 > config；clear 后回落 config', () => {
@@ -100,10 +101,30 @@ test('自动批准通知队列：64 条上限，按会话取回，溢出拒绝',
 test('门名校验与配置键映射', () => {
   assert.equal(isConfirmGate('invite'), true);
   assert.equal(isConfirmGate('join'), true);
+  assert.equal(isConfirmGate('claim'), true);
   assert.equal(isConfirmGate('other'), false);
   assert.equal(isConfirmGate(undefined), false);
   assert.equal(gateConfigKey('invite'), 'inviteConfirmation');
   assert.equal(gateConfigKey('join'), 'joinRequestConfirmation');
+  assert.equal(gateConfigKey('claim'), 'dispatchClaimConfirmation');
+});
+
+test('claim 门：会话覆盖 > config；clear 回落；三门覆盖互不挤占条目', () => {
+  const state = fakeState({ dispatchClaimConfirmation: true });
+  assert.deepEqual(gateValueOf(state, 'sess-a', 'claim'), {
+    sessionValue: null, configValue: true, effectiveValue: true,
+  });
+  setSessionGate(state, 'sess-a', 'claim', false, 0);
+  assert.deepEqual(gateValueOf(state, 'sess-a', 'claim'), {
+    sessionValue: false, configValue: true, effectiveValue: false,
+  });
+  // 三门覆盖并存时互不挤占；全部门清空才删条目
+  setSessionGate(state, 'sess-a', 'invite', false, 1);
+  assert.equal(clearSessionGate(state, 'sess-a', 'claim'), true);
+  assert.equal(state.confirmGates.sessions.has('sess-a'), true, 'invite 覆盖仍在');
+  assert.equal(gateValueOf(state, 'sess-a', 'claim').sessionValue, null);
+  assert.equal(clearSessionGate(state, 'sess-a', 'invite'), true);
+  assert.equal(state.confirmGates.sessions.has('sess-a'), false, '全门清空删条目');
 });
 
 test('会话表上限：256 条在线会话不越界，257 条越界', () => {

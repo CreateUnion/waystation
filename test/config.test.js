@@ -45,6 +45,7 @@ test('buildDefaults：标识名取传入主机名，形状完整', () => {
   assert.deepEqual(Object.keys(defaults).sort(), [
     'autoDeliver',
     'dialTimeoutMs',
+    'dispatchClaimConfirmation',
     'dispatchTickMs',
     'forumSyncIntervalMs',
     'freezeUnresolvedMs',

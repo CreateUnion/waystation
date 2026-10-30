@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { MAX_TOPIC_CHARS, isIdentityName, isPresentationText } from '../net/protocol.js';
 import { shortSessionId } from '../util/short-id.js';
+import { gateValueOf } from './confirm-gate.js';
 
 /* dispatch 内存域：与 managed / forum 同级的第三种模式，但不进 state.collabs、不写任何协作文件。
  * 状态全部在 state.dispatches（Map<collabId, record>）。本模块只做纯内存判定与组帧；
@@ -52,7 +53,13 @@ function dispatchApiOf(runtime) {
     isInteractiveOf,
     masterDispatchOf,
     dispatchOf,
-    create: (input) => createDispatchIn(state, metaOf, now, input),
+    create: (input) => {
+      const created = createDispatchIn(runtime, input);
+      if (created.ok && created.autoClaim) {
+        autoClaimPassIn(runtime, runtime.state.dispatches.get(created.collabId));
+      }
+      return created;
+    },
     scan: (input) => scanSessionsIn(runtime, input),
     claim: (input) => claimSessionsIn(runtime, input),
     approve: (input) => approveClaimIn(runtime, input),
@@ -137,7 +144,11 @@ function dispatchOfIn(state, sessionId, masterDispatchOf) {
   return null;
 }
 
-function createDispatchIn(state, metaOf, now, { name, topic, sessionId }) {
+/* autoClaim：创建即扫描收编一次，之后随 presence 节拍的 sweep 持续补收新会话；可绑定判定与
+ * claim 成功路径同口径（slave / 门 off 的交互式）——门开着的交互式会话绝不替人弹确认。
+ * 移除面不新增机制：slave 桥断开超宽限由既有 sweepGraceOf 自动移除并通告。 */
+function createDispatchIn(runtime, { name, topic, sessionId, autoClaim }) {
+  const { state, metaOf, now } = runtime;
   const meta = metaOf(sessionId);
   if (meta === null || meta.role !== 'master') {
     return { ok: false, message: 'dispatch 只能由启动期 WAYSTATION_ROLE=master 的会话创建——工具参数与聊天内容不能声明 master 角色' };
@@ -160,6 +171,7 @@ function createDispatchIn(state, metaOf, now, { name, topic, sessionId }) {
     topic: typeof topic === 'string' && topic.trim() !== '' ? topic.trim() : null,
     masterSessionId: sessionId,
     masterName: meta.name,
+    autoClaim: autoClaim === true,
     createdAt: new Date(now()).toISOString(),
     slaves: new Map(),
     claims: new Map(),
@@ -169,7 +181,33 @@ function createDispatchIn(state, metaOf, now, { name, topic, sessionId }) {
     eventTimer: null,
   };
   state.dispatches.set(collabId, record);
-  return { ok: true, collabId, mode: 'dispatch', ephemeral: true, name: record.name, topic: record.topic };
+  return { ok: true, collabId, mode: 'dispatch', ephemeral: true, name: record.name, topic: record.topic, autoClaim: record.autoClaim };
+}
+
+/* 一轮自动收编：跳过 master 自身 / 已绑定 / 有在途确认申请 / 预检不过的目标；
+ * 只直绑免确认可绑定的（slave，或 claim 门 off 的交互式）——门开时保持沉默。 */
+function autoClaimPassIn(runtime, record) {
+  const { metaOf, listSessionIds } = runtime;
+  for (const target of listSessionIds()) {
+    if (target === record.masterSessionId || record.slaves.has(target)) {
+      continue;
+    }
+    if ([...record.claims.values()].some((entry) => entry.targetSessionId === target)) {
+      continue;
+    }
+    const meta = metaOf(target);
+    if (meta === null) {
+      continue;
+    }
+    if (claimPrecheckOf(record, record.masterSessionId, meta, target) !== null) {
+      continue;
+    }
+    const bindable = meta.role === 'slave'
+      || (runtime.isInteractiveOf(meta) && gateValueOf(runtime.state, target, 'claim').effectiveValue === false);
+    if (bindable) {
+      bindSlave(runtime, record, meta);
+    }
+  }
 }
 
 /* scan 判定与 claim 判定同口径：claimable = role=slave（免确认绑定）或交互式元数据新鲜。
@@ -345,6 +383,21 @@ function approveClaimIn(runtime, { sessionId, claimId, approve, confirmToken }) 
   }
   if (approve === false) {
     return rejectPendingClaim(runtime, record, claimId);
+  }
+  /* 收编确认门（与邀请 / 加入门同族的第三道门）：目标会话的生效值为 off 时跳过令牌挑战
+   * 直接绑定，仍注入一行知情通知（谁收编了你）；拒绝路径不受门影响。 */
+  if (gateValueOf(runtime.state, sessionId, 'claim').effectiveValue === false) {
+    const bound = bindApprovedClaim(runtime, record, claimId, sessionId);
+    if (bound.ok) {
+      sendNotice(
+        runtime,
+        record,
+        sessionId,
+        `已按本机设置自动同意 master「${record.masterName}」的收编（要退出用 ws_leave_collab）`,
+        'dispatch-claim-auto',
+      );
+    }
+    return bound;
   }
   const tokenRefusal = confirmTokenRefusalOf(runtime, record, claim, confirmToken);
   if (tokenRefusal !== null) {
@@ -624,6 +677,9 @@ function sweepDispatchesIn(runtime, at) {
     }
     sweepClaimsOf(runtime, record, at);
     sweepGraceOf(runtime, record, at);
+    if (record.autoClaim) {
+      autoClaimPassIn(runtime, record);
+    }
   }
 }
 

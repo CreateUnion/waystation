@@ -25,6 +25,32 @@ test('claim 判定表：无头 slave 直接绑定；交互式无角色待确认�
   );
 });
 
+test('claim 门 off：approve:true 直接绑定（免令牌），附知情通知；approve:false 拒绝不变', (t) => {
+  const node = makeDispatchNode(t, { config: { dispatchClaimConfirmation: false } });
+  createDispatch(node);
+  const claimed = node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['human-1'] });
+  const claimId = claimed.results[0].claimId;
+  const approved = node.service.dispatch.approve({ sessionId: 'human-1', claimId, approve: true });
+  assert.equal(approved.ok, true, String(approved.message ?? ''));
+  assert.equal(approved.needsUserConfirmation, undefined, '门 off 不得再要确认');
+  assert.equal(approved.bound, true);
+  const autoNotice = node.notices.find(
+    (frame) => frame.payload?.targetSessionId === 'human-1' && frame.payload?.event === 'dispatch-claim-auto',
+  );
+  assert.ok(autoNotice, '应向被收编会话注入知情通知');
+  assert.match(autoNotice.payload.text, /master「master」/);
+  // 拒绝路径不受门影响：release 后重新 claim，approve:false 即时终局
+  node.service.dispatch.release({ sessionId: 'master-1', targetSessionId: 'human-1' });
+  const reclaimed = node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['human-1'] });
+  const rejected = node.service.dispatch.approve({ sessionId: 'human-1', claimId: reclaimed.results[0].claimId, approve: false });
+  assert.equal(rejected.ok, true);
+  assert.equal(rejected.approved, false);
+  const masterNotice = node.notices.find(
+    (frame) => frame.payload?.targetSessionId === 'master-1' && String(frame.payload?.text ?? '').includes('已拒绝'),
+  );
+  assert.ok(masterNotice, '拒绝通知仍发 master');
+});
+
 test('claim 拒绝：目标 role=master、WAYSTATION_MASTER 不匹配、master 自己', (t) => {
   const node = makeDispatchNode(t, {
     meta: [['other-master', { sessionId: 'other-master', role: 'master', name: 'other', kind: 'interactive', metaUpdatedAt: 0 }]],

@@ -387,7 +387,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_create_collab",
-    "description": "发起协作、讨论或本机 dispatch（模式创建时定死、不可变）：创建会话即入席——managed 下本会话任站长（joinSeq=1），forum 下任发起人/中继；向选中目标并行发出邀请（对方在同意门点头后两段式入席）；targets 可带 targetSessionId 指名目标会话；目标取自 ws_list_hosts 的实例标识与端点。dispatch 是纯内存本机多会话编排：仅启动期 WAYSTATION_ROLE=master 的会话可建，一个核心同时只允许一个，不接受 targets",
+    "description": "发起协作、讨论或本机 dispatch（模式创建时定死、不可变）：创建会话即入席——managed 下本会话任站长（joinSeq=1），forum 下任发起人/中继；向选中目标并行发出邀请（对方在同意门点头后两段式入席）；targets 可带 targetSessionId 指名目标会话；目标取自 ws_list_hosts 的实例标识与端点。dispatch 是纯内存本机多会话编排：仅启动期 WAYSTATION_ROLE=master 的会话可建，一个核心同时只允许一个，不接受 targets；dispatch 可选 autoClaim=true——创建即自动收编一轮，之后随核心节拍持续补收新出现的可绑定会话（role=slave 或 claim 门 off 的交互式；门开的交互式绝不自动弹确认），离线 slave 超宽限自动移除",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -498,7 +498,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_set_confirm_gate",
-    "description": "设置本机确认门：邀请同意是否必须人工确认（gate=invite）、作为站长收到加入申请是否必须人工批准（gate=join）。scope=session（缺省）只对当前会话生效，会话结束或核心重启即失效；scope=persistent 写入 config.json，对本机以后所有会话生效，首次调用只返回 needsUserConfirmation 与一次性 confirmToken——须向用户转述并取得明确同意后携令牌重试。action=status 返回本会话临时值 / config 永久值 / 当前生效值；action=clear 清除临时值，scope=persistent 时删除配置字段并回到默认 true。off 只免同意 / 批准，拒绝仍走人工确认",
+    "description": "设置本机确认门：邀请同意是否必须人工确认（gate=invite）、作为站长收到加入申请是否必须人工批准（gate=join）、被 dispatch master 收编是否必须人工确认（gate=claim）。scope=session（缺省）只对当前会话生效，会话结束或核心重启即失效；scope=persistent 写入 config.json，对本机以后所有会话生效，首次调用只返回 needsUserConfirmation 与一次性 confirmToken——须向用户转述并取得明确同意后携令牌重试。action=status 返回本会话临时值 / config 永久值 / 当前生效值（gate=all 返回三门，缺省 both=invite+join）；action=clear 清除临时值，scope=persistent 时删除配置字段并回到默认 true。claim 门 off 时收编请求自动绑定并注入知情通知；off 只免同意 / 批准 / 确认，拒绝仍走人工",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -516,9 +516,11 @@ const FROZEN_LIST_JSON = `[
           "enum": [
             "invite",
             "join",
-            "both"
+            "claim",
+            "both",
+            "all"
           ],
-          "description": "确认门（status 可省略，缺省 both；set / clear 必填且不能为 both）"
+          "description": "确认门（status 可省略，缺省 both=invite+join；all=三门；set / clear 必填且不能为 both / all）"
         },
         "requireConfirmation": {
           "type": "boolean",

@@ -108,7 +108,8 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
   ```
 
   `--allowed-tools` 必须包含 waystation MCP 工具（否则 `dontAsk` 下 worker 无法回执 / 查收件）；`claude --name` 设置会话名；长驻用 stream-json 输入，不要用一次性 `claude -p "任务"`。
-- **收编**：master 用 `ws_dispatch_scan` 扫描本机会话（名字 / kind / role / status / 已被谁收编），`ws_dispatch_claim { sessionIds }` 发起收编；交互式目标收到确认提示，`ws_dispatch_approve` 首次只返回一次性令牌、经本机用户确认后携令牌批准；`ws_dispatch_release { sessionId }` 释放。
+- **收编**：master 用 `ws_dispatch_scan` 扫描本机会话（名字 / kind / role / status / 已被谁收编 / `claimable`——`role=slave` 或交互式元数据新鲜＝可收编，false 的条目 claim 会被拒），`ws_dispatch_claim { sessionIds }` 发起收编；交互式目标收到确认提示，`ws_dispatch_approve` 首次只返回一次性令牌、经本机用户确认后携令牌批准；`ws_dispatch_release { sessionId }` 释放。目标会话可用 `ws_set_confirm_gate { gate: 'claim' }` 关掉本会话的被收编确认——off 时收编请求**自动绑定**并注入一行知情通知（拒绝仍走人工）。
+- **自动收编（autoClaim）**：创建时带 `ws_create_collab { mode: 'dispatch', autoClaim: true }`——创建即自动收编一轮，之后随核心节拍**持续补收新出现的可绑定会话**（`role=slave`，或 claim 门 off 的交互式；**门开的交互式绝不自动弹确认**），离线 slave 超宽限自动移除并通告。适合「master 常驻、worker 随开随编」的用法；不开 autoClaim 则保持手动 `claim` 语义。
 - **消息与结束**：复用 `ws_send_message`（dispatch 下可带 `toSessionIds` 与 `taskId`，类型限定 task / progress / result / error）与 `ws_end_collab`（master 结束并通知全员）。master 用 `@会话名` 定向、不写 `@` 群发；slave 回执默认回 master 并在正文带 `@来源`。实时细节只在内存与终端：台账 / 收件流水 / 观察窗历史不适用（`ws_view_ledger` / `ws_check_inbox` 明确回「不保存历史」）。
 - **纯内存、不保存历史**：dispatch 不进 `collabs/`（零文件：不建目录、不写 carrier / member / ledger / snapshot / outbox / inbox / invites / joins / seat / recovery / posts），核心重启或 dispatch 结束即消失，无回填、无恢复、无观察窗回放；`sessions/<sessionId>.json` 状态栏文件允许照常更新（它是本机会话状态，不是协作历史）。
 - **微信推送是 master / cc-connect 的集成责任**：waystation 不集成 cc-connect / 微信。以下行为仓库内无证据、需真机验证：无用户消息时 master 的输出是否会被 cc-connect 当作 push 转发；推送频率与 `burst_limit` / 24h 额度；`ret=-2` 的失败与重试。
@@ -134,13 +135,14 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
 - **任期分叉出口（0.2.0）**：同 term 不同站长一律冻结上报；出口是 `ws_decide choice:'terminate'`——只终止本方分支并本地归档，`merge` / `keep` 不适用、不自动合并；另一分支保持自身状态，随后可新建协作 / 重新邀请。
 - **混合版本（0.2.0 硬闸门）**：协作域帧根带 `cap:2`，旧版对端的**协作域帧**一律拒收；邀请 / 申请 / 建协作前要求目标能力为「支持」，不支持明确拒绝（提示需 0.2.0+）。发现面仍按 `v:1` 互通——**旧版可见，但不能协作；旧协作只读**（见「升级与迁移」节）。扫描应答无 `sessions`＝列表省略会话短码段；**能力态按证据分级**：**直连单播探测**缺 `participants` 才记「不支持」（已知「支持」可 2→0 降级）；扫描 / 自介 / 转达缺字段**只继承**已有能力态、不降级；无响应 / 无证据＝未知。未知在邀请 / 申请 / 建协作前先扫描 / 单播探测。
 
-### 确认门开关（invite / join，临时 / 永久）
+### 确认门开关（invite / join / claim，临时 / 永久）
 
 - `/ws-invite-confirm on|off|status|clear [--permanent]`：收到邀请是否要人工同意。`off` **只对指名邀请**自动同意；不指名邀请仍走人工，避免同机多个会话 `off` 时抢答、归属不清；**拒绝邀请始终人工**。
 - `/ws-join-confirm on|off|status|clear [--permanent]`：作为站长收到加入申请是否要人工批准。`off` 会让**整条入席自动走完**：站长侧自动批准，申请人侧的 `join-confirm` 是申请人核心自动发送的协议帧，不是第二次人工确认；**站长桥断开期间仍会继续自动批准**（本设计的取舍）。拒绝申请始终人工。
-- 不带 `--permanent`：临时，只对当前会话生效，会话结束或核心重启即失效；带 `--permanent`：写入本机数据根 `config.json` 的 `inviteConfirmation` / `joinRequestConfirmation`，对本机以后所有会话生效，首次调用需用户明确同意并携一次性令牌重试。
+- **dispatch 收编门（`ws_set_confirm_gate { gate: 'claim' }`，无斜杠命令）**：本会话被 dispatch master 收编时是否要人工确认。`off` 时收编请求**自动绑定**并注入一行知情通知（谁收编了你、如何退出）；拒绝收编仍走人工。适合「自己的会话随开随被编入」的常驻用法。
+- 不带 `--permanent`：临时，只对当前会话生效，会话结束或核心重启即失效；带 `--permanent`：写入本机数据根 `config.json` 的 `inviteConfirmation` / `joinRequestConfirmation` / `dispatchClaimConfirmation`，对本机以后所有会话生效，首次调用需用户明确同意并携一次性令牌重试。
 - 旧命令 `/ws-auto-accept-invites` 保留为兼容别名，但参数方向相反：旧 `on` = 新 `/ws-invite-confirm off`，旧 `off` = 新 `on`。
-- 默认两个门都是 `true`（需要人工确认），保持 0.2.x 行为。
+- 默认三个门都是 `true`（需要人工确认），保持 0.2.x 行为。
 
 ## 状态栏「协作中」指示
 

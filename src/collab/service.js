@@ -3501,14 +3501,14 @@ function confirmGateArgsRefusalOf(input, gate) {
 }
 
 function confirmGateGateRefusalOf(gate) {
-  if (gate !== 'invite' && gate !== 'join' && gate !== 'both') {
-    return { ok: false, message: `gate 非法（可取值：invite / join / both）：${String(gate)}` };
+  if (gate !== 'invite' && gate !== 'join' && gate !== 'claim' && gate !== 'both' && gate !== 'all') {
+    return { ok: false, message: `gate 非法（可取值：invite / join / claim / both / all）：${String(gate)}` };
   }
   return null;
 }
 
 function confirmGateBothRefusal() {
-  return { ok: false, message: 'set / clear 必须指定 gate（invite 或 join）——两个门的方向与风险不同，不合并设置' };
+  return { ok: false, message: 'set / clear 必须指定 gate（invite / join / claim）——各门的方向与风险不同，不合并设置' };
 }
 
 function confirmGateScopeRefusalOf(scope) {
@@ -3519,7 +3519,7 @@ function confirmGateScopeRefusalOf(scope) {
 }
 
 function confirmGateSetArgsRefusalOf(input, gate) {
-  if (gate === 'both') {
+  if (gate === 'both' || gate === 'all') {
     return confirmGateBothRefusal();
   }
   const scopeRefusal = confirmGateScopeRefusalOf(input.scope ?? 'session');
@@ -3533,15 +3533,18 @@ function confirmGateSetArgsRefusalOf(input, gate) {
 }
 
 function confirmGateClearArgsRefusalOf(input, gate) {
-  if (gate === 'both') {
+  if (gate === 'both' || gate === 'all') {
     return confirmGateBothRefusal();
   }
   return confirmGateScopeRefusalOf(input.scope ?? 'session');
 }
 
 function confirmGateStatusOf(state, sessionId, gate) {
+  const keys = gate === 'all'
+    ? ['invite', 'join', 'claim']
+    : gate === 'both' ? ['invite', 'join'] : [gate];
   const gates = {};
-  for (const key of (gate === 'both' ? ['invite', 'join'] : [gate])) {
+  for (const key of keys) {
     gates[key] = gateValueOf(state, sessionId, key);
   }
   return { ok: true, gates };

@@ -141,3 +141,48 @@ test('旧 ws_allow_next_invite 与新开关共用同一份会话状态', (t) => 
   service.setConfirmGate({ action: 'set', gate: 'invite', requireConfirmation: true, scope: 'session', sessionId: 'sess-a' });
   assert.equal(service.allowNextInvite({ mode: 'status', sessionId: 'sess-a' }).enabled, false);
 });
+
+test('claim 门：session set 立即生效；status all 返回三门；both/all 不可 set', (t) => {
+  const { service } = makeService(t);
+  const set = service.setConfirmGate({
+    action: 'set', gate: 'claim', requireConfirmation: false, scope: 'session', sessionId: 'sess-a',
+  });
+  assert.equal(set.ok, true, String(set.message ?? ''));
+  assert.equal(set.effectiveValue, false);
+  assert.equal(service.setConfirmGate({ action: 'status', gate: 'claim', sessionId: 'sess-a' }).gates.claim.effectiveValue, false);
+  const all = service.setConfirmGate({ action: 'status', gate: 'all', sessionId: 'sess-a' });
+  assert.deepEqual(Object.keys(all.gates).sort(), ['claim', 'invite', 'join']);
+  assert.equal(service.setConfirmGate({ action: 'set', gate: 'both', requireConfirmation: false, scope: 'session', sessionId: 'sess-a' }).ok, false);
+  assert.equal(service.setConfirmGate({ action: 'set', gate: 'all', requireConfirmation: false, scope: 'session', sessionId: 'sess-a' }).ok, false);
+  const cleared = service.setConfirmGate({ action: 'clear', gate: 'claim', scope: 'session', sessionId: 'sess-a' });
+  assert.equal(cleared.ok, true);
+  assert.equal(cleared.effectiveValue, true, 'clear 后回落默认 true');
+});
+
+test('claim 门：persistent set 先令牌后落盘；clear 携令牌删除字段', (t) => {
+  const { service, dataDir } = makeService(t);
+  const first = service.setConfirmGate({
+    action: 'set', gate: 'claim', requireConfirmation: false, scope: 'persistent', sessionId: 'sess-a',
+  });
+  assert.equal(first.needsUserConfirmation, true, '首次只签发令牌不落盘');
+  assert.equal(typeof first.confirmToken, 'string');
+  const configFile = join(dataDir, 'config.json');
+  assert.equal(existsSync(configFile), false, '未携令牌不得写 config');
+  const second = service.setConfirmGate({
+    action: 'set', gate: 'claim', requireConfirmation: false, scope: 'persistent', sessionId: 'sess-a',
+    confirmToken: first.confirmToken,
+  });
+  assert.equal(second.ok, true, String(second.message ?? ''));
+  assert.equal(second.configValue, false);
+  const raw = JSON.parse(readFileSync(configFile, 'utf8'));
+  assert.equal(raw.dispatchClaimConfirmation, false, '落盘字段正确');
+  const clearFirst = service.setConfirmGate({
+    action: 'clear', gate: 'claim', scope: 'persistent', sessionId: 'sess-a',
+  });
+  assert.equal(clearFirst.needsUserConfirmation, true);
+  const cleared = service.setConfirmGate({
+    action: 'clear', gate: 'claim', scope: 'persistent', sessionId: 'sess-a', confirmToken: clearFirst.confirmToken,
+  });
+  assert.equal(cleared.ok, true);
+  assert.equal(JSON.parse(readFileSync(configFile, 'utf8')).dispatchClaimConfirmation, undefined, 'clear 删除字段');
+});

@@ -11,6 +11,7 @@ const NOTICE_QUEUE_MAX = 64;
 const GATE_CONFIG_KEYS = {
   invite: 'inviteConfirmation',
   join: 'joinRequestConfirmation',
+  claim: 'dispatchClaimConfirmation',
 };
 
 export function createConfirmGateState() {
@@ -18,7 +19,7 @@ export function createConfirmGateState() {
 }
 
 export function isConfirmGate(value) {
-  return value === 'invite' || value === 'join';
+  return value === 'invite' || value === 'join' || value === 'claim';
 }
 
 export function gateConfigKey(gate) {
@@ -42,6 +43,7 @@ export function setSessionGate(state, sessionId, gate, value, now = Date.now()) 
   const entry = state.confirmGates.sessions.get(sessionId) ?? {
     invite: undefined,
     join: undefined,
+    claim: undefined,
     graceUntil: null,
     updatedAt: now,
   };
@@ -56,7 +58,7 @@ export function clearSessionGate(state, sessionId, gate) {
     return false;
   }
   entry[gate] = undefined;
-  if (entry.invite === undefined && entry.join === undefined) {
+  if (entry.invite === undefined && entry.join === undefined && entry.claim === undefined) {
     state.confirmGates.sessions.delete(sessionId);
   }
   return true;
