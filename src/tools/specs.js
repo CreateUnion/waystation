@@ -152,7 +152,7 @@ export const WS_SET_CONFIRM_GATE_SPEC = {
 
 export const WS_DISPATCH_SCAN_SPEC = {
   name: 'ws_dispatch_scan',
-  description: 'dispatch master 扫描本机已接入 waystation 的会话：会话名、role、kind、status、是否已被本 dispatch 收编。只返回本机在线会话，排除 master 自身；名字取 Claude Code 会话名，缺失回退会话短码',
+  description: 'dispatch master 扫描本机已接入 waystation 的会话：会话名、role、kind、status、是否已被本 dispatch 收编、claimable（role=slave 或交互式元数据新鲜＝可收编；false 的条目 claim 会被拒）。只返回本机在线会话，排除 master 自身；名字取 Claude Code 会话名，缺失回退会话短码',
   inputSchema: { type: 'object', properties: {} },
 };
 

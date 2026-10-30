@@ -26,7 +26,7 @@ test('创建：纯内存，不进 state.collabs，不写 collabs/ 目录', (t) =
   assert.deepEqual(existsSync(collabsDir) ? readdirSync(collabsDir).filter((name) => name === created.collabId) : [], []);
 });
 
-test('scan：排除 master 自身，返回名字 / kind / role / status / claimedBy', (t) => {
+test('scan：排除 master 自身，返回名字 / kind / role / status / claimedBy / claimable', (t) => {
   const node = makeDispatchNode(t);
   const created = node.service.create({ mode: 'dispatch', name: '扫描', sessionId: 'master-1' });
   const scanned = node.service.dispatch.scan({ sessionId: 'master-1' });
@@ -36,8 +36,24 @@ test('scan：排除 master 自身，返回名字 / kind / role / status / claime
   const human = scanned.sessions.find((entry) => entry.sessionId === 'human-1');
   assert.deepEqual(human, {
     sessionId: 'human-1', name: 'human', kind: 'interactive', entrypoint: 'cli',
-    role: 'none', status: 'idle', claimedBy: null,
+    role: 'none', status: 'idle', claimedBy: null, claimable: true,
   });
+});
+
+test('scan claimable 判定表：交互式新鲜元数据或 role=slave 为 true；非交互无角色、元数据过期、role=master 为 false', (t) => {
+  const node = makeDispatchNode(t);
+  node.meta.set('other-master', { sessionId: 'other-master', role: 'master', name: 'other', kind: 'interactive', entrypoint: 'cli', status: 'idle', metaUpdatedAt: node.now() });
+  node.service.create({ mode: 'dispatch', name: '判定表', sessionId: 'master-1' });
+  const fresh = node.service.dispatch.scan({ sessionId: 'master-1' });
+  const byId = Object.fromEntries(fresh.sessions.map((entry) => [entry.sessionId, entry]));
+  assert.equal(byId['human-1'].claimable, true, '交互式（元数据新鲜）＝可收编');
+  assert.equal(byId['worker-1'].claimable, true, 'role=slave ＝可收编（免确认绑定）');
+  assert.equal(byId['headless-1'].claimable, false, '非交互无角色＝不可收编');
+  assert.equal(byId['other-master'].claimable, false, 'role=master 即使交互式也不可收编（预检必拒）');
+  // 元数据过期（超过 DISPATCH_META_FRESH_MS）后交互式也不可收编——与 claim 判定同口径
+  node.meta.get('human-1').metaUpdatedAt = node.now() - (5 * 60 * 1000) - 1;
+  const stale = node.service.dispatch.scan({ sessionId: 'master-1' });
+  assert.equal(stale.sessions.find((entry) => entry.sessionId === 'human-1').claimable, false, '元数据过期＝不可收编');
 });
 
 test('describe / view / status：dispatch 不退化为讨论、不造空台账', (t) => {

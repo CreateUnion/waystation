@@ -298,7 +298,10 @@ async function sendMessageDefaultType() {
  * dispatch 工具面扩展（2026-10-29）：新增第 24–27 项 ws_dispatch_scan / claim / approve / release
  * （本机多会话编排：扫描、收编、确认、释放），并改写 ws_create_collab 的 mode/topic/targets 语义
  * （dispatch 不接受 targets、topic 可省）；按同一规程重冻，
- * md5 更新为 d605434e7866c2da292161b348efb485（21118 字符）。 */
+ * md5 更新为 d605434e7866c2da292161b348efb485（21118 字符）。
+ * ws_dispatch_scan 描述增补（2026-10-30）：scan 结果新增 claimable 字段（role≠master 且
+ * （role=slave 或交互式元数据新鲜）＝可收编），描述同步（字段级增补，无工具增删）；
+ * md5 更新为 ae06423ef21b898df3c3fc7ee6aae6d7（21174 字符）。 */
 const FROZEN_LIST_JSON = `[
   {
     "name": "ws_status",
@@ -541,7 +544,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_dispatch_scan",
-    "description": "dispatch master 扫描本机已接入 waystation 的会话：会话名、role、kind、status、是否已被本 dispatch 收编。只返回本机在线会话，排除 master 自身；名字取 Claude Code 会话名，缺失回退会话短码",
+    "description": "dispatch master 扫描本机已接入 waystation 的会话：会话名、role、kind、status、是否已被本 dispatch 收编、claimable（role=slave 或交互式元数据新鲜＝可收编；false 的条目 claim 会被拒）。只返回本机在线会话，排除 master 自身；名字取 Claude Code 会话名，缺失回退会话短码",
     "inputSchema": {
       "type": "object",
       "properties": {}

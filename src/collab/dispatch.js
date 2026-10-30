@@ -45,7 +45,7 @@ export function createDispatchDomain(deps) {
 /* 域入口表：读面（list / status / isDispatch）＋写面（create / claim / send / end / leave / sweep）——
  * 全部经 runtime 取注入面，闭包不直接捕获 deps。 */
 function dispatchApiOf(runtime) {
-  const { state, now, metaOf, isInteractiveOf, masterDispatchOf, dispatchOf, listSessionIds } = runtime;
+  const { state, now, metaOf, isInteractiveOf, masterDispatchOf, dispatchOf } = runtime;
   return {
     dispatches: state.dispatches,
     metaOf,
@@ -53,7 +53,7 @@ function dispatchApiOf(runtime) {
     masterDispatchOf,
     dispatchOf,
     create: (input) => createDispatchIn(state, metaOf, now, input),
-    scan: (input) => scanSessionsIn(state, masterDispatchOf, metaOf, listSessionIds, input),
+    scan: (input) => scanSessionsIn(runtime, input),
     claim: (input) => claimSessionsIn(runtime, input),
     approve: (input) => approveClaimIn(runtime, input),
     release: (input) => releaseSlaveIn(runtime, input),
@@ -172,7 +172,10 @@ function createDispatchIn(state, metaOf, now, { name, topic, sessionId }) {
   return { ok: true, collabId, mode: 'dispatch', ephemeral: true, name: record.name, topic: record.topic };
 }
 
-function scanSessionsIn(state, masterDispatchOf, metaOf, listSessionIds, { sessionId }) {
+/* scan 判定与 claim 判定同口径：claimable = role=slave（免确认绑定）或交互式元数据新鲜。
+ * 不可收编条目仍列出（如实呈现本机注册面），由 claimable 字段引导 master 认领正确目标。 */
+function scanSessionsIn(runtime, { sessionId }) {
+  const { masterDispatchOf, metaOf, listSessionIds, isInteractiveOf } = runtime;
   const record = masterDispatchOf(sessionId);
   if (record === null) {
     return { ok: false, code: 'dispatch-lost', message: 'dispatch 不存在（可能已结束或核心已重启）——请重新创建' };
@@ -194,6 +197,7 @@ function scanSessionsIn(state, masterDispatchOf, metaOf, listSessionIds, { sessi
       role: meta.role,
       status: meta.status,
       claimedBy: record.slaves.has(target) ? record.masterSessionId : null,
+      claimable: meta.role !== 'master' && (meta.role === 'slave' || isInteractiveOf(meta)),
     });
   }
   return { ok: true, dispatchId: record.collabId, sessions };
@@ -289,7 +293,7 @@ function claimTargetOf(runtime, record, masterSessionId, targetSessionId) {
   if (runtime.isInteractiveOf(target)) {
     return pendingClaimOf(runtime, record, masterSessionId, targetSessionId);
   }
-  return rejectedClaim(targetSessionId, '非交互式会话且未带 WAYSTATION_ROLE=slave——没有人可确认');
+  return rejectedClaim(targetSessionId, '非交互式会话且未带 WAYSTATION_ROLE=slave——没有人可确认（可收编目标在 ws_dispatch_scan 中标 claimable: true）');
 }
 
 /* 返回非 null 即终局（拒绝或已绑定），null 表示继续按角色 / 交互性分流。 */

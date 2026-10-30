@@ -18,6 +18,11 @@ test('claim 判定表：无头 slave 直接绑定；交互式无角色待确认�
   assert.equal(byId['human-1'].status, 'pending');
   assert.equal(typeof byId['human-1'].claimId, 'string');
   assert.equal(byId['headless-1'].status, 'rejected');
+  assert.match(
+    byId['headless-1'].reason,
+    /claimable: true/,
+    '拒收文案应指引 master 认领 scan 中标 claimable: true 的条目',
+  );
 });
 
 test('claim 拒绝：目标 role=master、WAYSTATION_MASTER 不匹配、master 自己', (t) => {
