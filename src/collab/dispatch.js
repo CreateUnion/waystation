@@ -10,7 +10,6 @@ import { gateValueOf } from './confirm-gate.js';
 export const DISPATCH_MESSAGE_TYPES = ['task', 'progress', 'result', 'error'];
 export const DISPATCH_QUEUE_MAX = 256;
 export const DISPATCH_CLAIM_TTL_MS = 10 * 60 * 1000;
-export const DISPATCH_META_FRESH_MS = 5 * 60 * 1000;
 export const DISPATCH_MEMBER_EVENT_DEBOUNCE_MS = 500;
 /* 桥断开宽限（与席位宽限同源配置，缺省与 service 的 DEFAULT_SEAT_GRACE_MS 对齐）。 */
 const DISPATCH_GRACE_MS = 60 * 1000;
@@ -20,10 +19,13 @@ export function createDispatchDomain(deps) {
   const sessionMetaOf = deps.sessionMetaOf ?? (() => null);
   const listSessionIds = deps.listSessionIds ?? (() => []);
   const metaOf = (sessionId) => normalizeMeta(sessionMetaOf(sessionId), sessionId);
+  /* 交互式判定只看「会话文件在档 + kind=interactive」：文件 mtime 的 5 分钟新鲜度上限
+   * 已移除——Claude Code 不持续触碰会话文件，空闲数分钟的真实会话会被误判不可收编
+   * （2026-10-30 实测：活跃会话被判 claimable=false）。活没活由桥连接性把关（注册表
+   * 只含已连桥，断开即出列），文件新鲜度不承担存活判定。 */
   const isInteractiveOf = (meta) => meta !== null
     && meta.kind === 'interactive'
-    && meta.metaUpdatedAt > 0
-    && now() - meta.metaUpdatedAt <= DISPATCH_META_FRESH_MS;
+    && meta.metaUpdatedAt > 0;
   const masterDispatchOf = (sessionId) => masterDispatchOfIn(state, sessionId);
   const dispatchOf = (sessionId) => dispatchOfIn(state, sessionId, masterDispatchOf);
   /* 注入面运行期容器：notify 是唯一投递出口（未注入＝队列兜底，绝不静默丢弃），
