@@ -108,7 +108,7 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
   ```
 
   `--allowed-tools` 必须包含 waystation MCP 工具（否则 `dontAsk` 下 worker 无法回执 / 查收件）；`claude --name` 设置会话名；长驻用 stream-json 输入，不要用一次性 `claude -p "任务"`。
-- **收编**：master 用 `ws_dispatch_scan` 扫描本机会话（名字 / kind / role / status / 已被谁收编 / `claimable`——`role=slave` 或交互式＝可收编，false 的条目 claim 会被拒），`ws_dispatch_claim { sessionIds }` 发起收编；交互式目标收到确认提示，`ws_dispatch_approve` 首次只返回一次性令牌、经本机用户确认后携令牌批准；`ws_dispatch_release { sessionId }` 释放。目标会话可用 `ws_set_confirm_gate { gate: 'claim' }` 关掉本会话的被收编确认——off 时收编请求**自动绑定**并注入一行知情通知（拒绝仍走人工）。
+- **收编**：master 用 `ws_dispatch_scan` 扫描本机会话（名字 / kind / role / status / 已被谁收编；**只列可收编目标**——`role=slave` 或交互式且会话文件在档；master、非交互无角色、无会话文件者不列出），`ws_dispatch_claim { sessionIds }` 发起收编；交互式目标收到确认提示，`ws_dispatch_approve` 首次只返回一次性令牌、经本机用户确认后携令牌批准；`ws_dispatch_release { sessionId }` 释放。目标会话可用 `ws_set_confirm_gate { gate: 'claim' }` 关掉本会话的被收编确认——off 时收编请求**自动绑定**并注入一行知情通知（拒绝仍走人工）。
 - **自动收编（autoClaim）**：创建时带 `ws_create_collab { mode: 'dispatch', autoClaim: true }`——创建即自动收编一轮，之后随核心节拍**持续补收新出现的可绑定会话**（`role=slave`，或 claim 门 off 的交互式；**门开的交互式绝不自动弹确认**），离线 slave 超宽限自动移除并通告。适合「master 常驻、worker 随开随编」的用法；不开 autoClaim 则保持手动 `claim` 语义。
 - **消息与结束**：复用 `ws_send_message`（dispatch 下可带 `toSessionIds` 与 `taskId`，类型限定 task / progress / result / error）与 `ws_end_collab`（master 结束并通知全员）。master 用 `@会话名` 定向、不写 `@` 群发；slave 回执默认回 master 并在正文带 `@来源`。实时细节只在内存与终端：台账 / 收件流水 / 观察窗历史不适用（`ws_view_ledger` / `ws_check_inbox` 明确回「不保存历史」）。
 - **纯内存、不保存历史**：dispatch 不进 `collabs/`（零文件：不建目录、不写 carrier / member / ledger / snapshot / outbox / inbox / invites / joins / seat / recovery / posts），核心重启或 dispatch 结束即消失，无回填、无恢复、无观察窗回放；`sessions/<sessionId>.json` 状态栏文件允许照常更新（它是本机会话状态，不是协作历史）。

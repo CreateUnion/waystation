@@ -229,6 +229,11 @@ function scanSessionsIn(runtime, { sessionId }) {
     if (meta === null) {
       continue;
     }
+    /* 只列可收编目标：role=slave 或交互式（会话文件在档）。不可收编条目（其他 master、
+     * 无会话文件的子代理桥、非交互无角色）不列出——scan 是 master 的收编视野，不是注册表全量。 */
+    if (meta.role === 'master' || !(meta.role === 'slave' || isInteractiveOf(meta))) {
+      continue;
+    }
     sessions.push({
       sessionId: target,
       name: meta.name,
@@ -237,7 +242,7 @@ function scanSessionsIn(runtime, { sessionId }) {
       role: meta.role,
       status: meta.status,
       claimedBy: record.slaves.has(target) ? record.masterSessionId : null,
-      claimable: meta.role !== 'master' && (meta.role === 'slave' || isInteractiveOf(meta)),
+      claimable: true,
     });
   }
   return { ok: true, dispatchId: record.collabId, sessions };

@@ -40,24 +40,22 @@ test('scan：排除 master 自身，返回名字 / kind / role / status / claime
   });
 });
 
-test('scan claimable 判定表：交互式（文件在档）或 role=slave 为 true；非交互无角色与 role=master 为 false；文件 mtime 陈旧不影响', (t) => {
+test('scan 过滤：只列可收编目标（slave / 交互式在档）；master、非交互无角色、文件不在档一律不出现', (t) => {
   const node = makeDispatchNode(t);
   node.meta.set('other-master', { sessionId: 'other-master', role: 'master', name: 'other', kind: 'interactive', entrypoint: 'cli', status: 'idle', metaUpdatedAt: node.now() });
   node.service.create({ mode: 'dispatch', name: '判定表', sessionId: 'master-1' });
-  const fresh = node.service.dispatch.scan({ sessionId: 'master-1' });
-  const byId = Object.fromEntries(fresh.sessions.map((entry) => [entry.sessionId, entry]));
-  assert.equal(byId['human-1'].claimable, true, '交互式＝可收编');
-  assert.equal(byId['worker-1'].claimable, true, 'role=slave ＝可收编（免确认绑定）');
-  assert.equal(byId['headless-1'].claimable, false, '非交互无角色＝不可收编');
-  assert.equal(byId['other-master'].claimable, false, 'role=master 即使交互式也不可收编（预检必拒）');
-  // 文件 mtime 陈旧（Claude Code 空闲不触文件）不再影响可收编——存活由桥连接性把关，kind 只看在档
+  const scanned = node.service.dispatch.scan({ sessionId: 'master-1' });
+  const ids = scanned.sessions.map((entry) => entry.sessionId);
+  assert.deepEqual(ids.sort(), ['human-1', 'worker-1'], `只应列出可收编的两个：${ids}`);
+  assert.equal(scanned.sessions.every((entry) => entry.claimable === true), true, '列出的全部可收编');
+  // 文件 mtime 陈旧（Claude Code 空闲不触文件）不影响——存活由桥连接性把关
   node.meta.get('human-1').metaUpdatedAt = 1;
   const stale = node.service.dispatch.scan({ sessionId: 'master-1' });
-  assert.equal(stale.sessions.find((entry) => entry.sessionId === 'human-1').claimable, true, '元数据陈旧的在档交互式仍可收编');
-  // 文件完全不在档（metaUpdatedAt=0，如子代理桥）依旧失败关闭
+  assert.equal(stale.sessions.some((entry) => entry.sessionId === 'human-1'), true, '元数据陈旧的在档交互式仍列出');
+  // 文件完全不在档（metaUpdatedAt=0，如子代理桥）失败关闭且不列出
   node.meta.get('human-1').metaUpdatedAt = 0;
   const missing = node.service.dispatch.scan({ sessionId: 'master-1' });
-  assert.equal(missing.sessions.find((entry) => entry.sessionId === 'human-1').claimable, false, '文件不在档＝不可收编');
+  assert.equal(missing.sessions.some((entry) => entry.sessionId === 'human-1'), false, '文件不在档＝不列出');
 });
 
 test('describe / view / status：dispatch 不退化为讨论、不造空台账', (t) => {
