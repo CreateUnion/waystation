@@ -153,7 +153,7 @@ function listBackups(home) {
   }
 }
 
-test('注入：最小 config 实际写入三键、创建备份、退出码 2（服务项待手动）', (t) => {
+test('注入：最小 config 实际写入两键、创建备份、退出码 2（服务项待手动）', (t) => {
   if (!powershellAvailable) { t.skip('powershell -File 不可用'); return; }
   const home = makeTempDir(t);
   writeCcConfig(home, MINIMAL_CONFIG);
@@ -164,9 +164,7 @@ test('注入：最小 config 实际写入三键、创建备份、退出码 2（�
   assert.ok(text.includes('mcp__waystation__ws_dispatch_rules_reload'), '白名单应含 ws_dispatch_rules_reload');
   assert.ok(!text.includes('ws_dispatch_approve'), '白名单刻意不含 ws_dispatch_approve');
   assert.ok(text.includes('append_system_prompt = """你是 waystation dispatch master'), '应注入 dispatch 规则');
-  const expectedWorkDir = join(home, '.waystation', 'app').replace(/\\/g, '/');
-  assert.ok(text.includes(`work_dir = "${expectedWorkDir}"`), `work_dir 应指向 waystation 安装目录：${text}`);
-  assert.ok(!text.includes('E:/demo'), '既有 work_dir 应被替换为安装目录');
+  assert.ok(text.includes('work_dir = "E:/demo"'), '既有键不得丢失');
   assert.equal(listBackups(home).length, 1, '应恰创建一个备份');
   assert.ok(result.stdout.includes('已注入并备份'), `应报告注入：${result.stdout}`);
   /* Task 4 恢复完整断言 */
@@ -238,10 +236,7 @@ test('多项目：两个 options 段各注入一份', (t) => {
   const text = readCcConfig(home);
   assert.equal((text.match(/allowed_tools = \[/g) || []).length, 2, `两段各注入 allowed_tools：${text}`);
   assert.equal((text.match(/append_system_prompt = """你是 waystation dispatch master/g) || []).length, 2, '两段各注入规则');
-  const expectedWorkDirLine = `work_dir = "${join(home, '.waystation', 'app').replace(/\\/g, '/')}"`;
-  assert.equal(text.split(expectedWorkDirLine).length - 1, 2, `两段 work_dir 均指向安装目录：${text}`);
-  assert.ok(!text.includes('E:/a') && !text.includes('E:/b'), '旧 work_dir 应被替换');
-  assert.ok(result.stdout.includes('已注入并备份'));
+  assert.ok(text.includes('work_dir = "E:/a"') && text.includes('work_dir = "E:/b"'), '既有 work_dir 不得被动');
 });
 
 test('服务缺席（缝=1）：真实运行打印手动指引并记待手动项', (t) => {

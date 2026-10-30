@@ -107,6 +107,7 @@ function buildLinkState(options) {
     sessionMeta: sessionMetaOf(options),
     coreEntry: options.coreEntry ?? CORE_ENTRY_PATH,
     spawnFn: options.spawn ?? spawnChild,
+    sessionIdProbe: options.sessionIdProbe ?? null,
     ...changeoverSettingsOf(options),
     changeover: buildChangeoverState(),
     ...timingOf(options),
@@ -301,8 +302,12 @@ async function connectStep(state, record, flow) {
 /* 冷启步（每 ensureCore 轮次至多 spawn 一次）：判陈旧后的统一出口——描述符缺失/不可解析、pid 死/
  * 非法、硬杀防护链确认退场后都走这里。不可解析的陈旧锁由被冷启核心的取锁仲裁清理（对证 null 的
  * 隔离路径），桥不删不抢。 */
-function coldStartStep(state, flow) {
+async function coldStartStep(state, flow) {
   if (!flow.coldStartIssued) {
+    const refusal = await assertNotServiceSession(state);
+    if (refusal !== null) {
+      return { kind: 'fail', failure: { kind: 'service-session', message: `核心冷启被拒：${refusal}`, retryMs: state.slowRetryMs } };
+    }
     flow.coldStartIssued = true;
     const issued = issueColdStart(state);
     if (!issued.ok) {
@@ -310,6 +315,53 @@ function coldStartStep(state, flow) {
     }
   }
   return { kind: 'wait', timeoutFailure: null };
+}
+
+/* 服务上下文守卫（Windows）：Session 0 里冷启的核心，其默认命名管道 ACL 会拒绝一切用户会话桥的
+ * 拨号（EPERM 锁死全场；2026-10-31 真机事故：cc-connect 服务树内的桥冷启了 Session 0 核心，
+ * 交互会话全部拨不进）。服务上下文一律不冷启——等用户会话桥把核心启起来后正常附着
+ * （Session 0 拨 Session 1 的管道无碍，白天长期验证）。 */
+async function assertNotServiceSession(state) {
+  if (process.platform !== 'win32') {
+    return null;
+  }
+  /* 会话号在桥进程生命周期内不变：探测一次按进程记忆化（探测走一次性 powershell，反复拉起太贵）。 */
+  if (state.serviceSession === undefined) {
+    const probe = state.sessionIdProbe ?? defaultSessionIdProbe;
+    try {
+      state.serviceSession = (await probe()) === 0;
+    } catch {
+      state.serviceSession = false;
+    }
+  }
+  if (!state.serviceSession) {
+    return null;
+  }
+  return '当前环境为服务上下文（Session 0）：在此冷启的核心，其管道会拒绝用户会话桥连接（EPERM）。请先在任一用户会话中把核心启动起来（任意 Claude 会话调用任一 ws_* 工具即可触发冷启），本桥随后自动附着';
+}
+
+export function defaultSessionIdProbe() {
+  return new Promise((resolve) => {
+    /* 冷启极低频，一次性 powershell 探测本进程会话号；失败/超时按非服务上下文处理（不挡冷启）。 */
+    const child = spawnChild('powershell.exe', [
+      '-NoProfile', '-NoLogo', '-Command', `(Get-Process -Id ${process.pid}).SessionId`,
+    ], { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = '';
+    const timer = setTimeout(() => {
+      child.kill();
+      resolve(1);
+    }, 3000);
+    child.stdout?.on('data', (chunk) => { out += chunk; });
+    child.once('error', () => {
+      clearTimeout(timer);
+      resolve(1);
+    });
+    child.once('exit', () => {
+      clearTimeout(timer);
+      const value = Number.parseInt(out.trim(), 10);
+      resolve(Number.isFinite(value) ? value : 1);
+    });
+  });
 }
 
 /* 僵尸核心（pid 活、心跳停）：硬杀防护链（stop-guard 共享件）——链全过才冷启；校验不过＝降级上报、
