@@ -16,7 +16,8 @@
     "typecheck": "tsc -p .",
     "gate": "npm run lint && npm run typecheck && npm run coverage"
   },
-  "license": "ISC",
+  "author": "xueweichao <xuecoder@aliyun.com> (lfemcp)",
+  "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1"
   },
