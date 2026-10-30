@@ -11,6 +11,10 @@ export const DISPATCH_MESSAGE_TYPES = ['task', 'progress', 'result', 'error'];
 export const DISPATCH_QUEUE_MAX = 256;
 export const DISPATCH_CLAIM_TTL_MS = 10 * 60 * 1000;
 export const DISPATCH_MEMBER_EVENT_DEBOUNCE_MS = 500;
+/* 收编后标准上报要求：随收编通知自动携带（机制化「master 重建 → 成员主动汇报积压状态」纪律）。
+ * 内容仍由 slave 模型生成——本常量只机制化"要求"，不机制化"内容"。 */
+export const DISPATCH_CLAIM_REPORT_HINT =
+  '收编后请主动向 master 汇报当前状态：在做什么、已完成什么、有无卡点待裁定（ws_send_message 本协作即回）';
 /* 桥断开宽限（与席位宽限同源配置，缺省与 service 的 DEFAULT_SEAT_GRACE_MS 对齐）。 */
 const DISPATCH_GRACE_MS = 60 * 1000;
 
@@ -208,6 +212,13 @@ function autoClaimPassIn(runtime, record) {
       || (runtime.isInteractiveOf(meta) && gateValueOf(runtime.state, target, 'claim').effectiveValue === false);
     if (bindable) {
       bindSlave(runtime, record, meta);
+      sendNotice(
+        runtime,
+        record,
+        meta.sessionId,
+        `已按本机设置自动同意 master「${record.masterName}」的收编（要退出用 ws_leave_collab）。\n${DISPATCH_CLAIM_REPORT_HINT}。`,
+        'dispatch-claim-auto',
+      );
     }
   }
 }
@@ -344,7 +355,7 @@ function claimTargetOf(runtime, record, masterSessionId, targetSessionId) {
         runtime,
         record,
         targetSessionId,
-        `已按本机设置自动同意 master「${record.masterName}」的收编（要退出用 ws_leave_collab）`,
+        `已按本机设置自动同意 master「${record.masterName}」的收编（要退出用 ws_leave_collab）。\n${DISPATCH_CLAIM_REPORT_HINT}。`,
         'dispatch-claim-auto',
       );
       return { sessionId: targetSessionId, status: 'bound' };
@@ -385,7 +396,7 @@ function pendingClaimOf(runtime, record, masterSessionId, targetSessionId) {
     runtime,
     record,
     targetSessionId,
-    `master「${record.masterName}」请求收编本会话，允许吗？确认请调用 ws_dispatch_approve { claimId: "${claimId}", approve: true }`,
+    `master「${record.masterName}」请求收编本会话，允许吗？确认请调用 ws_dispatch_approve { claimId: "${claimId}", approve: true }\n批准后${DISPATCH_CLAIM_REPORT_HINT}。`,
     'dispatch-claim',
   );
   return { sessionId: targetSessionId, status: 'pending', claimId };

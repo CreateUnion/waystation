@@ -159,3 +159,29 @@ test('claim 门 off：master 手动 claim 交互式会话直接绑定（不进 p
   const autoNotice = node.notices.find((frame) => frame.payload?.event === 'dispatch-claim-auto');
   assert.ok(autoNotice, '注入知情通知');
 });
+
+test('收编通知自动携带标准上报要求（三条路径：门 off 手动绑定 / autoClaim / pending 确认提示）', (t) => {
+  const node = makeDispatchNode(t, { config: { dispatchClaimConfirmation: false } });
+  createDispatch(node);
+  // 路径一：门 off 手动 claim → 直接绑定通知带上报要求
+  node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['human-1'] });
+  const boundNotice = node.notices.find(
+    (frame) => frame.payload?.event === 'dispatch-claim-auto' && frame.payload?.targetSessionId === 'human-1',
+  );
+  assert.match(String(boundNotice?.payload?.text ?? ''), /收编后请主动向 master 汇报当前状态/, '门 off 绑定通知应带上报要求');
+  // 路径二：autoClaim 入编 → 知情通知带上报要求
+  const autoNode = makeDispatchNode(t, { config: { dispatchClaimConfirmation: false } });
+  const autoCreated = autoNode.service.create({ mode: 'dispatch', name: 'dispatch', sessionId: 'master-1', autoClaim: true });
+  assert.equal(autoCreated.ok, true);
+  const autoNotice = autoNode.notices.find(
+    (frame) => frame.payload?.event === 'dispatch-claim-auto' && frame.payload?.targetSessionId === 'worker-1',
+  );
+  assert.match(String(autoNotice?.payload?.text ?? ''), /收编后请主动向 master 汇报当前状态/, 'autoClaim 通知应带上报要求');
+  // 路径三：门 on 的 pending 确认提示预告上报要求
+  const promptNode = makeDispatchNode(t);
+  createDispatch(promptNode);
+  promptNode.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['human-1'] });
+  const prompt = promptNode.notices.find((frame) => frame.payload?.event === 'dispatch-claim');
+  assert.match(String(prompt?.payload?.text ?? ''), /批准后收编后请主动向 master 汇报当前状态/, 'pending 提示应预告上报要求');
+  assert.equal(autoCreated.collabId !== undefined, true);
+});
