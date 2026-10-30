@@ -1,5 +1,7 @@
 # waystation（驿站）
 
+**[中文](README.md) | [English](README.en.md)**
+
 局域网内多台机器上的 AI 会话（首期 Claude Code）各自接入一个「驿站」（每台机器一个**核心**进程，会话经 MCP **桥**接入），
 互相发现、按星型站长模式建立协作并可靠投递消息——不依赖云账号与 Anthropic 服务。
 
