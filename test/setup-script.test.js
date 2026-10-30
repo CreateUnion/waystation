@@ -166,10 +166,8 @@ test('注入：最小 config 实际写入两键、创建备份、退出码 2（�
   assert.ok(text.includes('work_dir = "E:/demo"'), '既有键不得丢失');
   assert.equal(listBackups(home).length, 1, '应恰创建一个备份');
   assert.ok(result.stdout.includes('已注入并备份'), `应报告注入：${result.stdout}`);
-  /* 临时放宽（Task 3 申报，Task 4 补回）：完整断言 result.status === 2 依赖 Task 4 才实现的
-   * cc-connect 服务环境待手动项；Task 3 阶段注入成功不产生待手动项，退出码保持基线 0
-   * （与 Task 2 行为一致，即退出码不因本任务改变）。 */
-  assert.equal(result.status, 0, `注入成功无待手动项，退出码应保持基线 0；stderr：${result.stderr}`);
+  /* Task 4 恢复完整断言 */
+  assert.equal(result.status, 2, `注入成功但服务缺席应记待手动项（退出码 2）；stderr：${result.stderr}`);
 });
 
 test('幂等：第二遍全部跳过、不新增备份、内容不变', (t) => {
@@ -238,4 +236,33 @@ test('多项目：两个 options 段各注入一份', (t) => {
   assert.equal((text.match(/allowed_tools = \[/g) || []).length, 2, `两段各注入 allowed_tools：${text}`);
   assert.equal((text.match(/append_system_prompt = """你是 waystation dispatch master/g) || []).length, 2, '两段各注入规则');
   assert.ok(result.stdout.includes('已注入并备份'));
+});
+
+test('服务缺席（缝=1）：真实运行打印手动指引并记待手动项', (t) => {
+  if (!powershellAvailable) { t.skip('powershell -File 不可用'); return; }
+  const home = makeTempDir(t);
+  writeCcConfig(home, MINIMAL_CONFIG);
+  const { result } = runSetup(t, { home, seam: '1' });
+  assert.ok(result.stdout.includes('未以 Windows 服务运行'), `应报告服务缺席：${result.stdout}`);
+  assert.ok(result.stdout.includes('WAYSTATION_ROLE=master'), `应给出手动内容：${result.stdout}`);
+  assert.ok(result.stdout.includes('待手动事项'), `汇总应列待手动项：${result.stdout}`);
+  assert.equal(result.status, 2);
+});
+
+test('服务缺席 + 已全部配置：幂等重跑仍只报服务一项待手动', (t) => {
+  if (!powershellAvailable) { t.skip('powershell -File 不可用'); return; }
+  const home = makeTempDir(t);
+  writeCcConfig(home, MINIMAL_CONFIG);
+  runSetup(t, { home, seam: '1' });
+  const second = runSetup(t, { home, seam: '1' });
+  assert.equal(second.result.status, 2);
+  assert.ok(second.result.stdout.includes('已配置，跳过'), 'config 项应跳过');
+  assert.equal((second.result.stdout.match(/待手动事项/g) || []).length, 1, '只汇总一次待手动清单');
+});
+
+test('缺失提醒分支：退出码 0（未检测到 cc-connect 不算待手动）', (t) => {
+  if (!powershellAvailable) { t.skip('powershell -File 不可用'); return; }
+  const { result } = runSetup(t, { seam: 'nocc' });
+  assert.equal(result.status, 0, `缺失提醒不是待手动项；stderr：${result.stderr}`);
+  assert.ok(result.stdout.includes('智能安装完成'));
 });

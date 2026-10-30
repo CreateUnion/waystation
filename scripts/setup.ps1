@@ -262,6 +262,125 @@ function Merge-CcConfig([string]$ConfigPath) {
     return $changedSections
 }
 
+# 自提权片段执行器：写临时 .ps1 → Start-Process -Verb RunAs 等待退出码 → 清理片段。
+# 片段只做参数所述的一件事；UAC 被拒/执行失败一律返回 $false（调用方降级手动）。
+function Invoke-ElevatedSnippet([string[]]$SnippetLines) {
+    $snippet = Join-Path $env:TEMP ('ws-setup-' + [guid]::NewGuid().ToString('N') + '.ps1')
+    [System.IO.File]::WriteAllText($snippet, ($SnippetLines -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+    try {
+        $p = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-File', $snippet) -Verb RunAs -Wait -PassThru
+        return ($p.ExitCode -eq 0)
+    } catch {
+        return $false
+    } finally {
+        Remove-Item -Force -ErrorAction SilentlyContinue -Path $snippet
+    }
+}
+
+function Get-CcService {
+    if ($script:AssumeNoService) { return $null }
+    return (Get-Service -Name 'cc-connect' -ErrorAction SilentlyContinue)
+}
+
+function Get-ServiceRoleEntries {
+    try {
+        $prop = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\cc-connect\Parameters' -Name 'AppEnvironmentExtra' -ErrorAction Stop
+        return @($prop.AppEnvironmentExtra)
+    } catch {
+        return @()
+    }
+}
+
+# 服务环境变量步骤：缺 WAYSTATION_ROLE=master 时自提权写入（保留其余条目）；
+# 服务缺席 → 手动指引；UAC 拒绝/失败/复核不过 → 手动命令。返回是否实际写入。
+function Set-ServiceRoleEnv {
+    $svc = Get-CcService
+    if (-not $svc) {
+        Write-Note 'cc-connect 未以 Windows 服务运行——服务环境无法代写'
+        if ($DryRun) {
+            Write-Note '（dry-run）真实运行时将打印手动指引（在你的启动方式中设置 WAYSTATION_ROLE=master）'
+        } else {
+            Add-Manual '在你启动 cc-connect 的方式中设置环境变量 WAYSTATION_ROLE=master（若改为服务运行可重跑本脚本代写）'
+        }
+        return $false
+    }
+    $current = Get-ServiceRoleEntries
+    $roleEntry = @($current | Where-Object { $_ -match '^WAYSTATION_ROLE=' })
+    if ($roleEntry.Count -gt 0) {
+        if ($roleEntry[0] -eq 'WAYSTATION_ROLE=master') {
+            Write-Note '服务环境 WAYSTATION_ROLE=master：已配置，跳过'
+            return $false
+        }
+        Write-Warn "服务环境已有「$($roleEntry[0])」——可覆盖为 master"
+        if (-not (Ask-YesNo '把 cc-connect 服务环境的 WAYSTATION_ROLE 覆盖为 master？' $true)) {
+            if (-not $DryRun) {
+                Add-Manual "服务环境保留 $($roleEntry[0])（未覆盖）——dispatch master 角色不生效"
+            }
+            return $false
+        }
+    }
+    if ($DryRun) {
+        Write-Note '（dry-run）将自提权（UAC）写入 cc-connect 服务环境：WAYSTATION_ROLE=master（保留其余条目）'
+        return $false
+    }
+    $kept = @($current | Where-Object { $_ -notmatch '^WAYSTATION_ROLE=' })
+    $updated = @($kept + 'WAYSTATION_ROLE=master')
+    $entryArgs = @($updated | ForEach-Object { "'" + ($_ -replace "'", "''") + "'" })
+    $ok = Invoke-ElevatedSnippet @(
+        '$key = ''HKLM:\SYSTEM\CurrentControlSet\Services\cc-connect\Parameters'''
+        '$entries = @(' + ($entryArgs -join ',') + ')'
+        'try {'
+        '    Set-ItemProperty -Path $key -Name AppEnvironmentExtra -Value $entries -Type MultiString'
+        '    exit 0'
+        '} catch {'
+        '    exit 1'
+        '}'
+    )
+    if (-not $ok) {
+        Add-Manual '服务环境写入未完成（UAC 被拒或失败）——管理员 PowerShell 执行：nssm set cc-connect AppEnvironmentExtra <原条目 + WAYSTATION_ROLE=master>'
+        return $false
+    }
+    $verify = Get-ServiceRoleEntries
+    if (@($verify | Where-Object { $_ -eq 'WAYSTATION_ROLE=master' }).Count -eq 0) {
+        Add-Manual '服务环境写入后复核未通过——请手动写入 WAYSTATION_ROLE=master 后重跑本脚本核对'
+        return $false
+    }
+    Write-Note '已写入服务环境：WAYSTATION_ROLE=master'
+    return $true
+}
+
+# 重启服务（仅在发生实际更改且服务存在时询问；非交互默认 N）。返回是否实际执行了重启。
+function Invoke-CcRestart([bool]$Needed) {
+    $svc = Get-CcService
+    if (-not $svc) {
+        if ($Needed -and -not $DryRun) {
+            Write-Note '配置已更新——重启你的 cc-connect 启动方式后生效'
+        }
+        return $false
+    }
+    if (-not $Needed) { return $false }
+    if (-not (Ask-YesNo '配置已更新，需重启 cc-connect 服务生效（会中断当前会话）。现在重启？' $false)) {
+        Add-Manual '手动重启服务使配置生效（管理员 PowerShell）：Restart-Service cc-connect -Force'
+        return $false
+    }
+    $ok = Invoke-ElevatedSnippet @(
+        'try {'
+        '    Restart-Service -Name cc-connect -Force'
+        '    Start-Sleep -Seconds 3'
+        '    if ((Get-Service -Name cc-connect).Status -ne ''Running'') { exit 1 }'
+        '    exit 0'
+        '} catch {'
+        '    exit 1'
+        '}'
+    )
+    if (-not $ok) {
+        Add-Manual '服务重启未完成（UAC 被拒或失败）——管理员 PowerShell 执行：Restart-Service cc-connect -Force'
+        return $false
+    }
+    Write-Note '已重启服务 cc-connect（状态 Running）'
+    return $true
+}
+
 # ===== 主流程 =====
 
 if (-not (Test-Path (Join-Path $RepoRoot 'package.json')) -or -not (Test-Path (Join-Path $RepoRoot 'scripts\install.ps1'))) {
@@ -331,6 +450,8 @@ if (-not $ccExists) {
     $ccStatusLine = '已检测到'
     $configPath = Join-Path $HomeDir '.cc-connect\config.toml'
     $mergeChanged = Merge-CcConfig $configPath
+    $envChanged = Set-ServiceRoleEnv
+    Invoke-CcRestart -Needed (($mergeChanged -gt 0) -or $envChanged)
 }
 
 Write-Step '3/3' '自检汇总'
