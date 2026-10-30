@@ -174,6 +174,7 @@ $script:AllowedToolsLines = @(
     '  "mcp__waystation__ws_dispatch_release",'
     '  "mcp__waystation__ws_send_message",'
     '  "mcp__waystation__ws_end_collab",'
+    '  "mcp__waystation__ws_dispatch_rules_reload",'
     ']'
 )
 $script:AppendPromptLines = @(
@@ -212,11 +213,12 @@ function Merge-CcConfig([string]$ConfigPath) {
         if ($sectionIdx.Count -eq 0) {
             Write-Warn 'config.toml 中没有 [projects.agent.options] 段（结构未知）——不做自动合并'
             if (-not $DryRun) {
-                Add-Manual '手工把 allowed_tools 与 append_system_prompt 加进 cc-connect config.toml 的 [projects.agent.options] 段'
+                Add-Manual '手工把 allowed_tools、append_system_prompt 与 work_dir 加进 cc-connect config.toml 的 [projects.agent.options] 段'
             }
             return 0
         }
         $insertBlocks = @()
+        $replaceBlocks = @()
         $changedSections = 0
         for ($s = 0; $s -lt $sectionIdx.Count; $s++) {
             $start = $sectionIdx[$s]
@@ -229,7 +231,7 @@ function Merge-CcConfig([string]$ConfigPath) {
             if ($quoteCount % 2 -eq 1) {
                 Write-Warn "第 $($start + 1) 行的 [projects.agent.options] 段含未闭合多行字符串——放弃该段自动合并"
                 if (-not $DryRun) {
-                    Add-Manual '手工检查 config.toml 中未闭合的多行字符串后重跑，或手工注入 allowed_tools 与 append_system_prompt'
+                    Add-Manual '手工检查 config.toml 中未闭合的多行字符串后重跑，或手工注入 allowed_tools、append_system_prompt 与 work_dir'
                 }
                 continue
             }
@@ -237,20 +239,40 @@ function Merge-CcConfig([string]$ConfigPath) {
             for ($i = $start + 1; $i -lt $end; $i++) { $body += $lines[$i] }
             $needTools = $null -eq ($body | Where-Object { $_ -match '^\s*allowed_tools\s*=' })
             $needPrompt = $null -eq ($body | Where-Object { $_ -match '^\s*append_system_prompt\s*=' })
-            if (-not $needTools -and -not $needPrompt) {
+            # work_dir：master 工作目录统一指向 waystation 安装目录——缺失则插入，已有但不同则原位替换（旧值进提示与备份）
+            $wsWorkDir = ((Join-Path $HomeDir '.waystation\app') -replace '\\', '/')
+            $workDirLineIdx = $null
+            for ($i = $start + 1; $i -lt $end; $i++) {
+                if ($lines[$i] -match '^\s*work_dir\s*=\s*"([^"]*)"') { $workDirLineIdx = $i; break }
+            }
+            $needWorkDir = $null -eq $workDirLineIdx
+            $workDirReplaceIdx = $null
+            if (-not $needWorkDir) {
+                $existingDir = $Matches[1]
+                if ($existingDir -ne $wsWorkDir) { $workDirReplaceIdx = $workDirLineIdx }
+            }
+            if (-not $needTools -and -not $needPrompt -and -not $needWorkDir -and $null -eq $workDirReplaceIdx) {
                 Write-Note "第 $($start + 1) 行的 dispatch 配置：已配置，跳过"
                 continue
             }
             $insert = @()
+            if ($needWorkDir) {
+                $insert += ('work_dir = "' + $wsWorkDir + '"')
+                Write-Note "第 $($start + 1) 行段：将注入 work_dir（master 工作目录 → $wsWorkDir）"
+            }
             if ($needTools) {
                 $insert += $script:AllowedToolsLines
-                Write-Note "第 $($start + 1) 行段：将注入 allowed_tools（8 项白名单）"
+                Write-Note "第 $($start + 1) 行段：将注入 allowed_tools（9 项白名单）"
             }
             if ($needPrompt) {
                 $insert += $script:AppendPromptLines
                 Write-Note "第 $($start + 1) 行段：将注入 append_system_prompt（dispatch master 规则）"
             }
             $insertBlocks += @{ At = $start + 1; Lines = $insert }
+            if ($null -ne $workDirReplaceIdx) {
+                $replaceBlocks += @{ Index = $workDirReplaceIdx; Line = ('work_dir = "' + $wsWorkDir + '"') }
+                Write-Note "第 $($start + 1) 行段：work_dir「$existingDir」→「$wsWorkDir」（master 工作目录指向 waystation 安装目录）"
+            }
             $changedSections++
         }
         if ($changedSections -eq 0) { return 0 }
@@ -263,6 +285,8 @@ function Merge-CcConfig([string]$ConfigPath) {
         Copy-Item -Force -Path $ConfigPath -Destination $backupPath
         $out = New-Object 'System.Collections.Generic.List[string]'
         $out.AddRange([string[]]$lines)
+        # 先做原位替换（不改变行数），再做插入（插入索引用原始行号仍有效）
+        foreach ($r in $replaceBlocks) { $out[[int]$r.Index] = [string]$r.Line }
         $sorted = @($insertBlocks | Sort-Object { $_.At } -Descending)
         foreach ($block in $sorted) {
             $out.InsertRange([int]$block.At, [string[]]$block.Lines)
@@ -274,9 +298,9 @@ function Merge-CcConfig([string]$ConfigPath) {
         Write-Warn "config.toml 自动合并未完成（$($_.Exception.Message)）"
         if (-not $DryRun) {
             if ($backupPath -and (Test-Path $backupPath)) {
-                Add-Manual "config.toml 自动合并写入失败——手工把 allowed_tools 与 append_system_prompt 加进其 [projects.agent.options] 段（合并前备份已留在 $backupPath，必要时可据此还原）"
+                Add-Manual "config.toml 自动合并写入失败——手工把 allowed_tools、append_system_prompt 与 work_dir 加进其 [projects.agent.options] 段（合并前备份已留在 $backupPath，必要时可据此还原）"
             } else {
-                Add-Manual 'config.toml 自动合并失败（备份亦未生成）——手工把 allowed_tools 与 append_system_prompt 加进其 [projects.agent.options] 段'
+                Add-Manual 'config.toml 自动合并失败（备份亦未生成）——手工把 allowed_tools、append_system_prompt 与 work_dir 加进其 [projects.agent.options] 段'
             }
         }
         return 0
