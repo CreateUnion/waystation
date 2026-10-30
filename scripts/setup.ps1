@@ -7,11 +7,13 @@
          未安装→全新安装；已装更低→询问更新（默认 Y）；同版或更高→跳过；版本不可解析→询问重装（默认 Y）。
          全新安装/更新都委托 scripts\install.ps1（本脚本不改它的行为）。
       2) 检测 cc-connect（服务 / ~\.cc-connect\config.toml / PATH 或 npm 全局目录，任一命中即存在）：
-         不存在→提醒无法自动配置多会话控制；存在→全自动配置 dispatch master 自动化（本骨架后续版本实现）。
+         不存在→提醒无法自动配置多会话控制；存在→全自动配置 dispatch master 自动化。
     特性与边界：
       - 幂等：重复运行安全。
-      - -DryRun：只读检测并打印计划，零写入；询问转为打印决策；退出码恒 0。
-      - 非交互 stdin：「是否更新/重装」按默认 Y。
+      - -DryRun：只读检测并打印计划，零写入；询问转为打印决策；退出码恒 0（致命失败除外：
+        仓库树缺失/安装包损坏/install.ps1 失败时退出 1）。
+      - 非交互 stdin：「是否更新/重装」按默认 Y；「重启服务」按默认 N；「覆盖 WAYSTATION_ROLE」
+        按默认 Y。
       - 退出码：0=全部完成；2=完成但有待手动项；1=致命失败。
       - 测试缝：环境变量 WAYSTATION_TEST_SETUP=1 视 cc-connect 服务为不存在；=nocc 强制
         cc-connect 判定为不存在。仅自动化测试使用。
@@ -183,6 +185,8 @@ $script:AppendPromptLines = @(
 # 文本级合并：对每个 [projects.agent.options] 段插入缺失键；返回实际发生合并的段数（dry-run 恒 0）。
 # 段界防线：候选段范围内 """ 计数为奇数 = 段界落在多行字符串内部 → 该段放弃自动合并并降级手动。
 # 写回用 UTF8Encoding($false)（无 BOM）；换行沿用文件既有风格；备份仅在实际合并时创建。
+# 读入/备份/写回任一失败（AV 瞬时锁/只读/权限等）→ 警告 + 待手动项（dry-run 只警告），返回 0
+# 不中断后续步骤；try 内的 return/continue 是正常控制流，不经 catch。
 function Merge-CcConfig([string]$ConfigPath) {
     if (-not (Test-Path $ConfigPath)) {
         Write-Warn '未找到 cc-connect 配置文件（config.toml）——cc-connect 可能尚未初始化'
@@ -191,82 +195,95 @@ function Merge-CcConfig([string]$ConfigPath) {
         }
         return 0
     }
-    $raw = [System.IO.File]::ReadAllText($ConfigPath)
-    $newline = "`r`n"
-    if ($raw.IndexOf("`r`n") -lt 0) { $newline = "`n" }
-    $lines = $raw -split "`r?`n"
-    $sectionIdx = @()
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i].TrimStart() -match '^\[projects\.agent\.options\]$') { $sectionIdx += $i }
-    }
-    if ($sectionIdx.Count -eq 0) {
-        Write-Warn 'config.toml 中没有 [projects.agent.options] 段（结构未知）——不做自动合并'
-        if (-not $DryRun) {
-            Add-Manual '手工把 allowed_tools 与 append_system_prompt 加进 cc-connect config.toml 的 [projects.agent.options] 段'
+    $backupPath = $null
+    try {
+        $raw = [System.IO.File]::ReadAllText($ConfigPath)
+        $newline = "`r`n"
+        if ($raw.IndexOf("`r`n") -lt 0) { $newline = "`n" }
+        $lines = $raw -split "`r?`n"
+        $sectionIdx = @()
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i].TrimStart() -match '^\[projects\.agent\.options\]$') { $sectionIdx += $i }
         }
-        return 0
-    }
-    $insertBlocks = @()
-    $changedSections = 0
-    for ($s = 0; $s -lt $sectionIdx.Count; $s++) {
-        $start = $sectionIdx[$s]
-        $end = $lines.Count
-        if ($s -lt $sectionIdx.Count - 1) { $end = $sectionIdx[$s + 1] }
-        $quoteCount = 0
-        for ($i = $start; $i -lt $end; $i++) {
-            $quoteCount += ([regex]::Matches($lines[$i], '"""')).Count
-        }
-        if ($quoteCount % 2 -eq 1) {
-            Write-Warn "第 $($start + 1) 行的 [projects.agent.options] 段含未闭合多行字符串——放弃该段自动合并"
+        if ($sectionIdx.Count -eq 0) {
+            Write-Warn 'config.toml 中没有 [projects.agent.options] 段（结构未知）——不做自动合并'
             if (-not $DryRun) {
-                Add-Manual '手工检查 config.toml 中未闭合的多行字符串后重跑，或手工注入 allowed_tools 与 append_system_prompt'
+                Add-Manual '手工把 allowed_tools 与 append_system_prompt 加进 cc-connect config.toml 的 [projects.agent.options] 段'
             }
-            continue
+            return 0
         }
-        $body = @()
-        for ($i = $start + 1; $i -lt $end; $i++) { $body += $lines[$i] }
-        $needTools = $null -eq ($body | Where-Object { $_ -match '^\s*allowed_tools\s*=' })
-        $needPrompt = $null -eq ($body | Where-Object { $_ -match '^\s*append_system_prompt\s*=' })
-        if (-not $needTools -and -not $needPrompt) {
-            Write-Note "第 $($start + 1) 行的 dispatch 配置：已配置，跳过"
-            continue
+        $insertBlocks = @()
+        $changedSections = 0
+        for ($s = 0; $s -lt $sectionIdx.Count; $s++) {
+            $start = $sectionIdx[$s]
+            $end = $lines.Count
+            if ($s -lt $sectionIdx.Count - 1) { $end = $sectionIdx[$s + 1] }
+            $quoteCount = 0
+            for ($i = $start; $i -lt $end; $i++) {
+                $quoteCount += ([regex]::Matches($lines[$i], '"""')).Count
+            }
+            if ($quoteCount % 2 -eq 1) {
+                Write-Warn "第 $($start + 1) 行的 [projects.agent.options] 段含未闭合多行字符串——放弃该段自动合并"
+                if (-not $DryRun) {
+                    Add-Manual '手工检查 config.toml 中未闭合的多行字符串后重跑，或手工注入 allowed_tools 与 append_system_prompt'
+                }
+                continue
+            }
+            $body = @()
+            for ($i = $start + 1; $i -lt $end; $i++) { $body += $lines[$i] }
+            $needTools = $null -eq ($body | Where-Object { $_ -match '^\s*allowed_tools\s*=' })
+            $needPrompt = $null -eq ($body | Where-Object { $_ -match '^\s*append_system_prompt\s*=' })
+            if (-not $needTools -and -not $needPrompt) {
+                Write-Note "第 $($start + 1) 行的 dispatch 配置：已配置，跳过"
+                continue
+            }
+            $insert = @()
+            if ($needTools) {
+                $insert += $script:AllowedToolsLines
+                Write-Note "第 $($start + 1) 行段：将注入 allowed_tools（8 项白名单）"
+            }
+            if ($needPrompt) {
+                $insert += $script:AppendPromptLines
+                Write-Note "第 $($start + 1) 行段：将注入 append_system_prompt（dispatch master 规则）"
+            }
+            $insertBlocks += @{ At = $start + 1; Lines = $insert }
+            $changedSections++
         }
-        $insert = @()
-        if ($needTools) {
-            $insert += $script:AllowedToolsLines
-            Write-Note "第 $($start + 1) 行段：将注入 allowed_tools（8 项白名单）"
+        if ($changedSections -eq 0) { return 0 }
+        if ($DryRun) {
+            Write-Note "（dry-run）将备份并合并 config.toml（共 $changedSections 段），不写入"
+            return 0
         }
-        if ($needPrompt) {
-            $insert += $script:AppendPromptLines
-            Write-Note "第 $($start + 1) 行段：将注入 append_system_prompt（dispatch master 规则）"
+        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $backupPath = "$ConfigPath.bak-setup-$stamp"
+        Copy-Item -Force -Path $ConfigPath -Destination $backupPath
+        $out = New-Object 'System.Collections.Generic.List[string]'
+        $out.AddRange([string[]]$lines)
+        $sorted = @($insertBlocks | Sort-Object { $_.At } -Descending)
+        foreach ($block in $sorted) {
+            $out.InsertRange([int]$block.At, [string[]]$block.Lines)
         }
-        $insertBlocks += @{ At = $start + 1; Lines = $insert }
-        $changedSections++
-    }
-    if ($changedSections -eq 0) { return 0 }
-    if ($DryRun) {
-        Write-Note "（dry-run）将备份并合并 config.toml（共 $changedSections 段），不写入"
+        [System.IO.File]::WriteAllText($ConfigPath, ($out -join $newline), (New-Object System.Text.UTF8Encoding($false)))
+        Write-Note "已注入并备份：$backupPath"
+        return $changedSections
+    } catch {
+        Write-Warn "config.toml 自动合并未完成（$($_.Exception.Message)）"
+        if (-not $DryRun) {
+            if ($backupPath -and (Test-Path $backupPath)) {
+                Add-Manual "config.toml 自动合并写入失败——手工把 allowed_tools 与 append_system_prompt 加进其 [projects.agent.options] 段（合并前备份已留在 $backupPath，必要时可据此还原）"
+            } else {
+                Add-Manual 'config.toml 自动合并失败（备份亦未生成）——手工把 allowed_tools 与 append_system_prompt 加进其 [projects.agent.options] 段'
+            }
+        }
         return 0
     }
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $backupPath = "$ConfigPath.bak-setup-$stamp"
-    Copy-Item -Force -Path $ConfigPath -Destination $backupPath
-    $out = New-Object 'System.Collections.Generic.List[string]'
-    $out.AddRange([string[]]$lines)
-    $sorted = @($insertBlocks | Sort-Object { $_.At } -Descending)
-    foreach ($block in $sorted) {
-        $out.InsertRange([int]$block.At, [string[]]$block.Lines)
-    }
-    [System.IO.File]::WriteAllText($ConfigPath, ($out -join $newline), (New-Object System.Text.UTF8Encoding($false)))
-    Write-Note "已注入并备份：$backupPath"
-    return $changedSections
 }
 
 # 自提权片段执行器：写临时 .ps1 → Start-Process -Verb RunAs 等待退出码 → 清理片段。
 # 片段只做参数所述的一件事；UAC 被拒/执行失败一律返回 $false（调用方降级手动）。
 function Invoke-ElevatedSnippet([string[]]$SnippetLines) {
     $snippet = Join-Path $env:TEMP ('ws-setup-' + [guid]::NewGuid().ToString('N') + '.ps1')
-    [System.IO.File]::WriteAllText($snippet, ($SnippetLines -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::WriteAllText($snippet, ($SnippetLines -join "`r`n"), (New-Object System.Text.UTF8Encoding($true))) # 片段必须带 BOM：PS 5.1 对无 BOM 脚本按系统 ANSI 解码，既有 AppEnvironmentExtra 条目含非 ASCII（如中文用户名路径）时会在片段内乱码并被静默写回注册表
     try {
         $p = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-File', $snippet) -Verb RunAs -Wait -PassThru
         return ($p.ExitCode -eq 0)
