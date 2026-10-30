@@ -10,6 +10,7 @@ import { expireCoreWhenSeatsAllow, inboundHooksOf, noteBridgeCount, resolveCoreR
 import { createIpcClient } from '../src/core/ipc.js';
 import { createCollabService } from '../src/collab/service.js';
 import { createInbound } from '../src/net/inbound.js';
+import { TOOL_SPECS } from '../src/tools/specs.js';
 import { ANCHOR_PORT } from '../src/site.js';
 import { makeTempDir, pickFreePort, repoRoot, waitFor, waitForRebindable } from './helpers.js';
 
@@ -349,7 +350,10 @@ test('core.json 创建与正常退出删除（进程内）＋令牌轮换＋失�
   const first = await startCoreReady(t, prepare);
   const corePath = join(home, CORE_FILE);
   assertReadyRecord(readCoreJson(home), { home, port: first.core.port, pid: process.pid });
-  assert.deepEqual(first.core.registry.list().map((tool) => tool.name), TOOL_NAMES, '27 个处理器全数注册');
+  assert.deepEqual(first.core.registry.list().map((tool) => tool.name), TOOL_NAMES, '28 个处理器全数注册');
+  /* 桥面与核心面必须同清单：桥的工具目录是 specs.js 的静态 TOOL_SPECS 数组（不从核心现拉），
+   * 漏加=核心有而所有 claude 会话看不到（2026-10-30 reload 工具事故）。钉死两者逐字一致。 */
+  assert.deepEqual(TOOL_SPECS.map((tool) => tool.name), TOOL_NAMES, '桥面 TOOL_SPECS 必须与核心注册面逐字一致');
   const firstHeartbeat = readCoreJson(home).heartbeatAt;
   await waitFor(() => Date.parse(readCoreJson(home).heartbeatAt) > Date.parse(firstHeartbeat), { timeoutMs: 5000 });
   const firstToken = readCoreJson(home).token;
