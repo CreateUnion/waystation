@@ -128,6 +128,7 @@ export function createCollabService(options) {
   state.dispatchDomain = createDispatchDomain({
     state,
     config: options.config,
+    dataDir: options.dataDir,
     log: state.log,
     now: state.clock,
     notify: (frame) => state.notify?.(frame) ?? false,

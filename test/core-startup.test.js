@@ -16,9 +16,9 @@ import { makeTempDir, pickFreePort, repoRoot, waitFor, waitForRebindable } from 
 const CORE_ENTRY = join(repoRoot, 'bin', 'waystation-core.js');
 const CORE_FILE = join('run', 'core.json');
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-/* 工具名清单（注册面冻结口径）：与既有会话组合根注册的 27 个工具逐字一致——核心持有注册表，
- * 本用例把「27 个 handler 全数注册」钉成断言。 */
-const TOOL_NAMES = ['ws_status', 'ws_list_hosts', 'ws_ping', 'ws_delivery_status', 'ws_check_inbox', 'ws_list_collabs', 'ws_create_collab', 'ws_approve_invite', 'ws_allow_next_invite', 'ws_set_confirm_gate', 'ws_dispatch_scan', 'ws_dispatch_claim', 'ws_dispatch_approve', 'ws_dispatch_release', 'ws_withdraw_invite', 'ws_view_ledger', 'ws_send_message', 'ws_set_mute', 'ws_leave_collab', 'ws_end_collab', 'ws_invite', 'ws_request_join', 'ws_join', 'ws_approve_join', 'ws_decide', 'ws_handover', 'ws_take_over'];
+/* 工具名清单（注册面冻结口径）：与既有会话组合根注册的 28 个工具逐字一致——核心持有注册表，
+ * 本用例把「28 个 handler 全数注册」钉成断言。 */
+const TOOL_NAMES = ['ws_status', 'ws_list_hosts', 'ws_ping', 'ws_delivery_status', 'ws_check_inbox', 'ws_list_collabs', 'ws_create_collab', 'ws_approve_invite', 'ws_allow_next_invite', 'ws_set_confirm_gate', 'ws_dispatch_scan', 'ws_dispatch_claim', 'ws_dispatch_approve', 'ws_dispatch_release', 'ws_dispatch_rules_reload', 'ws_withdraw_invite', 'ws_view_ledger', 'ws_send_message', 'ws_set_mute', 'ws_leave_collab', 'ws_end_collab', 'ws_invite', 'ws_request_join', 'ws_join', 'ws_approve_join', 'ws_decide', 'ws_handover', 'ws_take_over'];
 const PORT_SETUP_ATTEMPTS = 3;
 
 /* 核心进程收尾（与 server.test.js 同一模式）：收尾钩子必须先于 makeTempDir 的删除钩子注册——

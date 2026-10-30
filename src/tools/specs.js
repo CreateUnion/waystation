@@ -195,6 +195,16 @@ export const WS_DISPATCH_RELEASE_SPEC = {
   },
 };
 
+export const WS_DISPATCH_RULES_RELOAD_SPEC = {
+  name: 'ws_dispatch_rules_reload',
+  description: 'dispatch master 专用：重读 ~/.waystation/dispatch-rules.md（收编纪律单一权威源）并向全体在编成员广播最新纪律包（带内容版本号+时间戳，便于会话识别新旧）——改纪律文件后对已收编会话立即生效，无需重建；文件缺失时按内置最简纪律广播并在结果中标注 rulesMissing',
+  inputSchema: {
+    type: 'object',
+    properties: {},
+    additionalProperties: false,
+  },
+};
+
 export const WS_WITHDRAW_INVITE_SPEC = {
   name: 'ws_withdraw_invite',
   description: '撤回邀请（managed 仅站长；forum 仅撤回本机挂起记录并停止补投，已投出的邀请不可收回）：按 inviteId 撤回该条邀请记录；未给 inviteId 时按 target 精确匹配撤回该目标的一条邀请。inviteId 与 target 至少给一个，二者二选一——本工具不提供整条协作取消，结束协作请用 ws_end_collab',

@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { DISPATCH_RULES_FILE_NAME } from '../src/collab/dispatch.js';
 import { makeDispatchNode } from './helpers/dispatch.js';
 
 function createDispatch(node) {
@@ -160,28 +163,110 @@ test('claim 门 off：master 手动 claim 交互式会话直接绑定（不进 p
   assert.ok(autoNotice, '注入知情通知');
 });
 
-test('收编通知自动携带标准上报要求（三条路径：门 off 手动绑定 / autoClaim / pending 确认提示）', (t) => {
+test('收编通知携带纪律包全文（三条路径：门 off 手动绑定 / autoClaim / pending 确认提示）', (t) => {
   const node = makeDispatchNode(t, { config: { dispatchClaimConfirmation: false } });
+  writeFileSync(join(node.dataDir, DISPATCH_RULES_FILE_NAME), '纪律甲：主动汇报。\n纪律乙：弹窗先知会。\n', 'utf8');
   createDispatch(node);
-  // 路径一：门 off 手动 claim → 直接绑定通知带上报要求
+  // 路径一：门 off 手动 claim → 直接绑定通知带纪律包全文
   node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['human-1'] });
   const boundNotice = node.notices.find(
     (frame) => frame.payload?.event === 'dispatch-claim-auto' && frame.payload?.targetSessionId === 'human-1',
   );
-  assert.match(String(boundNotice?.payload?.text ?? ''), /收编后请主动向 master 汇报当前状态/, '门 off 绑定通知应带上报要求');
-  // 路径二：autoClaim 入编 → 知情通知带上报要求
+  assert.match(String(boundNotice?.payload?.text ?? ''), /纪律甲：主动汇报/, '门 off 绑定通知应带纪律包全文');
+  // 路径二：autoClaim 入编 → 知情通知带纪律包全文
   const autoNode = makeDispatchNode(t, { config: { dispatchClaimConfirmation: false } });
+  writeFileSync(join(autoNode.dataDir, DISPATCH_RULES_FILE_NAME), '纪律甲：主动汇报。\n', 'utf8');
   const autoCreated = autoNode.service.create({ mode: 'dispatch', name: 'dispatch', sessionId: 'master-1', autoClaim: true });
   assert.equal(autoCreated.ok, true);
   const autoNotice = autoNode.notices.find(
     (frame) => frame.payload?.event === 'dispatch-claim-auto' && frame.payload?.targetSessionId === 'worker-1',
   );
-  assert.match(String(autoNotice?.payload?.text ?? ''), /收编后请主动向 master 汇报当前状态/, 'autoClaim 通知应带上报要求');
-  // 路径三：门 on 的 pending 确认提示预告上报要求
+  assert.match(String(autoNotice?.payload?.text ?? ''), /纪律甲：主动汇报/, 'autoClaim 通知应带纪律包全文');
+  // 路径三：门 on 的 pending 确认提示预告纪律
   const promptNode = makeDispatchNode(t);
+  writeFileSync(join(promptNode.dataDir, DISPATCH_RULES_FILE_NAME), '纪律乙：弹窗先知会。\n', 'utf8');
   createDispatch(promptNode);
   promptNode.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['human-1'] });
   const prompt = promptNode.notices.find((frame) => frame.payload?.event === 'dispatch-claim');
-  assert.match(String(prompt?.payload?.text ?? ''), /批准后收编后请主动向 master 汇报当前状态/, 'pending 提示应预告上报要求');
+  assert.match(String(prompt?.payload?.text ?? ''), /批准后适用收编纪律：\n纪律乙/, 'pending 提示应预告纪律');
   assert.equal(autoCreated.collabId !== undefined, true);
+});
+
+test('纪律文件热生效：改文件后再收编，新通知携带新文本（无需 reload）', (t) => {
+  const node = makeDispatchNode(t, { config: { dispatchClaimConfirmation: false } });
+  writeFileSync(join(node.dataDir, DISPATCH_RULES_FILE_NAME), '纪律 v1：主动汇报。\n', 'utf8');
+  createDispatch(node);
+  node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['human-1'] });
+  writeFileSync(join(node.dataDir, DISPATCH_RULES_FILE_NAME), '纪律 v2：先知会再弹窗。\n', 'utf8');
+  node.service.dispatch.release({ sessionId: 'master-1', targetSessionId: 'human-1' });
+  const again = node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['human-1'] });
+  assert.equal(again.results[0].status, 'bound');
+  const notice = node.notices.filter(
+    (frame) => frame.payload?.event === 'dispatch-claim-auto' && frame.payload?.targetSessionId === 'human-1',
+  ).pop();
+  assert.match(String(notice?.payload?.text ?? ''), /纪律 v2：先知会再弹窗/, '改文件后新收编通知应带新文本');
+  assert.equal(String(notice?.payload?.text ?? '').includes('纪律 v1'), false, '旧文本不应再出现');
+});
+
+test('纪律文件缺失：回退内置最简纪律并向 master 知会一次（同 record 不重复刷屏）', (t) => {
+  const node = makeDispatchNode(t, { config: { dispatchClaimConfirmation: false } });
+  createDispatch(node);
+  node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['human-1'] });
+  const boundNotice = node.notices.find(
+    (frame) => frame.payload?.event === 'dispatch-claim-auto' && frame.payload?.targetSessionId === 'human-1',
+  );
+  assert.match(String(boundNotice?.payload?.text ?? ''), /权限类允许\/拒绝弹窗不可远程代批/, '缺失时回退内置最简纪律');
+  const warns = () => node.notices.filter(
+    (frame) => frame.payload?.event === 'dispatch-rules-missing' && frame.payload?.targetSessionId === 'master-1',
+  );
+  assert.equal(warns().length, 1, 'master 只被告知一次');
+  node.service.dispatch.release({ sessionId: 'master-1', targetSessionId: 'human-1' });
+  node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['human-1'] });
+  assert.equal(warns().length, 1, '同 record 第二次收编不再重复知会');
+});
+
+test('ws_dispatch_rules_reload：master 重读文件向全体在编广播最新纪律（带版本号）；非 master 拒绝', (t) => {
+  const node = makeDispatchNode(t, { config: { dispatchClaimConfirmation: false } });
+  writeFileSync(join(node.dataDir, DISPATCH_RULES_FILE_NAME), '纪律 R1：主动汇报。\n', 'utf8');
+  createDispatch(node);
+  node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['human-1'] });
+  node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['worker-1'] });
+
+  const denied = node.service.dispatch.reloadRules({ sessionId: 'human-1' });
+  assert.equal(denied.ok, false, '非 master 不能重载广播');
+
+  const reloaded = node.service.dispatch.reloadRules({ sessionId: 'master-1' });
+  assert.equal(reloaded.ok, true);
+  assert.equal(reloaded.rulesMissing, false);
+  assert.equal(reloaded.notified, 2, '全体在编成员都收到广播');
+  assert.match(reloaded.version, /^[0-9a-f]{8}$/);
+  const updates = node.notices.filter((frame) => frame.payload?.event === 'dispatch-rules-updated');
+  assert.equal(updates.length, 2);
+  assert.deepEqual(
+    updates.map((frame) => frame.payload?.targetSessionId).sort(),
+    ['human-1', 'worker-1'],
+    '广播对象应为全体在编成员',
+  );
+  for (const frame of updates) {
+    assert.match(String(frame.payload?.text ?? ''), /【纪律更新 v[0-9a-f]{8} .+】/, '广播带版本号+时间戳');
+    assert.match(String(frame.payload?.text ?? ''), /纪律 R1：主动汇报/, '广播携带最新全文');
+  }
+});
+
+test('reload 文件缺失：按内置最简纪律广播并标注 rulesMissing；版本随内容变化', (t) => {
+  const node = makeDispatchNode(t, { config: { dispatchClaimConfirmation: false } });
+  createDispatch(node);
+  node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['worker-1'] });
+  const missing = node.service.dispatch.reloadRules({ sessionId: 'master-1' });
+  assert.equal(missing.ok, true);
+  assert.equal(missing.rulesMissing, true);
+  const frame = node.notices.find((entry) => entry.payload?.event === 'dispatch-rules-updated');
+  assert.match(String(frame?.payload?.text ?? ''), /权限类允许\/拒绝弹窗不可远程代批/, '缺失时广播内置最简纪律');
+
+  writeFileSync(join(node.dataDir, DISPATCH_RULES_FILE_NAME), '纪律 R2：先知会。\n', 'utf8');
+  const first = node.service.dispatch.reloadRules({ sessionId: 'master-1' });
+  writeFileSync(join(node.dataDir, DISPATCH_RULES_FILE_NAME), '纪律 R3：热生效。\n', 'utf8');
+  const second = node.service.dispatch.reloadRules({ sessionId: 'master-1' });
+  assert.notEqual(first.version, second.version, '内容变了版本号必须变');
+  assert.equal(first.rulesMissing, false);
 });

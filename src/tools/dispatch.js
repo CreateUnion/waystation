@@ -1,5 +1,6 @@
 import {
-  WS_DISPATCH_APPROVE_SPEC, WS_DISPATCH_CLAIM_SPEC, WS_DISPATCH_RELEASE_SPEC, WS_DISPATCH_SCAN_SPEC,
+  WS_DISPATCH_APPROVE_SPEC, WS_DISPATCH_CLAIM_SPEC, WS_DISPATCH_RELEASE_SPEC,
+  WS_DISPATCH_RULES_RELOAD_SPEC, WS_DISPATCH_SCAN_SPEC,
 } from './specs.js';
 import { errorResult, okResult } from './collab.js';
 
@@ -98,6 +99,20 @@ export function dispatchReleaseTool() {
         sessionId: caller.sessionId,
         targetSessionId: args.sessionId.trim(),
       });
+      return result.ok === true ? okResult(result) : dispatchFailure(result);
+    },
+  };
+}
+
+export function dispatchRulesReloadTool() {
+  return {
+    ...WS_DISPATCH_RULES_RELOAD_SPEC,
+    handler: async (_args, context) => {
+      const caller = callerSessionOf(context, 'ws_dispatch_rules_reload');
+      if (caller.refusal !== null) {
+        return caller.refusal;
+      }
+      const result = context.collab.dispatch.reloadRules({ sessionId: caller.sessionId });
       return result.ok === true ? okResult(result) : dispatchFailure(result);
     },
   };

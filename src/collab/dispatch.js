@@ -1,4 +1,6 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { MAX_TOPIC_CHARS, isIdentityName, isPresentationText } from '../net/protocol.js';
 import { shortSessionId } from '../util/short-id.js';
 import { gateValueOf } from './confirm-gate.js';
@@ -11,10 +13,13 @@ export const DISPATCH_MESSAGE_TYPES = ['task', 'progress', 'result', 'error'];
 export const DISPATCH_QUEUE_MAX = 256;
 export const DISPATCH_CLAIM_TTL_MS = 10 * 60 * 1000;
 export const DISPATCH_MEMBER_EVENT_DEBOUNCE_MS = 500;
-/* 收编后标准上报要求：随收编通知自动携带（机制化「master 重建 → 成员主动汇报积压状态」纪律）。
- * 内容仍由 slave 模型生成——本常量只机制化"要求"，不机制化"内容"。 */
-export const DISPATCH_CLAIM_REPORT_HINT =
-  '收编后请主动向 master 汇报当前状态：在做什么、已完成什么、有无卡点待裁定（ws_send_message 本协作即回）';
+/* 收编纪律单一权威源：~/.waystation/dispatch-rules.md（markdown 分节，每条一句话）。
+ * 收编低频，通知发出时实时读文件——改完即热生效，无需 reload 命令。缺失/为空时回退内置最简
+ * 纪律（仅主动上报 + 权限豁免），并向 master 知会一次（每 record 只提醒一次，防刷屏）。
+ * 内容仍由 slave 模型执行——核心只机制化"要求"的携带，不机制化"内容"本身。 */
+export const DISPATCH_RULES_FILE_NAME = 'dispatch-rules.md';
+export const DISPATCH_RULES_FALLBACK =
+  '收编后请主动向 master 汇报当前状态与结果（ws_send_message 本协作即回）；权限类允许/拒绝弹窗不可远程代批，被拒照实上报原因';
 /* 桥断开宽限（与席位宽限同源配置，缺省与 service 的 DEFAULT_SEAT_GRACE_MS 对齐）。 */
 const DISPATCH_GRACE_MS = 60 * 1000;
 
@@ -37,6 +42,7 @@ export function createDispatchDomain(deps) {
   const runtime = {
     state,
     config: deps.config ?? {},
+    dataDir: typeof deps.dataDir === 'string' && deps.dataDir.length > 0 ? deps.dataDir : null,
     log: deps.log ?? null,
     notify: typeof deps.notify === 'function' ? deps.notify : null,
     now,
@@ -70,6 +76,7 @@ function dispatchApiOf(runtime) {
     claim: (input) => claimSessionsIn(runtime, input),
     approve: (input) => approveClaimIn(runtime, input),
     release: (input) => releaseSlaveIn(runtime, input),
+    reloadRules: (input) => reloadRulesIn(runtime, input),
     send: (input) => sendMessageIn(runtime, input),
     end: (input) => endDispatchIn(runtime, input),
     leave: (input) => leaveDispatchIn(runtime, input),
@@ -179,6 +186,7 @@ function createDispatchIn(runtime, { name, topic, sessionId, autoClaim }) {
     masterName: meta.name,
     autoClaim: autoClaim === true,
     createdAt: new Date(now()).toISOString(),
+    rulesMissingWarned: false,
     slaves: new Map(),
     claims: new Map(),
     queues: new Map(),
@@ -188,6 +196,60 @@ function createDispatchIn(runtime, { name, topic, sessionId, autoClaim }) {
   };
   state.dispatches.set(collabId, record);
   return { ok: true, collabId, mode: 'dispatch', ephemeral: true, name: record.name, topic: record.topic, autoClaim: record.autoClaim };
+}
+
+/* 纪律包读取：dispatch-rules.md 实时读（收编低频，现读天然最新）；缺失/为空回退内置最简纪律。 */
+function dispatchRulesOf(runtime) {
+  if (runtime.dataDir === null) {
+    return { text: DISPATCH_RULES_FALLBACK, missing: true };
+  }
+  let text = '';
+  try {
+    text = readFileSync(join(runtime.dataDir, DISPATCH_RULES_FILE_NAME), 'utf8').trim();
+  } catch {
+    text = '';
+  }
+  return text.length > 0 ? { text, missing: false } : { text: DISPATCH_RULES_FALLBACK, missing: true };
+}
+
+/* 收编通知正文 = 前缀 + 纪律包全文；文件缺失时回退并向 master 知会一次（每 record 只提醒一次）。 */
+function claimNoticeTextOf(runtime, record, prefix) {
+  const rules = dispatchRulesOf(runtime);
+  if (rules.missing && record.rulesMissingWarned !== true) {
+    record.rulesMissingWarned = true;
+    sendNotice(
+      runtime,
+      record,
+      record.masterSessionId,
+      `收编纪律文件缺失（~/.waystation/${DISPATCH_RULES_FILE_NAME}），本次已回退内置最简纪律——请创建该文件（markdown 分节，每条一句话），改完即热生效`,
+      'dispatch-rules-missing',
+    );
+  }
+  return `${prefix}\n${rules.text}`;
+}
+
+/* 纪律重载广播（master 专用）：实时重读 dispatch-rules.md，向全体在编成员广播最新纪律包——
+ * 改纪律文件对已收编会话也立即生效，无需重建。广播带内容版本号（sha256 前 8 位）+时间戳，
+ * 便于会话识别新旧；文件缺失时按内置最简纪律广播并在结果中如实标注 rulesMissing。 */
+function reloadRulesIn(runtime, { sessionId }) {
+  const record = runtime.masterDispatchOf(sessionId);
+  if (record === null) {
+    return dispatchLost();
+  }
+  const rules = dispatchRulesOf(runtime);
+  const version = rulesVersionOf(rules.text);
+  const stamp = new Date(runtime.now()).toISOString();
+  const text = `【纪律更新 v${version} ${stamp}】以下为最新全员纪律（来源 ~/.waystation/${DISPATCH_RULES_FILE_NAME}，收到后以此覆盖本地旧认知）：\n${rules.text}`;
+  let notified = 0;
+  for (const slaveSessionId of record.slaves.keys()) {
+    sendNotice(runtime, record, slaveSessionId, text, 'dispatch-rules-updated');
+    notified += 1;
+  }
+  return { ok: true, dispatchId: record.collabId, version, rulesMissing: rules.missing, notified };
+}
+
+function rulesVersionOf(text) {
+  return createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 8);
 }
 
 /* 一轮自动收编：跳过 master 自身 / 已绑定 / 有在途确认申请 / 预检不过的目标；
@@ -216,7 +278,11 @@ function autoClaimPassIn(runtime, record) {
         runtime,
         record,
         meta.sessionId,
-        `已按本机设置自动同意 master「${record.masterName}」的收编（要退出用 ws_leave_collab）。\n${DISPATCH_CLAIM_REPORT_HINT}。`,
+        claimNoticeTextOf(
+          runtime,
+          record,
+          `已按本机设置自动同意 master「${record.masterName}」的收编（要退出用 ws_leave_collab）。`,
+        ),
         'dispatch-claim-auto',
       );
     }
@@ -355,7 +421,11 @@ function claimTargetOf(runtime, record, masterSessionId, targetSessionId) {
         runtime,
         record,
         targetSessionId,
-        `已按本机设置自动同意 master「${record.masterName}」的收编（要退出用 ws_leave_collab）。\n${DISPATCH_CLAIM_REPORT_HINT}。`,
+        claimNoticeTextOf(
+          runtime,
+          record,
+          `已按本机设置自动同意 master「${record.masterName}」的收编（要退出用 ws_leave_collab）。`,
+        ),
         'dispatch-claim-auto',
       );
       return { sessionId: targetSessionId, status: 'bound' };
@@ -396,7 +466,11 @@ function pendingClaimOf(runtime, record, masterSessionId, targetSessionId) {
     runtime,
     record,
     targetSessionId,
-    `master「${record.masterName}」请求收编本会话，允许吗？确认请调用 ws_dispatch_approve { claimId: "${claimId}", approve: true }\n批准后${DISPATCH_CLAIM_REPORT_HINT}。`,
+    claimNoticeTextOf(
+      runtime,
+      record,
+      `master「${record.masterName}」请求收编本会话，允许吗？确认请调用 ws_dispatch_approve { claimId: "${claimId}", approve: true }\n批准后适用收编纪律：`,
+    ),
     'dispatch-claim',
   );
   return { sessionId: targetSessionId, status: 'pending', claimId };
