@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { makeDispatchNode } from './helpers/dispatch.js';
-import { sendMessageTool, viewLedgerTool } from '../src/tools/collab.js';
+import { createCollabTool, sendMessageTool, viewLedgerTool } from '../src/tools/collab.js';
 import { checkInboxTool } from '../src/tools/check-inbox.js';
 import { deliveryStatusTool } from '../src/tools/delivery-status.js';
 
@@ -42,4 +42,15 @@ test('dispatch 的 check_inbox / delivery_status / view_ledger 返回明确空�
   assert.match(delivery.content[0].text, /无持久投递账/);
   const ledger = await viewLedgerTool().handler({ collabId: created.collabId }, contextOf(node, 'master-1'));
   assert.match(ledger.content[0].text, /不保存历史/);
+});
+
+test('ws_create_collab：dispatch 的 autoClaim 透传服务层（工具层不得吞参）', async (t) => {
+  const node = makeDispatchNode(t, { config: { dispatchClaimConfirmation: false } });
+  const result = await createCollabTool().handler({
+    name: '透传', mode: 'dispatch', autoClaim: true,
+  }, contextOf(node, 'master-1'));
+  assert.equal(result.isError, undefined);
+  assert.match(result.content[0].text, /"autoClaim": true/);
+  const bound = node.service.dispatch.status().dispatch.slaves.map((slave) => slave.sessionId);
+  assert.deepEqual(bound.sort(), ['human-1', 'worker-1'], '创建即自动收编一轮');
 });

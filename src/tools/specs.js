@@ -97,6 +97,7 @@ export const WS_CREATE_COLLAB_SPEC = {
       name: { type: 'string', description: '项目名（必填；同身份名呈现判据，≤64 字符）' },
       topic: { type: 'string', description: '主题描述（managed / forum 必填；dispatch 可省；≤200 字符）' },
       mode: { type: 'string', description: '模式（可选，缺省 managed）：managed / forum / dispatch——forum（讨论）参与者至多 16（含发起人）；dispatch 不进局域网、不保存历史' },
+      autoClaim: { type: 'boolean', description: '仅 dispatch：true＝创建即自动收编一轮，之后随核心节拍持续补收可绑定会话（role=slave 或 claim 门 off 的交互式；门开的交互式绝不自动弹确认）；缺省 false' },
       targets: { type: 'array', description: '被邀请目标（managed / forum 必填；dispatch 不接受；1–31 项；讨论模式至多 15 项）', items: TARGET_ITEM_SCHEMA },
     },
     required: ['name'],

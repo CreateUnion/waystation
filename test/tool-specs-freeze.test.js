@@ -403,6 +403,10 @@ const FROZEN_LIST_JSON = `[
           "type": "string",
           "description": "模式（可选，缺省 managed）：managed / forum / dispatch——forum（讨论）参与者至多 16（含发起人）；dispatch 不进局域网、不保存历史"
         },
+        "autoClaim": {
+          "type": "boolean",
+          "description": "仅 dispatch：true＝创建即自动收编一轮，之后随核心节拍持续补收可绑定会话（role=slave 或 claim 门 off 的交互式；门开的交互式绝不自动弹确认）；缺省 false"
+        },
         "targets": {
           "type": "array",
           "description": "被邀请目标（managed / forum 必填；dispatch 不接受；1–31 项；讨论模式至多 15 项）",

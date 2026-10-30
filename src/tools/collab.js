@@ -79,7 +79,8 @@ export function createCollabTool() {
         }
         const dispatchTopic = trimmedString(args, 'topic');
         return resultOf(await context.collab.create({
-          mode: 'dispatch', name, topic: dispatchTopic === '' ? undefined : dispatchTopic, sessionId: context.sessionId,
+          mode: 'dispatch', name, topic: dispatchTopic === '' ? undefined : dispatchTopic,
+          autoClaim: args.autoClaim === true, sessionId: context.sessionId,
         }));
       }
       const topic = trimmedString(args, 'topic');
