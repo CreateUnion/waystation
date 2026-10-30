@@ -468,7 +468,7 @@ if (-not $ccExists) {
     $configPath = Join-Path $HomeDir '.cc-connect\config.toml'
     $mergeChanged = Merge-CcConfig $configPath
     $envChanged = Set-ServiceRoleEnv
-    Invoke-CcRestart -Needed (($mergeChanged -gt 0) -or $envChanged)
+    $null = Invoke-CcRestart -Needed (($mergeChanged -gt 0) -or $envChanged)
 }
 
 Write-Step '3/3' '自检汇总'
