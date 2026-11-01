@@ -6,3 +6,8 @@ docs/logs/
 # 会话隔离工作树（harness 管理，勿入库）
 .claude/worktrees/
 dist/
+
+# 研发过程文件（本地保留，不上传仓库）
+.superpowers/
+poc/
+docs/superpowers/
