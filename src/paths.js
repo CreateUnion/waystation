@@ -7,6 +7,9 @@ export const DATA_DIR_ENV = 'WAYSTATION_HOME';
 export const LOGS_DIR_NAME = 'logs';
 export const COLLABS_DIR_NAME = 'collabs';
 export const SITES_DIR_NAME = 'sites';
+export const DISPATCH_DIR_NAME = 'dispatch';
+export const DISPATCH_STATE_FILE_NAME = 'state.json';
+export const ARCHIVE_DIR_NAME = 'archive';
 /* 配置文件名归路径层：站点解析（site.js）在载入 config 前需要按「目录 → 原样读取 port」直接定位文件，
  * 而 config.js 依赖 site.js 的锚点常量——文件名常量若留在 config 会形成循环依赖，故归位于路径层（各文件/目录名常量所在）。 */
 export const CONFIG_FILE_NAME = 'config.json';
@@ -33,6 +36,17 @@ export function resolveLogDir(dataDir, configuredLogDir) {
 
 export function ensureDir(dir) {
   mkdirSync(dir, { recursive: true });
+}
+
+/** 调度状态文件默认位置：`<dataDir>/dispatch/state.json`（设计 §5.3；实际位置可由
+ * config.dispatch.state_path 改写，解析在 collab/dispatch-store.js）。 */
+export function dispatchStateFilePath(dataDir) {
+  return join(dataDir, DISPATCH_DIR_NAME, DISPATCH_STATE_FILE_NAME);
+}
+
+/** 保留期归档目录：`<dataDir>/archive/collabs/`（协作目录先归档为 .json.gz 再删除）。 */
+export function collabArchiveDir(dataDir) {
+  return join(dataDir, ARCHIVE_DIR_NAME, COLLABS_DIR_NAME);
 }
 
 /** 每协作目录（设计 §15：每协作一个目录，存台账 / 快照 / 待投队列 / 本地流水）。

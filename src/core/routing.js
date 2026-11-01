@@ -361,9 +361,10 @@ function noteUnhealthy(state, bridgeId) {
  *   isGranted?: ((collabId: string, sessionId: string) => boolean | null | undefined) | null,
  *   seatsOf?: ((collabId: string) => Array<any> | null) | null,
  *   seatOf?: ((collabId: string, sessionId: string) => any) | null,
+ *   onCallActivity?: ((sessionId: string, at: number) => unknown) | null,
  *   receiptTimeoutMs?: number, callTimeoutMs?: number, now?: () => number }} options
  */
-export function createInjectionRouter({ dataDir, log, describeCollab = null, isGranted = null, seatsOf = null, seatOf = null, receiptTimeoutMs = PUSH_RECEIPT_TIMEOUT_MS, callTimeoutMs = CALL_SAFETY_DEADLINE_MS, now = Date.now }) {
+export function createInjectionRouter({ dataDir, log, describeCollab = null, isGranted = null, seatsOf = null, seatOf = null, onCallActivity = null, receiptTimeoutMs = PUSH_RECEIPT_TIMEOUT_MS, callTimeoutMs = CALL_SAFETY_DEADLINE_MS, now = Date.now }) {
   const state = {
     dataDir,
     log,
@@ -371,6 +372,7 @@ export function createInjectionRouter({ dataDir, log, describeCollab = null, isG
     isGranted,
     seatsOf,
     seatOf,
+    onCallActivity,
     timeoutMs: receiptTimeoutMs,
     callTimeoutMs,
     clock: now,
@@ -610,8 +612,22 @@ function closeAfter(context, result) {
 /* call 帧执行面（桥 e2e 的解锁面——未接时 call 帧被静默丢弃）：adopt 判定先于 handler → handler（per-request context
  * 带调用者身份，执行带安全期限）→ 写点 → notice 附加 → result 帧。**每次 call 必回恰一帧 result**
  * （正常/未知工具/isError/异常/期限全路径）——桥侧在途调用由此不会永久挂起。 */
+/* 工具调用活性上报（调度长心跳来源之一）：任意 ws 工具调用都证明该会话仍在驱动编排。
+ * 注入面归属运行期（协作服务后构造），异常隔离——心跳失败不得影响工具执行主链。 */
+function noteCallActivity(state, sessionId) {
+  if (typeof state.onCallActivity !== 'function' || typeof sessionId !== 'string' || sessionId === '') {
+    return;
+  }
+  try {
+    state.onCallActivity(sessionId, state.clock());
+  } catch (error) {
+    state.log?.warn?.('工具调用活性上报失败（已隔离）', { sessionId, reason: error?.message });
+  }
+}
+
 async function handleCallOf(state, frame, record, options) {
   const caller = { bridgeId: record?.bridgeId ?? null, sessionId: record?.sessionId ?? null };
+  noteCallActivity(state, caller.sessionId);
   const guidance = applyAdoptOf(state, { tool: frame.tool, args: frame.args, caller });
   const call = { ...caller, notices: [] };
   const context = { ...options.baseContext, bridgeId: caller.bridgeId, sessionId: caller.sessionId };

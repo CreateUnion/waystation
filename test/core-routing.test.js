@@ -73,6 +73,7 @@ function makeRouter(t, overrides = {}) {
     log: overrides.log ?? quietLog(),
     describeCollab: overrides.describeCollab ?? (() => ({ name: '项目甲', mode: 'managed' })),
     isGranted: overrides.isGranted,
+    onCallActivity: overrides.onCallActivity,
     receiptTimeoutMs: overrides.receiptTimeoutMs,
     now: overrides.now,
   });
@@ -90,6 +91,18 @@ function makeRouter(t, overrides = {}) {
 function pushFramesOf(out, bridgeId = null) {
   return out.filter((entry) => entry.frame.type === 'push' && (bridgeId === null || entry.record.bridgeId === bridgeId));
 }
+
+test('工具调用活性上报：每个 call 帧都触发 onCallActivity（dispatch 调度长心跳来源）', async (t) => {
+  const calls = [];
+  let now = 1000;
+  const { router, registry } = makeRouter(t, { now: () => now, onCallActivity: (sessionId, at) => calls.push({ sessionId, at }) });
+  const record = registry.register(bridgeRecord('bridge-a', 'session-a'));
+  const tools = { call: () => ({ content: [] }) };
+  await router.handleCall({ id: 'call-1', tool: 'ws_status', args: {} }, record, { tools, baseContext: {} });
+  now = 2000;
+  await router.handleCall({ id: 'call-2', tool: 'ws_status', args: {} }, record, { tools, baseContext: {} });
+  assert.deepEqual(calls, [{ sessionId: 'session-a', at: 1000 }, { sessionId: 'session-a', at: 2000 }]);
+});
 
 function sampleFrame(collabId, overrides = {}) {
   return {

@@ -3,16 +3,32 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { MAX_TOPIC_CHARS, isIdentityName, isPresentationText } from '../net/protocol.js';
 import { shortSessionId } from '../util/short-id.js';
+import { dispatchStateFilePath } from '../paths.js';
+import {
+  dispatchStatePathOf, masterTimeoutMsOf, persistEnabledOf, retentionConfigOf,
+} from '../dispatch-config.js';
+import {
+  DISPATCH_TASK_SUMMARY_MAX, REPLACED_MASTER_MAX, loadDispatchState, migrateDispatchState, quarantineDispatchState,
+  removeDispatchState, resolveDispatchStatePath, saveDispatchState,
+} from './dispatch-store.js';
 import { gateValueOf } from './confirm-gate.js';
 
-/* dispatch 内存域：与 managed / forum 同级的第三种模式，但不进 state.collabs、不写任何协作文件。
- * 状态全部在 state.dispatches（Map<collabId, record>）。本模块只做纯内存判定与组帧；
- * 消息投递经注入的 notify（routing.notify），不碰 LAN 出站队列 / 本机席位注入 / inbox 落盘。 */
+/* dispatch 域：与 managed / forum 同级的第三种模式，但不进 state.collabs、不写任何协作文件。
+ * 运行态全部在 state.dispatches（Map<collabId, record>）；编排状态（组员 / 任务表 / 调度长心跳）
+ * 可持久化到单独的 dispatch/state.json（dispatch-store.js；persist=false 退回纯内存），
+ * 消息流水仍不落盘。消息投递经注入的 notify（routing.notify），不碰 LAN 出站队列 / 本机席位注入 / inbox 落盘。 */
 
 export const DISPATCH_MESSAGE_TYPES = ['task', 'progress', 'result', 'error'];
 export const DISPATCH_QUEUE_MAX = 256;
 export const DISPATCH_CLAIM_TTL_MS = 10 * 60 * 1000;
 export const DISPATCH_MEMBER_EVENT_DEBOUNCE_MS = 500;
+/* 任务表容量上限：完成项按保留期裁剪；在途任务不被自动清理，达到上限后拒绝新 taskId
+ * （防止无限增长的持久面；1000 与单机编排量级匹配）。 */
+export const DISPATCH_TASK_MAX = 1000;
+const DISPATCH_TASK_DONE_STATUSES = new Set(['done', 'failed']);
+const HOUR_MS = 60 * 60 * 1000;
+/* 旧 master 被接管后的明确拒绝（单一文案源）。 */
+const TAKEN_OVER_MESSAGE = '本会话已被接管——dispatch 的调度长已换届；请勿再按原调度长身份操作（新调度长可用 ws_status / ws_list_collabs 确认）';
 /* 收编纪律单一权威源：~/.waystation/dispatch-rules.md（markdown 分节，每条一句话）。
  * 收编低频，通知发出时实时读文件——改完即热生效，无需 reload 命令。缺失/为空时回退内置兜底
  * 纪律（与 dispatch-rules.md 保持逐条同步，新装机开箱即得完整纪律），并向 master 知会一次
@@ -61,8 +77,195 @@ export function createDispatchDomain(deps) {
     masterDispatchOf,
     dispatchOf,
     listSessionIds,
+    persistence: {
+      enabled: false,
+      degraded: false,
+      statePath: /** @type {string | null} */ (null),
+      warned: false,
+    },
   };
+  runtime.persistence = createPersistence(runtime);
+  restoreDispatchIn(runtime);
   return dispatchApiOf(runtime);
+}
+
+/* 持久化运行面：enabled＝配置总开关；degraded＝写失败后本进程内永久降级；
+ * statePath＝解析后的绝对路径（null＝未启用/不可解析）。 */
+function createPersistence(runtime) {
+  if (!persistEnabledOf(runtime.config)) {
+    return { enabled: false, degraded: false, statePath: null, warned: false };
+  }
+  if (runtime.dataDir === null) {
+    runtime.log?.warn?.('dispatch 持久化已启用但数据目录缺失——降级为纯内存', {});
+    return { enabled: false, degraded: true, statePath: null, warned: true };
+  }
+  const statePath = statePathFor(runtime);
+  logMigration(runtime, statePath);
+  return { enabled: true, degraded: false, statePath, warned: false };
+}
+
+function statePathFor(runtime) {
+  try {
+    return resolveDispatchStatePath(runtime.dataDir, dispatchStatePathOf(runtime.config));
+  } catch (error) {
+    runtime.log?.warn?.('dispatch.state_path 非法——回退默认位置', { reason: error?.message });
+    return dispatchStateFilePath(runtime.dataDir);
+  }
+}
+
+function logMigration(runtime, statePath) {
+  const migrated = migrateDispatchState({ dataDir: runtime.dataDir, statePath, now: runtime.now() });
+  if (!migrated.ok) {
+    runtime.log?.warn?.('调度状态文件位置迁移失败（继续使用配置位置）', { reason: migrated.reason, statePath });
+    return;
+  }
+  if (migrated.changed) {
+    runtime.log?.info?.('调度状态文件已迁移', { mode: migrated.mode, statePath });
+  }
+}
+
+function persistenceReadable(runtime) {
+  const persistence = runtime.persistence;
+  return persistence !== undefined && persistence.enabled && persistence.statePath !== null;
+}
+
+/* 写盘：仅在持久化启用且未降级时执行；失败告警一次并永久降级（编排继续，不阻塞）。
+ * 写前裁剪已完成任务（保留期），保证文件不随长寿命 dispatch 无限增长。 */
+function persistNow(runtime, record) {
+  const persistence = runtime.persistence;
+  if (!persistenceReadable(runtime) || persistence.degraded) {
+    return false;
+  }
+  if (record !== null && record !== undefined) {
+    pruneTasksIn(runtime, record, runtime.now());
+  }
+  try {
+    saveDispatchState(persistence.statePath, record, { now: runtime.now() });
+    return true;
+  } catch (error) {
+    degradePersistence(runtime, error);
+    return false;
+  }
+}
+
+function degradePersistence(runtime, error) {
+  const persistence = runtime.persistence;
+  persistence.degraded = true;
+  if (persistence.warned) {
+    return;
+  }
+  persistence.warned = true;
+  runtime.log?.warn?.('调度状态持久化失败——本进程内降级为纯内存（编排继续）', {
+    statePath: persistence.statePath, reason: error?.message,
+  });
+}
+
+/* 删除持久面（正常结束 / 超期残留）：删除失败只告警，不影响内存收尾。 */
+function removePersistedState(runtime, reason) {
+  if (!persistenceReadable(runtime)) {
+    return;
+  }
+  try {
+    removeDispatchState(runtime.persistence.statePath);
+  } catch (error) {
+    runtime.log?.warn?.('调度状态文件删除失败', { reason, error: error?.message, statePath: runtime.persistence.statePath });
+  }
+}
+
+/* 启动恢复：读状态文件 → 校验 → master 在线判定 → 进入内存域。
+ * 核心启动时桥尚未注册（metaOf 为空），因此通常先落为 pending-takeover；master 桥重连后
+ * noteBridgeOnline 会刷新心跳并恢复 active。 */
+function restoreDispatchIn(runtime) {
+  if (!persistenceReadable(runtime)) {
+    return;
+  }
+  const record = restoredRecordFrom(runtime);
+  if (record === null) {
+    return;
+  }
+  const status = isSessionOnline(runtime, record.masterSessionId) ? 'active' : 'pending-takeover';
+  const changedStatus = record.status !== status;
+  applyRestoredStatus(record, status, runtime);
+  const pruned = pruneTasksIn(runtime, record, runtime.now());
+  if (status === 'pending-takeover' && isStalePending(record, runtime)) {
+    discardStaleRestored(runtime, record);
+    return;
+  }
+  runtime.state.dispatches.set(record.collabId, record);
+  broadcastRestored(runtime, record);
+  if (changedStatus || pruned) {
+    persistNow(runtime, record);
+  }
+}
+
+function restoredRecordFrom(runtime) {
+  const loaded = loadDispatchState(runtime.persistence.statePath);
+  if (loaded.ok === true) {
+    return loaded.record;
+  }
+  if (loaded.corrupt === true) {
+    const quarantined = quarantineDispatchState(runtime.persistence.statePath, runtime.now());
+    runtime.log?.warn?.('调度状态文件损坏——按无状态启动', {
+      reason: loaded.reason, quarantined, statePath: runtime.persistence.statePath,
+    });
+  } else if (loaded.unreadable === true) {
+    runtime.log?.warn?.('调度状态文件不可读——按无状态启动（本进程仍可写）', {
+      reason: loaded.reason, statePath: runtime.persistence.statePath,
+    });
+  }
+  return null;
+}
+
+function applyRestoredStatus(record, status, runtime) {
+  record.status = status;
+  if (status !== 'active') {
+    return;
+  }
+  record.masterLostAt = null;
+  record.masterLastSeenAt = Math.max(record.masterLastSeenAt, runtime.now());
+}
+
+function discardStaleRestored(runtime, record) {
+  removePersistedState(runtime, 'stale-pending');
+  runtime.log?.warn?.('调度状态残留超期（待接管且心跳超过保留期）——已删除，不恢复', {
+    collabId: record.collabId,
+    masterLastSeenAt: isoOf(record.masterLastSeenAt),
+    retentionHours: retentionConfigOf(runtime.config).dispatch_hours,
+  });
+}
+
+function isSessionOnline(runtime, sessionId) {
+  const meta = runtime.metaOf(sessionId);
+  return meta !== null && meta.online === true;
+}
+
+function isStalePending(record, runtime) {
+  const hours = retentionConfigOf(runtime.config).dispatch_hours;
+  return hours === 0 || runtime.now() - record.masterLastSeenAt > hours * HOUR_MS;
+}
+
+function broadcastRestored(runtime, record) {
+  if (record.status === 'active') {
+    for (const slaveSessionId of record.slaves.keys()) {
+      sendNotice(
+        runtime, record, slaveSessionId,
+        `dispatch「${record.name}」已恢复（调度长：${record.masterName}）；组员与任务表保留`,
+        'dispatch-restored',
+      );
+    }
+    return;
+  }
+  for (const slaveSessionId of record.slaves.keys()) {
+    sendNotice(
+      runtime, record, slaveSessionId,
+      `dispatch「${record.name}」已恢复为待接管：调度长「${record.masterName}」当前不在线；组员与任务表保留，新调度长可接管`,
+      'dispatch-takeover-pending',
+    );
+  }
+}
+
+function isoOf(ms) {
+  return new Date(ms).toISOString();
 }
 
 /* 域入口表：读面（list / status / isDispatch）＋写面（create / claim / send / end / leave / sweep）——
@@ -90,13 +293,19 @@ function dispatchApiOf(runtime) {
     send: (input) => sendMessageIn(runtime, input),
     end: (input) => endDispatchIn(runtime, input),
     leave: (input) => leaveDispatchIn(runtime, input),
+    noteActivity: (sessionId, at = now()) => noteActivityIn(runtime, sessionId, at),
     noteBridgeOnline: (sessionId) => noteBridgeOnlineIn(runtime, sessionId),
     noteBridgeClosed: (sessionId, at = now()) => noteBridgeClosedIn(runtime, sessionId, at),
     sweep: (at = now()) => sweepDispatchesIn(runtime, at),
-    list: () => listDispatchesIn(state),
+    list: () => listDispatchesIn(runtime),
     describe: (collabId) => describeDispatchIn(state, collabId),
-    view: (collabId) => viewDispatchIn(state, collabId),
-    status: () => statusOfDispatches(state),
+    view: (collabId) => viewDispatchIn(runtime, collabId),
+    status: () => statusOfDispatches(runtime),
+    persistStatus: () => ({
+      enabled: runtime.persistence.enabled,
+      degraded: runtime.persistence.degraded,
+      statePath: runtime.persistence.statePath,
+    }),
     isDispatch: (collabId) => state.dispatches.has(collabId),
   };
 }
@@ -176,17 +385,24 @@ function createDispatchIn(runtime, { name, topic, sessionId, autoClaim }) {
   if (meta === null || meta.role !== 'master') {
     return { ok: false, message: 'dispatch 只能由启动期 WAYSTATION_ROLE=master 的会话创建——工具参数与聊天内容不能声明 master 角色' };
   }
-  if (state.dispatches.size > 0) {
-    return { ok: false, message: '一个核心同一时刻只允许一个 dispatch——先结束现有 dispatch' };
-  }
   if (!isIdentityName(name)) {
     return { ok: false, message: 'dispatch 名称非法：需要 1–64 字符且不含控制字符' };
   }
   if (topic !== undefined && topic !== null && !isPresentationText(topic, MAX_TOPIC_CHARS)) {
     return { ok: false, message: `dispatch 主题非法：需要不超过 ${MAX_TOPIC_CHARS} 字符` };
   }
+  if (state.dispatches.size > 0) {
+    return createOrTakeoverDispatch(runtime, [...state.dispatches.values()][0], { sessionId, meta });
+  }
   const collabId = randomUUID();
-  const record = {
+  const record = newDispatchRecord({ collabId, name, topic, sessionId, autoClaim }, meta, now());
+  state.dispatches.set(collabId, record);
+  persistNow(runtime, record);
+  return createdDispatchResult(record, runtime);
+}
+
+function newDispatchRecord({ collabId, name, topic, sessionId, autoClaim }, meta, at) {
+  return {
     collabId,
     mode: 'dispatch',
     ephemeral: true,
@@ -195,17 +411,115 @@ function createDispatchIn(runtime, { name, topic, sessionId, autoClaim }) {
     masterSessionId: sessionId,
     masterName: meta.name,
     autoClaim: autoClaim === true,
-    createdAt: new Date(now()).toISOString(),
+    status: 'active',
+    createdAt: new Date(at).toISOString(),
+    masterLastSeenAt: at,
+    masterLostAt: null,
+    replacedMasterSessionIds: new Set(),
     rulesMissingWarned: false,
     slaves: new Map(),
+    tasks: new Map(),
     claims: new Map(),
     queues: new Map(),
     grace: new Map(),
     pendingEvents: [],
     eventTimer: null,
   };
-  state.dispatches.set(collabId, record);
-  return { ok: true, collabId, mode: 'dispatch', ephemeral: true, name: record.name, topic: record.topic, autoClaim: record.autoClaim };
+}
+
+function createdDispatchResult(record, runtime) {
+  return {
+    ok: true,
+    collabId: record.collabId,
+    mode: 'dispatch',
+    ephemeral: true,
+    persisted: persistenceActive(runtime),
+    name: record.name,
+    topic: record.topic,
+    autoClaim: record.autoClaim,
+  };
+}
+
+function persistenceActive(runtime) {
+  const persistence = runtime.persistence;
+  return persistence !== undefined && persistence.enabled && !persistence.degraded;
+}
+
+/* 已有 dispatch 时的 create 判定：同 master 幂等拒绝 / 旧 master 禁止夺回 / 未超时拒绝 /
+ * 心跳超时则原地换届（保留 collabId、name/topic、slave 列表与任务表）。 */
+function createOrTakeoverDispatch(runtime, existing, { sessionId, meta }) {
+  if (existing.masterSessionId === sessionId) {
+    return { ok: false, message: '本会话已是该 dispatch 的调度长——一个核心同一时刻只允许一个 dispatch' };
+  }
+  if (isReplacedMasterOf(existing, sessionId)) {
+    return takenOverResult();
+  }
+  const remaining = masterTimeoutMsOf(runtime.config) - (runtime.now() - existing.masterLastSeenAt);
+  if (remaining > 0) {
+    return {
+      ok: false,
+      message: `现有 dispatch 的调度长「${existing.masterName}」仍活跃（心跳超时还需约 ${Math.ceil(remaining / 1000)}s）——不能接管`,
+    };
+  }
+  return takeOverDispatchIn(runtime, existing, { sessionId, meta });
+}
+
+function takeOverDispatchIn(runtime, existing, { sessionId, meta }) {
+  const previousMasterSessionId = existing.masterSessionId;
+  const previousMasterName = existing.masterName;
+  const previousOnline = runtime.metaOf(previousMasterSessionId)?.online === true;
+  applyTakeoverState(existing, { sessionId, masterName: meta.name, now: runtime.now(), previousMasterSessionId });
+  notifyTakeoverParties(runtime, existing, { previousMasterSessionId, previousMasterName, previousOnline, sessionId });
+  persistNow(runtime, existing);
+  return takeoverResult(runtime, existing, previousMasterSessionId, previousMasterName);
+}
+
+function applyTakeoverState(existing, { sessionId, masterName, now, previousMasterSessionId }) {
+  existing.masterSessionId = sessionId;
+  existing.masterName = masterName;
+  existing.status = 'active';
+  existing.masterLastSeenAt = now;
+  existing.masterLostAt = null;
+  const replaced = [...(existing.replacedMasterSessionIds ?? []), previousMasterSessionId];
+  existing.replacedMasterSessionIds = new Set(replaced.slice(-REPLACED_MASTER_MAX));
+  existing.claims.clear();
+  existing.grace.delete(previousMasterSessionId);
+  existing.queues.delete(previousMasterSessionId);
+}
+
+function notifyTakeoverParties(runtime, existing, { previousMasterSessionId, previousMasterName, previousOnline, sessionId }) {
+  const summary = `调度长已换届：原调度长「${previousMasterName}」→ 新调度长「${existing.masterName}」；组员与任务表原样移交`;
+  for (const slaveSessionId of existing.slaves.keys()) {
+    sendNotice(runtime, existing, slaveSessionId, summary, 'dispatch-takeover');
+  }
+  if (previousOnline) {
+    /* 旧 master 已不属于 dispatch：不走待补投队列（dispatchOf 找不到它，队列永远不会 flush），
+     * 在线时直接投一条明确通知。 */
+    notifyOnce(runtime, noticeFrame(runtime, existing, previousMasterSessionId, TAKEN_OVER_MESSAGE, 'dispatch-taken-over'));
+  }
+  sendNotice(
+    runtime, existing, sessionId,
+    `已接管 dispatch「${existing.name}」（调度长：${previousMasterName} → ${existing.masterName}）；组员 ${existing.slaves.size} 人、任务 ${existing.tasks.size} 项原样移交`,
+    'dispatch-takeover-accepted',
+  );
+}
+
+function takeoverResult(runtime, existing, previousMasterSessionId, previousMasterName) {
+  return {
+    ok: true,
+    collabId: existing.collabId,
+    mode: 'dispatch',
+    ephemeral: true,
+    persisted: persistenceActive(runtime),
+    name: existing.name,
+    topic: existing.topic,
+    autoClaim: existing.autoClaim,
+    takeover: true,
+    previousMasterSessionId,
+    previousMasterName,
+    slaveCount: existing.slaves.size,
+    taskCount: existing.tasks.size,
+  };
 }
 
 /* 纪律包读取：dispatch-rules.md 实时读（收编低频，现读天然最新）；缺失/为空回退内置最简纪律。 */
@@ -242,9 +556,9 @@ function claimNoticeTextOf(runtime, record, prefix) {
  * 改纪律文件对已收编会话也立即生效，无需重建。广播带内容版本号（sha256 前 8 位）+时间戳，
  * 便于会话识别新旧；文件缺失时按内置最简纪律广播并在结果中如实标注 rulesMissing。 */
 function reloadRulesIn(runtime, { sessionId }) {
-  const record = runtime.masterDispatchOf(sessionId);
+  const { record, refusal } = masterRecordOf(runtime, sessionId);
   if (record === null) {
-    return dispatchLost();
+    return refusal;
   }
   const rules = dispatchRulesOf(runtime);
   const version = rulesVersionOf(rules.text);
@@ -302,10 +616,10 @@ function autoClaimPassIn(runtime, record) {
 /* scan 判定与 claim 判定同口径：claimable = role=slave（免确认绑定）或交互式元数据新鲜。
  * 不可收编条目仍列出（如实呈现本机注册面），由 claimable 字段引导 master 认领正确目标。 */
 function scanSessionsIn(runtime, { sessionId }) {
-  const { masterDispatchOf, metaOf, listSessionIds, isInteractiveOf } = runtime;
-  const record = masterDispatchOf(sessionId);
+  const { metaOf, listSessionIds, isInteractiveOf } = runtime;
+  const { record, refusal } = masterRecordOf(runtime, sessionId);
   if (record === null) {
-    return { ok: false, code: 'dispatch-lost', message: 'dispatch 不存在（可能已结束或核心已重启）——请重新创建' };
+    return scanLostResult(refusal);
   }
   const sessions = [];
   for (const target of listSessionIds()) {
@@ -335,15 +649,25 @@ function scanSessionsIn(runtime, { sessionId }) {
   return { ok: true, dispatchId: record.collabId, sessions };
 }
 
-function listDispatchesIn(state) {
-  return [...state.dispatches.values()].map((record) => ({
+function scanLostResult(refusal) {
+  const lost = refusal ?? dispatchLost();
+  return lost.code === 'dispatch-lost'
+    ? { ...lost, message: 'dispatch 不存在（可能已结束或核心已重启）——请重新创建' }
+    : lost;
+}
+
+function listDispatchesIn(runtime) {
+  return [...runtime.state.dispatches.values()].map((record) => ({
     collabId: record.collabId,
     name: record.name,
     mode: 'dispatch',
     ephemeral: true,
+    persisted: persistenceActive(runtime),
+    status: record.status,
     topic: record.topic,
     masterSessionId: record.masterSessionId,
     slaveCount: record.slaves.size,
+    taskCount: record.tasks.size,
     createdAt: record.createdAt,
   }));
 }
@@ -356,21 +680,22 @@ function describeDispatchIn(state, collabId) {
   return { collabId, name: record.name, mode: 'dispatch', ephemeral: true, topic: record.topic };
 }
 
-function viewDispatchIn(state, collabId) {
-  const record = state.dispatches.get(collabId);
+function viewDispatchIn(runtime, collabId) {
+  const record = runtime.state.dispatches.get(collabId);
   if (record === undefined) {
     return { ok: false, message: '本机没有该 dispatch（可能已结束或核心已重启）' };
   }
+  const persisted = persistenceActive(runtime);
   return {
-    ok: true, collabId, mode: 'dispatch', ephemeral: true,
-    message: 'dispatch 不保存历史：无台账、无帖、无收件流水、无观察窗回放',
+    ok: true, collabId, mode: 'dispatch', ephemeral: true, persisted, status: record.status,
+    message: `dispatch 不保存历史：无消息台账、无帖、无收件流水、无观察窗回放；编排状态（组员 / 任务表 / 心跳）${persisted ? '已持久化，核心重启可恢复' : '仅在本进程内存中'}`,
   };
 }
 
-function statusOfDispatches(state) {
-  const records = [...state.dispatches.values()];
+function statusOfDispatches(runtime) {
+  const records = [...runtime.state.dispatches.values()];
   if (records.length === 0) {
-    return { ok: true, dispatch: null };
+    return { ok: true, dispatch: null, persisted: persistenceActive(runtime) };
   }
   const record = records[0];
   return {
@@ -378,11 +703,15 @@ function statusOfDispatches(state) {
     dispatch: {
       collabId: record.collabId,
       name: record.name,
+      status: record.status,
       masterSessionId: record.masterSessionId,
+      masterLastSeenAt: isoOf(record.masterLastSeenAt),
       slaves: [...record.slaves.values()].map((slave) => ({
         sessionId: slave.sessionId, name: slave.name, kind: slave.kind,
       })),
+      taskCount: record.tasks.size,
     },
+    persisted: persistenceActive(runtime),
   };
 }
 
@@ -392,14 +721,42 @@ function dispatchLost() {
   return { ok: false, code: 'dispatch-lost', message: 'dispatch 不存在（可能已结束或核心已重启）' };
 }
 
+/* 旧调度长被换届后的明确拒绝：比 dispatch-lost 多一个稳定 code，便于恢复方识别「不是丢了，
+ * 而是被接管了」。 */
+function takenOverResult() {
+  return { ok: false, code: 'dispatch-taken-over', message: TAKEN_OVER_MESSAGE };
+}
+
+function isReplacedMasterOf(record, sessionId) {
+  return record?.replacedMasterSessionIds?.has?.(sessionId) === true;
+}
+
+function takenOverRecordOf(state, sessionId) {
+  for (const record of state.dispatches.values()) {
+    if (isReplacedMasterOf(record, sessionId)) {
+      return record;
+    }
+  }
+  return null;
+}
+
+/* 当前 master 记录 / 明确拒绝二选一：旧 master 得到 dispatch-taken-over，其余得到 dispatch-lost。 */
+function masterRecordOf(runtime, sessionId) {
+  const record = runtime.masterDispatchOf(sessionId);
+  if (record !== null) {
+    return { record, refusal: null };
+  }
+  return { record: null, refusal: takenOverRecordOf(runtime.state, sessionId) === null ? dispatchLost() : takenOverResult() };
+}
+
 function rejectedClaim(sessionId, reason) {
   return { sessionId, status: 'rejected', reason };
 }
 
 function claimSessionsIn(runtime, { sessionId, sessionIds }) {
-  const record = runtime.masterDispatchOf(sessionId);
+  const { record, refusal } = masterRecordOf(runtime, sessionId);
   if (record === null) {
-    return dispatchLost();
+    return refusal;
   }
   if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
     return { ok: false, message: 'sessionIds 非法：需要非空数组' };
@@ -574,9 +931,9 @@ function bindApprovedClaim(runtime, record, claimId, sessionId) {
 }
 
 function releaseSlaveIn(runtime, { sessionId, targetSessionId }) {
-  const record = runtime.masterDispatchOf(sessionId);
+  const { record, refusal } = masterRecordOf(runtime, sessionId);
   if (record === null) {
-    return dispatchLost();
+    return refusal;
   }
   const slave = record.slaves.get(targetSessionId);
   if (slave === undefined) {
@@ -591,10 +948,11 @@ function releaseSlaveIn(runtime, { sessionId, targetSessionId }) {
   /* 先把窗口内待发的加入事件送出去，保证 master 看到的顺序是「加入在前、离席在后」。 */
   flushMemberEvents(runtime, record);
   sendNotice(runtime, record, sessionId, `已释放「${slave.name}」`, 'dispatch-member-left');
+  persistNow(runtime, record);
   return { ok: true, sessionId: targetSessionId };
 }
 
-/* —— 纯内存消息（send / end / leave）与桥生命周期 —— */
+/* —— 消息（不落盘，仅任务摘要进状态文件）与桥生命周期 —— */
 
 /* 发送：master 可定向或广播给已收编 slave，slave 只能回 master（省略 toSessionIds 即回 master）。
  * 投递唯一出口是 runtime.notify；notify 返回 false 时按目标入有界队列，桥重连（noteBridgeOnline）补投。
@@ -603,6 +961,9 @@ function sendMessageIn(runtime, { collabId, sessionId, text, type, toSessionIds,
   const record = runtime.state.dispatches.get(collabId);
   if (record === undefined) {
     return dispatchLost();
+  }
+  if (isReplacedMasterOf(record, sessionId)) {
+    return takenOverResult();
   }
   const sender = runtime.metaOf(sessionId);
   if (sender === null) {
@@ -616,7 +977,86 @@ function sendMessageIn(runtime, { collabId, sessionId, text, type, toSessionIds,
   if (message.error !== undefined) {
     return { ok: false, message: message.error };
   }
-  return deliverMessage(runtime, record, targets.value, message.value);
+  const taskUpdate = recordTaskStateIn(runtime, record, message.value, targets.value);
+  if (taskUpdate.error !== undefined) {
+    return { ok: false, message: taskUpdate.error };
+  }
+  const delivered = deliverMessage(runtime, record, targets.value, message.value);
+  /* 关键节点写盘：只有带 taskId 的消息改变任务表；普通聊天不触发 IO。 */
+  if (message.value.taskId !== null) {
+    persistNow(runtime, record);
+  }
+  return delivered;
+}
+
+/* 任务表状态机（task / progress / result / error + taskId）：
+ *   task → assigned（重新派发保留 createdAt、清 completedAt）
+ *   progress → active；result → done；error → failed（后两者记 completedAt）
+ * master 的消息按目标归属（单目标即该目标；广播保留原归属），slave 的消息归属发送者。
+ * 任务表满时先裁完成项，仍满则拒绝新 taskId（在途任务不自动清理）。 */
+function recordTaskStateIn(runtime, record, message, targets) {
+  if (message.taskId === null) {
+    return { error: undefined };
+  }
+  const existing = record.tasks.get(message.taskId);
+  if (existing === undefined && record.tasks.size >= DISPATCH_TASK_MAX) {
+    pruneTasksIn(runtime, record, runtime.now());
+    if (record.tasks.size >= DISPATCH_TASK_MAX) {
+      return { error: `任务表已满（上限 ${DISPATCH_TASK_MAX}）——请先完成 / 清理在途任务，或换一个 taskId` };
+    }
+  }
+  const at = runtime.now();
+  const senderIsMaster = message.fromSessionId === record.masterSessionId;
+  const defaultAssignee = targets.length === 1 ? targets[0] : (existing?.assigneeSessionId ?? null);
+  const next = taskAfterMessage({
+    taskId: message.taskId,
+    messageType: message.messageType,
+    text: message.text,
+    assigneeSessionId: senderIsMaster ? defaultAssignee : message.fromSessionId,
+    existing,
+    at,
+  });
+  record.tasks.set(message.taskId, next);
+  return { error: undefined };
+}
+
+function taskAfterMessage({ taskId, messageType, text, assigneeSessionId, existing, at }) {
+  const summary = text.trim().slice(0, DISPATCH_TASK_SUMMARY_MAX);
+  const base = existing === undefined
+    ? { taskId, status: 'assigned', assigneeSessionId, lastProgress: null, createdAt: at, updatedAt: at, completedAt: null }
+    : { ...existing, assigneeSessionId: existing.assigneeSessionId ?? assigneeSessionId, updatedAt: at };
+  if (messageType === 'task') {
+    return { ...base, assigneeSessionId, status: 'assigned', lastProgress: summary, completedAt: null };
+  }
+  if (messageType === 'progress') {
+    return { ...base, assigneeSessionId, status: 'active', lastProgress: summary, completedAt: null };
+  }
+  return {
+    ...base,
+    assigneeSessionId,
+    status: messageType === 'result' ? 'done' : 'failed',
+    lastProgress: summary,
+    completedAt: at,
+  };
+}
+
+/* 完成项按 dispatch_hours 裁剪；未完成（assigned / active）永不清理。返回是否有变动。 */
+function pruneTasksIn(runtime, record, at) {
+  const hours = retentionConfigOf(runtime.config).dispatch_hours;
+  const cutoff = at - hours * HOUR_MS;
+  let changed = false;
+  for (const [taskId, task] of [...record.tasks]) {
+    if (!DISPATCH_TASK_DONE_STATUSES.has(task.status)) {
+      continue;
+    }
+    const completedAt = Number.isFinite(task.completedAt) ? task.completedAt : task.updatedAt;
+    const expired = hours === 0 || (Number.isFinite(completedAt) && completedAt <= cutoff);
+    if (expired) {
+      record.tasks.delete(taskId);
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 /* 正文 / 类型 / taskId 的判定与出站文本组装。slave 的回复带 @来源——master 收到的是多条
@@ -637,7 +1077,8 @@ function messageOf(record, { text, type, taskId, sessionId }, sender) {
   const outbound = sessionId === record.masterSessionId ? text : `@${sender.name} ${text}`;
   return {
     value: {
-      messageType, taskId: taskId ?? null, outbound, fromSessionId: sessionId, fromSessionName: sender.name,
+      messageType, taskId: taskId ?? null, outbound, text: text.trim(),
+      fromSessionId: sessionId, fromSessionName: sender.name,
     },
   };
 }
@@ -716,15 +1157,17 @@ function slaveTargetsOf(record, sessionId, toSessionIds) {
   return { value: [record.masterSessionId] };
 }
 
-/* 结束（master 专属）：先向每个 slave 与 master 发结束通知，再从内存域删除整条记录
- * （队列随之回收；核心重启后本就没有持久面）。 */
+/* 结束（master 专属）：先向每个 slave 与 master 发结束通知，再从内存域删除整条记录并删除
+ * 持久面（队列 / 任务表随之回收）。旧 master 已被接管时返回明确拒绝。 */
 function endDispatchIn(runtime, { collabId, sessionId }) {
   const record = runtime.state.dispatches.get(collabId);
   if (record === undefined) {
     return dispatchLost();
   }
   if (record.masterSessionId !== sessionId) {
-    return { ok: false, message: '只有 master 可以结束 dispatch' };
+    return isReplacedMasterOf(record, sessionId)
+      ? takenOverResult()
+      : { ok: false, message: '只有 master 可以结束 dispatch' };
   }
   endDispatch(runtime, record, 'master-ended');
   return { ok: true, collabId };
@@ -737,6 +1180,7 @@ function endDispatch(runtime, record, reason) {
   sendNotice(runtime, record, record.masterSessionId, `dispatch「${record.name}」已结束`, 'dispatch-ended');
   clearTimeout(record.eventTimer);
   runtime.state.dispatches.delete(record.collabId);
+  removePersistedState(runtime, reason);
 }
 
 /* 退出（slave 专属）：只移除自己并通知 master；master 退出即「结束」，必须走 ws_end_collab。 */
@@ -748,6 +1192,9 @@ function leaveDispatchIn(runtime, { collabId, sessionId }) {
   if (record.masterSessionId === sessionId) {
     return { ok: false, message: 'master 不能被 leave——结束请用 ws_end_collab' };
   }
+  if (isReplacedMasterOf(record, sessionId)) {
+    return takenOverResult();
+  }
   const slave = record.slaves.get(sessionId);
   if (slave === undefined) {
     return { ok: false, message: '本会话不在该 dispatch 内' };
@@ -757,20 +1204,25 @@ function leaveDispatchIn(runtime, { collabId, sessionId }) {
   record.queues.delete(sessionId);
   flushMemberEvents(runtime, record);
   sendNotice(runtime, record, record.masterSessionId, `「${slave.name}」已退出 dispatch`, 'dispatch-member-left');
+  persistNow(runtime, record);
   return { ok: true, collabId };
 }
 
-/* 桥重连：撤销宽限并把断连期间排队的通知补投（notify 恢复后即可达）。 */
+/* 桥重连：master 注册即刷新心跳（可能撤销待接管），并撤销宽限、补投断连期间排队的通知。 */
 function noteBridgeOnlineIn(runtime, sessionId) {
   const record = runtime.dispatchOf(sessionId);
   if (record === null) {
     return;
   }
   record.grace.delete(sessionId);
+  if (record.masterSessionId === sessionId) {
+    noteActivityIn(runtime, sessionId, runtime.now());
+  }
   flushQueue(runtime, record, sessionId);
 }
 
-/* 桥断开：登记宽限截止时刻，超时由 sweep 收口（master 超时＝整个 dispatch 结束）。 */
+/* 桥断开：登记宽限截止时刻；master 宽限到期只标记待接管（不再直接结束 dispatch），
+ * slave 超时由 sweep 移除。 */
 function noteBridgeClosedIn(runtime, sessionId, at) {
   const record = runtime.dispatchOf(sessionId);
   if (record === null) {
@@ -784,40 +1236,113 @@ function graceMsOf(config) {
   return Number.isInteger(value) && value >= 0 ? value : DISPATCH_GRACE_MS;
 }
 
-/* 清扫（presence 节拍驱动）：过期收编申请 + 桥断开宽限超时。核心重启后两本内存账一起清空。 */
+/* 心跳刷新（任意 ws 工具调用 / 桥重连）：只更新 master 的心跳；从 pending-takeover 恢复时
+ * 广播一次「调度恢复」并写盘。active 状态的普通心跳不写盘（避免 IO 放大）。 */
+function noteActivityIn(runtime, sessionId, at) {
+  const record = runtime.masterDispatchOf(sessionId);
+  if (record === null) {
+    return { ok: false, code: 'dispatch-lost' };
+  }
+  record.masterLastSeenAt = Math.max(record.masterLastSeenAt, at);
+  if (record.status === 'pending-takeover') {
+    resumeDispatchIn(runtime, record);
+  }
+  return { ok: true, dispatchId: record.collabId, status: record.status };
+}
+
+function resumeDispatchIn(runtime, record) {
+  record.status = 'active';
+  record.masterLostAt = null;
+  for (const sessionId of record.slaves.keys()) {
+    sendNotice(
+      runtime, record, sessionId,
+      `调度长「${record.masterName}」已恢复心跳——dispatch「${record.name}」继续执行（组员与任务表保留）`,
+      'dispatch-resumed',
+    );
+  }
+  persistNow(runtime, record);
+}
+
+function markPendingTakeover(runtime, record, at, reason) {
+  if (record.status === 'pending-takeover') {
+    return false;
+  }
+  record.status = 'pending-takeover';
+  record.masterLostAt = at;
+  record.grace.delete(record.masterSessionId);
+  const timeoutSeconds = Math.round(masterTimeoutMsOf(runtime.config) / 1000);
+  const detail = reason === 'master-disconnected'
+    ? `调度长「${record.masterName}」已断开超过宽限`
+    : `调度长「${record.masterName}」心跳超时（${timeoutSeconds}s 无 ws 工具调用）`;
+  for (const sessionId of record.slaves.keys()) {
+    sendNotice(
+      runtime, record, sessionId,
+      `${detail}——调度暂停，组员与任务表保留；新调度长可调用 ws_create_collab 接管，原调度长恢复调用可继续`,
+      'dispatch-takeover-pending',
+    );
+  }
+  if (runtime.metaOf(record.masterSessionId)?.online === true) {
+    sendNotice(
+      runtime, record, record.masterSessionId,
+      `你的调度长心跳已超时（${timeoutSeconds}s 无 ws 工具调用）——继续调用任意 ws 工具可恢复，否则其他 master 会话可接管（组员与任务表保留）`,
+      'dispatch-takeover-pending',
+    );
+  }
+  persistNow(runtime, record);
+  return true;
+}
+
+/* 清扫（presence 节拍驱动）：master 心跳超时 → 待接管；过期收编申请 + 桥断开宽限超时。
+ * 核心重启后内存账从状态文件恢复；状态文件之外的运行态（claim / grace / 队列）不恢复。 */
 function sweepDispatchesIn(runtime, at) {
   for (const record of [...runtime.state.dispatches.values()]) {
     if (!runtime.state.dispatches.has(record.collabId)) {
       continue;
     }
+    maybeMarkMasterPending(runtime, record, at);
     sweepClaimsOf(runtime, record, at);
     sweepGraceOf(runtime, record, at);
-    if (record.autoClaim) {
+    if (record.status === 'active' && record.autoClaim) {
       autoClaimPassIn(runtime, record);
     }
   }
 }
 
-/* 宽限超时：master 超时＝整个 dispatch 结束（结束通知不合并）；slave 超时先移除再统一通告。
- * 单个超时保持既有直发 member-left（同步语义）；同一节拍多个超时合并成一条成员事件，
+function maybeMarkMasterPending(runtime, record, at) {
+  if (record.status !== 'active') {
+    return;
+  }
+  if (at - record.masterLastSeenAt < masterTimeoutMsOf(runtime.config)) {
+    return;
+  }
+  markPendingTakeover(runtime, record, at, 'heartbeat-timeout');
+}
+
+/* 宽限超时：master 超时＝标记待接管（保留组员 / 任务表，不再直接结束）；slave 超时先移除再
+ * 统一通告。单个超时保持既有直发 member-left（同步语义）；同一节拍多个超时合并成一条成员事件，
  * 避免一次清扫刷屏。 */
 function sweepGraceOf(runtime, record, at) {
   const expired = [];
+  let changed = false;
   for (const [sessionId, deadline] of [...record.grace]) {
     if (deadline > at) {
       continue;
     }
     if (sessionId === record.masterSessionId) {
-      endDispatch(runtime, record, 'master-timeout');
-      return;
+      markPendingTakeover(runtime, record, at, 'master-disconnected');
+      break;
     }
     const slave = record.slaves.get(sessionId);
     record.slaves.delete(sessionId);
     record.grace.delete(sessionId);
     record.queues.delete(sessionId);
     expired.push(slave?.name ?? sessionId);
+    changed = true;
   }
   notifyGraceTimeouts(runtime, record, expired);
+  if (changed) {
+    persistNow(runtime, record);
+  }
 }
 
 function notifyGraceTimeouts(runtime, record, expired) {
@@ -854,6 +1379,7 @@ function bindSlave(runtime, record, meta) {
   record.grace.delete(meta.sessionId);
   flushQueue(runtime, record, meta.sessionId);
   queueMemberEvent(runtime, record, `「${meta.name}」已加入`);
+  persistNow(runtime, record);
 }
 
 /* 成员事件去抖：同一 500ms 窗口内的加入 / 批量离席文本合并成一条 dispatch-member-event 投给 master。

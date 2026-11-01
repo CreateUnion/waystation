@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url';
 import { COLLABS_DIR_NAME, CONFIG_FILE_NAME, DATA_DIR_ENV, coreJsonPath, ensureDir, resolveDataDir, resolveLogDir, runDir } from '../paths.js';
 import { checkWritableDir } from '../selfcheck.js';
 import { buildDefaults, loadConfig, saveConfig } from '../config.js';
+import { retentionConfigOf } from '../dispatch-config.js';
+import { runRetentionCleanup } from '../retention.js';
 import { createLogger } from '../log.js';
 import { loadOrCreateInstanceId } from '../instance-id.js';
 import { createToolRegistry } from '../tools/registry.js';
@@ -111,6 +113,7 @@ const VIEWER_SCRIPT_PATH = fileURLToPath(new URL('../../scripts/ws-viewer.js', i
  * @property {any} sessionStatus
  * @property {any} grace
  * @property {any} changeover
+ * @property {ReturnType<typeof setInterval> | null} retentionTimer
  * @property {number | null} idleSince
  * @property {any} seatGraceTimer
  * @property {((record: any) => void) | null} onBridgeSessionFileDrop
@@ -944,6 +947,8 @@ function injectionSeatWiringOf(state) {
   return {
     seatsOf: (collabId) => state.collab?.seatsForRouting?.(collabId) ?? [],
     seatOf: (collabId, sessionId) => state.collab?.seatForRouting?.(collabId, sessionId) ?? null,
+    /* 调度长心跳：任意 ws 工具调用经此上报（服务后构造，闭包运行期触达）。 */
+    onCallActivity: (sessionId, at) => state.collab?.dispatch?.noteActivity?.(sessionId, at),
   };
 }
 
@@ -1117,6 +1122,40 @@ async function lanRetryRound(state) {
   state.log.info('局域网监听已恢复（占用者已退场，自动接管）', { port: state.port });
   state.retry?.stop();
   state.retry = null;
+}
+
+/* 保留期清理（任务书 §5.4）：启动一次（在 loadRegistry 之前，避免把已加载的活跃协作误判）
+ * + 周期执行；单轮异常只留痕，不阻塞核心主链。 */
+function runRetentionRound(state) {
+  try {
+    runRetentionCleanup({
+      dataDir: state.dataDir,
+      logDir: state.logDir,
+      config: state.config,
+      log: state.log,
+      now: Date.now(),
+    });
+  } catch (error) {
+    state.log?.warn?.('保留期清理异常（已隔离）', { reason: error?.message });
+  }
+}
+
+function startRetentionTimer(state) {
+  if (state.retentionTimer !== null) {
+    return;
+  }
+  const hours = retentionConfigOf(state.config).cleanup_interval_h;
+  const timer = setInterval(() => runRetentionRound(state), hours * 60 * 60 * 1000);
+  timer.unref?.();
+  state.retentionTimer = timer;
+}
+
+function stopRetentionTimer(state) {
+  if (state.retentionTimer === null) {
+    return;
+  }
+  clearInterval(state.retentionTimer);
+  state.retentionTimer = null;
 }
 
 /* 启动序步骤八·就绪：原子改写 status:'ready'（就绪＝桥的握手语义点）；宽限电平补充——
@@ -1385,6 +1424,7 @@ async function stopCore(state) {
   state.stopped = true;
   state.grace?.cancel();
   clearSeatGraceTimer(state);
+  stopRetentionTimer(state);
   clearStopReconcileTimer(state);
   state.stopReconcile = null;
   const pendingLeave = await flushLeaveBeforeStopSafely(state);
@@ -1448,7 +1488,7 @@ function createExitLatch() {
 
 /* 生命周期运行态字段（单列以守编排函数的行数上限）。 */
 function coreRuntimeState() {
-  return { heartbeat: null, detector: null, lifetime: null, retry: null, stopped: false };
+  return { heartbeat: null, detector: null, lifetime: null, retry: null, retentionTimer: null, stopped: false };
 }
 
 /* 席位存续的运行态字段（与生命周期组件同构）。 */
@@ -1521,10 +1561,13 @@ async function runStartupSequence(state) {
 async function runServiceSequence(state) {
   checkSelf(state);
   persistIdentityAndConfig(state);
+  /* 保留期清理先于注册表加载：已结束协作目录在进入内存前清掉，避免「加载后再删」的活跃误判。 */
+  runRetentionRound(state);
   buildComponents(state);
   await startNetStack(state);
   await listenIpc(state);
   markReady(state);
+  startRetentionTimer(state);
   scheduleCoreStopReconciliation(state);
 }
 

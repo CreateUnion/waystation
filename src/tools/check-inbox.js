@@ -52,11 +52,11 @@ function limitRefusalOf(limit) {
   return null;
 }
 
-/* dispatch 没有收件流水（消息只经本机 notify 投递、不落盘）：返回明确的空面，
- * 而不是让调用方误以为「查到了但没有」。 */
+/* dispatch 没有收件流水（消息只经本机 notify 投递、不落盘；编排状态可能持久化，但收件历史不在其中）：
+ * 返回明确的空面，而不是让调用方误以为「查到了但没有」。 */
 function dispatchInboxResultOf(collabId) {
   return { content: [{ type: 'text', text: JSON.stringify({
     ok: true, collabId, mode: 'dispatch', ephemeral: true, rows: [],
-    message: 'dispatch 不保存收件历史（纯内存模式）',
+    message: 'dispatch 不保存收件历史（消息流水不落盘；编排状态持久化不含收件流水）',
   }, null, 2) }] };
 }

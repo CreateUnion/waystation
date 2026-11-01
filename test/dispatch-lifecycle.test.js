@@ -8,7 +8,7 @@ function pastDebounce() {
   return new Promise((resolve) => setTimeout(resolve, DISPATCH_MEMBER_EVENT_DEBOUNCE_MS + 150));
 }
 
-test('master 断开宽限内保留；超时后 dispatch 结束、slave 收到通知', (t) => {
+test('master 断开宽限内保留；超时后进入待接管、slave 收到通知（不再直接结束）', (t) => {
   const node = makeDispatchNode(t);
   const created = node.service.create({ mode: 'dispatch', name: '宽限', sessionId: 'master-1' });
   node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['worker-1'] });
@@ -18,8 +18,10 @@ test('master 断开宽限内保留；超时后 dispatch 结束、slave 收到通
   assert.equal(node.service.dispatch.status().dispatch.collabId, created.collabId);
   node.advance(600);
   node.service.dispatch.sweep(node.now());
-  assert.equal(node.service.dispatch.status().dispatch, null);
-  assert.equal(node.notices.some((entry) => entry.payload?.event === 'dispatch-ended'), true);
+  const record = node.service.dispatch.dispatches.get(created.collabId);
+  assert.equal(record.status, 'pending-takeover');
+  assert.equal(node.notices.some((entry) => entry.payload?.event === 'dispatch-takeover-pending'), true);
+  assert.equal(node.notices.some((entry) => entry.payload?.event === 'dispatch-ended'), false);
 });
 
 test('slave 断开宽限内重连保留；超时移除并通知 master', (t) => {
@@ -87,15 +89,19 @@ test('注册让出期内断开：迟到续体不得撤销宽限或补投队列�
   assert.equal(record.queues.has('worker-1'), false, '宽限超时回收待补投队列');
 });
 
-test('服务 presence 清扫接线：start 的清扫节拍收口超时 master', (t) => {
+test('服务 presence 清扫接线：start 的清扫节拍把超时 master 标为待接管', (t) => {
   const node = makeDispatchNode(t);
-  node.service.create({ mode: 'dispatch', name: '节拍', sessionId: 'master-1' });
+  const created = node.service.create({ mode: 'dispatch', name: '节拍', sessionId: 'master-1' });
   node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['worker-1'] });
   node.service.unregisterBridgeEntry('master-1');
   node.advance(1100);
   node.service.start();
-  assert.equal(node.service.dispatch.status().dispatch, null, 'presence 节拍须驱动 dispatch.sweep');
-  assert.equal(node.notices.some((entry) => entry.payload?.event === 'dispatch-ended'), true);
+  assert.equal(
+    node.service.dispatch.dispatches.get(created.collabId)?.status,
+    'pending-takeover',
+    'presence 节拍须驱动 dispatch.sweep',
+  );
+  assert.equal(node.notices.some((entry) => entry.payload?.event === 'dispatch-takeover-pending'), true);
   node.service.close();
 });
 

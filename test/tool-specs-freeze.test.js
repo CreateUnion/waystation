@@ -311,7 +311,10 @@ async function sendMessageDefaultType() {
  * dispatch 中文术语标准化（2026-11-01，用户拍板术语表）：仅改用户可见 description——
  * dispatch master / slave 增「调度长 / 组员」中文对照，dispatch 模式称谓增「调度」；
  * 工具名、inputSchema 与全部代码标识符未动（ws_dispatch_*、role=slave、WAYSTATION_ROLE 等原样）；
- * 按同一规程重冻，md5 更新为 cdbb70ebf7e1634d43a7c0f6fee54877（21994 字符）。冻结断言未放宽。 */
+ * 按同一规程重冻，md5 更新为 cdbb70ebf7e1634d43a7c0f6fee54877（21994 字符）。冻结断言未放宽。
+ * dispatch 持久化 / 接管语义（2026-11-02）：仅改用户可见 description（「纯内存」→「编排状态默认
+ * 持久化，可经 config.dispatch.persist 关闭」，并补调度长心跳超时接管说明）；工具名与 inputSchema
+ * 未动，按同一规程重冻。冻结断言未放宽。 */
 const FROZEN_LIST_JSON = `[
   {
     "name": "ws_status",
@@ -397,7 +400,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_create_collab",
-    "description": "发起协作、讨论或本机调度（dispatch；模式创建时定死、不可变）：创建会话即入席——managed 下本会话任站长（joinSeq=1），forum 下任发起人/中继；向选中目标并行发出邀请（对方在同意门点头后两段式入席）；targets 可带 targetSessionId 指名目标会话；目标取自 ws_list_hosts 的实例标识与端点。调度（dispatch）是纯内存本机多会话编排：仅启动期 WAYSTATION_ROLE=master 的会话（调度长）可建，一个核心同时只允许一个，不接受 targets；调度可选 autoClaim=true——创建即自动收编一轮，之后随核心节拍持续补收新出现的可绑定会话（role=slave 或 claim 门 off 的交互式；门开的交互式绝不自动弹确认），离线组员超宽限自动移除",
+    "description": "发起协作、讨论或本机调度（dispatch；模式创建时定死、不可变）：创建会话即入席——managed 下本会话任站长（joinSeq=1），forum 下任发起人/中继；向选中目标并行发出邀请（对方在同意门点头后两段式入席）；targets 可带 targetSessionId 指名目标会话；目标取自 ws_list_hosts 的实例标识与端点。调度（dispatch）是本机多会话编排（编排状态默认持久化，可经 config.dispatch.persist 关闭）：仅启动期 WAYSTATION_ROLE=master 的会话（调度长）可建，一个核心同时只允许一个，不接受 targets；调度长心跳超时后新的 master 会话可原地接管；调度可选 autoClaim=true——创建即自动收编一轮，之后随核心节拍持续补收新出现的可绑定会话（role=slave 或 claim 门 off 的交互式；门开的交互式绝不自动弹确认），离线组员超宽限自动移除",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -411,7 +414,7 @@ const FROZEN_LIST_JSON = `[
         },
         "mode": {
           "type": "string",
-          "description": "模式（可选，缺省 managed）：managed / forum / dispatch——forum（讨论）参与者至多 16（含发起人）；dispatch 不进局域网、不保存历史"
+          "description": "模式（可选，缺省 managed）：managed / forum / dispatch——forum（讨论）参与者至多 16（含发起人）；dispatch 不进局域网、不保存消息历史（编排状态默认持久化）"
         },
         "autoClaim": {
           "type": "boolean",
@@ -677,7 +680,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_send_message",
-    "description": "发送协作域消息（发送者须为本机活跃且非 unverified 席位）：星型路由——成员发给站长，站长省略 to 即发全体成员；按目标机器去重、一机一帧，返回逐机器 msgId；席位宽限内断连的帧由本机核心暂存、重连后补投，判离席或冻结期丢弃，不保证送达。to＝目标实例/地址，配可选 toSessionId（会话，短码或完整标识，精确匹配；只给会话参数会被拒绝）。讨论模式为发帖（人人可见、to / toSessionId 一律拒绝）：默认经中继（发起人）投递（成员投稿至中继、由其转达全员），中继不可达时自动降级直投——返回的 route 字段如实标注本机走的路（relay/degraded/fanout）、results 为投稿或直投的受理态，成员级结果经中继聚合捎回、未达者由对方周期对表收敛。调度（dispatch，纯内存本机编排）另走一套：消息只经本机核心投递、不落盘，type 取 task / progress / result / error，定向用 toSessionIds（省略即调度长→全体已收编组员、组员→调度长），可用 taskId 关联任务；不接受 to / toSessionId",
+    "description": "发送协作域消息（发送者须为本机活跃且非 unverified 席位）：星型路由——成员发给站长，站长省略 to 即发全体成员；按目标机器去重、一机一帧，返回逐机器 msgId；席位宽限内断连的帧由本机核心暂存、重连后补投，判离席或冻结期丢弃，不保证送达。to＝目标实例/地址，配可选 toSessionId（会话，短码或完整标识，精确匹配；只给会话参数会被拒绝）。讨论模式为发帖（人人可见、to / toSessionId 一律拒绝）：默认经中继（发起人）投递（成员投稿至中继、由其转达全员），中继不可达时自动降级直投——返回的 route 字段如实标注本机走的路（relay/degraded/fanout）、results 为投稿或直投的受理态，成员级结果经中继聚合捎回、未达者由对方周期对表收敛。调度（dispatch，本机编排；消息流水不落盘、编排状态默认持久化）另走一套：消息只经本机核心投递、不落盘，type 取 task / progress / result / error，定向用 toSessionIds（省略即调度长→全体已收编组员、组员→调度长），可用 taskId 关联任务；不接受 to / toSessionId",
     "inputSchema": {
       "type": "object",
       "properties": {

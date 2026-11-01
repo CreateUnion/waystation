@@ -41,13 +41,15 @@
 
 | 路径 | 内容 |
 | --- | --- |
-| `config.json` | 身份名、端口、投递与席位参数、确认门默认值等 |
+| `config.json` | 身份名、端口、投递与席位参数、确认门默认值、`dispatch.*` 与 `retention.*` 等 |
 | `run/core.json` | 运行描述符：pid、端点、token、状态、心跳、启动截止期等（独占创建，兼作核心锁） |
 | `run/core-stop.json` | 核心退出时的本机席位快照，供重启对账 |
 | `collabs/<collabId>/` | 每协作目录：`carrier.json`、`ledger.jsonl`、`snapshot.json`、`member.json`、`seats/<sessionId>.json`、`invites.json`、`pending-invites.json`、`outbox.jsonl`、`inbox.jsonl`、`handover-offers.json`、`departed.jsonl`、`recovery.json` 等 |
 | `sessions/<sessionId>.json` | 会话级状态栏指示文件（由核心写；桥断开即删） |
 | `known-hosts.json` | 发现辅助：见过的「地址:端口」、实例标识、能力证据与会话短码 |
 | `dispatch-rules.md` | 调度纪律——调度（dispatch）全员纪律的单一权威源（收编通知实时读取） |
+| `dispatch/state.json` | 调度编排状态（组员 / 任务表 / 调度长心跳；`dispatch.state_path` 可改位置；`dispatch.persist=false` 时不产生） |
+| `archive/collabs/` | 保留期清理的已结束协作归档（gzip 清单；受同一 `collabs_days` 窗口约束） |
 | `logs/` | 核心的文件日志（桥不写文件日志，诊断走 stderr） |
 
 ## 2. 进程与通信
@@ -249,16 +251,27 @@ replacer 等旧核退场 10 秒，到期走硬杀防护链；硬杀后有 2 秒�
 - **范围**：只在本机，不接入局域网。`mode:'dispatch'` 的邀请帧在协议层即被拒绝；
   伪造的调度帧在调度准入层拒绝并计数。
 - **拓扑**：调度长 + 若干组员。角色只认启动期环境变量 `WAYSTATION_ROLE`——工具参数与聊天内容
-  不能声明调度长；一个核心同时只允许一个调度（dispatch），不接受 `targets`。
+  不能声明调度长；一个核心同时只允许一个调度（dispatch），不接受 `targets`。调度长心跳超时
+  （默认 3 分钟无 ws 工具调用 / 无桥重连）后，另一个启动期 master 会话再次创建即**原地接管**：
+  collabId、组员与任务表原样移交；旧调度长恢复后的调度操作返回 `dispatch-taken-over`。
 - **收编**：调度长用 `ws_dispatch_scan` 扫描本机会话，`ws_dispatch_claim` 发起收编；
   交互式目标需用户确认（一次性令牌），无头／服务拉起的会话必须带 `WAYSTATION_ROLE=slave`
   才会被收编。确认门 `gate:'claim'` 关闭时收编请求自动绑定并注入知情通知。
 - **autoClaim**：创建时开启后，创建即自动收编一轮，此后随核心节拍持续补收新出现的可绑定会话。
 - **纪律包**：收编通知自动携带 `dispatch-rules.md` 全文；该文件是调度纪律的唯一权威源，
   通知发出时实时读取，改完即热生效。`ws_dispatch_rules_reload` 重读文件并向全体在编成员广播。
-- **持久化**：**纯内存**。不进 `collabs/`，不建目录、不写 carrier／member／ledger／snapshot／
-  outbox／inbox／invites／joins／seat／recovery／posts；核心重启或调度结束即消失，
-  无回填、无恢复、无观察窗回放。
+- **持久化**：编排状态默认持久化到 `<数据根>/dispatch/state.json`（`config.dispatch.persist=false`
+  可退回纯内存，`config.dispatch.state_path` 可改位置）。文件只含可重建事实：collabId／名称／主题、
+  调度长会话与最后心跳、组员列表、任务表（taskId → 状态／负责会话／最近 progress 摘要／时间戳）；
+  不存消息流水、待确认收编申请、待补投队列等运行态。写盘只在关键节点（创建／收编／释放／
+  任务状态变更／接管／待接管与恢复／结束），普通聊天不触发 IO；写失败告警一次并本进程内降级
+  纯内存；损坏文件隔离为 `.corrupt-<ts>` 后按无状态启动。核心重启恢复时校验调度长是否在线：
+  在线恢复 active，离线标记 `pending-takeover`；正常结束（`ws_end_collab`）删除状态文件。
+  仍不进 `collabs/`（不建协作目录、不写 carrier／member／ledger／snapshot／outbox／inbox／invites／
+  joins／seat／recovery／posts），消息历史与观察窗回放仍不保存。
+- **保留期**：完成任务的保留时长 `retention.dispatch_hours`（默认 24h，0＝不保留完成项；未完成
+  任务永不裁剪）；超过保留期的 `pending-takeover` 状态文件在启动时清理。组员/任务表容量有界
+  （任务表上限 1000，满后拒绝新 taskId）。
 - **消息**：复用 `ws_send_message`（可带 `toSessionIds` 与 `taskId`，类型限定 `task`／`progress`／
   `result`／`error`）与 `ws_end_collab`；投递唯一出口是本机注入路由，失败进有界待补投队列，
   桥重连后补投。
@@ -269,9 +282,9 @@ replacer 等旧核退场 10 秒，到期走硬杀防护链；硬杀后有 2 秒�
 | --- | --- | --- | --- |
 | 范围 | 局域网 | 局域网 | 仅本机 |
 | 拓扑 | 站长 + 成员（星型） | 平权＋发起人中继 | 调度长 + 组员 |
-| 权威数据 | 站长机台账（单写者） | 各成员本地副本＋对表收敛 | 无持久化（纯内存） |
-| 结束权 | 站长（含移交／接管） | 发起人 | 调度长 |
-| 持久化 | 协作目录全套文件 | 协作目录全套文件（无 snapshot） | 不写协作文件 |
+| 权威数据 | 站长机台账（单写者） | 各成员本地副本＋对表收敛 | 本机 `dispatch/state.json`（单写者） |
+| 结束权 | 站长（含移交／接管） | 发起人 | 调度长（心跳超时可由新 master 接管） |
+| 持久化 | 协作目录全套文件 | 协作目录全套文件（无 snapshot） | 编排状态单文件（消息历史不落盘） |
 | 冻结／接管 | 有 | 无 | 无 |
 
 ## 5. 消息路由
@@ -415,8 +428,10 @@ forum 的直接加入没有批准门：本会话已在席时 `ws_join` 立即生
 - **投递保证是机器级**：一条逻辑消息按机器拆帧，接收核按 `toSessions` 扇出到本机席位；
   不提供远端逐席位终态。同机某席位离线时，暂存只在核心存活期内有效，核心崩溃即丢失；
   发送侧仍可能显示机器级已送达。暂存有容量上限，超限丢最旧并计数。
-- **调度（dispatch）纯内存**：不持久化、不保存历史、无恢复、无观察窗回放；核心重启或调度结束即消失。
-  `ws_view_ledger`／`ws_check_inbox` 对调度明确回「不保存历史」。
+- **调度（dispatch）持久化边界**：编排状态（组员 / 任务表 / 调度长心跳）默认持久化并可恢复；
+  消息流水、台账、收件历史与观察窗回放仍不保存（`ws_view_ledger`／`ws_check_inbox` 对调度明确回
+  「不保存历史」）。`config.dispatch.persist=false` 时为纯内存（核心重启即丢）；持久化写失败时
+  自动降级纯内存（不阻塞编排）；损坏状态文件隔离后按无状态启动。
 - **forum 的中继枢纽**：中继（发起人）是全部帖子的必经转达点，可静默延迟或丢弃转达；
   常见情形由落后方周期对表拉取兜底，但中继本身是新的可用性面。发起人退出后讨论不再有人能结束它。
 - **发现面的边界**：发现依赖探测应答、启动自介与已知主机清单；从未与本站点接触过、又不在扫描段内的

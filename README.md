@@ -98,7 +98,7 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
 
 与协作（managed）/ 讨论（forum）并列的第三种模式——**调度（dispatch）**：**只在本机**把多个 Claude Code 会话编成一个调度长 + 若干组员的执行组（例如调度长在微信侧统筹、worker 各自跑任务）。模式在创建时定死；**不接入局域网**——`mode: 'dispatch'` 的邀请帧在协议层即被拒绝；伪造的调度（dispatch）`task` / `progress` 帧在调度准入层显式拒绝并计入 `dispatchLanRejected`，`result` / `error` 不是协议帧类型，更早被协议类型白名单拒绝（同样丢弃，但不进该计数器）。
 
-- **调度长**：由启动器（如 cc-connect）拉起，进程环境带 `WAYSTATION_ROLE=master`，并在 `append_system_prompt` 里交代职责，例如「你是 waystation dispatch master（调度长）。会话启动后创建调度（dispatch）模式并扫描本机会话；用 @会话名 定向、不写 @ 群发；只推关键事件到微信，普通进度留在内存」。启动后由调度长会话调用 `ws_create_collab { mode: 'dispatch', name: 'dispatch' }` 创建——**角色只认启动期环境变量**，工具参数与聊天内容不能声明调度长；一个核心同时只允许一个调度（dispatch），调度不接受 `targets`。
+- **调度长**：由启动器（如 cc-connect）拉起，进程环境带 `WAYSTATION_ROLE=master`，并在 `append_system_prompt` 里交代职责，例如「你是 waystation dispatch master（调度长）。会话启动后创建调度（dispatch）模式并扫描本机会话；用 @会话名 定向、不写 @ 群发；只推关键事件到微信，普通进度留在内存」。启动后由调度长会话调用 `ws_create_collab { mode: 'dispatch', name: 'dispatch' }` 创建——**角色只认启动期环境变量**，工具参数与聊天内容不能声明调度长；一个核心同时只允许一个调度（dispatch），调度不接受 `targets`。调度长心跳超时（默认 3 分钟无 ws 工具调用 / 无桥重连）后，另一个启动期 master 会话再次调用 `ws_create_collab` 会**原地接管**该调度（collabId、组员与任务表保留；旧调度长恢复后的调度操作会被明确拒绝并提示「已被接管」）。
 - **组员（交互式）**：人工正常打开 Claude Code 即可；首次被收编时核心向该会话注入确认提示，**需本机用户确认**后才绑定（可选 `WAYSTATION_ROLE=slave` 预授权、`WAYSTATION_MASTER=<调度长会话名>` 限定主人）。
 - **组员（无头 / 服务拉起）**：必须带 `WAYSTATION_ROLE=slave` 才会被收编（无角色且不可交互 → 拒绝）。示例：
 
@@ -113,8 +113,9 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
 - **收编**：调度长用 `ws_dispatch_scan` 扫描本机会话（名字 / kind / role / status / 已被谁收编；**只列可收编目标**——`role=slave` 或交互式且会话文件在档；调度长、非交互无角色、无会话文件者不列出），`ws_dispatch_claim { sessionIds }` 发起收编；交互式目标收到确认提示，`ws_dispatch_approve` 首次只返回一次性令牌、经本机用户确认后携令牌批准；`ws_dispatch_release { sessionId }` 释放。目标会话可用 `ws_set_confirm_gate { gate: 'claim' }` 关掉本会话的被收编确认——off 时收编请求**自动绑定**并注入一行知情通知（拒绝仍走人工）。
 - **自动收编（autoClaim）**：创建时带 `ws_create_collab { mode: 'dispatch', autoClaim: true }`——创建即自动收编一轮，之后随核心节拍**持续补收新出现的可绑定会话**（`role=slave`，或 claim 门 off 的交互式；**门开的交互式绝不自动弹确认**），离线组员超宽限自动移除并通告。适合「调度长常驻、worker 随开随编」的用法；不开 autoClaim 则保持手动 `claim` 语义。
 - **收编纪律包（单一权威源）**：收编通知（绑定知情通知与 pending 确认提示）自动携带 `~/.waystation/dispatch-rules.md`（调度纪律）全文——该文件是调度（dispatch）全员纪律的唯一权威源，收编低频、通知发出时实时读取，**改完即热生效**（无需重启或 reload）；文件缺失/为空时回退内置最简纪律（主动上报 + 权限豁免），并向调度长知会一次。改文件要对**已收编在编会话**立即生效时，调度长调 `ws_dispatch_rules_reload`：核心重读文件并向全体在编成员广播最新纪律包（带内容版本号+时间戳，便于会话识别新旧）。
-- **消息与结束**：复用 `ws_send_message`（调度模式下可带 `toSessionIds` 与 `taskId`，类型限定 task / progress / result / error）与 `ws_end_collab`（调度长结束并通知全员）。调度长用 `@会话名` 定向、不写 `@` 群发；组员回执默认回调度长并在正文带 `@来源`。实时细节只在内存与终端：台账 / 收件流水 / 观察窗历史不适用（`ws_view_ledger` / `ws_check_inbox` 明确回「不保存历史」）。
-- **纯内存、不保存历史**：调度（dispatch）不进 `collabs/`（零文件：不建目录、不写 carrier / member / ledger / snapshot / outbox / inbox / invites / joins / seat / recovery / posts），核心重启或调度结束即消失，无回填、无恢复、无观察窗回放；`sessions/<sessionId>.json` 状态栏文件允许照常更新（它是本机会话状态，不是协作历史）。
+- **消息与结束**：复用 `ws_send_message`（调度模式下可带 `toSessionIds` 与 `taskId`，类型限定 task / progress / result / error）与 `ws_end_collab`（调度长结束并通知全员）。调度长用 `@会话名` 定向、不写 `@` 群发；组员回执默认回调度长并在正文带 `@来源`。消息流水 / 台账 / 收件流水 / 观察窗历史仍不保存（`ws_view_ledger` / `ws_check_inbox` 明确回「不保存历史」）。
+- **编排状态持久化**：调度（dispatch）不写 `collabs/`（不建协作目录、不写 carrier / member / ledger / snapshot / outbox / inbox / invites / joins / seat / recovery / posts）；组员名单、任务表、调度长身份与心跳默认持久化到 `<数据根>/dispatch/state.json`（`config.dispatch.persist=false` 可退回纯内存，`config.dispatch.state_path` 可改相对数据根或绝对路径）。核心重启后恢复并校验调度长在线，离线则标记「待接管」；`dispatch.persist=false` 时行为与旧版一致（重启即丢）。`sessions/<sessionId>.json` 状态栏文件仍照常更新（本机会话状态，不是协作历史）。
+- **保留期**：`config.retention` 配置完成调度任务（`dispatch_hours`，默认 24h）、已结束协作（`collabs_days`，默认 30 天）、日志（`logs_days`，默认 14 天）与清理周期（`cleanup_interval_h`，默认 6h）；启动时清理一次并周期执行。已结束协作**先 gzip 归档再删除**，活跃 / 在途 / 席位未归档 / recovery / 未知目录永不清理；日志按现有大小轮转与时间上限双条件取先到者；`retention.dry_run=true` 只报告不删除。
 - **微信推送是调度长 / cc-connect 的集成责任**：waystation 不集成 cc-connect / 微信。以下行为仓库内无证据、需真机验证：无用户消息时调度长的输出是否会被 cc-connect 当作 push 转发；推送频率与 `burst_limit` / 24h 额度；`ret=-2` 的失败与重试。
 - **如实披露**：同机同用户信任边界——同用户的其他进程可以设置角色 / 连本地 IPC（更强隔离用不同 OS 账户运行调度长 / 组员）；「交互式确认」是模型转述的提示，最终取决于该会话语义与用户行为；会话名与 `kind`（interactive / bg）取自 Claude Code 的私有字段与状态栏数据，字段缺失或不可读时按「未知 / 非交互」失败关闭处理。
 
@@ -255,6 +256,7 @@ node ~/.waystation/app/scripts/ws-viewer.js --stop       # 停止正在运行的
 - **机器级投递的边界（0.2.0）**：投递保证按**机器**记账——同一机器一帧；同机某席位离线时，其暂存只在核心存活期内有效，核心崩溃即丢失，发送侧仍显示机器级已送达；暂存有上限，超限丢最旧并计数。不提供远端逐席位终态。
 - **加入申请路径可见（会话级新增）**：加入申请与批准 / 拒绝帧携实例标识与会话短码至对端；按名解析（`join-resolve`）对目标**单播**——对方可见「有人查询某协作名」，名称本身不广播；讨论侧敲门仍是局域网广播、把讨论名播给全网（沿「讨论模式」节披露⑥的既有口径）。同网段伪造申请只能污染对端待批准面——**批准与否由活人把关**。
 - **本机 IPC 面（单核新增）**：桥与核心经本机 IPC（Windows 命名管道 / POSIX 本机套接字，＋每次核心启动轮换的 token）通信；核心另并行监听 **TCP 环回 `127.0.0.1`（ephemeral 端口）**供跨 Session 拨入（服务上下文冷启不再锁死用户会话桥），端点写入 `run/core.json` 的 `ipc.tcp`，桥优先拨入、失败回退旧端点，`WAYSTATION_IPC_TRANSPORT=pipe` 可整体回滚；token 存于数据根 `run/core.json`，**同用户进程可读、可连**并驱动工具面（含同意门 / 裁定类）——沿用「本机同用户进程视为可信」的既有口径；进程身份校验经实现期先验不可行（Node 拿不到对端进程凭据、强做须原生扩展），已按裁定**回落「接受＋如实登记」**（登记见 `docs/编码规范.md`；不构成对同用户恶意进程的防护，是对该边界的如实说明）。
+- **调度状态落盘与接管（本机新增）**：调度（dispatch）的编排状态（组员会话名 / 会话标识、任务表、调度长心跳、最近 progress 摘要）默认写入本机数据根 `dispatch/state.json`——同用户可读，不含消息正文；`dispatch.persist=false` 可关闭。调度长心跳超时后，任何启动期 `WAYSTATION_ROLE=master` 会话都可接管，仍遵循「同机同用户进程视为可信」的既有边界；不做跨用户防护。
 - **本机权限不被绕过**：跨机指令永远越不过本机的工具授权与本机的人。
 
 成员准入与网络隔离机制不在 v1 范围（上线后按使用情况再评估）；以上是如实的取舍记录，不是可忽略的细节。

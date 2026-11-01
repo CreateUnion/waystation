@@ -364,7 +364,7 @@ function joinStateOf(options) {
 function runtimeMaps() {
   return {
     collabs: new Map(),
-    dispatches: new Map(),   // dispatch 内存域（与 collabs 平行：不落盘、不进注册表）
+    dispatches: new Map(),   // dispatch 运行域（与 collabs 平行：不进注册表；编排状态可持久化到独立 state.json）
     inviteWindow: new Map(),
     relayedOrigins: new Map(),
     pendingViews: new Map(),   // 值 = 该协作的等待面列表
@@ -433,7 +433,7 @@ function apiOf(state) {
 function dispatchApiOf(state) {
   return {
     dispatch: state.dispatchDomain,
-    /* dispatch 是纯内存域：不进 state.collabs，走既有写门会因「本机没有该协作」误拒——
+    /* dispatch 是独立运行域：不进 state.collabs，走既有写门会因「本机没有该协作」误拒——
      * 发送 / 结束 / 退出先按 isDispatch 分流，判定与投递全在 dispatch 域内。 */
     send: (input) => state.dispatchDomain.isDispatch(input?.collabId)
       ? state.dispatchDomain.send(input)
@@ -793,7 +793,7 @@ function startService(state) {
   /* 邀请/在途入席的生命周期清扫挂到既有 presence 节拍（takeover.runPresenceTick）：
    * 不新增定时器；清扫只触碰本机三本账，异常隔离不影响心跳。 */
   state.joinLifecycleSweep = () => {
-    /* dispatch 宽限清扫搭同一节拍（不新增定时器）；纯内存域，重启即空。 */
+    /* dispatch 宽限清扫搭同一节拍（不新增定时器）；状态文件由域内启动恢复，本层只管内存账。 */
     state.dispatchDomain?.sweep?.(state.clock());
     pruneConfirmGates(state, state.clock());
     if (confirmGateOverCap(state)) {
@@ -1108,7 +1108,7 @@ function listCollabs(state, input) {
     collabs.push(legacyListEntryOf(collabId, summary));
   }
   appendInviteStubEntries(state, collabs, caller);
-  /* dispatch 条目与协作同列（纯内存）：agent 可见面不区分两种容器，模式字段即分派依据。 */
+  /* dispatch 条目与协作同列：agent 可见面不区分两种容器，模式字段即分派依据。 */
   collabs.push(...state.dispatchDomain.list());
   return { collabs };
 }
@@ -2090,7 +2090,7 @@ function readonlyWriteMessageOf(reason) {
  * 中止创建；本层只在出站层成功后补登创建者席位，并兜底检查载体（缺失时写 recovery 标记，
  * 不留「无 carrier、有 member.json」的目录，否则重启会被判 legacy 永久归档）。 */
 function createNow(state, input) {
-  /* dispatch 是纯内存建域，与 LAN 目标无关：必须先于能力探测分流——生产组合根恒定注入
+  /* dispatch 是独立运行域，与 LAN 目标无关：必须先于能力探测分流——生产组合根恒定注入
    * probeCapability，先走探测会拿空 targets 空等两轮并被误拒。 */
   const dispatched = createDispatchNow(state, input);
   if (dispatched !== null) {

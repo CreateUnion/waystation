@@ -1,0 +1,75 @@
+/* 调度持久化 / 保留期的配置常量与读取面（单一权威源，供 config.js、collab/dispatch.js、
+ * retention.js 共用——避免默认值三处漂移）。
+ * 配置是外部输入：消费方（尤其单测/旧配置文件）可能缺整段或给错类型，读取函数一律按
+ * 「缺失/非法 → 内置默认」失败安全，校验告警由 config.js 的加载面负责。 */
+
+export const DEFAULT_DISPATCH_CONFIG = Object.freeze({
+  persist: true,
+  state_path: '',
+  master_timeout_ms: 180000,
+});
+
+export const DEFAULT_RETENTION_CONFIG = Object.freeze({
+  dispatch_hours: 24,
+  collabs_days: 30,
+  logs_days: 14,
+  cleanup_interval_h: 6,
+  dry_run: false,
+});
+
+export const MASTER_TIMEOUT_MIN_MS = 10000;
+export const MASTER_TIMEOUT_MAX_MS = 3600000;
+export const DISPATCH_HOURS_MAX = 8760;          // 1 年
+export const COLLABS_DAYS_MAX = 3650;            // 10 年
+export const LOGS_DAYS_MAX = 3650;
+export const CLEANUP_INTERVAL_MAX_H = 168;       // 1 周
+
+const PATH_SEGMENT_SEPARATORS = /[\\/]+/;
+
+/** state_path 形态：字符串、无空字节、任一「..」路径段都拒绝（相对与绝对路径都适用）；
+ * 空串＝用默认位置。路径解析（相对数据根 / 绝对路径原样）在 dispatch-store.js。 */
+export function isValidDispatchStatePath(value) {
+  if (typeof value !== 'string' || value.includes('\0')) {
+    return false;
+  }
+  if (value.trim() === '') {
+    return true;
+  }
+  return !value.split(PATH_SEGMENT_SEPARATORS).includes('..');
+}
+
+/** 是否启用调度状态持久化：只有显式 false 关闭；缺省（旧配置 / 单测夹具）保持任务书默认开启。 */
+export function persistEnabledOf(config) {
+  return config?.dispatch?.persist !== false;
+}
+
+/** 调度长心跳超时（毫秒）：缺失/非法回退 180000。 */
+export function masterTimeoutMsOf(config) {
+  const value = config?.dispatch?.master_timeout_ms;
+  return Number.isInteger(value) && value >= MASTER_TIMEOUT_MIN_MS && value <= MASTER_TIMEOUT_MAX_MS
+    ? value
+    : DEFAULT_DISPATCH_CONFIG.master_timeout_ms;
+}
+
+/** 配置的 state_path（空串＝默认位置；非法值回退空串——调用方据此走默认位置而不是抛错）。 */
+export function dispatchStatePathOf(config) {
+  const value = config?.dispatch?.state_path;
+  return isValidDispatchStatePath(value) ? value.trim() : '';
+}
+
+function integerInRange(value, min, max, fallback) {
+  return Number.isInteger(value) && value >= min && value <= max ? value : fallback;
+}
+
+/** 生效的保留期配置：逐项校验，缺失/非法回退默认值。 */
+export function retentionConfigOf(config) {
+  const raw = config?.retention;
+  const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  return {
+    dispatch_hours: integerInRange(source.dispatch_hours, 0, DISPATCH_HOURS_MAX, DEFAULT_RETENTION_CONFIG.dispatch_hours),
+    collabs_days: integerInRange(source.collabs_days, 0, COLLABS_DAYS_MAX, DEFAULT_RETENTION_CONFIG.collabs_days),
+    logs_days: integerInRange(source.logs_days, 0, LOGS_DAYS_MAX, DEFAULT_RETENTION_CONFIG.logs_days),
+    cleanup_interval_h: integerInRange(source.cleanup_interval_h, 1, CLEANUP_INTERVAL_MAX_H, DEFAULT_RETENTION_CONFIG.cleanup_interval_h),
+    dry_run: typeof source.dry_run === 'boolean' ? source.dry_run : DEFAULT_RETENTION_CONFIG.dry_run,
+  };
+}

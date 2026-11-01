@@ -5,6 +5,10 @@ import { MAX_IDENTITY_NAME_CHARS, isIdentityName, isPort } from './net/protocol.
 import { ANCHOR_PORT, SLOT_COUNT, slotDefaultPort } from './site.js';
 import { CONFIG_FILE_NAME } from './paths.js';
 import { writeJsonAtomic } from './storage.js';
+import {
+  CLEANUP_INTERVAL_MAX_H, COLLABS_DAYS_MAX, DEFAULT_DISPATCH_CONFIG, DEFAULT_RETENTION_CONFIG,
+  DISPATCH_HOURS_MAX, LOGS_DAYS_MAX, MASTER_TIMEOUT_MAX_MS, MASTER_TIMEOUT_MIN_MS, isValidDispatchStatePath,
+} from './dispatch-config.js';
 
 /* 文件名的权威源在 paths.js：站点解析（site.js）在载入配置前要按目录直读 config 的 port，
  * 与 config→site 的依赖方向（锚点常量的引用）共同决定了文件名不能留在本文件（会成环）。
@@ -76,6 +80,41 @@ const FIELD_RULES = {
   dispatchClaimConfirmation: { check: (value) => typeof value === 'boolean', reason: '需为布尔值' },
 };
 
+/* 嵌套对象配置（任务书 §5.3/§5.4）。与顶层字段同一纪律：未知子键原样保留（前后版本并存），
+ * 已知子键逐项校验、非法值回落默认并告警；整段类型错则整组回落。 */
+const NESTED_FIELD_RULES = {
+  dispatch: {
+    persist: { check: (value) => typeof value === 'boolean', reason: '需为布尔值' },
+    state_path: {
+      check: isValidDispatchStatePath,
+      reason: '需为字符串，且不得包含 .. 路径段或空字节（空串＝默认位置；绝对路径或相对数据根）',
+    },
+    master_timeout_ms: {
+      check: (value) => Number.isInteger(value) && value >= MASTER_TIMEOUT_MIN_MS && value <= MASTER_TIMEOUT_MAX_MS,
+      reason: `需为 ${MASTER_TIMEOUT_MIN_MS}–${MASTER_TIMEOUT_MAX_MS} 的整数（毫秒）`,
+    },
+  },
+  retention: {
+    dispatch_hours: {
+      check: (value) => Number.isInteger(value) && value >= 0 && value <= DISPATCH_HOURS_MAX,
+      reason: `需为 0–${DISPATCH_HOURS_MAX} 的整数（小时；0＝不保留已完成任务）`,
+    },
+    collabs_days: {
+      check: (value) => Number.isInteger(value) && value >= 0 && value <= COLLABS_DAYS_MAX,
+      reason: `需为 0–${COLLABS_DAYS_MAX} 的整数（天）`,
+    },
+    logs_days: {
+      check: (value) => Number.isInteger(value) && value >= 0 && value <= LOGS_DAYS_MAX,
+      reason: `需为 0–${LOGS_DAYS_MAX} 的整数（天）`,
+    },
+    cleanup_interval_h: {
+      check: (value) => Number.isInteger(value) && value >= 1 && value <= CLEANUP_INTERVAL_MAX_H,
+      reason: `需为 1–${CLEANUP_INTERVAL_MAX_H} 的整数（小时）`,
+    },
+    dry_run: { check: (value) => typeof value === 'boolean', reason: '需为布尔值' },
+  },
+};
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /* 旧键校验规则：managerLossTimeoutMs 的前身。映射时按旧范围 200–3600000 原样生效，
@@ -138,8 +177,7 @@ export function buildDefaults(hostName, options = {}) {
   return {
     identityName: defaultIdentityName(hostName, slot),
     port: slot === null ? ANCHOR_PORT : slotDefaultPort(slot),
-    offlineQueue: true,
-    autoDeliver: true,
+    offlineQueue: true, autoDeliver: true,
     logDir: '',
     logMaxBytes: 1048576,
     logMaxFiles: 5,
@@ -179,6 +217,17 @@ export function buildDefaults(hostName, options = {}) {
     // 讨论的周期对表节拍（设计 §5.4 明文默认 60s）：落后方按此节拍拉增量、对账与重播。
     forumSyncIntervalMs: 60000,
     inviteConfirmation: true, joinRequestConfirmation: true, dispatchClaimConfirmation: true,
+    ...persistenceDefaultsOf(),
+  };
+}
+
+/* 调度持久化与保留期默认值（任务书 §5.3/§5.4，2026-11-02 用户确认）：dispatch 默认开启持久化
+ * （state_path 空串＝默认 <数据根>/dispatch/state.json；master 心跳超时 3 分钟）；retention 默认：
+ * 完成调度任务 24h、已结束协作 30 天、日志 14 天、每 6 小时清理一次、非 dry-run。 */
+function persistenceDefaultsOf() {
+  return {
+    dispatch: { ...DEFAULT_DISPATCH_CONFIG },
+    retention: { ...DEFAULT_RETENTION_CONFIG },
   };
 }
 
@@ -207,25 +256,34 @@ export function loadConfig(dataDir, options = {}) {
   const unknown = Object.create(null);
   const { entries, legacyManagerLoss } = normalizeLegacyKeys(raw, warn);
   for (const [key, value] of Object.entries(entries)) {
-    if (!Object.hasOwn(defaults, key)) {
-      unknown[key] = value;
-      continue;
-    }
-    if (key === 'identityName' && identityDefaulted) {
-      continue;   // 未设置不告警：保留默认机器名，由调用方落盘触发一次提示
-    }
-    const checked = validateField(key, value);
-    if (checked.ok) {
-      config[key] = checked.value;
-    } else {
-      warn(`配置项 ${key} 无效（${checked.reason}），改用默认值 ${JSON.stringify(defaults[key])}`);
-    }
+    applyConfigEntry(config, key, value, { defaults, unknown, identityDefaulted, warn });
   }
   // 映射值按旧范围校验后直接生效（不再过新键 FIELD_RULES）；交叉校验照常约束组合
   if (legacyManagerLoss !== null) {
     config.managerLossTimeoutMs = legacyManagerLoss;
   }
   return { config: validateCrossFields({ ...config, ...unknown }, { defaults, warn }), created, identityDefaulted };
+}
+
+/* 单条原始配置的落点：未知键保留 / identityName 未设置静默 / 嵌套对象逐项校验 / 普通字段校验。 */
+function applyConfigEntry(config, key, value, { defaults, unknown, identityDefaulted, warn }) {
+  if (!Object.hasOwn(defaults, key)) {
+    unknown[key] = value;
+    return;
+  }
+  if (key === 'identityName' && identityDefaulted) {
+    return;   // 未设置不告警：保留默认机器名，由调用方落盘触发一次提示
+  }
+  if (Object.hasOwn(NESTED_FIELD_RULES, key)) {
+    config[key] = validateNestedField(key, value, defaults[key], warn);
+    return;
+  }
+  const checked = validateField(key, value);
+  if (checked.ok) {
+    config[key] = checked.value;
+    return;
+  }
+  warn(`配置项 ${key} 无效（${checked.reason}），改用默认值 ${JSON.stringify(defaults[key])}`);
 }
 
 /* 旧配置键归一（设计 §11）：managerOfflineMs 提取为待映射值，takeoverWindowMs 退役。
@@ -307,6 +365,30 @@ function validateField(key, value) {
     return { ok: false, reason: rule.reason };
   }
   return { ok: true, value };
+}
+
+/* 嵌套对象逐子键校验：整段类型错 → 整组回落默认；未知子键原样保留（用 defineProperty 落成
+ * 普通数据键，防 __proto__ 之类的键经原型 setter 改写对象原型——与顶层 unknown 的 null 原型同理）。 */
+function validateNestedField(key, value, defaults, warn) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    warn(`配置项 ${key} 无效（需为 JSON 对象），已整组回落默认值`);
+    return { ...defaults };
+  }
+  const rules = NESTED_FIELD_RULES[key];
+  const result = { ...defaults };
+  for (const [subKey, subValue] of Object.entries(value)) {
+    if (!Object.hasOwn(rules, subKey)) {
+      Object.defineProperty(result, subKey, { value: subValue, enumerable: true, writable: true, configurable: true });
+      continue;
+    }
+    const rule = rules[subKey];
+    if (rule.check(subValue)) {
+      result[subKey] = subValue;
+    } else {
+      warn(`配置项 ${key}.${subKey} 无效（${rule.reason}），改用默认值 ${JSON.stringify(defaults[subKey])}`);
+    }
+  }
+  return result;
 }
 
 function readRawConfig(file, warn) {
