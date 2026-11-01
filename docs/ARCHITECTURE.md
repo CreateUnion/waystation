@@ -47,7 +47,7 @@
 | `collabs/<collabId>/` | 每协作目录：`carrier.json`、`ledger.jsonl`、`snapshot.json`、`member.json`、`seats/<sessionId>.json`、`invites.json`、`pending-invites.json`、`outbox.jsonl`、`inbox.jsonl`、`handover-offers.json`、`departed.jsonl`、`recovery.json` 等 |
 | `sessions/<sessionId>.json` | 会话级状态栏指示文件（由核心写；桥断开即删） |
 | `known-hosts.json` | 发现辅助：见过的「地址:端口」、实例标识、能力证据与会话短码 |
-| `dispatch-rules.md` | dispatch 全员纪律的单一权威源（收编通知实时读取） |
+| `dispatch-rules.md` | 调度纪律——调度（dispatch）全员纪律的单一权威源（收编通知实时读取） |
 | `logs/` | 核心的文件日志（桥不写文件日志，诊断走 stderr） |
 
 ## 2. 进程与通信
@@ -212,7 +212,7 @@ replacer 等旧核退场 10 秒，到期走硬杀防护链；硬杀后有 2 秒�
 
 ## 4. 协作模式
 
-模式在创建时定死，之后不可变。`managed`、`forum`、`dispatch` 三者的参与者、拓扑与持久化方式不同。
+模式在创建时定死，之后不可变。`managed`（协作）、`forum`（讨论）、`dispatch`（调度）三者的参与者、拓扑与持久化方式不同。
 
 ### 4.1 managed（协作）
 
@@ -244,20 +244,20 @@ replacer 等旧核退场 10 秒，到期走硬杀防护链；硬杀后有 2 秒�
 - **消息面**：不设私聊，`to` 一律拒绝；帖子默认落本地列表，实时新帖进会话注入，
   回填／追赶帖只汇总一行并指引查看。
 
-### 4.3 dispatch（本机编排）
+### 4.3 调度（dispatch，本机编排）
 
 - **范围**：只在本机，不接入局域网。`mode:'dispatch'` 的邀请帧在协议层即被拒绝；
-  伪造的 dispatch 帧在 dispatch 准入层拒绝并计数。
-- **拓扑**：master + 若干 slave。角色只认启动期环境变量 `WAYSTATION_ROLE`——工具参数与聊天内容
-  不能声明 master；一个核心同时只允许一个 dispatch，不接受 `targets`。
-- **收编**：master 用 `ws_dispatch_scan` 扫描本机会话，`ws_dispatch_claim` 发起收编；
+  伪造的调度帧在调度准入层拒绝并计数。
+- **拓扑**：调度长 + 若干组员。角色只认启动期环境变量 `WAYSTATION_ROLE`——工具参数与聊天内容
+  不能声明调度长；一个核心同时只允许一个调度（dispatch），不接受 `targets`。
+- **收编**：调度长用 `ws_dispatch_scan` 扫描本机会话，`ws_dispatch_claim` 发起收编；
   交互式目标需用户确认（一次性令牌），无头／服务拉起的会话必须带 `WAYSTATION_ROLE=slave`
   才会被收编。确认门 `gate:'claim'` 关闭时收编请求自动绑定并注入知情通知。
 - **autoClaim**：创建时开启后，创建即自动收编一轮，此后随核心节拍持续补收新出现的可绑定会话。
-- **纪律包**：收编通知自动携带 `dispatch-rules.md` 全文；该文件是全员纪律的唯一权威源，
+- **纪律包**：收编通知自动携带 `dispatch-rules.md` 全文；该文件是调度纪律的唯一权威源，
   通知发出时实时读取，改完即热生效。`ws_dispatch_rules_reload` 重读文件并向全体在编成员广播。
 - **持久化**：**纯内存**。不进 `collabs/`，不建目录、不写 carrier／member／ledger／snapshot／
-  outbox／inbox／invites／joins／seat／recovery／posts；核心重启或 dispatch 结束即消失，
+  outbox／inbox／invites／joins／seat／recovery／posts；核心重启或调度结束即消失，
   无回填、无恢复、无观察窗回放。
 - **消息**：复用 `ws_send_message`（可带 `toSessionIds` 与 `taskId`，类型限定 `task`／`progress`／
   `result`／`error`）与 `ws_end_collab`；投递唯一出口是本机注入路由，失败进有界待补投队列，
@@ -265,12 +265,12 @@ replacer 等旧核退场 10 秒，到期走硬杀防护链；硬杀后有 2 秒�
 
 ### 4.4 模式对照
 
-| 维度 | managed | forum | dispatch |
+| 维度 | managed（协作） | forum（讨论） | dispatch（调度） |
 | --- | --- | --- | --- |
 | 范围 | 局域网 | 局域网 | 仅本机 |
-| 拓扑 | 站长 + 成员（星型） | 平权＋发起人中继 | master + slave |
+| 拓扑 | 站长 + 成员（星型） | 平权＋发起人中继 | 调度长 + 组员 |
 | 权威数据 | 站长机台账（单写者） | 各成员本地副本＋对表收敛 | 无持久化（纯内存） |
-| 结束权 | 站长（含移交／接管） | 发起人 | master |
+| 结束权 | 站长（含移交／接管） | 发起人 | 调度长 |
 | 持久化 | 协作目录全套文件 | 协作目录全套文件（无 snapshot） | 不写协作文件 |
 | 冻结／接管 | 有 | 无 | 无 |
 
@@ -317,7 +317,7 @@ replacer 等旧核退场 10 秒，到期走硬杀防护链；硬杀后有 2 秒�
 - **本机暂存**：目标席位的桥不在线（或补投进行中）时，内容帧进入席位内存暂存；
   同 `sessionId` 在席位宽限内重连即按到达序补投。暂存默认上限为单席 100 条、单协作 500 条，
   超限丢最旧并计数；丢弃同时释放该 `msgId` 的去重记录，允许发送侧重投。
-- **补投顺序**：桥注册回执（`welcome`）写出发送后，核心让出一拍再补投 dispatch 队列、
+- **补投顺序**：桥注册回执（`welcome`）写出发送后，核心让出一拍再补投调度（dispatch）消息队列、
   席位暂存与挂起邀请——避免桥在握手完成前拒收 `push` 却已被记为「已送达」。补投期间席位保持
   `flushing`，新到的帧先入暂存队尾，保证不乱序。
 
@@ -395,7 +395,7 @@ forum 的直接加入没有批准门：本会话已在席时 `ws_join` 立即生
 
 1. 绑定该会话在本机各协作的席位到新桥，撤销过期的确认门状态；
 2. 让出一拍（覆盖握手回执在途）；
-3. 补投 dispatch 队列、席位暂存、挂起邀请与确认门通知；
+3. 补投调度（dispatch）消息队列、席位暂存、挂起邀请与确认门通知；
 4. 桥在注册成功后补发一次最新会话元数据（`register-update`），核心据此刷新会话状态文件。
 
 **席位宽限。** 桥断开时席位不立即消失，核心记下关闭时刻；同 `sessionId` 在宽限内重连即取消离席，
@@ -415,8 +415,8 @@ forum 的直接加入没有批准门：本会话已在席时 `ws_join` 立即生
 - **投递保证是机器级**：一条逻辑消息按机器拆帧，接收核按 `toSessions` 扇出到本机席位；
   不提供远端逐席位终态。同机某席位离线时，暂存只在核心存活期内有效，核心崩溃即丢失；
   发送侧仍可能显示机器级已送达。暂存有容量上限，超限丢最旧并计数。
-- **dispatch 纯内存**：不持久化、不保存历史、无恢复、无观察窗回放；核心重启或 dispatch 结束即消失。
-  `ws_view_ledger`／`ws_check_inbox` 对 dispatch 明确回「不保存历史」。
+- **调度（dispatch）纯内存**：不持久化、不保存历史、无恢复、无观察窗回放；核心重启或调度结束即消失。
+  `ws_view_ledger`／`ws_check_inbox` 对调度明确回「不保存历史」。
 - **forum 的中继枢纽**：中继（发起人）是全部帖子的必经转达点，可静默延迟或丢弃转达；
   常见情形由落后方周期对表拉取兜底，但中继本身是新的可用性面。发起人退出后讨论不再有人能结束它。
 - **发现面的边界**：发现依赖探测应答、启动自介与已知主机清单；从未与本站点接触过、又不在扫描段内的

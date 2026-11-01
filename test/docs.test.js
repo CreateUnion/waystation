@@ -71,7 +71,7 @@ test('README：确认门命令、默认值与 join 自动走完边界齐备', ()
 
 test('README：dispatch 模式、角色、无历史边界与微信集成责任齐备', () => {
   const text = readFileSync(join(repoRoot, 'README.md'), 'utf8');
-  assert.ok(text.includes('## dispatch 模式（本机多会话编排）'), 'dispatch 模式节写入文档');
+  assert.ok(text.includes('## 调度（dispatch）模式（本机多会话编排）'), '调度（dispatch）模式节写入文档');
   assert.ok(text.includes('WAYSTATION_ROLE=master'), 'master 启动期角色写入文档');
   assert.ok(text.includes('WAYSTATION_ROLE=slave'), 'slave 启动期角色写入文档');
   assert.ok(text.includes('不保存历史'), '无历史边界写入文档');

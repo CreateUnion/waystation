@@ -21,7 +21,7 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
 - **防火墙**：脚本只打印放行指引、**不自动修改**系统设置。Windows 用 `Get-NetFirewallProfile` 检测各配置状态并给出 `New-NetFirewallRule` 示例；Linux 免 root 读取 ufw 启用态（`/etc/ufw/ufw.conf`）或检测 firewalld 服务，给出 `ufw allow` / `firewall-cmd` 示例。（Windows 防火墙开启场景的规则形态尚未实测验收。）
 - **卸载**：`waystation uninstall`——**先停核心**（在跑的核心经 `core stop` 有序停止；核心拒绝停止时整单中止，未做任何改动）、注销 MCP 注册、移除随装的斜杠命令（只删带受管标记的文件，手工放入的同名文件不动）、删除可执行与安装目录；数据目录默认保留，加 `--purge-data` 连数据一起删（先加 `--dry-run` 可预览）。与安装脚本的 `-Uninstall` / `--uninstall` 开关在默认布局下等价，二选一即可；**自定义 `WAYSTATION_HOME` 时以本命令为准**（安装脚本不读该变量）。
 - **清空数据（保留身份与安装）**：`waystation purge-data`——先停核心（停不住即拒绝清理并提示；等待接管态的核心经本通道零写终止）、清掉全部协作数据、保留身份（`config.json`、`instance-id`，含各槽位）与安装面（`app/`、`bin/`）；默认只预览（列出将删除与保留的清单），确认后加 `--yes` 执行，不可恢复；也可用 `/ws-purge` 斜杠命令走同一条流程。
-- **智能安装入口（Windows，推荐）**：`powershell -File scripts\setup.ps1`（预览：`-DryRun`）——先检测已装版本：未装则全新安装；已装低于安装包时询问是否更新；同版或更高跳过；随后检测 cc-connect：已装则自动配置 dispatch master 自动化（先备份再向 `~/.cc-connect/config.toml` 的 `[projects.agent.options]` 段注入 `allowed_tools` 与 `append_system_prompt`、幂等可重复；以 UAC 自提权向 Windows 服务环境写入 `WAYSTATION_ROLE=master`；有实际更改时询问是否重启服务），任一步失败降级为打印精确手动命令（退出码 2）；未装 cc-connect 则提醒无法自动配置微信/QQ 多会话控制入口，装好后重跑本脚本即可补配。退出码：0 全部完成；2 有待手动项；1 致命失败。`install.ps1` 仍可单独使用（setup 是它的智能前置 + cc-connect 集成，不改变其行为）。
+- **智能安装入口（Windows，推荐）**：`powershell -File scripts\setup.ps1`（预览：`-DryRun`）——先检测已装版本：未装则全新安装；已装低于安装包时询问是否更新；同版或更高跳过；随后检测 cc-connect：已装则自动配置 dispatch master（调度长）自动化（先备份再向 `~/.cc-connect/config.toml` 的 `[projects.agent.options]` 段注入 `allowed_tools` 与 `append_system_prompt`、幂等可重复；以 UAC 自提权向 Windows 服务环境写入 `WAYSTATION_ROLE=master`；有实际更改时询问是否重启服务），任一步失败降级为打印精确手动命令（退出码 2）；未装 cc-connect 则提醒无法自动配置微信/QQ 多会话控制入口，装好后重跑本脚本即可补配。退出码：0 全部完成；2 有待手动项；1 致命失败。`install.ps1` 仍可单独使用（setup 是它的智能前置 + cc-connect 集成，不改变其行为）。
 - 第二台及以后的机器：同样流程、独立安装即可。
 - 刚安装或升级过 Node 时，重启 Claude Code 与终端让 PATH 生效，再进会话首检。
 
@@ -33,7 +33,7 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
 4. 可选：配置状态栏「协作中」指示（见后文「状态栏」节）——进入协作后状态栏显示当前协作。
 5. 可选：其他 MCP 客户端（如 opencode）见后文「其他 MCP 客户端」节。
 
-工具面共 **28 项**（扫描 / 探测 / 投递状态 / 收件流水 / 协作建撤进退与邀请 / 主动加入与批准 / 邀请确认 / **确认门开关** / **dispatch 编排** / 消息与台账 / 会话级静音 / 移交 / 接管（窗口内 / 手动）/ 裁定），完整清单与参数由 MCP 客户端在会话里展示。0.2.2 新增第 23 项 `ws_set_confirm_gate`（邀请 / 加入申请确认门，见「确认门开关」节）——**显式移交与接管**（窗口内 / 手动）确认仍复用 `ws_handover` / `ws_take_over` 的一次性确认令牌；**自动移交按预授权由目标核自动接受**，不弹目标确认。dispatch 模式另增第 24–27 项 `ws_dispatch_scan` / `ws_dispatch_claim` / `ws_dispatch_approve` / `ws_dispatch_release`（见「dispatch 模式（本机多会话编排）」节），并复用 `ws_send_message` / `ws_end_collab` 等既有工具；0.2.4 已实际发布第 28 项 `ws_dispatch_rules_reload`（重读纪律文件并向在编成员广播），0.2.5 追认入契约。
+工具面共 **28 项**（扫描 / 探测 / 投递状态 / 收件流水 / 协作建撤进退与邀请 / 主动加入与批准 / 邀请确认 / **确认门开关** / **调度（dispatch）编排** / 消息与台账 / 会话级静音 / 移交 / 接管（窗口内 / 手动）/ 裁定），完整清单与参数由 MCP 客户端在会话里展示。0.2.2 新增第 23 项 `ws_set_confirm_gate`（邀请 / 加入申请确认门，见「确认门开关」节）——**显式移交与接管**（窗口内 / 手动）确认仍复用 `ws_handover` / `ws_take_over` 的一次性确认令牌；**自动移交按预授权由目标核自动接受**，不弹目标确认。调度（dispatch）模式另增第 24–27 项 `ws_dispatch_scan` / `ws_dispatch_claim` / `ws_dispatch_approve` / `ws_dispatch_release`（见「调度（dispatch）模式（本机多会话编排）」节），并复用 `ws_send_message` / `ws_end_collab` 等既有工具；0.2.4 已实际发布第 28 项 `ws_dispatch_rules_reload`（重读纪律文件并向在编成员广播），0.2.5 追认入契约。
 
 - **`ws_list_hosts` 列表含本机段**：载荷分两段——`self`＝本机自身（身份名、端口与**活跃终端**＝本机核心当前注册的会话，`sessionCount` 与 `sessions`，会话标识即 `CLAUDE_CODE_SESSION_ID`）＋ `hosts`＝其他驿站。**同机的其他数据根实例**（如「单机一核与桥」节逃生门的第二核）照常列出、带 `sameMachine: true` 标注（命令面呈现「本机·另一数据根」）——自机识别只按实例标识（同一数据根＝同一驿站，不重复列出），不按地址过滤。**远端条目另携会话段**：对端上报的活跃会话 `sessions`（**短码数组**——会话标识前 8 字符；缺字段＝对端未报、已如实省略，「对端没有活跃会话」与「对端没报」不混同——对端如实报零时是空数组在场）。如实边界：发现仍靠同一套机制（探测应答与启动自介写入的已知主机清单），**从未与本站点接触过、又不在扫描段内（默认 7321–7328）的同机实例扫不到**（不做地址枚举）。**能力闸门（0.2.0）**：远端条目另带 `participants` 能力（支持 / 不支持 / 未知）——0.2.0 只与「支持」的对端建立协作；旧版对端仍可被发现，但邀请 / 申请 / 建协作被明确拒绝（见「升级与迁移」节）。
 
@@ -94,13 +94,13 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
 - **16 个活跃会话上限是邀请侧软约束**（代码常量 `MAX_FORUM_ACTIVE_SEATS`＝16，`src/net/protocol.js`）：本机折叠成员表（活跃会话）≥16 时拒绝发起新邀请；已有的 join 与合并不因超限被拒（保收敛）。并发场景允许**暂时到 17**——软约束的存量边界（设计未单列）。
 - **时钟序为近似序**：显示按时间戳排序；跨作者的时间戳仅近似（作者侧已强制单调，同作者内比较以作者序号为准）。
 
-## dispatch 模式（本机多会话编排）
+## 调度（dispatch）模式（本机多会话编排）
 
-与协作 / 讨论并列的第三种模式：**只在本机**把多个 Claude Code 会话编成一个 master + 若干 slave 的执行组（例如 master 在微信侧统筹、worker 各自跑任务）。模式在创建时定死；**不接入局域网**——`mode: 'dispatch'` 的邀请帧在协议层即被拒绝；伪造的 dispatch `task` / `progress` 帧在 dispatch 准入层显式拒绝并计入 `dispatchLanRejected`，`result` / `error` 不是协议帧类型，更早被协议类型白名单拒绝（同样丢弃，但不进该计数器）。
+与协作（managed）/ 讨论（forum）并列的第三种模式——**调度（dispatch）**：**只在本机**把多个 Claude Code 会话编成一个调度长 + 若干组员的执行组（例如调度长在微信侧统筹、worker 各自跑任务）。模式在创建时定死；**不接入局域网**——`mode: 'dispatch'` 的邀请帧在协议层即被拒绝；伪造的调度（dispatch）`task` / `progress` 帧在调度准入层显式拒绝并计入 `dispatchLanRejected`，`result` / `error` 不是协议帧类型，更早被协议类型白名单拒绝（同样丢弃，但不进该计数器）。
 
-- **master**：由启动器（如 cc-connect）拉起，进程环境带 `WAYSTATION_ROLE=master`，并在 `append_system_prompt` 里交代职责，例如「你是 waystation master。会话启动后创建 dispatch 模式并扫描本机会话；用 @会话名 定向、不写 @ 群发；只推关键事件到微信，普通进度留在内存」。启动后由 master 会话调用 `ws_create_collab { mode: 'dispatch', name: 'dispatch' }` 创建——**角色只认启动期环境变量**，工具参数与聊天内容不能声明 master；一个核心同时只允许一个 dispatch，dispatch 不接受 `targets`。
-- **slave（交互式）**：人工正常打开 Claude Code 即可；首次被收编时核心向该会话注入确认提示，**需本机用户确认**后才绑定（可选 `WAYSTATION_ROLE=slave` 预授权、`WAYSTATION_MASTER=<master 名>` 限定主人）。
-- **slave（无头 / 服务拉起）**：必须带 `WAYSTATION_ROLE=slave` 才会被收编（无角色且不可交互 → 拒绝）。示例：
+- **调度长**：由启动器（如 cc-connect）拉起，进程环境带 `WAYSTATION_ROLE=master`，并在 `append_system_prompt` 里交代职责，例如「你是 waystation dispatch master（调度长）。会话启动后创建调度（dispatch）模式并扫描本机会话；用 @会话名 定向、不写 @ 群发；只推关键事件到微信，普通进度留在内存」。启动后由调度长会话调用 `ws_create_collab { mode: 'dispatch', name: 'dispatch' }` 创建——**角色只认启动期环境变量**，工具参数与聊天内容不能声明调度长；一个核心同时只允许一个调度（dispatch），调度不接受 `targets`。
+- **组员（交互式）**：人工正常打开 Claude Code 即可；首次被收编时核心向该会话注入确认提示，**需本机用户确认**后才绑定（可选 `WAYSTATION_ROLE=slave` 预授权、`WAYSTATION_MASTER=<调度长会话名>` 限定主人）。
+- **组员（无头 / 服务拉起）**：必须带 `WAYSTATION_ROLE=slave` 才会被收编（无角色且不可交互 → 拒绝）。示例：
 
   ```bash
   WAYSTATION_ROLE=slave WAYSTATION_MASTER=master claude --name worker-1 \
@@ -110,13 +110,13 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
   ```
 
   `--allowed-tools` 必须包含 waystation MCP 工具（否则 `dontAsk` 下 worker 无法回执 / 查收件）；`claude --name` 设置会话名；长驻用 stream-json 输入，不要用一次性 `claude -p "任务"`。
-- **收编**：master 用 `ws_dispatch_scan` 扫描本机会话（名字 / kind / role / status / 已被谁收编；**只列可收编目标**——`role=slave` 或交互式且会话文件在档；master、非交互无角色、无会话文件者不列出），`ws_dispatch_claim { sessionIds }` 发起收编；交互式目标收到确认提示，`ws_dispatch_approve` 首次只返回一次性令牌、经本机用户确认后携令牌批准；`ws_dispatch_release { sessionId }` 释放。目标会话可用 `ws_set_confirm_gate { gate: 'claim' }` 关掉本会话的被收编确认——off 时收编请求**自动绑定**并注入一行知情通知（拒绝仍走人工）。
-- **自动收编（autoClaim）**：创建时带 `ws_create_collab { mode: 'dispatch', autoClaim: true }`——创建即自动收编一轮，之后随核心节拍**持续补收新出现的可绑定会话**（`role=slave`，或 claim 门 off 的交互式；**门开的交互式绝不自动弹确认**），离线 slave 超宽限自动移除并通告。适合「master 常驻、worker 随开随编」的用法；不开 autoClaim 则保持手动 `claim` 语义。
-- **收编纪律包（单一权威源）**：收编通知（绑定知情通知与 pending 确认提示）自动携带 `~/.waystation/dispatch-rules.md` 全文——该文件是 dispatch 全员纪律的唯一权威源，收编低频、通知发出时实时读取，**改完即热生效**（无需重启或 reload）；文件缺失/为空时回退内置最简纪律（主动上报 + 权限豁免），并向 master 知会一次。改文件要对**已收编在编会话**立即生效时，master 调 `ws_dispatch_rules_reload`：核心重读文件并向全体在编成员广播最新纪律包（带内容版本号+时间戳，便于会话识别新旧）。
-- **消息与结束**：复用 `ws_send_message`（dispatch 下可带 `toSessionIds` 与 `taskId`，类型限定 task / progress / result / error）与 `ws_end_collab`（master 结束并通知全员）。master 用 `@会话名` 定向、不写 `@` 群发；slave 回执默认回 master 并在正文带 `@来源`。实时细节只在内存与终端：台账 / 收件流水 / 观察窗历史不适用（`ws_view_ledger` / `ws_check_inbox` 明确回「不保存历史」）。
-- **纯内存、不保存历史**：dispatch 不进 `collabs/`（零文件：不建目录、不写 carrier / member / ledger / snapshot / outbox / inbox / invites / joins / seat / recovery / posts），核心重启或 dispatch 结束即消失，无回填、无恢复、无观察窗回放；`sessions/<sessionId>.json` 状态栏文件允许照常更新（它是本机会话状态，不是协作历史）。
-- **微信推送是 master / cc-connect 的集成责任**：waystation 不集成 cc-connect / 微信。以下行为仓库内无证据、需真机验证：无用户消息时 master 的输出是否会被 cc-connect 当作 push 转发；推送频率与 `burst_limit` / 24h 额度；`ret=-2` 的失败与重试。
-- **如实披露**：同机同用户信任边界——同用户的其他进程可以设置角色 / 连本地 IPC（更强隔离用不同 OS 账户运行 master / slave）；「交互式确认」是模型转述的提示，最终取决于该会话语义与用户行为；会话名与 `kind`（interactive / bg）取自 Claude Code 的私有字段与状态栏数据，字段缺失或不可读时按「未知 / 非交互」失败关闭处理。
+- **收编**：调度长用 `ws_dispatch_scan` 扫描本机会话（名字 / kind / role / status / 已被谁收编；**只列可收编目标**——`role=slave` 或交互式且会话文件在档；调度长、非交互无角色、无会话文件者不列出），`ws_dispatch_claim { sessionIds }` 发起收编；交互式目标收到确认提示，`ws_dispatch_approve` 首次只返回一次性令牌、经本机用户确认后携令牌批准；`ws_dispatch_release { sessionId }` 释放。目标会话可用 `ws_set_confirm_gate { gate: 'claim' }` 关掉本会话的被收编确认——off 时收编请求**自动绑定**并注入一行知情通知（拒绝仍走人工）。
+- **自动收编（autoClaim）**：创建时带 `ws_create_collab { mode: 'dispatch', autoClaim: true }`——创建即自动收编一轮，之后随核心节拍**持续补收新出现的可绑定会话**（`role=slave`，或 claim 门 off 的交互式；**门开的交互式绝不自动弹确认**），离线组员超宽限自动移除并通告。适合「调度长常驻、worker 随开随编」的用法；不开 autoClaim 则保持手动 `claim` 语义。
+- **收编纪律包（单一权威源）**：收编通知（绑定知情通知与 pending 确认提示）自动携带 `~/.waystation/dispatch-rules.md`（调度纪律）全文——该文件是调度（dispatch）全员纪律的唯一权威源，收编低频、通知发出时实时读取，**改完即热生效**（无需重启或 reload）；文件缺失/为空时回退内置最简纪律（主动上报 + 权限豁免），并向调度长知会一次。改文件要对**已收编在编会话**立即生效时，调度长调 `ws_dispatch_rules_reload`：核心重读文件并向全体在编成员广播最新纪律包（带内容版本号+时间戳，便于会话识别新旧）。
+- **消息与结束**：复用 `ws_send_message`（调度模式下可带 `toSessionIds` 与 `taskId`，类型限定 task / progress / result / error）与 `ws_end_collab`（调度长结束并通知全员）。调度长用 `@会话名` 定向、不写 `@` 群发；组员回执默认回调度长并在正文带 `@来源`。实时细节只在内存与终端：台账 / 收件流水 / 观察窗历史不适用（`ws_view_ledger` / `ws_check_inbox` 明确回「不保存历史」）。
+- **纯内存、不保存历史**：调度（dispatch）不进 `collabs/`（零文件：不建目录、不写 carrier / member / ledger / snapshot / outbox / inbox / invites / joins / seat / recovery / posts），核心重启或调度结束即消失，无回填、无恢复、无观察窗回放；`sessions/<sessionId>.json` 状态栏文件允许照常更新（它是本机会话状态，不是协作历史）。
+- **微信推送是调度长 / cc-connect 的集成责任**：waystation 不集成 cc-connect / 微信。以下行为仓库内无证据、需真机验证：无用户消息时调度长的输出是否会被 cc-connect 当作 push 转发；推送频率与 `burst_limit` / 24h 额度；`ret=-2` 的失败与重试。
+- **如实披露**：同机同用户信任边界——同用户的其他进程可以设置角色 / 连本地 IPC（更强隔离用不同 OS 账户运行调度长 / 组员）；「交互式确认」是模型转述的提示，最终取决于该会话语义与用户行为；会话名与 `kind`（interactive / bg）取自 Claude Code 的私有字段与状态栏数据，字段缺失或不可读时按「未知 / 非交互」失败关闭处理。
 
 ## 会话级加入（申请/指名/可见性）
 
@@ -142,7 +142,7 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
 
 - `/ws-invite-confirm on|off|status|clear [--permanent]`：收到邀请是否要人工同意。`off` **只对指名邀请**自动同意；不指名邀请仍走人工，避免同机多个会话 `off` 时抢答、归属不清；**拒绝邀请始终人工**。
 - `/ws-join-confirm on|off|status|clear [--permanent]`：作为站长收到加入申请是否要人工批准。`off` 会让**整条入席自动走完**：站长侧自动批准，申请人侧的 `join-confirm` 是申请人核心自动发送的协议帧，不是第二次人工确认；**站长桥断开期间仍会继续自动批准**（本设计的取舍）。拒绝申请始终人工。
-- **dispatch 收编门（`ws_set_confirm_gate { gate: 'claim' }`，无斜杠命令）**：本会话被 dispatch master 收编时是否要人工确认。`off` 时收编请求**自动绑定**并注入一行知情通知（谁收编了你、如何退出）；拒绝收编仍走人工。适合「自己的会话随开随被编入」的常驻用法。
+- **调度（dispatch）收编门（`ws_set_confirm_gate { gate: 'claim' }`，无斜杠命令）**：本会话被调度长收编时是否要人工确认。`off` 时收编请求**自动绑定**并注入一行知情通知（谁收编了你、如何退出）；拒绝收编仍走人工。适合「自己的会话随开随被编入」的常驻用法。
 - 不带 `--permanent`：临时，只对当前会话生效，会话结束或核心重启即失效；带 `--permanent`：写入本机数据根 `config.json` 的 `inviteConfirmation` / `joinRequestConfirmation` / `dispatchClaimConfirmation`，对本机以后所有会话生效，首次调用需用户明确同意并携一次性令牌重试。
 - 旧命令 `/ws-auto-accept-invites` 保留为兼容别名，但参数方向相反：旧 `on` = 新 `/ws-invite-confirm off`，旧 `off` = 新 `on`。
 - 默认三个门都是 `true`（需要人工确认），保持 0.2.x 行为。

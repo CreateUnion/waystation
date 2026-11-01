@@ -90,7 +90,7 @@ export const WS_LIST_COLLABS_SPEC = {
 
 export const WS_CREATE_COLLAB_SPEC = {
   name: 'ws_create_collab',
-  description: '发起协作、讨论或本机 dispatch（模式创建时定死、不可变）：创建会话即入席——managed 下本会话任站长（joinSeq=1），forum 下任发起人/中继；向选中目标并行发出邀请（对方在同意门点头后两段式入席）；targets 可带 targetSessionId 指名目标会话；目标取自 ws_list_hosts 的实例标识与端点。dispatch 是纯内存本机多会话编排：仅启动期 WAYSTATION_ROLE=master 的会话可建，一个核心同时只允许一个，不接受 targets；dispatch 可选 autoClaim=true——创建即自动收编一轮，之后随核心节拍持续补收新出现的可绑定会话（role=slave 或 claim 门 off 的交互式；门开的交互式绝不自动弹确认），离线 slave 超宽限自动移除',
+  description: '发起协作、讨论或本机调度（dispatch；模式创建时定死、不可变）：创建会话即入席——managed 下本会话任站长（joinSeq=1），forum 下任发起人/中继；向选中目标并行发出邀请（对方在同意门点头后两段式入席）；targets 可带 targetSessionId 指名目标会话；目标取自 ws_list_hosts 的实例标识与端点。调度（dispatch）是纯内存本机多会话编排：仅启动期 WAYSTATION_ROLE=master 的会话（调度长）可建，一个核心同时只允许一个，不接受 targets；调度可选 autoClaim=true——创建即自动收编一轮，之后随核心节拍持续补收新出现的可绑定会话（role=slave 或 claim 门 off 的交互式；门开的交互式绝不自动弹确认），离线组员超宽限自动移除',
   inputSchema: {
     type: 'object',
     properties: {
@@ -137,7 +137,7 @@ export const WS_ALLOW_NEXT_INVITE_SPEC = {
 
 export const WS_SET_CONFIRM_GATE_SPEC = {
   name: 'ws_set_confirm_gate',
-  description: '设置本机确认门：邀请同意是否必须人工确认（gate=invite）、作为站长收到加入申请是否必须人工批准（gate=join）、被 dispatch master 收编是否必须人工确认（gate=claim）。scope=session（缺省）只对当前会话生效，会话结束或核心重启即失效；scope=persistent 写入 config.json，对本机以后所有会话生效，首次调用只返回 needsUserConfirmation 与一次性 confirmToken——须向用户转述并取得明确同意后携令牌重试。action=status 返回本会话临时值 / config 永久值 / 当前生效值（gate=all 返回三门，缺省 both=invite+join）；action=clear 清除临时值，scope=persistent 时删除配置字段并回到默认 true。claim 门 off 时收编请求自动绑定并注入知情通知；off 只免同意 / 批准 / 确认，拒绝仍走人工',
+  description: '设置本机确认门：邀请同意是否必须人工确认（gate=invite）、作为站长收到加入申请是否必须人工批准（gate=join）、被调度长（dispatch master）收编是否必须人工确认（gate=claim）。scope=session（缺省）只对当前会话生效，会话结束或核心重启即失效；scope=persistent 写入 config.json，对本机以后所有会话生效，首次调用只返回 needsUserConfirmation 与一次性 confirmToken——须向用户转述并取得明确同意后携令牌重试。action=status 返回本会话临时值 / config 永久值 / 当前生效值（gate=all 返回三门，缺省 both=invite+join）；action=clear 清除临时值，scope=persistent 时删除配置字段并回到默认 true。claim 门 off 时收编请求自动绑定并注入知情通知；off 只免同意 / 批准 / 确认，拒绝仍走人工',
   inputSchema: {
     type: 'object',
     properties: {
@@ -153,13 +153,13 @@ export const WS_SET_CONFIRM_GATE_SPEC = {
 
 export const WS_DISPATCH_SCAN_SPEC = {
   name: 'ws_dispatch_scan',
-  description: 'dispatch master 扫描本机已接入 waystation 的会话：会话名、role、kind、status、是否已被本 dispatch 收编。只返回本机**可收编**的在线会话（role=slave 或交互式；master、非交互无角色、无会话文件者不列出），排除 master 自身；名字取 Claude Code 会话名，缺失回退会话短码',
+  description: '调度长（dispatch master）扫描本机已接入 waystation 的会话：会话名、role、kind、status、是否已被本调度（dispatch）收编。只返回本机**可收编**的在线会话（role=slave 或交互式；调度长、非交互无角色、无会话文件者不列出），排除调度长自身；名字取 Claude Code 会话名，缺失回退会话短码',
   inputSchema: { type: 'object', properties: {} },
 };
 
 export const WS_DISPATCH_CLAIM_SPEC = {
   name: 'ws_dispatch_claim',
-  description: 'dispatch master 收编一个或多个本机会话：无头且带 WAYSTATION_ROLE=slave 的会话直接绑定；交互式会话返回 pending 并向目标注入首次确认；非交互式且无角色的会话拒绝。一个核心同一时刻只允许一个 dispatch，slave 独占',
+  description: '调度长（dispatch master）收编一个或多个本机会话：无头且带 WAYSTATION_ROLE=slave 的会话直接绑定；交互式会话返回 pending 并向目标注入首次确认；非交互式且无角色的会话拒绝。一个核心同一时刻只允许一个调度（dispatch），组员独占',
   inputSchema: {
     type: 'object',
     properties: {
@@ -171,7 +171,7 @@ export const WS_DISPATCH_CLAIM_SPEC = {
 
 export const WS_DISPATCH_APPROVE_SPEC = {
   name: 'ws_dispatch_approve',
-  description: '交互式 slave 确认 / 拒绝 master 的收编请求。第一次 approve:true 不带 confirmToken 时只返回 needsUserConfirmation 与一次性令牌；目标会话的模型把请求转述给本机用户，用户明确同意后携令牌重试才绑定。这是模型转述的确认，不是带外硬人工门',
+  description: '交互式组员确认 / 拒绝调度长（dispatch master）的收编请求。第一次 approve:true 不带 confirmToken 时只返回 needsUserConfirmation 与一次性令牌；目标会话的模型把请求转述给本机用户，用户明确同意后携令牌重试才绑定。这是模型转述的确认，不是带外硬人工门',
   inputSchema: {
     type: 'object',
     properties: {
@@ -185,7 +185,7 @@ export const WS_DISPATCH_APPROVE_SPEC = {
 
 export const WS_DISPATCH_RELEASE_SPEC = {
   name: 'ws_dispatch_release',
-  description: 'dispatch master 释放单个 slave。释放后该会话不再接收 dispatch 消息；整体结束用 ws_end_collab，slave 自己退出用 ws_leave_collab',
+  description: '调度长（dispatch master）释放单个组员。释放后该会话不再接收调度（dispatch）消息；整体结束用 ws_end_collab，组员自己退出用 ws_leave_collab',
   inputSchema: {
     type: 'object',
     properties: {
@@ -197,7 +197,7 @@ export const WS_DISPATCH_RELEASE_SPEC = {
 
 export const WS_DISPATCH_RULES_RELOAD_SPEC = {
   name: 'ws_dispatch_rules_reload',
-  description: 'dispatch master 专用：重读 ~/.waystation/dispatch-rules.md（收编纪律单一权威源）并向全体在编成员广播最新纪律包（带内容版本号+时间戳，便于会话识别新旧）——改纪律文件后对已收编会话立即生效，无需重建；文件缺失时按内置最简纪律广播并在结果中标注 rulesMissing',
+  description: '调度长（dispatch master）专用：重读 ~/.waystation/dispatch-rules.md（调度纪律，收编纪律单一权威源）并向全体在编成员广播最新纪律包（带内容版本号+时间戳，便于会话识别新旧）——改纪律文件后对已收编会话立即生效，无需重建；文件缺失时按内置最简纪律广播并在结果中标注 rulesMissing',
   inputSchema: {
     type: 'object',
     properties: {},
@@ -233,7 +233,7 @@ export const WS_VIEW_LEDGER_SPEC = {
 
 export const WS_SEND_MESSAGE_SPEC = {
   name: 'ws_send_message',
-  description: '发送协作域消息（发送者须为本机活跃且非 unverified 席位）：星型路由——成员发给站长，站长省略 to 即发全体成员；按目标机器去重、一机一帧，返回逐机器 msgId；席位宽限内断连的帧由本机核心暂存、重连后补投，判离席或冻结期丢弃，不保证送达。to＝目标实例/地址，配可选 toSessionId（会话，短码或完整标识，精确匹配；只给会话参数会被拒绝）。讨论模式为发帖（人人可见、to / toSessionId 一律拒绝）：默认经中继（发起人）投递（成员投稿至中继、由其转达全员），中继不可达时自动降级直投——返回的 route 字段如实标注本机走的路（relay/degraded/fanout）、results 为投稿或直投的受理态，成员级结果经中继聚合捎回、未达者由对方周期对表收敛。dispatch（纯内存本机编排）另走一套：消息只经本机核心投递、不落盘，type 取 task / progress / result / error，定向用 toSessionIds（省略即 master→全体已收编 slave、slave→master），可用 taskId 关联任务；不接受 to / toSessionId',
+  description: '发送协作域消息（发送者须为本机活跃且非 unverified 席位）：星型路由——成员发给站长，站长省略 to 即发全体成员；按目标机器去重、一机一帧，返回逐机器 msgId；席位宽限内断连的帧由本机核心暂存、重连后补投，判离席或冻结期丢弃，不保证送达。to＝目标实例/地址，配可选 toSessionId（会话，短码或完整标识，精确匹配；只给会话参数会被拒绝）。讨论模式为发帖（人人可见、to / toSessionId 一律拒绝）：默认经中继（发起人）投递（成员投稿至中继、由其转达全员），中继不可达时自动降级直投——返回的 route 字段如实标注本机走的路（relay/degraded/fanout）、results 为投稿或直投的受理态，成员级结果经中继聚合捎回、未达者由对方周期对表收敛。调度（dispatch，纯内存本机编排）另走一套：消息只经本机核心投递、不落盘，type 取 task / progress / result / error，定向用 toSessionIds（省略即调度长→全体已收编组员、组员→调度长），可用 taskId 关联任务；不接受 to / toSessionId',
   inputSchema: {
     type: 'object',
     properties: {
