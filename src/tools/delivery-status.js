@@ -1,4 +1,5 @@
 import { ID_PATTERN } from '../net/protocol.js';
+import { errorResult } from './collab.js';
 import { WS_DELIVERY_STATUS_SPEC } from './specs.js';
 
 const FILTER_PARAMS = ['msgId', 'collabId'];
@@ -22,7 +23,7 @@ export function deliveryStatusTool() {
         return value !== undefined && (typeof value !== 'string' || value.trim() === '');
       });
       if (invalid.length > 0) {
-        return { content: [{ type: 'text', text: `参数 ${invalid.join('、')} 非法：需要非空字符串（可选参数，不传则不过滤）` }], isError: true };
+        return errorResult(`参数 ${invalid.join('、')} 非法：需要非空字符串（可选参数，不传则不过滤）`);
       }
       /* 校验通过的值至多带首尾空白，透传前去除：查询按标识精确比对，带空白串会被当作不存在的标识、
        * 静默返回空列表——「没匹配上」与「该标识不存在」将不可区分。 */

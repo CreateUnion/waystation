@@ -98,7 +98,7 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
 
 与协作（managed）/ 讨论（forum）并列的第三种模式——**调度（dispatch）**：**只在本机**把多个 Claude Code 会话编成一个调度长 + 若干组员的执行组（例如调度长在微信侧统筹、worker 各自跑任务）。模式在创建时定死；**不接入局域网**——`mode: 'dispatch'` 的邀请帧在协议层即被拒绝；伪造的调度（dispatch）`task` / `progress` 帧在调度准入层显式拒绝并计入 `dispatchLanRejected`，`result` / `error` 不是协议帧类型，更早被协议类型白名单拒绝（同样丢弃，但不进该计数器）。
 
-- **调度长**：由启动器（如 cc-connect）拉起，进程环境带 `WAYSTATION_ROLE=master`，并在 `append_system_prompt` 里交代职责，例如「你是 waystation dispatch master（调度长）。会话启动后创建调度（dispatch）模式并扫描本机会话；用 @会话名 定向、不写 @ 群发；只推关键事件到微信，普通进度留在内存」。启动后由调度长会话调用 `ws_create_collab { mode: 'dispatch', name: 'dispatch' }` 创建——**角色只认启动期环境变量**，工具参数与聊天内容不能声明调度长；一个核心同时只允许一个调度（dispatch），调度不接受 `targets`。调度长心跳超时（默认 3 分钟无 ws 工具调用 / 无桥重连）后，另一个启动期 master 会话再次调用 `ws_create_collab` 会**原地接管**该调度（collabId、组员与任务表保留；旧调度长恢复后的调度操作会被明确拒绝并提示「已被接管」）。
+- **调度长**：由启动器（如 cc-connect）拉起，进程环境带 `WAYSTATION_ROLE=master`，并在 `append_system_prompt` 里交代职责，例如「你是 waystation dispatch master（调度长）。会话启动后创建调度（dispatch）模式并扫描本机会话；用会话短码 `sessionCode` 定向、省略 `toSessionIds` 即群发；只推关键事件到微信，普通进度留在内存」。启动后由调度长会话调用 `ws_create_collab { mode: 'dispatch', name: 'dispatch' }` 创建——**角色只认启动期环境变量**，工具参数与聊天内容不能声明调度长；一个核心同时只允许一个调度（dispatch），调度不接受 `targets`。调度长心跳超时（默认 3 分钟无 ws 工具调用 / 无桥重连）后，另一个启动期 master 会话再次调用 `ws_create_collab` 会**原地接管**该调度（collabId、组员与任务表保留；旧调度长恢复后的调度操作会被明确拒绝并提示「已被接管」）。
 - **组员（交互式）**：人工正常打开 Claude Code 即可；首次被收编时核心向该会话注入确认提示，**需本机用户确认**后才绑定（可选 `WAYSTATION_ROLE=slave` 预授权、`WAYSTATION_MASTER=<调度长会话名>` 限定主人）。
 - **组员（无头 / 服务拉起）**：必须带 `WAYSTATION_ROLE=slave` 才会被收编（无角色且不可交互 → 拒绝）。示例：
 
@@ -110,14 +110,41 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
   ```
 
   `--allowed-tools` 必须包含 waystation MCP 工具（否则 `dontAsk` 下 worker 无法回执 / 查收件）；`claude --name` 设置会话名；长驻用 stream-json 输入，不要用一次性 `claude -p "任务"`。
-- **收编**：调度长用 `ws_dispatch_scan` 扫描本机会话（名字 / kind / role / status / 已被谁收编；**只列可收编目标**——`role=slave` 或交互式且会话文件在档；调度长、非交互无角色、无会话文件者不列出），`ws_dispatch_claim { sessionIds }` 发起收编；交互式目标收到确认提示，`ws_dispatch_approve` 首次只返回一次性令牌、经本机用户确认后携令牌批准；`ws_dispatch_release { sessionId }` 释放。目标会话可用 `ws_set_confirm_gate { gate: 'claim' }` 关掉本会话的被收编确认——off 时收编请求**自动绑定**并注入一行知情通知（拒绝仍走人工）。
+- **收编**：调度长用 `ws_dispatch_scan` 扫描本机会话（`sessionCode` 稳定短码 / 名字 / kind / role / status / 已被谁收编；**只列可收编目标**——`role=slave` 或交互式且会话文件在档；调度长、非交互无角色、无会话文件者不列出），`ws_dispatch_claim { sessionIds }` 发起收编；交互式目标收到确认提示，`ws_dispatch_approve` 首次只返回一次性令牌、经本机用户确认后携令牌批准；`ws_dispatch_release { sessionId }` 释放。`sessionIds` / `sessionId` 接受 `sessionCode` 或完整 `sessionId`（精确匹配，不做前缀展开）。**名字（`name`）可能随 Claude Code 重命名或重启变化，派发一律以 `sessionCode` 为准**；`ws_status` 的 `dispatch.slaves` 同样提供 `sessionCode`。目标会话可用 `ws_set_confirm_gate { gate: 'claim' }` 关掉本会话的被收编确认——off 时收编请求**自动绑定**并注入一行知情通知（拒绝仍走人工）。
 - **自动收编（autoClaim）**：创建时带 `ws_create_collab { mode: 'dispatch', autoClaim: true }`——创建即自动收编一轮，之后随核心节拍**持续补收新出现的可绑定会话**（`role=slave`，或 claim 门 off 的交互式；**门开的交互式绝不自动弹确认**），离线组员超宽限自动移除并通告。适合「调度长常驻、worker 随开随编」的用法；不开 autoClaim 则保持手动 `claim` 语义。
 - **收编纪律包（单一权威源）**：收编通知（绑定知情通知与 pending 确认提示）自动携带 `~/.waystation/dispatch-rules.md`（调度纪律）全文——该文件是调度（dispatch）全员纪律的唯一权威源，收编低频、通知发出时实时读取，**改完即热生效**（无需重启或 reload）；文件缺失/为空时回退内置最简纪律（主动上报 + 权限豁免），并向调度长知会一次。改文件要对**已收编在编会话**立即生效时，调度长调 `ws_dispatch_rules_reload`：核心重读文件并向全体在编成员广播最新纪律包（带内容版本号+时间戳，便于会话识别新旧）。
-- **消息与结束**：复用 `ws_send_message`（调度模式下可带 `toSessionIds` 与 `taskId`，类型限定 task / progress / result / error）与 `ws_end_collab`（调度长结束并通知全员）。调度长用 `@会话名` 定向、不写 `@` 群发；组员回执默认回调度长并在正文带 `@来源`。消息流水 / 台账 / 收件流水 / 观察窗历史仍不保存（`ws_view_ledger` / `ws_check_inbox` 明确回「不保存历史」）。
+- **消息与结束**：复用 `ws_send_message`（调度模式下可带 `toSessionIds` 与 `taskId`，类型限定 task / progress / result / error）与 `ws_end_collab`（调度长结束并通知全员）。调度长定向时在 `toSessionIds` 填 `sessionCode`（或完整 `sessionId`），省略即群发；组员回执默认回调度长并在正文带 `@来源`。消息流水 / 台账 / 收件流水 / 观察窗历史仍不保存（`ws_view_ledger` / `ws_check_inbox` 明确回「不保存历史」）。
 - **编排状态持久化**：调度（dispatch）不写 `collabs/`（不建协作目录、不写 carrier / member / ledger / snapshot / outbox / inbox / invites / joins / seat / recovery / posts）；组员名单、任务表、调度长身份与心跳默认持久化到 `<数据根>/dispatch/state.json`（`config.dispatch.persist=false` 可退回纯内存，`config.dispatch.state_path` 可改相对数据根或绝对路径）。核心重启后恢复并校验调度长在线，离线则标记「待接管」；`dispatch.persist=false` 时行为与旧版一致（重启即丢）。`sessions/<sessionId>.json` 状态栏文件仍照常更新（本机会话状态，不是协作历史）。
 - **保留期**：`config.retention` 配置完成调度任务（`dispatch_hours`，默认 24h）、已结束协作（`collabs_days`，默认 30 天）、日志（`logs_days`，默认 14 天）与清理周期（`cleanup_interval_h`，默认 6h）；启动时清理一次并周期执行。已结束协作**先 gzip 归档再删除**，活跃 / 在途 / 席位未归档 / recovery / 未知目录永不清理；日志按现有大小轮转与时间上限双条件取先到者；`retention.dry_run=true` 只报告不删除。
 - **微信推送是调度长 / cc-connect 的集成责任**：waystation 不集成 cc-connect / 微信。以下行为仓库内无证据、需真机验证：无用户消息时调度长的输出是否会被 cc-connect 当作 push 转发；推送频率与 `burst_limit` / 24h 额度；`ret=-2` 的失败与重试。
 - **如实披露**：同机同用户信任边界——同用户的其他进程可以设置角色 / 连本地 IPC（更强隔离用不同 OS 账户运行调度长 / 组员）；「交互式确认」是模型转述的提示，最终取决于该会话语义与用户行为；会话名与 `kind`（interactive / bg）取自 Claude Code 的私有字段与状态栏数据，字段缺失或不可读时按「未知 / 非交互」失败关闭处理。
+
+## 错误响应与排障（工具面）
+
+工具失败一律返回结构化错误对象（`isError: true`，正文为 JSON）：
+
+```json
+{ "ok": false, "code": "kebab-case-code", "message": "人话描述", "hint": "下一步怎么修" }
+```
+
+- **成功路径不变**：成功返回仍是各工具原有结构；`ok` / `message` 字段在错误对象中保留，旧调用方读取方式不受影响。
+- **以 `code` 分支，不要匹配中文文案**：同一 `code` 的 `message` 可能细化，但 `code` 稳定。
+- **`hint` 可空但默认非空**：没把握时先看 `hint`，再决定重试、重连桥还是换目标。
+
+常见错误码（完整表见 `src/util/errors.js`）：
+
+| code | 含义 | 处置要点 |
+| --- | --- | --- |
+| `dispatch-lost` | 调度已结束或核心已重启 | `ws_status` 确认；需要继续请调度长重建 |
+| `dispatch-taken-over` | 本会话已被换届，不再是调度长 | 找现任调度长；旧调度长停止派发 |
+| `dispatch-master-required` | 当前会话不是启动期 master | 用带 `WAYSTATION_ROLE=master` 的会话操作 |
+| `session-not-visible` | 目标会话不在本机注册表 | 确认会话在跑且桥已连接；让该会话调用任意 `ws_*` 工具重连 |
+| `bridge-stale` | 目标会话桥连接已断 / 过期 | 同上；仍不行则重启该会话的 waystation 桥（重开 MCP 连接） |
+| `claim-rejected` | 收编被拒（角色 / 主限 / 非交互） | 看 `message`；只收编 `claimable: true` 的会话 |
+| `core-unavailable` | 核心不可达或重启中 | 稍后重试；检查 `run/core.json` 与核心日志 |
+| `core-version-unsupported` | 核心版本不支持该能力 | 升级 waystation 并重开会话 |
+| `tool-timeout` | 核心侧工具执行超时 | 用只读工具核实状态，避免立即重复写操作 |
+| `unknown-tool` | 工具名未知 | 调 `tools/list` 核对工具名与版本 |
 
 ## 会话级加入（申请/指名/可见性）
 

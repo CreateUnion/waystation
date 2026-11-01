@@ -4,6 +4,7 @@ import { ID_PATTERN } from '../net/protocol.js';
 import { MAX_TAKEOVER_WINDOW_MS } from '../config.js';
 import { renderSessionMessage } from '../adapters/claude-code.js';
 import { listLocalCollabIds, loadMember, saveMember } from '../collab/store.js';
+import { errorOf, errorResultOf } from '../util/errors.js';
 import { matchSessionByToken } from '../util/short-id.js';
 
 /* 注入路由（设计 §4/§5.2）：席位表驱动的两条注入决策链。
@@ -673,7 +674,7 @@ function callWithDeadline(state, tool, execute) {
       }
       state.counters.callFailures++;
       state.log.error('工具调用执行面异常（已隔离）', { tool, reason: error?.message });
-      finish({ timedOut: false, result: { content: [{ type: 'text', text: `工具执行面异常：${error?.message ?? '未知原因'}` }], isError: true } });
+      finish({ timedOut: false, result: errorResultOf(errorOf('internal-error', `工具执行面异常：${error?.message ?? '未知原因'}`)) });
     };
     try {
       Promise.resolve(execute()).then((result) => finish({ timedOut: false, result }), failed);
@@ -685,10 +686,10 @@ function callWithDeadline(state, tool, execute) {
 
 function timeoutResultOf(state) {
   const seconds = Math.round(state.callTimeoutMs / 1000);
-  return {
-    content: [{ type: 'text', text: `工具执行超时（核心侧安全期限 ${seconds}s）：本次调用不再等待——该操作可能仍在后台继续，请稍后用只读工具（ws_status / ws_list_collabs）核实状态` }],
-    isError: true,
-  };
+  return errorResultOf(errorOf(
+    'tool-timeout',
+    `工具执行超时（核心侧安全期限 ${seconds}s）：本次调用不再等待——该操作可能仍在后台继续，请稍后用只读工具（ws_status / ws_list_collabs）核实状态`,
+  ));
 }
 
 function sendResultOf(state, record, id, result) {

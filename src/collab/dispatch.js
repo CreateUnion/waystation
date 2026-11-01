@@ -2,7 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ID_PATTERN, MAX_TOPIC_CHARS, isIdentityName, isPresentationText } from '../net/protocol.js';
-import { shortSessionId } from '../util/short-id.js';
+import { errorOf } from '../util/errors.js';
+import { matchSessionByToken, shortSessionId } from '../util/short-id.js';
 import { dispatchStateFilePath } from '../paths.js';
 import {
   dispatchStatePathOf, masterTimeoutMsOf, persistEnabledOf, retentionConfigOf,
@@ -385,13 +386,13 @@ function createDispatchIn(runtime, { name, topic, sessionId, autoClaim }) {
   const { state, metaOf, now } = runtime;
   const meta = metaOf(sessionId);
   if (meta === null || meta.role !== 'master') {
-    return { ok: false, message: 'dispatch 只能由启动期 WAYSTATION_ROLE=master 的会话创建——工具参数与聊天内容不能声明 master 角色' };
+    return errorOf('dispatch-master-required', 'dispatch 只能由启动期 WAYSTATION_ROLE=master 的会话创建——工具参数与聊天内容不能声明 master 角色');
   }
   if (!isIdentityName(name)) {
-    return { ok: false, message: 'dispatch 名称非法：需要 1–64 字符且不含控制字符' };
+    return errorOf('invalid-dispatch-name', 'dispatch 名称非法：需要 1–64 字符且不含控制字符');
   }
   if (topic !== undefined && topic !== null && !isPresentationText(topic, MAX_TOPIC_CHARS)) {
-    return { ok: false, message: `dispatch 主题非法：需要不超过 ${MAX_TOPIC_CHARS} 字符` };
+    return errorOf('invalid-topic', `dispatch 主题非法：需要不超过 ${MAX_TOPIC_CHARS} 字符`);
   }
   if (state.dispatches.size > 0) {
     return createOrTakeoverDispatch(runtime, [...state.dispatches.values()][0], { sessionId, meta });
@@ -456,17 +457,17 @@ function persistenceActive(runtime) {
  * 心跳超时则原地换届（保留 collabId、name/topic、slave 列表与任务表）。 */
 function createOrTakeoverDispatch(runtime, existing, { sessionId, meta }) {
   if (existing.masterSessionId === sessionId) {
-    return { ok: false, message: '本会话已是该 dispatch 的调度长——一个核心同一时刻只允许一个 dispatch' };
+    return errorOf('dispatch-already-created', '本会话已是该 dispatch 的调度长——一个核心同一时刻只允许一个 dispatch');
   }
   if (isReplacedMasterOf(existing, sessionId)) {
     return takenOverResult();
   }
   const remaining = masterTimeoutMsOf(runtime.config) - (runtime.now() - existing.masterLastSeenAt);
   if (remaining > 0) {
-    return {
-      ok: false,
-      message: `现有 dispatch 的调度长「${existing.masterName}」仍活跃（心跳超时还需约 ${Math.ceil(remaining / 1000)}s）——不能接管`,
-    };
+    return errorOf(
+      'dispatch-master-active',
+      `现有 dispatch 的调度长「${existing.masterName}」仍活跃（心跳超时还需约 ${Math.ceil(remaining / 1000)}s）——不能接管`,
+    );
   }
   return takeOverDispatchIn(runtime, existing, { sessionId, meta });
 }
@@ -644,6 +645,8 @@ function scanSessionsIn(runtime, { sessionId }) {
     }
     sessions.push({
       sessionId: target,
+      /* 稳定标识：派发以短码为准；name 会随 Claude Code 重命名 / 重启变化，只作提示。 */
+      sessionCode: shortSessionId(target),
       name: meta.name,
       kind: meta.kind,
       entrypoint: meta.entrypoint,
@@ -690,7 +693,7 @@ function describeDispatchIn(state, collabId) {
 function viewDispatchIn(runtime, collabId) {
   const record = runtime.state.dispatches.get(collabId);
   if (record === undefined) {
-    return { ok: false, message: '本机没有该 dispatch（可能已结束或核心已重启）' };
+    return errorOf('dispatch-lost', '本机没有该 dispatch（可能已结束或核心已重启）');
   }
   const persisted = persistenceActive(runtime);
   return {
@@ -712,9 +715,13 @@ function statusOfDispatches(runtime) {
       name: record.name,
       status: record.status,
       masterSessionId: record.masterSessionId,
+      masterSessionCode: shortSessionId(record.masterSessionId),
       masterLastSeenAt: isoOf(record.masterLastSeenAt),
       slaves: [...record.slaves.values()].map((slave) => ({
-        sessionId: slave.sessionId, name: slave.name, kind: slave.kind,
+        sessionId: slave.sessionId,
+        sessionCode: shortSessionId(slave.sessionId),
+        name: slave.name,
+        kind: slave.kind,
       })),
       taskCount: record.tasks.size,
     },
@@ -725,13 +732,13 @@ function statusOfDispatches(runtime) {
 /* —— 收编判定（claim / approve / release）与通知投递 —— */
 
 function dispatchLost() {
-  return { ok: false, code: 'dispatch-lost', message: 'dispatch 不存在（可能已结束或核心已重启）' };
+  return errorOf('dispatch-lost', 'dispatch 不存在（可能已结束或核心已重启）');
 }
 
 /* 旧调度长被换届后的明确拒绝：比 dispatch-lost 多一个稳定 code，便于恢复方识别「不是丢了，
  * 而是被接管了」。 */
 function takenOverResult() {
-  return { ok: false, code: 'dispatch-taken-over', message: TAKEN_OVER_MESSAGE };
+  return errorOf('dispatch-taken-over', TAKEN_OVER_MESSAGE);
 }
 
 function isReplacedMasterOf(record, sessionId) {
@@ -756,8 +763,9 @@ function masterRecordOf(runtime, sessionId) {
   return { record: null, refusal: takenOverRecordOf(runtime.state, sessionId) === null ? dispatchLost() : takenOverResult() };
 }
 
-function rejectedClaim(sessionId, reason) {
-  return { sessionId, status: 'rejected', reason };
+function rejectedClaim(sessionId, reason, code = 'claim-rejected') {
+  const error = errorOf(code, reason);
+  return { sessionId, status: 'rejected', code: error.code, reason, hint: error.hint };
 }
 
 function claimSessionsIn(runtime, { sessionId, sessionIds }) {
@@ -766,7 +774,7 @@ function claimSessionsIn(runtime, { sessionId, sessionIds }) {
     return refusal;
   }
   if (!Array.isArray(sessionIds) || sessionIds.length === 0) {
-    return { ok: false, message: 'sessionIds 非法：需要非空数组' };
+    return errorOf('invalid-session-ids', 'sessionIds 非法：需要非空数组');
   }
   const results = [];
   for (const targetSessionId of [...new Set(sessionIds)]) {
@@ -775,8 +783,29 @@ function claimSessionsIn(runtime, { sessionId, sessionIds }) {
   return { ok: true, dispatchId: record.collabId, results };
 }
 
-/* 单目标判定表：预检（在线 / 身份 / 已绑定 / 白名单）→ 直接绑定 / 待确认 / 拒绝。 */
-function claimTargetOf(runtime, record, masterSessionId, targetSessionId) {
+/* 会话标识解析（完整标识或短码）：候选集内的精确匹配；零命中 / 歧义 / 非法一律 null。
+ * 候选先去重——同一会话同时出现在 grace 与 slaves 时，重复条目会把短码误判成歧义。 */
+function resolveSessionToken(candidates, token) {
+  return matchSessionByToken([...new Set(candidates)].map((sessionId) => ({ sessionId })), token);
+}
+
+function resolveRegisteredSession(runtime, token) {
+  return resolveSessionToken(runtime.listSessionIds(), token);
+}
+
+/* 单目标判定表：预检（在线 / 身份 / 已绑定 / 白名单）→ 直接绑定 / 待确认 / 拒绝。
+ * 目标标识接受完整 sessionId 或短码（sessionCode）：先在本机注册表精确解析，零命中/歧义
+ * 一律按「指定会话不在场」处置，与短码工具的既有口径一致。 */
+function claimTargetOf(runtime, record, masterSessionId, targetToken) {
+  const targetSessionId = resolveRegisteredSession(runtime, targetToken);
+  if (targetSessionId === null) {
+    /* 已绑定组员的桥断开后注册表不再列出、但在宽限期内仍在 record.slaves——这属于桥陈旧，
+     * 与「从未注册过 / 目标不存在」分开给码，修复动作不同（重连桥 vs 核对目标）。 */
+    const stale = resolveSessionToken([...record.grace.keys(), ...record.slaves.keys()], targetToken);
+    return stale === null
+      ? rejectedClaim(targetToken, '本机会话不在线或不可见（不在本机注册表）', 'session-not-visible')
+      : rejectedClaim(stale, '本机会话的桥连接已断或已过期（仍在宽限期内）', 'bridge-stale');
+  }
   const target = runtime.metaOf(targetSessionId);
   const precheck = claimPrecheckOf(record, masterSessionId, target, targetSessionId);
   if (precheck !== null) {
@@ -811,8 +840,11 @@ function claimTargetOf(runtime, record, masterSessionId, targetSessionId) {
 
 /* 返回非 null 即终局（拒绝或已绑定），null 表示继续按角色 / 交互性分流。 */
 function claimPrecheckOf(record, masterSessionId, target, targetSessionId) {
-  if (target === null || target.online !== true) {
-    return rejectedClaim(targetSessionId, '本机会话不在线或不可见');
+  if (target === null) {
+    return rejectedClaim(targetSessionId, '本机会话不在线或不可见（不在本机注册表）', 'session-not-visible');
+  }
+  if (target.online !== true) {
+    return rejectedClaim(targetSessionId, '本机会话的桥连接已断或已过期（在线标记为假）', 'bridge-stale');
   }
   if (target.sessionId === masterSessionId || target.role === 'master') {
     return rejectedClaim(targetSessionId, '不能收编 master 自身或其他 master 会话');
@@ -853,7 +885,7 @@ function pendingClaimOf(runtime, record, masterSessionId, targetSessionId) {
 function approveClaimIn(runtime, { sessionId, claimId, approve, confirmToken }) {
   const found = claimOf(runtime.state, claimId);
   if (found === null) {
-    return { ok: false, message: '收编申请不存在、已过期或已处置' };
+    return errorOf('claim-not-found', '收编申请不存在、已过期或已处置');
   }
   const { record, claim } = found;
   const refusal = claimRefusalOf(runtime, record, claim, sessionId, approve);
@@ -888,14 +920,14 @@ function approveClaimIn(runtime, { sessionId, claimId, approve, confirmToken }) 
 /* 身份 / 时效 / 取值形态三判：拒绝直接给出终局结果；通过返回 null。 */
 function claimRefusalOf(runtime, record, claim, sessionId, approve) {
   if (claim.targetSessionId !== sessionId) {
-    return { ok: false, message: '只有被收编的目标会话可以确认该申请' };
+    return errorOf('claim-not-yours', '只有被收编的目标会话可以确认该申请');
   }
   if (runtime.now() >= claim.expiresAt) {
     record.claims.delete(claim.claimId);
-    return { ok: false, message: '收编申请已超时——请让 master 重新发起' };
+    return errorOf('claim-expired', '收编申请已超时——请让 master 重新发起');
   }
   if (approve !== true && approve !== false) {
-    return { ok: false, message: 'approve 须为布尔值' };
+    return errorOf('invalid-approve', 'approve 须为布尔值');
   }
   return null;
 }
@@ -921,7 +953,7 @@ function confirmTokenRefusalOf(runtime, record, claim, confirmToken) {
     };
   }
   if (claim.token === undefined || claim.token.value !== confirmToken || claim.token.expiresAt <= runtime.now()) {
-    return { ok: false, message: '确认令牌无效或已过期——请重新发起' };
+    return errorOf('confirm-token-invalid', '确认令牌无效或已过期——请重新发起');
   }
   return null;
 }
@@ -929,7 +961,7 @@ function confirmTokenRefusalOf(runtime, record, claim, confirmToken) {
 function bindApprovedClaim(runtime, record, claimId, sessionId) {
   const target = runtime.metaOf(sessionId);
   if (target === null) {
-    return { ok: false, message: '目标会话已不在本机注册表内——请让 master 重新发起' };
+    return errorOf('session-not-visible', '目标会话已不在本机注册表内——请让 master 重新发起');
   }
   record.claims.delete(claimId);
   /* 加入事件统一由 bindSlave 入去抖队列——这里不再直发，避免同一成员被通知两次。 */
@@ -942,21 +974,22 @@ function releaseSlaveIn(runtime, { sessionId, targetSessionId }) {
   if (record === null) {
     return refusal;
   }
-  const slave = record.slaves.get(targetSessionId);
+  const resolved = resolveSessionToken(record.slaves.keys(), targetSessionId);
+  const slave = resolved === null ? undefined : record.slaves.get(resolved);
   if (slave === undefined) {
-    return { ok: false, message: '该会话不在本 dispatch 内' };
+    return errorOf('session-not-in-dispatch', '该会话不在本 dispatch 内');
   }
-  record.slaves.delete(targetSessionId);
-  sendNotice(runtime, record, targetSessionId, 'master 已释放本会话——dispatch 收编结束', 'dispatch-released');
+  record.slaves.delete(resolved);
+  sendNotice(runtime, record, resolved, 'master 已释放本会话——dispatch 收编结束', 'dispatch-released');
   /* 释放后该会话不再属于本 dispatch（dispatchOf 也找不到它），待补投队列再无人 flush：
    * 连刚排入的释放通知一起回收，避免内存滞留。主调用的通知走 master 队列，不受影响。
    * 待确认账同步收口：目标已不可达，不能让它按超时静默挂着。 */
-  dropTargetQueue(runtime, record, targetSessionId, '目标已被释放');
+  dropTargetQueue(runtime, record, resolved, '目标已被释放');
   /* 先把窗口内待发的加入事件送出去，保证 master 看到的顺序是「加入在前、离席在后」。 */
   flushMemberEvents(runtime, record);
   sendNotice(runtime, record, sessionId, `已释放「${slave.name}」`, 'dispatch-member-left');
   persistNow(runtime, record);
-  return { ok: true, sessionId: targetSessionId };
+  return { ok: true, sessionId: resolved };
 }
 
 /* —— 消息（不落盘，仅任务摘要进状态文件）与桥生命周期 —— */
@@ -976,22 +1009,22 @@ async function sendMessageIn(runtime, { collabId, sessionId, text, type, toSessi
   }
   const sender = runtime.metaOf(sessionId);
   if (sender === null) {
-    return { ok: false, message: '调用会话不在本机注册表内' };
+    return errorOf('session-not-visible', '调用会话不在本机注册表内——本会话的桥可能已断开');
   }
   if (ackFor !== undefined) {
     return ackOnlyIn(runtime, record, sessionId, { ackFor, text, type, toSessionIds, taskId, requireAck });
   }
   const targets = sendTargetsOf(record, sessionId, toSessionIds);
   if (targets.error !== undefined) {
-    return { ok: false, message: targets.error };
+    return targets.error;
   }
   const message = messageOf(record, { text, type, taskId, sessionId, requireAck }, sender);
   if (message.error !== undefined) {
-    return { ok: false, message: message.error };
+    return message.error;
   }
   const taskUpdate = recordTaskStateIn(runtime, record, message.value, targets.value);
   if (taskUpdate.error !== undefined) {
-    return { ok: false, message: taskUpdate.error };
+    return taskUpdate.error;
   }
   const delivered = deliverMessage(runtime, record, targets.value, message.value);
   /* 关键节点写盘：只有带 taskId 的消息改变任务表；普通聊天不触发 IO。 */
@@ -1014,7 +1047,7 @@ function recordTaskStateIn(runtime, record, message, targets) {
   if (existing === undefined && record.tasks.size >= DISPATCH_TASK_MAX) {
     pruneTasksIn(runtime, record, runtime.now());
     if (record.tasks.size >= DISPATCH_TASK_MAX) {
-      return { error: `任务表已满（上限 ${DISPATCH_TASK_MAX}）——请先完成 / 清理在途任务，或换一个 taskId` };
+      return { error: errorOf('task-table-full', `任务表已满（上限 ${DISPATCH_TASK_MAX}）——请先完成 / 清理在途任务，或换一个 taskId`) };
     }
   }
   const at = runtime.now();
@@ -1097,16 +1130,16 @@ function messageOf(record, input, sender) {
 
 function messageRejectionOf(record, { text, type, taskId, sessionId, requireAck }) {
   if (requireAck !== undefined && typeof requireAck !== 'boolean') {
-    return 'requireAck 非法：需要布尔值';
+    return errorOf('invalid-require-ack', 'requireAck 非法：需要布尔值');
   }
   if (typeof text !== 'string' || text.trim() === '') {
-    return 'text 非法：需要非空白字符串';
+    return errorOf('invalid-message-text', 'text 非法：需要非空白字符串');
   }
   if (type !== undefined && !DISPATCH_MESSAGE_TYPES.includes(type)) {
-    return `type 非法：dispatch 可取值为 ${DISPATCH_MESSAGE_TYPES.join(' / ')}`;
+    return errorOf('invalid-message-type', `type 非法：dispatch 可取值为 ${DISPATCH_MESSAGE_TYPES.join(' / ')}`);
   }
   if (taskId !== undefined && !isDispatchTaskId(taskId)) {
-    return 'taskId 非法：需要 1–64 字符的非空白字符串';
+    return errorOf('invalid-task-id', 'taskId 非法：需要 1–64 字符的非空白字符串');
   }
   return requireAckRejectionOf(record, { requireAck, sessionId, type });
 }
@@ -1123,7 +1156,7 @@ function requireAckRejectionOf(record, { requireAck, sessionId, type }) {
     return null;
   }
   const masterTask = sessionId === record.masterSessionId && messageTypeOf(record, type, sessionId) === 'task';
-  return masterTask ? null : 'requireAck 仅适用于调度长发出的 task 消息';
+  return masterTask ? null : errorOf('require-ack-not-allowed', 'requireAck 仅适用于调度长发出的 task 消息');
 }
 
 function isDispatchTaskId(taskId) {
@@ -1273,10 +1306,10 @@ function overallDeliveryStateOf(counts, total) {
 /* ackFor 是独立回执动作（服务层同口径）：形态必须合法，且不得与消息发送字段混用。 */
 function ackOnlyIn(runtime, record, sessionId, { ackFor, text, type, toSessionIds, taskId, requireAck }) {
   if (typeof ackFor !== 'string' || !ID_PATTERN.test(ackFor)) {
-    return { ok: false, message: 'ackFor 非法：需要消息标识（1–64 位字母数字与连字符）' };
+    return errorOf('invalid-ack-for', 'ackFor 非法：需要消息标识（1–64 位字母数字与连字符）');
   }
   if (type !== undefined || toSessionIds !== undefined || taskId !== undefined || requireAck !== undefined) {
-    return { ok: false, message: 'ackFor 回执不能与 type / toSessionIds / taskId / requireAck 同时使用' };
+    return errorOf('ack-for-conflict', 'ackFor 回执不能与 type / toSessionIds / taskId / requireAck 同时使用');
   }
   return ackMessageIn(runtime, record, sessionId, ackFor, text);
 }
@@ -1285,10 +1318,10 @@ function ackOnlyIn(runtime, record, sessionId, { ackFor, text, type, toSessionId
 function ackMessageIn(runtime, record, sessionId, ackFor, text) {
   const pending = record.pendingAcks.get(ackFor);
   if (pending === undefined) {
-    return { ok: false, message: 'ackFor 无对应的待确认消息（可能已确认、已超时或标识有误）' };
+    return errorOf('ack-not-found', 'ackFor 无对应的待确认消息（可能已确认、已超时或标识有误）');
   }
   if (pending.targetSessionId !== sessionId) {
-    return { ok: false, message: '只有该消息的目标会话可以确认（ackFor 与调用会话不匹配）' };
+    return errorOf('ack-not-yours', '只有该消息的目标会话可以确认（ackFor 与调用会话不匹配）');
   }
   record.pendingAcks.delete(ackFor);
   const sender = runtime.metaOf(sessionId);
@@ -1324,33 +1357,48 @@ function toSessionIdsRefusalOf(toSessionIds) {
     return null;
   }
   if (!Array.isArray(toSessionIds) || toSessionIds.length === 0) {
-    return 'toSessionIds 非法：需要非空字符串数组（省略即按绑定路由）';
+    return errorOf('invalid-session-ids', 'toSessionIds 非法：需要非空字符串数组（省略即按绑定路由）');
   }
   return toSessionIds.every((id) => typeof id === 'string' && id.trim() !== '')
     ? null
-    : 'toSessionIds 非法：需要非空字符串数组';
+    : errorOf('invalid-session-ids', 'toSessionIds 非法：需要非空字符串数组');
+}
+
+/* 显式目标接受完整 sessionId 或短码（sessionCode）：逐个解析到唯一在册会话；
+ * 任一目标无法唯一解析即整单拒绝——静默跳过会让调用方误以为已送达。 */
+function resolveTargetsOrNull(candidates, tokens) {
+  const resolved = [];
+  for (const token of new Set(tokens)) {
+    const sessionId = resolveSessionToken(candidates, token);
+    if (sessionId === null) {
+      return { error: errorOf('target-not-in-dispatch', `目标会话不在本 dispatch 内：${token}`) };
+    }
+    resolved.push(sessionId);
+  }
+  return { value: [...new Set(resolved)] };
 }
 
 function masterTargetsOf(record, toSessionIds) {
-  const requested = toSessionIds !== undefined && toSessionIds.length > 0
-    ? [...new Set(toSessionIds)]
-    : [...record.slaves.keys()];
-  if (requested.length === 0) {
-    return { error: 'dispatch 内没有已收编的 slave' };
+  if (toSessionIds === undefined || toSessionIds.length === 0) {
+    const broadcast = [...record.slaves.keys()];
+    return broadcast.length === 0
+      ? { error: errorOf('dispatch-empty', 'dispatch 内没有已收编的 slave') }
+      : { value: broadcast };
   }
-  const invalid = requested.find((target) => !record.slaves.has(target));
-  return invalid === undefined
-    ? { value: requested }
-    : { error: `目标会话不在本 dispatch 内：${invalid}` };
+  return resolveTargetsOrNull(record.slaves.keys(), toSessionIds);
 }
 
 function slaveTargetsOf(record, sessionId, toSessionIds) {
   if (!record.slaves.has(sessionId)) {
-    return { error: '本会话不是该 dispatch 的成员' };
+    return { error: errorOf('not-dispatch-member', '本会话不是该 dispatch 的成员') };
   }
-  if (Array.isArray(toSessionIds) && toSessionIds.length > 0
-    && (toSessionIds.length !== 1 || toSessionIds[0] !== record.masterSessionId)) {
-    return { error: 'slave 只能回复 master，不能给其他 slave 发消息' };
+  if (Array.isArray(toSessionIds) && toSessionIds.length > 0) {
+    const resolved = toSessionIds.length === 1
+      ? resolveSessionToken([record.masterSessionId], toSessionIds[0])
+      : null;
+    if (resolved !== record.masterSessionId) {
+      return { error: errorOf('slave-target-refused', 'slave 只能回复 master，不能给其他 slave 发消息') };
+    }
   }
   return { value: [record.masterSessionId] };
 }
@@ -1365,7 +1413,7 @@ function endDispatchIn(runtime, { collabId, sessionId }) {
   if (record.masterSessionId !== sessionId) {
     return isReplacedMasterOf(record, sessionId)
       ? takenOverResult()
-      : { ok: false, message: '只有 master 可以结束 dispatch' };
+      : errorOf('dispatch-master-required', '只有 master 可以结束 dispatch');
   }
   endDispatch(runtime, record, 'master-ended');
   return { ok: true, collabId };
@@ -1388,14 +1436,14 @@ function leaveDispatchIn(runtime, { collabId, sessionId }) {
     return dispatchLost();
   }
   if (record.masterSessionId === sessionId) {
-    return { ok: false, message: 'master 不能被 leave——结束请用 ws_end_collab' };
+    return errorOf('dispatch-master-cannot-leave', 'master 不能被 leave——结束请用 ws_end_collab');
   }
   if (isReplacedMasterOf(record, sessionId)) {
     return takenOverResult();
   }
   const slave = record.slaves.get(sessionId);
   if (slave === undefined) {
-    return { ok: false, message: '本会话不在该 dispatch 内' };
+    return errorOf('not-dispatch-member', '本会话不在该 dispatch 内');
   }
   record.slaves.delete(sessionId);
   dropTargetQueue(runtime, record, sessionId, '目标已退出');

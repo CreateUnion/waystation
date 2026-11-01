@@ -1,6 +1,7 @@
 import { isIP } from 'node:net';
 import { COLLAB_MODES, DEFAULT_COLLAB_MODE, ID_PATTERN, MAX_COLLAB_MEMBERS, POST_KINDS, isIdentityName, isPort } from '../net/protocol.js';
 import { DISPATCH_MESSAGE_TYPES } from '../collab/dispatch.js';
+import { errorOf, errorPayloadOf, errorResultOf } from '../util/errors.js';
 import {
   WS_ALLOW_NEXT_INVITE_SPEC, WS_APPROVE_INVITE_SPEC, WS_CREATE_COLLAB_SPEC, WS_END_COLLAB_SPEC, WS_INVITE_SPEC, WS_LEAVE_COLLAB_SPEC,
   WS_LIST_COLLABS_SPEC, WS_REQUEST_JOIN_SPEC, WS_SEND_MESSAGE_SPEC, WS_SET_MUTE_SPEC, WS_VIEW_LEDGER_SPEC,
@@ -75,7 +76,7 @@ export function createCollabTool() {
       /* dispatch 是纯内存本机编排：不接受 LAN 目标，主题可选；创建会话须为 master（服务判定）。 */
       if (mode === 'dispatch') {
         if (args.targets !== undefined) {
-          return errorResult('dispatch 模式不接受 targets：首建后用 ws_dispatch_claim 收编本机会话');
+          return errorResult('dispatch 模式不接受 targets：首建后用 ws_dispatch_claim 收编本机会话', { code: 'dispatch-targets-refused' });
         }
         const dispatchTopic = trimmedString(args, 'topic');
         return resultOf(await context.collab.create({
@@ -249,10 +250,10 @@ export function approveInviteTool() {
       /* 用户确认挑战：结构化返回（令牌不能被 resultOf 的纯文案错误面吞掉）——
        * 代理据此把邀请摘要转述给用户，取得同意后携 confirmToken 重试。 */
       if (result?.needsUserConfirmation === true) {
-        return {
-          content: [{ type: 'text', text: JSON.stringify({ ok: false, needsUserConfirmation: true, confirmToken: result.confirmToken, invite: result.invite, message: result.message }) }],
-          isError: true,
-        };
+        return errorResultOf(errorPayloadOf({
+          ok: false, code: 'user-confirmation-required', needsUserConfirmation: true,
+          confirmToken: result.confirmToken, invite: result.invite, message: result.message,
+        }));
       }
       return resultOf(result);
     },
@@ -356,7 +357,7 @@ export function sendMessageTool() {
       const dispatch = context.collab.dispatch?.isDispatch?.(collabId) === true;
       const parsed = dispatch ? dispatchSendArgsOf(args) : sendMessageArgsOf(args);
       if (parsed.error !== undefined) {
-        return errorResult(parsed.error);
+        return errorResult(parsed.error, { code: parsed.code });
       }
       /* 发送者会话随调用上下文穿参：本机多席时由服务层据此选定发件席位（缺省兜底只适用于
        * 无席位表的历史调用链）。 */
@@ -376,11 +377,11 @@ function sendMessageArgsOf(args) {
    * requireAck / ackFor 同属 dispatch 专属（managed 的机器级 ack 是协议层，不是会话级确认）。 */
   const ackRefusal = dispatchAckFieldsRefusalOf(args);
   if (ackRefusal !== null) {
-    return { error: ackRefusal };
+    return { error: ackRefusal, code: 'dispatch-field-refused' };
   }
   const dispatchOnlyRefusal = dispatchOnlyFieldsRefusalOf(args);
   if (dispatchOnlyRefusal !== null) {
-    return { error: dispatchOnlyRefusal };
+    return { error: dispatchOnlyRefusal, code: 'dispatch-field-refused' };
   }
   const to = optionalTextArg(args, 'to');
   if (args.to !== undefined && to === '') {
@@ -442,7 +443,7 @@ function dispatchSendArgsOf(args) {
   if (ackFor.value !== undefined) {
     const conflict = ackConflictOf(args);
     if (conflict !== null) {
-      return { error: conflict };
+      return { error: conflict, code: 'ack-for-conflict' };
     }
     return { value: { text: basics.value.text, ackFor: ackFor.value } };
   }
@@ -451,7 +452,7 @@ function dispatchSendArgsOf(args) {
     return targets;
   }
   if (args.taskId !== undefined && !isDispatchTaskId(args.taskId)) {
-    return { error: 'taskId 非法：需要 1–64 字符的非空白字符串' };
+    return { error: 'taskId 非法：需要 1–64 字符的非空白字符串', code: 'invalid-task-id' };
   }
   return {
     value: {
@@ -469,7 +470,7 @@ function ackForArgOf(args) {
   const value = typeof args.ackFor === 'string' ? args.ackFor.trim() : '';
   return ID_PATTERN.test(value)
     ? { value }
-    : { error: '参数 ackFor 非法：需要消息标识（1–64 位字母数字与连字符，取自待确认消息的回执指引）' };
+    : { error: '参数 ackFor 非法：需要消息标识（1–64 位字母数字与连字符，取自待确认消息的回执指引）', code: 'invalid-ack-for' };
 }
 
 function requireAckArgOf(args) {
@@ -478,7 +479,7 @@ function requireAckArgOf(args) {
   }
   return typeof args.requireAck === 'boolean'
     ? { value: args.requireAck }
-    : { error: '参数 requireAck 非法：需要布尔值' };
+    : { error: '参数 requireAck 非法：需要布尔值', code: 'invalid-require-ack' };
 }
 
 /* ackFor 是独立回执动作：不得同时定向/关联任务/再要求确认/声明消息类型——组合语义会分叉。 */
@@ -492,13 +493,16 @@ function ackConflictOf(args) {
 function dispatchBasicsOf(args) {
   const text = trimmedString(args, 'text');
   if (text === '') {
-    return { error: '参数 text 非法：需要非空白字符串（消息正文）' };
+    return { error: '参数 text 非法：需要非空白字符串（消息正文）', code: 'invalid-message-text' };
   }
   if (args.type !== undefined && !DISPATCH_MESSAGE_TYPES.includes(args.type)) {
-    return { error: `参数 type 非法：dispatch 可选值为 ${DISPATCH_MESSAGE_TYPES.join(' / ')}` };
+    return { error: `参数 type 非法：dispatch 可选值为 ${DISPATCH_MESSAGE_TYPES.join(' / ')}`, code: 'invalid-message-type' };
   }
   if (args.to !== undefined || args.toSessionId !== undefined) {
-    return { error: 'dispatch 不接受 to / toSessionId——定向用 toSessionIds 数组，省略即由核心按绑定路由' };
+    return {
+      error: 'dispatch 不接受 to / toSessionId——定向用 toSessionIds 数组，省略即由核心按绑定路由',
+      code: 'dispatch-targets-refused',
+    };
   }
   return { value: { text } };
 }
@@ -509,7 +513,7 @@ function dispatchTargetsArgOf(toSessionIds) {
   }
   if (!Array.isArray(toSessionIds) || toSessionIds.length === 0
     || toSessionIds.some((id) => typeof id !== 'string' || id.trim() === '')) {
-    return { error: 'toSessionIds 非法：需要非空字符串数组（省略即按绑定路由）' };
+    return { error: 'toSessionIds 非法：需要非空字符串数组（省略即按绑定路由）', code: 'invalid-session-ids' };
   }
   return { value: toSessionIds.map((id) => id.trim()) };
 }
@@ -577,29 +581,31 @@ export function callerSessionOf(context, toolName) {
   if (sessionId === '') {
     return {
       sessionId,
-      refusal: errorResult(`本会话无会话标识：${toolName} 以调用会话的席位授权，无法确定调用席位——请从带会话标识的终端调用`),
+      refusal: errorResult(`本会话无会话标识：${toolName} 以调用会话的席位授权，无法确定调用席位——请从带会话标识的终端调用`, { code: 'session-id-required' }),
     };
   }
   return { sessionId, refusal: null };
 }
 
-/* 工具返回口径（27 工具单一权威）：成功 = 顶层含 ok:true 的 JSON 对象（列表载荷用命名字段承载：
- * hosts / rows / collabs）；失败 = errorResult 纯文案 + isError。新增工具一律照此。 */
+/* 工具返回口径（28 工具单一权威）：成功 = 顶层含 ok:true 的 JSON 对象（列表载荷用命名字段承载：
+ * hosts / rows / collabs）；失败 = isError + 统一错误对象 { ok:false, code, message, hint }。
+ * 新增工具一律照此。成功路径结构不因错误契约改动。 */
 export function okResult(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
 }
 
-export function errorResult(message) {
-  return { content: [{ type: 'text', text: message }], isError: true };
+/** @param {string} message @param {{ code?: string, hint?: string }} [options] */
+export function errorResult(message, { code, hint } = {}) {
+  return errorResultOf(errorOf(code, message, hint));
 }
 
-/* 业务结果封装：{ ok: true, … } → 正常输出；{ ok: false, message } → isError 原文案。
- * 导出供治理工具集复用——工具层的输出契约单一权威。 */
+/* 业务结果封装：{ ok: true, … } → 正常输出；{ ok: false, message, code?, hint? } → 统一错误对象。
+ * 服务层已有稳定 code 时原样透传，旧调用方读 ok / message 仍成立。 */
 export function resultOf(result) {
   if (result.ok === true) {
     return okResult(result);
   }
-  return errorResult(result.message);
+  return errorResult(result.message, { code: result.code, hint: result.hint });
 }
 
 export function trimmedString(args, name) {

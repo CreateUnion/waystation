@@ -1,4 +1,5 @@
 import { CHECK_INBOX_DEFAULT_LIMIT, CHECK_INBOX_MAX_LIMIT } from '../net/inbound.js';
+import { errorResult } from './collab.js';
 import { WS_CHECK_INBOX_SPEC } from './specs.js';
 
 /* ws_check_inbox：会话主动查（设计 §4 的降级路径）——读取某协作的收件流水窗口
@@ -11,17 +12,20 @@ export function checkInboxTool() {
     handler: async (args, context) => {
       const collabId = collabIdArgOf(args);
       if (collabId === null) {
-        return { content: [{ type: 'text', text: '参数 collabId 非法：需要非空字符串' }], isError: true };
+        return errorResult('参数 collabId 非法：需要非空字符串');
       }
       const limitRefusal = limitRefusalOf(args.limit);
       if (limitRefusal !== null) {
-        return { content: [{ type: 'text', text: limitRefusal }], isError: true };
+        return errorResult(limitRefusal);
       }
       /* 按本会话过滤（设计 §1.2/§9）：收件流水是逐席位的，没有会话标识就无法确定该给谁看——
        * 必须拒绝，不得退回「全本机收件」（那会把同机其他会话的消息泄露给无标识调用方）。 */
       const sessionId = typeof context.sessionId === 'string' ? context.sessionId.trim() : '';
       if (sessionId === '') {
-        return { content: [{ type: 'text', text: '本会话无会话标识：ws_check_inbox 按会话过滤（设计 §1.2），无法确定收件席位——请从带会话标识的终端调用' }], isError: true };
+        return errorResult(
+          '本会话无会话标识：ws_check_inbox 按会话过滤（设计 §1.2），无法确定收件席位——请从带会话标识的终端调用',
+          { code: 'session-id-required' },
+        );
       }
       /* dispatch 是纯内存域：没有收件流水（消息只经本机 notify 投递、不落盘）——
        * 返回明确的空面，而不是让调用方误以为「查到了但没有」。 */

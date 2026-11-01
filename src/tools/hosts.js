@@ -1,5 +1,6 @@
 import { participantsStateOf } from '../net/known-hosts.js';
 import { shortSessionId } from '../util/short-id.js';
+import { errorResult } from './collab.js';
 import { WS_LIST_HOSTS_SPEC } from './specs.js';
 
 /* ws_list_hosts：扫描局域网在线驿站（广播段扫 + 已知主机单播兜底，窗口收应答）。
@@ -17,7 +18,7 @@ export function hostsTool() {
     handler: async (_args, context) => {
       const listed = await context.net.listHosts();
       if (!listed.ok) {
-        return { content: [{ type: 'text', text: listed.message }], isError: true };
+        return errorResult(listed.message, { code: 'network-scan-failed' });
       }
       const hosts = listed.hosts.map((host) => ({
         instanceId: host.instanceId,

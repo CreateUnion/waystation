@@ -34,7 +34,7 @@ const TARGET_ITEM_SCHEMA = {
 
 export const WS_STATUS_SPEC = {
   name: 'ws_status',
-  description: '查看本机驿站状态（版本、实例标识、数据目录、端口配置、网络状态等）——会话期首检与排障使用',
+  description: '查看本机驿站状态（版本、实例标识、数据目录、端口配置、网络状态等）——会话期首检与排障使用；dispatch 段含调度长与组员的稳定会话短码 sessionCode（派发以此为准，名字可能随重命名 / 重启变化）',
   inputSchema: { type: 'object', properties: {} },
 };
 
@@ -153,17 +153,17 @@ export const WS_SET_CONFIRM_GATE_SPEC = {
 
 export const WS_DISPATCH_SCAN_SPEC = {
   name: 'ws_dispatch_scan',
-  description: '调度长（dispatch master）扫描本机已接入 waystation 的会话：会话名、role、kind、status、是否已被本调度（dispatch）收编。只返回本机**可收编**的在线会话（role=slave 或交互式；调度长、非交互无角色、无会话文件者不列出），排除调度长自身；名字取 Claude Code 会话名，缺失回退会话短码',
+  description: '调度长（dispatch master）扫描本机已接入 waystation 的会话：会话短码 sessionCode（稳定，派发以此为准）、会话名（可能随重命名 / 重启变化，仅作提示）、role、kind、status、是否已被本调度（dispatch）收编。只返回本机**可收编**的在线会话（role=slave 或交互式；调度长、非交互无角色、无会话文件者不列出），排除调度长自身；名字取 Claude Code 会话名，缺失回退会话短码',
   inputSchema: { type: 'object', properties: {} },
 };
 
 export const WS_DISPATCH_CLAIM_SPEC = {
   name: 'ws_dispatch_claim',
-  description: '调度长（dispatch master）收编一个或多个本机会话：无头且带 WAYSTATION_ROLE=slave 的会话直接绑定；交互式会话返回 pending 并向目标注入首次确认；非交互式且无角色的会话拒绝。一个核心同一时刻只允许一个调度（dispatch），组员独占',
+  description: '调度长（dispatch master）收编一个或多个本机会话：无头且带 WAYSTATION_ROLE=slave 的会话直接绑定；交互式会话返回 pending 并向目标注入首次确认；非交互式且无角色的会话拒绝。sessionIds 接受会话短码 sessionCode 或完整 sessionId。一个核心同一时刻只允许一个调度（dispatch），组员独占',
   inputSchema: {
     type: 'object',
     properties: {
-      sessionIds: { type: 'array', description: '目标会话标识（1–32 项；取自 ws_dispatch_scan）', items: { type: 'string' } },
+      sessionIds: { type: 'array', description: '目标会话标识（1–32 项；短码 sessionCode 或完整 sessionId，取自 ws_dispatch_scan）', items: { type: 'string' } },
     },
     required: ['sessionIds'],
   },
@@ -189,7 +189,7 @@ export const WS_DISPATCH_RELEASE_SPEC = {
   inputSchema: {
     type: 'object',
     properties: {
-      sessionId: { type: 'string', description: '要释放的 slave 会话标识（取自 ws_dispatch_scan）' },
+      sessionId: { type: 'string', description: '要释放的组员（slave）会话标识（短码 sessionCode 或完整 sessionId，取自 ws_dispatch_scan）' },
     },
     required: ['sessionId'],
   },
@@ -242,7 +242,7 @@ export const WS_SEND_MESSAGE_SPEC = {
       type: { type: 'string', description: '消息类型（可选，缺省 reply；managed / forum 可选值：topic / task / progress / issue / stop / reply；dispatch 可选值：task / progress / result / error，省略时 master＝task、slave＝result）' },
       to: { type: 'string', description: '目标成员实例标识或地址（可选；须与 toSessionId 同时给出才能定向席位；协作：站长可选；成员省略即发给站长；讨论一律拒绝；dispatch 不接受本参数）' },
       toSessionId: { type: 'string', description: '目标会话（可选，须与 to 同时给出；短码或完整标识，精确匹配、不做前缀展开；歧义或无匹配即拒绝）——只投该机器上的这一会话；讨论与 dispatch 一律拒绝' },
-      toSessionIds: { type: 'array', items: { type: 'string' }, description: '仅 dispatch：目标会话数组；省略时由核心按绑定路由（master→全体已收编 slave、slave→master）。managed / forum 使用会报错' },
+      toSessionIds: { type: 'array', items: { type: 'string' }, description: '仅 dispatch：目标会话数组（短码 sessionCode 或完整 sessionId）；省略时由核心按绑定路由（master→全体已收编组员、组员→master）。managed / forum 使用会报错' },
       taskId: { type: 'string', description: '仅 dispatch：任务关联键（可选，1–64 字符），随消息投递给目标；managed / forum 使用会报错' },
       requireAck: { type: 'boolean', description: '仅 dispatch 调度长发出的 task：要求目标会话回执确认（可选，默认 false）；回执到达时核心另行通知调度长。其他模式/类型使用会报错' },
       ackFor: { type: 'string', description: '仅 dispatch：确认收到的消息 msgId（取自投递文本中的回执指引）；只能由该消息的目标会话回执，不能与 toSessionIds / taskId / requireAck / type 同时使用。managed / forum 使用会报错' },

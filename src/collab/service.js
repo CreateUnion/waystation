@@ -31,6 +31,7 @@ import {
 import { JOIN_REQUEST_RETRY_MAX_MS, JOIN_REQUEST_RETRY_MS, JOIN_REQUEST_TTL_MS, createJoinDomain, resolveJoinTarget } from './join.js';
 import { createDispatchDomain } from './dispatch.js';
 import { ID_PATTERN, POST_KINDS } from '../net/protocol.js';
+import { errorOf } from '../util/errors.js';
 import { matchSessionByToken, shortSessionId } from '../util/short-id.js';
 import { decideAdmission, frozenWriteRefusalOf, managerFreezeReasonOf, SYNC_REQUEST_MAX, SYNC_REQUEST_WINDOW_MS } from './gate.js';
 import { handleEvent, maybeEstablish } from './events.js';
@@ -2112,10 +2113,10 @@ function createDispatchNow(state, input) {
     return null;
   }
   if (input.targets !== undefined) {
-    return { ok: false, message: 'dispatch 模式不接受 targets——首建后由 master 用 ws_dispatch_claim 收编' };
+    return errorOf('dispatch-targets-refused', 'dispatch 模式不接受 targets——首建后由 master 用 ws_dispatch_claim 收编');
   }
   if (!validSessionId(input?.sessionId)) {
-    return { ok: false, message: '本会话无会话标识（CLAUDE_CODE_SESSION_ID 缺失）——不得创建 dispatch；请重开会话或检查客户端环境' };
+    return errorOf('session-id-required', '本会话无会话标识（CLAUDE_CODE_SESSION_ID 缺失）——不得创建 dispatch；请重开会话或检查客户端环境');
   }
   return state.dispatchDomain.create(input);
 }

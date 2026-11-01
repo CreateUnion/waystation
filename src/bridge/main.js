@@ -6,6 +6,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { resolveDataDir } from '../paths.js';
 import { createMcpServer } from '../server.js';
 import { TOOL_SPECS } from '../tools/specs.js';
+import { errorOf, errorResultOf } from '../util/errors.js';
 import { HEARTBEAT_ENV, createHeartbeatLoop, heartbeatSettingsOf } from './heartbeat.js';
 import { createCoreLink } from './ipc-client.js';
 import { createSessionWriter } from './session-writer.js';
@@ -49,13 +50,31 @@ async function forwardCall(link, name, args, bridgeInfo) {
     return failureResult(name, ensured, bridgeInfo);
   }
   if (isDispatchCallOf(name, args) && link.state?.welcome?.dispatch !== 1) {
-    return {
-      content: [{ type: 'text', text: '当前核心版本不支持 dispatch——请升级并重开会话' }],
-      isError: true,
-    };
+    return errorResultOf(errorOf('core-version-unsupported', '当前核心版本不支持 dispatch——请升级并重开会话'));
   }
   const called = await link.call(name, args);
   return called.ok ? called.result : failureResult(name, called, bridgeInfo);
+}
+
+/* 连接件失败 kind → 对外错误码：同一个「核心不可达」在等待启动、换代、版本闸门与调用超时下
+ * 的处置不同，稳定 code 让调用方不必从中文文案里猜。 */
+const CORE_FAILURE_CODES = {
+  unreachable: 'core-unavailable',
+  waiting: 'core-unavailable',
+  closed: 'core-unavailable',
+  'heartbeat-timeout': 'core-unavailable',
+  starting: 'core-starting',
+  replacing: 'core-changeover',
+  timeout: 'tool-timeout',
+  version: 'core-version-unsupported',
+  'startup-failed': 'core-startup-failed',
+  'cold-start-failed': 'core-startup-failed',
+  'cold-start-limited': 'core-startup-failed',
+  'changeover-stopped': 'core-changeover',
+};
+
+function coreFailureCodeOf(kind) {
+  return CORE_FAILURE_CODES[kind] ?? 'core-unavailable';
 }
 
 /* dispatch 能力面：dispatch_* 工具与「创建 dispatch 模式」同属新核能力——旧核不宣告 dispatch 时
@@ -65,18 +84,19 @@ function isDispatchCallOf(name, args) {
   return name.startsWith('ws_dispatch_') || (name === 'ws_create_collab' && args.mode === 'dispatch');
 }
 
-/* 核心不可达的差错载荷（设计 §8 写死）：ws_status 合成 core:{available:false, reason}
+/* 核心不可达的差错载荷（设计 §8）：统一错误四字段 ＋ ws_status 额外合成 core:{available:false, reason}
  * （reason 取分类文案：等待态即 statusDetail，失败态取 startupError 或桥的分类文案）
  * ＋桥来源静态信息（version/app，标注来源＝桥）；其余字段省略——不填占位、不伪造。 */
 function failureResult(name, failure, bridgeInfo) {
+  const error = errorOf(coreFailureCodeOf(failure.kind), failure.message);
   if (name !== 'ws_status') {
-    return { content: [{ type: 'text', text: failure.message }], isError: true };
+    return errorResultOf(error);
   }
-  const payload = {
+  return errorResultOf({
+    ...error,
     core: { available: false, reason: failure.message },
     bridge: { version: bridgeInfo.version, app: bridgeInfo.app },
-  };
-  return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }], isError: true };
+  });
 }
 
 /* 桥运行时：装配连接件、注入写面与转发 registry（不含 stdio/MCP 传输——单测可直接装配）。
