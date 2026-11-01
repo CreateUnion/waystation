@@ -14,12 +14,22 @@ export const DISPATCH_QUEUE_MAX = 256;
 export const DISPATCH_CLAIM_TTL_MS = 10 * 60 * 1000;
 export const DISPATCH_MEMBER_EVENT_DEBOUNCE_MS = 500;
 /* 收编纪律单一权威源：~/.waystation/dispatch-rules.md（markdown 分节，每条一句话）。
- * 收编低频，通知发出时实时读文件——改完即热生效，无需 reload 命令。缺失/为空时回退内置最简
- * 纪律（仅主动上报 + 权限豁免），并向 master 知会一次（每 record 只提醒一次，防刷屏）。
+ * 收编低频，通知发出时实时读文件——改完即热生效，无需 reload 命令。缺失/为空时回退内置兜底
+ * 纪律（与 dispatch-rules.md 保持逐条同步，新装机开箱即得完整纪律），并向 master 知会一次
+ * （每 record 只提醒一次，防刷屏）。改纪律先改文件、再同步本常量。
  * 内容仍由 slave 模型执行——核心只机制化"要求"的携带，不机制化"内容"本身。 */
 export const DISPATCH_RULES_FILE_NAME = 'dispatch-rules.md';
-export const DISPATCH_RULES_FALLBACK =
-  '收编后请主动向 master 汇报当前状态与结果（ws_send_message 本协作即回）；权限类允许/拒绝弹窗不可远程代批，被拒照实上报原因';
+export const DISPATCH_RULES_FALLBACK = [
+  '# dispatch 全员纪律（内置兜底版，与 dispatch-rules.md 逐条同步；新装机请创建该文件，改完即热生效）',
+  '',
+  '1. 主动上报：任务推进中主动向 master 汇报进展与结果，不静默（ws_send_message 本协作即回）。',
+  '2. 收编状态汇报：被收编后立即向 master 汇报当前状态——在做什么、已完成什么、有无卡点待裁定。',
+  '3. 人工选择清单：先发 dispatch 消息知会 master（选项概要+时限）转呈用户拍板，等 2 分钟无回传再弹窗兜底；确定用户正在本机交互可直接弹窗。',
+  '4. 权限弹窗豁免：权限类允许/拒绝弹窗不适用远程拍板（安全机制不可代批），被拒照实上报原因。',
+  '5. 已验证坑即入册：有实测证据的坑当轮写入项目知识库（现象-根因-修复-预防），不等批量指令。',
+  '6. 全量汇报禁拦截：会话间消息禁止静默拦截或选择性省略，任何到达消息都要如实上报（slave 报 master，master 转呈用户）。',
+  '7. 待批独立成条：需用户拍板的事项独立成条正式提请（事项+事实清单+「现在等你决定」），不附带在进度汇报里，不自行压后审批节奏。',
+].join('\n');
 /* 桥断开宽限（与席位宽限同源配置，缺省与 service 的 DEFAULT_SEAT_GRACE_MS 对齐）。 */
 const DISPATCH_GRACE_MS = 60 * 1000;
 
@@ -207,7 +217,7 @@ function dispatchRulesOf(runtime) {
   try {
     text = readFileSync(join(runtime.dataDir, DISPATCH_RULES_FILE_NAME), 'utf8').trim();
   } catch {
-    text = '';
+    /* 读取失败按缺失处理，沿用初始空值走兜底 */
   }
   return text.length > 0 ? { text, missing: false } : { text: DISPATCH_RULES_FALLBACK, missing: true };
 }

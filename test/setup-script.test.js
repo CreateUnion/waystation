@@ -232,7 +232,7 @@ test('多项目：两个 options 段各注入一份', (t) => {
     'work_dir = "E:/b"',
     '',
   ].join('\n'));
-  const { result } = runSetup(t, { home, seam: '1' });
+  runSetup(t, { home, seam: '1' });
   const text = readCcConfig(home);
   assert.equal((text.match(/allowed_tools = \[/g) || []).length, 2, `两段各注入 allowed_tools：${text}`);
   assert.equal((text.match(/append_system_prompt = """你是 waystation dispatch master/g) || []).length, 2, '两段各注入规则');

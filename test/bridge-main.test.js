@@ -38,13 +38,13 @@ function stubLink(overrides = {}) {
 test('tools/list 数据源＝规格单一权威（顺序与内容一致；返回浅拷贝不共享数组）', () => {
   const registry = createForwardingRegistry({ link: stubLink(), version: '0.1.0', app: '/app' });
   const listed = registry.list();
-  assert.equal(listed.length, 27);
+  assert.equal(listed.length, 28);
   assert.deepEqual(listed.map((tool) => tool.name), TOOL_SPECS.map((tool) => tool.name), '注册序与规格一致');
   assert.deepEqual(listed, TOOL_SPECS, '条目内容与规格逐字段相同');
   const again = registry.list();
   assert.notEqual(listed, again, '每次返回新数组');
   listed.pop();
-  assert.equal(registry.list().length, 27, '调用方变异不污染规格');
+  assert.equal(registry.list().length, 28, '调用方变异不污染规格');
 });
 
 test('dispatch 能力位：已注册旧核未宣告 dispatch 时拒绝 ws_dispatch_*，不转发', async () => {
@@ -194,7 +194,7 @@ test('桥运行时：dataDir 取数据根解析；关闭转发到连接件', asy
     link,
   });
   assert.equal(runtime.dataDir, 'E:\\tmp\\bridge-home');
-  assert.equal(runtime.registry.list().length, 27);
+  assert.equal(runtime.registry.list().length, 28);
   await runtime.close();
   assert.equal(closed, 1);
 });
@@ -367,7 +367,7 @@ test('进程级：MCP 立即可答、核心启动失败降级文案、stdin 关�
   await client.connect(transport);
   childPid = transport.pid ?? null;
   const { tools } = await client.listTools();
-  assert.equal(tools.length, 27, 'tools/list 不依赖核心即答');
+  assert.equal(tools.length, 28, 'tools/list 不依赖核心即答');
   const called = await client.callTool({ name: 'ws_status', arguments: {} });
   assert.equal(called.isError, true);
   const payload = JSON.parse(called.content[0].text);

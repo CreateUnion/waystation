@@ -163,7 +163,7 @@ function Test-CcConnectExists {
     return $false
 }
 
-# —— cc-connect 注入内容（与 2026-10-30 已验证配置逐字一致；唯一权威在本文件） ——
+# —— cc-connect 注入内容（allowed_tools 白名单权威在本文件；append_system_prompt 单一权威源在 templates\master-prompt.md） ——
 $script:AllowedToolsLines = @(
     'allowed_tools = ['
     '  "mcp__waystation__ws_status",'
@@ -177,15 +177,33 @@ $script:AllowedToolsLines = @(
     '  "mcp__waystation__ws_dispatch_rules_reload",'
     ']'
 )
-$script:AppendPromptLines = @(
-    'append_system_prompt = """你是 waystation dispatch master：启动环境已带 WAYSTATION_ROLE=master，可把任务分派给本机其他 Claude Code 会话并行执行。'
-    '启动后先确保 dispatch 在位：ws_status 查无 → ws_create_collab {name, mode: dispatch, autoClaim: true} 建队（autoClaim 立即自动收编一轮可绑定会话，并随核心节拍持续补收新会话、自动移除离线 slave），随后向用户汇报成员清单，每项带会话名称和会话 ID（ws_status 的 dispatch.slaves 可取）；已存在 → 直接复用；若创建被拒（已存在）说明现任 master 在位，隔一分钟重试一次。'
-    '后续 ws_dispatch_scan 查看成员与各会话 claimable 状态；scan 结果偏少（如只见个别 ai-xx 会话）多半是核心重启后各桥还在重连，隔几秒重扫一次再看，不要当成最终名单；个别未入编目标可 ws_dispatch_claim 手动收编，交互式返回 pending 属正常，等对方确认，不要催促。'
-    'ws_send_message {collabId, type: task, toSessionIds, taskId} 下发任务，收 progress/result，type 只用 task/progress/result/error；结束用 ws_dispatch_release 释放单个或 ws_end_collab 整体结束。改过 ~/.waystation/dispatch-rules.md（收编纪律单一权威源）后，用 ws_dispatch_rules_reload 向全体在编成员广播最新纪律包（新收编会话无需此步，通知自动携带）。'
-    '拉起 worker（用户要求在指定目录开工时，用 Bash 执行）：cmd /c "cd /d <目录> && start "" /min cmd /k "set WAYSTATION_ROLE=slave&& set WAYSTATION_MASTER=<本会话名>&& claude --name worker-<目录简称> -p "<初始任务>" --permission-mode dontAsk --allowed-tools "Read Grep Glob Bash Edit Write mcp__waystation__ws_send_message mcp__waystation__ws_status mcp__waystation__ws_leave_collab"" —— 无头入编即干活；<初始任务>末尾必须附上收编纪律：先用 Read 读 ~/.waystation/dispatch-rules.md 全文，原样拼在任务文本末尾（单一权威源、热生效，勿在提示词写死副本；核心收编通知也会自动携带该文件）。'
-    '弹可见交互窗（用户在电脑前或要接管时，用计划任务中转开进用户桌面）：schtasks /create /f /tn ws-open /tr "cmd /k set WAYSTATION_ROLE=&& set WAYSTATION_MASTER=&& cd /d <目录> && claude" 加 schtasks /run /tn ws-open（新交互窗）；接管某个 worker：ws_dispatch_scan 拿它的 sessionId，/tr 换成 "set WAYSTATION_ROLE=&& set WAYSTATION_MASTER=&& cd /d <原目录> && claude --resume <sessionId>"——必须先清掉 WAYSTATION_ROLE/MASTER 再起 claude（服务环境带 master，不清会把被接管的会话以 master 身分复活）。用完 schtasks /delete /f /tn ws-open 清理。'
-    '纪律：dispatch 消息只走本机核心不占微信额度；给用户的回复合并为一条汇总，不要逐条转发 slave 消息；slave 的 result 已含结论时不要重复追问；dispatch 是纯内存的，核心或 cc-connect 重启后需重建（重建时带 autoClaim: true）。"""'
-)
+# master 提示词单一权威源 = 仓库文件 templates\master-prompt.md（唯一编辑入口，本文件不写副本）。
+# 安装注入从模板全文生成 append_system_prompt 三引号多行串；模板缺失/不可读返回 $null，调用方降级待手动。
+function Get-MasterPromptLines {
+    $templatePath = Join-Path $RepoRoot 'templates\master-prompt.md'
+    if (-not (Test-Path $templatePath)) { return $null }
+    try {
+        $raw = [System.IO.File]::ReadAllText($templatePath)
+    } catch {
+        return $null
+    }
+    $tplLines = @($raw -split "`r?`n")
+    while ($tplLines.Count -gt 0 -and $tplLines[$tplLines.Count - 1] -eq '') {
+        if ($tplLines.Count -eq 1) { return $null }
+        $tplLines = $tplLines[0..($tplLines.Count - 2)]
+    }
+    if ($tplLines.Count -eq 0) { return $null }
+    $lines = @('append_system_prompt = """' + $tplLines[0])
+    if ($tplLines.Count -gt 2) {
+        $lines += $tplLines[1..($tplLines.Count - 2)]
+    }
+    if ($tplLines.Count -gt 1) {
+        $lines += ($tplLines[$tplLines.Count - 1] + '"""')
+    } else {
+        $lines[0] += '"""'
+    }
+    return $lines
+}
 
 # 文本级合并：对每个 [projects.agent.options] 段插入缺失键；返回实际发生合并的段数（dry-run 恒 0）。
 # 段界防线：候选段范围内 """ 计数为奇数 = 段界落在多行字符串内部 → 该段放弃自动合并并降级手动。
@@ -219,6 +237,8 @@ function Merge-CcConfig([string]$ConfigPath) {
         }
         $insertBlocks = @()
         $changedSections = 0
+        $promptLines = $null
+        $promptLoadAttempted = $false
         for ($s = 0; $s -lt $sectionIdx.Count; $s++) {
             $start = $sectionIdx[$s]
             $end = $lines.Count
@@ -248,11 +268,25 @@ function Merge-CcConfig([string]$ConfigPath) {
                 Write-Note "第 $($start + 1) 行段：将注入 allowed_tools（9 项白名单）"
             }
             if ($needPrompt) {
-                $insert += $script:AppendPromptLines
-                Write-Note "第 $($start + 1) 行段：将注入 append_system_prompt（dispatch master 规则）"
+                if (-not $promptLoadAttempted) {
+                    $promptLoadAttempted = $true
+                    $promptLines = Get-MasterPromptLines
+                    if ($null -eq $promptLines) {
+                        Write-Warn '未找到 master 提示词模板（templates\master-prompt.md）——append_system_prompt 无法自动注入'
+                        if (-not $DryRun) {
+                            Add-Manual '模板 templates\master-prompt.md 缺失——恢复模板后重跑本脚本，或手工把 append_system_prompt 加进 config.toml 各 [projects.agent.options] 段'
+                        }
+                    }
+                }
+                if ($null -ne $promptLines) {
+                    $insert += $promptLines
+                    Write-Note "第 $($start + 1) 行段：将注入 append_system_prompt（templates\master-prompt.md 全文）"
+                }
             }
-            $insertBlocks += @{ At = $start + 1; Lines = $insert }
-            $changedSections++
+            if ($insert.Count -gt 0) {
+                $insertBlocks += @{ At = $start + 1; Lines = $insert }
+                $changedSections++
+            }
         }
         if ($changedSections -eq 0) { return 0 }
         if ($DryRun) {
