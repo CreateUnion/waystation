@@ -1,5 +1,6 @@
 import { isIP } from 'node:net';
 import { isPort } from '../net/protocol.js';
+import { errorResult } from './collab.js';
 import { WS_PING_SPEC } from './specs.js';
 
 /* ws_ping：可达性探测（TCP 拨入 + ping/pong 往返延迟）。目标端口取自扫描列表（多站点下端口按站点独立，
@@ -10,14 +11,14 @@ export function pingTool() {
     handler: async (args, context) => {
       const address = typeof args.address === 'string' ? args.address.trim() : '';
       if (address === '' || isIP(address) === 0) {
-        return { content: [{ type: 'text', text: '参数 address 非法：需要 IPv4/IPv6 字面量（不做域名解析）' }], isError: true };
+        return errorResult('参数 address 非法：需要 IPv4/IPv6 字面量（不做域名解析）');
       }
       if (!isPort(args.port)) {
-        return { content: [{ type: 'text', text: '参数 port 非法：需要 1–65535 的整数（取自 ws_list_hosts 的端点）' }], isError: true };
+        return errorResult('参数 port 非法：需要 1–65535 的整数（取自 ws_list_hosts 的端点）');
       }
       const probed = await context.net.pingHost({ address, port: args.port });
       if (!probed.ok) {
-        return { content: [{ type: 'text', text: probed.message }], isError: true };
+        return errorResult(probed.message, { code: 'probe-failed' });
       }
       return { content: [{ type: 'text', text: JSON.stringify(probed, null, 2) }] };
     },

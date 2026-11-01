@@ -26,7 +26,7 @@ test('创建：纯内存，不进 state.collabs，不写 collabs/ 目录', (t) =
   assert.deepEqual(existsSync(collabsDir) ? readdirSync(collabsDir).filter((name) => name === created.collabId) : [], []);
 });
 
-test('scan：排除 master 自身，返回名字 / kind / role / status / claimedBy / claimable', (t) => {
+test('scan：排除 master 自身，返回短码 / 名字 / kind / role / status / claimedBy / claimable', (t) => {
   const node = makeDispatchNode(t);
   const created = node.service.create({ mode: 'dispatch', name: '扫描', sessionId: 'master-1' });
   const scanned = node.service.dispatch.scan({ sessionId: 'master-1' });
@@ -35,7 +35,7 @@ test('scan：排除 master 自身，返回名字 / kind / role / status / claime
   assert.equal(scanned.sessions.some((entry) => entry.sessionId === 'master-1'), false);
   const human = scanned.sessions.find((entry) => entry.sessionId === 'human-1');
   assert.deepEqual(human, {
-    sessionId: 'human-1', name: 'human', kind: 'interactive', entrypoint: 'cli',
+    sessionId: 'human-1', sessionCode: 'human-1', name: 'human', kind: 'interactive', entrypoint: 'cli',
     role: 'none', status: 'idle', claimedBy: null, claimable: true,
   });
 });

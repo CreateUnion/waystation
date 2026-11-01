@@ -52,6 +52,20 @@
 | `archive/collabs/` | 保留期清理的已结束协作归档（gzip 清单；受同一 `collabs_days` 窗口约束） |
 | `logs/` | 核心的文件日志（桥不写文件日志，诊断走 stderr） |
 
+### 1.4 工具面错误响应
+
+工具失败统一返回 `isError` ＋ JSON 错误对象：
+
+```json
+{ "ok": false, "code": "kebab-case-code", "message": "人话描述", "hint": "修复建议" }
+```
+
+- **成功路径不受影响**：成功返回保持各工具原有结构；错误对象保留 `ok` / `message`，旧调用方按原字段读取仍成立。
+- **code 是稳定契约**：调用方按 `code` 分支，不匹配 `message` 文案；新增 code 必须在 `src/util/errors.js` 的 `ERROR_HINTS` 配一句可执行建议（可被具体调用点覆盖）。
+- **单一权威**：工具层（`tools/*`）、协作服务（`collab/dispatch.js`）、核心路由兜底与桥侧核心不可达差错共用 `src/util/errors.js`——桥与核心的错误载荷因此同构。
+- **桥侧 `ws_status` 例外**：核心不可达时仍合成 `core:{available:false, reason}` 与 `bridge:{version, app}`，并**同时**带统一错误四字段；这仍是「桥是纯转发件」原则的唯一登记例外。
+- **dispatch 子结果**：`ws_dispatch_claim` 顶层成功，逐目标 `status:'rejected'` 条目带 `code` / `reason` / `hint`（保留 `reason` 兼容），便于调度长按稳定 code 识别 `session-not-visible` / `bridge-stale` / `claim-rejected`。
+
 ## 2. 进程与通信
 
 ### 2.1 本机 IPC
@@ -269,6 +283,11 @@ replacer 等旧核退场 10 秒，到期走硬杀防护链；硬杀后有 2 秒�
 - **收编**：调度长用 `ws_dispatch_scan` 扫描本机会话，`ws_dispatch_claim` 发起收编；
   交互式目标需用户确认（一次性令牌），无头／服务拉起的会话必须带 `WAYSTATION_ROLE=slave`
   才会被收编。确认门 `gate:'claim'` 关闭时收编请求自动绑定并注入知情通知。
+- **会话标识**：`ws_dispatch_scan` 与 `ws_status` 的 dispatch 段为每个会话返回稳定短码
+  `sessionCode`（`sessionId` 前 8 字符，与 `shortSessionId` 同源）；`name` 保留但标为提示——
+  Claude Code 重命名 / 重启会让名字漂移。`ws_dispatch_claim` / `ws_dispatch_release` /
+  `ws_send_message.toSessionIds` 接受 `sessionCode` 或完整 `sessionId`（精确匹配、不做前缀展开；
+  零命中或歧义按「指定会话不在场」拒绝）。
 - **autoClaim**：创建时开启后，创建即自动收编一轮，此后随核心节拍持续补收新出现的可绑定会话。
 - **纪律包**：收编通知自动携带 `dispatch-rules.md` 全文；该文件是调度纪律的唯一权威源，
   通知发出时实时读取，改完即热生效。`ws_dispatch_rules_reload` 重读文件并向全体在编成员广播。

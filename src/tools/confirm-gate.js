@@ -1,3 +1,4 @@
+import { errorPayloadOf, errorResultOf } from '../util/errors.js';
 import { WS_SET_CONFIRM_GATE_SPEC } from './specs.js';
 import { errorResult, okResult } from './collab.js';
 
@@ -12,10 +13,7 @@ export function setConfirmGateTool() {
       }
       const result = context.collab.setConfirmGate({ ...args, sessionId });
       if (result.needsUserConfirmation === true) {
-        return {
-          content: [{ type: 'text', text: JSON.stringify(result) }],
-          isError: true,
-        };
+        return errorResultOf(errorPayloadOf({ ...result, code: 'user-confirmation-required' }));
       }
       return result.ok === true ? okResult(result) : errorResult(result.message ?? '确认门设置失败');
     },

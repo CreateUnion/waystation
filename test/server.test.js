@@ -342,7 +342,9 @@ test('数据目录不可用：核心启动自检拒绝服务（退出码 1＋std
   const called = await client.callTool({ name: 'ws_status', arguments: {} });
   assert.equal(called.isError, true);
   const payload = JSON.parse(called.content[0].text);
-  assert.deepEqual(Object.keys(payload), ['core', 'bridge']);
+  assert.deepEqual(Object.keys(payload), ['ok', 'code', 'message', 'hint', 'core', 'bridge']);
+  assert.equal(payload.ok, false);
+  assert.equal(payload.code, 'core-startup-failed', '核心拒服归码 core-startup-failed');
   assert.equal(payload.core.available, false);
   assert.ok(payload.core.reason.includes('协作目录不可用'), `reason 应取 startupError 原文，实际：${payload.core.reason}`);
   const record = JSON.parse(readFileSync(coreJsonPath(home), 'utf8'));

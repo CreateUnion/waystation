@@ -317,11 +317,14 @@ async function sendMessageDefaultType() {
  * 未动，按同一规程重冻。冻结断言未放宽。
  * A/B 合并（0.2.6，2026-11-02）：ws_send_message 描述同时保留 A 的持久化措辞与 B 的
  * delivery / requireAck / ackFor 增量字段，inputSchema 增 requireAck / ackFor；按同一规程
- * 重冻，md5 更新为 4c6ad52d9f47efbba48a4d3ac1abe6e7（22730 字符）。冻结断言未放宽。 */
+ * 重冻，md5 更新为 4c6ad52d9f47efbba48a4d3ac1abe6e7（22730 字符）。冻结断言未放宽。
+ * 会话身份双标识（2026-11-02）：仅改用户可见 description——ws_status / ws_dispatch_scan 标明
+ * 稳定短码 sessionCode 与「名字可能变化」，ws_dispatch_claim / release / ws_send_message
+ * 标明目标接受短码或完整 sessionId；工具名、inputSchema 字段与必填性未动，按同一规程重冻。 */
 const FROZEN_LIST_JSON = `[
   {
     "name": "ws_status",
-    "description": "查看本机驿站状态（版本、实例标识、数据目录、端口配置、网络状态等）——会话期首检与排障使用",
+    "description": "查看本机驿站状态（版本、实例标识、数据目录、端口配置、网络状态等）——会话期首检与排障使用；dispatch 段含调度长与组员的稳定会话短码 sessionCode（派发以此为准，名字可能随重命名 / 重启变化）",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -566,7 +569,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_dispatch_scan",
-    "description": "调度长（dispatch master）扫描本机已接入 waystation 的会话：会话名、role、kind、status、是否已被本调度（dispatch）收编。只返回本机**可收编**的在线会话（role=slave 或交互式；调度长、非交互无角色、无会话文件者不列出），排除调度长自身；名字取 Claude Code 会话名，缺失回退会话短码",
+    "description": "调度长（dispatch master）扫描本机已接入 waystation 的会话：会话短码 sessionCode（稳定，派发以此为准）、会话名（可能随重命名 / 重启变化，仅作提示）、role、kind、status、是否已被本调度（dispatch）收编。只返回本机**可收编**的在线会话（role=slave 或交互式；调度长、非交互无角色、无会话文件者不列出），排除调度长自身；名字取 Claude Code 会话名，缺失回退会话短码",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -574,13 +577,13 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_dispatch_claim",
-    "description": "调度长（dispatch master）收编一个或多个本机会话：无头且带 WAYSTATION_ROLE=slave 的会话直接绑定；交互式会话返回 pending 并向目标注入首次确认；非交互式且无角色的会话拒绝。一个核心同一时刻只允许一个调度（dispatch），组员独占",
+    "description": "调度长（dispatch master）收编一个或多个本机会话：无头且带 WAYSTATION_ROLE=slave 的会话直接绑定；交互式会话返回 pending 并向目标注入首次确认；非交互式且无角色的会话拒绝。sessionIds 接受会话短码 sessionCode 或完整 sessionId。一个核心同一时刻只允许一个调度（dispatch），组员独占",
     "inputSchema": {
       "type": "object",
       "properties": {
         "sessionIds": {
           "type": "array",
-          "description": "目标会话标识（1–32 项；取自 ws_dispatch_scan）",
+          "description": "目标会话标识（1–32 项；短码 sessionCode 或完整 sessionId，取自 ws_dispatch_scan）",
           "items": {
             "type": "string"
           }
@@ -624,7 +627,7 @@ const FROZEN_LIST_JSON = `[
       "properties": {
         "sessionId": {
           "type": "string",
-          "description": "要释放的 slave 会话标识（取自 ws_dispatch_scan）"
+          "description": "要释放的组员（slave）会话标识（短码 sessionCode 或完整 sessionId，取自 ws_dispatch_scan）"
         }
       },
       "required": [
@@ -712,7 +715,7 @@ const FROZEN_LIST_JSON = `[
           "items": {
             "type": "string"
           },
-          "description": "仅 dispatch：目标会话数组；省略时由核心按绑定路由（master→全体已收编 slave、slave→master）。managed / forum 使用会报错"
+          "description": "仅 dispatch：目标会话数组（短码 sessionCode 或完整 sessionId）；省略时由核心按绑定路由（master→全体已收编组员、组员→master）。managed / forum 使用会报错"
         },
         "taskId": {
           "type": "string",

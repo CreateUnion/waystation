@@ -119,30 +119,41 @@ test('dispatch 能力位：核心不可达走既有差错文案，不误报不�
   });
   const result = await createForwardingRegistry({ link }).call('ws_dispatch_scan', {});
   assert.equal(result.isError, true);
-  assert.equal(result.content[0].text, '核心无应答或重启中，请重试', '不可达走核心差错文案');
+  const payload = JSON.parse(result.content[0].text);
+  assert.equal(payload.code, 'core-unavailable', '不可达归码 core-unavailable');
+  assert.equal(payload.message, '核心无应答或重启中，请重试', 'message 保留核心差错文案');
+  assert.equal(typeof payload.hint, 'string');
   assert.doesNotMatch(result.content[0].text, /不支持 dispatch/);
   assert.deepEqual(calls, [], '不可达时不转发');
 });
 
-test('核心不可达的 ws_status 合成：core.available=false＋reason＋桥来源静态信息，其余字段省略', async () => {
+test('核心不可达的 ws_status 合成：统一错误字段＋core.available=false＋reason＋桥来源静态信息', async () => {
   const message = '检测到同根旧版会话运行中（pid 4242），请先关闭它；关闭后自动接管';
   const link = stubLink({ ensureCore: async () => ({ ok: false, kind: 'waiting', message }) });
   const registry = createForwardingRegistry({ link, version: '9.9.9', app: 'E:\\app-root' });
   const result = await registry.call('ws_status', {});
   assert.equal(result.isError, true);
   const payload = JSON.parse(result.content[0].text);
-  assert.deepEqual(Object.keys(payload), ['core', 'bridge'], '差错载荷只含 core 与 bridge 两块');
+  assert.deepEqual(Object.keys(payload), ['ok', 'code', 'message', 'hint', 'core', 'bridge'], '统一错误四字段＋core 与 bridge 两块');
+  assert.equal(payload.ok, false);
+  assert.equal(payload.code, 'core-unavailable');
+  assert.equal(payload.message, message);
+  assert.equal(typeof payload.hint, 'string');
   assert.deepEqual(payload.core, { available: false, reason: message }, 'reason 取分类文案（等待态即 statusDetail）');
   assert.deepEqual(payload.bridge, { version: '9.9.9', app: 'E:\\app-root' }, '静态信息来源＝桥');
 });
 
-test('核心不可达的其余工具：纯文本错误文案（含明确指引）', async () => {
+test('核心不可达的其余工具：统一错误四字段（含 code 与修复建议）', async () => {
   const link = stubLink({ ensureCore: async () => ({ ok: false, kind: 'unreachable', message: '核心无应答或重启中，请重试' }) });
   const registry = createForwardingRegistry({ link });
   for (const name of ['ws_list_hosts', 'ws_check_inbox', 'ws_ping']) {
     const result = await registry.call(name, {});
     assert.equal(result.isError, true);
-    assert.equal(result.content[0].text, '核心无应答或重启中，请重试');
+    const payload = JSON.parse(result.content[0].text);
+    assert.equal(payload.ok, false);
+    assert.equal(payload.code, 'core-unavailable');
+    assert.equal(payload.message, '核心无应答或重启中，请重试');
+    assert.equal(typeof payload.hint, 'string');
   }
 });
 
@@ -371,7 +382,9 @@ test('进程级：MCP 立即可答、核心启动失败降级文案、stdin 关�
   const called = await client.callTool({ name: 'ws_status', arguments: {} });
   assert.equal(called.isError, true);
   const payload = JSON.parse(called.content[0].text);
-  assert.deepEqual(Object.keys(payload), ['core', 'bridge']);
+  assert.deepEqual(Object.keys(payload), ['ok', 'code', 'message', 'hint', 'core', 'bridge']);
+  assert.equal(payload.ok, false);
+  assert.equal(payload.code, 'core-startup-failed', '核心启动失败归码 core-startup-failed');
   assert.equal(payload.core.available, false);
   assert.ok(payload.core.reason.length > 0, '降级文案非空（退出码归因）');
   assert.equal(typeof payload.bridge.version, 'string');

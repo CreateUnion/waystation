@@ -77,7 +77,7 @@ test('README：dispatch 模式、角色、无历史边界与微信集成责任�
   assert.ok(text.includes('不保存历史'), '无历史边界写入文档');
   assert.ok(text.includes('--allowed-tools'), '无头 worker 的 allowed-tools 模板写入文档');
   assert.ok(text.includes('微信'), '微信推送的集成责任写入文档');
-  assert.ok(text.includes('@会话名') && text.includes('群发'), '@ 定向与无 @ 群发写入文档');
+  assert.ok(text.includes('sessionCode') && text.includes('群发'), '会话短码定向与省略即群发写入文档');
   assert.ok(text.includes('burst_limit') && text.includes('ret=-2'), '微信侧人工验证项（burst_limit / ret=-2）写入文档');
 });
 

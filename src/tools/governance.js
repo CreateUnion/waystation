@@ -1,4 +1,5 @@
 import { ID_PATTERN } from '../net/protocol.js';
+import { errorPayloadOf, errorResultOf } from '../util/errors.js';
 import { callerSessionOf, collabIdArg, errorResult, optionalTextArg, resultOf } from './collab.js';
 import { WS_DECIDE_SPEC, WS_HANDOVER_SPEC, WS_TAKE_OVER_SPEC } from './specs.js';
 
@@ -190,9 +191,12 @@ export function takeOverTool() {
 /* 一次性挑战的返回面与 ws_approve_invite 同形：令牌不能被 resultOf 的纯文案错误面吞掉——
  * 代理据此把治理动作转述给用户，取得同意后携 confirmToken 重试。 */
 function confirmationChallengeOf(result, offerId) {
-  const payload = { ok: false, needsUserConfirmation: true, confirmToken: result.token, message: result.message };
+  const payload = {
+    ok: false, code: 'user-confirmation-required', needsUserConfirmation: true,
+    confirmToken: result.token, message: result.message,
+  };
   if (offerId !== undefined) {
     payload.offerId = offerId;
   }
-  return { content: [{ type: 'text', text: JSON.stringify(payload) }], isError: true };
+  return errorResultOf(errorPayloadOf(payload));
 }
