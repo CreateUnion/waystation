@@ -8,6 +8,21 @@ function pastDebounce() {
   return new Promise((resolve) => setTimeout(resolve, DISPATCH_MEMBER_EVENT_DEBOUNCE_MS + 150));
 }
 
+test('sweep 容错：记录缺运行态 Map（旧文件 / 测试桩）按空 Map 处理，不抛异常', (t) => {
+  const node = makeDispatchNode(t);
+  const created = node.service.create({ mode: 'dispatch', name: '缺省容错', sessionId: 'master-1' });
+  node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['worker-1'] });
+  const record = node.service.dispatch.dispatches.get(created.collabId);
+  delete record.queueDeadlines;
+  delete record.pendingAcks;
+  assert.doesNotThrow(() => node.service.dispatch.sweep(node.now()), '缺省 Map 不得阻断清扫');
+  assert.equal(record.queueDeadlines instanceof Map, true, '缺省项须补齐为空 Map（语义不是数组）');
+  assert.equal(record.pendingAcks instanceof Map, true, '缺省项须补齐为空 Map（语义不是数组）');
+  node.service.dispatch.noteBridgeClosed('worker-1');
+  node.advance(1100);
+  assert.doesNotThrow(() => node.service.dispatch.sweep(node.now()), '宽限超时回收队列时同样不得抛');
+});
+
 test('master 断开宽限内保留；超时后进入待接管、slave 收到通知（不再直接结束）', (t) => {
   const node = makeDispatchNode(t);
   const created = node.service.create({ mode: 'dispatch', name: '宽限', sessionId: 'master-1' });

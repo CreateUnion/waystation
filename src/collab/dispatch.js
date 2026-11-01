@@ -1584,6 +1584,7 @@ function sweepDispatchesIn(runtime, at) {
     if (!runtime.state.dispatches.has(record.collabId)) {
       continue;
     }
+    ensureRuntimeMaps(record);
     maybeMarkMasterPending(runtime, record, at);
     sweepClaimsOf(runtime, record, at);
     sweepQueuesOf(runtime, record, at);
@@ -1592,6 +1593,17 @@ function sweepDispatchesIn(runtime, at) {
     if (record.status === 'active' && record.autoClaim) {
       autoClaimPassIn(runtime, record);
     }
+  }
+}
+
+/* 运行态 Map 容错：正常记录由创建 / 恢复路径保证是 Map；旧文件或测试桩缺省时补空 Map
+ * （这两本账的语义就是 Map，不用数组兜底）。 */
+function ensureRuntimeMaps(record) {
+  if (!(record.queueDeadlines instanceof Map)) {
+    record.queueDeadlines = new Map();
+  }
+  if (!(record.pendingAcks instanceof Map)) {
+    record.pendingAcks = new Map();
   }
 }
 

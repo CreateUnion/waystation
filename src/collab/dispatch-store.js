@@ -217,6 +217,10 @@ function restoredRecordOf(dispatch, parts) {
     tasks: new Map(parts.tasks.map((task) => [task.taskId, task])),
     claims: new Map(),
     queues: new Map(),
+    /* 运行态两本账不落盘（重启即丢）；恢复时补空 Map，与创建路径保持一致——
+     * 缺了它们 sweep 的展开迭代会直接抛 TypeError，核心起不来。 */
+    queueDeadlines: new Map(),
+    pendingAcks: new Map(),
     grace: new Map(),
     pendingEvents: [],
     eventTimer: null,

@@ -4,6 +4,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFi
 import { join } from 'node:path';
 import { makeDispatchNode } from './helpers/dispatch.js';
 import { makeTempDir } from './helpers.js';
+import { loadDispatchState } from '../src/collab/dispatch-store.js';
 
 /* 调度持久化（问题 1/19）：关键节点落盘、重启恢复、损坏/不可写降级、位置迁移、任务表保留期。
  * 文件位置默认 <dataDir>/dispatch/state.json。 */
@@ -217,6 +218,63 @@ test('启动残留：待接管且 masterLastSeenAt 超过 dispatch_hours → 删
   assert.equal(restarted.service.dispatch.status().dispatch, null, '超期待接管残留不得恢复');
   assert.equal(existsSync(file), false, '超期残留状态文件删除');
 });
+
+test('恢复 v1 状态文件：运行态 Map 缺省即空 Map（queueDeadlines / pendingAcks）', (t) => {
+  const dataDir = makeTempDir(t);
+  mkdirSync(join(dataDir, 'dispatch'), { recursive: true });
+  writeFileSync(statePathOf(dataDir), JSON.stringify(v1StateWithoutRuntimeMaps()), 'utf8');
+
+  const loaded = loadDispatchState(statePathOf(dataDir));
+  assert.equal(loaded.ok, true, String(loaded.reason ?? ''));
+  assert.equal(loaded.record.queueDeadlines instanceof Map, true, 'queueDeadlines 须恢复为空 Map');
+  assert.equal(loaded.record.pendingAcks instanceof Map, true, 'pendingAcks 须恢复为空 Map');
+  assert.equal(loaded.record.queueDeadlines.size, 0);
+  assert.equal(loaded.record.pendingAcks.size, 0);
+});
+
+test('回归：0.2.6 状态文件恢复后 presence 节拍 sweep 不得抛异常', (t) => {
+  const dataDir = makeTempDir(t);
+  const first = makeDispatchNode(t, { dataDir, config: { dispatch: { persist: true } } });
+  const created = createDispatch(first, '崩溃回归');
+  first.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['worker-1'] });
+
+  const restarted = makeDispatchNode(t, {
+    dataDir, now: first.now(), config: { dispatch: { persist: true } }, meta: [...first.meta],
+  });
+  const record = restarted.service.dispatch.dispatches.get(created.collabId);
+  assert.ok(record, '状态文件须恢复为内存记录');
+  try {
+    /* 真实启动路径：service.start 的 presence 节拍即刻驱动 dispatch.sweep。 */
+    assert.doesNotThrow(() => restarted.service.start(), '恢复记录的 sweep 不得抛异常');
+    assert.doesNotThrow(() => restarted.service.dispatch.sweep(restarted.now()));
+  } finally {
+    restarted.service.close();
+  }
+});
+
+/** 0.2.6 写出的 v1 记录：不含内存态 queueDeadlines / pendingAcks。 */
+function v1StateWithoutRuntimeMaps() {
+  const at = new Date(1000).toISOString();
+  return {
+    v: 1,
+    savedAt: at,
+    dispatch: {
+      collabId: '11111111-1111-4111-8111-111111111111',
+      name: '旧版调度',
+      topic: null,
+      status: 'active',
+      autoClaim: false,
+      createdAt: at,
+      masterSessionId: 'master-1',
+      masterName: 'master',
+      masterLastSeenAt: at,
+      masterLostAt: null,
+      replacedMasterSessionIds: [],
+      slaves: [{ sessionId: 'worker-1', name: 'worker-1', kind: 'bg', role: 'slave', boundAt: at }],
+      tasks: [],
+    },
+  };
+}
 
 test('普通消息（无 taskId）不触发写盘', async (t) => {
   const dataDir = makeTempDir(t);
