@@ -11,3 +11,6 @@ dist/
 .superpowers/
 poc/
 docs/superpowers/
+
+# 内部路线文档（不对外）
+docs/IMPROVEMENTS.md
