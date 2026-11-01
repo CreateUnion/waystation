@@ -1,5 +1,6 @@
 /* 核心与桥之间的本机 IPC 层（设计 §2.3/§2.4）：端点选择与权限、NDJSON 帧编解码与逐字段校验、
- * 首帧（hello）认证、心跳与卡死判定。传输＝命名管道（Windows）/ Unix 域套接字（POSIX），零端口占用。
+ * 首帧（hello）认证、心跳与卡死判定。传输＝命名管道（Windows）/ Unix 域套接字（POSIX）为主端点，
+ * 并行监听 TCP 环回（127.0.0.1，ephemeral 端口）供跨 Session 拨入；双监听保证新旧桥混配可用。
  *
  * 本模块只承载两端共用契约与机制；连接生命周期策略（冷启/重连/换代/顶替）属消费方
  * （核心组合根与桥的监督件）。帧协议冻结于此：类型集、字段形态与校验判据以设计 §2.4 为准，
@@ -55,6 +56,11 @@ const DELIVERED_REASONS = ['rejected', 'failed', 'unavailable', 'timeout'];
 const REPLACE_REASONS = ['version-mismatch', 'manual'];
 const WELCOME_ERROR_CODES = ['auth', 'version', 'replacing', 'shutting-down'];
 const BYE_REASONS = ['session-end', 'replace'];
+
+/* 本机 TCP loopback 监听：服务上下文（Session 0）冷启的核心，命名管道默认 ACL 会拒绝用户会话
+ * 拨号（EPERM）；TCP 环回无此跨 Session 限制。只绑显式 IPv4 环回——localhost 可能解析到 ::1，
+ * 0.0.0.0 会暴露到局域网。端口 ephemeral（listen 端口 0），由系统分配后回填描述符。 */
+export const IPC_TCP_HOST = '127.0.0.1';
 
 const PIPE_PREFIX = '\\\\.\\pipe\\waystation-';
 const UNIX_SOCKET_NAME = 'core.sock';
@@ -574,8 +580,9 @@ function pickMs(values, fallback) {
  *   heartbeat?: { pingIntervalMs?: number, peerTimeoutMs?: number, now?: () => number },
  *   log?: any,
  * }} options
- * @returns {{ endpoint: string, state: any, start: () => Promise<{ endpoint: string }>, close: () => Promise<void>,
- *   send: (record: any, frame: any) => boolean, broadcast: (frame: any) => number, listBridges: () => any[] }}
+ * @returns {{ endpoint: string, state: any, start: () => Promise<{ endpoint: string, tcp: { host: string, port: number } }>, close: () => Promise<void>,
+ *   send: (record: any, frame: any) => boolean, broadcast: (frame: any) => number, listBridges: () => any[],
+ *   tcp: () => { host: string, port: number } | null }}
  */
 export function createIpcServer(options) {
   const state = buildServerState(options);
@@ -587,6 +594,7 @@ export function createIpcServer(options) {
     send: (record, frame) => sendToRecord(state, record, frame),
     broadcast: (frame) => broadcast(state, frame),
     listBridges: () => listBridges(state),
+    tcp: () => state.tcp,
   };
 }
 
@@ -625,6 +633,10 @@ function buildServerState({ dataDir, token, welcomeOf, onFrame, onRegister, onCl
     nextConnId: 1,
     /** @type {any} */
     listener: null,
+    /** @type {{ host: string, port: number } | null} */
+    tcp: null,
+    /** @type {any} */
+    tcpListener: null,
   };
 }
 
@@ -639,7 +651,29 @@ async function startServer(state) {
   if (process.platform !== 'win32') {
     chmodSync(state.endpoint, SOCKET_FILE_MODE);
   }
-  return { endpoint: state.endpoint };
+  await startTcpListener(state);
+  return { endpoint: state.endpoint, tcp: { ...state.tcp } };
+}
+
+/* TCP 监听与旧端点并存（过渡期双监听）：旧桥照连原端点，新桥优先 TCP。
+ * ephemeral 端口由系统分配，监听后从 address() 回填——描述符由组合根写入。 */
+async function startTcpListener(state) {
+  const listener = net.createServer((socket) => acceptConnection(state, socket));
+  listener.on('error', (error) => state.log?.warn?.('IPC TCP 监听错误', { code: errnoCodeOf(error) }));
+  await new Promise((resolve, reject) => {
+    const onError = (error) => reject(error);
+    listener.once('error', onError);
+    listener.listen({ host: IPC_TCP_HOST, port: 0 }, () => {
+      listener.removeListener('error', onError);
+      resolve(undefined);
+    });
+  });
+  const address = listener.address();
+  if (address === null || typeof address === 'string') {
+    throw new TypeError('TCP 监听未返回端口（装配错误）');
+  }
+  state.tcp = { host: IPC_TCP_HOST, port: address.port };
+  state.tcpListener = listener;
 }
 
 function listenOn(listener, endpoint) {
@@ -657,8 +691,14 @@ async function closeServer(state) {
   for (const conn of [...state.conns]) {
     conn.socket.destroy();
   }
-  const listener = state.listener;
-  state.listener = null;
+  await closeListener(state, 'listener');
+  await closeListener(state, 'tcpListener');
+  state.tcp = null;
+}
+
+async function closeListener(state, key) {
+  const listener = state[key];
+  state[key] = null;
   if (listener !== null) {
     await new Promise((resolve) => listener.close(() => resolve(undefined)));
   }
@@ -883,6 +923,7 @@ function listBridges(state) {
  * 消费者须自行隔离。
  * @param {{
  *   dataDir: string,
+ *   endpoint?: string | { host: string, port: number },
  *   hello: { app: string, v?: number, token: string, bridgeId: string, sessionId?: string, pid?: number, platform?: string,
  *     role?: string, masterName?: string | null, name?: string | null, kind?: string, entrypoint?: string | null,
  *     status?: string | null, metaUpdatedAt?: number },
@@ -894,7 +935,7 @@ function listBridges(state) {
  *   connectTimeoutMs?: number,
  *   handshakeTimeoutMs?: number,
  * }} options
- * @returns {{ endpoint: string, state: any, connect: () => Promise<any>, send: (frame: any) => boolean, close: () => Promise<void> }}
+ * @returns {{ endpoint: string | { host: string, port: number }, state: any, connect: () => Promise<any>, send: (frame: any) => boolean, close: () => Promise<void> }}
  */
 export function createIpcClient(options) {
   const state = buildClientState(options);
@@ -917,7 +958,7 @@ function assertClientOptions(dataDir, hello) {
 }
 
 /** @param {any} [options] */
-function buildClientState({ dataDir, hello, onFrame, onStuck, onClose, heartbeat, log, connectTimeoutMs = IPC_CONNECT_TIMEOUT_MS, handshakeTimeoutMs = IPC_HANDSHAKE_TIMEOUT_MS } = {}) {
+function buildClientState({ dataDir, endpoint, hello, onFrame, onStuck, onClose, heartbeat, log, connectTimeoutMs = IPC_CONNECT_TIMEOUT_MS, handshakeTimeoutMs = IPC_HANDSHAKE_TIMEOUT_MS } = {}) {
   assertClientOptions(dataDir, hello);
   const state = {
     dataDir,
@@ -929,7 +970,8 @@ function buildClientState({ dataDir, hello, onFrame, onStuck, onClose, heartbeat
     params: heartbeatParamsOf(heartbeat),
     connectTimeoutMs,
     handshakeTimeoutMs,
-    endpoint: endpointFor(dataDir),
+    /* 端点可注入（描述符里的 TCP 环回）；缺省沿用数据根派生端点——旧核/旧测试形态不变。 */
+    endpoint: endpoint ?? endpointFor(dataDir),
     view: { welcome: null, registered: false, refusedFrames: 0, oversizeFrames: 0, malformedFrames: 0, invalidFrames: 0, stuckPeers: 0 },
     started: false,
     registered: false,

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { DISPATCH_RULES_FILE_NAME } from '../src/collab/dispatch.js';
+import { DISPATCH_RULES_FALLBACK, DISPATCH_RULES_FILE_NAME } from '../src/collab/dispatch.js';
 import { makeDispatchNode } from './helpers/dispatch.js';
 
 function createDispatch(node) {
@@ -215,7 +215,7 @@ test('纪律文件缺失：回退内置最简纪律并向 master 知会一次（
   const boundNotice = node.notices.find(
     (frame) => frame.payload?.event === 'dispatch-claim-auto' && frame.payload?.targetSessionId === 'human-1',
   );
-  assert.match(String(boundNotice?.payload?.text ?? ''), /权限类允许\/拒绝弹窗不可远程代批/, '缺失时回退内置最简纪律');
+  assert.ok(String(boundNotice?.payload?.text ?? '').includes(DISPATCH_RULES_FALLBACK), '缺失时回退内置最简纪律（以常量为权威源）');
   const warns = () => node.notices.filter(
     (frame) => frame.payload?.event === 'dispatch-rules-missing' && frame.payload?.targetSessionId === 'master-1',
   );
@@ -261,7 +261,7 @@ test('reload 文件缺失：按内置最简纪律广播并标注 rulesMissing；
   assert.equal(missing.ok, true);
   assert.equal(missing.rulesMissing, true);
   const frame = node.notices.find((entry) => entry.payload?.event === 'dispatch-rules-updated');
-  assert.match(String(frame?.payload?.text ?? ''), /权限类允许\/拒绝弹窗不可远程代批/, '缺失时广播内置最简纪律');
+  assert.ok(String(frame?.payload?.text ?? '').includes(DISPATCH_RULES_FALLBACK), '缺失时广播内置最简纪律（以常量为权威源）');
 
   writeFileSync(join(node.dataDir, DISPATCH_RULES_FILE_NAME), '纪律 R2：先知会。\n', 'utf8');
   const first = node.service.dispatch.reloadRules({ sessionId: 'master-1' });

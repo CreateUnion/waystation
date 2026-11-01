@@ -65,6 +65,7 @@ const VIEWER_SCRIPT_PATH = fileURLToPath(new URL('../../scripts/ws-viewer.js', i
  * @property {string} appVersion
  * @property {number} pid
  * @property {string} endpoint
+ * @property {{ tcp: { host: string, port: number } | null }} ipc
  * @property {string} token
  * @property {{ instanceId: string, identityName: string } | null} identity
  * @property {number} port
@@ -422,7 +423,11 @@ async function listenIpc(state) {
   });
   state.routing.attach({ registry: state.bridges, ipc: state.ipc });
   state.routing.load();
-  await state.ipc.start();
+  const started = await state.ipc.start();
+  /* TCP 端点监听成功后才可知（ephemeral 端口）：回填描述符供新桥优先拨入；旧字段 endpoint
+   * 语义不变，旧桥不受影响。 */
+  state.record.ipc = { tcp: started.tcp };
+  writeCoreRecordQuietly(state);
 }
 
 /* 换代席构造（设计 §5.2）：首个 replace 受理即广播 core-restarting 并触发换届收尾（恰一次）。
@@ -1410,6 +1415,7 @@ function createCoreRecord(root) {
     appVersion: APP_VERSION,
     pid: process.pid,
     endpoint: endpointFor(root.dataDir),
+    ipc: { tcp: null },
     token: newIpcToken(),
     identity: null,
     port: root.port,

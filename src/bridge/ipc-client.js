@@ -54,6 +54,11 @@ export const BYE_FLUSH_MS = 20;
  * 桥侧必须长于核心侧，否则会抢在核心的安全期限前把仍在执行的调用误收口。 */
 export const CALL_RESULT_BACKSTOP_MS = 690000;
 
+/* IPC 传输选择（回滚开关）：auto（缺省）＝优先描述符里的 TCP 环回、失败回退旧端点；
+ * pipe＝强制旧端点（回滚路径）；tcp＝只用描述符 TCP（缺省时按旧端点）。非法值按 auto 处理。 */
+const IPC_TRANSPORT_ENV = 'WAYSTATION_IPC_TRANSPORT';
+const TRANSPORT_MODES = ['auto', 'tcp', 'pipe'];
+
 /* 冷启入口：按本模块位置相对解析（安装树整目录拷贝 bin/src，同路径代码恒为最近一次安装版本），
  * 不依赖 PATH/CWD。 */
 const CORE_ENTRY_PATH = fileURLToPath(new URL('../../bin/waystation-core.js', import.meta.url));
@@ -107,7 +112,9 @@ function buildLinkState(options) {
     sessionMeta: sessionMetaOf(options),
     coreEntry: options.coreEntry ?? CORE_ENTRY_PATH,
     spawnFn: options.spawn ?? spawnChild,
-    sessionIdProbe: options.sessionIdProbe ?? null,
+    transport: transportModeOf(env),
+    transportFallbacks: 0,
+    lastTransport: null,
     ...changeoverSettingsOf(options),
     changeover: buildChangeoverState(),
     ...timingOf(options),
@@ -130,7 +137,8 @@ function buildLinkState(options) {
     lastFailure: null,
     rebirth: false,
     rapidAttempts: [],
-    view: { registered: false, welcome: null, lastFailure: null, rebirth: false, rapidRetries: 0 },
+    view: { registered: false, welcome: null, lastFailure: null, rebirth: false, rapidRetries: 0, transport: null, transportFallbacks: 0, lastReconnectMs: null },
+    lostAt: null, lastReconnectMs: null,
   };
 }
 
@@ -206,6 +214,9 @@ function syncView(state) {
   state.view.rebirth = state.rebirth;
   state.view.rapidRetries = state.rapidAttempts.length;
   state.view.notice = state.changeover.lastNotice;
+  state.view.transport = state.lastTransport;
+  state.view.transportFallbacks = state.transportFallbacks;
+  state.view.lastReconnectMs = state.lastReconnectMs;
 }
 
 /* —— 四态判定与冷启 —— */
@@ -304,10 +315,6 @@ async function connectStep(state, record, flow) {
  * 隔离路径），桥不删不抢。 */
 async function coldStartStep(state, flow) {
   if (!flow.coldStartIssued) {
-    const refusal = await assertNotServiceSession(state);
-    if (refusal !== null) {
-      return { kind: 'fail', failure: { kind: 'service-session', message: `核心冷启被拒：${refusal}`, retryMs: state.slowRetryMs } };
-    }
     flow.coldStartIssued = true;
     const issued = issueColdStart(state);
     if (!issued.ok) {
@@ -315,53 +322,6 @@ async function coldStartStep(state, flow) {
     }
   }
   return { kind: 'wait', timeoutFailure: null };
-}
-
-/* 服务上下文守卫（Windows）：Session 0 里冷启的核心，其默认命名管道 ACL 会拒绝一切用户会话桥的
- * 拨号（EPERM 锁死全场；2026-10-31 真机事故：cc-connect 服务树内的桥冷启了 Session 0 核心，
- * 交互会话全部拨不进）。服务上下文一律不冷启——等用户会话桥把核心启起来后正常附着
- * （Session 0 拨 Session 1 的管道无碍，白天长期验证）。 */
-async function assertNotServiceSession(state) {
-  if (process.platform !== 'win32') {
-    return null;
-  }
-  /* 会话号在桥进程生命周期内不变：探测一次按进程记忆化（探测走一次性 powershell，反复拉起太贵）。 */
-  if (state.serviceSession === undefined) {
-    const probe = state.sessionIdProbe ?? defaultSessionIdProbe;
-    try {
-      state.serviceSession = (await probe()) === 0;
-    } catch {
-      state.serviceSession = false;
-    }
-  }
-  if (!state.serviceSession) {
-    return null;
-  }
-  return '当前环境为服务上下文（Session 0）：在此冷启的核心，其管道会拒绝用户会话桥连接（EPERM）。请先在任一用户会话中把核心启动起来（任意 Claude 会话调用任一 ws_* 工具即可触发冷启），本桥随后自动附着';
-}
-
-export function defaultSessionIdProbe() {
-  return new Promise((resolve) => {
-    /* 冷启极低频，一次性 powershell 探测本进程会话号；失败/超时按非服务上下文处理（不挡冷启）。 */
-    const child = spawnChild('powershell.exe', [
-      '-NoProfile', '-NoLogo', '-Command', `(Get-Process -Id ${process.pid}).SessionId`,
-    ], { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
-    let out = '';
-    const timer = setTimeout(() => {
-      child.kill();
-      resolve(1);
-    }, 3000);
-    child.stdout?.on('data', (chunk) => { out += chunk; });
-    child.once('error', () => {
-      clearTimeout(timer);
-      resolve(1);
-    });
-    child.once('exit', () => {
-      clearTimeout(timer);
-      const value = Number.parseInt(out.trim(), 10);
-      resolve(Number.isFinite(value) ? value : 1);
-    });
-  });
 }
 
 /* 僵尸核心（pid 活、心跳停）：硬杀防护链（stop-guard 共享件）——链全过才冷启；校验不过＝降级上报、
@@ -452,26 +412,96 @@ function heartbeatFresh(state, record) {
  * version（降级文案、终态）与 replacing/shutting-down（等待新核接续位）不参与预算内重试；
  * auth/errno/超时在预算内重试（核心可能正在完成启动或已换代重写描述符）。 */
 async function connectOnce(state, record, flow) {
-  const token = typeof record.token === 'string' && record.token !== '' ? record.token : null;
+  const token = tokenOf(record);
   if (token === null) {
-    return { ok: false, fatal: false, failure: { kind: 'unreachable', message: '核心无应答：运行描述符缺少凭据（描述符可能不完整）', retryMs: state.slowRetryMs } };
+    return noTokenFailure(state);
   }
-  const client = createClientFor(state, record, token, flow);
+  const plan = endpointsOf(state, record);
+  const first = await attemptEndpoint(state, record, token, flow, plan.primary, plan.kind);
+  if (shouldKeepFirst(first, plan)) {
+    return first;
+  }
+  return fallbackAttempt(state, record, token, flow, plan, first);
+}
+
+function tokenOf(record) {
+  return typeof record.token === 'string' && record.token !== '' ? record.token : null;
+}
+
+function noTokenFailure(state) {
+  return { ok: false, fatal: false, failure: { kind: 'unreachable', message: '核心无应答：运行描述符缺少凭据（描述符可能不完整）', retryMs: state.slowRetryMs } };
+}
+
+function shouldKeepFirst(first, plan) {
+  return first.ok || first.fatal || plan.fallback === null;
+}
+
+/* TCP 拨入失败（端口陈旧/被占/对端进程换了）：回退旧端点一次。认证类失败也回退——
+ * 描述符里的端口可能已是别的进程；token 仍由 hello 校验，回退不放宽安全面。 */
+async function fallbackAttempt(state, record, token, flow, plan, first) {
+  state.transportFallbacks++;
+  state.log?.warn?.('TCP 端点连接失败，回退旧端点', { reason: first.failure?.message ?? null });
+  syncView(state);
+  const second = await attemptEndpoint(state, record, token, flow, plan.fallback, 'legacy');
+  return second.ok ? second : first;
+}
+
+async function attemptEndpoint(state, record, token, flow, endpoint, kind) {
+  const client = createClientFor(state, record, token, flow, endpoint);
   try {
     const welcome = await client.connect();
-    return await finalizeRegistration(state, client, welcome);
+    const outcome = await finalizeRegistration(state, client, welcome);
+    if (outcome.ok) {
+      state.lastTransport = kind;
+      syncView(state);
+    }
+    return outcome;
   } catch (error) {
     await client.close();
     return classifyConnectError(state, error);
   }
 }
 
-function createClientFor(state, record, token, flow) {
+/* 端点选择（见 IPC_TRANSPORT_ENV）：tcp 只取描述符环回地址，绝不接受非 127.0.0.1（描述符被篡改
+ * 也不得外连）；auto 额外给旧端点作一次回退。 */
+function endpointsOf(state, record) {
+  const legacy = endpointFor(state.dataDir);
+  if (state.transport === 'pipe') {
+    return { primary: legacy, fallback: null, kind: 'legacy' };
+  }
+  const tcp = tcpEndpointOf(record);
+  if (tcp === null) {
+    return { primary: legacy, fallback: null, kind: 'legacy' };
+  }
+  return { primary: tcp, fallback: state.transport === 'auto' ? legacy : null, kind: 'tcp' };
+}
+
+function tcpEndpointOf(record) {
+  const tcp = record?.ipc?.tcp;
+  if (tcp === null || typeof tcp !== 'object' || Array.isArray(tcp)) {
+    return null;
+  }
+  if (tcp.host !== '127.0.0.1') {
+    return null;
+  }
+  if (!Number.isInteger(tcp.port) || tcp.port < 1 || tcp.port > 65535) {
+    return null;
+  }
+  return { host: tcp.host, port: tcp.port };
+}
+
+function transportModeOf(env) {
+  const raw = typeof env?.[IPC_TRANSPORT_ENV] === 'string' ? env[IPC_TRANSPORT_ENV].trim().toLowerCase() : '';
+  return TRANSPORT_MODES.includes(raw) ? raw : 'auto';
+}
+
+function createClientFor(state, record, token, flow, endpoint) {
   const budgeted = budgetTimeouts(state, flow);
   /** @type {any} */
   let client = null;
   client = createIpcClient({
     dataDir: state.dataDir,
+    endpoint,
     hello: {
       app: state.app, v: state.ipcV, token, bridgeId: state.bridgeId, sessionId: state.sessionId, ...state.sessionMeta,
     },
@@ -501,6 +531,10 @@ async function finalizeRegistration(state, client, welcome) {
   state.welcome = welcome;
   const reborn = state.rebirth;
   state.rebirth = false;
+  if (reborn && state.lostAt !== null) {
+    state.lastReconnectMs = state.now() - state.lostAt;
+    state.lostAt = null;
+  }
   state.lastFailure = null;
   state.changeover.replacingAt = null;
   state.changeover.replacement = null;
@@ -640,6 +674,7 @@ function handleConnectionLoss(state, client) {
   state.registered = false;
   state.welcome = null;
   state.rebirth = true;
+  state.lostAt = state.now();
   state.log?.warn?.('核心连接断开（重生流：判陈旧后冷启）');
   const failure = { kind: 'unreachable', message: '核心无应答或重启中，请重试', retryMs: null };
   state.lastFailure = failure;

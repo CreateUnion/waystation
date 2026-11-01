@@ -184,6 +184,17 @@ async function rawAuthAttempt(cleanup, endpoint, frameOrRaw) {
   return collected.text;
 }
 
+/* 认证成功路径的原始读取：注册后连接保持，等 welcome 行到达即主动断开（rawAuthAttempt
+ * 依赖服务端断开，只适用于拒绝路径）。 */
+async function rawWelcomeOver(cleanup, endpoint, frame) {
+  const { socket, collected } = await connectRaw(endpoint);
+  cleanup(() => socket.destroy());
+  writeLine(socket, frame);
+  await waitFor(() => collected.text.includes('\n'), { timeoutMs: 10000 });
+  socket.destroy();
+  return collected.text;
+}
+
 /* —— 端点与凭据 —— */
 
 test('endpointFor：POSIX 为 <root>/run/core.sock；Windows 为 \\\\.\\pipe\\waystation-<rootDigest 8hex>', (t) => {
@@ -198,6 +209,50 @@ test('endpointFor：POSIX 为 <root>/run/core.sock；Windows 为 \\\\.\\pipe\\wa
   assert.match(windows, /^\\\\\.\\pipe\\waystation-[0-9a-f]{8}$/);
   const other = makeTempDir(t);
   assert.notEqual(endpointFor(other, 'win32'), windows, '不同数据根不得共用端点（多根隔离）');
+});
+
+/* —— TCP loopback 监听（服务上下文跨会话可达） —— */
+
+test('TCP 监听：start() 返回 127.0.0.1 的 ephemeral 端口，且该端点可完成 hello 认证', async (t) => {
+  const cleanup = cleanupOf(t);
+  const root = makeTempDir(t);
+  const server = startServer(cleanup, root);
+  const started = await server.start();
+
+  assert.equal(started.tcp.host, '127.0.0.1', '只绑 IPv4 环回（禁 localhost 与 0.0.0.0）');
+  assert.ok(Number.isInteger(started.tcp.port) && started.tcp.port > 0, 'ephemeral 端口须回填');
+  assert.ok(started.tcp.port < 7321 || started.tcp.port > 7328, '不得占用站点锚点段 7321–7328');
+
+  const bytes = await rawWelcomeOver(cleanup, started.tcp, helloFrame());
+  const receipt = JSON.parse(bytes);
+  assert.equal(receipt.ok, true, 'TCP 端点与管道共用同一认证面');
+  assert.equal(server.listBridges().length, 1);
+  assert.equal(server.listBridges()[0].bridgeId, 'bridge-1');
+});
+
+test('TCP 监听：错误 token 走同一认证回执（不泄漏差异）', async (t) => {
+  const cleanup = cleanupOf(t);
+  const root = makeTempDir(t);
+  const server = startServer(cleanup, root);
+  const started = await server.start();
+
+  const bytes = await rawAuthAttempt(cleanup, started.tcp, helloFrame({ token: 'wrong-token' }));
+
+  assert.equal(JSON.parse(bytes).code, 'auth');
+  assert.equal(server.listBridges().length, 0);
+  assert.equal(server.state.authFailures, 1);
+});
+
+test('TCP 监听：与原端点并存（旧桥仍可连原端点）', async (t) => {
+  const cleanup = cleanupOf(t);
+  const root = makeTempDir(t);
+  const server = startServer(cleanup, root);
+  const started = await server.start();
+
+  assert.equal(started.endpoint, endpointFor(root), '返回的 endpoint 保持旧语义');
+  assert.notEqual(started.tcp, null);
+  const bytes = await rawWelcomeOver(cleanup, endpointFor(root), helloFrame({ bridgeId: 'bridge-legacy' }));
+  assert.equal(JSON.parse(bytes).ok, true, '双监听：旧端点在新核上照常可用');
 });
 
 test('newIpcToken：64 hex、每次轮换不同', () => {

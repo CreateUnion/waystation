@@ -13,7 +13,7 @@ import { deliveryStatusTool } from '../src/tools/delivery-status.js';
 import { checkInboxTool } from '../src/tools/check-inbox.js';
 import { listCollabsTool, createCollabTool, approveInviteTool, allowNextInviteTool, withdrawInviteTool, viewLedgerTool, sendMessageTool, setMuteTool, leaveCollabTool, endCollabTool, inviteTool, requestJoinTool, SEND_MESSAGE_TYPES } from '../src/tools/collab.js';
 import { setConfirmGateTool } from '../src/tools/confirm-gate.js';
-import { dispatchApproveTool, dispatchClaimTool, dispatchReleaseTool, dispatchScanTool } from '../src/tools/dispatch.js';
+import { dispatchApproveTool, dispatchClaimTool, dispatchReleaseTool, dispatchRulesReloadTool, dispatchScanTool } from '../src/tools/dispatch.js';
 import { joinTool, approveJoinTool } from '../src/tools/join.js';
 import { decideTool, handoverTool, takeOverTool } from '../src/tools/governance.js';
 import { COLLAB_MODES, DEFAULT_COLLAB_MODE, MAX_ACTIVE_SEATS, MAX_IDENTITY_NAME_CHARS, MAX_MESSAGE_TEXT_CHARS, MAX_REASON_CHARS, MAX_TOPIC_CHARS } from '../src/net/protocol.js';
@@ -30,8 +30,8 @@ import { buildDefaults } from '../src/config.js';
 
 const propertiesOf = (name) => SPECS_BY_NAME[name].inputSchema.properties;
 
-/* 设计 §9 的 27 项工具清单（独立于 specs.js 登记，防「误换一项再重冻」自证）：
- * 表内 22 个单项 + 末行 5 项（status / ping / decide / withdraw / request_join）。 */
+/* 设计 §9 的 28 项工具清单（独立于 specs.js 登记，防「误换一项再重冻」自证）：
+ * 0.2.0 设计 27 项 + 0.2.4 实际发布的第 28 项 ws_dispatch_rules_reload（0.2.5 追认）。 */
 const DESIGN_SECTION_9_TOOLS = [
   'ws_create_collab',
   'ws_invite',
@@ -42,6 +42,7 @@ const DESIGN_SECTION_9_TOOLS = [
   'ws_dispatch_claim',
   'ws_dispatch_approve',
   'ws_dispatch_release',
+  'ws_dispatch_rules_reload',
   'ws_join',
   'ws_approve_join',
   'ws_leave_collab',
@@ -79,6 +80,7 @@ const TOOL_FACTORIES = [
   dispatchClaimTool,
   dispatchApproveTool,
   dispatchReleaseTool,
+  dispatchRulesReloadTool,
   withdrawInviteTool,
   viewLedgerTool,
   sendMessageTool,
@@ -102,9 +104,9 @@ function coreToolList() {
   return registry.list();
 }
 
-test('工具面冻结快照：27 项逐字节不变', () => {
+test('工具面冻结快照：28 项逐字节不变', () => {
   const listed = coreToolList();
-  assert.equal(listed.length, 27, '工具数为 27——增删工具属须人批准的对外变更');
+  assert.equal(listed.length, 28, '工具数为 28——增删工具属须人批准的对外变更');
   assert.equal(
     JSON.stringify(listed, null, 2),
     FROZEN_LIST_JSON,
@@ -112,15 +114,15 @@ test('工具面冻结快照：27 项逐字节不变', () => {
   );
 });
 
-test('规格模块：27 项无遗漏，按名索引与注册序一致', () => {
-  assert.equal(TOOL_SPECS.length, 27, '规格模块须与工具数一一对应');
+test('规格模块：28 项无遗漏，按名索引与注册序一致', () => {
+  assert.equal(TOOL_SPECS.length, 28, '规格模块须与工具数一一对应');
   assert.deepEqual(Object.keys(SPECS_BY_NAME), TOOL_SPECS.map((spec) => spec.name));
   assert.deepEqual(coreToolList().map((tool) => tool.name), TOOL_SPECS.map((spec) => spec.name));
 });
 
-test('规格模块：27 项与设计 §9 的工具清单逐名一致', () => {
-  assert.equal(DESIGN_SECTION_9_TOOLS.length, 27, '设计 §9 清单自身须为 27 项（22 单项 + 末行 5 项）');
-  assert.equal(new Set(DESIGN_SECTION_9_TOOLS).size, 27, '设计 §9 清单不得有重复名');
+test('规格模块：28 项与设计 §9 的工具清单逐名一致', () => {
+  assert.equal(DESIGN_SECTION_9_TOOLS.length, 28, '设计 §9 清单自身须为 28 项（0.2.0 设计 27 + 0.2.4 追认第 28 项）');
+  assert.equal(new Set(DESIGN_SECTION_9_TOOLS).size, 28, '设计 §9 清单不得有重复名');
   assert.deepEqual([...Object.keys(SPECS_BY_NAME)].sort(), [...DESIGN_SECTION_9_TOOLS].sort(), '工具名与设计 §9 独立对照——误换一项再重冻会在这里变红');
 });
 
@@ -280,7 +282,7 @@ async function sendMessageDefaultType() {
   return sent.type;
 }
 
-/* 冻结基准：27 工具注册后 JSON.stringify(registry.list(), null, 2) 的全量输出（由当前树生成）。
+/* 冻结基准：28 工具注册后 JSON.stringify(registry.list(), null, 2) 的全量输出（由当前树生成）。
  * 文本级固化——缩进与换行也是比对范围，故整段贴在此处、不手工编辑。
  * 会话级参与者 0.2.0 工具面（22 项）：名单与参与者粒度按会话——ws_send_message 增 toSessionId、
  * ws_handover 增 targetSessionId/offerId/confirmToken/decision/reason 并放宽为双角色、
@@ -301,7 +303,11 @@ async function sendMessageDefaultType() {
  * md5 更新为 d605434e7866c2da292161b348efb485（21118 字符）。
  * ws_dispatch_scan 描述增补（2026-10-30）：scan 结果新增 claimable 字段（role≠master 且
  * （role=slave 或交互式）＝可收编），描述同步（字段级增补，无工具增删）；
- * md5 更新为 ae06423ef21b898df3c3fc7ee6aae6d7（21174 字符）。 */
+ * md5 更新为 ae06423ef21b898df3c3fc7ee6aae6d7（21174 字符）。
+ * dispatch 纪律重载（0.2.4 实际发布、0.2.5 追认）：新增第 28 项 ws_dispatch_rules_reload（重读
+ * dispatch-rules.md 单一权威源并向在编成员广播最新纪律包）；工具面数量 27→28，按用户 2026-11-01
+ * 裁定重冻——追认已发布事实，非放宽约束；
+ * md5 更新为 01a4854f681839d334b8694ea4a2674a（21989 字符）。 */
 const FROZEN_LIST_JSON = `[
   {
     "name": "ws_status",
@@ -614,6 +620,15 @@ const FROZEN_LIST_JSON = `[
       "required": [
         "sessionId"
       ]
+    }
+  },
+  {
+    "name": "ws_dispatch_rules_reload",
+    "description": "dispatch master 专用：重读 ~/.waystation/dispatch-rules.md（收编纪律单一权威源）并向全体在编成员广播最新纪律包（带内容版本号+时间戳，便于会话识别新旧）——改纪律文件后对已收编会话立即生效，无需重建；文件缺失时按内置最简纪律广播并在结果中标注 rulesMissing",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
     }
   },
   {

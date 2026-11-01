@@ -8,7 +8,7 @@ import { join, resolve } from 'node:path';
 import { makeTempDir, pickFreePort, repoRoot, waitFor } from './helpers.js';
 import { IPC_VERSION, createIpcServer, endpointFor } from '../src/core/ipc.js';
 import { coreJsonPath, runDir } from '../src/paths.js';
-import { createCoreLink, defaultSessionIdProbe } from '../src/bridge/ipc-client.js';
+import { createCoreLink } from '../src/bridge/ipc-client.js';
 
 /* 桥连接件的判别测试（四态判据写死）：桩 core.json ＋桩核心（IPC 层真实服务端）。
  * 全部临时根（makeTempDir），不触碰真实 ~/.waystation、不占站点端口段——端点走管道/套接字文件。 */
@@ -108,8 +108,6 @@ function linkFor(home, spawnFn, overrides = {}) {
     sessionId: 'session-bridge-1',
     log: quietLog(),
     spawn: spawnFn,
-    /* 测试缺省注入非服务探针：冷启用例零 powershell 开销（真实探针单独一个用例直测）。 */
-    sessionIdProbe: async () => 1,
     waitMs: 1500,
     pollMs: 25,
     waitingPollMs: 100,
@@ -155,47 +153,125 @@ test('四态·无文件：冷启 spawn（detached/剥离会话私有环境）→
   assert.equal('CLAUDE_CODE_MESSAGING_TOKEN' in call.options.env, false, '会话凭据不出桥进程');
 });
 
-test('服务上下文守卫：Session 0 拒绝冷启（service-session 失败、零 spawn、指引等用户会话启动）', { timeout: 15000 }, async (t) => {
-  const home = makeTempDir(t);
-  const sim = coldStartSimulator(t, home);
-  const link = linkFor(home, sim.spawnFn, { waitMs: 300, sessionIdProbe: async () => 0 });
-  t.after(() => link.close());
-  const outcome = await link.ensureCore();
-  assert.equal(outcome.ok, false);
-  assert.equal(outcome.kind, 'service-session');
-  assert.match(outcome.message, /Session 0/);
-  assert.match(outcome.message, /用户会话/);
-  assert.equal(sim.calls.length, 0, '服务上下文不得 spawn 核心（防 Session 0 管道锁死用户会话桥）');
-});
+/* —— 传输选择（TCP 环回优先 / 回退 / 回滚开关） —— */
 
-test('非服务会话：守卫放行冷启（探针返回 Session 1）', { timeout: 15000 }, async (t) => {
+test('传输：描述符带 TCP 端点时优先走 TCP', { timeout: 15000 }, async (t) => {
   const home = makeTempDir(t);
-  const sim = coldStartSimulator(t, home);
-  const link = linkFor(home, sim.spawnFn, { waitMs: 3000, sessionIdProbe: async () => 1 });
-  t.after(() => link.close());
-  const outcome = await link.ensureCore();
-  assert.equal(outcome.ok, true);
-  assert.equal(sim.calls.length, 1, '守卫放行后恰冷启一次');
-});
-
-test('守卫探针失败按非服务上下文处理（不挡冷启）', { timeout: 15000 }, async (t) => {
-  const home = makeTempDir(t);
-  const sim = coldStartSimulator(t, home);
-  const link = linkFor(home, sim.spawnFn, {
-    waitMs: 3000,
-    sessionIdProbe: async () => {
-      throw new Error('probe boom');
-    },
+  const stub = await startStubCore(t, home);
+  writeRecord(home, { ipc: { tcp: stub.tcp() } });
+  const link = linkFor(home, () => {
+    throw new Error('描述符就绪时不应冷启');
   });
   t.after(() => link.close());
+
   const outcome = await link.ensureCore();
+
   assert.equal(outcome.ok, true);
-  assert.equal(sim.calls.length, 1, '探针故障不得阻断冷启');
+  assert.equal(link.state.transport, 'tcp', '优先拨描述符里的环回 TCP');
+  assert.equal(link.state.transportFallbacks, 0);
 });
 
-test('真实探针（defaultSessionIdProbe）：本测试进程解析出非负会话号', { timeout: 20000 }, async () => {
-  const sessionId = await defaultSessionIdProbe();
-  assert.equal(Number.isInteger(sessionId) && sessionId >= 0, true, `会话号应为非负整数，实得 ${sessionId}`);
+test('传输：TCP 端点陈旧 → 回退旧端点一次并计数', { timeout: 20000 }, async (t) => {
+  const home = makeTempDir(t);
+  await startStubCore(t, home);
+  const deadPort = await pickFreePort();
+  writeRecord(home, { ipc: { tcp: { host: '127.0.0.1', port: deadPort } } });
+  const link = linkFor(home, () => {
+    throw new Error('描述符就绪时不应冷启');
+  });
+  t.after(() => link.close());
+
+  const outcome = await link.ensureCore();
+
+  assert.equal(outcome.ok, true, 'TCP 失败后旧端点仍可注册');
+  assert.equal(link.state.transport, 'legacy');
+  assert.equal(link.state.transportFallbacks, 1);
+});
+
+test('传输：描述符 host 非环回 → 拒绝拨入（回退旧端点，零外连）', { timeout: 15000 }, async (t) => {
+  const home = makeTempDir(t);
+  await startStubCore(t, home);
+  writeRecord(home, { ipc: { tcp: { host: '192.168.1.5', port: 9 } } });
+  const link = linkFor(home, () => {
+    throw new Error('描述符就绪时不应冷启');
+  });
+  t.after(() => link.close());
+
+  const outcome = await link.ensureCore();
+
+  assert.equal(outcome.ok, true);
+  assert.equal(link.state.transport, 'legacy', '非环回地址一律不拨——描述符被篡改也不外连');
+  assert.equal(link.state.transportFallbacks, 0, '直接按旧端点，无需回退计数');
+});
+
+test('传输：描述符端口非法 → 按旧端点（防御畸形描述符）', { timeout: 15000 }, async (t) => {
+  const home = makeTempDir(t);
+  await startStubCore(t, home);
+  writeRecord(home, { ipc: { tcp: { host: '127.0.0.1', port: 70000 } } });
+  const link = linkFor(home, () => {
+    throw new Error('描述符就绪时不应冷启');
+  });
+  t.after(() => link.close());
+
+  const outcome = await link.ensureCore();
+
+  assert.equal(outcome.ok, true);
+  assert.equal(link.state.transport, 'legacy');
+});
+
+test('传输：非法开关值按 auto 处理（仍优先 TCP）', { timeout: 15000 }, async (t) => {
+  const home = makeTempDir(t);
+  const stub = await startStubCore(t, home);
+  writeRecord(home, { ipc: { tcp: stub.tcp() } });
+  const link = linkFor(home, () => {
+    throw new Error('描述符就绪时不应冷启');
+  }, {
+    env: { WAYSTATION_HOME: home, WAYSTATION_IPC_TRANSPORT: 'bogus' },
+  });
+  t.after(() => link.close());
+
+  const outcome = await link.ensureCore();
+
+  assert.equal(outcome.ok, true);
+  assert.equal(link.state.transport, 'tcp', '非法值回落到 auto（优先 TCP）');
+});
+
+test('传输：WAYSTATION_IPC_TRANSPORT=pipe 强制旧端点（回滚开关）', { timeout: 15000 }, async (t) => {
+  const home = makeTempDir(t);
+  const stub = await startStubCore(t, home);
+  writeRecord(home, { ipc: { tcp: stub.tcp() } });
+  const link = linkFor(home, () => {
+    throw new Error('描述符就绪时不应冷启');
+  }, {
+    env: { WAYSTATION_HOME: home, WAYSTATION_IPC_TRANSPORT: 'pipe' },
+  });
+  t.after(() => link.close());
+
+  const outcome = await link.ensureCore();
+
+  assert.equal(outcome.ok, true);
+  assert.equal(link.state.transport, 'legacy');
+  assert.equal(link.state.transportFallbacks, 0, '强制旧端点不走 TCP，无回退计数');
+});
+
+test('重生流：核心断开后后台自动重连并重注册（不依赖工具调用）', { timeout: 20000 }, async (t) => {
+  const home = makeTempDir(t);
+  writeRecord(home);
+  const first = await startStubCore(t, home);
+  const link = linkFor(home, () => {
+    throw new Error('描述符就绪时不应冷启');
+  }, { waitMs: 500, pollMs: 25, slowRetryMs: 100, fastRetryMs: 0 });
+  t.after(() => link.close());
+  assert.equal((await link.ensureCore()).ok, true);
+
+  await first.close();
+  await waitFor(() => link.state.registered === false, { timeoutMs: 5000 });
+
+  await startStubCore(t, home);
+  await waitFor(() => link.state.registered === true, { timeoutMs: 10000 });
+  assert.equal(link.state.rebirth, false, '重注册后退出重生流');
+  assert.equal(typeof link.state.lastReconnectMs, 'number', '观测面记录重连耗时');
+  assert.equal(link.state.lastReconnectMs >= 0, true);
 });
 
 test('hello 携启动期会话元数据：注册记录的 role/name/kind 等来自 hello', { timeout: 15000 }, async (t) => {
