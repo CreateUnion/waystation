@@ -59,7 +59,12 @@ test('空闲内存等于阈值：不警告（严格小于才触发）', (t) => {
 });
 
 test('组员数达到 max_slaves：给出当前组员数与释放建议', (t) => {
-  const node = makeDispatchNode(t, { config: { dispatch: { resource_guard: { max_slaves: 2 } } } });
+  /* 固定内存探针：本用例只测组员数提醒；不注入时全量并行会读真实空闲内存，
+   * 低于默认阈值 2048 MB 时多出一条内存告警（expected 1, actual 2）。 */
+  const node = makeDispatchNode(t, {
+    freeMemMB: 8192,
+    config: { dispatch: { resource_guard: { max_slaves: 2 } } },
+  });
   withWorker2(node);
   createDispatch(node);
   const result = node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['worker-1', 'worker-2'] });
