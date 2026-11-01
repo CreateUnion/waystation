@@ -36,11 +36,11 @@ test('心跳未超时：新 master 创建被拒，给出剩余等待时间', (t)
   assert.match(String(refused.message), /调度长.*活跃|剩余/);
 });
 
-test('心跳超时：新 master 原地接管，collabId / 组员 / 任务表原样移交', (t) => {
+test('心跳超时：新 master 原地接管，collabId / 组员 / 任务表原样移交', async (t) => {
   const node = makeNode(t);
   const created = createDispatch(node, '换届');
   node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['worker-1'] });
-  node.service.dispatch.send({
+  await node.service.dispatch.send({
     collabId: created.collabId, sessionId: 'master-1', text: '在途任务', type: 'task', toSessionIds: ['worker-1'], taskId: 't1',
   });
   node.advance(180001);
@@ -69,13 +69,13 @@ test('心跳超时：新 master 原地接管，collabId / 组员 / 任务表原�
   );
 });
 
-test('旧 master 恢复后发消息 / 再创建：明确拒绝并提示已被接管', (t) => {
+test('旧 master 恢复后发消息 / 再创建：明确拒绝并提示已被接管', async (t) => {
   const node = makeNode(t);
   const created = createDispatch(node);
   node.advance(180001);
   assert.equal(node.service.create({ mode: 'dispatch', name: '新', sessionId: 'master-2' }).ok, true);
 
-  const oldSend = node.service.dispatch.send({ collabId: created.collabId, sessionId: 'master-1', text: '还在吗' });
+  const oldSend = await node.service.dispatch.send({ collabId: created.collabId, sessionId: 'master-1', text: '还在吗' });
   assert.equal(oldSend.ok, false);
   assert.equal(oldSend.code, 'dispatch-taken-over');
   assert.match(String(oldSend.message), /已被接管/);

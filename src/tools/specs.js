@@ -233,7 +233,7 @@ export const WS_VIEW_LEDGER_SPEC = {
 
 export const WS_SEND_MESSAGE_SPEC = {
   name: 'ws_send_message',
-  description: '发送协作域消息（发送者须为本机活跃且非 unverified 席位）：星型路由——成员发给站长，站长省略 to 即发全体成员；按目标机器去重、一机一帧，返回逐机器 msgId；席位宽限内断连的帧由本机核心暂存、重连后补投，判离席或冻结期丢弃，不保证送达。to＝目标实例/地址，配可选 toSessionId（会话，短码或完整标识，精确匹配；只给会话参数会被拒绝）。讨论模式为发帖（人人可见、to / toSessionId 一律拒绝）：默认经中继（发起人）投递（成员投稿至中继、由其转达全员），中继不可达时自动降级直投——返回的 route 字段如实标注本机走的路（relay/degraded/fanout）、results 为投稿或直投的受理态，成员级结果经中继聚合捎回、未达者由对方周期对表收敛。调度（dispatch，本机编排；消息流水不落盘、编排状态默认持久化）另走一套：消息只经本机核心投递、不落盘，type 取 task / progress / result / error，定向用 toSessionIds（省略即调度长→全体已收编组员、组员→调度长），可用 taskId 关联任务；不接受 to / toSessionId',
+  description: '发送协作域消息（发送者须为本机活跃且非 unverified 席位）：星型路由——成员发给站长，站长省略 to 即发全体成员；按目标机器去重、一机一帧，返回逐机器 msgId；席位宽限内断连的帧由本机核心暂存、重连后补投，判离席或冻结期丢弃，不保证送达。返回的 delivery 字段给出逐目标送达态：delivered（已投进目标会话）/ queued（暂存待补投，附 queuedUntil 宽限截止）/ failed（附原因），state 归并为 delivered / queued / failed / partial。to＝目标实例/地址，配可选 toSessionId（会话，短码或完整标识，精确匹配；只给会话参数会被拒绝）。讨论模式为发帖（人人可见、to / toSessionId 一律拒绝）：默认经中继（发起人）投递（成员投稿至中继、由其转达全员），中继不可达时自动降级直投——返回的 route 字段如实标注本机走的路（relay/degraded/fanout）、results 为投稿或直投的受理态，成员级结果经中继聚合捎回、未达者由对方周期对表收敛。调度（dispatch，本机编排；消息流水不落盘、编排状态默认持久化）另走一套：消息只经本机核心投递、不落盘，type 取 task / progress / result / error，定向用 toSessionIds（省略即调度长→全体已收编组员、组员→调度长），可用 taskId 关联任务；不接受 to / toSessionId。requireAck 仅 dispatch 调度长的 task：投递文本附回执指引，目标会话用 ackFor 回执后核心另行通知调度长（delivery.ack.pending 为待确认 msgId）；ackFor 是独立回执动作，不与定向/任务字段并用',
   inputSchema: {
     type: 'object',
     properties: {
@@ -244,6 +244,8 @@ export const WS_SEND_MESSAGE_SPEC = {
       toSessionId: { type: 'string', description: '目标会话（可选，须与 to 同时给出；短码或完整标识，精确匹配、不做前缀展开；歧义或无匹配即拒绝）——只投该机器上的这一会话；讨论与 dispatch 一律拒绝' },
       toSessionIds: { type: 'array', items: { type: 'string' }, description: '仅 dispatch：目标会话数组；省略时由核心按绑定路由（master→全体已收编 slave、slave→master）。managed / forum 使用会报错' },
       taskId: { type: 'string', description: '仅 dispatch：任务关联键（可选，1–64 字符），随消息投递给目标；managed / forum 使用会报错' },
+      requireAck: { type: 'boolean', description: '仅 dispatch 调度长发出的 task：要求目标会话回执确认（可选，默认 false）；回执到达时核心另行通知调度长。其他模式/类型使用会报错' },
+      ackFor: { type: 'string', description: '仅 dispatch：确认收到的消息 msgId（取自投递文本中的回执指引）；只能由该消息的目标会话回执，不能与 toSessionIds / taskId / requireAck / type 同时使用。managed / forum 使用会报错' },
     },
     required: ['collabId', 'text'],
   },

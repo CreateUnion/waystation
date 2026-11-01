@@ -39,7 +39,7 @@ import {
   STARTUP_DEADLINE_MS, acquireCoreLock, createArbiter, createBridgeRegistry, createChangeoverSeat,
   createEndpointProbe, createGraceWindow, createOwnedHeartbeat, createPeriodicRetry, createPortDetector,
   createWaitingLifetime, degradedDetailOf, lifecycleParams, pidIsAlive, readCoreRecord, readPersistentCore,
-  removeOwnCoreRecord, sameProcessRecord, startHeartbeat, testNumber, waitingDetailOf,
+  removeOwnCoreRecord, sameCoreRecord, sameProcessRecord, startHeartbeat, testNumber, waitingDetailOf,
 } from './lifecycle.js';
 
 /* 核心组合根与启动序（设计 §3.1-6）：本数据根唯一的常驻驿站进程——数据、网络、定时器与工具执行的
@@ -958,6 +958,8 @@ function deliveryWiringOf(state) {
   return {
     notify: (frame) => state.routing.notify(frame),
     deliverSeat: (frame, seat) => state.routing.deliverToSeat(seat.sessionId, frame),
+    /* dispatch 域按 sessionId 直投（帧内已携 targetSessionId）：等 bridge 回执后才算「已投进会话」。 */
+    deliverDispatch: (frame, sessionId) => state.routing.deliverToSeat(sessionId, frame),
     deliveryStatusOf: (msgId) => state.dispatch?.deliveryStatusOf?.(msgId) ?? null,
     localSeatDeliveryOf: (msgId, sessionId) => state.inbound?.localSeatDeliveryOf?.(msgId, sessionId)
       ?? { collabId: null, msgId, sessionId, status: 'unknown', complete: false },
@@ -1585,7 +1587,15 @@ async function refuseStartup(state, error) {
   state.detector?.close();
   await recycleComponents(state);
   try {
-    writeCoreRecord(state);
+    /* 只写自己仍持有的锁：多核并发冷启时，失败核可能晚于成功核的启动窗口才收场——
+     * 无条件写会把成功核的 ready 描述符覆盖成 startupError，桥随后拒绝再冷启（永久卡死）。
+     * 对证失败＝锁已不属于本进程，保留继任者描述符。 */
+    const latest = readCoreRecord(state.corePath);
+    if (latest.ok && sameCoreRecord(state.record, latest.record)) {
+      writeCoreRecord(state);
+    } else {
+      state.log?.warn?.('启动失败的运行描述符未写入（锁已不属于本进程——保留继任者描述符）');
+    }
   } catch {
     // run/ 自身不可写：原因写不进——如实只剩退出码
   }

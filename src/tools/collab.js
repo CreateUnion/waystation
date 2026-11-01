@@ -372,7 +372,12 @@ function sendMessageArgsOf(args) {
   if (basics.error !== undefined) {
     return basics;
   }
-  /* dispatch 专属字段不得被 managed / forum 静默忽略：忽略会造出「定向了却没定向」的假象。 */
+  /* dispatch 专属字段不得被 managed / forum 静默忽略：忽略会造出「定向了却没定向」的假象。
+   * requireAck / ackFor 同属 dispatch 专属（managed 的机器级 ack 是协议层，不是会话级确认）。 */
+  const ackRefusal = dispatchAckFieldsRefusalOf(args);
+  if (ackRefusal !== null) {
+    return { error: ackRefusal };
+  }
   const dispatchOnlyRefusal = dispatchOnlyFieldsRefusalOf(args);
   if (dispatchOnlyRefusal !== null) {
     return { error: dispatchOnlyRefusal };
@@ -410,6 +415,14 @@ function dispatchOnlyFieldsRefusalOf(args) {
     : null;
 }
 
+/* requireAck / ackFor 属 dispatch 会话级确认；managed/forum 的机器级 ack 由协议层自动完成，
+ * 不接受这两个字段（静默忽略会让调用方误以为拿到了「目标会话确认」）。 */
+function dispatchAckFieldsRefusalOf(args) {
+  return args.requireAck !== undefined || args.ackFor !== undefined
+    ? 'requireAck / ackFor 只用于 dispatch 模式（managed / forum 的机器级 ack 由协议层自动完成）'
+    : null;
+}
+
 /* dispatch 参数面（纯本机内存域）：type 只认四类词表；定向用 toSessionIds 数组
  * （省略即由核心按绑定路由：master→全体 slave、slave→master），不接受 to / toSessionId
  * （实例 + 会话的两段式定位在单机域里没有意义）；taskId 是任务的关联键，≤64 字符。 */
@@ -418,6 +431,21 @@ function dispatchSendArgsOf(args) {
   if (basics.error !== undefined) {
     return basics;
   }
+  const ackFor = ackForArgOf(args);
+  if (ackFor.error !== undefined) {
+    return ackFor;
+  }
+  const requireAck = requireAckArgOf(args);
+  if (requireAck.error !== undefined) {
+    return requireAck;
+  }
+  if (ackFor.value !== undefined) {
+    const conflict = ackConflictOf(args);
+    if (conflict !== null) {
+      return { error: conflict };
+    }
+    return { value: { text: basics.value.text, ackFor: ackFor.value } };
+  }
   const targets = dispatchTargetsArgOf(args.toSessionIds);
   if (targets.error !== undefined) {
     return targets;
@@ -425,7 +453,40 @@ function dispatchSendArgsOf(args) {
   if (args.taskId !== undefined && !isDispatchTaskId(args.taskId)) {
     return { error: 'taskId 非法：需要 1–64 字符的非空白字符串' };
   }
-  return { value: { text: basics.value.text, type: args.type, toSessionIds: targets.value, taskId: args.taskId?.trim() } };
+  return {
+    value: {
+      text: basics.value.text, type: args.type, toSessionIds: targets.value,
+      taskId: args.taskId?.trim(), requireAck: requireAck.value,
+    },
+  };
+}
+
+/* 会话级确认必须是原消息 msgId（1–64 位字母数字与连字符），形态不对直接拒绝。 */
+function ackForArgOf(args) {
+  if (args.ackFor === undefined) {
+    return { value: undefined };
+  }
+  const value = typeof args.ackFor === 'string' ? args.ackFor.trim() : '';
+  return ID_PATTERN.test(value)
+    ? { value }
+    : { error: '参数 ackFor 非法：需要消息标识（1–64 位字母数字与连字符，取自待确认消息的回执指引）' };
+}
+
+function requireAckArgOf(args) {
+  if (args.requireAck === undefined) {
+    return { value: undefined };
+  }
+  return typeof args.requireAck === 'boolean'
+    ? { value: args.requireAck }
+    : { error: '参数 requireAck 非法：需要布尔值' };
+}
+
+/* ackFor 是独立回执动作：不得同时定向/关联任务/再要求确认/声明消息类型——组合语义会分叉。 */
+function ackConflictOf(args) {
+  if (args.toSessionIds !== undefined || args.taskId !== undefined || args.requireAck !== undefined || args.type !== undefined) {
+    return 'ackFor 回执不能与 toSessionIds / taskId / requireAck / type 同时使用';
+  }
+  return null;
 }
 
 function dispatchBasicsOf(args) {

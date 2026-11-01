@@ -64,6 +64,7 @@ function serviceOptionsOf({ dataDir, options, meta, notify, nowOf, log }) {
     knownHosts: { remember: () => {}, lookup: () => undefined },
     notify,
     deliverSeat: () => true,
+    ...(options.deliverDispatch === undefined ? {} : { deliverDispatch: options.deliverDispatch }),
     log,
     syncPeerPicker: () => [],
     now: nowOf,

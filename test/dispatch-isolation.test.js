@@ -40,7 +40,7 @@ test('LAN 准入：dispatch collabId 的伪造 task/progress/result/error 一律
   assert.equal(node.service.stats().dispatchLanRejected, types.length, 'LAN 拒绝逐帧计数留痕');
 });
 
-test('零文件：dispatch 创建 / 消息 / 结束不新增 collabs/ 文件', (t) => {
+test('零文件：dispatch 创建 / 消息 / 结束不新增 collabs/ 文件', async (t) => {
   const node = makeDispatchNode(t);
   const collabsDir = join(node.dataDir, 'collabs');
   const listCollabFiles = () => (existsSync(collabsDir) ? readdirSync(collabsDir, { recursive: true }).sort() : []);
@@ -48,7 +48,7 @@ test('零文件：dispatch 创建 / 消息 / 结束不新增 collabs/ 文件', (
   const created = node.service.create({ mode: 'dispatch', name: '零文件', sessionId: 'master-1' });
   assert.equal(created.ok, true, String(created.message));
   node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['worker-1'] });
-  node.service.dispatch.send({ collabId: created.collabId, sessionId: 'master-1', text: 'x', toSessionIds: ['worker-1'] });
+  await node.service.dispatch.send({ collabId: created.collabId, sessionId: 'master-1', text: 'x', toSessionIds: ['worker-1'] });
   node.service.dispatch.end({ collabId: created.collabId, sessionId: 'master-1' });
   const after = listCollabFiles();
   assert.deepEqual(after, before, 'dispatch 生命周期不得在 collabs/ 留下任何文件');

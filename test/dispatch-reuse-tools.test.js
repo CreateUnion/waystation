@@ -25,7 +25,40 @@ test('ws_send_message：dispatch 接受 toSessionIds / taskId / result', async (
   assert.match(empty.content[0].text, /toSessionIds 非法/);
 });
 
-test('ws_send_message：非 dispatch 拒绝 toSessionIds / taskId', async () => {
+test('ws_send_message：requireAck 走工具面，目标会话用 ackFor 回执', async (t) => {
+  const node = makeDispatchNode(t);
+  const created = node.service.create({ mode: 'dispatch', name: '工具确认', sessionId: 'master-1' });
+  node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['worker-1'] });
+  const sent = await sendMessageTool().handler({
+    collabId: created.collabId, text: '任务', type: 'task', toSessionIds: ['worker-1'], requireAck: true,
+  }, contextOf(node, 'master-1'));
+  assert.equal(sent.isError, undefined);
+  const payload = JSON.parse(sent.content[0].text);
+  assert.equal(payload.delivery.ack.required, true);
+  const msgId = payload.delivery.ack.pending[0];
+  const acked = await sendMessageTool().handler({
+    collabId: created.collabId, text: '收到', ackFor: msgId,
+  }, contextOf(node, 'worker-1'));
+  assert.equal(acked.isError, undefined);
+  assert.equal(JSON.parse(acked.content[0].text).acked, true);
+  const badShape = await sendMessageTool().handler({
+    collabId: created.collabId, text: 'x', ackFor: 'bad id!',
+  }, contextOf(node, 'worker-1'));
+  assert.equal(badShape.isError, true);
+  assert.match(badShape.content[0].text, /ackFor 非法/);
+});
+
+test('ws_send_message：非 dispatch 拒绝 toSessionIds / taskId 与 ack 字段', async () => {
+  const context = { collab: { dispatch: { isDispatch: () => false } }, sessionId: 'master-1', net: {} };
+  const toSessionIds = await sendMessageTool().handler({ collabId: 'collab-managed', text: 'x', toSessionIds: ['worker-1'], taskId: 't-1' }, context);
+  assert.equal(toSessionIds.isError, true);
+  assert.match(toSessionIds.content[0].text, /只用于 dispatch/);
+  const ack = await sendMessageTool().handler({ collabId: 'collab-managed', text: 'x', requireAck: true }, context);
+  assert.equal(ack.isError, true);
+  assert.match(ack.content[0].text, /只用于 dispatch/);
+});
+
+test('ws_send_message：非 dispatch 拒绝 toSessionIds / taskId（既有口径）', async () => {
   const result = await sendMessageTool().handler({
     collabId: 'collab-managed', text: 'x', toSessionIds: ['worker-1'], taskId: 't-1',
   }, { collab: { dispatch: { isDispatch: () => false } }, sessionId: 'master-1', net: {} });

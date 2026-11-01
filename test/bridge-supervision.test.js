@@ -11,6 +11,7 @@ import { coreJsonPath, runDir } from '../src/paths.js';
 import { killGuarded, probeEndpointPresence } from '../src/core/stop-guard.js';
 import { createCoreLink } from '../src/bridge/ipc-client.js';
 import { createBridgeRuntime } from '../src/bridge/main.js';
+import { createHeartbeatLoop } from '../src/bridge/heartbeat.js';
 
 /* 桥监督判别测试（设计 §2.6 硬杀防护链／§3.3 崩溃矩阵）：stop-guard 五分支与 pid 复用防护、
  * 崩溃→重生→重注册链（快速重试上界→慢速转换）、僵尸核硬杀冷启、降级上报、桥运行时接线、
@@ -552,6 +553,139 @@ test('监督：等待预算为硬期限——只接不说的端点下仍按预�
   const elapsed = Date.now() - started;
   assert.equal(outcome.ok, false);
   assert.ok(elapsed < 2000, `预算 300ms 一档收口（实际 ${elapsed}ms——未钳制时为连接 5s＋握手 10s 叠加）`);
+});
+
+/* —— 桥层心跳（问题 7）：显式 ping、超时强制重连、未注册态监督 —— */
+
+/* 静默核：完成 IPC 握手后不再应答任何帧（心跳超时的最小复现；真实桩核会自动回 pong）。 */
+async function startSilentTcpCore(t) {
+  const sockets = new Set();
+  const welcome = {
+    type: 'welcome', ok: true, v: IPC_VERSION, app: STUB_APP_VERSION, corePid: process.pid,
+    dataDir: 'silent-core', identity: { instanceId: 'inst-silent', identityName: 'silent' },
+    port: 7500, net: { available: true, degraded: false }, persistent: false, bridges: 1,
+  };
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+    socket.on('error', () => {});
+    let buffer = '';
+    let welcomed = false;
+    socket.on('data', (chunk) => {
+      if (welcomed) {
+        return;
+      }
+      buffer += chunk.toString('utf8');
+      if (!buffer.includes('\n')) {
+        return;
+      }
+      welcomed = true;
+      socket.write(`${JSON.stringify(welcome)}\n`);
+    });
+  });
+  await new Promise((resolve) => {
+    server.listen({ host: '127.0.0.1', port: 0 }, resolve);
+  });
+  t.after(() => {
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    server.close();
+  });
+  return server.address().port;
+}
+
+test('心跳：已注册连接 ping 有应答 → ok，不触发重连', { timeout: 15000 }, async (t) => {
+  const home = makeTempDir(t);
+  writeRecordFile(home);
+  await startStubCore(t, home);
+  const link = linkFor(home, spawnRecorder().spawnFn, { heartbeatTimeoutMs: 200 });
+  t.after(() => link.close());
+  assert.equal((await link.ensureCore()).ok, true);
+  assert.deepEqual(await link.heartbeat({ timeoutMs: 200 }), { ok: true, reconnected: false });
+  assert.equal(link.state.registered, true, '有应答不改变注册态');
+});
+
+test('心跳：静默核超时 → 强制断开并进入重生流（快速重试窗口不参与判定）', { timeout: 15000 }, async (t) => {
+  const home = makeTempDir(t);
+  const port = await startSilentTcpCore(t);
+  writeRecordFile(home, { ipc: { tcp: { host: '127.0.0.1', port } } });
+  const link = linkFor(home, spawnRecorder().spawnFn, {
+    env: { WAYSTATION_HOME: home, CLAUDE_CODE_SESSION_ID: 'session-supervision-1', WAYSTATION_IPC_TRANSPORT: 'tcp' },
+    fastRetryMs: 3600000,
+    slowRetryMs: 3600000,
+    heartbeatTimeoutMs: 100,
+  });
+  t.after(() => link.close());
+  assert.equal((await link.ensureCore()).ok, true);
+  const beat = await link.heartbeat({ timeoutMs: 50 });
+  assert.equal(beat.ok, false);
+  assert.equal(beat.kind, 'heartbeat-timeout');
+  assert.equal(link.state.registered, false, '超时后已进入重生流');
+});
+
+test('心跳监督：60s 慢速窗口内仍能自行冷启并重注册（未注册态每拍走 ensureCore）', { timeout: 20000 }, async (t) => {
+  const home = makeTempDir(t);
+  writeRecordFile(home);
+  const server = await startStubCore(t, home);
+  const sim = coldStartSim(t, home);
+  const registered = [];
+  const link = linkFor(home, sim.spawnFn, { fastRetryMs: 3600000, slowRetryMs: 3600000 });
+  link.setRegisteredHandler((_welcome, meta) => registered.push(meta));
+  const loop = createHeartbeatLoop({ link, intervalMs: 20, timeoutMs: 200 });
+  t.after(async () => {
+    loop.stop();
+    await link.close();
+  });
+  assert.equal((await link.ensureCore()).ok, true);
+  const dead = spawnSync(process.execPath, ['-e', '']);
+  writeRecordFile(home, { pid: dead.pid, status: 'ready' });
+  await server.close();
+  await waitFor(() => link.state.registered === false, { timeoutMs: 3000 });
+  loop.start();
+  await waitFor(() => link.state.registered === true, { timeoutMs: 8000 });
+  assert.deepEqual(registered.map((meta) => meta.reborn), [false, true], '心跳监督带回的是重生后重注册');
+  assert.equal(sim.latestServer().listBridges()[0]?.sessionId, 'session-supervision-1', 'hello 重新上报 sessionId（核心侧 seat rebind 输入）');
+  assert.equal(sim.calls.length, 1, '恰冷启一次（配额与 inFlight 去重照常）');
+});
+
+/* —— startupError 判定与冷启配额 —— */
+
+test('startupError：失败进程已死 → 按陈旧记录重新冷启；进程活且心跳新鲜 → 仍按启动失败收口', { timeout: 15000 }, async (t) => {
+  const home = makeTempDir(t);
+  const dead = spawnSync(process.execPath, ['-e', '']);
+  writeRecordFile(home, { pid: dead.pid, startupError: 'EPERM: rename core.json' });
+  const recorder = spawnRecorder();
+  const link = linkFor(home, recorder.spawnFn, { waitMs: 100, pollMs: 10, fastRetryMs: 3600000, slowRetryMs: 3600000 });
+  t.after(() => link.close());
+  assert.equal((await link.ensureCore()).ok, false);
+  assert.equal(recorder.calls.length, 1, '陈旧 startupError（pid 已死）允许重新冷启');
+
+  const home2 = makeTempDir(t);
+  writeRecordFile(home2, { pid: process.pid, startupError: 'boom', heartbeatAt: freshIso() });
+  const recorder2 = spawnRecorder();
+  const link2 = linkFor(home2, recorder2.spawnFn, { waitMs: 100, pollMs: 10, fastRetryMs: 3600000, slowRetryMs: 3600000 });
+  t.after(() => link2.close());
+  const failed = await link2.ensureCore();
+  assert.equal(failed.ok, false);
+  assert.match(failed.message, /启动失败/);
+  assert.equal(recorder2.calls.length, 0, '失败进程仍活且心跳新鲜：不冷启（防崩溃环）');
+});
+
+test('冷启配额：3 次/10 分钟，第 4 次返回 cold-start-limited（心跳不会退化成 spawn 风暴）', { timeout: 15000 }, async (t) => {
+  const home = makeTempDir(t);
+  const dead = spawnSync(process.execPath, ['-e', '']);
+  writeRecordFile(home, { pid: dead.pid, startupError: 'persistent failure' });
+  const recorder = spawnRecorder();
+  const link = linkFor(home, recorder.spawnFn, { waitMs: 50, pollMs: 10, fastRetryMs: 3600000, slowRetryMs: 3600000 });
+  t.after(() => link.close());
+  for (let round = 0; round < 3; round++) {
+    assert.equal((await link.ensureCore()).ok, false);
+  }
+  const limited = await link.ensureCore();
+  assert.equal(limited.ok, false);
+  assert.equal(limited.kind, 'cold-start-limited', '第 4 次被配额拦截');
+  assert.equal(recorder.calls.length, 3, '真正 spawn 恰好三次');
 });
 
 /* —— 桥运行时接线：崩溃→重生→重注册链经组合根成立 —— */

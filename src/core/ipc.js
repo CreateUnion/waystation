@@ -935,7 +935,8 @@ function listBridges(state) {
  *   connectTimeoutMs?: number,
  *   handshakeTimeoutMs?: number,
  * }} options
- * @returns {{ endpoint: string | { host: string, port: number }, state: any, connect: () => Promise<any>, send: (frame: any) => boolean, close: () => Promise<void> }}
+ * @returns {{ endpoint: string | { host: string, port: number }, state: any, connect: () => Promise<any>, send: (frame: any) => boolean,
+ *   probe: (timeoutMs?: number) => Promise<boolean>, close: () => Promise<void> }}
  */
 export function createIpcClient(options) {
   const state = buildClientState(options);
@@ -944,6 +945,10 @@ export function createIpcClient(options) {
     state: state.view,
     connect: () => connect(state),
     send: (frame) => sendToCore(state, frame),
+    /* 主动存活探测（桥层心跳的落点）：发 ping，等任意新的入站帧；超时返回 false。
+     * 连接层既有的 10s ping/30s 判卡死继续保留——本方法是「显式探测」入口，语义为
+     * 「这一刻核心还能不能应答」，供上层决定是否强制重连。 */
+    probe: (timeoutMs) => probeClient(state, timeoutMs),
     close: () => closeClient(state),
   };
 }
@@ -977,6 +982,10 @@ function buildClientState({ dataDir, endpoint, hello, onFrame, onStuck, onClose,
     registered: false,
     closeReason: 'peer',
     lastFrameAt: 0,
+    /* 入站帧序号＋显式探测等待表：probeClient 用「帧序号是否前移」判活——
+     * 不依赖 pong 专用字段（pong 无 id），任何入站帧都证明连接在应答。 */
+    frameSeq: 0,
+    probes: new Set(),
     /** @type {any} */
     socket: null,
     /** @type {any} */
@@ -1073,6 +1082,8 @@ function errorWithCode(code, message) {
 
 function handleClientFrame(state, frame) {
   state.lastFrameAt = state.params.now();
+  state.frameSeq++;
+  resolveProbes(state);
   const checked = validateIpcFrame(frame);
   if (!checked.ok) {
     countClientRefusal(state, 'invalid', checked.reason);
@@ -1138,6 +1149,53 @@ function tickClient(state) {
   sendToCore(state, { type: 'ping' });
 }
 
+/* 显式存活探测：基线＝当前帧序号，发 ping 后等任一入站帧（pong / 业务帧均可）。
+ * 未注册或无可用连接直接判 false（调用方据此走重生流）；期限到仍未前移即 false。
+ * 等待期登记在 state.probes，连接关闭时统一收口为 false（不留悬挂 promise）。 */
+function probeClient(state, timeoutMs = state.params.peerTimeoutMs) {
+  if (!state.registered || state.socket === null || state.socket.destroyed) {
+    return Promise.resolve(false);
+  }
+  const baseline = state.frameSeq;
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (alive) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      state.probes.delete(waiter);
+      resolve(alive);
+    };
+    const waiter = (alive = true) => finish(alive);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    timer.unref?.();
+    state.probes.add(waiter);
+    if (!sendToCore(state, { type: 'ping' })) {
+      finish(false);
+      return;
+    }
+    /* 发送前后已有帧到达（极短连接 / 同步测试桩）：同样算活。 */
+    if (state.frameSeq !== baseline) {
+      finish(true);
+    }
+  });
+}
+
+function resolveProbes(state) {
+  for (const waiter of [...state.probes]) {
+    waiter();
+  }
+}
+
+function failProbes(state) {
+  for (const waiter of [...state.probes]) {
+    state.probes.delete(waiter);
+    waiter(false);
+  }
+}
+
 function sendToCore(state, frame) {
   const socket = state.socket;
   if (socket === null || socket.destroyed) {
@@ -1168,6 +1226,7 @@ function onClientClose(state) {
   clearTimeout(state.handshakeTimer);
   state.dialTimer = null;
   state.handshakeTimer = null;
+  failProbes(state);
   if (state.settle !== null) {
     failConnect(state, state.dialError?.code ?? 'closed', 'IPC 连接在握手完成前关闭');
     return;

@@ -1,6 +1,6 @@
 {
   "name": "waystation",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "局域网多机会话协作驿站（MCP stdio 进程）",
   "type": "module",
   "bin": {

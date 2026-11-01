@@ -879,8 +879,12 @@ function textRejectionOf(type, text) {
 async function deliverMessage(state, local, type, text, targets, fromSessionId) {
   const payload = payloadOf(type, text);
   const sent = await sendToSeats(state, { collabId: local.collabId, fromSessionId, type, payload, targets });
+  const sentFromSessionId = /** @type {any} */ (sent).fromSessionId ?? fromSessionId;
+  const delivery = managedDeliveryOf(state, sent.results, sentFromSessionId);
   if (sent.ok !== true) {
-    return { ok: false, message: `消息未入队（${failuresTextOf(sent)}）` };
+    /* 全部目标失败仍走既有 isError 收口（工具层是纯文本）；delivery 保留在服务结果里，
+     * 供直接调用方与测试读取逐目标原因（不改变既有成功/失败语义）。 */
+    return { ok: false, message: `消息未入队（${failuresTextOf(sent)}）`, delivery };
   }
   const delivered = sent.results.filter((entry) => entry.ok === true);
   const failed = sent.results.filter((entry) => entry.ok !== true);
@@ -888,6 +892,7 @@ async function deliverMessage(state, local, type, text, targets, fromSessionId) 
     ok: true,
     msgId: delivered.find((entry) => typeof entry.msgId === 'string')?.msgId,
     tier: 'queued',
+    delivery,
     to: delivered.map((entry) => entry.instanceId),
     /* 逐机器结果保留全部条目（成功带 msgId、失败带 reason）：部分失败不得被「ok:true」吞掉。 */
     results: sent.results.map((entry) => ({
@@ -910,6 +915,96 @@ async function deliverMessage(state, local, type, text, targets, fromSessionId) 
 function failuresTextOf(sent) {
   const reasons = sent.results.filter((entry) => entry.ok !== true).map((entry) => entry.reason ?? '未知原因');
   return reasons.length === 0 ? sent.reason ?? '未知原因' : reasons.join('；');
+}
+
+/* —— 送达态汇总（ws_send_message 的 delivery 增量字段） ——
+ * 本机旁路能拿到逐席位注入结果（已注入 / 暂存 / 丢弃）；远端机器只能确认「已受理入队」——
+ * 机器帧的 ack/第三档属协议层，目标会话是否注入由对端核报回，不能在本机这一步谎报 delivered。
+ * 因此远端 ok 一律 queued（附消息 TTL 作为宽限截止），失败带原因；本机逐席位如实映射。 */
+const MANAGED_DELIVERY_TTL_FALLBACK_MS = 7 * 24 * 60 * 60 * 1000;
+const MANAGED_DELIVERY_GRACE_FALLBACK_MS = 60 * 1000;
+
+function managedDeliveryOf(state, results, fromSessionId) {
+  const targets = [];
+  for (const entry of results ?? []) {
+    if (entry.local === true) {
+      targets.push(...localDeliveryTargetsOf(state, entry, fromSessionId));
+    } else {
+      targets.push(remoteDeliveryTargetOf(state, entry));
+    }
+  }
+  const counts = deliveryCountsOf(targets);
+  return { state: deliveryStateOf(counts, targets.length), ...counts, targets };
+}
+
+/* 本机旁路：逐席位结果映射；自己的席位（skipped: self）不是「目标」，从明细中剔除。 */
+function localDeliveryTargetsOf(state, entry, fromSessionId) {
+  return (entry.results ?? [])
+    .filter((seat) => !(seat.sessionId === fromSessionId && seat.status === 'skipped'))
+    .map((seat) => localDeliveryTargetOf(state, seat, entry.msgId));
+}
+
+function localDeliveryTargetOf(state, seat, msgId) {
+  if (seat.status === 'injected') {
+    return { sessionId: seat.sessionId, status: 'delivered', msgId };
+  }
+  if (seat.status === 'staged') {
+    return {
+      sessionId: seat.sessionId,
+      status: 'queued',
+      msgId,
+      queuedUntil: new Date(Date.now() + graceMsOf(state.config)).toISOString(),
+    };
+  }
+  return { sessionId: seat.sessionId, status: 'failed', msgId, reason: seat.reason ?? '本机注入未成功' };
+}
+
+function remoteDeliveryTargetOf(state, entry) {
+  if (entry.ok === true) {
+    return {
+      instanceId: entry.instanceId,
+      sessionIds: entry.sessionIds,
+      status: 'queued',
+      msgId: entry.msgId,
+      queuedUntil: new Date(Date.now() + messageTtlMsOf(state.config)).toISOString(),
+    };
+  }
+  return { instanceId: entry.instanceId, sessionIds: entry.sessionIds, status: 'failed', reason: entry.reason ?? '未知原因' };
+}
+
+function deliveryCountsOf(targets) {
+  const counts = { delivered: 0, queued: 0, failed: 0 };
+  for (const entry of targets) {
+    if (entry.status === 'delivered' || entry.status === 'queued' || entry.status === 'failed') {
+      counts[entry.status]++;
+    }
+  }
+  return counts;
+}
+
+function deliveryStateOf(counts, total) {
+  if (total > 0 && counts.delivered === total) {
+    return 'delivered';
+  }
+  if (total > 0 && counts.failed === total) {
+    return 'failed';
+  }
+  if (counts.delivered === 0 && counts.failed === 0) {
+    return 'queued';
+  }
+  return 'partial';
+}
+
+function messageTtlMsOf(config) {
+  return Number.isInteger(config?.messageTtlMs) && config.messageTtlMs > 0
+    ? config.messageTtlMs
+    : MANAGED_DELIVERY_TTL_FALLBACK_MS;
+}
+
+function graceMsOf(config) {
+  return Number.isInteger(config?.sessionSeatGraceMs) && config.sessionSeatGraceMs >= 0
+    ? config.sessionSeatGraceMs
+    : MANAGED_DELIVERY_GRACE_FALLBACK_MS;
 }
 
 /* 讨论模式发帖（设计 §5.2）：to 一律拒绝（讨论不设定向）；kind 按徽标词表、text 沿消息文本
@@ -944,8 +1039,31 @@ async function sendForumPost(state, local, { text, type, to, sessionId }) {
     route: routed.route,
     to: routed.results.map((entry) => entry.instanceId),
     results: routed.results,
+    delivery: forumDeliveryOf(routed.results),
     note: routed.note,
   };
+}
+
+/* 讨论帖的 delivery：受理成功＝queued（短重试 + 周期对表收敛，不落持久队列；10 分钟为短时
+ * 投递记录的保留窗）；未受理＝failed。中继路径下目标是中继机器，成员级结果由中继聚合捎回。 */
+const FORUM_DELIVERY_GRACE_MS = 10 * 60 * 1000;
+
+function forumDeliveryOf(results) {
+  const targets = (results ?? []).map((entry) => forumDeliveryTargetOf(entry));
+  const counts = deliveryCountsOf(targets);
+  return { state: deliveryStateOf(counts, targets.length), ...counts, targets };
+}
+
+function forumDeliveryTargetOf(entry) {
+  if (entry.ok === true) {
+    return {
+      instanceId: entry.instanceId,
+      status: 'queued',
+      msgId: entry.msgId,
+      queuedUntil: new Date(Date.now() + FORUM_DELIVERY_GRACE_MS).toISOString(),
+    };
+  }
+  return { instanceId: entry.instanceId, status: 'failed', reason: entry.reason ?? '未受理' };
 }
 
 /* 发帖前置与签发席位：成员资格、正文、发送席位三查都必须在分配 post 之前。发帖也是成员会话的

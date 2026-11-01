@@ -20,15 +20,15 @@ function createDispatch(node, name = '持久化') {
   return created;
 }
 
-test('创建 / 收编 / 任务状态变化落盘；新实例同数据根恢复 slave 与任务表', (t) => {
+test('创建 / 收编 / 任务状态变化落盘；新实例同数据根恢复 slave 与任务表', async (t) => {
   const dataDir = makeTempDir(t);
   const node = makeDispatchNode(t, { dataDir, config: { dispatch: { persist: true } } });
   const created = createDispatch(node);
   node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['worker-1'] });
-  node.service.dispatch.send({
+  await node.service.dispatch.send({
     collabId: created.collabId, sessionId: 'master-1', text: '跑接口层', type: 'task', toSessionIds: ['worker-1'], taskId: 't1',
   });
-  node.service.dispatch.send({
+  await node.service.dispatch.send({
     collabId: created.collabId, sessionId: 'worker-1', text: '接口层已完成', type: 'progress', taskId: 't1',
   });
 
@@ -148,7 +148,7 @@ test('位置迁移：两边都有 → 新位置优先，旧文件归档', (t) =>
   );
 });
 
-test('任务表保留期：已完成任务超过 dispatch_hours 后在下一次写盘时裁剪，未完成保留', (t) => {
+test('任务表保留期：已完成任务超过 dispatch_hours 后在下一次写盘时裁剪，未完成保留', async (t) => {
   const dataDir = makeTempDir(t);
   const node = makeDispatchNode(t, {
     dataDir,
@@ -156,14 +156,14 @@ test('任务表保留期：已完成任务超过 dispatch_hours 后在下一次�
   });
   const created = createDispatch(node);
   node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['worker-1'] });
-  node.service.dispatch.send({
+  await node.service.dispatch.send({
     collabId: created.collabId, sessionId: 'master-1', text: '旧任务', type: 'task', toSessionIds: ['worker-1'], taskId: 'old-task',
   });
-  node.service.dispatch.send({
+  await node.service.dispatch.send({
     collabId: created.collabId, sessionId: 'worker-1', text: '旧任务完成', type: 'result', taskId: 'old-task',
   });
   node.advance(2 * 60 * 60 * 1000);
-  node.service.dispatch.send({
+  await node.service.dispatch.send({
     collabId: created.collabId, sessionId: 'master-1', text: '新任务', type: 'task', toSessionIds: ['worker-1'], taskId: 'new-task',
   });
   const tasks = readState(dataDir).dispatch.tasks;
@@ -218,13 +218,13 @@ test('启动残留：待接管且 masterLastSeenAt 超过 dispatch_hours → 删
   assert.equal(existsSync(file), false, '超期残留状态文件删除');
 });
 
-test('普通消息（无 taskId）不触发写盘', (t) => {
+test('普通消息（无 taskId）不触发写盘', async (t) => {
   const dataDir = makeTempDir(t);
   const node = makeDispatchNode(t, { dataDir, config: { dispatch: { persist: true } } });
   const created = createDispatch(node);
   node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['worker-1'] });
   const before = readFileSync(statePathOf(dataDir), 'utf8');
-  node.service.dispatch.send({
+  await node.service.dispatch.send({
     collabId: created.collabId, sessionId: 'master-1', text: '普通消息', toSessionIds: ['worker-1'],
   });
   assert.equal(readFileSync(statePathOf(dataDir), 'utf8'), before, '无 taskId 的消息不改变持久面');
