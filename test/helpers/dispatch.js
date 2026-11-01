@@ -65,6 +65,8 @@ function serviceOptionsOf({ dataDir, options, meta, notify, nowOf, log }) {
     notify,
     deliverSeat: () => true,
     ...(options.deliverDispatch === undefined ? {} : { deliverDispatch: options.deliverDispatch }),
+    ...(options.freeMemMB === undefined ? {} : { freeMemMBOf: () => options.freeMemMB }),
+    ...(options.freeMemMBOf === undefined ? {} : { freeMemMBOf: options.freeMemMBOf }),
     log,
     syncPeerPicker: () => [],
     now: nowOf,

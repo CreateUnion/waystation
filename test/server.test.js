@@ -148,8 +148,8 @@ async function connectClient(t, entry, home, extraConfig = {}, sessionId = null)
   return client;
 }
 
-async function fetchStatus(client) {
-  const called = await client.callTool({ name: 'ws_status', arguments: {} });
+async function fetchStatus(client, args = {}) {
+  const called = await client.callTool({ name: 'ws_status', arguments: args });
   return JSON.parse(called.content[0].text);
 }
 
@@ -263,7 +263,7 @@ test('stdio 骨架：进程可起、ws_status 可调、网络层就绪、数据�
   const client = await connectClient(t, INDEX_ENTRY, home, { port });
   const { tools } = await client.listTools();
   assert.deepEqual(tools.map((tool) => tool.name), ['ws_status', 'ws_list_hosts', 'ws_ping', 'ws_delivery_status', 'ws_check_inbox', 'ws_list_collabs', 'ws_create_collab', 'ws_approve_invite', 'ws_allow_next_invite', 'ws_set_confirm_gate', 'ws_dispatch_scan', 'ws_dispatch_claim', 'ws_dispatch_approve', 'ws_dispatch_release', 'ws_dispatch_rules_reload', 'ws_withdraw_invite', 'ws_view_ledger', 'ws_send_message', 'ws_set_mute', 'ws_leave_collab', 'ws_end_collab', 'ws_invite', 'ws_request_join', 'ws_join', 'ws_approve_join', 'ws_decide', 'ws_handover', 'ws_take_over']);
-  const status = await fetchStatus(client);
+  const status = await fetchStatus(client, { view: 'full' });
   assert.equal(status.name, 'waystation');
   assert.equal(status.version, JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')).version, 'ws_status 版本与包版本一致');
   assert.match(status.instanceId, UUID_PATTERN);
@@ -391,7 +391,7 @@ test('端口占用一：显式端口被另一驿站占 → ② 降级服务（re
   assert.equal((await fetchStatus(clientA)).net.available, true);
   const homeB = makeStationHome(t);
   const clientB = await connectClient(t, INDEX_ENTRY, homeB, { port });
-  const statusB = await fetchStatus(clientB);
+  const statusB = await fetchStatus(clientB, { view: 'full' });
   /* 降级服务态（设计 §6.1-②）：核心照常 ready（ws_status 由核心应答，core.pid 在场＝非等待接管态）；
    * 单核形态 site 不退回 null，LAN 降级经 net 表达；分类文案落 core.json.statusDetail（T5 新语义）。 */
   assert.equal(statusB.net.available, false);
@@ -415,7 +415,7 @@ test('端口占用二：显式端口被无关程序占 → ① 降级服务（�
   const home = makeStationHome(t);   // 站点收尾钩子先于占位收尾钩子注册：占位收尾抛错也不跳过站点关闭（钩子跳过语义）
   const port = await startPortOccupier(t);
   const client = await connectClient(t, INDEX_ENTRY, home, { port });
-  const status = await fetchStatus(client);
+  const status = await fetchStatus(client, { view: 'full' });
   assert.equal(status.net.available, false);
   assert.equal(status.net.reason, 'port-taken');
   /* degraded 由 net.available 同源推导（status.js）——此处固化「降级服务态带 degraded 标注」的契约在场 */

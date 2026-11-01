@@ -6,8 +6,10 @@ import { ANCHOR_PORT, SLOT_COUNT, slotDefaultPort } from './site.js';
 import { CONFIG_FILE_NAME } from './paths.js';
 import { writeJsonAtomic } from './storage.js';
 import {
-  CLEANUP_INTERVAL_MAX_H, COLLABS_DAYS_MAX, DEFAULT_DISPATCH_CONFIG, DEFAULT_RETENTION_CONFIG,
-  DISPATCH_HOURS_MAX, LOGS_DAYS_MAX, MASTER_TIMEOUT_MAX_MS, MASTER_TIMEOUT_MIN_MS, isValidDispatchStatePath,
+  CLEANUP_INTERVAL_MAX_H, COLLABS_DAYS_MAX, DEFAULT_DISPATCH_CONFIG, DEFAULT_RESOURCE_GUARD_CONFIG,
+  DEFAULT_RETENTION_CONFIG, DISPATCH_HOURS_MAX, LOGS_DAYS_MAX, MASTER_TIMEOUT_MAX_MS, MASTER_TIMEOUT_MIN_MS,
+  RESOURCE_GUARD_MEM_MB_MAX, RESOURCE_GUARD_MEM_MB_MIN, RESOURCE_GUARD_SLAVES_MAX, RESOURCE_GUARD_SLAVES_MIN,
+  isValidDispatchStatePath,
 } from './dispatch-config.js';
 
 /* 文件名的权威源在 paths.js：站点解析（site.js）在载入配置前要按目录直读 config 的 port，
@@ -92,6 +94,21 @@ const NESTED_FIELD_RULES = {
     master_timeout_ms: {
       check: (value) => Number.isInteger(value) && value >= MASTER_TIMEOUT_MIN_MS && value <= MASTER_TIMEOUT_MAX_MS,
       reason: `需为 ${MASTER_TIMEOUT_MIN_MS}–${MASTER_TIMEOUT_MAX_MS} 的整数（毫秒）`,
+    },
+    /* 资源提醒（#14）：只影响 claim 返回的 warnings，不参与收编判定。
+     * 嵌套一层子键，非法值逐项回落默认并告警；未知子键原样保留。 */
+    resource_guard: {
+      nestedRules: {
+        enabled: { check: (value) => typeof value === 'boolean', reason: '需为布尔值' },
+        min_free_mem_mb: {
+          check: (value) => Number.isInteger(value) && value >= RESOURCE_GUARD_MEM_MB_MIN && value <= RESOURCE_GUARD_MEM_MB_MAX,
+          reason: `需为 ${RESOURCE_GUARD_MEM_MB_MIN}–${RESOURCE_GUARD_MEM_MB_MAX} 的整数（MB）`,
+        },
+        max_slaves: {
+          check: (value) => Number.isInteger(value) && value >= RESOURCE_GUARD_SLAVES_MIN && value <= RESOURCE_GUARD_SLAVES_MAX,
+          reason: `需为 ${RESOURCE_GUARD_SLAVES_MIN}–${RESOURCE_GUARD_SLAVES_MAX} 的整数`,
+        },
+      },
     },
   },
   retention: {
@@ -226,7 +243,8 @@ export function buildDefaults(hostName, options = {}) {
  * 完成调度任务 24h、已结束协作 30 天、日志 14 天、每 6 小时清理一次、非 dry-run。 */
 function persistenceDefaultsOf() {
   return {
-    dispatch: { ...DEFAULT_DISPATCH_CONFIG },
+    /* resource_guard 是嵌套对象：显式复制一层，避免默认值对象被调用方意外改写。 */
+    dispatch: { ...DEFAULT_DISPATCH_CONFIG, resource_guard: { ...DEFAULT_RESOURCE_GUARD_CONFIG } },
     retention: { ...DEFAULT_RETENTION_CONFIG },
   };
 }
@@ -368,27 +386,39 @@ function validateField(key, value) {
 }
 
 /* 嵌套对象逐子键校验：整段类型错 → 整组回落默认；未知子键原样保留（用 defineProperty 落成
- * 普通数据键，防 __proto__ 之类的键经原型 setter 改写对象原型——与顶层 unknown 的 null 原型同理）。 */
+ * 普通数据键，防 __proto__ 之类的键经原型 setter 改写对象原型——与顶层 unknown 的 null 原型同理）。
+ * 已知子键若自带 nestedRules（如 dispatch.resource_guard），递归到下一层按同一纪律校验。 */
 function validateNestedField(key, value, defaults, warn) {
+  return validateObjectField(key, value, defaults, NESTED_FIELD_RULES[key], warn);
+}
+
+function validateObjectField(label, value, defaults, rules, warn) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    warn(`配置项 ${key} 无效（需为 JSON 对象），已整组回落默认值`);
+    warn(`配置项 ${label} 无效（需为 JSON 对象），已整组回落默认值`);
     return { ...defaults };
   }
-  const rules = NESTED_FIELD_RULES[key];
   const result = { ...defaults };
   for (const [subKey, subValue] of Object.entries(value)) {
-    if (!Object.hasOwn(rules, subKey)) {
-      Object.defineProperty(result, subKey, { value: subValue, enumerable: true, writable: true, configurable: true });
-      continue;
-    }
-    const rule = rules[subKey];
-    if (rule.check(subValue)) {
-      result[subKey] = subValue;
-    } else {
-      warn(`配置项 ${key}.${subKey} 无效（${rule.reason}），改用默认值 ${JSON.stringify(defaults[subKey])}`);
-    }
+    applyNestedEntry(result, { label, subKey, subValue, defaults, rules, warn });
   }
   return result;
+}
+
+function applyNestedEntry(result, { label, subKey, subValue, defaults, rules, warn }) {
+  if (!Object.hasOwn(rules, subKey)) {
+    Object.defineProperty(result, subKey, { value: subValue, enumerable: true, writable: true, configurable: true });
+    return;
+  }
+  const rule = rules[subKey];
+  if (rule.nestedRules !== undefined) {
+    result[subKey] = validateObjectField(`${label}.${subKey}`, subValue, defaults[subKey], rule.nestedRules, warn);
+    return;
+  }
+  if (rule.check(subValue)) {
+    result[subKey] = subValue;
+    return;
+  }
+  warn(`配置项 ${label}.${subKey} 无效（${rule.reason}），改用默认值 ${JSON.stringify(defaults[subKey])}`);
 }
 
 function readRawConfig(file, warn) {

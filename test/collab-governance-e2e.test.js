@@ -207,7 +207,7 @@ async function callTool(client, name, args = {}) {
 /* 发现隔离硬断言：ws_status 由核心进程应答，disabled=true 证明子进程真的收到隔离开关；
  * bound=false / scanning=0 证明没有 UDP 绑定与扫描轮次（静态 env 传递链不再作为唯一依据）。 */
 async function assertDiscoveryIsolated(client) {
-  const status = await callTool(client, 'ws_status');
+  const status = await callTool(client, 'ws_status', { view: 'full' });
   assert.equal(status.isError, false, String(status.payload));
   const discovery = status.payload.net?.counters?.discovery;
   assert.ok(discovery !== undefined, 'ws_status 暴露发现层状态');
@@ -398,7 +398,7 @@ test('治理验收：原站长重启握手降级（旧站长按更高任期退�
     const listed = (await callTool(a2, 'ws_list_collabs')).payload.collabs;
     return roleOf({ collabs: listed }, COLLAB) === 'member' ? true : null;
   }, { timeoutMs: 30000, intervalMs: 250 });
-  const bStatus = await callTool(b, 'ws_status');
+  const bStatus = await callTool(b, 'ws_status', { view: 'full' });
   assert.equal(bStatus.payload.collab.handshakesIn >= 1, true, '可达 peer（B）应答了重启站长的握手');
   await assertDiscoveryIsolated(a2);
 });

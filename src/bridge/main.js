@@ -33,7 +33,7 @@ export function createStderrLog() {
 
 /* 转发 registry（server.js 消费的同一形态）：list＝规格单一权威的浅拷贝（按只读处理，
  * 桥侧不得变异——共享对象一旦就地改写会同时污染核心侧输出）；call＝经连接件转发。
- * dispatch 是本机纯内存能力：规格列表无条件暴露（桥不依赖核心即答），但调用在核心 welcome
+ * dispatch 是本机多会话编排（编排状态可持久化、消息流水不落盘）：规格列表无条件暴露（桥不依赖核心即答），但调用在核心 welcome
  * 未宣告 dispatch 能力位时由桥直接拒绝——旧核收到未知工具只会回泛化错误，用户无从知道该升级
  * 重开会话。能力判定必须晚于 ensureCore：冷启 / 重连时 welcome 尚为 null，先看它会把
  * 「核心还没起」误诊成「核心版本不支持」，并跳过 ensureCore 的等待契约。 */

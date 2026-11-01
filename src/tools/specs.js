@@ -34,8 +34,17 @@ const TARGET_ITEM_SCHEMA = {
 
 export const WS_STATUS_SPEC = {
   name: 'ws_status',
-  description: '查看本机驿站状态（版本、实例标识、数据目录、端口配置、网络状态等）——会话期首检与排障使用；dispatch 段含调度长与组员的稳定会话短码 sessionCode（派发以此为准，名字可能随重命名 / 重启变化）',
-  inputSchema: { type: 'object', properties: {} },
+  description: '查看本机驿站状态（版本、实例标识、网络状态等）——会话期首检与排障使用；默认精简视图（view 缺省 compact），完整计数器与数据目录 / 端口 / 节点版本等用 view: "full"（full 保持旧版全量字段，另含 host.resources）；任何视图的 dispatch 段都含调度长与组员的稳定会话短码 sessionCode（派发以此为准，名字可能随重命名 / 重启变化）',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      view: {
+        type: 'string',
+        enum: ['compact', 'full'],
+        description: '视图（可选，缺省 compact）：compact＝精简视图（版本 / 实例 / core / site / net.available+reason / host.resources / dispatch 全段 / 协作计数摘要）；full＝完整视图（含数据目录、日志目录、配置文件、端口、节点版本、net 全量计数器、collab 全量计数与 identityHint）',
+      },
+    },
+  },
 };
 
 export const WS_LIST_HOSTS_SPEC = {
@@ -159,7 +168,7 @@ export const WS_DISPATCH_SCAN_SPEC = {
 
 export const WS_DISPATCH_CLAIM_SPEC = {
   name: 'ws_dispatch_claim',
-  description: '调度长（dispatch master）收编一个或多个本机会话：无头且带 WAYSTATION_ROLE=slave 的会话直接绑定；交互式会话返回 pending 并向目标注入首次确认；非交互式且无角色的会话拒绝。sessionIds 接受会话短码 sessionCode 或完整 sessionId。一个核心同一时刻只允许一个调度（dispatch），组员独占',
+  description: '调度长（dispatch master）收编一个或多个本机会话：无头且带 WAYSTATION_ROLE=slave 的会话直接绑定；交互式会话返回 pending 并向目标注入首次确认；非交互式且无角色的会话拒绝。sessionIds 接受会话短码 sessionCode 或完整 sessionId。一个核心同一时刻只允许一个调度（dispatch），组员独占。返回 warnings 数组（资源提醒：空闲内存低于 dispatch.resource_guard.min_free_mem_mb、当前组员数达到 max_slaves 时给出实测数字与释放建议；只警告，不拒绝收编）',
   inputSchema: {
     type: 'object',
     properties: {

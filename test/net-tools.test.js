@@ -275,7 +275,7 @@ test('ws_delivery_status：过滤参数缺省 → 正常查询（不过滤）', 
 
 test('ws_status：输出含 net 状态块（可用性与计数器）', async () => {
   const net = { status: () => ({ available: true, reason: null, message: '', port: 17321, counters: { discovery: {}, transport: {}, dispatch: {}, inbound: {} } }) };
-  const result = await callTool(statusTool(), {}, net);
+  const result = await callTool(statusTool(), { view: 'full' }, net);
   const status = JSON.parse(result.content[0].text);
   assert.equal(status.net.available, true);
   assert.equal(status.net.port, 17321);
@@ -448,7 +448,7 @@ test('ws_status：身份未设置（首跑）载荷带 identityHint；预写合�
   const loaded = loadConfig(fresh);
   assert.equal(loaded.identityDefaulted, true, '前置：全新数据目录按未设置读入');
   const freshContext = { ...contextWith(net), dataDir: fresh, config: loaded.config, identityDefaulted: loaded.identityDefaulted };
-  const freshStatus = JSON.parse((await statusTool().handler({}, freshContext)).content[0].text);
+  const freshStatus = JSON.parse((await statusTool().handler({ view: 'full' }, freshContext)).content[0].text);
   assert.equal(typeof freshStatus.identityHint, 'string');
   assert.ok(freshStatus.identityHint.includes(loaded.config.identityName), '提示需含当前机器名值');
   assert.ok(freshStatus.identityHint.includes(join(fresh, CONFIG_FILE_NAME)), '提示需含配置文件路径');
@@ -460,7 +460,7 @@ test('ws_status：身份未设置（首跑）载荷带 identityHint；预写合�
   const named = loadConfig(configured);
   assert.equal(named.identityDefaulted, false, '前置：合法身份名不触发');
   const namedContext = { ...contextWith(net), dataDir: configured, config: named.config, identityDefaulted: named.identityDefaulted };
-  const namedStatus = JSON.parse((await statusTool().handler({}, namedContext)).content[0].text);
+  const namedStatus = JSON.parse((await statusTool().handler({ view: 'full' }, namedContext)).content[0].text);
   assert.equal(Object.hasOwn(namedStatus, 'identityHint'), false, '字段有值：一切照旧、无提示');
 });
 

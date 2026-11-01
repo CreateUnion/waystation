@@ -6,8 +6,9 @@ import { errorOf } from '../util/errors.js';
 import { matchSessionByToken, shortSessionId } from '../util/short-id.js';
 import { dispatchStateFilePath } from '../paths.js';
 import {
-  dispatchStatePathOf, masterTimeoutMsOf, persistEnabledOf, retentionConfigOf,
+  dispatchStatePathOf, masterTimeoutMsOf, persistEnabledOf, resourceGuardConfigOf, retentionConfigOf,
 } from '../dispatch-config.js';
+import { freeMemMBOf as systemFreeMemMBOf } from '../host-resources.js';
 import {
   DISPATCH_TASK_SUMMARY_MAX, REPLACED_MASTER_MAX, loadDispatchState, migrateDispatchState, quarantineDispatchState,
   removeDispatchState, resolveDispatchStatePath, saveDispatchState,
@@ -74,6 +75,8 @@ export function createDispatchDomain(deps) {
     log: deps.log ?? null,
     notify: typeof deps.notify === 'function' ? deps.notify : null,
     deliverSeat: typeof deps.deliverSeat === 'function' ? deps.deliverSeat : null,
+    /* 资源提醒的实测内存入口（单测可注入；生产缺省读 node:os）。 */
+    freeMemMBOf: freeMemProbeOf(deps),
     now,
     metaOf,
     isInteractiveOf,
@@ -90,6 +93,10 @@ export function createDispatchDomain(deps) {
   runtime.persistence = createPersistence(runtime);
   restoreDispatchIn(runtime);
   return dispatchApiOf(runtime);
+}
+
+function freeMemProbeOf(deps) {
+  return typeof deps.freeMemMBOf === 'function' ? deps.freeMemMBOf : systemFreeMemMBOf;
 }
 
 /* 持久化运行面：enabled＝配置总开关；degraded＝写失败后本进程内永久降级；
@@ -780,7 +787,40 @@ function claimSessionsIn(runtime, { sessionId, sessionIds }) {
   for (const targetSessionId of [...new Set(sessionIds)]) {
     results.push(claimTargetOf(runtime, record, sessionId, targetSessionId));
   }
-  return { ok: true, dispatchId: record.collabId, results };
+  return { ok: true, dispatchId: record.collabId, results, warnings: claimWarningsOf(runtime, record) };
+}
+
+/* #14 资源感知（建议型）：只生成提醒，不改收编结果。两项各按实测值判定：
+ * 空闲内存严格小于 min_free_mem_mb；当前组员数达到（≥）max_slaves。 */
+function claimWarningsOf(runtime, record) {
+  const guard = resourceGuardConfigOf(runtime.config);
+  if (!guard.enabled) {
+    return [];
+  }
+  const warnings = [];
+  const freeMemMB = probeFreeMemMB(runtime);
+  if (freeMemMB !== null && freeMemMB < guard.min_free_mem_mb) {
+    warnings.push(
+      `空闲内存 ${freeMemMB} MB 低于 dispatch.resource_guard.min_free_mem_mb（${guard.min_free_mem_mb} MB）`
+      + '——建议先释放不用的会话或关闭不用的 worker（仅警告，不拒绝本次收编）',
+    );
+  }
+  if (record.slaves.size >= guard.max_slaves) {
+    warnings.push(
+      `当前组员数 ${record.slaves.size} 已达 dispatch.resource_guard.max_slaves（${guard.max_slaves}）`
+      + '——建议先释放不用的组员或关闭不用的 worker（仅警告，不拒绝本次收编）',
+    );
+  }
+  return warnings;
+}
+
+function probeFreeMemMB(runtime) {
+  try {
+    const value = runtime.freeMemMBOf();
+    return Number.isFinite(value) ? value : null;
+  } catch {
+    return null;
+  }
 }
 
 /* 会话标识解析（完整标识或短码）：候选集内的精确匹配；零命中 / 歧义 / 非法一律 null。

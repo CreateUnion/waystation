@@ -69,6 +69,7 @@ export const ERROR_HINTS = Object.freeze({
   'user-confirmation-required': '这是需要用户确认的中间态，不是失败：先向用户转述请求，取得明确同意后携 confirmToken 重试。',
   'probe-failed': '探测失败：确认对端驿站在线、地址与端口取自 ws_list_hosts；仍失败请检查局域网连通性。',
   'network-scan-failed': '局域网扫描失败：确认本机网络与端口可用，稍后重试；仍失败请查看核心日志。',
+  'invalid-view': 'view 只接受 "compact"（缺省）或 "full"；完整计数器请用 ws_status { view: "full" }。',
 
   /* 其他既有域错误码（经 resultOf 透传） */
   'forum-no-invite': '讨论（forum）模式没有邀请簿记：加入 / 同意 / 拒绝走 ws_join 与 ws_approve_invite 的成员事件路径，不要使用 inviteId。',

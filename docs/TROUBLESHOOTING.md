@@ -26,23 +26,28 @@
 ws_status {}
 ```
 
-- **成功**：返回 `core.pid`、`core.app`、`core.endpoint`、`net`、`dispatch` 等字段，说明本会话的桥已经连上核心。
-- **失败**：返回
+- **成功**：返回 `core.pid`、`core.app`、`core.endpoint`、`net.available`/`net.reason`、`dispatch`、`host.resources` 等 compact 字段，说明本会话的桥已经连上核心。需要 `dataDir`/`logDir`/`configFile`、`net` 全量计数器、`collab.byState` 等完整字段（以及仅 full 视图出现的 `core.degraded`）时用 `ws_status { view: "full" }`。
+- **失败**：返回统一错误对象＋桥侧静态信息：
 
   ```json
   {
+    "ok": false,
+    "code": "core-unavailable",
+    "message": "……",
+    "hint": "……",
     "core": { "available": false, "reason": "……" },
     "bridge": { "version": "0.2.6", "app": "……" }
   }
   ```
 
-  `reason` 是桥侧的分类文案（核心启动失败原因、等待接管说明、冷启配额说明等），**原文优先看它**。
+  `reason` 是桥侧的分类文案（核心启动失败原因、等待接管说明、冷启配额说明等），**原文优先看它**；
+  `code` 是稳定标识（用 `code` 分支，不要匹配中文文案），`message` / `hint` 给出描述与下一步修复建议。
   详细原理见 [`ARCHITECTURE.md` §3.3](ARCHITECTURE.md#33-桥的探测与四态判定)。
 
 注意两条边界：
 
 1. 核心不可达时，MCP 的 `tools/list` 仍然正常（桥不依赖核心即答工具目录），只是**调用**失败。
-2. `ws_status` 是唯一由桥合成的差错载荷；其他 `ws_*` 工具此时只会返回错误文本。
+2. `ws_status` 是唯一由桥合成的差错载荷（额外带 `core` / `bridge` 两块静态信息）；其他 `ws_*` 工具此时返回同样的统一错误对象 `{ ok:false, code, message, hint }`，只是不带这两块。
 3. 如果 `ws_status` 也调用不到，说明 MCP 桥本身没有起来/已退出，先检查该会话的 MCP 注册与进程（见 §2）。
 
 ### 0.2 看核心状态
@@ -87,7 +92,7 @@ WAYSTATION_HOME=/data/waystation waystation core status
 
 ### 0.3 看日志
 
-核心日志默认在 `<数据根>/logs/waystation.log`（`config.logDir` 可改；`ws_status` 成功时返回 `logDir`）。
+核心日志默认在 `<数据根>/logs/waystation.log`（`config.logDir` 可改；`ws_status { view: "full" }` 成功时返回 `logDir`）。
 日志是**一行一个 JSON 对象**。
 
 ```powershell
@@ -129,7 +134,7 @@ POSIX 下 `run/` 应为 `0700`、套接字文件为 `0600`。原理见 [`ARCHITE
 | --- | --- |
 | ≤0.2.4 | Windows 有「服务上下文（Session 0）冷启守卫」：桥在 Session 0 拒绝冷启核心，报「核心冷启被拒：服务上下文」。需要在用户会话里先拉起核心。 |
 | 0.2.5 | 改用 TCP 环回（`run/core.json` 的 `ipc.tcp`），移除 Session 0 守卫；桥仍依赖断连后的重生流/慢速重试，多桥并发冷启时可能长时间不重注册；调度仍是纯内存；`ws_send_message` 没有 `delivery` 增量字段。 |
-| 0.2.6 | 桥常驻心跳（默认 10s 探测、30s 超时）自动重连并重注册；调度编排状态默认持久化；`ws_send_message` 增加 `delivery` 与 `requireAck`；保留期清理；扫描/状态返回稳定会话短码 `sessionCode`（`sessionId` 前 8 位），`ws_dispatch_claim` / `ws_dispatch_release` / `ws_send_message.toSessionIds` 接受短码或完整 `sessionId`。 |
+| 0.2.6 | 桥常驻心跳（默认 10s 探测、30s 超时）自动重连并重注册；调度编排状态默认持久化；`ws_send_message` 增加 `delivery` 与 `requireAck`；保留期清理；扫描/状态返回稳定会话短码 `sessionCode`（`sessionId` 前 8 位），`ws_dispatch_claim` / `ws_dispatch_release` / `ws_send_message.toSessionIds` 接受短码或完整 `sessionId`；`ws_status` 默认精简视图（`view:"full"` 取全量字段与 `net` 计数器），两视图都带 `host.resources`；`ws_dispatch_claim` 返回资源提醒 `warnings`。 |
 
 查看安装树版本：
 
@@ -228,7 +233,7 @@ ps -p <pid> -o pid,ppid,sid,etime,cmd
 
 - `WAYSTATION_HOME` 在核心、桥、CLI 三处一致（见 §0）。
 - 局域网端口 7321–7328 被占**不会**让核心拒绝启动，只会进入 LAN 降级服务：
-  `ws_status` 的 `core.degraded`/`net` 会体现，本地工具仍可用。这是「本地能用、局域网工具报降级」的常见原因。
+  `ws_status { view: "full" }` 的 `core.degraded`/`net` 会体现，本地工具仍可用。这是「本地能用、局域网工具报降级」的常见原因。
 - IPC 端点（Windows 命名管道 / POSIX `run/core.sock`，以及 `ipc.tcp`）不可用会让核心启动失败或桥连不上。
 - 磁盘满、只读、ACL 变化都会让自检失败。
 
@@ -396,16 +401,13 @@ ps -p <pid> -o pid,ppid,sid,etime,cmd
   { "ok": true, "dispatchId": "……", "sessions": [] }
   ```
 
-- 手工收编返回：
-
-  ```text
-  本机会话不在线或不可见
-  ```
+- 手工收编返回顶层 `ok:false`，`code` 为 `session-not-visible`（不在注册表）或
+  `bridge-stale`（桥连接已断 / 过期）；`message` / `hint` 给出原因与修复动作。
 
 - 目标会话的 Claude Code 进程还活着、transcript 还在更新，但 `ws_status`/`ws_dispatch_scan` 看不到它。
 - 常见于**核心重启/换代之后**：调度长自己的桥已连上新核（所以 `ws_status` 成功），
   其他会话的桥仍挂在旧连接上（stale），既不重连也不报错。
-- 2026-11-01 实例：核心重启后三个交互会话的桥 stale，`scan` 为空、`claim` 报「本机会话不在线或不可见」，
+- 2026-11-01 实例：核心重启后三个交互会话的桥 stale，`scan` 为空、`claim` 报 `session-not-visible` / `bridge-stale`，
   最终通过**杀掉目标会话的桥进程，让 Claude Code 在下次工具调用时重新 spawn** 恢复。
 
 ### 诊断步骤
@@ -697,7 +699,7 @@ cc-connect 重启会树杀核心、调度长桥与 agent；用户发一条消息
 
 - 0.2.5 及更早：`ws_send_message` 返回 `ok: true`，但目标会话没有收到/没有处理。
 - 0.2.6：返回里带 `delivery`，可能是 `queued`、`failed`、`partial`；或者 `delivered` 但目标仍未处理。
-- `ws_status` 的 `net.dispatch.counters` 中 `deliveryFailures`、`directUndelivered` 很高。
+- `ws_status { view: "full" }` 的 `net.dispatch.counters` 中 `deliveryFailures`、`directUndelivered` 很高。
   2026-11-01 实例：`deliveryFailures: 455`、`directUndelivered: 518`，同时调度消息大量未达。
 
 #### 诊断步骤
@@ -731,15 +733,16 @@ ws_delivery_status { "msgId": "<消息标识>" }
 - 机器级状态：「已排队」「已到对方驿站」「已投进对方会话」「未达」；「已投进会话」不等于已读。
 - 本机接收侧另有逐席位明细；远端只有机器级。
 - **dispatch 没有持久投递账**：对 dispatch 的 `collabId` 查询会返回空并明确说明
-  `dispatch 无持久投递账（纯内存模式）`。调度消息只能看 `delivery`、`ack` 或让组员回执。
+  `dispatch 无持久投递账（投递记录不落盘）`。调度消息只能看 `delivery`、`ack` 或让组员回执。
 
 **第 3 步：看计数器。**
 
 ```text
-ws_status {}
+ws_status { "view": "full" }
 ```
 
-路径：`net.dispatch.counters.deliveryFailures` / `net.dispatch.counters.directUndelivered`。
+路径：`net.dispatch.counters.deliveryFailures` / `net.dispatch.counters.directUndelivered`
+（compact 缺省视图不含完整 `net` 计数器，必须显式 `view:"full"`）。
 
 - `deliveryFailures`：拨号/写帧失败累计（包含重试），不是「每条消息失败一次」。
 - `directUndelivered`：直投记录在等待窗内未确认、最终标记未达的累计。
@@ -755,7 +758,7 @@ ws_list_hosts {}
 ```
 
 - dispatch：目标必须在 `record.slaves` 里；`toSessionIds` 接受 `sessionCode`（`sessionId` 前 8 位）或**完整 sessionId**，两者都精确匹配、不做前缀展开，不接受显示名。
-  目标不在 dispatch 内会返回 `目标会话不在本 dispatch 内：<id>`。
+  目标不在 dispatch 内会返回顶层 `ok:false`、`code="target-not-in-dispatch"`（`message` 含目标标识）。
 - managed/forum：目标会话必须在场/在席；离线时按暂存/过期语义处理。
 - `ws_list_hosts.self.sessions` 可看核心当前注册的会话短码（发现面口径）。
 - `sessions/<sessionId>.json` 的 mtime 可辅助判断桥是否还在注册（`pid` 是核心 pid，不是桥 pid）。
@@ -783,18 +786,18 @@ grep -E '投递|未入队|队列|超时|ack|补投|静音|冻结' ~/.waystation/
 #### 修复动作
 
 先分清载体：**dispatch 的 `delivery` 只会给 `delivered` 或 `queued`**（目标在发前已校验过）；
-目标不在 dispatch、非成员、任务表满等会直接以顶层 `ok: false` + `message` 返回，不走 `delivery.failed`。
+目标不在 dispatch、非成员、任务表满等会直接以顶层 `ok:false` + `code` / `message` / `hint` 返回，不走 `delivery.failed`。
 managed 的本机旁路与远端机器才可能出现 `delivery.failed`。按实际返回分支：
 
 | 返回形态 | 动作 |
 | --- | --- |
 | `delivery.state=delivered` 但目标没反应 | 目标可能停在权限提示/回合未继续；按 §4.2 处理，不要重复轰炸 |
 | `delivery.state=queued` | 等 `queuedUntil`；让目标会话调用任意 `ws_*` 工具触发桥重连/补投。目标已离席则过期，重新收编后再发 |
-| 顶层 `ok:false`：`目标会话不在本 dispatch 内：<id>` | 用 `ws_dispatch_scan` 取 `sessionCode`（或完整 `sessionId`）；`ws_dispatch_claim` 收编后重发 |
-| 顶层 `ok:false`：`本会话不是该 dispatch 的成员` | 发送会话本身未收编；让调度长收编它，或从调度长会话发送 |
-| 顶层 `ok:false`：`dispatch 不存在（可能已结束或核心已重启）` | 按 §3 恢复/重建调度，再发 |
-| 顶层 `ok:false`：`任务表已满（上限 1000）` | 完成/清理在途任务，或换新 `taskId`；未完成任务不会被自动裁剪 |
-| 收编结果里出现 `本机会话不在线或不可见` | 这是收编判定，不是发送结果；先按 §2 恢复桥注册，再收编/重发 |
+| 顶层 `ok:false`：`code=target-not-in-dispatch` | 用 `ws_dispatch_scan` 取 `sessionCode`（或完整 `sessionId`）；`ws_dispatch_claim` 收编后重发 |
+| 顶层 `ok:false`：`code=not-dispatch-member` | 发送会话本身未收编；让调度长收编它，或从调度长会话发送 |
+| 顶层 `ok:false`：`code=dispatch-lost` | 按 §3 恢复/重建调度，再发 |
+| 顶层 `ok:false`：`code=task-table-full` | 完成/清理在途任务，或换新 `taskId`；未完成任务不会被自动裁剪 |
+| 收编结果的 `status:"rejected"` 条目带 `code=session-not-visible` / `bridge-stale` / `claim-rejected` | 这是收编判定，不是发送结果；先按 §2 恢复桥注册，再收编/重发；看该条目的 `reason` / `hint` |
 | `delivery.failed`（managed 本机旁路/远端） | 看 `reason`：席位静音由目标会话自行取消；注入失败/离席/队列拒绝按原因恢复目标后重发 |
 | `ok:true` 但无 `delivery`（旧版） | 升级 0.2.6；升级前 `requireAck` 不可用，只能让目标回执/查收件 |
 
@@ -1416,7 +1419,7 @@ jq '.retention' ~/.waystation/config.json
 | `保留期清理：已归档并删除协作目录` | 协作归档后删除 | §7.2 |
 | `保留期清理：已删除超期日志` | 日志按时间清理 | §7.2 |
 
-`ws_status` 计数：
+`ws_status { view: "full" }` 计数（compact 缺省视图不含完整计数器）：
 
 | 路径 | 含义 |
 | --- | --- |

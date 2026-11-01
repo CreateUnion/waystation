@@ -66,6 +66,17 @@
 - **桥侧 `ws_status` 例外**：核心不可达时仍合成 `core:{available:false, reason}` 与 `bridge:{version, app}`，并**同时**带统一错误四字段；这仍是「桥是纯转发件」原则的唯一登记例外。
 - **dispatch 子结果**：`ws_dispatch_claim` 顶层成功，逐目标 `status:'rejected'` 条目带 `code` / `reason` / `hint`（保留 `reason` 兼容），便于调度长按稳定 code 识别 `session-not-visible` / `bridge-stale` / `claim-rejected`。
 
+### 1.5 状态视图与资源面
+
+`ws_status` 有 `compact`（缺省）与 `full` 两种视图：
+
+- **compact**：只保留首检与调度长提示词真正依赖的字段——`ok`、`version`、`name`、`identityName`、`instanceId`、`pid`、`startedAt`、`core:{pid, app, endpoint}`、`site`、`net:{available, reason}`、`host.resources`、完整 `dispatch` 段、协作计数摘要 `collab:{collabs, active, completed, terminated}`，并附 `viewHint` 指向 full。
+- **full**：与 0.2.6 既有输出逐字段一致（路径、端口、节点版本、`net` 全量计数器、`collab` 全量计数与 `identityHint` 均保留），仅新增 `host.resources`；不新增 `viewHint`。
+- **不变式**：任何视图都保留 `ok`、`version`、`dispatch`（无调度时为 `null`，字段不消失）与 `dispatch.slaves`（有调度时为数组）；非法 `view` 返回统一错误 `invalid-view`。
+- **`host.resources`**：`{ freeMemMB, totalMemMB, claudeProcs, nodeProcs }`。内存取 `node:os` 的 `freemem`/`totalmem`；进程数按平台读系统进程清单（Windows `tasklist` / POSIX `ps`），短时缓存、探测失败计零，不阻断工具主链，也不作为资源裁决依据。
+
+`config.dispatch.resource_guard`（`enabled` 默认 true、`min_free_mem_mb` 默认 2048 / 范围 256–65536、`max_slaves` 默认 8 / 范围 1–64）只驱动 `ws_dispatch_claim` 返回的 `warnings`：空闲内存严格小于阈值、或当前组员数达到上限时，附实测数字与释放建议；**只警告不拒绝**，不改收编结果。非法配置值在加载时逐项回落默认并各告警一次，未知子键保留。
+
 ## 2. 进程与通信
 
 ### 2.1 本机 IPC
@@ -283,6 +294,7 @@ replacer 等旧核退场 10 秒，到期走硬杀防护链；硬杀后有 2 秒�
 - **收编**：调度长用 `ws_dispatch_scan` 扫描本机会话，`ws_dispatch_claim` 发起收编；
   交互式目标需用户确认（一次性令牌），无头／服务拉起的会话必须带 `WAYSTATION_ROLE=slave`
   才会被收编。确认门 `gate:'claim'` 关闭时收编请求自动绑定并注入知情通知。
+  收编返回另带 `warnings` 资源提醒（空闲内存 / 组员数阈值，见 §1.5），只警告不拒绝。
 - **会话标识**：`ws_dispatch_scan` 与 `ws_status` 的 dispatch 段为每个会话返回稳定短码
   `sessionCode`（`sessionId` 前 8 字符，与 `shortSessionId` 同源）；`name` 保留但标为提示——
   Claude Code 重命名 / 重启会让名字漂移。`ws_dispatch_claim` / `ws_dispatch_release` /

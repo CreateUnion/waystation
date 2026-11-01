@@ -42,8 +42,8 @@ function fakeContext(overrides = {}) {
   };
 }
 
-async function statusPayload(context) {
-  const result = await statusTool().handler({}, context);
+async function statusPayload(context, args = {}) {
+  const result = await statusTool().handler(args, context);
   return JSON.parse(result.content[0].text);
 }
 
@@ -59,7 +59,7 @@ test('ws_status：成功应答为单核形态——site 恒 single、pid/started
 
 test('ws_status：①② 端口降级服务态——site 仍 single，降级经 net 与 core.degraded 表达', async () => {
   const degraded = { available: false, message: '端口被无关程序占用，请释放后自动接管', reason: 'occupied' };
-  const payload = await statusPayload(fakeContext({ net: { status: () => degraded } }));
+  const payload = await statusPayload(fakeContext({ net: { status: () => degraded } }), { view: 'full' });
   assert.deepEqual(payload.site, { mode: 'single', slot: null, port: 17321, takeover: false }, '降级服务态下 site 仍是单核形态');
   assert.equal(payload.net.available, false);
   assert.equal(payload.core.degraded, true);

@@ -3,10 +3,17 @@
  * 配置是外部输入：消费方（尤其单测/旧配置文件）可能缺整段或给错类型，读取函数一律按
  * 「缺失/非法 → 内置默认」失败安全，校验告警由 config.js 的加载面负责。 */
 
+export const DEFAULT_RESOURCE_GUARD_CONFIG = Object.freeze({
+  enabled: true,
+  min_free_mem_mb: 2048,
+  max_slaves: 8,
+});
+
 export const DEFAULT_DISPATCH_CONFIG = Object.freeze({
   persist: true,
   state_path: '',
   master_timeout_ms: 180000,
+  resource_guard: DEFAULT_RESOURCE_GUARD_CONFIG,
 });
 
 export const DEFAULT_RETENTION_CONFIG = Object.freeze({
@@ -19,6 +26,10 @@ export const DEFAULT_RETENTION_CONFIG = Object.freeze({
 
 export const MASTER_TIMEOUT_MIN_MS = 10000;
 export const MASTER_TIMEOUT_MAX_MS = 3600000;
+export const RESOURCE_GUARD_MEM_MB_MIN = 256;
+export const RESOURCE_GUARD_MEM_MB_MAX = 65536;
+export const RESOURCE_GUARD_SLAVES_MIN = 1;
+export const RESOURCE_GUARD_SLAVES_MAX = 64;
 export const DISPATCH_HOURS_MAX = 8760;          // 1 年
 export const COLLABS_DAYS_MAX = 3650;            // 10 年
 export const LOGS_DAYS_MAX = 3650;
@@ -59,6 +70,27 @@ export function dispatchStatePathOf(config) {
 
 function integerInRange(value, min, max, fallback) {
   return Number.isInteger(value) && value >= min && value <= max ? value : fallback;
+}
+
+/** 生效的资源提醒配置：缺失/非法逐项回落默认值（消费方为空配置 / 旧配置文件时安全）。 */
+export function resourceGuardConfigOf(config) {
+  const raw = config?.dispatch?.resource_guard;
+  const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  return {
+    enabled: typeof source.enabled === 'boolean' ? source.enabled : DEFAULT_RESOURCE_GUARD_CONFIG.enabled,
+    min_free_mem_mb: integerInRange(
+      source.min_free_mem_mb,
+      RESOURCE_GUARD_MEM_MB_MIN,
+      RESOURCE_GUARD_MEM_MB_MAX,
+      DEFAULT_RESOURCE_GUARD_CONFIG.min_free_mem_mb,
+    ),
+    max_slaves: integerInRange(
+      source.max_slaves,
+      RESOURCE_GUARD_SLAVES_MIN,
+      RESOURCE_GUARD_SLAVES_MAX,
+      DEFAULT_RESOURCE_GUARD_CONFIG.max_slaves,
+    ),
+  };
 }
 
 /** 生效的保留期配置：逐项校验，缺失/非法回退默认值。 */
