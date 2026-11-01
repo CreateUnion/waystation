@@ -1,15 +1,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeTempDir, repoRoot } from './helpers.js';
 
 /* setup.ps1 的 ps1 臂：仅 win32 且 powershell -File 可跑；否则整文件跳过（不得假红）。
  * 用 -HomeDir 指向临时目录伪造安装态（未装/低版本/同版/损坏），用 WAYSTATION_TEST_SETUP
- * 隔离真机 cc-connect 服务。dry-run 用例断言零写入；真实写入用例（Task 3 起）落在临时
- * HomeDir 内，不触碰真机。 */
+ * 隔离真机 cc-connect 服务。dry-run 用例断言零写入；真实写入用例的 -HomeDir 只影响
+ * setup.ps1 自身检测——它委托 install.ps1 时不转发该参数，install.ps1 的 $HOME 由
+ * USERPROFILE/HOMEDRIVE/HOMEPATH 派生，故 runSetup 必须在子进程环境里把这些一并重定向到
+ * 临时家，否则测试会真的安装进操作者家目录（2026-11-02 事故：~/.waystation/app 被改写）。
+ * 非 dry-run 用例跑完还须正向断言临时家的安装产物（版本＝仓库版本）——原缺陷下该断言必红。 */
 const powershellAvailable = (function powershellFileRuns() {
   if (process.platform !== 'win32') {
     return false;
@@ -35,7 +38,21 @@ function writeInstalledVersion(home, version) {
   writeFileSync(join(appDir, 'package.json'), JSON.stringify({ name: 'waystation', version }), 'utf8');
 }
 
+/* 正向断言（真实写入用例）：setup.ps1 委托 install.ps1 后，安装产物必须落在临时家。
+ * 若 $HOME 重定向失效（或 install.ps1 的安装面未经 HOME 派生），这里会因文件缺失/版本不符变红
+ * ——原缺陷下真实安装被写进操作者家目录，临时家反而是空的，此断言正是原来缺失的感知面。 */
+function assertInstalledIntoTempHome(home, result) {
+  const pkgPath = join(home, '.waystation', 'app', 'package.json');
+  assert.ok(existsSync(pkgPath), `真实写入用例应安装到临时家（$HOME 重定向未生效？）：${pkgPath}\nstdout：${result.stdout}\nstderr：${result.stderr}`);
+  const installed = JSON.parse(readFileSync(pkgPath, 'utf8'));
+  assert.equal(installed.version, bundledVersion(), `临时家的安装版本应等于仓库版本：${pkgPath}`);
+}
+
 function runSetup(t, { args = [], home = makeTempDir(t), seam = '1' } = {}) {
+  /* PowerShell 5.1 启动时会在重定向后的 $HOME 下创建 AppData\Roaming（实测：-NoProfile 空脚本
+   * 亦如此），属外壳自身副作用而非脚本写入。预置该环境目录后再快照，保持 assertDryRunNoWrite
+   * 的严格逐项判据原样不变——setup.ps1 的任何真实写入仍会让目录树前后不等。 */
+  mkdirSync(join(home, 'AppData', 'Roaming'), { recursive: true });
   /* 运行前快照：零写入断言按「运行前后目录树逐项相等」判定——比按名单过滤更强，
    * 且不会被用例自己预置的安装态夹具（.waystation\app\package.json）误判成写入。 */
   const entriesBefore = readdirSync(home, { recursive: true }).sort();
@@ -45,9 +62,23 @@ function runSetup(t, { args = [], home = makeTempDir(t), seam = '1' } = {}) {
     {
       encoding: 'utf8',
       timeout: 120000,
-      env: { ...process.env, WAYSTATION_TEST_SETUP: seam },
+      env: {
+        ...process.env,
+        WAYSTATION_TEST_SETUP: seam,
+        /* -HomeDir 只约束 setup.ps1 自身的检测；非 dry-run 分支委托 install.ps1 时不转发它，
+         * 而 install.ps1 的 $HOME 来自 USERPROFILE/HOMEDRIVE/HOMEPATH（PS 5.1 的 $HOME 只读，
+         * 不可赋值）——照同文件 runPs1Uninstall 的既有做法重定向到临时家。WAYSTATION_HOME 同步
+         * 指向同一临时根下的数据目录，保证任何按环境解析数据根的子进程也不落真机。 */
+        USERPROFILE: home,
+        HOMEDRIVE: home.slice(0, 2),
+        HOMEPATH: home.slice(2),
+        WAYSTATION_HOME: join(home, '.waystation'),
+      },
     },
   );
+  if (!args.includes('-DryRun')) {
+    assertInstalledIntoTempHome(home, result);
+  }
   return { home, result, entriesBefore };
 }
 
