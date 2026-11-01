@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { MAX_TOPIC_CHARS, isIdentityName, isPresentationText } from '../net/protocol.js';
+import { ID_PATTERN, MAX_TOPIC_CHARS, isIdentityName, isPresentationText } from '../net/protocol.js';
 import { shortSessionId } from '../util/short-id.js';
 import { gateValueOf } from './confirm-gate.js';
 
@@ -12,6 +12,7 @@ import { gateValueOf } from './confirm-gate.js';
 export const DISPATCH_MESSAGE_TYPES = ['task', 'progress', 'result', 'error'];
 export const DISPATCH_QUEUE_MAX = 256;
 export const DISPATCH_CLAIM_TTL_MS = 10 * 60 * 1000;
+export const DISPATCH_ACK_TTL_MS = 10 * 60 * 1000;
 export const DISPATCH_MEMBER_EVENT_DEBOUNCE_MS = 500;
 /* 收编纪律单一权威源：~/.waystation/dispatch-rules.md（markdown 分节，每条一句话）。
  * 收编低频，通知发出时实时读文件——改完即热生效，无需 reload 命令。缺失/为空时回退内置兜底
@@ -55,6 +56,7 @@ export function createDispatchDomain(deps) {
     dataDir: typeof deps.dataDir === 'string' && deps.dataDir.length > 0 ? deps.dataDir : null,
     log: deps.log ?? null,
     notify: typeof deps.notify === 'function' ? deps.notify : null,
+    deliverSeat: typeof deps.deliverSeat === 'function' ? deps.deliverSeat : null,
     now,
     metaOf,
     isInteractiveOf,
@@ -200,6 +202,11 @@ function createDispatchIn(runtime, { name, topic, sessionId, autoClaim }) {
     slaves: new Map(),
     claims: new Map(),
     queues: new Map(),
+    /* 用户消息的补投截止（target → epoch ms）：宽限期到仍未补投即 drop 并向调度长回报；
+     * 控制通知（join/leave 等）不设截止，沿用既有宽限/释放回收。 */
+    queueDeadlines: new Map(),
+    /* requireAck 的待确认账（msgId → 记录）：delivered/queued 均登记，收到目标会话 ack 或超时收口。 */
+    pendingAcks: new Map(),
     grace: new Map(),
     pendingEvents: [],
     eventTimer: null,
@@ -583,11 +590,11 @@ function releaseSlaveIn(runtime, { sessionId, targetSessionId }) {
     return { ok: false, message: '该会话不在本 dispatch 内' };
   }
   record.slaves.delete(targetSessionId);
-  record.grace.delete(targetSessionId);
   sendNotice(runtime, record, targetSessionId, 'master 已释放本会话——dispatch 收编结束', 'dispatch-released');
   /* 释放后该会话不再属于本 dispatch（dispatchOf 也找不到它），待补投队列再无人 flush：
-   * 连刚排入的释放通知一起回收，避免内存滞留。主调用的通知走 master 队列，不受影响。 */
-  record.queues.delete(targetSessionId);
+   * 连刚排入的释放通知一起回收，避免内存滞留。主调用的通知走 master 队列，不受影响。
+   * 待确认账同步收口：目标已不可达，不能让它按超时静默挂着。 */
+  dropTargetQueue(runtime, record, targetSessionId, '目标已被释放');
   /* 先把窗口内待发的加入事件送出去，保证 master 看到的顺序是「加入在前、离席在后」。 */
   flushMemberEvents(runtime, record);
   sendNotice(runtime, record, sessionId, `已释放「${slave.name}」`, 'dispatch-member-left');
@@ -597,9 +604,11 @@ function releaseSlaveIn(runtime, { sessionId, targetSessionId }) {
 /* —— 纯内存消息（send / end / leave）与桥生命周期 —— */
 
 /* 发送：master 可定向或广播给已收编 slave，slave 只能回 master（省略 toSessionIds 即回 master）。
- * 投递唯一出口是 runtime.notify；notify 返回 false 时按目标入有界队列，桥重连（noteBridgeOnline）补投。
+ * 投递优先走 runtime.deliverSeat（等 bridge delivered 回执，确认真正投进目标会话）；缺省回落
+ * runtime.notify 的同步受理语义。失败入按目标分桶的有界队列，桥重连（noteBridgeOnline）补投。
+ * requireAck 仅 dispatch 的 task（调度长→组员）：登记待确认账并额外通知调度长。
  * 消息不落盘、不经 LAN 出站队列、不做本机席位注入——这是 dispatch 与 managed / forum 的根本差异。 */
-function sendMessageIn(runtime, { collabId, sessionId, text, type, toSessionIds, taskId }) {
+async function sendMessageIn(runtime, { collabId, sessionId, text, type, toSessionIds, taskId, requireAck, ackFor }) {
   const record = runtime.state.dispatches.get(collabId);
   if (record === undefined) {
     return dispatchLost();
@@ -608,62 +617,250 @@ function sendMessageIn(runtime, { collabId, sessionId, text, type, toSessionIds,
   if (sender === null) {
     return { ok: false, message: '调用会话不在本机注册表内' };
   }
+  if (ackFor !== undefined) {
+    return ackOnlyIn(runtime, record, sessionId, { ackFor, text, type, toSessionIds, taskId, requireAck });
+  }
   const targets = sendTargetsOf(record, sessionId, toSessionIds);
   if (targets.error !== undefined) {
     return { ok: false, message: targets.error };
   }
-  const message = messageOf(record, { text, type, taskId, sessionId }, sender);
+  const message = messageOf(record, { text, type, taskId, sessionId, requireAck }, sender);
   if (message.error !== undefined) {
     return { ok: false, message: message.error };
   }
   return deliverMessage(runtime, record, targets.value, message.value);
 }
 
-/* 正文 / 类型 / taskId 的判定与出站文本组装。slave 的回复带 @来源——master 收到的是多条
- * slave 消息混流，纯文本无法区分说话者。 */
-function messageOf(record, { text, type, taskId, sessionId }, sender) {
-  if (typeof text !== 'string' || text.trim() === '') {
-    return { error: 'text 非法：需要非空白字符串' };
+/* 正文 / 类型 / taskId / ack 的判定与出站文本组装。slave 的回复带 @来源——master 收到的是多条
+ * slave 消息混流，纯文本无法区分说话者。requireAck 只允许调度长的 task：其他组合静默忽略会
+ * 造出「要了确认却没有确认」的假象，必须明确拒绝。 */
+function messageOf(record, input, sender) {
+  const rejection = messageRejectionOf(record, input);
+  if (rejection !== null) {
+    return { error: rejection };
   }
-  const messageType = type === undefined
-    ? (sessionId === record.masterSessionId ? 'task' : 'result')
-    : type;
-  if (!DISPATCH_MESSAGE_TYPES.includes(messageType)) {
-    return { error: `type 非法：dispatch 可取值为 ${DISPATCH_MESSAGE_TYPES.join(' / ')}` };
-  }
-  if (taskId !== undefined && !isDispatchTaskId(taskId)) {
-    return { error: 'taskId 非法：需要 1–64 字符的非空白字符串' };
-  }
-  const outbound = sessionId === record.masterSessionId ? text : `@${sender.name} ${text}`;
+  const messageType = messageTypeOf(record, input.type, input.sessionId);
+  const outbound = input.sessionId === record.masterSessionId ? input.text : `@${sender.name} ${input.text}`;
   return {
     value: {
-      messageType, taskId: taskId ?? null, outbound, fromSessionId: sessionId, fromSessionName: sender.name,
+      messageType,
+      taskId: input.taskId ?? null,
+      outbound,
+      fromSessionId: input.sessionId,
+      fromSessionName: sender.name,
+      requireAck: input.requireAck === true,
     },
   };
+}
+
+function messageRejectionOf(record, { text, type, taskId, sessionId, requireAck }) {
+  if (requireAck !== undefined && typeof requireAck !== 'boolean') {
+    return 'requireAck 非法：需要布尔值';
+  }
+  if (typeof text !== 'string' || text.trim() === '') {
+    return 'text 非法：需要非空白字符串';
+  }
+  if (type !== undefined && !DISPATCH_MESSAGE_TYPES.includes(type)) {
+    return `type 非法：dispatch 可取值为 ${DISPATCH_MESSAGE_TYPES.join(' / ')}`;
+  }
+  if (taskId !== undefined && !isDispatchTaskId(taskId)) {
+    return 'taskId 非法：需要 1–64 字符的非空白字符串';
+  }
+  return requireAckRejectionOf(record, { requireAck, sessionId, type });
+}
+
+function messageTypeOf(record, type, sessionId) {
+  if (type !== undefined) {
+    return type;
+  }
+  return sessionId === record.masterSessionId ? 'task' : 'result';
+}
+
+function requireAckRejectionOf(record, { requireAck, sessionId, type }) {
+  if (requireAck !== true) {
+    return null;
+  }
+  const masterTask = sessionId === record.masterSessionId && messageTypeOf(record, type, sessionId) === 'task';
+  return masterTask ? null : 'requireAck 仅适用于调度长发出的 task 消息';
 }
 
 function isDispatchTaskId(taskId) {
   return typeof taskId === 'string' && taskId.trim() !== '' && taskId.length <= 64;
 }
 
-/* 投递循环：notify 成功即送达；失败入按目标分桶的有界队列（桥重连补投），不静默丢弃。 */
-function deliverMessage(runtime, record, targets, message) {
-  let delivered = 0;
-  let queued = 0;
+/* 投递循环（async：deliverSeat 要等 bridge 回执）：成功即送达；失败入按目标分桶的有界队列
+ * （桥重连补投），不静默丢弃。返回逐目标 delivery 与既有 delivered/queued 计数。 */
+async function deliverMessage(runtime, record, targets, message) {
+  const results = [];
   for (const target of targets) {
-    const frame = noticeFrame(runtime, record, target, message.outbound, 'dispatch-message');
-    frame.payload.messageType = message.messageType;
-    frame.payload.taskId = message.taskId;
-    frame.payload.fromSessionId = message.fromSessionId;
-    frame.payload.fromSessionName = message.fromSessionName;
-    if (notifyOnce(runtime, frame)) {
-      delivered++;
-    } else {
-      enqueue(runtime, record, target, frame);
-      queued++;
+    const frame = messageFrameOf(runtime, record, target, message);
+    const delivered = await deliverOnce(runtime, frame, target, record.collabId);
+    results.push(delivered
+      ? deliveredEntryFrame(runtime, target, frame, record, message)
+      : queuedEntryFrame(runtime, record, target, frame, message));
+  }
+  return messageResultOf(record, targets, results, message.requireAck);
+}
+
+/* 单目标帧：在既有通知帧上补 dispatch 消息面；requireAck 时在正文末尾追加回执指引
+ * （目标模型看不到帧 msgId，必须在文本里给出可直接照抄的调用）。 */
+function messageFrameOf(runtime, record, target, message) {
+  const frame = noticeFrame(runtime, record, target, message.outbound, 'dispatch-message');
+  frame.payload.messageType = message.messageType;
+  frame.payload.taskId = message.taskId;
+  frame.payload.fromSessionId = message.fromSessionId;
+  frame.payload.fromSessionName = message.fromSessionName;
+  if (message.requireAck) {
+    frame.payload.requireAck = true;
+    frame.payload.text = `${message.outbound}\n\n[需确认] 收到请回执：ws_send_message { collabId: "${record.collabId}", text: "收到", ackFor: "${frame.msgId}" }`;
+  }
+  return frame;
+}
+
+/* 单目标投递：有异步投递面就等它（bridge 回执），否则回落既有同步 notify。 */
+async function deliverOnce(runtime, frame, target, collabId) {
+  if (runtime.deliverSeat === null) {
+    return notifyOnce(runtime, frame);
+  }
+  try {
+    return (await runtime.deliverSeat(frame, target)) === true;
+  } catch (error) {
+    runtime.log?.warn?.('dispatch 消息投递异常（转入待补投队列）', {
+      collabId, targetSessionId: target, reason: error?.message,
+    });
+    return false;
+  }
+}
+
+function deliveredEntryFrame(runtime, target, frame, record, message) {
+  if (message.requireAck) {
+    registerPendingAck(runtime, record, target, frame, message, 'delivered');
+  }
+  return { sessionId: target, status: 'delivered', msgId: frame.msgId };
+}
+
+/* 入队并为该目标设定补投截止（首次入队时确定；宽限内桥重连会由 noteBridgeOnline 补投）。 */
+function queuedEntryFrame(runtime, record, target, frame, message) {
+  const deadline = queueDeadlineOf(runtime, record, target);
+  enqueue(runtime, record, target, frame);
+  if (message.requireAck) {
+    registerPendingAck(runtime, record, target, frame, message, 'queued');
+  }
+  return { sessionId: target, status: 'queued', msgId: frame.msgId, queuedUntil: new Date(deadline).toISOString() };
+}
+
+function queueDeadlineOf(runtime, record, target) {
+  const known = record.queueDeadlines.get(target);
+  if (known !== undefined) {
+    return known;
+  }
+  const grace = record.grace.get(target);
+  const deadline = Number.isInteger(grace) ? Math.max(grace, runtime.now()) : runtime.now() + graceMsOf(runtime.config);
+  record.queueDeadlines.set(target, deadline);
+  return deadline;
+}
+
+function registerPendingAck(runtime, record, target, frame, message, deliveryState) {
+  record.pendingAcks.set(frame.msgId, {
+    ackFor: frame.msgId,
+    targetSessionId: target,
+    masterSessionId: record.masterSessionId,
+    taskId: message.taskId,
+    excerpt: excerptOf(message.outbound),
+    deliveryState,
+    createdAt: runtime.now(),
+    deadline: runtime.now() + ackTtlOf(runtime.config),
+  });
+}
+
+function ackTtlOf(config) {
+  const value = config?.dispatchAckTtlMs;
+  return Number.isInteger(value) && value > 0 ? value : DISPATCH_ACK_TTL_MS;
+}
+
+function excerptOf(text, max = 60) {
+  const flat = typeof text === 'string' ? text.replace(/\s+/g, ' ').trim() : '';
+  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
+}
+
+/* 发送结果：既有字段（delivered/queued/targets）原样保留，新增 delivery 汇总与逐目标明细。 */
+function messageResultOf(record, targets, results, requireAck) {
+  const counts = countDelivery(results);
+  const ack = requireAck
+    ? { required: true, state: 'pending', pending: results.filter((entry) => entry.status !== 'failed').map((entry) => entry.msgId) }
+    : undefined;
+  return {
+    ok: true,
+    dispatchId: record.collabId,
+    delivered: counts.delivered,
+    queued: counts.queued,
+    targets,
+    delivery: {
+      state: overallDeliveryStateOf(counts, results.length),
+      ...counts,
+      targets: results,
+      ...(ack === undefined ? {} : { ack }),
+    },
+  };
+}
+
+function countDelivery(results) {
+  const counts = { delivered: 0, queued: 0, failed: 0 };
+  for (const entry of results) {
+    if (entry.status === 'delivered' || entry.status === 'queued' || entry.status === 'failed') {
+      counts[entry.status]++;
     }
   }
-  return { ok: true, dispatchId: record.collabId, delivered, queued, targets };
+  return counts;
+}
+
+/* 归并状态：全 delivered / 全 failed / 无 delivered 且无 failed（全 queued）/ 其余 partial。 */
+function overallDeliveryStateOf(counts, total) {
+  if (total > 0 && counts.delivered === total) {
+    return 'delivered';
+  }
+  if (total > 0 && counts.failed === total) {
+    return 'failed';
+  }
+  if (counts.delivered === 0 && counts.failed === 0) {
+    return 'queued';
+  }
+  return 'partial';
+}
+
+/* ackFor 是独立回执动作（服务层同口径）：形态必须合法，且不得与消息发送字段混用。 */
+function ackOnlyIn(runtime, record, sessionId, { ackFor, text, type, toSessionIds, taskId, requireAck }) {
+  if (typeof ackFor !== 'string' || !ID_PATTERN.test(ackFor)) {
+    return { ok: false, message: 'ackFor 非法：需要消息标识（1–64 位字母数字与连字符）' };
+  }
+  if (type !== undefined || toSessionIds !== undefined || taskId !== undefined || requireAck !== undefined) {
+    return { ok: false, message: 'ackFor 回执不能与 type / toSessionIds / taskId / requireAck 同时使用' };
+  }
+  return ackMessageIn(runtime, record, sessionId, ackFor, text);
+}
+
+/* 目标会话回执：ackFor 必须命中待确认账且回执者就是被投递目标；成功即向调度长另行通知。 */
+function ackMessageIn(runtime, record, sessionId, ackFor, text) {
+  const pending = record.pendingAcks.get(ackFor);
+  if (pending === undefined) {
+    return { ok: false, message: 'ackFor 无对应的待确认消息（可能已确认、已超时或标识有误）' };
+  }
+  if (pending.targetSessionId !== sessionId) {
+    return { ok: false, message: '只有该消息的目标会话可以确认（ackFor 与调用会话不匹配）' };
+  }
+  record.pendingAcks.delete(ackFor);
+  const sender = runtime.metaOf(sessionId);
+  const name = sender?.name ?? sessionId;
+  const note = typeof text === 'string' ? text.trim() : '';
+  const task = pending.taskId === null ? '消息' : `任务 ${pending.taskId}`;
+  sendNotice(
+    runtime,
+    record,
+    record.masterSessionId,
+    `「${name}」已确认收到${task}（${ackFor}）${note === '' ? '' : `：${note}`}（原文：${pending.excerpt}）`,
+    'dispatch-ack',
+  );
+  return { ok: true, dispatchId: record.collabId, acked: true, ackFor, taskId: pending.taskId };
 }
 
 /* 路由判定：返回 { value: targets } 或 { error }。master 定向到非成员 / slave 越权回复 /
@@ -753,8 +950,7 @@ function leaveDispatchIn(runtime, { collabId, sessionId }) {
     return { ok: false, message: '本会话不在该 dispatch 内' };
   }
   record.slaves.delete(sessionId);
-  record.grace.delete(sessionId);
-  record.queues.delete(sessionId);
+  dropTargetQueue(runtime, record, sessionId, '目标已退出');
   flushMemberEvents(runtime, record);
   sendNotice(runtime, record, record.masterSessionId, `「${slave.name}」已退出 dispatch`, 'dispatch-member-left');
   return { ok: true, collabId };
@@ -791,6 +987,8 @@ function sweepDispatchesIn(runtime, at) {
       continue;
     }
     sweepClaimsOf(runtime, record, at);
+    sweepQueuesOf(runtime, record, at);
+    sweepAcksOf(runtime, record, at);
     sweepGraceOf(runtime, record, at);
     if (record.autoClaim) {
       autoClaimPassIn(runtime, record);
@@ -813,11 +1011,81 @@ function sweepGraceOf(runtime, record, at) {
     }
     const slave = record.slaves.get(sessionId);
     record.slaves.delete(sessionId);
-    record.grace.delete(sessionId);
-    record.queues.delete(sessionId);
+    dropTargetQueue(runtime, record, sessionId, '宽限超时离席');
     expired.push(slave?.name ?? sessionId);
   }
   notifyGraceTimeouts(runtime, record, expired);
+}
+
+/* 补投超时（宽限截止已到）：丢弃该目标队列并向调度长如实回报条数——队列不会无限滞留。 */
+function sweepQueuesOf(runtime, record, at) {
+  for (const [target, deadline] of [...record.queueDeadlines]) {
+    if (deadline > at) {
+      continue;
+    }
+    const dropped = record.queues.get(target)?.length ?? 0;
+    dropQueueOnly(runtime, record, target, '补投超时');
+    if (dropped > 0) {
+      sendNotice(
+        runtime,
+        record,
+        record.masterSessionId,
+        `「${targetNameOf(record, target)}」的消息补投超时（${dropped} 条未送达，宽限截止）`,
+        'dispatch-delivery-timeout',
+      );
+    }
+  }
+}
+
+/* 待确认超时：requireAck 的条目超过 TTL 仍未回执，收口并通知调度长（不静默挂着）。 */
+function sweepAcksOf(runtime, record, at) {
+  for (const [msgId, pending] of [...record.pendingAcks]) {
+    if (pending.deadline > at) {
+      continue;
+    }
+    record.pendingAcks.delete(msgId);
+    sendNotice(
+      runtime,
+      record,
+      record.masterSessionId,
+      `任务消息超时未确认：${msgId}${pending.taskId === null ? '' : `（任务 ${pending.taskId}）`}——目标 ${targetNameOf(record, pending.targetSessionId)}`,
+      'dispatch-ack-timeout',
+    );
+  }
+}
+
+/* 目标队列回收：只清队列、补投截止与待确认账（不碰 grace/成员关系——宽限超时后仍由
+ * sweepGraceOf 收口）；待确认账同步作废并向调度长回报。 */
+function dropQueueOnly(runtime, record, target, reason) {
+  record.queues.delete(target);
+  record.queueDeadlines.delete(target);
+  expirePendingAcksOfTarget(runtime, record, target, reason);
+}
+
+/* 目标退场（释放/退出/宽限超时）：队列三本账 + 宽限一起清。 */
+function dropTargetQueue(runtime, record, target, reason) {
+  dropQueueOnly(runtime, record, target, reason);
+  record.grace.delete(target);
+}
+
+function expirePendingAcksOfTarget(runtime, record, target, reason) {
+  for (const [msgId, pending] of [...record.pendingAcks]) {
+    if (pending.targetSessionId !== target) {
+      continue;
+    }
+    record.pendingAcks.delete(msgId);
+    sendNotice(
+      runtime,
+      record,
+      record.masterSessionId,
+      `任务消息未确认（${reason}）：${msgId}${pending.taskId === null ? '' : `（任务 ${pending.taskId}）`}`,
+      'dispatch-ack-timeout',
+    );
+  }
+}
+
+function targetNameOf(record, targetSessionId) {
+  return record.slaves.get(targetSessionId)?.name ?? targetSessionId;
 }
 
 function notifyGraceTimeouts(runtime, record, expired) {
@@ -934,12 +1202,28 @@ function notifyOnce(runtime, frame) {
 function enqueue(runtime, record, targetSessionId, frame) {
   const queue = record.queues.get(targetSessionId) ?? [];
   if (queue.length >= queueLimitOf(runtime.config)) {
-    queue.shift();
+    noteDroppedFrame(runtime, record, queue.shift());
     runtime.state.counters.dispatchQueueDropped = (runtime.state.counters.dispatchQueueDropped ?? 0) + 1;
     runtime.log?.warn?.('dispatch 通知队列已满，丢弃最旧一条', { collabId: record.collabId, targetSessionId });
   }
   queue.push(frame);
   record.queues.set(targetSessionId, queue);
+}
+
+/* 队列溢出丢弃的帧：若它在待确认账里，立即作废并如实通知调度长（不能等 TTL 假装还在等）。 */
+function noteDroppedFrame(runtime, record, frame) {
+  const pending = record.pendingAcks.get(frame.msgId);
+  if (pending === undefined) {
+    return;
+  }
+  record.pendingAcks.delete(frame.msgId);
+  sendNotice(
+    runtime,
+    record,
+    record.masterSessionId,
+    `任务消息未确认（待补投队列溢出，已丢弃）：${frame.msgId}`,
+    'dispatch-ack-timeout',
+  );
 }
 
 /* 通知队列容量：缺省用本模块常量；配置可经 dispatchQueueMax 收紧 / 放宽（未知键原样保留在生效配置）。 */
@@ -953,10 +1237,24 @@ function flushQueue(runtime, record, targetSessionId) {
   if (queue === undefined) {
     return;
   }
+  const deadline = record.queueDeadlines.get(targetSessionId);
+  if (deadline !== undefined && runtime.now() > deadline) {
+    dropQueueOnly(runtime, record, targetSessionId, '补投超时');
+    return;
+  }
   while (queue.length > 0 && notifyOnce(runtime, queue[0])) {
-    queue.shift();
+    noteQueuedAckDelivered(record, queue.shift());
   }
   if (queue.length === 0) {
     record.queues.delete(targetSessionId);
+    record.queueDeadlines.delete(targetSessionId);
+  }
+}
+
+/* 补投成功：待确认账从 queued 推进到 delivered（ack 超时仍按原截止收口）。 */
+function noteQueuedAckDelivered(record, frame) {
+  const pending = record.pendingAcks.get(frame.msgId);
+  if (pending !== undefined) {
+    pending.deliveryState = 'delivered';
   }
 }

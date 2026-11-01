@@ -68,15 +68,54 @@ export function loadLines(filePath) {
   return loaded;
 }
 
+/* 覆盖式 rename 的瞬时失败（Windows 实测）：目标文件被并发读者以不允许删除的共享模式打开时，
+ * rename 报 EPERM/EACCES/EBUSY。这不是数据错误，读句柄关闭后即可成功——对这三类 errno 做
+ * 小步同步重试；其余错误与重试耗尽照常抛出，不掩盖真问题。 */
+export const TRANSIENT_RENAME_CODES = ['EPERM', 'EACCES', 'EBUSY'];
+const RENAME_RETRY_ATTEMPTS = 5;
+const RENAME_RETRY_WAIT_MS = 2;
+/* 同步退避缓冲：Node 没有同步 sleep；Atomics.wait 在主线程可用，且不引入依赖。 */
+const RETRY_WAIT_BUFFER = new Int32Array(new SharedArrayBuffer(4));
+
+/**
+ * 瞬时文件系统错误重试（同步）：只对 retryCodes 命中的错误重试，其余立即抛出。
+ * 返回 fn 的返回值；attempt 从 1 起传入，便于调用方记录最终尝试次数。
+ * @template T
+ * @param {(attempt: number) => T} fn
+ * @param {{ attempts?: number, waitMs?: number, retryCodes?: string[] }} [options]
+ * @returns {T}
+ */
+export function retryTransientSync(fn, { attempts = RENAME_RETRY_ATTEMPTS, waitMs = RENAME_RETRY_WAIT_MS, retryCodes = TRANSIENT_RENAME_CODES } = {}) {
+  const limit = Number.isInteger(attempts) && attempts > 0 ? attempts : 1;
+  return retryAttempt(fn, { limit, waitMs, retryCodes, attempt: 1 });
+}
+
+function retryAttempt(fn, { limit, waitMs, retryCodes, attempt }) {
+  try {
+    return fn(attempt);
+  } catch (error) {
+    if (!shouldRetryFs(error, { limit, retryCodes, attempt })) {
+      throw error;
+    }
+    Atomics.wait(RETRY_WAIT_BUFFER, 0, 0, waitMs);
+    return retryAttempt(fn, { limit, waitMs, retryCodes, attempt: attempt + 1 });
+  }
+}
+
+function shouldRetryFs(error, { limit, retryCodes, attempt }) {
+  return attempt < limit && retryCodes.includes(error?.code);
+}
+
 /**
  * 整体替换：同目录临时文件写全 + rename 覆盖（同卷 rename 在 Windows/Linux 均覆盖既有文件）。
  * 崩溃最坏情形是留下一份孤儿临时文件，目标文件永远是完整旧版或完整新版。
+ * write/rename 都套瞬时错误重试：并发读者只影响 rename 窗口，重试后仍失败才抛出。
  */
 export function replaceFile(filePath, content) {
   const tempPath = `${filePath}.${randomUUID()}.tmp`;
   try {
-    writeFileSync(tempPath, content);
-    renameSync(tempPath, filePath);
+    retryTransientSync(() => writeFileSync(tempPath, content));
+    retryTransientSync(() => renameSync(tempPath, filePath));
   } catch (error) {
     rmSync(tempPath, { force: true });
     throw error;

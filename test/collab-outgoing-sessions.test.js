@@ -81,6 +81,50 @@ test('站长群发：按机器分组，一机一帧并携 toSessions；同机其
   assert.deepEqual(injected.map((entry) => entry.sessionId), ['sess-local2'], '同机其他席位走旁路，不给发送会话自己投递');
   assert.equal(injected[0].frame.from.sessionId, 'sess-self');
   assert.deepEqual(result.to.sort(), ['inst-b', 'inst-c', 'inst-self']);
+
+  /* delivery 增量字段：本机旁路已注入＝delivered；远端仅受理入队＝queued（附 TTL 截止）。 */
+  assert.equal(result.delivery.state, 'partial');
+  assert.equal(result.delivery.delivered, 1);
+  assert.equal(result.delivery.queued, 2);
+  assert.equal(result.delivery.failed, 0);
+  const localTarget = result.delivery.targets.find((entry) => entry.sessionId === 'sess-local2');
+  assert.deepEqual(localTarget, { sessionId: 'sess-local2', status: 'delivered', msgId: injected[0].frame.msgId });
+  for (const target of result.delivery.targets.filter((entry) => entry.status === 'queued')) {
+    assert.equal(typeof target.msgId, 'string');
+    assert.ok(Number.isFinite(Date.parse(target.queuedUntil)), '远端排队必须给出 TTL 截止');
+  }
+});
+
+test('delivery：本机暂存 → queued 带席位宽限截止；全本机注入 → delivered', async () => {
+  const localOnly = () => makeState({
+    seats: [seat('sess-self', { role: 'manager' }), seat('sess-local2')],
+    roster: [rosterRow('inst-self', 'sess-self', 'manager'), rosterRow('inst-self', 'sess-local2')],
+  });
+  const staged = localOnly();
+  staged.state.injectLocalSeat = async () => ({ ok: true, staged: true });
+  const queued = await sendMessage(staged.state, { collabId: 'collab-1', text: '暂存', sessionId: 'sess-self' });
+  assert.equal(queued.delivery.state, 'queued');
+  assert.equal(queued.delivery.targets[0].status, 'queued');
+  assert.ok(Number.isFinite(Date.parse(queued.delivery.targets[0].queuedUntil)), '本机暂存也给宽限截止');
+
+  const delivered = localOnly();
+  const ok = await sendMessage(delivered.state, { collabId: 'collab-1', text: '直达', sessionId: 'sess-self' });
+  assert.equal(ok.delivery.state, 'delivered');
+  assert.equal(ok.delivery.targets[0].status, 'delivered');
+});
+
+test('delivery：本机旁路注入失败 → failed 带原因，不谎报 delivered', async () => {
+  const { state } = makeState({
+    seats: [seat('sess-self', { role: 'manager' }), seat('sess-local2')],
+    roster: [rosterRow('inst-self', 'sess-self', 'manager'), rosterRow('inst-self', 'sess-local2')],
+  });
+  state.injectLocalSeat = async () => ({ ok: false, status: 'dropped', reason: '注入面拒绝' });
+  const result = await sendMessage(state, { collabId: 'collab-1', text: '本机失败', sessionId: 'sess-self', to: 'inst-self', toSessionId: 'sess-local2' });
+  assert.equal(result.ok, false, '全部目标失败仍按既有 isError 语义');
+  assert.equal(result.delivery.state, 'failed');
+  assert.deepEqual(result.delivery.targets[0], {
+    sessionId: 'sess-local2', status: 'failed', msgId: result.delivery.targets[0].msgId, reason: '注入面拒绝',
+  });
 });
 
 test('本机旁路：目标全在本机时不调用 dispatch.send，逐席调用 injectLocalSeat', async () => {

@@ -267,6 +267,32 @@ test('启动自检失败（进程内）：协作目录不可用 → 拒绝服务
   assert.ok(String(readCoreJson(home).startupError).includes('协作目录不可用'), '原因须留在运行描述符');
 });
 
+test('启动失败收场不覆盖继任者描述符（多桥并发冷启竞态）', { timeout: 30000 }, async (t) => {
+  const home = makeCoreHome(t);
+  writeCoreConfig(home, { port: await pickFreePort() });
+  writeFileSync(join(home, 'collabs'), 'not a directory\n');
+  const pending = startCore({
+    env: { ...coreEnv(home), NODE_TEST_CONTEXT: 'core-startup-test', WAYSTATION_TEST_STARTUP_DELAY_MS: '120' },
+  });
+  /* 启动延迟期内模拟继任者已重建描述符（不同 token/startedAt）：失败核收场必须保留它。 */
+  await waitFor(() => existsSync(join(home, CORE_FILE)), { timeoutMs: 5000 });
+  const acquired = readCoreJson(home);
+  const successor = {
+    ...acquired,
+    token: 'successor-token-0123456789abcdef',
+    startedAt: new Date().toISOString(),
+    status: 'ready',
+    heartbeatAt: new Date().toISOString(),
+    marker: 'successor',
+  };
+  writeFileSync(join(home, CORE_FILE), JSON.stringify(successor));
+  const result = await pending;
+  assert.equal(result.ok, false, '自检仍应失败');
+  const final = readCoreJson(home);
+  assert.equal(final.marker, 'successor', '失败核不得覆盖继任者描述符');
+  assert.equal(final.startupError, undefined, '失败原因不得写进继任者记录');
+});
+
 /* 无关程序占位：TCP 先手监听选中端口（listen 撞 EADDRINUSE ＝ 被环境抢先，换端口重试）。 */
 async function holdPortWithUnrelatedServer(t) {
   for (let attempt = 0; attempt < PORT_SETUP_ATTEMPTS; attempt++) {

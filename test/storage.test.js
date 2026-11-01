@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { appendLine, loadLines, replaceFile, writeJsonAtomic } from '../src/storage.js';
+import { appendLine, loadLines, replaceFile, retryTransientSync, writeJsonAtomic } from '../src/storage.js';
 import { makeTempDir } from './helpers.js';
 
 test('appendLine + loadLines：基本往返', (t) => {
@@ -122,6 +122,33 @@ test('半行断在多字节字符中间（解码出替换符）：仍能识别�
   assert.deepEqual(loaded.entries, [{ a: 1 }]);
   assert.equal(loaded.tailDropped, true);
   assert.equal(readFileSync(file, 'utf8'), '{"a":1}\n');
+});
+
+test('retryTransientSync：瞬时共享冲突重试后成功，非瞬时错误立即抛出', () => {
+  let attempts = 0;
+  const value = retryTransientSync(() => {
+    attempts++;
+    if (attempts < 3) {
+      throw Object.assign(new Error('被占用'), { code: 'EPERM' });
+    }
+    return 'ok';
+  }, { attempts: 5, waitMs: 0 });
+  assert.equal(value, 'ok');
+  assert.equal(attempts, 3, '前两次瞬时失败被重试');
+
+  let fatalAttempts = 0;
+  assert.throws(() => retryTransientSync(() => {
+    fatalAttempts++;
+    throw Object.assign(new Error('不存在'), { code: 'ENOENT' });
+  }, { attempts: 5, waitMs: 0 }), /不存在/);
+  assert.equal(fatalAttempts, 1, '非瞬时错误不重试');
+
+  let exhausted = 0;
+  assert.throws(() => retryTransientSync(() => {
+    exhausted++;
+    throw Object.assign(new Error('仍被占用'), { code: 'EBUSY' });
+  }, { attempts: 3, waitMs: 0 }), /仍被占用/);
+  assert.equal(exhausted, 3, '重试次数用尽后抛出最后一次错误');
 });
 
 test('replaceFile：原子替换既有文件、不留临时文件', (t) => {

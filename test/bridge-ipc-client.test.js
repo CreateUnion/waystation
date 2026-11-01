@@ -961,6 +961,9 @@ test('换代·单次闸（模块级 Set）拦同 pid 第二次终止信号：第
   assert.equal((await second.ensureCore()).kind, 'replacing');
   await waitFor(() => lines.some((line) => line.includes('already-once')), { timeoutMs: 5000 });
   assert.equal(kills.length, 1, '本进程已对同 pid 发过信号：第二次不再投递（模块级单次闸）');
+  /* 台账判停发生在 finishFlight 之后的异步 ensureCore 里（重握手仍被 version 拒绝）：等它收敛，
+   * 不把调度时序当断言前提（并发负载下即时断言会假红）。 */
+  await waitFor(() => /ipcV/.test(second.changeoverState().notice ?? ''), { timeoutMs: 5000 });
   assert.match(second.changeoverState().notice, /ipcV/, '随后台账判停（重 spawn 后仍不兼容＝不循环）');
 });
 

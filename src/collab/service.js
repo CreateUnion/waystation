@@ -132,6 +132,9 @@ export function createCollabService(options) {
     log: state.log,
     now: state.clock,
     notify: (frame) => state.notify?.(frame) ?? false,
+    /* dispatch 消息的「已投进目标会话」判定：路由层 deliverToSeat 会等 bridge 的 delivered
+     * 回执（2s 上限）；缺省（单测/旧装配）回落 notify 的同步受理语义。 */
+    deliverSeat: pickOption(options, 'deliverDispatch', null),
     sessionMetaOf: pickOption(options, 'sessionMetaOf', () => null),
     listSessionIds: pickOption(options, 'listSessionIds', () => []),
   });

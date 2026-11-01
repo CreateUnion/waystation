@@ -74,6 +74,10 @@ export function createCoreLink(options = {}) {
   return {
     state: state.view,
     ensureCore: () => ensureCore(state),
+    /* 桥层常驻心跳的一次探测：已注册→发 ping 等应答，超时强制断开并进重生流；
+     * 未注册→直接走既有 ensureCore（四态判定/冷启/换代窗口复用，不另造重连）。
+     * 返回 { ok, kind?, message?, reconnected? }；replacing/closed 属预期态，不升级为告警。 */
+    heartbeat: (options) => heartbeat(state, options),
     call: (tool, args) => callTool(state, tool, args),
     sendDelivered: (frame) => sendDelivered(state, frame),
     sendRegisterUpdate: (meta) => sendRegisterUpdate(state, meta),
@@ -120,10 +124,18 @@ function buildLinkState(options) {
     ...timingOf(options),
     // 心跳新鲜阈值＝核心侧判死阈值（≥3×刷新间隔且 ≥15s，lifecycle.js 的 lifecycleParams 单一权威）
     judgeMs: lifecycleParams(env).judgeMs,
+    ...heartbeatSupervisionOf(options),
     // 硬杀防护链的注入缝（测试/校准）：透传给 stop-guard 的构造参数
     guardOptions: options.guardOptions ?? null,
     onCoreRestarting: options.onCoreRestarting ?? null,
     onRegistered: options.onRegistered ?? null,
+    ...linkRuntimeStateOf(),
+  };
+}
+
+/* 连接/重试运行态（零值初始化）：从主构造器分出，保持单函数行数与字段分组可读。 */
+function linkRuntimeStateOf() {
+  return {
     pushHandler: null,
     client: null,
     registered: false,
@@ -139,6 +151,15 @@ function buildLinkState(options) {
     rapidAttempts: [],
     view: { registered: false, welcome: null, lastFailure: null, rebirth: false, rapidRetries: 0, transport: null, transportFallbacks: 0, lastReconnectMs: null },
     lostAt: null, lastReconnectMs: null,
+  };
+}
+
+/* 桥层心跳监督的注入面：显式探测期限（默认 30s）与冷启配额数组（3 次/10 分钟，与快速重试同族；
+ * 心跳每 10s 可探测，但只有配额允许才真的 spawn——持久故障不会退化成 spawn 风暴）。 */
+function heartbeatSupervisionOf(options) {
+  return {
+    heartbeatTimeoutMs: options.heartbeatTimeoutMs ?? 30000,
+    spawnAttempts: [],
   };
 }
 
@@ -219,6 +240,56 @@ function syncView(state) {
   state.view.lastReconnectMs = state.lastReconnectMs;
 }
 
+/* —— 桥层心跳（常驻监督的探测面） —— */
+
+/* 一次心跳：已注册＝显式 ping 等应答；未注册＝复用 ensureCore 走重生流。
+ * 「重连成功」由既有 finalizeRegistration 的 hello/onRegistered 完成（sessionId 重新上报、
+ * 核心侧 registerBridgeEntry 触发 seat rebind），本函数不重复注册。 */
+async function heartbeat(state, options = {}) {
+  if (state.closed) {
+    return { ok: false, kind: 'closed', message: '桥已关闭' };
+  }
+  if (!state.registered || state.client === null) {
+    return reconnectHeartbeat(state);
+  }
+  return probeHeartbeat(state, options.timeoutMs);
+}
+
+async function reconnectHeartbeat(state) {
+  const ensured = await ensureCore(state);
+  return ensured.ok
+    ? { ok: true, reconnected: true, message: '心跳监督已重连并重新注册' }
+    : { ok: false, kind: ensured.kind ?? 'unreachable', message: ensured.message ?? '核心无应答' };
+}
+
+async function probeHeartbeat(state, requestedTimeoutMs) {
+  const client = state.client;
+  const waitMs = heartbeatWaitMs(state, requestedTimeoutMs);
+  const alive = typeof client.probe === 'function' ? await client.probe(waitMs) : true;
+  if (alive) {
+    return { ok: true, reconnected: false };
+  }
+  state.log?.warn?.('桥心跳失败（核心在期限内无应答）——强制断开并进入重生流', { timeoutMs: waitMs });
+  forceReconnect(state, client);
+  return { ok: false, kind: 'heartbeat-timeout', message: '核心心跳无应答，已强制重连' };
+}
+
+function heartbeatWaitMs(state, requested) {
+  return Number.isInteger(requested) && requested > 0 ? requested : state.heartbeatTimeoutMs;
+}
+
+/* 心跳判死后强制断开：先走既有断连收口（清注册态、收口在途调用、排重生重试），再关连接。
+ * 收口后 state.client 已置 null，客户端 onClose 的重复触发被 handleConnectionLoss 的
+ * 「state.client !== client」守卫吸收。 */
+function forceReconnect(state, client) {
+  if (state.closed || state.client !== client) {
+    return false;
+  }
+  handleConnectionLoss(state, client);
+  void client.close().catch(noop);
+  return true;
+}
+
 /* —— 四态判定与冷启 —— */
 
 function ensureCore(state) {
@@ -277,7 +348,16 @@ async function probeStep(state, flow) {
   }
   const record = probe.record;
   if (typeof record.startupError === 'string' && record.startupError !== '') {
-    return { kind: 'fail', failure: startupFailed(state, record.startupError) };
+    /* startupError 只在「失败进程仍活且心跳新鲜」时阻断冷启；进程已死/心跳已停＝陈旧失败记录
+     * （多桥并发冷启的典型残局）。继续阻断会让桥永久停在慢速空转——陈旧记录按崩溃残留处理，
+     * 重新冷启，频率由 spawn 配额（3 次/10 分钟）兜底。 */
+    if (failedProcessStillSuspect(state, record)) {
+      return { kind: 'fail', failure: startupFailed(state, record.startupError) };
+    }
+    state.log?.warn?.('发现陈旧启动失败记录（失败进程已退出/心跳已停）——按陈旧处理并重新冷启', {
+      failedPid: record.pid ?? null,
+    });
+    return coldStartStep(state, flow);
   }
   const liveness = await livenessStep(state, flow, record);
   return liveness ?? connectStep(state, record, flow);
@@ -315,6 +395,10 @@ async function connectStep(state, record, flow) {
  * 隔离路径），桥不删不抢。 */
 async function coldStartStep(state, flow) {
   if (!flow.coldStartIssued) {
+    const gate = spawnGate(state);
+    if (!gate.ok) {
+      return { kind: 'fail', failure: { kind: 'cold-start-limited', message: gate.message, retryMs: state.slowRetryMs } };
+    }
     flow.coldStartIssued = true;
     const issued = issueColdStart(state);
     if (!issued.ok) {
@@ -322,6 +406,30 @@ async function coldStartStep(state, flow) {
     }
   }
   return { kind: 'wait', timeoutFailure: null };
+}
+
+/* 陈旧 startupError 的判据：失败进程仍活且心跳新鲜才继续按失败收口；pid 死或心跳停即视为
+ * 崩溃残留。心跳判据与核心侧判死阈值同源（judgeMs），避免把刚失败、尚未退出的进程误当陈旧。 */
+function failedProcessStillSuspect(state, record) {
+  if (!pidIsAlive(record.pid)) {
+    return false;
+  }
+  return state.now() - Date.parse(record.heartbeatAt ?? '') < state.judgeMs;
+}
+
+/* 冷启配额：与快速重试同一上界（3 次/10 分钟）。心跳每拍都可探测，但真正 spawn 必须过关——
+ * 持久故障下最多 3 次/10 分钟，不会因心跳退化成 spawn 风暴。通过即记账。 */
+function spawnGate(state) {
+  const now = state.now();
+  state.spawnAttempts = state.spawnAttempts.filter((at) => now - at < RAPID_RETRY_WINDOW_MS);
+  if (state.spawnAttempts.length >= RAPID_RETRY_MAX) {
+    return {
+      ok: false,
+      message: `冷启尝试超过上界（${RAPID_RETRY_MAX} 次/${Math.round(RAPID_RETRY_WINDOW_MS / 60000)} 分钟）——等待窗口滑过后自动重试`,
+    };
+  }
+  state.spawnAttempts.push(now);
+  return { ok: true };
 }
 
 /* 僵尸核心（pid 活、心跳停）：硬杀防护链（stop-guard 共享件）——链全过才冷启；校验不过＝降级上报、

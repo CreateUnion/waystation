@@ -6,6 +6,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { resolveDataDir } from '../paths.js';
 import { createMcpServer } from '../server.js';
 import { TOOL_SPECS } from '../tools/specs.js';
+import { HEARTBEAT_ENV, createHeartbeatLoop, heartbeatSettingsOf } from './heartbeat.js';
 import { createCoreLink } from './ipc-client.js';
 import { createSessionWriter } from './session-writer.js';
 import { bridgeMetaOf, createSessionMetaWatcher } from './session-meta.js';
@@ -90,6 +91,7 @@ export function createBridgeRuntime(options = {}) {
   const sessionId = sessionIdOf(env);
   const link = options.link ?? createCoreLink(linkOptionsOf({ options, env, log, dataDir, sessionId }));
   const watcher = startSessionMetaWatcher(options, env, sessionId, link);
+  const heartbeat = startHeartbeatRuntime({ options, env, log, link });
   link.setPushHandler((push) => {
     void deliverPush(link, writer, push, log);
   });
@@ -105,12 +107,38 @@ export function createBridgeRuntime(options = {}) {
     dataDir,
     writer,
     link,
+    heartbeat,
     registry: createForwardingRegistry({ link }),
     close: async () => {
+      heartbeat?.stop();
       watcher?.close();
       await link.close();
     },
   };
+}
+
+/* 常驻心跳接线：环境变量 0/false/off/no 关闭；非法间隔告警一次后回落默认。
+ * 连接件无 heartbeat 方法（旧桩/嵌入形态）时静默不启——心跳是增量监督，旧路径照常。 */
+function startHeartbeatRuntime({ options, env, log, link }) {
+  if (options.heartbeat === false || typeof link.heartbeat !== 'function') {
+    return null;
+  }
+  const settings = heartbeatSettingsOf(env, options);
+  if (settings.invalidValue !== undefined) {
+    log.warn?.('桥心跳间隔配置非法（回落到默认 10s）', { value: settings.invalidValue, env: HEARTBEAT_ENV });
+  }
+  if (settings.intervalMs <= 0) {
+    log.info?.('桥常驻心跳已关闭（WAYSTATION_BRIDGE_HEARTBEAT=0）');
+    return null;
+  }
+  const loop = createHeartbeatLoop({
+    link,
+    log,
+    intervalMs: settings.intervalMs,
+    timeoutMs: settings.timeoutMs,
+  });
+  loop.start();
+  return loop;
 }
 
 /* 启动力检（既有组合根的「会话投递适配器不可用」告警在此接续）：未检测到会话消息套接字＝
@@ -133,6 +161,7 @@ function linkOptionsOf({ options, env, log, dataDir, sessionId }) {
     ...bridgeMetaOf({ env, sessionId }),
     fastRetryMs: options.fastRetryMs,
     callTimeoutMs: options.callTimeoutMs,
+    heartbeatTimeoutMs: options.heartbeatTimeoutMs,
     guardOptions: options.guardOptions,
   };
 }

@@ -67,7 +67,7 @@ test('注册让出期内断开：迟到续体不得撤销宽限或补投队列�
   const created = node.service.create({ mode: 'dispatch', name: '窗口断连', sessionId: 'master-1' });
   node.service.dispatch.claim({ sessionId: 'master-1', sessionIds: ['worker-1'] });
   const record = node.service.dispatch.dispatches.get(created.collabId);
-  node.service.dispatch.send({ collabId: created.collabId, sessionId: 'master-1', text: '断连排队', toSessionIds: ['worker-1'] });
+  await node.service.dispatch.send({ collabId: created.collabId, sessionId: 'master-1', text: '断连排队', toSessionIds: ['worker-1'] });
   assert.equal(record.queues.has('worker-1'), true, '前置：通知失败已入待补投队列');
   const registering = node.service.registerBridgeEntry('worker-1', 'bridge-window');
   node.service.unregisterBridgeEntry('worker-1', 'bridge-window');
