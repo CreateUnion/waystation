@@ -11,6 +11,7 @@ import { HEARTBEAT_ENV, createHeartbeatLoop, heartbeatSettingsOf } from './heart
 import { createCoreLink } from './ipc-client.js';
 import { createSessionWriter } from './session-writer.js';
 import { bridgeMetaOf, createSessionMetaWatcher } from './session-meta.js';
+import { createToolCatalog } from './tool-catalog.js';
 
 /* 桥组合根（设计 §2.1/§2.2）：stdio MCP 门面＋工具目录/转发＋本会话注入口写入＋核心连接监督。
  * 桥只做两件半事：27 工具的目录（不依赖核心即答）与调用转发、注入写入（复用适配器写面）、
@@ -37,9 +38,13 @@ export function createStderrLog() {
  * 未宣告 dispatch 能力位时由桥直接拒绝——旧核收到未知工具只会回泛化错误，用户无从知道该升级
  * 重开会话。能力判定必须晚于 ensureCore：冷启 / 重连时 welcome 尚为 null，先看它会把
  * 「核心还没起」误诊成「核心版本不支持」，并跳过 ensureCore 的等待契约。 */
-export function createForwardingRegistry({ link, version = BRIDGE_VERSION, app = APP_ROOT }) {
+/** @param {{ link: any, version?: string, app?: string, catalog?: any }} options */
+export function createForwardingRegistry({ link, version = BRIDGE_VERSION, app = APP_ROOT, catalog = null }) {
   return {
-    list: () => TOOL_SPECS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
+    list: () => (catalog?.list() ?? TOOL_SPECS)
+      .map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
+    /* tools/list 前先做一次热刷新检查（文件 mtime+size）；注册换代时的强制刷新由 runtime 触发。 */
+    refresh: () => catalog?.refresh?.() ?? Promise.resolve({ changed: false }),
     call: (name, args) => forwardCall(link, name, args ?? {}, { version, app }),
   };
 }
@@ -112,6 +117,7 @@ export function createBridgeRuntime(options = {}) {
   const link = options.link ?? createCoreLink(linkOptionsOf({ options, env, log, dataDir, sessionId }));
   const watcher = startSessionMetaWatcher(options, env, sessionId, link);
   const heartbeat = startHeartbeatRuntime({ options, env, log, link });
+  const catalog = options.toolCatalog ?? createToolCatalog({ log });
   link.setPushHandler((push) => {
     void deliverPush(link, writer, push, log);
   });
@@ -120,6 +126,9 @@ export function createBridgeRuntime(options = {}) {
     /* 「注册时上报一次」：hello 快照固定于运行时构造，断连期间的 /rename 不会被 watcher 补发
      * （未注册时 sendRegisterUpdate 丢弃但基线已前移）——注册成功后现读一次最新元数据补上。 */
     link.sendRegisterUpdate?.(bridgeMetaOf({ env, sessionId }));
+    /* 核心换代 / 重装后：目录文件变化或核心版本与桥版本不同 → 热刷新目录并通知客户端。
+     * 桥进程本身由 MCP 客户端托管，不能安全自重启；工具目录热刷新覆盖会话可见契约面。 */
+    void refreshCatalogOnRegistration(catalog, welcome, options.onToolCatalogChanged, log);
   });
   return {
     env,
@@ -128,13 +137,38 @@ export function createBridgeRuntime(options = {}) {
     writer,
     link,
     heartbeat,
-    registry: createForwardingRegistry({ link }),
+    catalog,
+    registry: createForwardingRegistry({ link, catalog }),
     close: async () => {
       heartbeat?.stop();
       watcher?.close();
       await link.close();
     },
   };
+}
+
+async function refreshCatalogOnRegistration(catalog, welcome, onChanged, log) {
+  const result = await refreshCatalogSafely(catalog, welcome, log);
+  if (result === null) {
+    return;
+  }
+  if (result.changed) {
+    log.info?.('桥工具目录已按安装树刷新', { coreApp: welcome?.app ?? null });
+    onChanged?.(result);
+    return;
+  }
+  if (result.reason !== undefined) {
+    log.warn?.('桥工具目录刷新未生效，继续使用旧目录', { reason: result.reason });
+  }
+}
+
+async function refreshCatalogSafely(catalog, welcome, log) {
+  try {
+    return await catalog.refresh({ force: welcome?.app !== BRIDGE_VERSION });
+  } catch (error) {
+    log.warn?.('桥工具目录刷新异常，继续使用旧目录', { reason: error?.message ?? String(error) });
+    return null;
+  }
 }
 
 /* 常驻心跳接线：环境变量 0/false/off/no 关闭；非法间隔告警一次后回落默认。
@@ -223,8 +257,17 @@ async function deliverPush(link, writer, push, log) {
  * （server.connect 立即完成；首个工具调用才等待，上限 10s）。会话结束（stdin EOF）＝桥退场：
  * 发 bye、关连接，核心侧按「桥断开」清理并起宽限计时。 */
 export async function startBridge(options = {}) {
-  const runtime = createBridgeRuntime(options);
-  const server = createMcpServer({ version: BRIDGE_VERSION, registry: runtime.registry, context: {} });
+  /** @type {any} */
+  let server = null;
+  const onCatalogChanged = options.onToolCatalogChanged;
+  const runtime = createBridgeRuntime({
+    ...options,
+    onToolCatalogChanged: (result) => {
+      onCatalogChanged?.(result);
+      void server?.sendToolListChanged?.()?.catch?.(noop);
+    },
+  });
+  server = createMcpServer({ version: BRIDGE_VERSION, registry: runtime.registry, context: {} });
   await server.connect(new StdioServerTransport());
   void runtime.link.ensureCore().catch(noop);
   let closing = false;
