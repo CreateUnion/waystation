@@ -2,7 +2,7 @@
 
 **[中文](README.md) | [English](README.en.md)**
 
-> 当前版本 0.2.9。waystation 是一个跑在局域网里的 MCP 服务：它把不同机器、不同终端里的 AI 会话连在一起，让你们可以像同事一样互相传消息、共享记录，或者在一台机器上把任务分给多个 worker 并行去做。整个过程不经过云端，也不需要账号。
+> 当前版本 0.2.10。waystation 是一个跑在局域网里的 MCP 服务：它把不同机器、不同终端里的 AI 会话连在一起，让你们可以像同事一样互相传消息、共享记录，或者在一台机器上把任务分给多个 worker 并行去做。整个过程不经过云端，也不需要账号。
 
 ## 1. 这是什么
 
@@ -294,7 +294,7 @@ ws_create_collab { mode: 'dispatch', name: 'dispatch', autoClaim: true }
 {
   "commit": "abc1234",
   "tests": { "pass": 10, "fail": 0, "command": "npm test" },
-  "artifacts": ["dist/waystation-0.2.9.zip"],
+  "artifacts": ["dist/waystation-0.2.10.zip"],
   "gates": ["lint", "typecheck"]
 }
 ```
