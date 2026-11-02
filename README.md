@@ -2,196 +2,412 @@
 
 **[中文](README.md) | [English](README.en.md)**
 
-局域网内多台机器上的 AI 会话（首期 Claude Code）各自接入一个「驿站」（每台机器一个**核心**进程，会话经 MCP **桥**接入），
-互相发现、按星型站长模式建立协作并可靠投递消息——不依赖云账号与 Anthropic 服务。
+> 当前版本 0.2.9。waystation 是一个跑在局域网里的 MCP 服务：它把不同机器、不同终端里的 AI 会话连在一起，让你们可以像同事一样互相传消息、共享记录，或者在一台机器上把任务分给多个 worker 并行去做。整个过程不经过云端，也不需要账号。
 
-**总模型（0.2.0）**：参与者＝**会话**——同机多会话各自成席（席位键 `(instanceId, sessionId)`），站长本身也是一个会话；机器＝**载体**——端点、寻址与传输仍按实例，机器不占席位、不批准。
+## 1. 这是什么
 
-> 状态：**版本 0.2.2（候选），会话级参与者已实现，待双端真机验收 / 发布**（0.2.2：修复心跳回报占满发送队列；新增邀请 / 加入申请确认门开关，旧 `/ws-auto-accept-invites` 保留为兼容别名）；单机一核与桥（路 A）已实现收束。本文已按设计 v4.1 更新；**0.2.0 语义以 AI 工作区 `docs/计划/2026-10-21-waystation-会话级参与者-设计.md`（v4.1）为准；静音默认值以 `2026-10-14-waystation-安静默认-设计.md` §3.1/§3.3 的 2026-10-22 注记为准（新席位默认不静音）**，本文只写用户可见行为。0.1.x 与 0.2.0 **协作域不互操作**；发现面仍按 `v:1` 互通（旧版可见、不可协作）。
+### 1.1 一句话说清楚
 
-## 安装
+你可能同时开着好几台电脑，每台电脑上又有好几个 Claude Code 会话。它们平时各干各的，遇到需要配合的时候就麻烦了：消息要手动复制粘贴，进度靠人转述，任务派出去之后不知道做到哪了。
 
-Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录运行）：
+waystation 想解决的就是这件事。每台机器上跑一个**核心**（core），每个 AI 会话通过 MCP 接一条**桥**（bridge）。核心负责发现局域网里的其他驿站、维护协作名单和消息投递；桥只负责把本会话的工具调用转给核心，再把核心的消息送进本会话。会话之间不直接相连，也不依赖任何云服务。
 
-- Windows：`powershell -File scripts\install.ps1`（预览不改动任何东西：加 `-DryRun`；若本机执行策略禁止运行脚本，先按你的安全策略处理，脚本可全文审读）
-- Linux：`bash scripts/install.sh`（预览：`--dry-run`）
+它适合这样的场景：
 
-脚本按设计流程执行，幂等、可重复运行：检测 Node（下限实读 `package.json` 的 engines，缺失时给安装指引、**不自动安装**）→ 安装到 `~/.waystation/app/`（`npm ci --omit=dev` 就位运行依赖）→ 放置可执行（Windows `waystation.cmd` / Linux `~/.local/bin/waystation`）→ 注册 Claude Code MCP（Windows 以 `node` + 安装目录入口的绝对路径注册——Claude Code 不经 shell 直接拉起 MCP 子进程，`.cmd` 不可靠；Linux 注册为 PATH 上的 `waystation`，`~/.local/bin` 不在 PATH 时注册该 shim 的绝对路径；机器上没有 Claude Code 则跳过并打印手工步骤，不影响安装的其他部分）→ 安装斜杠命令到 `~/.claude/commands/`（`/ws-collab`、`/ws-discuss`、`/ws-list`、`/ws-join`、`/ws-mute`、`/ws-invite-confirm`、`/ws-join-confirm`、`/ws-auto-accept-invites`（兼容别名）、`/ws-purge`、`/ws-view` 随装；重跑覆盖已装版本、同名手工文件不覆盖、安装目录下已移除命令的陈旧副本会清理；没有 Claude Code 则跳过并打印手工步骤）→ 放置人类观察窗启动器（`ws-view.cmd` / `ws-view.vbs` / `~/.local/bin/ws-view`；见后文「人类观察窗」节）→ 自检并打印**防火墙放行指引**、其他 MCP 客户端配置片段与会话期首检清单。
+- 几台自己的电脑、可信的局域网，想让 Claude Code 会话之间互相传话；
+- 一台机器上开多个会话，想让一个“调度长”把任务分给多个 worker；
+- 想在浏览器里旁观协作或讨论的进展；
+- 想通过微信 / QQ 远程指挥（需要配合 cc-connect，waystation 本身不集成微信）。
 
-- **防火墙**：脚本只打印放行指引、**不自动修改**系统设置。Windows 用 `Get-NetFirewallProfile` 检测各配置状态并给出 `New-NetFirewallRule` 示例；Linux 免 root 读取 ufw 启用态（`/etc/ufw/ufw.conf`）或检测 firewalld 服务，给出 `ufw allow` / `firewall-cmd` 示例。（Windows 防火墙开启场景的规则形态尚未实测验收。）
-- **卸载**：`waystation uninstall`——**先停核心**（在跑的核心经 `core stop` 有序停止；核心拒绝停止时整单中止，未做任何改动）、注销 MCP 注册、移除随装的斜杠命令（只删带受管标记的文件，手工放入的同名文件不动）、删除可执行与安装目录；数据目录默认保留，加 `--purge-data` 连数据一起删（先加 `--dry-run` 可预览）。与安装脚本的 `-Uninstall` / `--uninstall` 开关在默认布局下等价，二选一即可；**自定义 `WAYSTATION_HOME` 时以本命令为准**（安装脚本不读该变量）。
-- **清空数据（保留身份与安装）**：`waystation purge-data`——先停核心（停不住即拒绝清理并提示；等待接管态的核心经本通道零写终止）、清掉全部协作数据、保留身份（`config.json`、`instance-id`，含各槽位）与安装面（`app/`、`bin/`）；默认只预览（列出将删除与保留的清单），确认后加 `--yes` 执行，不可恢复；也可用 `/ws-purge` 斜杠命令走同一条流程。
-- **智能安装入口（Windows，推荐）**：`powershell -File scripts\setup.ps1`（预览：`-DryRun`）——先检测已装版本：未装则全新安装；已装低于安装包时询问是否更新；同版或更高跳过；随后检测 cc-connect：已装则自动配置 dispatch master（调度长）自动化（先备份再向 `~/.cc-connect/config.toml` 的 `[projects.agent.options]` 段注入 `allowed_tools` 与 `append_system_prompt`、幂等可重复；以 UAC 自提权向 Windows 服务环境写入 `WAYSTATION_ROLE=master`；有实际更改时询问是否重启服务），任一步失败降级为打印精确手动命令（退出码 2）；未装 cc-connect 则提醒无法自动配置微信/QQ 多会话控制入口，装好后重跑本脚本即可补配。退出码：0 全部完成；2 有待手动项；1 致命失败。`install.ps1` 仍可单独使用（setup 是它的智能前置 + cc-connect 集成，不改变其行为）。
-- 第二台及以后的机器：同样流程、独立安装即可。
-- 刚安装或升级过 Node 时，重启 Claude Code 与终端让 PATH 生效，再进会话首检。
+不适合的场景也先说清楚：它不是公网服务，不面向不可信网络，也不做多租户隔离。安全边界见第 5 章。
 
-## 快速上手
+### 1.2 三种模式，三种用法
 
-1. 新开一个 Claude Code 会话（会话启动时会拉起该会话的**驿站桥**进程；**核心**按需自动启动）；`/mcp` 里 waystation 应显示已连接。
-2. 让 Claude 调用 `ws_status` 查看本站点状态、`ws_list_hosts` 扫局域网在线驿站（列出身份名与 地址:端口）；装了随安装分发的斜杠命令时，等价形态是 `/ws-list`。
-3. 发起协作：`ws_create_collab`（项目名 / 主题 / 目标取自扫描列表）——斜杠命令等价形态 `/ws-collab <项目名> <主题…> [协作者…]`（不写协作者会弹出在线驿站多选）；邀请可**指名会话**（`targetSessionId`，短码或完整标识，精确匹配）或**不指名**（投目标机全部活跃会话，**每个同意的会话各自成席**）；对方在同意门 `ws_approve_invite` →（0.2.0 两段式入席）→ 双向 `ws_send_message`、`ws_view_ledger` 看台账。
-4. 可选：配置状态栏「协作中」指示（见后文「状态栏」节）——进入协作后状态栏显示当前协作。
-5. 可选：其他 MCP 客户端（如 opencode）见后文「其他 MCP 客户端」节。
+waystation 有三种模式。模式在创建时定死，之后不能改。
 
-工具面共 **28 项**（扫描 / 探测 / 投递状态 / 收件流水 / 协作建撤进退与邀请 / 主动加入与批准 / 邀请确认 / **确认门开关** / **调度（dispatch）编排** / 消息与台账 / 会话级静音 / 移交 / 接管（窗口内 / 手动）/ 裁定），完整清单与参数由 MCP 客户端在会话里展示。0.2.2 新增第 23 项 `ws_set_confirm_gate`（邀请 / 加入申请确认门，见「确认门开关」节）——**显式移交与接管**（窗口内 / 手动）确认仍复用 `ws_handover` / `ws_take_over` 的一次性确认令牌；**自动移交按预授权由目标核自动接受**，不弹目标确认。调度（dispatch）模式另增第 24–27 项 `ws_dispatch_scan` / `ws_dispatch_claim` / `ws_dispatch_approve` / `ws_dispatch_release`（见「调度（dispatch）模式（本机多会话编排）」节），并复用 `ws_send_message` / `ws_end_collab` 等既有工具；0.2.4 已实际发布第 28 项 `ws_dispatch_rules_reload`（重读纪律文件并向在编成员广播），0.2.5 追认入契约。
+| 模式 | 谁和谁 | 一句话 | 适合 |
+| --- | --- | --- | --- |
+| **协作（managed）** | 一台机器上的站长 + 其他成员 | 有站长、有共享记录、有邀请和批准；像一个小项目组 | 需要明确责任人、需要共享一份权威名单的跨机协作 |
+| **讨论（forum）** | 局域网里的所有参与者 | 只追加的公共帖子列表，人人可发、人人可见 | 开放式讨论、信息同步、不需要“谁说了算”的场合 |
+| **调度（dispatch）** | 同一台机器上的调度长 + 组员 | 调度长派任务，worker 回报进度和结果 | 把一件工作拆给多个本机会话并行执行；可接 cc-connect 远程指挥 |
 
-- **`ws_list_hosts` 列表含本机段**：载荷分两段——`self`＝本机自身（身份名、端口与**活跃终端**＝本机核心当前注册的会话，`sessionCount` 与 `sessions`，会话标识即 `CLAUDE_CODE_SESSION_ID`）＋ `hosts`＝其他驿站。**同机的其他数据根实例**（如「单机一核与桥」节逃生门的第二核）照常列出、带 `sameMachine: true` 标注（命令面呈现「本机·另一数据根」）——自机识别只按实例标识（同一数据根＝同一驿站，不重复列出），不按地址过滤。**远端条目另携会话段**：对端上报的活跃会话 `sessions`（**短码数组**——会话标识前 8 字符；缺字段＝对端未报、已如实省略，「对端没有活跃会话」与「对端没报」不混同——对端如实报零时是空数组在场）。如实边界：发现仍靠同一套机制（探测应答与启动自介写入的已知主机清单），**从未与本站点接触过、又不在扫描段内（默认 7321–7328）的同机实例扫不到**（不做地址枚举）。**能力闸门（0.2.0）**：远端条目另带 `participants` 能力（支持 / 不支持 / 未知）——0.2.0 只与「支持」的对端建立协作；旧版对端仍可被发现，但邀请 / 申请 / 建协作被明确拒绝（见「升级与迁移」节）。
+**协作（managed）** 是三者里治理最完整的一个。创建者成为站长，邀请别人加入；被邀请的人要在自己的机器上点头，站长批准后还要走一段确认。协作出问题时有移交、接管、以及暂停（冻结）这些机制，成员名单和操作记录也有明确的人负责写。它适合“这件事只有几个人做，而且需要一个负责人”的场景。
 
-身份名默认为机器名（单核后每台机器一个身份；旧槽位身份在槽位目录原地保留，见「单机一核与桥」节）；数据目录 `config.json` 的 `identityName` 为空或缺失 = 未设置——首个会话会提示一次并自动写入默认值（此后不再提示）；要自定义就改该字段（下次会话生效）。
+**讨论（forum）** 轻得多。没有站长，谁都可以邀请别人，谁都可以发帖；帖子只追加，不同机器之间靠定期互相核对慢慢追平。发起人是“第一个”，也是唯一能结束讨论的人。它适合“大家交换信息，不需要拍板”的场景。
 
-## 单机一核与桥
+**调度（dispatch）** 只在本机生效，不碰局域网。启动环境带 `WAYSTATION_ROLE=master` 的会话可以当调度长，把本机其他会话拉进调度组，成为组员，然后用任务表派活。组员的进度、结果、证据都会回到调度长这里。它适合“一个负责人 + 多个执行者”的本机并行，也适合让 cc-connect 从微信 / QQ 远程指挥。
 
-> 本节为单核改造（路 A）的落地口径（设计与实现均已收束）；设计全文见 AI 工作区 `docs/计划/2026-10-15-waystation-单机一核-设计.md`。
+### 1.3 几个会反复出现的词
 
-- **单核与桥**：升级后每台机器只有**一个驿站核心**（LAN 身份与数据面单写者；核心不在时工具面仍可启动、`tools/list` 照常应答，调用给明确错误文案）；每个 Claude Code 会话起一条**桥**（MCP 门面＋本会话注入口）。**同机多开会话＝同一站点多桥**（共享身份）——不再产生第二套驿站/第二个身份；同机开第二个会话不再让扫描列表多一台机器。**本机提示按会话席位路由（0.2.0）**：每个会话在协作中各自成席，创建 / 同意邀请 / 申请入席都只作用于发起调用的会话；同机其他会话要参与须自己受邀或申请（0.1.x 的绑定表与写类调用夺席已退役，无自动代收）。**本机管理口**：`waystation core status` 查看核心状态（未运行 / 运行中 / **等待接管**〔`status=waiting`，附处置指引〕/ 异常〔残留描述符、疑似僵尸或描述符不可解析〕——附 pid、心跳、端口、端点、版本〔含 IPC `v`〕与数据根；终端里直接敲需 `~/.waystation/bin` 在 PATH，或用 `node <安装目录>/bin/waystation.js core …`）；`waystation core stop` 经 IPC 让核心**有序退出**（IPC 无应答的僵尸核自动落硬杀防护链；`--force` 显式授权硬杀——判别器、复读校验、端点消失确认照走，校验不过不杀；**等待接管态的核心不监听 IPC**——`core stop` 会拒绝并指引改用 `--force` 直接终止，或先关闭同根旧版会话）；`ws_status` 在核心应答时带 `core:{pid, app, endpoint}`（LAN 降级时 full 视图附 `degraded: true`），核心不可达时返回错误载荷 `core:{available:false, reason}`＋`bridge:{version, app}`（`available:false` 只在此差错载荷中出现）。
-- **`ws_status` 视图**：默认 `compact` 精简视图——只含首检与调度提示词依赖的字段（版本、实例标识、`core`、`site`、`net.available`/`net.reason`、`host.resources`、`dispatch` 全段、协作计数 `collabs`/`active`/`completed`/`terminated`），并附一句 `viewHint`。完整字段（`dataDir`/`logDir`/`configFile`/`port`/`node`、`net` 全量计数器、`collab.byState` 与全量计数、`identityHint`）用 `ws_status { view: "full" }`；full 与旧版输出逐字段一致，仅新增 `host.resources`。两种视图都保留 `ok`/`version`/`dispatch`（无调度为 `null`）与 `dispatch.slaves`；非法 `view` 返回 `invalid-view`。`host.resources = { freeMemMB, totalMemMB, claudeProcs, nodeProcs }`（进程计数为建议型诊断数据，探测失败计零，不影响工具主链）。
-- **`persistentCore`**：数据根 `config.json` 的可选布尔字段（**每根一份**）。缺省（false/缺失）＝**末桥退场后核心在宽限期（≤60s）内退场**（宽限内重开会话秒级可用、无冷启）；`true`＝核心**常驻**（**无会话也在线**——对端物理机场景用；扫到 ≠ 有会话）。**如实**：常驻模式下核心崩溃＝无会话监督、对端视角静默离线（需再开会话拉起）；`waystation core stop` 可停。**不含开机自启**（单列后续）。
-- **升级换代**：推荐顺序「**关全部旧会话 → 重跑安装脚本 → 重开**」（安装脚本末行会打印这条指引）；新会话首次调用工具时自动换代（老核退场、新核启动）；**发布升级须递增版本号**——换代判定「安装树 vs 运行核心」以 `package.json` 版本号为准，同号重装不触发自动换代（此时以 `waystation core stop` 停核、由下次调用冷启）。不关旧会话也能收敛（新核检测到同根旧站点即进入等待接管态，不并行写），但会经过过渡态——此时 `waystation core status` 显示「核心：等待接管（status=waiting——不监听 IPC、数据面零写；关闭同根旧版会话后自动接管）」并附处置指引；关闭旧会话后自动接管（等待驻留有 60 分钟寿命上界，到期自行退出、桥再到达时重新探测）。
-- **离线语义修订**：宽限期与常驻模式下「**在线 ≠ 有会话**」——扫到的机器可能处于会话已关的 ≤60s 尾巴或常驻态；「已投进对方会话」语义不变（≠ 已读）。离线语义遵循「**推停拉不停**」：会话关闭或核心退场期间不再追发推送，重开会话后可经 `ws_check_inbox` 拉取。**会话关闭与补投（0.2.0 席位口径）**：会话关闭起 `sessionSeatGraceMs`（默认 60s）内同 `sessionId` 重连＝未离席，期间到达的消息由核心**暂存、重连后补投**；宽限到期＝离席，暂存丢弃并计数（发送侧仍可能显示机器级已送达——核心崩溃也会丢暂存，是机器级投递的已知边界）。离席后重新参与＝重新受邀或申请，不复用旧席位；本机随时可用 `ws_check_inbox` / `ws_view_ledger` / 观察窗补看。**邀请例外**：不指名邀请投给目标机**当前全部活跃会话**（会话尚未在席也可收到），指名邀请只投目标会话——同意门语义保持（邀请仍进会话，谁点头由人定）；零活跃会话时挂起登记，等目标会话下次注册时补投；TTL 过期作废。
-- **槽位停用与逃生门**：旧槽位站点（`sites/<k>/`）**停用**——数据**原地保留**、观察窗照常可看（只读历史面）；**目录 mtime 变化＝本机仍有旧版站点在跑**（升级窗口未关旧会话），勿误读为新数据。要把它当独立站点继续跑＝**显式逃生门（C 方案）**：以 `WAYSTATION_HOME` 指向该目录起第二核心，**必须显式配端口**（未配拒绝启动）。
-- **观察窗补句**：单核后观察窗**根恒 `main`**；C 方案第二核心的窗口**根名同为 `main`**（以窗口标题/数据根路径区分）；旧 `s<k>` 保留为历史读取面。
+- **实例 / 站点**：一台机器上的一个数据根就是一个驿站实例。单核之后，一台机器默认只有一个实例、一个身份。
+- **核心（core）**：常驻进程，负责网络发现、协作状态、消息投递和保存。同一数据根同时只有一个核心。
+- **桥（bridge）**：每个 AI 会话一条，是 MCP 的 stdio 入口。核心不在时桥也能回答 `tools/list`，但真正调工具要等核心起来。
+- **会话位置（seat）**：参与者是会话，不是机器。同机多个会话可以各自参与，互不代替。位置用 `(instanceId, sessionId)`。
+- **`collabId`**：协作或讨论的唯一标识。名字只用来显示，真正区分一律看 `collabId`。
+- **`sessionCode`**：会话标识的前 8 个字符，稳定、适合派发时填写。会话名可能随重命名或重启变化，所以派发以短码为准。
+- **人工确认**：邀请、加入申请、调度拉进调度组这三件事默认都要本机的人点头。可以在会话级或永久配置里关掉。
 
-## 静音（默认不静音）与观察窗自动打开
+### 1.4 工具面：28 项
 
-**静音（会话级，0.2.1 口径）**：每个会话在新建协作 / 讨论，或同意邀请 / 经批准入席后，**本会话席位默认不静音**——实时内容（讨论帖、协作内容消息）照常注入本会话；需要安静时用 `/ws-mute`（或工具 `ws_set_mute`）**只静音本席位**，同机其他会话各自独立判定、互不影响。静音期实时内容不再注入本会话，但**照常落盘、观察窗照常显示**（补看走查看器 / `ws_view_ledger` / `ws_check_inbox`）；结束、邀请与治理等待办仍照常注入（静音只收窄内容注入，不抑待办）。静音时观察窗详情页页头显示「🔇 本协作已静音……」横幅、观察窗列表对应行带 🔇 标记；**取消静音也用 `/ws-mute`**（或工具 `ws_set_mute`）——**只改本席位**，取消时给一行「静音期间新增 N 条」摘要。**既有席位不追溯**（升级不改存量）；席位删除即清理静音，退出后重入按新默认不静音。
+工具由 MCP 客户端在会话里展示，这里只按用途分个组，方便你找。
 
-**观察窗自动打开**（协作与讨论同规）：
+| 用途 | 工具 |
+| --- | --- |
+| 状态与网络 | `ws_status`、`ws_list_hosts`、`ws_ping`、`ws_delivery_status`、`ws_check_inbox` |
+| 协作生命周期 | `ws_list_collabs`、`ws_create_collab`、`ws_invite`、`ws_approve_invite`、`ws_allow_next_invite`、`ws_set_confirm_gate`、`ws_withdraw_invite`、`ws_view_ledger`、`ws_send_message`、`ws_set_mute`、`ws_leave_collab`、`ws_end_collab` |
+| 主动加入与治理 | `ws_request_join`、`ws_join`、`ws_approve_join`、`ws_decide`、`ws_handover`、`ws_take_over` |
+| 调度（dispatch） | `ws_dispatch_scan`、`ws_dispatch_claim`、`ws_dispatch_approve`、`ws_dispatch_release`、`ws_dispatch_rules_reload` |
 
-- 建立时：本会话创建 / 加入成功后，自动打开观察窗到该协作详情页；同数据根的观察窗已在跑则只再开一次窗（不会起第二份服务）。
-- 新会话启动时（触发 B）：判定面＝**本会话在席的进行中协作（0.2.0 席位口径）**——该集合非空且同数据根观察窗**未在跑**才拉起；恰一个时直达其详情页、多个时打开列表页；已在跑不重复弹窗，空集不做（自己发起、等对方同意中的算进行中，受邀未同意的邀请不算）。判定时点＝核心首次见到该会话（桥注册）时——**已在席的会话在核心换代/重启后重注册时会再拉起**；**同核内重开（同会话标识不重判）与任何新会话都不会**（新会话默认不在任何协作里）；无会话标识的会话不判不弹。
-- 拉起失败静默降级（不影响协作本体），日志留痕。
+另外还有一组随安装分发的斜杠命令：`/ws-collab`、`/ws-discuss`、`/ws-list`、`/ws-join`、`/ws-mute`、`/ws-invite-confirm`、`/ws-join-confirm`、`/ws-auto-accept-invites`（旧命令兼容别名）、`/ws-purge`、`/ws-view`。
 
-**本机开关 `viewerAutoOpen`**：数据目录 `config.json` 的可选布尔字段（单核后**主根一份**）——在该文件里写 `"viewerAutoOpen": false`（其余配置不动）即**关闭全部自动弹窗**（上述两条触发同时关闭）；不影响 `/ws-view` 手动打开，也不影响静音行为。缺省 / 缺失 = 自动打开；取值非布尔或配置文件读不出时按默认开启处理，并留一行告警日志。
+## 2. 安装
 
-**会话启动确认 `viewerAutoOpenOnStart`**：同一 `config.json` 的可选字段（`"auto"` 缺省 / `"confirm"`）——写 `"viewerAutoOpenOnStart": "confirm"` 时，**会话启动 / 核换代后的已在席会话不自动弹窗**，改为向该会话投一条确认提示（列明本会话在席的进行中协作＋`/ws-view` 指引），由你决定是否手动打开；创建 / 同意邀请的自动弹窗（触发 A）不受影响。总开关 `viewerAutoOpen: false` 优先（连提示也不投）。取值非法按 `auto` 处理并留一行告警日志。
+### 2.1 前置条件
 
-手动打开与定位（含直达某协作详情页的 `--focus`）见「人类观察窗」节。
+- Node.js ≥ 20（运行时的硬下限，实读 `package.json` 的 `engines`）。
+- 想跑测试和开发工具链，需要 Node ≥ 21（本项目固定用 22）。
+- Claude Code（或其他支持 MCP 的客户端）。没有 Claude Code 也能装，只是脚本会跳过 MCP 注册和斜杠命令，并打印手工步骤。
+- Windows 或 Linux。首期以 Windows 为主，Linux 脚本同在仓库里。
 
-## 讨论模式（forum）
+### 2.2 Windows：推荐 `setup.ps1`
 
-与协作并列的第二种模式：一条**只追加**的公共帖子列表——人人可发、人人可见、任何成员可拉人；没有站长，也没有抢接 / 交接 / 冻结那套治理机器。发起人是「第一个」，且**只有它能结束**。模式在创建时定死（列表里以「讨论」标注），**主题同样创建时定死、不可改**。
-
-- **发起**：`/ws-discuss <讨论名> <主题…> [参与者…]`，或直接调 `ws_create_collab` 带 `mode: 'forum'`。人数软顶按**活跃会话**计：至多 16（含发起人会话）；协议层名单硬顶 32。
-- **邀请**：`ws_invite`——**任何成员**都可发起（同意门仍在被邀方：对方 `ws_approve_invite` 同意即加入、自行广播 join）；不指名时目标机每个同意的会话各自成席，指名时只有目标会话能点头。讨论**要求参与者同版本**（0.2.0）——协作帧带 `cap:2` 能力闸门，旧版对端可被发现但协作操作被拒，掺旧版会坏收敛。
-- **主动加入**：只知讨论名时用 `ws_request_join <讨论名>` 在局域网敲门（广播 + 已知主机单播、少量重发）——在场成员自动应答（含 collabId / 主题 / 成员数 / 发起人），并收到一行放行提示（单核口径：应答判据＝**该讨论在本机是否有活跃席位**——会话已关的宽限尾巴或常驻无人态**不回应答**，如实表达无人值守，避免对端「有人应答但无人放行」的悬置）；随后任一成员本机放行（对方执行 `ws_invite` 邀请你），你在同意门确认后加入、历史自动回填。**无应答** = 统一提示（无人收到敲门 / 成员离线 / 讨论名无人认领）——稍后重试或直接联系成员，工具不做自动重试；敲门会把讨论名播给全网（见披露⑥）。**会话化入口**：本会话已在席的讨论，`ws_join` 直接接线**立即生效**（无批准门）；未在席时才走上述整条敲门流程（`ws_join` 是敲门全流程的封装，`ws_request_join` 保留为敲门原语）。
-- **发帖**：`ws_send_message`（人人可见；不设私聊——`to` 一律拒绝；标签词表 topic / task / progress / issue / stop / reply 只作标签，`topic` 类帖不改任何元状态）。帖子默认经**中继（发起人）**转达全员；中继不可达时自动降级直投，后台恢复检测通过后回中继。
-- **查看**：`ws_view_ledger`（本地合并视图，标注「未与全员核对」）＋「讨论查看器」节的只读观战窗。离线期落下的帖子由你本机的周期对表自动追平；回填帖不进会话注入、只汇总一行（见披露⑤）。
-- **静音**：新建 / 加入后**默认不静音**（2026-10-22 起；见「静音（默认不静音）与观察窗自动打开」节）；设静音 / 取消用 `ws_set_mute` 或 `/ws-mute`——纯本机开关（不广播、对端无感），0.2.0 起**只改本席位**：同机其他会话不受影响，席位删除即清理。静音期实时内容不再注入本会话，结束 / 邀请 / 治理等待办照常注入。
-- **退出与结束**：成员退出用 `ws_leave_collab`（只退本会话席位）；**结束权归发起人**（`ws_end_collab`），结束 = 广播 end、全员归档。0.2.0 起全部活跃席位离席时，各核按心跳事实**本地**置 `completed`（只读判定，不写共享台账、不代写他人 `leave`）。
-- 以上都在现有工具面内（共 28 项）；本模式新增 `ws_invite`（任何成员可邀请）与 `ws_request_join`（主动加入的敲门入口，§5.6）两件，另增两模式通用的静音开关 `ws_set_mute`；会话级加入另增 `ws_join`（发起加入）与 `ws_approve_join`（站长批准 / 拒绝）两件，邀请确认另增 `ws_allow_next_invite`（一次性确认豁免）（见「会话级加入（申请/指名/可见性）」节）；其余复用既有工具。
-
-**如实披露（讨论模式）**——以下是该模式取舍的全部代价，逐条列出（编号沿用设计文档）：
-
-- **① 任何成员可邀请**：邀请不设层级——闸门只在被邀方的同意门，本机的人点头才生效。
-- **② end / join 等广播无认证可伪造**：同网段设备可伪造结束或加入广播，伪造的 end 与真 end 无从区分（既有「无认证」披露的扩展陈述）。
-- **③ `history-request` 仅应答本地成员表内的请求方**（非成员拒绝并计数）：讨论本就是人人全量副本，「谁来拉」收敛在有据可查的成员面内——此条为应答面收敛的如实说明，不是保密性增强。
-- **④ 帖子作者身份可伪造、bundle 内容无来源校验（合并即信任）**：相对协作的单写者台账（成员无法直接向台账写内容），讨论的内容面伪造面扩大——帖子里的作者名不构成可信证明。
-- **⑤ 回填帖与实时帖的会话可见性不对称**：实时新帖进会话注入；回填 / 追赶帖不进注入、仅汇总一行并指引查看。
-- **⑥ 敲门会把讨论名播给全网**：主动加入的敲门是发现类广播（局域网可见）——**讨论名的保密性为零**（如实）；应答为自动行为，伪造敲门可探测「本机在某名讨论中」（含端点），**与探测应答（probe-ack）同类反射面**。
-- **⑦ 加入申请可伪造**（发现类报文无认证）：**放行（对方本机人确认）与同意门（你本机点头）兜底**——伪造申请只构成噪声，可直接拒绝。
-- **⑧ 中继枢纽**：中继（发起人）是全部帖子的必经转达点，可**静默延迟 / 丢弃转达**——新的枢纽可用性面（无新防线；常见情形由落后方周期对表拉取兜底，且拉取两件套不经中继）；内容面无增量暴露（中继身为成员本已持全量副本）。
-- **跨模式同名 = 不同实例**：讨论与协作即使同名也互不影响（名字仅展示，区分一律用 collabId）——讨论不参与协作的同名冻结匹配。
-- **发起人退出的自然消亡**：发起人会话可退出（同普通成员）——退出即同时放弃结束权与中继职责：内容仍可继续（直投兜底、后进者经对表追平），但**不再有人能结束它**；全部会话离席后各核本地判 `completed`（只读终态，不写共享台账）。
-- **16 个活跃会话上限是邀请侧软约束**（代码常量 `MAX_FORUM_ACTIVE_SEATS`＝16，`src/net/protocol.js`）：本机折叠成员表（活跃会话）≥16 时拒绝发起新邀请；已有的 join 与合并不因超限被拒（保收敛）。并发场景允许**暂时到 17**——软约束的存量边界（设计未单列）。
-- **时钟序为近似序**：显示按时间戳排序；跨作者的时间戳仅近似（作者侧已强制单调，同作者内比较以作者序号为准）。
-
-## 调度（dispatch）模式（本机多会话编排）
-
-与协作（managed）/ 讨论（forum）并列的第三种模式——**调度（dispatch）**：**只在本机**把多个 Claude Code 会话编成一个调度长 + 若干组员的执行组（例如调度长在微信侧统筹、worker 各自跑任务）。模式在创建时定死；**不接入局域网**——`mode: 'dispatch'` 的邀请帧在协议层即被拒绝；伪造的调度（dispatch）`task` / `progress` 帧在调度准入层显式拒绝并计入 `dispatchLanRejected`，`result` / `error` 不是协议帧类型，更早被协议类型白名单拒绝（同样丢弃，但不进该计数器）。
-
-- **调度长**：由启动器（如 cc-connect）拉起，进程环境带 `WAYSTATION_ROLE=master`，并在 `append_system_prompt` 里交代职责，例如「你是 waystation dispatch master（调度长）。会话启动后创建调度（dispatch）模式并扫描本机会话；用会话短码 `sessionCode` 定向、省略 `toSessionIds` 即群发；只推关键事件到微信，普通进度留在内存」。启动后由调度长会话调用 `ws_create_collab { mode: 'dispatch', name: 'dispatch' }` 创建——**角色只认启动期环境变量**，工具参数与聊天内容不能声明调度长；一个核心同时只允许一个调度（dispatch），调度不接受 `targets`。调度长心跳超时（默认 3 分钟无 ws 工具调用 / 无桥重连）后，另一个启动期 master 会话再次调用 `ws_create_collab` 会**原地接管**该调度（collabId、组员与任务表保留；旧调度长恢复后的调度操作会被明确拒绝并提示「已被接管」）。
-- **组员（交互式）**：人工正常打开 Claude Code 即可；首次被收编时核心向该会话注入确认提示，**需本机用户确认**后才绑定（可选 `WAYSTATION_ROLE=slave` 预授权、`WAYSTATION_MASTER=<调度长会话名>` 限定主人）。
-- **组员（无头 / 服务拉起）**：必须带 `WAYSTATION_ROLE=slave` 才会被收编（无角色且不可交互 → 拒绝）。示例：
-
-  ```bash
-  WAYSTATION_ROLE=slave WAYSTATION_MASTER=master claude --name worker-1 \
-    -p --input-format stream-json --output-format stream-json --verbose \
-    --permission-mode dontAsk \
-    --allowed-tools "Read Grep Glob Bash Edit Write mcp__waystation__ws_send_message mcp__waystation__ws_check_inbox mcp__waystation__ws_status mcp__waystation__ws_leave_collab"
-  ```
-
-  `--allowed-tools` 必须包含 waystation MCP 工具（否则 `dontAsk` 下 worker 无法回执 / 查收件）；`claude --name` 设置会话名；长驻用 stream-json 输入，不要用一次性 `claude -p "任务"`。
-- **收编**：调度长用 `ws_dispatch_scan` 扫描本机会话（`sessionCode` 稳定短码 / 名字 / kind / role / status / 已被谁收编；**只列可收编目标**——`role=slave` 或交互式且会话文件在档；调度长、非交互无角色、无会话文件者不列出），`ws_dispatch_claim { sessionIds }` 发起收编；交互式目标收到确认提示，`ws_dispatch_approve` 首次只返回一次性令牌、经本机用户确认后携令牌批准；`ws_dispatch_release { sessionId }` 释放。`sessionIds` / `sessionId` 接受 `sessionCode` 或完整 `sessionId`（精确匹配，不做前缀展开）。**名字（`name`）可能随 Claude Code 重命名或重启变化，派发一律以 `sessionCode` 为准**；`ws_status` 的 `dispatch.slaves` 同样提供 `sessionCode`。目标会话可用 `ws_set_confirm_gate { gate: 'claim' }` 关掉本会话的被收编确认——off 时收编请求**自动绑定**并注入一行知情通知（拒绝仍走人工）。
-- **自动收编（autoClaim）**：创建时带 `ws_create_collab { mode: 'dispatch', autoClaim: true }`——创建即自动收编一轮，之后随核心节拍**持续补收新出现的可绑定会话**（`role=slave`，或 claim 门 off 的交互式；**门开的交互式绝不自动弹确认**），离线组员超宽限自动移除并通告。适合「调度长常驻、worker 随开随编」的用法；不开 autoClaim 则保持手动 `claim` 语义。
-- **收编纪律包（单一权威源）**：收编通知（绑定知情通知与 pending 确认提示）自动携带 `~/.waystation/dispatch-rules.md`（调度纪律）全文——该文件是调度（dispatch）全员纪律的唯一权威源，收编低频、通知发出时实时读取，**改完即热生效**（无需重启或 reload）；文件缺失/为空时回退内置最简纪律（主动上报 + 权限豁免），并向调度长知会一次。改文件要对**已收编在编会话**立即生效时，调度长调 `ws_dispatch_rules_reload`：核心重读文件并向全体在编成员广播最新纪律包（带内容版本号+时间戳，便于会话识别新旧）。
-- **消息与结束**：复用 `ws_send_message`（调度模式下可带 `toSessionIds` 与 `taskId`，类型限定 task / progress / result / error）与 `ws_end_collab`（调度长结束并通知全员）。调度长定向时在 `toSessionIds` 填 `sessionCode`（或完整 `sessionId`），省略即群发；组员回执默认回调度长并在正文带 `@来源`。消息流水 / 台账 / 收件流水 / 观察窗历史仍不保存（`ws_view_ledger` / `ws_check_inbox` 明确回「不保存历史」）。
-- **消息机制化（长度 / 结构化报告 / 证据 / 验收）**：`config.dispatch.message_limits` 限制调度消息正文（progress 默认 800、result 默认 3000、其他类型 text 默认 4000 字符；范围 64–20000，非法逐项回落默认）——超限**明确拒绝**（`message-too-long`），提示把长内容写文件、消息里只发摘要 + 文件路径，不截断、不静默丢弃；仅 dispatch 生效。`progress` / `result` 可带结构化 `report`（`summary` / `done` / `blockers` / `next`，单项 ≤200 字符、数组 ≤20 项；带 report 时 `text` 可为空串或省略，正文由 report 渲染）；`result` 可带 `evidence`（`commit` / `tests` / `artifacts` / `gates`，逐项校验、不强制）；`task` 可带 `acceptance`（验收标准 1–20 项）。report / evidence / acceptance 随帧投递并写入任务表（`lastProgress` 摘要 / `evidenceRef` / `acceptance`）。
-- **任务超时提醒与默认回执**：sweep 对 `assigned` / `active` 且最后一次 progress 距今 ≥ `config.dispatch.task_stale_ms`（默认 30 分钟，范围 60 秒–24 小时）的任务，向调度长投一次 `dispatch-task-stale`（含 taskId / 负责会话 / 最后进度摘要）；同一任务只提醒一次，有新 progress 才清位，**不改任务状态、不自动失败**。`config.dispatch.require_ack_default`（默认 false）为 true 时，调度长发出的 `task` 未显式给 `requireAck` 按 true 处理（显式 false 仍可关闭）。
-- **编排状态持久化**：调度（dispatch）不写 `collabs/`（不建协作目录、不写 carrier / member / ledger / snapshot / outbox / inbox / invites / joins / seat / recovery / posts）；组员名单、任务表、调度长身份与心跳默认持久化到 `<数据根>/dispatch/state.json`（`config.dispatch.persist=false` 可退回纯内存，`config.dispatch.state_path` 可改相对数据根或绝对路径）。任务表新增 `acceptance` / `evidenceRef` 为 v1 增量字段（schema 版本不升；旧文件缺字段按空处理）。核心重启后恢复并校验调度长在线，离线则标记「待接管」；`dispatch.persist=false` 时行为与旧版一致（重启即丢）。`sessions/<sessionId>.json` 状态栏文件仍照常更新（本机会话状态，不是协作历史）。
-- **资源提醒（建议型，不拒绝）**：`ws_dispatch_claim` 返回 `warnings` 数组——空闲内存低于 `config.dispatch.resource_guard.min_free_mem_mb`（默认 2048 MB）或当前组员数达到 `max_slaves`（默认 8）时，附实测数字与「先释放会话 / 关闭不用的 worker」建议；`enabled=false` 关闭。只提醒，不改收编结果；不做限流拒绝、自动回收会话或跨机资源汇总。
-- **保留期**：`config.retention` 配置完成调度任务（`dispatch_hours`，默认 24h）、已结束协作（`collabs_days`，默认 30 天）、日志（`logs_days`，默认 14 天）与清理周期（`cleanup_interval_h`，默认 6h）；启动时清理一次并周期执行。已结束协作**先 gzip 归档再删除**，活跃 / 在途 / 席位未归档 / recovery / 未知目录永不清理；日志按现有大小轮转与时间上限双条件取先到者；`retention.dry_run=true` 只报告不删除。
-- **微信推送是调度长 / cc-connect 的集成责任**：waystation 不集成 cc-connect / 微信。以下行为仓库内无证据、需真机验证：无用户消息时调度长的输出是否会被 cc-connect 当作 push 转发；推送频率与 `burst_limit` / 24h 额度；`ret=-2` 的失败与重试。
-- **如实披露**：同机同用户信任边界——同用户的其他进程可以设置角色 / 连本地 IPC（更强隔离用不同 OS 账户运行调度长 / 组员）；「交互式确认」是模型转述的提示，最终取决于该会话语义与用户行为；会话名与 `kind`（interactive / bg）取自 Claude Code 的私有字段与状态栏数据，字段缺失或不可读时按「未知 / 非交互」失败关闭处理。
-
-## 错误响应与排障（工具面）
-
-工具失败一律返回结构化错误对象（`isError: true`，正文为 JSON）：
-
-```json
-{ "ok": false, "code": "kebab-case-code", "message": "人话描述", "hint": "下一步怎么修" }
+```powershell
+powershell -File scripts\setup.ps1          # 真正安装 / 更新
+powershell -File scripts\setup.ps1 -DryRun  # 只预览，不改动
 ```
 
-- **成功路径不变**：成功返回仍是各工具原有结构；`ok` / `message` 字段在错误对象中保留，旧调用方读取方式不受影响。
-- **以 `code` 分支，不要匹配中文文案**：同一 `code` 的 `message` 可能细化，但 `code` 稳定。
-- **`hint` 可空但默认非空**：没把握时先看 `hint`，再决定重试、重连桥还是换目标。
+`setup.ps1` 是智能入口：先检测已装版本，没装就全新安装，旧了就问你要不要更新，同版或更高就跳过。然后它检测 cc-connect，如果装了，就帮你把调度长的自动化配置好（细节见 3.4.5）。任何一步失败，它会打印精确的手工命令，退出码 2；全部完成是 0；致命失败是 1。
 
-常见错误码（完整表见 `src/util/errors.js`）：
+如果你只想要最朴素的安装，也可以直接用：
 
-| code | 含义 | 处置要点 |
+```powershell
+powershell -File scripts\install.ps1
+powershell -File scripts\install.ps1 -DryRun
+```
+
+脚本会做这些事：检查 Node；把运行文件复制到 `~/.waystation/app/`；用 `npm ci --omit=dev` 装好运行依赖；放一个 `waystation.cmd` 到 `~/.waystation/bin/`；注册 Claude Code 的 MCP（Windows 用 `node` 加安装目录入口的绝对路径，不经过 `.cmd`，因为 Claude Code 拉起 MCP 子进程时 `.cmd` 不可靠）；把斜杠命令复制到 `~/.claude/commands/`；放好观察窗启动器；最后自检并打印防火墙放行指引、其他 MCP 客户端配置片段和会话启动后的检查清单。脚本是幂等的，重复运行不会把环境搞乱。
+
+### 2.3 Linux：`install.sh`
+
+```bash
+bash scripts/install.sh
+bash scripts/install.sh --dry-run
+```
+
+流程和 Windows 一致。可执行文件放在 `~/.local/bin/waystation`；如果这个目录不在 PATH 里，MCP 注册会用它的绝对路径。
+
+### 2.4 安装完先做三件事
+
+1. 新开一个 Claude Code 会话。会话启动时会拉起本会话的桥；核心按需自动启动。
+2. 在会话里执行 `/mcp`，waystation 应该显示已连接。
+3. 让 Claude 调一次 `ws_status`（看本机状态）、一次 `ws_list_hosts`（扫局域网里的其他驿站）。如果装了斜杠命令，`/ws-list` 是等价的快捷方式。
+
+如果刚装过或升级过 Node，先重启 Claude Code 和终端，让 PATH 生效。
+
+### 2.5 防火墙
+
+安装脚本只打印放行指引，**不会自动改你的系统设置**。Windows 会用 `Get-NetFirewallProfile` 看各配置的状态，然后给出 `New-NetFirewallRule` 示例；Linux 会读 ufw 是否启用，或者检测 firewalld，给出 `ufw allow` / `firewall-cmd` 示例。默认端口是 `config.json` 里的 `port`，没有显式配置时是 7321。
+
+Windows 防火墙开启时的规则形态还没有在真机上完整验收，放行后如果仍然互扫不到，请先检查这一点。
+
+### 2.6 卸载与清空数据
+
+卸载用：
+
+```bash
+waystation uninstall
+waystation uninstall --dry-run
+```
+
+它会先停核心（核心拒绝停止时整单中止，什么都不改），再注销 MCP、移除随安装分发的斜杠命令（只删带受管标记的文件，同名手工文件不动）、删除可执行和安装目录。数据目录默认保留；加 `--purge-data` 才会连数据一起删，删之前建议先 `--dry-run` 看一眼。安装脚本的 `-Uninstall` / `--uninstall` 开关在默认布局下和它等价，二选一即可。**自定义 `WAYSTATION_HOME` 时以本命令为准**，因为安装脚本不读这个变量。
+
+只想清空协作数据、保留身份和安装，用：
+
+```bash
+waystation purge-data
+waystation purge-data --yes
+```
+
+它会先停核心，再清掉全部协作数据，保留 `config.json`、`instance-id` 和安装面（`app/`、`bin/`）。默认只预览，确认后加 `--yes`，不可恢复。会话里也可以用 `/ws-purge`。
+
+### 2.7 数据目录与身份名
+
+默认数据目录是 `~/.waystation/`。一台机器一个核心、一个身份。`config.json` 里的 `identityName` 就是显示给其他驿站看的名字；留空或删除，首个会话会提示一次并自动写入默认值（通常是机器名）。以后想改，直接改这个字段，下次会话生效。
+
+旧版本的槽位目录 `sites/<k>/` 已经停用，数据原地保留，只作为只读的历史数据；升级时不用手工搬。确实需要第二个独立站点时，用 `WAYSTATION_HOME` 指向另一个数据目录，并且**必须显式配置端口**，否则拒绝启动。
+
+## 3. 运行原理与使用
+
+### 3.1 单机一核与桥
+
+单核改造之后，每台机器只有一个核心。LAN 身份和这些数据都由它统一写；所有会话桥都连到它。核心不在时，桥仍然能启动并回答 `tools/list`，但调用工具会得到明确的“核心不可达”错误。
+
+同机多开会话，就是同一站点下多座桥。它们共享机器身份，但各自是独立的会话位置。本机提示按会话转交：你在哪个会话里创建协作、同意邀请、申请加入，就只作用于那个会话。同机另一个会话想参与，要自己受邀或申请。
+
+核心和桥之间走本机 IPC：Windows 用命名管道，POSIX 用本机套接字；核心同时监听一个 `127.0.0.1` 的 TCP 环回端口，端点写在 `run/core.json` 的 `ipc.tcp` 里。桥默认优先拨 TCP，失败再回退旧管道。要整体回滚，可以设 `WAYSTATION_IPC_TRANSPORT=pipe`；只想用 TCP 就设 `tcp`。
+
+核心的管理口有两个：
+
+```bash
+waystation core status
+waystation core stop
+```
+
+`core status` 看核心是否在跑、pid、心跳、端口、端点、版本和数据根。`core stop` 走 IPC 让核心有序退出；IPC 不响应的僵尸核会自动进入强制终止前的防护流程；`--force` 是显式授权强制终止，但流程里的判据、复核校验、端点消失确认仍然会走。等待接管态（`status=waiting`）的核心不监听 IPC，`core stop` 会拒绝，并提示你先关掉同根旧版会话，或者用 `--force` 直接终止。0.2.8 起 `core stop` 和桥用同一套端点选择逻辑：优先 TCP 环回、失败回退旧管道，所以在“管道连不上但 TCP 正常”的机器上也能优雅停核。
+
+`persistentCore` 是 `config.json` 里的可选布尔字段（每个数据根一份）。缺省或 `false` 时，最后一个桥退场后核心在宽限期（≤60 秒）内退出；设为 `true` 时核心常驻，没有会话也在线。常驻模式适合“对端物理机随时来连”的场景，但也要知道：核心崩溃时没有会话在监督，对端看到的就是静默离线。常驻不包含开机自启。
+
+### 3.2 协作模式（managed）
+
+#### 3.2.1 建协作与邀请
+
+在 Claude Code 里直接用工具：
+
+```text
+ws_create_collab { name, topic, targets }
+```
+
+或者用斜杠命令：
+
+```text
+/ws-collab <项目名> <主题…> [协作者…]
+```
+
+不写协作者时，会弹出在线驿站让你多选。邀请可以**指名会话**（`targetSessionId`，短码或完整标识，精确匹配），也可以**不指名**：不指名时投给目标机当前全部活跃会话，谁同意谁加入，一个会话一个位置。
+
+#### 3.2.2 本人确认与加入
+
+被邀请的会话默认要在本机确认：第一次调用 `ws_approve_invite` 只返回 `needsUserConfirmation`、邀请摘要和一次性 `confirmToken`；代理把邀请转述给用户，用户点头后带着令牌重试才生效。用户说“下一次不用确认”时，可以调 `ws_allow_next_invite` 登记一次性豁免；说“这个会话里都别问了”时，用 `/ws-auto-accept-invites` 开启会话级免确认——只免同意，拒绝仍然要人工。旧命令 `/ws-auto-accept-invites` 保留为兼容别名，但参数方向和新命令相反：旧的 `on` 等于新的 `/ws-invite-confirm off`。
+
+主动加入走 `ws_join`：给 `collabId` 就直接申请；给名字和 `target` 就先单播解析出 `collabId`，名称不广播。申请到站长那里，站长用 `ws_approve_join` 批准或拒绝；批准必须由真人来做，没人点头就进不来。批准后还要走一段确认（`joining` → `member`），确认时限默认 60 秒。
+
+#### 3.2.3 消息、共享记录与投递
+
+消息用 `ws_send_message`。协作是一个负责人加若干成员的结构：成员发给站长，站长省略 `to` 就发给全体成员。返回值里的 `delivery` 会告诉你每个目标到底走到了哪一步：`delivered`（已投进目标会话）、`queued`（暂存，等桥重连）、`failed`（附原因）。“已投进会话”不等于“已读”，这是两件事。
+
+共享记录用 `ws_view_ledger` 看，按会话列名单和离开历史。收件记录用 `ws_check_inbox`，只返回本会话的收件；系统级提示对全本机会话可见。投递记录是按机器算的：一条消息发给 N 台机器就是 N 个机器帧，每个帧有自己的 `msgId`；不提供远端逐个会话的最终状态，本机侧才显示逐个会话明细。
+
+离线时的规则是“**推停拉不停**”：会话关闭或核心退出期间不再追发推送；重开会话后可以用 `ws_check_inbox`、`ws_view_ledger` 或观察窗补看。会话关闭后有 `sessionSeatGraceMs`（默认 60 秒）的宽限，期内同 `sessionId` 重连算没走，期间到达的消息会暂存、等重连后补发；宽限到期才算离开，暂存丢弃并计数。发送侧可能仍显示为已送达，这是按机器投递的已知边界。
+
+#### 3.2.4 站长交接、接管与暂停
+
+站长的会话关闭、但机器还在线时，原站长所在的核心会按 `joinSeq` 选可达的最早成员，自动移交。目标核按预授权自动接受，不要求目标机的用户确认；新站长签发后开一个 1 分钟的接管窗口，窗口内其他成员可以 `ws_take_over`。
+
+站长整机离线时，协作会暂停（冻结：停写，非治理消息丢弃），**不会自动选举**。需要成员机上的用户确认后手动接管。最后一个人离开，协作变成 `completed`，允许空名单和 `manager: null`。
+
+显式移交用 `ws_handover`：站长指定目标和目标会话，目标会话在本机确认后，旧站长降为成员、目标升站长。它不进入接管窗口，确认时限默认 120 秒。任期分叉（同一个 term 出现两个站长）一律暂停并上报，出口是 `ws_decide choice: 'terminate'`，只终止本方分支，不自动合并。
+
+#### 3.2.5 结束
+
+结束权在站长会话，用 `ws_end_collab`。结束会广播给全员，各机把最终记录归档，之后不再接受协作消息。成员自己退出用 `ws_leave_collab`，只退本会话。
+
+### 3.3 讨论模式（forum）
+
+讨论是一条只追加的公共帖子列表。没有站长，没有抢负责人、交接、暂停那一套。任何成员都可以邀请别人，任何成员都可以发帖；发起人是第一个，也是唯一能结束讨论的人。主题在创建时定死，不能改。
+
+创建和邀请：
+
+```text
+/ws-discuss <讨论名> <主题…> [参与者…]
+ws_create_collab { mode: 'forum', name, topic, targets }
+ws_invite { collabId, targets }
+```
+
+人数软顶按活跃会话算：最多 16 个（含发起人），协议层名单硬顶 32。已有的加入和合并不因超限被拒，并发时允许暂时到 17 个。
+
+如果只记得讨论名，可以用 `ws_request_join` 在局域网里敲门：广播加已知主机单播、少量重发。在场成员会自动应答（返回 `collabId`、主题、成员数、发起人），并收到一行放行提示；随后任一成员执行 `ws_invite` 邀请你，你本人确认后加入，历史消息会自动补上。敲门会把讨论名播给全网，所以讨论名的保密性为零，这一点后面还会说。没有应答就是统一提示（没人收到、成员离线、名字没人认领），工具不会自动重试，你可以稍后再试或直接联系成员。已经参与的讨论，用 `ws_join` 可以直接接线，立即生效。
+
+发帖用 `ws_send_message`，人人可见，不设私聊（`to` 一律拒绝）。帖子默认经发起人转达全员；发起人不可达时改为直接发给每个人，等发起人恢复后再改回由发起人转发。查看用 `ws_view_ledger`，或后文的讨论查看器。离线期间落下的帖子由本机定期互相核对补齐；补上的历史帖不会送进会话，只汇总一行并提示查看。
+
+退出用 `ws_leave_collab`，结束用 `ws_end_collab`（只有发起人能结束）。发起人退出后，内容还能继续（直接投递保底，后来的人靠核对补齐），但不再有人能结束它。
+
+**如实披露（讨论模式）**——这些是该模式取舍的全部代价，不是可以忽略的细节：
+
+1. **任何成员都能邀请**：没有层级，决定权在被邀请的人手里。
+2. **`end` / `join` 等广播没有认证，可以伪造**：同网段设备能伪造结束或加入广播，伪造的和真的无从区分。
+3. **`history-request` 只应答本地成员表里的请求方**：这只是把应答范围收窄，并不是提高了保密性。
+4. **帖子作者身份可以伪造，bundle 内容没有来源校验**：讨论里可伪造的空间比协作大，协作的记录由一个人统一写。
+5. **补上的历史帖和实时帖的可见性不对称**：实时新帖会送进会话，补历史 / 追赶帖只汇总一行。
+6. **敲门会把讨论名播给全网**：讨论名没有保密性；应答是自动行为，伪造敲门可以探测“本机在某讨论中”。
+7. **加入申请可以伪造**：有放行和本人确认保底，伪造只会带来噪声。
+8. **发起人是转发枢纽**：发起人可以静默延迟或丢弃转达；常见情况由落后的一方定期互相核对保底，但转发人本身成了一个单点。
+9. **发起人退出后自然消亡**：内容还能继续，但没人能结束；全部离开后各核本地判 `completed`。
+10. **16 个活跃会话上限是邀请侧软上限**：本机活跃会话 ≥16 时拒绝新邀请，已有加入和合并不受影响。
+11. **时间顺序只是近似序**：跨作者的时间戳只用于近似排序，同作者内以作者序号为准。
+
+### 3.4 调度（dispatch）模式（本机多会话编排）
+
+调度只在本机。它让一个 Claude Code 会话当调度长，把本机其他会话拉进调度组，成为组员。调度长派任务，组员回报进度、结果和证据。调度不接入局域网：`mode: 'dispatch'` 的邀请帧在协议层就被拒；伪造的 `task` / `progress` 帧也会在加入调度时被拒绝并计数。
+
+#### 3.4.1 角色与创建
+
+调度长由启动器拉起，进程环境里带 `WAYSTATION_ROLE=master`。角色只认启动期环境变量，工具参数和聊天内容都不能声明自己是调度长。一个核心同时只允许一个调度。调度长心跳超时（默认 3 分钟没有 ws 工具调用、也没有桥重连）后，另一个启动期 master 会话再调用 `ws_create_collab` 会原地接管：`collabId`、组员和任务表都保留，旧调度长恢复后的调度操作会被明确拒绝。
+
+创建：
+
+```text
+ws_create_collab { mode: 'dispatch', name: 'dispatch', autoClaim: true }
+```
+
+`autoClaim` 是可选的。开了之后，创建时自动把能拉的会话拉进来一轮，之后随着核心的节奏持续补收新出现的可加入会话；不开就保持手动拉进调度组。需要本人确认的交互式会话，绝不会被自动拉进来。
+
+#### 3.4.2 拉进调度组
+
+调度长用 `ws_dispatch_scan` 扫描本机会话。返回的每个会话都带稳定的 `sessionCode`、名字、kind、role、status 和是否已被拉进调度组。scan 只列可加入调度目标：`role=slave` 或交互式且会话文件在档；调度长自己、非交互无角色、无会话文件的会话不会出现。
+
+拉进调度组用 `ws_dispatch_claim { sessionIds }`。交互式目标会收到确认提示，目标会话用 `ws_dispatch_approve` 确认：第一次只返回一次性令牌，经本机用户确认后带令牌重试才绑定。无头 / 服务拉起的组员必须带 `WAYSTATION_ROLE=slave` 才会被拉进调度组；也可以用 `WAYSTATION_MASTER=<调度长会话名>` 限定主人。
+
+释放用 `ws_dispatch_release { sessionId }`。名字可能随 Claude Code 重命名或重启变化，派发一律用 `sessionCode`；`ws_status` 的 `dispatch.slaves` 也提供短码。目标会话可以用 `ws_set_confirm_gate { gate: 'claim' }` 关掉自己被拉进调度组时的确认；关掉后加入请求会自动绑定，并送进一行知情通知。
+
+#### 3.4.3 消息、任务表、报告与证据
+
+调度消息用 `ws_send_message`，类型只有 `task` / `progress` / `result` / `error`。定向用 `toSessionIds`；省略就是群发：调度长发给全体组员，组员回调度长。组员的回复正文前会带 `@来源`，因为调度长收到的是多条组员消息混流。
+
+任务表靠 `taskId` 关联。`task` 把任务置为 `assigned`，`progress` 置为 `active`，`result` 置为 `done`，`error` 置为 `failed`。任务表有上限，满时会先裁掉已完成的旧任务，仍然满就拒绝新的 `taskId`。
+
+调度消息有长度上限，配置在 `config.dispatch.message_limits`：
+
+| 类型 | 默认上限 | 范围 |
 | --- | --- | --- |
-| `dispatch-lost` | 调度已结束或核心已重启 | `ws_status` 确认；需要继续请调度长重建 |
-| `dispatch-taken-over` | 本会话已被换届，不再是调度长 | 找现任调度长；旧调度长停止派发 |
-| `dispatch-master-required` | 当前会话不是启动期 master | 用带 `WAYSTATION_ROLE=master` 的会话操作 |
-| `session-not-visible` | 目标会话不在本机注册表 | 确认会话在跑且桥已连接；让该会话调用任意 `ws_*` 工具重连 |
-| `bridge-stale` | 目标会话桥连接已断 / 过期 | 同上；仍不行则重启该会话的 waystation 桥（重开 MCP 连接） |
-| `claim-rejected` | 收编被拒（角色 / 主限 / 非交互） | 看 `message`；只收编 `claimable: true` 的会话 |
-| `message-too-long` | dispatch 消息超过长度上限 | 长内容写文件，只发摘要 + 文件路径；阈值见 `config.dispatch.message_limits` |
-| `report-not-allowed` / `invalid-report` | report 用于非 dispatch progress/result，或形态非法 | report 仅限 dispatch 的 progress / result；按 `summary` / `done` / `blockers` / `next` 修正 |
-| `evidence-not-allowed` / `invalid-evidence` | evidence 用错类型或形态非法 | evidence 仅限 dispatch 的 result；按 `commit` / `tests` / `artifacts` / `gates` 修正 |
-| `acceptance-not-allowed` / `invalid-acceptance` | acceptance 用错类型或形态非法 | acceptance 仅限 dispatch 的 task；1–20 项非空字符串 |
-| `core-unavailable` | 核心不可达或重启中 | 稍后重试；检查 `run/core.json` 与核心日志 |
-| `core-version-unsupported` | 核心版本不支持该能力 | 升级 waystation 并重开会话 |
-| `tool-timeout` | 核心侧工具执行超时 | 用只读工具核实状态，避免立即重复写操作 |
-| `invalid-view` | `ws_status` 的 `view` 取值非法 | 改用 `compact`（缺省）或 `full` |
-| `unknown-tool` | 工具名未知 | 调 `tools/list` 核对工具名与版本 |
+| `progress` | 800 字符 | 64–20000 |
+| `result` | 3000 字符 | 64–20000 |
+| 其他类型（`task` / `error`）的 `text` | 4000 字符 | 64–20000 |
 
-## 会话级加入（申请/指名/可见性）
+超限会明确拒绝，错误码 `message-too-long`，提示你把长内容写进文件、消息里只发摘要和文件路径；不会截断，也不会静默丢弃。这个限制只作用于 dispatch。
 
-治理与可见的最小单位是**会话**：机器仍是协议上的载体（成员表、寻址、传输、离线 / 送达语义按实例不变），而**在席与可见一律按会话席位记账**——每个会话是一个独立席位（键 `(instanceId, sessionId)`），同机多会话可同时在席、各自独立；共享名单即唯一权威（不再有单独的获准台账 / 绑定表）。协议细节以设计 v4.1 为准（见文件头指针），本节只写用户可见行为。
+`progress` 和 `result` 可以带结构化的 `report`：
 
-**会话标识三个面**：**显示**用短码（会话标识前 8 字符，不假设十六进制）；**输入**接受短码或完整标识（精确匹配，完整标识按全等，0.2.0 起不做前缀展开；无匹配即按「指定会话不在场」处置）；**内部席位键与 `seat-presence` 载荷**用参与会话的完整 `sessionId`（离席判定所必需，见「安全模型」披露）。
+```json
+{
+  "summary": "一句话摘要",
+  "done": ["已完成的事"],
+  "blockers": ["受阻的事"],
+  "next": ["下一步"]
+}
+```
 
-- **协作·申请加入（`ws_join`，斜杠命令 `/ws-join`）**：本会话尚未在席时发起——参数 `collabId? | name+target`：给 `collabId` 直接申请；给 `name`＋`target` 时先对该目标**单播**按名解析出 `collabId`（`target` 可给地址:端口，也可给实例标识——后者经已知主机清单解析出端点；名称不广播——与讨论敲门的全网广播不同）。会话标识取自**本会话**上下文——无会话标识的会话明确拒（无法申请加入）。链路（0.2.0 两段式，细节见设计 §4.4）：**申请 → 站长待批准 → 本会话确认 → 站长入名单**（`unverified` 期间可收注入、禁发消息，收到含本席的快照后转正式成员）。同会话对同协作未决期内重复申请**幂等**；**逐一会话记**：新窗口＝新申请，同一会话重开＝沿用。**未在席的会话**发送被拒并给指引先受邀 / `ws_join`（0.2.0 无写类调用夺席）。**同机与跨机均可申请**（同机走本机待批准面，不经网络帧）；只有「网络申请帧来自本机」被拒（自邀 / 冒名拒）——判定按发起席位，不是按机器禁止同机申请。**再入席**：已退出 / 拒绝过邀请 / 邀请被撤回的会话可重新申请或接受站长重邀——经站长批准后重走两段式；协作已结束 / 已终止不再受理。
-- **站长侧批准（`ws_approve_join`）**：参数 `collabId + sessionId`（短码或完整标识，精确匹配）`+ approve + reason?`——**只有站长会话**可批准（同机其他会话不能代批）；批准授权**申请人会话**走两段式入席（0.2.0，见设计 §4.4）。要在别的会话跟进就走指名邀请、过其同意门，不开第二路径；待批准上限 **16 条**（每协作；代码常量 `MAX_PENDING_INVITES`，`src/collab/model.js`）。**批准是活人门**：无人点头＝新会话加不进协作（严格治理的固有代价，如实）。
-- **协作·站长增员（`ws_invite`，仅站长）**：站长可邀请**尚不在活跃名单内**的会话加入既有 managed 协作（`targets` 可携 `targetSessionId` 指名会话；**不指名时目标机每个同意的会话各自成席**；离席后重邀＝新席位）。目标席位已在活跃名单如实拒——**目标机的其他会话**可另行受邀或走 `ws_join` 申请。受邀会话同意后走两段式入席（`joining` → `member`，0.2.0）。managed 邀请生成 `inviteId` 供撤回 / 对账；讨论模式的 `ws_invite` 仍是平权（任何成员可邀请，且**不生成、不返回 `inviteId`**）。
-- **邀请决定的用户确认门**：同意 / 拒绝邀请默认**必须用户明确确认**（与 Claude Code 的权限模式含 auto mode 无关）——首次调用 `ws_approve_invite` 只返回 `needsUserConfirmation`＋邀请摘要＋一次性 `confirmToken`，代理须把邀请转述给用户、取得同意后携令牌重试才生效。用户明确说「下一次无需确认」时，代理可调用 `ws_allow_next_invite` 登记**一次性豁免**（下一次决定直接生效并立即消耗；核心重启后失效）。用户明确要求「本会话内不再逐条确认同意邀请」时，执行 `/ws-auto-accept-invites`（底层 `ws_allow_next_invite mode=session`）开启**会话级免确认**：只对同意生效，拒绝仍走确认门；`/ws-auto-accept-invites off` 关闭，会话结束或核心重启亦失效（纯内存态）。**重复同意幂等**：本会话已在名单、或仍有有效在途授权时重试同意，按成功受理并续发授权；邀请已撤回 / 过期 / 已关闭且确无在途授权时，站长回一条终态拒绝（`join-deny`），本会话据此回滚申请并提示重新受邀或申请，不会停在「已接受、等授权」的死胡同。
-- **讨论·直接加入**：`ws_join` 的讨论路径**无批准门**——本会话已在席＝接线**立即生效**；本会话未在席＝封装整条敲门流程（敲门的细节见「讨论模式」节）。
-- **指名邀请**：邀请（创建时与后续邀请同规）可携可选 `targetSessionId`（短码或完整标识，**精确匹配**）**指名某会话**——只有该会话能点头，其余会话即使收到也拒（提示本邀请指定给了别的会话）。**不指名**（缺省）＝投目标机**当前全部活跃会话**；每个同意的会话**独立成席**，邀请在 TTL 内保持有效（可多席），直到撤回或过期。指名邀请在目标会话接受 / 拒绝后消费；目标不在场＝挂起登记，等该会话下次注册时补投（按邀请 TTL 过期）。**同一会话对同一 `inviteId` 只能成席一次**；`joining` 失败 / 超时可携同一 `inviteId` 重试（新 `joinId`）。**0.2.0 协作帧带能力闸门**：旧版对端不能参与，不再有「忽略 `targetSessionId` 等同不指名」的兼容路径。
-- **可见性**：`ws_list_hosts` 远端条目携对端活跃会话短码与 `participants` 能力（口径见「快速上手」节）；`ws_list_collabs` 各条目带本会话的 `sessionRole` / `sessionState`、冻结原因（`freezeReason`）、是否静音与待回应邀请（含已过期标注，0.2.0），站长侧另带 `pendingJoins`（两段式入席的待确认申请）；`ws_check_inbox` 只返回本会话的收件（机器级治理提示对全本机会话可见）；观察窗按**会话成员视图**展示（本机会员 / 远端成员 / 离席历史，见「人类观察窗」节）。
-- **时限**：申请与待批准沿用 `joinRequestTtlMs`（数据根 `config.json` 的可选字段，毫秒整数，缺省 24 小时＝86400000；取值非法时按缺省处理并留一行告警日志）；0.2.0 两段式另由 `joinConfirmTtlMs`（默认 60s）管 `join-confirm` 确认。申请直投站长、短节律重试至 TTL，**不进离线长队列**；站长不可达＝如实报错（暂不可达，稍后重试）。同网段伪造申请只能污染待批准面——批准与否由活人把关。
-- **投递记账（0.2.0 机器级）**：一条逻辑消息向 N 台机器发送＝N 个机器帧（逐机器 `msgId`）；`ack` 与 `delivery-status` 保持机器级，**不引入远端逐席位终态**；接收机按 `toSessions` 扇出到本机席位，本机侧另显示逐席位明细（已注入 / 暂存待重连 / 判离席丢弃）。`ws_check_inbox` 按本会话过滤；`ws_delivery_status` 远端只显示机器级。零成功（本机无席位接收）的 `delivery-status` 仍携原消息出站条目记录的 `fromSessionId`（历史发件身份，不要求该席位仍活跃）。
-- **席位生命周期与站长交接（0.2.0）**：站长＝`role=manager` 的活跃会话；会话关闭宽限到期即离席并通知其余会话。**站长会话关闭、机器仍在线** → 原站长核按 `joinSeq` 选可达最早成员自动移交：目标核按预授权**自动接受、不要求目标机用户确认**，以新站长名义签发，随后开 **1 分钟接管窗口**（窗口内其他成员可 `ws_take_over`）；**站长整机离线** → 成员冻结（**不自动选举**），由本机用户确认后手动接管（`ws_take_over`）。最后一人离席 → 协作 `completed`（允许空名单、`manager:null`）。
-- **显式移交（站长在线，0.2.0）**：`ws_handover` 双角色——站长发起（`target`＋`targetSessionId`）→ 目标会话确认（`offerId`＋`confirmToken`，本机用户点头）→ 旧站长降为成员、目标升站长；**不进入接管窗口**，目标不自行提升；确认时限默认 120s（可配），迟到 accept 拒绝。
-- **任期分叉出口（0.2.0）**：同 term 不同站长一律冻结上报；出口是 `ws_decide choice:'terminate'`——只终止本方分支并本地归档，`merge` / `keep` 不适用、不自动合并；另一分支保持自身状态，随后可新建协作 / 重新邀请。
-- **混合版本（0.2.0 硬闸门）**：协作域帧根带 `cap:2`，旧版对端的**协作域帧**一律拒收；邀请 / 申请 / 建协作前要求目标能力为「支持」，不支持明确拒绝（提示需 0.2.0+）。发现面仍按 `v:1` 互通——**旧版可见，但不能协作；旧协作只读**（见「升级与迁移」节）。扫描应答无 `sessions`＝列表省略会话短码段；**能力态按证据分级**：**直连单播探测**缺 `participants` 才记「不支持」（已知「支持」可 2→0 降级）；扫描 / 自介 / 转达缺字段**只继承**已有能力态、不降级；无响应 / 无证据＝未知。未知在邀请 / 申请 / 建协作前先扫描 / 单播探测。
+摘要单项不超过 200 字符，三个数组各不超过 20 项、单项不超过 200 字符。带 `report` 时 `text` 可以是空串或省略，正文会由 report 渲染成“摘要 + 已完成 / 受阻 / 下一步”。`report` 会进投递文本，`report.summary` 会写进任务表的最后进度摘要。
 
-### 确认门开关（invite / join / claim，临时 / 永久）
+`result` 可以带完成证据 `evidence`：
 
-- `/ws-invite-confirm on|off|status|clear [--permanent]`：收到邀请是否要人工同意。`off` **只对指名邀请**自动同意；不指名邀请仍走人工，避免同机多个会话 `off` 时抢答、归属不清；**拒绝邀请始终人工**。
-- `/ws-join-confirm on|off|status|clear [--permanent]`：作为站长收到加入申请是否要人工批准。`off` 会让**整条入席自动走完**：站长侧自动批准，申请人侧的 `join-confirm` 是申请人核心自动发送的协议帧，不是第二次人工确认；**站长桥断开期间仍会继续自动批准**（本设计的取舍）。拒绝申请始终人工。
-- **调度（dispatch）收编门（`ws_set_confirm_gate { gate: 'claim' }`，无斜杠命令）**：本会话被调度长收编时是否要人工确认。`off` 时收编请求**自动绑定**并注入一行知情通知（谁收编了你、如何退出）；拒绝收编仍走人工。适合「自己的会话随开随被编入」的常驻用法。
-- 不带 `--permanent`：临时，只对当前会话生效，会话结束或核心重启即失效；带 `--permanent`：写入本机数据根 `config.json` 的 `inviteConfirmation` / `joinRequestConfirmation` / `dispatchClaimConfirmation`，对本机以后所有会话生效，首次调用需用户明确同意并携一次性令牌重试。
-- 旧命令 `/ws-auto-accept-invites` 保留为兼容别名，但参数方向相反：旧 `on` = 新 `/ws-invite-confirm off`，旧 `off` = 新 `on`。
-- 默认三个门都是 `true`（需要人工确认），保持 0.2.x 行为。
+```json
+{
+  "commit": "abc1234",
+  "tests": { "pass": 10, "fail": 0, "command": "npm test" },
+  "artifacts": ["dist/waystation-0.2.9.zip"],
+  "gates": ["lint", "typecheck"]
+}
+```
 
-## 状态栏「协作中」指示
+证据会逐项校验，但不强制。没有证据的 `result` 仍然接受；调度纪律要求组员带证据，调度长验收时也可以按未完成处理。
 
-驿站把「本会话参与的协作」写入会话级状态文件（`~/.waystation/sessions/<会话标识>.json`，会话关闭即删除；单核下由核心为每个会话写；0.2.0 数据源＝本机会话席位表）；**受邀未同意的邀请不显示**——同意加入进入协作后才出现（单核口径）。
-随附的读取脚本渲染成一行：进入协作后显示 `协作中：项目名（角色，人数，N 条）`、讨论显示 `讨论中：讨论名（人数，N 帖）`，无协作 / 会话离线时不显示；**本会话席位处于静音时名称前带 🔇**（与观察窗的 🔇 标记同一语义——静音期内容不注入本会话，观察窗照常显示）。
-消息数口径：协作 N = 本机累计收到的内容消息数（按到站副本计——去重窗外的同 msgId 重投会再计、直投与转达双路各到一份也各计一条；自本次升级起累计，升级前的存量不计）、讨论 N = 本机帖子副本总数（含回填帖）；两者都不受后续静音开关影响。
-计数、成员或静音变化即时刷新会话状态文件（状态栏的更新节奏仍取决于 Claude Code 调用脚本的频率，不承诺更快）；人数 / 消息数在数据面不可得时相应项省略，静音标记对未带该字段的旧会话文件按未静音显示。
+`task` 可以带验收标准 `acceptance`：一个 1–20 项的非空字符串数组。它随任务投递并保存到任务表。任务表里的 `acceptance` 和最近一次 `result` 的 `evidenceRef` 会保存进 `dispatch/state.json`，状态文件格式版本仍为 v1，旧文件缺字段按空处理。
 
-配置（`~/.claude/settings.json`；`$HOME` 在 bash 与 PowerShell 下均可用，路径按你的安装位置调整）：
+另外还有两个开关：
+
+- **任务超时提醒**：`config.dispatch.task_stale_ms`，默认 30 分钟，范围 60 秒–24 小时。后台巡检发现 `assigned` / `active` 任务超过这个时间没有 progress，会向调度长投一次 `dispatch-task-stale`，带 taskId、负责会话和最后进度摘要。同一任务只提醒一次，有新 progress 才清位；不改任务状态，也不自动失败。
+- **默认要求对方回复收到**：`config.dispatch.require_ack_default`，默认 `false`。设为 `true` 时，调度长发出的 `task` 如果没有显式给 `requireAck`，按 true 处理；显式 `false` 仍然可以关掉。回复收到用 `ackFor`，目标会话确认后核心会另行通知调度长；等待确认的记录默认 10 分钟超时。
+
+调度还提供资源提醒：`ws_dispatch_claim` 返回的 `warnings` 会在空闲内存低于 `config.dispatch.resource_guard.min_free_mem_mb`（默认 2048 MB）或组员数达到 `max_slaves`（默认 8）时给出实测数字和释放建议。只提醒，不拒绝拉进调度组。
+
+#### 3.4.4 保存与接管
+
+调度不写 `collabs/`，只把编排状态写到 `<数据根>/dispatch/state.json`：组员名单、任务表、调度长身份和心跳。消息记录不保存到磁盘，`ws_view_ledger` 和 `ws_check_inbox` 对调度会明确回“不保存历史”。
+
+`config.dispatch.persist=false` 可以退回纯内存；`config.dispatch.state_path` 可以改相对数据根或绝对路径。核心重启后恢复任务表和组员，校验调度长是否在线；不在线就标记“待接管”。完成任务的保留时长由 `config.retention.dispatch_hours` 控制，默认 24 小时；未完成任务永不自动清理。
+
+#### 3.4.5 与 cc-connect 对接
+
+waystation 不集成微信或 QQ。远程指挥是调度长和 cc-connect 的集成责任：cc-connect 把消息送进 master 会话，master 用调度工具派活，再把关键结果转述回微信 / QQ。
+
+`scripts\setup.ps1` 检测到 cc-connect 后，会帮你配好这些：
+
+- 向 `~/.cc-connect/config.toml` 的 `[projects.agent.options]` 段注入 `allowed_tools` 和 `append_system_prompt`，先备份、幂等可重复；
+- 通过 UAC 自提权，把 `WAYSTATION_ROLE=master` 写进 Windows 服务环境；
+- 有实际更改时询问是否重启服务；任何一步失败都会降级成精确的手工命令，退出码 2。
+
+master 提示词的唯一编辑入口是仓库里的 `templates/master-prompt.md`。改完之后用 `scripts/sync-master-prompt.ps1` 同步到运行版 `config.toml`：脚本会先备份为 `config.toml.bak-sync-<时间戳>`，再整体替换注入值；`-DryRun` 可以预览。改完 cc-connect 配置后需要重启服务或新开会话才生效。
+
+拉起 worker 的常见做法：
+
+```bash
+WAYSTATION_ROLE=slave WAYSTATION_MASTER=master claude --name worker-1 \
+  -p --input-format stream-json --output-format stream-json --verbose \
+  --permission-mode dontAsk \
+  --allowed-tools "Read Grep Glob Bash Edit Write mcp__waystation__ws_send_message mcp__waystation__ws_check_inbox mcp__waystation__ws_status mcp__waystation__ws_leave_collab"
+```
+
+`--allowed-tools` 必须包含 waystation 的 MCP 工具，否则 worker 在 `dontAsk` 模式下没法回复或查收件；`claude --name` 设置会话名；长驻用 stream-json 输入，不要用一次性的 `claude -p "任务"`。Windows 下拉起时，建议把完整任务书写成文件，批处理里只写“读 <任务书路径> 并严格执行”，批处理与任务书文件名尽量全 ASCII，避免 cmd 的编码问题。
+
+微信侧有些行为仓库里没有证据，需要你在真机上验证：没有用户消息时调度长的输出会不会被 cc-connect 当成 push 转发；推送频率和 `burst_limit` / 24 小时额度；`ret=-2` 的失败与重试。这些不是 waystation 能替你保证的。
+
+#### 3.4.6 调度组规则
+
+加入通知会自动携带 `~/.waystation/dispatch-rules.md` 的全文。调度组所有成员共同遵守的规则，以这个文件为准，拉进调度组时实时读取，改完即热生效，不用重启。文件缺失或为空时回退到内置规则，并向调度长知会一次。想让已经拉进调度组的会话立刻看到新规则，调度长调用 `ws_dispatch_rules_reload`，核心会重读文件并向调度组里的所有人广播，带内容版本号和时间戳。
+
+### 3.5 其他功能
+
+#### 3.5.1 人工确认开关
+
+三处人工确认可以分别控制：
+
+- `/ws-invite-confirm on|off|status|clear [--permanent]`：收到邀请要不要人工同意。`off` 只对指名邀请自动同意；不指名邀请仍然走人工，避免同机多个会话都关掉时抢答、归属不清。拒绝邀请始终人工。
+- `/ws-join-confirm on|off|status|clear [--permanent]`：作为站长收到加入申请要不要人工批准。`off` 会让整个加入流程自动走完：站长侧自动批准，申请人侧的确认是协议帧，不是第二次人工确认。站长桥断开期间仍会继续自动批准，这是这个取舍的代价。拒绝申请始终人工。
+- 调度加入确认：`ws_set_confirm_gate { gate: 'claim' }`，没有斜杠命令。`off` 时加入请求自动绑定，并送进一行知情通知；拒绝拉进调度组仍然人工。
+
+不带 `--permanent` 是临时，只对当前会话生效，会话结束或核心重启就失效。带 `--permanent` 会写进 `config.json` 的 `inviteConfirmation` / `joinRequestConfirmation` / `dispatchClaimConfirmation`，对本机以后的会话生效；首次调用需要用户明确同意并带一次性令牌。这三项确认默认都是开启的（`true`）。
+
+旧命令 `/ws-auto-accept-invites` 保留为兼容别名，参数方向和新命令相反：旧的 `on` 等于新的 `/ws-invite-confirm off`。
+
+#### 3.5.2 静音
+
+新建或加入协作 / 讨论后，本会话默认不静音，实时内容会照常送进本会话。想安静时用 `/ws-mute` 或 `ws_set_mute`，只静音本会话，同机其他会话不受影响。静音期间实时内容不再送进本会话，但照常保存到磁盘、观察窗照常显示；结束、邀请和治理等待办仍然会送进本会话。取消静音也用同一个命令，会给一行“静音期间新增 N 条”的摘要。静音状态保存在本机会话里，会话离开就清理；升级不会追溯改变已有会话。
+
+观察窗里，静音详情页的页头会显示“🔇 本协作已静音……”横幅，列表对应行也带 🔇 标记。状态栏的协作名前面同样会带 🔇。
+
+#### 3.5.3 人类观察窗（Web 查看器）
+
+协作和讨论的本地内容可以在浏览器里看：
+
+```text
+/ws-view
+```
+
+或者直接双击 `~/.waystation/bin/ws-view.vbs`（Windows，静默启动，不弹终端）。默认地址是 `http://127.0.0.1:7330/`，端口被占用时在 7330–7339 之间顺延。它只绑本机回环、只读、不写任何文件，也不消耗会话。
+
+命令行也可以直接启动：
+
+```bash
+node ~/.waystation/app/scripts/ws-viewer.js
+node ~/.waystation/app/scripts/ws-viewer.js --focus <root>/<id>
+node ~/.waystation/app/scripts/ws-viewer.js --port N
+node ~/.waystation/app/scripts/ws-viewer.js --no-open
+node ~/.waystation/app/scripts/ws-viewer.js --stop
+```
+
+- `--focus <root>/<id>` 直接定位到某个协作或讨论的详情页。单核后新数据只产 `main`，根恒为 `main`；`s2`–`s8` 保留为历史数据的只读页。
+- 同数据根已经在跑时，只再开一次窗，不会起第二份服务。
+- `--port N` 是显式端口，不做顺延；被占用就报错退出，退出码 2。占用者是同数据根的观察窗时只开窗。
+- **裸 `--stop` 停不到用自定义 `--port` 起的实例**——起的时候带了 `--port N`，停的时候也要带同一个 `--port N`。
+- 双击 `ws-view.vbs` 没有反应，去看 `%TEMP%\ws-view.log`，静默启动的 stdout 和 stderr 都会追加到这个文件。
+- 消息正文按标准 Markdown 写效果最好（标题、粗体斜体、行内代码、围栏代码块、引用、列表、表格）。非标准语法如 `==高亮==`、`> [!NOTE]`、脚注会按纯文本显示。
+
+#### 3.5.4 讨论查看器
+
+如果只想在终端里看某条讨论的本地帖子流，可以用：
+
+```bash
+node scripts/collab-viewer.js <讨论标识>
+node scripts/collab-viewer.js <讨论标识> --author
+```
+
+它是零依赖、零网络、只读的。启动先印一行横幅，然后回放已有帖子；之后的成员进出和名称、状态这类信息的变化，会以 `· ` 开头的提示行追加。按 `p` 暂停 / 恢复，按 `q` 或 Ctrl+C 退出。只有 stdout 是终端时才上色，管道或重定向输出裸文本。数据还没保存到磁盘时会标注“数据未就绪”并等待；文件被截断或中途消失会提示并从文件开头重读。
+
+#### 3.5.5 状态栏
+
+驿站会把本会话参与的协作写到 `~/.waystation/sessions/<会话标识>.json`，会话关闭即删除。随附的 `statusline.js` 把它渲染成一行：协作显示 `协作中：项目名（角色，人数，N 条）`，讨论显示 `讨论中：讨论名（人数，N 帖）`；没有协作或会话离线时不显示；本会话静音时名称前带 🔇。受邀但还没同意的邀请不显示。
+
+配置在 `~/.claude/settings.json`：
 
 ```json
 {
@@ -202,48 +418,87 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
 }
 ```
 
-- 已在用第三方状态栏（如 claude-hud）时，组合方式取决于该插件的扩展能力（claude-hud 的 `--extra-cmd` 可追加一段输出，需 `CLAUDE_HUD_ALLOW_EXTRA_CMD=1`），按插件文档对接；本脚本也可独立作为 `statusLine` 使用。
-- 若状态栏为空：先确认脚本路径存在；个别平台若经 cmd.exe 执行、`$HOME` 不展开，改用绝对路径。
-- 已知边界：会话恢复（`--continue` / `--resume`）场景下，驿站进程持有的会话标识可能与当前状态栏不一致——此时指示不显示。
-- 自定义数据目录：显式 `WAYSTATION_HOME` 由驿站与状态栏脚本各自从所在进程的环境读取——需对两者都生效（如整机环境变量）；仅注入 MCP 注册（如 `claude mcp add -e`）时，状态栏进程按默认目录读取、与实际写入目录失配——指示不显示。
+如果你已经在用第三方状态栏（比如 claude-hud），怎么组合取决于那个插件的能力；claude-hud 的 `--extra-cmd` 可以追加一段输出，需要设 `CLAUDE_HUD_ALLOW_EXTRA_CMD=1`。状态栏为空时，先确认脚本路径存在；个别平台经 cmd.exe 执行时 `$HOME` 不展开，换成绝对路径。会话恢复（`--continue` / `--resume`）时，驿站进程持有的会话标识可能和当前状态栏不一致，这时指示不显示。自定义数据目录时，`WAYSTATION_HOME` 要对驿站和状态栏脚本都生效，只在 MCP 注册时设置环境变量是不够的。
 
-## 讨论查看器（本地只读观战窗）
+#### 3.5.6 状态视图与网络发现
 
-讨论的本地帖子可以单独看：仓库随附一个独立只读脚本，把某台讨论的本地数据渲染成「时间戳＋正文」的帖流并自动跟随增量刷新。零依赖、零网络、**不写任何文件**（纯读，也不改「半写尾行」这类残缺数据）。
+`ws_status` 默认是精简视图，只给第一次检查和调度提示词真正需要的字段：版本、实例标识、`core`、`site`、`net.available` / `net.reason`、`host.resources`、完整的 `dispatch` 段，以及协作计数摘要。想看全量字段，用 `ws_status { view: "full" }`，它会带上数据目录、日志目录、配置文件、端口、节点版本、`net` 全量计数器、`collab.byState` 和 `identityHint`。两种视图都保留 `ok`、`version`、`dispatch`（没有调度时为 `null`）和 `dispatch.slaves`；非法 `view` 返回 `invalid-view`。
 
-```bash
-node scripts/collab-viewer.js <讨论标识>            # 讨论标识 = ws_list_collabs 里的 collabId
-node scripts/collab-viewer.js <讨论标识> --author    # 在时间戳与正文之间加一列发帖身份名
+`ws_list_hosts` 的返回分两段：`self` 是本机自身（身份名、端口、活跃终端会话），`hosts` 是其他驿站。**本机段**里会列出本机核心当前注册的会话。同机的其他数据根实例也会照常列出，带 `sameMachine: true` 标注，命令面显示为“本机·另一数据根”；自机识别只按实例标识，不按地址过滤。远端条目会带对端上报的活跃会话短码和 `participants` 能力（支持 / 不支持 / 未知）。对端能力的判断按证据强弱来：直连单播探测缺字段才记“不支持”，扫描、自介、转达缺字段时只沿用已有状态，不降级；无响应就是未知。
+
+发现依赖探测应答和启动时自报家门（自介）写入的已知主机清单。**从未与本站点接触过、又不在扫描段内（默认 7321–7328）的同机实例扫不到**，因为不做地址枚举。
+
+`host.resources` 包含 `freeMemMB`、`totalMemMB`、`claudeProcs`、`nodeProcs`。进程计数只是建议型诊断数据，探测失败计零，不影响工具主链。
+
+#### 3.5.7 保留期
+
+`config.retention` 控制完成调度任务、已结束协作、日志和清理周期：
+
+| 配置 | 默认 | 说明 |
+| --- | --- | --- |
+| `dispatch_hours` | 24 小时 | 完成调度任务的保留时长；0 表示不保留完成项 |
+| `collabs_days` | 30 天 | 已结束协作的保留时长 |
+| `logs_days` | 14 天 | 日志保留时长 |
+| `cleanup_interval_h` | 6 小时 | 清理周期 |
+| `dry_run` | false | 只报告不删除 |
+
+启动时清理一次，之后周期执行。已结束协作会先 gzip 归档再删除；活跃、在途、会话位置未归档、recovery 和未知目录永不清理。日志按现有大小轮转和时间上限双条件取先到者。
+
+#### 3.5.8 错误响应
+
+工具失败时返回统一的结构化错误对象，`isError: true`，正文是 JSON：
+
+```json
+{ "ok": false, "code": "kebab-case-code", "message": "人话描述", "hint": "下一步怎么修" }
 ```
 
-- 启动先印一行横幅（`【讨论名】状态 ｜ N 人`），随后回放既有全部帖子；此后的成员进出与元状态（名称 / 状态）变化以 `· ` 开头的暗色系统行追加——成员事件不产生帖行。
-- 按 `p` 暂停 / 恢复（暂停只冻结显示，文件照常增长，恢复后补齐暂停期内容）；按 `q` 或 Ctrl+C 退出。
-- 仅当 stdout 是终端时上色，管道 / 重定向输出裸文本；数据尚未落盘（讨论还没建出来）时横幅标注「数据未就绪」并持续等待；文件被截断或中途消失都会给出提示并自卷首重读。
-- 参数缺失 / 非法会打印用法并以非 0 退出（与状态栏脚本「故障静默空输出」是两种程序的两种契约）。
+成功路径的结构不变，旧调用方读 `ok` / `message` 仍然成立。请以 `code` 分支，不要匹配中文文案；`hint` 可能为空但默认非空，没把握时先看它。常见错误码：
 
-## 人类观察窗（Web 查看器）
+| code | 含义 | 处置 |
+| --- | --- | --- |
+| `dispatch-lost` | 调度已结束或核心已重启 | 用 `ws_status` 确认；需要继续请调度长重建 |
+| `dispatch-taken-over` | 本会话已被换届，不再是调度长 | 找现任调度长；旧调度长停止派发 |
+| `dispatch-master-required` | 当前会话不是启动期 master | 用带 `WAYSTATION_ROLE=master` 的会话操作 |
+| `session-not-visible` | 目标会话不在本机注册表 | 确认会话在跑且桥已连接；让它调用任意 `ws_*` 工具重连 |
+| `bridge-stale` | 目标会话的桥断开或过期 | 让该会话重连桥；仍不行就重启该会话的 MCP 连接 |
+| `claim-rejected` | 拉进调度组被拒（角色 / 上限 / 非交互） | 看 `message`；只拉进调度组 `claimable: true` 的会话 |
+| `message-too-long` | dispatch 消息超过长度上限 | 长内容写文件，只发摘要和文件路径 |
+| `report-not-allowed` / `invalid-report` | report 用错类型或形态非法 | report 仅限 dispatch 的 progress / result |
+| `evidence-not-allowed` / `invalid-evidence` | evidence 用错类型或形态非法 | evidence 仅限 dispatch 的 result |
+| `acceptance-not-allowed` / `invalid-acceptance` | acceptance 用错类型或形态非法 | acceptance 仅限 dispatch 的 task，1–20 项 |
+| `core-unavailable` | 核心不可达或重启中 | 稍后重试；检查 `run/core.json` 和核心日志 |
+| `core-version-unsupported` | 核心版本不支持该能力 | 升级 waystation 并重开会话 |
+| `tool-timeout` | 核心侧工具执行超时 | 用只读工具核实状态，避免立即重复写操作 |
+| `invalid-view` | `ws_status` 的 `view` 非法 | 改用 `compact`（缺省）或 `full` |
+| `unknown-tool` | 工具名未知 | 调 `tools/list` 核对工具名和版本 |
 
-讨论与协作的本地内容可以在浏览器里看：会话里一条 `/ws-view` 斜杠命令，或直接双击 `~/.waystation/bin/ws-view.vbs`（Windows；静默启动、不弹终端），即起本地只读服务并自动开窗（新建 / 加入协作与新会话启动时的自动打开，见「静音（默认不静音）与观察窗自动打开」节）。默认地址 `http://127.0.0.1:7330/`（端口被占自动顺延 7330–7339）；仅绑本机回环、只读零写盘、不耗会话。与「讨论查看器」的终端观战窗是同一观测面的两种形态，看哪边随心。
+## 4. 升级、开发与对接
 
-```bash
-node ~/.waystation/app/scripts/ws-viewer.js              # 等价的直接启动（仓库内开发时：node scripts/ws-viewer.js）
-node ~/.waystation/app/scripts/ws-viewer.js --focus <root>/<id>   # 打开并定位到某协作 / 讨论详情页（会话内等价形态：/ws-view --focus <root>/<id>）
-node ~/.waystation/app/scripts/ws-viewer.js --port N     # 指定端口（显式指定不做顺延，被占即报错退出码 2；占用者是同数据根的观察窗时只开窗）
-node ~/.waystation/app/scripts/ws-viewer.js --no-open    # 只起服务并打印地址，不开窗
-node ~/.waystation/app/scripts/ws-viewer.js --stop       # 停止正在运行的观察窗
-```
+### 4.1 升级与迁移
 
-- 重复启动：同数据根已在跑时只再开一次窗、不会起第二份服务。
-- `--focus <root>/<id>`：直接定位到某协作 / 讨论的详情页——`<root>` 为 `main`（主数据目录）或 `s2`–`s8`（槽位站点 k≥2 即 `s<k>`；**单核后新数据只产 `main`、根恒 `main`**，`s2`–`s8` 保留为历史读取面——见「单机一核与桥」节），`<id>` 为协作标识（`ws_list_collabs` 里取）；同数据根已在跑时只再开窗到该页，未在跑先拉起服务；与 `--no-open` 组合只打印地址、不开窗。
-- 窗口标题：详情页在协作 / 讨论名就绪后标题带其名称（`waystation 观察窗 · <名称>`），列表页保持默认标题。
-- **会话显示（会话级，0.2.0）**：列表页每行附本机会员席位摘要与活跃席位数（含 🔇「N 席中 M 席静音」、冻结原因〔站长离线 / 自动移交等待 / 任期分叉〕、旧协作「旧版·只读」、待回应邀请）；详情页按**会话成员视图**展示——成员按会话（机器名＋短码＋角色＋状态＋`joinSeq`，站长单独标记）、本机会员 / 远端成员 / 离席历史三段；**移除旧的获准 / 绑定 / 远端发布四视图**（0.1.x 口径，随绑定表与获准台账退役）。
-- **裸 `--stop` 停不到用自定义 `--port` 起的实例**——起的时候带了 `--port N`，停的时候也要带同一个 `--port N`。
-- **双击 `ws-view.vbs` 没有反应**：看 `%TEMP%\ws-view.log`（静默启动的 stdout/stderr 都追加进这个文件）。
-- **发送方提示**：消息正文按标准 Markdown 写（标题 / 粗体斜体 / 行内代码与围栏代码块 / 引用 / 列表 / 表格）呈现效果最好；**非标准语法**（如 `==高亮==`、`> [!NOTE]`、脚注）按纯文本显示。
+升级的推荐顺序是「**关全部旧会话 → 重跑安装脚本 → 重开**」，安装脚本最后也会打印这句话。新会话第一次调工具时会自动换代：老核退场，新核启动。发布升级必须递增 `package.json` 的版本号，因为换代判定看的是安装树和运行核心的版本读数；同号重装不会触发自动换代，这时用 `waystation core stop` 停核，等下次调用重新拉起。
 
-## 其他 MCP 客户端
+不关旧会话也能平稳过渡：新核发现同根旧站点会进入等待接管状态，不并行写。过渡期间 `waystation core status` 会显示“核心：等待接管（status=waiting——不监听 IPC、数据面零写；关闭同根旧版会话后自动接管）”，并附处置指引。等待驻留最多 60 分钟，到期自行退出；桥再到达时会重新探测。
 
-以 opencode 为例（`opencode.json` 的 `mcp` 段；`command` 为数组、指向安装目录入口的绝对路径）：
+0.2.9 起，桥在核心换代后会自动热刷新工具目录并通知 MCP 客户端，所以**换上新桥之后**，后续核心升级不需要再 `/mcp` 重连就能看到新工具。但安装 0.2.9 本身仍需要**重跑一次安装脚本**并让已开会话 `/mcp` 重连一次（或重开会话），因为正在跑的旧桥进程里没有热刷新逻辑。桥的行为代码本身仍然要重开会话才会更新；热刷新的只是工具目录。
+
+从 0.2.0 之前升级：双端必须同版；旧版对端还能被发现，但协作操作会被版本能力检查拒绝；旧协作启动时会自动写归档标记，变成只读，观察窗和 `scripts/collab-viewer.js` 仍然能看。旧 `bindings.json`、`mute.json` 和 `joins.json` 的 `approvals` 段会留在盘上不删，新代码忽略；`joins.json` 升到 `v:2`，读侧兼容 `v:1`。
+
+迁移时还有一个老坑：历史版本曾把默认端口写进站点配置。改过端口的旧站点升级后靠启动自介推送和扫描段扫自愈，互扫一下就能重新见到彼此，不用手工同步配置。
+
+### 4.2 开发
+
+- 运行时 Node ≥ 20；跑测试和工具链需要 Node ≥ 21（项目固定 22）。
+- `npm test` 跑测试；`npm run coverage` 跑覆盖率并检查阈值。
+- `npm run lint` 是 ESLint，`npm run typecheck` 是 `tsc` 的 checkJs。
+- 提交前门禁：`npm run gate`（lint + typecheck + 覆盖率阈值）。
+- 手工调试：`node src/index.js` 是桥入口，以 stdio 服务 MCP 客户端；核心按需自动拉起，多起会被取锁仲裁挡住。直接在终端启动没有输出是正常的，stdout 是协议通道。
+- 分层：核心组合根在 `src/core/main.js`，桥组合根在 `src/bridge/main.js`，模块边界见 `docs/编码规范.md`。
+- 数据目录默认 `~/.waystation/`。需要独立第二站点时用 `WAYSTATION_HOME` 指向独立目录，并且必须显式配 `port`。旧槽位目录 `sites/<k>/` 已停用，只作为只读的历史数据。
+
+### 4.3 对接其他 MCP 客户端
+
+以 opencode 为例，`opencode.json` 的 `mcp` 段这样写：
 
 ```json
 {
@@ -257,46 +512,45 @@ node ~/.waystation/app/scripts/ws-viewer.js --stop       # 停止正在运行的
 }
 ```
 
-（示例依据 opencode 官方文档 `mcp-servers` 页，2026-10-13 核对；不同客户端字段名不同，按其文档对应填写。）
+`command` 是数组，指向安装目录入口的绝对路径。不同客户端的字段名不一样，按它的文档对应填写。这个示例按 opencode 官方 `mcp-servers` 页在 2026-10-13 核对过，客户端版本演进后可能变化。
 
-## 升级与迁移
+## 5. 安全模型
 
-- 更新：把新版本文件就位后**重跑安装脚本**，再按「单机一核与桥」节的推荐顺序重开会话——新会话首次调用工具时自动换代；将来发布 npm 后为一条更新命令。
-- 既有安装升级：**重跑一次安装脚本**（`install.ps1` / `install.sh`）才有「人类观察窗」的命令与启动器（`/ws-view`、`ws-view.cmd` / `ws-view.vbs` 随安装脚本分发，旧安装不会自动获得）；单核版升级期间**避免新建会话 / 开观察窗**（文件替换窗口），安装脚本末行打印「升级后重开会话即自动换代」。
-- 迁移注意：**改过端口的旧站点**（历史版本曾把默认端口写进站点配置）靠启动自介推送与扫描段扫自愈——升级后互扫即可重新见到彼此，无需手工同步配置。
-- **0.2.0（会话级参与者）**：双端**必须同版**；旧版对端可见但协作操作被能力闸门拒绝；旧协作（0.1.x 形态）启动时自动写入归档标记，**只读**——观察窗 / `scripts/collab-viewer.js` 可看，写操作被拒；半写新目录按只读处理；**无格式标记、无旧 `member.json`、无 `pending-invites.json` 的目录判为损坏，同样只读、写操作被拒**。旧 `bindings.json`、`mute.json` 与 **`joins.json` 的 `approvals` 段**留盘不删、新代码忽略；`joins.json` 升 `v:2`，读侧兼容 `v:1`。
+### 5.1 总原则
 
-## 开发
+**v1 采用“局域网全信任”模型：没有口令、没有成员准入、明文传输。建议仅在可信网络使用。** 下面把这些取舍逐条说清楚，它们是设计的一部分，不是可以忽略的细节。
 
-- 运行环境：Node ≥ 20（**运行时下限**，取 `package.json` 的 `engines`）；**跑测试与工具链需 Node ≥ 21（本项目固定 22）**——测试命令使用 `node --test` 的 glob 参数（Node 21 起支持；Node 20 实测以「Could not find …」退出码 1 失败，不会静默假绿）
-- 跑测试：`npm test`；覆盖率（含阈值）：`npm run coverage`
-- 静态检查：`npm run lint`（ESLint）、`npm run typecheck`（tsc checkJs）
-- 提交前门禁：`npm run gate`（lint + typecheck + 覆盖率阈值）
-- 手工启动（开发调试）：`node src/index.js`——**桥**入口（以 stdio 服务 MCP 客户端；核心按需自动拉起，手工多起会被取锁仲裁挡住）；直接在终端启动时无输出属正常（stdout 是协议通道）
-- 核心/桥分层：核心组合根 `src/core/main.js`、桥组合根 `src/bridge/main.js`（模块边登记见 `docs/编码规范.md`）
-- 数据目录与单核：默认 `~/.waystation/`（**每台机器一个核心、一个身份**；端口取 `config.port` 显式值、缺省锚点 7321）；需要独立第二站点时以 `WAYSTATION_HOME` 指向独立数据目录（**该根必须显式配 `port`，未配拒绝启动**）；旧槽位目录 `sites/<k>/` **停用**为历史只读面（见「单机一核与桥」节）
-- 会话状态文件：`~/.waystation/sessions/<会话标识>.json`（状态栏指示的机制载体；崩溃残留按 20 秒时间判据自然不可见）
+### 5.2 网络与身份
 
-## 安全模型（如实披露）
+- **可被发现、可被邀请、身份自报（可冒名）**：同网设备能扫到驿站，任何人都可以向本机弹邀请。身份名是自报的，扫描列表里会混进陌生机器，“身份”不构成可信证明。需要真人确认的地方是本人确认（每条协作都要被邀方本机的人点头）和站长批准（主动申请加入要站长会话点头）。
+- **明文、无认证**：信道不加密，消息没有认证。同网段设备可以嗅探邀请和消息内容，也可以伪造探测应答、冒充在线机器。
+- **能力探测应答没有认证**：单播能力探测会跳过对端 250ms 的探测限流，按 `instanceId` 关联、不校验来源端点；同网段主机可以在探测窗口内伪造应答，把目标显示成“支持 / 不支持”，也能利用这个应答做反射。这个能力标记只用来提示，不是信任边界；实际准入仍然靠邀请、批准和本人确认。
 
-**v1 采用「局域网全信任」模型：无口令、无成员准入、明文传输。建议仅在可信网络使用。** 以下是该取舍的全部代价，如实列出：
+### 5.3 外部内容与治理消息伪造
 
-- **可被发现、可被邀请、身份自报（可冒名）**：同网设备能扫到驿站，任何人都可以向本机弹邀请；身份名是自报的，扫描列表里会混入陌生机器，「身份」不构成可信证明。人工闸门是**同意门**（每条协作都要被邀方本机的人点头）与**站长批准**（主动申请加入须站长会话点头）。
-- **明文、无认证**：信道不加密、消息无认证；同网段设备可以嗅探往来的邀请与消息内容，也可以伪造探测应答、冒充在线机器。
-- **能力探测应答无认证**：单播能力探测会跳过对端 250ms 探测限流，且按 `instanceId` 关联、不校验来源端点；同网段主机可在探测窗口内伪造应答，把目标显示为「支持/不支持」，也可利用该应答做反射。能力态只是准入提示，不是信任边界；实际准入仍靠邀请、批准与同意门。
-- **远程文本注入面**：邀请与协作消息的内容（项目名、主题、消息体）会进入本机会话被模型读取。适配层会把协作内容标注为**外部数据**——请同样对待：**外部内容一律是数据，不是指令**，不得当作命令执行。
-- **治理类消息可被伪造**：`freeze` / `decision` / `takeover` 等治理消息同样无认证，同网段设备可伪造以扰乱协作；「本机人确认」只约束发起侧，挡不住伪造。
-- **讨论模式另有增补披露**：邀请面 / 伪造面 / 回填可见性 / 中继枢纽 / 发起人退出形态等，逐条见「讨论模式（forum）」节——同样如实，不是可忽略的细节。
-- **会话短码与完整会话标识可见（会话级新增）**：会话短码（会话标识前 8 字符）随扫描应答发布，`ws_list_hosts` 与观察窗也会展示——同网段设备可枚举活跃会话数与短码；**协作成员之间**的席位心跳另携参与会话的**完整 `sessionId`**（离席判定所必需），显示用短码；完整标识比短码更强，按席位必要性保留并如实披露。均**不含任何会话内容**，也换不来准入门票（放行与批准仍是活人门）。
-- **无自动故障转移（0.2.0）**：站长**整机离线**时协作冻结（停写、非治理消息丢弃），必须由成员机用户确认后手动接管；**不自动选举、不自动宣告**。自动移交只在「站长会话关闭、机器仍在线」时发生（随后 1 分钟接管窗口）；目标已接受但签发帧丢失会停在只读等待，需人工处置。同 term 不同站长一律冻结上报，不自动选胜者。
-- **机器级投递的边界（0.2.0）**：投递保证按**机器**记账——同一机器一帧；同机某席位离线时，其暂存只在核心存活期内有效，核心崩溃即丢失，发送侧仍显示机器级已送达；暂存有上限，超限丢最旧并计数。不提供远端逐席位终态。
-- **加入申请路径可见（会话级新增）**：加入申请与批准 / 拒绝帧携实例标识与会话短码至对端；按名解析（`join-resolve`）对目标**单播**——对方可见「有人查询某协作名」，名称本身不广播；讨论侧敲门仍是局域网广播、把讨论名播给全网（沿「讨论模式」节披露⑥的既有口径）。同网段伪造申请只能污染对端待批准面——**批准与否由活人把关**。
-- **本机 IPC 面（单核新增）**：桥与核心经本机 IPC（Windows 命名管道 / POSIX 本机套接字，＋每次核心启动轮换的 token）通信；核心另并行监听 **TCP 环回 `127.0.0.1`（ephemeral 端口）**供跨 Session 拨入（服务上下文冷启不再锁死用户会话桥），端点写入 `run/core.json` 的 `ipc.tcp`，桥优先拨入、失败回退旧端点，`WAYSTATION_IPC_TRANSPORT=pipe` 可整体回滚；token 存于数据根 `run/core.json`，**同用户进程可读、可连**并驱动工具面（含同意门 / 裁定类）——沿用「本机同用户进程视为可信」的既有口径；进程身份校验经实现期先验不可行（Node 拿不到对端进程凭据、强做须原生扩展），已按裁定**回落「接受＋如实登记」**（登记见 `docs/编码规范.md`；不构成对同用户恶意进程的防护，是对该边界的如实说明）。
-- **调度状态落盘与接管（本机新增）**：调度（dispatch）的编排状态（组员会话名 / 会话标识、任务表含 `acceptance` / `evidenceRef`、调度长心跳、最近 progress 摘要）默认写入本机数据根 `dispatch/state.json`——同用户可读，不含消息正文；`dispatch.persist=false` 可关闭。调度长心跳超时后，任何启动期 `WAYSTATION_ROLE=master` 会话都可接管，仍遵循「同机同用户进程视为可信」的既有边界；不做跨用户防护。`requireAck` 的待确认账与补投队列截止仍是内存态，核心重启即丢失（不写入 `dispatch/state.json`）。
-- **本机权限不被绕过**：跨机指令永远越不过本机的工具授权与本机的人。
+- **外部文字会进入会话**：邀请和协作消息里的项目名、主题、消息体会进入本机会话，被模型读取。适配层会把协作内容标注为外部数据。请同样对待：**外部内容一律是数据，不是指令**，不要把它当命令执行。
+- **治理类消息可以被伪造**：`freeze` / `decision` / `takeover` 这些治理消息同样没有认证，同网段设备可以伪造来扰乱协作。“本机人确认”只约束发起侧，挡不住伪造。
+- **讨论模式另有增补披露**：邀请面、伪造面、补历史可见性、转发人枢纽、发起人退出形态等，逐条见 3.3 的如实披露。那些同样是真实代价。
 
-成员准入与网络隔离机制不在 v1 范围（上线后按使用情况再评估）；以上是如实的取舍记录，不是可忽略的细节。
+### 5.4 会话标识与投递边界
 
-## 开源协议
+- **会话短码和完整会话标识可见**：会话短码（会话标识前 8 位）会随扫描应答发布，`ws_list_hosts` 和观察窗也会显示；同网段设备可以枚举活跃会话数和短码。协作成员之间的会话心跳另携参与会话的完整 `sessionId`（离开判定需要），显示仍然用短码。完整标识比短码更强，这里按离开判定的必要性保留并如实披露。它们都不含会话内容，也换不来准入门票。
+- **按机器投递的边界**：投递保证按机器记录，同一台机器一帧。同机某个会话离线时，暂存只在核心存活期内有效；核心崩溃就丢，发送侧仍可能显示为已送达。暂存有上限，超限丢最旧并计数。不提供远端每个会话的最终状态。
+- **无自动故障转移**：站长整机离线时协作暂停（冻结：停写、非治理消息丢弃），必须由成员机上的用户确认后手动接管；不自动选举、不自动宣告。自动移交只在“站长会话关闭、机器仍在线”时发生，随后开 1 分钟接管窗口。目标已经接受但签发帧丢失时，会停在只读等待，需要人工处置。同一个 term 出现不同站长时一律暂停并上报，不自动选胜者。
 
-waystation 以 [MIT](./LICENSE) 协议开源——版权归 lfemcp（作者 xueweichao）所有。任何人在保留上述版权与许可声明的前提下，可自由使用、复制、修改、合并、发布与分发本软件（含商用），作者与版权方不对软件质量作任何担保（详见 LICENSE 全文）。
+### 5.5 加入申请与讨论披露
+
+- **加入申请路径可见**：申请和批准 / 拒绝帧会携实例标识和会话短码到对端；按名解析（`join-resolve`）是单播，对方能看到“有人查询某协作名”，但名称本身不广播。讨论侧的敲门仍然是局域网广播，会把讨论名播给全网（见 3.3 披露⑥）。同网段伪造申请只能污染对端的待批准列表，批准与否由活人把关。
+- **讨论模式增补披露**：任何成员可邀请、广播可伪造、帖子作者身份可伪造、补上的历史帖与实时帖可见性不对称、敲门会把讨论名播给全网、转发人可以静默延迟或丢弃、发起人退出后讨论无法结束。详见 3.3。
+
+### 5.6 本机 IPC 与调度状态
+
+- **本机 IPC**：桥和核心经本机 IPC 通信（Windows 命名管道 / POSIX 本机套接字，外加每次核心启动轮换的 token）。核心同时监听一个 `127.0.0.1` 的 TCP 环回端口，供不同 Windows 会话（Session）拨入；端点写在 `run/core.json` 的 `ipc.tcp`，桥优先拨 TCP、失败回退旧端点，`WAYSTATION_IPC_TRANSPORT=pipe` 可以整体回滚。token 存在 `run/core.json`，**同用户进程可读、可连**，并能调起所有工具（包括本人确认和裁定类操作）。这沿用了“本机同用户进程视为可信”的假设；Node 拿不到对端进程凭据，进程身份校验在实现期不可行，已按裁定改为“接受并如实登记”。它不构成对同用户恶意进程的防护，只是把这个边界说清楚。
+- **调度状态保存到磁盘与接管**：调度的编排状态（组员会话名 / 标识、任务表含 `acceptance` / `evidenceRef`、调度长心跳、最近 progress 摘要）默认写到 `<数据根>/dispatch/state.json`，同用户可读，不含消息正文；`dispatch.persist=false` 可以关闭。调度长心跳超时后，任何启动期 `WAYSTATION_ROLE=master` 的会话都可以接管，同样遵循“同机同用户进程视为可信”的边界，不做跨用户防护。回复收到的等待记录和待补投队列都只在内存里，核心重启即丢。
+- **本机权限不被绕过**：跨机指令永远越不过本机的工具授权和本机的人。
+
+成员准入和网络隔离不在 v1 范围内，上线后会按实际使用情况再评估。
+
+## 6. 开源协议
+
+waystation 以 [MIT](./LICENSE) 协议开源，版权归 lfemcp（作者 xueweichao）所有。任何人在保留版权与许可声明的前提下，可以自由使用、复制、修改、合并、发布和分发本软件，包括商用；作者与版权方不对软件质量作任何担保。完整条款见 LICENSE。

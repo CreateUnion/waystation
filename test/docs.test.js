@@ -28,7 +28,7 @@ test('README：数据目录与单核说明（WAYSTATION_HOME、槽位历史布�
 
 test('README：单机一核与桥节齐备（核心管理口 / 常驻开关 / 离线语义 / 逃生门）', () => {
   const text = readFileSync(join(repoRoot, 'README.md'), 'utf8');
-  assert.ok(text.includes('## 单机一核与桥'), '单核与桥节写入文档');
+  assert.ok(text.includes('单机一核与桥'), '单核与桥节写入文档');
   assert.ok(text.includes('waystation core status') && text.includes('waystation core stop'), '核心管理口（core status / core stop）写入文档');
   assert.ok(text.includes('persistentCore'), '常驻开关（persistentCore）写入文档');
   assert.ok(text.includes('推停拉不停'), '离线语义修订（推停拉不停、不追发）写入文档');
@@ -42,7 +42,7 @@ test('README：披露锚句与安装/状态栏/卸载/迁移文档面齐备（�
   assert.ok(text.includes('waystation uninstall'), '卸载命令面写入文档');
   assert.ok(text.includes('/ws-collab'), '随安装分发的斜杠命令（/ws-collab）写入文档');
   assert.ok(text.includes('/ws-discuss') && text.includes('/ws-mute'), '讨论 / 静音命令（/ws-discuss、/ws-mute）写入文档');
-  assert.ok(text.includes('## 讨论模式（forum）'), '讨论模式节写入文档');
+  assert.ok(text.includes('讨论模式（forum）'), '讨论模式节写入文档');
   assert.ok(text.includes('如实披露（讨论模式）'), '讨论模式披露逐条写入文档');
   assert.ok(text.includes('waystation purge-data'), '清空数据命令（purge-data，保留身份与安装）写入文档');
   assert.ok(text.includes('scripts\\setup.ps1'), '智能安装入口（setup.ps1）写入文档');
@@ -71,7 +71,7 @@ test('README：确认门命令、默认值与 join 自动走完边界齐备', ()
 
 test('README：dispatch 模式、角色、无历史边界与微信集成责任齐备', () => {
   const text = readFileSync(join(repoRoot, 'README.md'), 'utf8');
-  assert.ok(text.includes('## 调度（dispatch）模式（本机多会话编排）'), '调度（dispatch）模式节写入文档');
+  assert.ok(text.includes('调度（dispatch）模式（本机多会话编排）'), '调度（dispatch）模式节写入文档');
   assert.ok(text.includes('WAYSTATION_ROLE=master'), 'master 启动期角色写入文档');
   assert.ok(text.includes('WAYSTATION_ROLE=slave'), 'slave 启动期角色写入文档');
   assert.ok(text.includes('不保存历史'), '无历史边界写入文档');
@@ -84,7 +84,7 @@ test('README：dispatch 模式、角色、无历史边界与微信集成责任�
 test('README：人类观察窗节齐备（命令/启动器/开关/日志排查/发送方提示/升级重跑）', () => {
   const text = readFileSync(join(repoRoot, 'README.md'), 'utf8');
   assert.ok(text.includes('/ws-view'), '观察窗命令（/ws-view）写入文档');
-  assert.ok(text.includes('## 人类观察窗（Web 查看器）'), '观察窗节写入文档');
+  assert.ok(text.includes('人类观察窗（Web 查看器）'), '观察窗节写入文档');
   assert.ok(text.includes('ws-view.vbs'), '双击启动器（ws-view.vbs）写入文档');
   assert.ok(text.includes('http://127.0.0.1:7330/'), '默认地址写入文档');
   assert.ok(text.includes('--no-open') && text.includes('--stop'), '观察窗开关（--no-open / --stop）写入文档');
