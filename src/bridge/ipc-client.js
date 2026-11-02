@@ -2,7 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { spawn as spawnChild } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { IPC_CONNECT_TIMEOUT_MS, IPC_HANDSHAKE_TIMEOUT_MS, IPC_VERSION, createIpcClient, endpointFor } from '../core/ipc.js';
+import {
+  IPC_CONNECT_TIMEOUT_MS, IPC_HANDSHAKE_TIMEOUT_MS, IPC_VERSION, createIpcClient, endpointFor,
+  endpointsOf, transportModeOf,
+} from '../core/ipc.js';
 import { lifecycleParams, pidIsAlive } from '../core/lifecycle.js';
 import { killGuarded, probeEndpointPresence } from '../core/stop-guard.js';
 import {
@@ -53,11 +56,6 @@ export const BYE_FLUSH_MS = 20;
  * 时 MCP 面不得无限挂起。口径＝核心侧执行安全期限（> 合法长等待上界＋余量，≈660s）＋30s 余量——
  * 桥侧必须长于核心侧，否则会抢在核心的安全期限前把仍在执行的调用误收口。 */
 export const CALL_RESULT_BACKSTOP_MS = 690000;
-
-/* IPC 传输选择（回滚开关）：auto（缺省）＝优先描述符里的 TCP 环回、失败回退旧端点；
- * pipe＝强制旧端点（回滚路径）；tcp＝只用描述符 TCP（缺省时按旧端点）。非法值按 auto 处理。 */
-const IPC_TRANSPORT_ENV = 'WAYSTATION_IPC_TRANSPORT';
-const TRANSPORT_MODES = ['auto', 'tcp', 'pipe'];
 
 /* 冷启入口：按本模块位置相对解析（安装树整目录拷贝 bin/src，同路径代码恒为最近一次安装版本），
  * 不依赖 PATH/CWD。 */
@@ -524,7 +522,7 @@ async function connectOnce(state, record, flow) {
   if (token === null) {
     return noTokenFailure(state);
   }
-  const plan = endpointsOf(state, record);
+  const plan = endpointsOf({ dataDir: state.dataDir, record, transport: state.transport });
   const first = await attemptEndpoint(state, record, token, flow, plan.primary, plan.kind);
   if (shouldKeepFirst(first, plan)) {
     return first;
@@ -570,38 +568,6 @@ async function attemptEndpoint(state, record, token, flow, endpoint, kind) {
   }
 }
 
-/* 端点选择（见 IPC_TRANSPORT_ENV）：tcp 只取描述符环回地址，绝不接受非 127.0.0.1（描述符被篡改
- * 也不得外连）；auto 额外给旧端点作一次回退。 */
-function endpointsOf(state, record) {
-  const legacy = endpointFor(state.dataDir);
-  if (state.transport === 'pipe') {
-    return { primary: legacy, fallback: null, kind: 'legacy' };
-  }
-  const tcp = tcpEndpointOf(record);
-  if (tcp === null) {
-    return { primary: legacy, fallback: null, kind: 'legacy' };
-  }
-  return { primary: tcp, fallback: state.transport === 'auto' ? legacy : null, kind: 'tcp' };
-}
-
-function tcpEndpointOf(record) {
-  const tcp = record?.ipc?.tcp;
-  if (tcp === null || typeof tcp !== 'object' || Array.isArray(tcp)) {
-    return null;
-  }
-  if (tcp.host !== '127.0.0.1') {
-    return null;
-  }
-  if (!Number.isInteger(tcp.port) || tcp.port < 1 || tcp.port > 65535) {
-    return null;
-  }
-  return { host: tcp.host, port: tcp.port };
-}
-
-function transportModeOf(env) {
-  const raw = typeof env?.[IPC_TRANSPORT_ENV] === 'string' ? env[IPC_TRANSPORT_ENV].trim().toLowerCase() : '';
-  return TRANSPORT_MODES.includes(raw) ? raw : 'auto';
-}
 
 function createClientFor(state, record, token, flow, endpoint) {
   const budgeted = budgetTimeouts(state, flow);

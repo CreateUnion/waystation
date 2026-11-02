@@ -96,8 +96,8 @@ async function startStubCore(cleanup, home, { token = TOKEN, onReplace } = {}) {
     log: silentLog(),
   });
   cleanup(() => server.close());
-  await server.start();
-  return { server, replaces };
+  const started = await server.start();
+  return { server, replaces, started };
 }
 
 /* 记录型防护链桩：按构造结论应答，留全部入参供断言（消费契约面）。 */
@@ -259,6 +259,78 @@ test('core stop 正常路径：桩核心收到 replace{reason:manual} 并退出 
   assert.ok(output.includes('经 IPC 有序退出'), output);
   assert.equal(existsSync(coreJsonPath(home)), false, '桩核心按停止请求清理了运行描述符');
   assert.equal(guard.calls.length, 0, '有序路径不得触碰防护链');
+});
+
+test('core stop：auto 优先 TCP 环回——旧管道不可达（EPERM/ENOENT 场景）仍能有序停止', async (t) => {
+  const cleanup = cleanupOf(t);
+  const home = makeTempDir(t);
+  /* 桩服务起在另一个数据根：home 的旧管道不存在（模拟本机 EPERM/ENOENT），只有 TCP 可达。 */
+  const stubHome = makeTempDir(t);
+  const stub = await startStubCore(cleanup, stubHome, {
+    onReplace: () => rmSync(coreJsonPath(home), { force: true }),
+  });
+  writeCoreJson(home, { ipc: { tcp: { host: '127.0.0.1', port: stub.started.tcp.port } } });
+  const guard = recordingGuard();
+  const { code, output } = await runCli(['stop'], { env: fastStopEnv(home), killGuarded: guard.killGuarded });
+  assert.equal(code, 0, output);
+  assert.ok(output.includes('经 IPC 有序退出'), output);
+  assert.deepEqual(stub.replaces.map((frame) => frame.reason), ['manual'], 'TCP 端点收到 replace{manual}');
+  assert.equal(guard.calls.length, 0, 'TCP 可用时不得落到硬杀防护链');
+});
+
+test('core stop：auto 在 TCP 环回不可达时回退旧管道', async (t) => {
+  const cleanup = cleanupOf(t);
+  const home = makeTempDir(t);
+  const stub = await startStubCore(cleanup, home);
+  const deadPort = await pickFreePort();
+  writeCoreJson(home, {
+    endpoint: stub.started.endpoint,
+    ipc: { tcp: { host: '127.0.0.1', port: deadPort } },
+  });
+  const guard = recordingGuard();
+  const { code, output } = await runCli(['stop'], { env: fastStopEnv(home), killGuarded: guard.killGuarded });
+  assert.equal(code, 0, output);
+  assert.deepEqual(stub.replaces.map((frame) => frame.reason), ['manual'], 'TCP 失败后旧管道仍可停止');
+  assert.equal(guard.calls.length, 0);
+});
+
+test('core stop：WAYSTATION_IPC_TRANSPORT=pipe 强制旧管道——TCP 可用也不得走', async (t) => {
+  const cleanup = cleanupOf(t);
+  const home = makeTempDir(t);
+  const stubHome = makeTempDir(t);
+  const stub = await startStubCore(cleanup, stubHome);
+  writeCoreJson(home, { ipc: { tcp: { host: '127.0.0.1', port: stub.started.tcp.port } } });
+  const guard = recordingGuard('not-eligible');
+  const env = { ...fastStopEnv(home), WAYSTATION_IPC_TRANSPORT: 'pipe' };
+  const { code, output } = await runCli(['stop'], { env, killGuarded: guard.killGuarded });
+  assert.equal(code, 1, output);
+  assert.equal(stub.replaces.length, 0, 'pipe 模式不得连 TCP 端点');
+  assert.equal(guard.calls.length, 1, '旧管道不可达后交防护链判定');
+  assert.equal(guard.calls[0].endpoint, endpointFor(home), '防护链对证端点＝记录端点');
+});
+
+test('core stop：WAYSTATION_IPC_TRANSPORT=tcp 只走 TCP；记录无 TCP 时按旧端点（与桥同口径）', async (t) => {
+  const cleanup = cleanupOf(t);
+  const home = makeTempDir(t);
+  const stubHome = makeTempDir(t);
+  const stub = await startStubCore(cleanup, stubHome, {
+    onReplace: () => rmSync(coreJsonPath(home), { force: true }),
+  });
+  writeCoreJson(home, { ipc: { tcp: { host: '127.0.0.1', port: stub.started.tcp.port } } });
+  const env = { ...fastStopEnv(home), WAYSTATION_IPC_TRANSPORT: 'tcp' };
+  const first = await runCli(['stop'], { env, killGuarded: recordingGuard().killGuarded });
+  assert.equal(first.code, 0, first.output);
+  assert.deepEqual(stub.replaces.map((frame) => frame.reason), ['manual']);
+
+  const homeNoTcp = makeTempDir(t);
+  const stubNoTcp = await startStubCore(cleanup, homeNoTcp);
+  writeCoreJson(homeNoTcp, { endpoint: stubNoTcp.started.endpoint });
+  const second = await runCli(['stop'], {
+    env: { ...fastStopEnv(homeNoTcp), WAYSTATION_IPC_TRANSPORT: 'tcp' },
+    killGuarded: recordingGuard().killGuarded,
+  });
+  assert.equal(second.code, 0, second.output);
+  assert.deepEqual(stubNoTcp.replaces.map((frame) => frame.reason), ['manual'], '无 TCP 记录时回退旧端点');
 });
 
 test('core stop 僵尸：端点不可达＋心跳超期 → 自动落防护链（allowOnce=false）、参数逐项对证', async (t) => {

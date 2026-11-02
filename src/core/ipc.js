@@ -99,6 +99,51 @@ export function endpointFor(dataDir, platform = process.platform) {
   return join(runDir(dataDir), UNIX_SOCKET_NAME);
 }
 
+/* IPC 传输选择（回滚开关，桥与 core stop 共用同一口径）：auto（缺省）＝优先描述符里的 TCP
+ * 环回、失败回退旧端点；pipe＝强制旧端点（回滚路径）；tcp＝只用描述符 TCP（缺省时按旧端点）。
+ * 非法值按 auto 处理。 */
+export const IPC_TRANSPORT_ENV = 'WAYSTATION_IPC_TRANSPORT';
+export const IPC_TRANSPORT_MODES = ['auto', 'tcp', 'pipe'];
+
+/** @param {Record<string, string | undefined> | null | undefined} [env] */
+export function transportModeOf(env = process.env) {
+  const raw = typeof env?.[IPC_TRANSPORT_ENV] === 'string' ? env[IPC_TRANSPORT_ENV].trim().toLowerCase() : '';
+  return IPC_TRANSPORT_MODES.includes(raw) ? raw : 'auto';
+}
+
+/** 描述符里的 TCP 环回端点；只接受 127.0.0.1（描述符被篡改也不得外连），非法形态返回 null。
+ * @param {any} record
+ * @returns {{ host: string, port: number } | null} */
+export function tcpEndpointOf(record) {
+  const tcp = record?.ipc?.tcp;
+  if (tcp === null || typeof tcp !== 'object' || Array.isArray(tcp)) {
+    return null;
+  }
+  if (tcp.host !== '127.0.0.1') {
+    return null;
+  }
+  if (!Number.isInteger(tcp.port) || tcp.port < 1 || tcp.port > 65535) {
+    return null;
+  }
+  return { host: tcp.host, port: tcp.port };
+}
+
+/** 端点计划：primary / fallback / kind（tcp 或 legacy）。auto 下 TCP 可用则回退旧端点；
+ * pipe 只给旧端点；tcp 只给 TCP（描述符无 TCP 时按旧端点）。
+ * @param {{ dataDir: string, record?: any, transport?: string }} options */
+export function endpointsOf({ dataDir, record = null, transport = 'auto' }) {
+  const mode = IPC_TRANSPORT_MODES.includes(transport) ? transport : 'auto';
+  const legacy = endpointFor(dataDir);
+  if (mode === 'pipe') {
+    return { primary: legacy, fallback: null, kind: 'legacy' };
+  }
+  const tcp = tcpEndpointOf(record);
+  if (tcp === null) {
+    return { primary: legacy, fallback: null, kind: 'legacy' };
+  }
+  return { primary: tcp, fallback: mode === 'auto' ? legacy : null, kind: 'tcp' };
+}
+
 /**
  * run/ 显式以 0700 创建（设计 §2.3：token 保密性由 run/ 自身 mode 承重——0700 的目录不可被
  * 非属主穿透；根目录 0755 不致命）。无法保证 0700（设置失败或既存宽松）时告警如实登记：

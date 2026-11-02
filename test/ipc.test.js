@@ -7,7 +7,7 @@ import { makeTempDir, waitFor } from './helpers.js';
 import {
   FRAME_TYPES, HEARTBEAT_PING_MS, IPC_MAX_FRAME_BYTES, IPC_VERSION, PEER_TIMEOUT_MS,
   createFrameDecoder, createIpcClient, createIpcServer, encodeIpcFrame, endpointFor,
-  ensureRunDir, newIpcToken, prepareEndpoint, validateIpcFrame,
+  endpointsOf, ensureRunDir, newIpcToken, prepareEndpoint, transportModeOf, validateIpcFrame,
 } from '../src/core/ipc.js';
 import { runDir } from '../src/paths.js';
 import { rootDigest } from '../src/util/digest.js';
@@ -1120,4 +1120,35 @@ test('多根隔离：两个数据根各自起服务，客户端各连各的不�
   await clientB.connect();
   assert.deepEqual(serverA.listBridges().map((record) => record.bridgeId), ['bridge-a']);
   assert.deepEqual(serverB.listBridges().map((record) => record.bridgeId), ['bridge-b']);
+});
+
+test('IPC 端点选择：auto 优先 TCP 并回退旧端点；pipe / tcp 强制；非法值按 auto', () => {
+  const dataDir = 'C:/tmp/ws-ipc-endpoints';
+  const legacy = endpointFor(dataDir);
+  const tcp = { host: '127.0.0.1', port: 55017 };
+  const record = { ipc: { tcp } };
+  assert.deepEqual(endpointsOf({ dataDir, record, transport: 'auto' }), { primary: tcp, fallback: legacy, kind: 'tcp' });
+  assert.deepEqual(endpointsOf({ dataDir, record, transport: 'pipe' }), { primary: legacy, fallback: null, kind: 'legacy' });
+  assert.deepEqual(endpointsOf({ dataDir, record, transport: 'tcp' }), { primary: tcp, fallback: null, kind: 'tcp' });
+  assert.deepEqual(endpointsOf({ dataDir, record: {}, transport: 'auto' }), { primary: legacy, fallback: null, kind: 'legacy' });
+  assert.deepEqual(endpointsOf({ dataDir, record, transport: 'bogus' }), { primary: tcp, fallback: legacy, kind: 'tcp' });
+  assert.deepEqual(
+    endpointsOf({ dataDir, record: { ipc: { tcp: { host: '10.0.0.1', port: 1 } } }, transport: 'auto' }),
+    { primary: legacy, fallback: null, kind: 'legacy' },
+    'TCP 环回端点只接受 127.0.0.1',
+  );
+  assert.deepEqual(
+    endpointsOf({ dataDir, record: { ipc: { tcp: { host: '127.0.0.1', port: 0 } } }, transport: 'auto' }),
+    { primary: legacy, fallback: null, kind: 'legacy' },
+    '非法端口忽略',
+  );
+});
+
+test('transportModeOf：仅 auto / tcp / pipe 生效，非法或缺失按 auto', () => {
+  assert.equal(transportModeOf({ WAYSTATION_IPC_TRANSPORT: 'tcp' }), 'tcp');
+  assert.equal(transportModeOf({ WAYSTATION_IPC_TRANSPORT: ' PIPE ' }), 'pipe');
+  assert.equal(transportModeOf({ WAYSTATION_IPC_TRANSPORT: 'auto' }), 'auto');
+  assert.equal(transportModeOf({ WAYSTATION_IPC_TRANSPORT: 'bogus' }), 'auto');
+  assert.equal(transportModeOf({}), 'auto');
+  assert.equal(transportModeOf(null), 'auto');
 });

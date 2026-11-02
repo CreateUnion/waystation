@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { coreJsonPath, resolveDataDir } from './paths.js';
-import { createIpcClient } from './core/ipc.js';
+import { createIpcClient, endpointsOf, transportModeOf } from './core/ipc.js';
 import { lifecycleParams, pidIsAlive, readCoreRecord, sameProcessRecord, testNumber } from './core/lifecycle.js';
 
 /* `waystation core` 子命令（设计 §3.4 停止面、§2.3 等待接管态退出③）：
@@ -287,8 +287,28 @@ async function stopRunningCore({ status, force, killGuarded, params }) {
  * 为完成判据（期限经注入缝）。连接被拒分两类：核心已在关闭中（replacing/shutting-down）＝等它退出；
  * 凭据/版本不符＝拒绝（未授权硬杀时不落防护链）。 */
 async function stopViaIpc({ status, params }) {
+  /* 与桥同口径的端点计划：auto 优先描述符 TCP 环回、连接失败回退旧端点；pipe / tcp 强制单端点。
+   * auth / version 是端点无关的致命拒绝——不因它再去试另一个端点。 */
+  const plan = endpointsOf({
+    dataDir: status.dataDir,
+    record: status.record,
+    transport: params.transport,
+  });
+  const first = await stopAttemptAt({ status, params, endpoint: plan.primary });
+  if (!shouldTryStopFallback(first, plan)) {
+    return first;
+  }
+  return stopAttemptAt({ status, params, endpoint: plan.fallback });
+}
+
+function shouldTryStopFallback(result, plan) {
+  return plan.fallback !== null && result.kind === 'unreachable' && result.reason !== 'no-exit';
+}
+
+async function stopAttemptAt({ status, params, endpoint }) {
   const client = createIpcClient({
     dataDir: status.dataDir,
+    endpoint,
     hello: {
       app: APP_VERSION,
       token: status.record.token,
@@ -410,6 +430,7 @@ function stopParams(env) {
     pollMs: testNumber(env, SEAM_POLL, 10, 60000) ?? STOP_POLL_MS,
     connectTimeoutMs: testNumber(env, SEAM_CONNECT, 100, 60000) ?? STOP_CONNECT_TIMEOUT_MS,
     handshakeTimeoutMs: testNumber(env, SEAM_HANDSHAKE, 100, 60000) ?? STOP_HANDSHAKE_TIMEOUT_MS,
+    transport: transportModeOf(env),
   };
 }
 
