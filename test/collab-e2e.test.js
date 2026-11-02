@@ -324,7 +324,7 @@ async function waitPostConvergence(clientA, clientB, collabId, count) {
 /* 命令文件驱动链的装置：把仓库真实命令源装进临时 HOME，读回安装态文件（即命令实际读到的指令）。 */
 function installManagedCommand(t, fileName) {
   const home = makeTempDir(t);
-  const applied = applyInstallCommands(planInstallCommands({ home, sourceDir: join(repoRoot, 'scripts', 'claude-commands') }));
+  const applied = applyInstallCommands(planInstallCommands({ home, sourceDir: join(repoRoot, 'install', 'claude-commands') }));
   assert.deepEqual(applied.failures, [], `命令安装不得有失败项：${applied.failures.join('；')}`);
   const path = join(commandsDirFor(home), fileName);
   assert.equal(existsSync(path), true, `命令文件应经安装落地：${fileName}`);

@@ -72,8 +72,8 @@ waystation 有三种模式。模式在创建时定死，之后不能改。
 ### 2.2 Windows：推荐 `setup.ps1`
 
 ```powershell
-powershell -File scripts\setup.ps1          # 真正安装 / 更新
-powershell -File scripts\setup.ps1 -DryRun  # 只预览，不改动
+powershell -File install\setup.ps1          # 真正安装 / 更新
+powershell -File install\setup.ps1 -DryRun  # 只预览，不改动
 ```
 
 `setup.ps1` 是智能入口：先检测已装版本，没装就全新安装，旧了就问你要不要更新，同版或更高就跳过。然后它检测 cc-connect，如果装了，就帮你把调度长的自动化配置好（细节见 3.4.5）。任何一步失败，它会打印精确的手工命令，退出码 2；全部完成是 0；致命失败是 1。
@@ -81,8 +81,8 @@ powershell -File scripts\setup.ps1 -DryRun  # 只预览，不改动
 如果你只想要最朴素的安装，也可以直接用：
 
 ```powershell
-powershell -File scripts\install.ps1
-powershell -File scripts\install.ps1 -DryRun
+powershell -File install\install.ps1
+powershell -File install\install.ps1 -DryRun
 ```
 
 脚本会做这些事：检查 Node；把运行文件复制到 `~/.waystation/app/`；用 `npm ci --omit=dev` 装好运行依赖；放一个 `waystation.cmd` 到 `~/.waystation/bin/`；注册 Claude Code 的 MCP（Windows 用 `node` 加安装目录入口的绝对路径，不经过 `.cmd`，因为 Claude Code 拉起 MCP 子进程时 `.cmd` 不可靠）；把斜杠命令复制到 `~/.claude/commands/`；放好观察窗启动器；最后自检并打印防火墙放行指引、其他 MCP 客户端配置片段和会话启动后的检查清单。脚本是幂等的，重复运行不会把环境搞乱。
@@ -90,8 +90,8 @@ powershell -File scripts\install.ps1 -DryRun
 ### 2.3 Linux：`install.sh`
 
 ```bash
-bash scripts/install.sh
-bash scripts/install.sh --dry-run
+bash install/install.sh
+bash install/install.sh --dry-run
 ```
 
 流程和 Windows 一致。可执行文件放在 `~/.local/bin/waystation`；如果这个目录不在 PATH 里，MCP 注册会用它的绝对路径。
@@ -320,13 +320,13 @@ ws_create_collab { mode: 'dispatch', name: 'dispatch', autoClaim: true }
 
 waystation 不集成微信或 QQ。远程指挥是调度长和 cc-connect 的集成责任：cc-connect 把消息送进 master 会话，master 用调度工具派活，再把关键结果转述回微信 / QQ。
 
-`scripts\setup.ps1` 检测到 cc-connect 后，会帮你配好这些：
+`install\setup.ps1` 检测到 cc-connect 后，会帮你配好这些：
 
 - 向 `~/.cc-connect/config.toml` 的 `[projects.agent.options]` 段注入 `allowed_tools` 和 `append_system_prompt`，先备份、幂等可重复；
 - 通过 UAC 自提权，把 `WAYSTATION_ROLE=master` 写进 Windows 服务环境；
 - 有实际更改时询问是否重启服务；任何一步失败都会降级成精确的手工命令，退出码 2。
 
-master 提示词的唯一编辑入口是仓库里的 `templates/master-prompt.md`。改完之后用 `scripts/sync-master-prompt.ps1` 同步到运行版 `config.toml`：脚本会先备份为 `config.toml.bak-sync-<时间戳>`，再整体替换注入值；`-DryRun` 可以预览。改完 cc-connect 配置后需要重启服务或新开会话才生效。
+master 提示词的唯一编辑入口是仓库里的 `templates/master-prompt.md`。改完之后用 `install/sync-master-prompt.ps1` 同步到运行版 `config.toml`：脚本会先备份为 `config.toml.bak-sync-<时间戳>`，再整体替换注入值；`-DryRun` 可以预览。改完 cc-connect 配置后需要重启服务或新开会话才生效。
 
 调度长空闲时不会主动调用 ws 工具。核心把“心跳”定义为任意一次 ws 工具调用（或桥重连），`dispatch.master_timeout_ms` 默认 3 分钟、最长可配到 1 小时；超过这个时间没有调用，就会被判为待接管，组员和任务表保留，调度长下一次调用工具即恢复。如果调度长需要长期待命，可以再挂一个 cc-connect 定时任务，每 20 分钟让它调一次轻量工具续心跳。让调度长只回复 `NO_REPLY`，cc-connect 会把这条回复静默掉，不会发到微信 / QQ：
 

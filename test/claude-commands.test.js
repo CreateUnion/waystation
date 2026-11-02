@@ -58,7 +58,7 @@ function makeCommandsDir(home, files) {
 
 test('仓库命令源：十个文件存在且带受管标记（防源集合与标记漂移）', () => {
   for (const name of ['ws-collab.md', 'ws-discuss.md', 'ws-list.md', 'ws-mute.md', 'ws-purge.md', 'ws-view.md', 'ws-join.md', 'ws-auto-accept-invites.md', 'ws-invite-confirm.md', 'ws-join-confirm.md']) {
-    const filePath = join(repoRoot, 'scripts', 'claude-commands', name);
+    const filePath = join(repoRoot, 'install', 'claude-commands', name);
     assert.equal(existsSync(filePath), true, `缺少命令源文件：${name}`);
     const text = readFileSync(filePath, 'utf8');
     assert.ok(text.startsWith('---'), `${name} 应以 frontmatter 开头`);
@@ -67,7 +67,7 @@ test('仓库命令源：十个文件存在且带受管标记（防源集合与�
 });
 
 test('ws-invite-confirm 命令文：临时 / 永久 / 状态 / 清除与边界齐备', () => {
-  const text = readFileSync(join(repoRoot, 'scripts', 'claude-commands', 'ws-invite-confirm.md'), 'utf8');
+  const text = readFileSync(join(repoRoot, 'install', 'claude-commands', 'ws-invite-confirm.md'), 'utf8');
   assert.ok(text.includes('ws_set_confirm_gate'));
   assert.ok(text.includes("gate: 'invite'") || text.includes('gate: invite'));
   assert.ok(text.includes('--permanent'));
@@ -76,7 +76,7 @@ test('ws-invite-confirm 命令文：临时 / 永久 / 状态 / 清除与边界�
 });
 
 test('ws-join-confirm 命令文：自动批准与整条入席自动走完的如实边界齐备', () => {
-  const text = readFileSync(join(repoRoot, 'scripts', 'claude-commands', 'ws-join-confirm.md'), 'utf8');
+  const text = readFileSync(join(repoRoot, 'install', 'claude-commands', 'ws-join-confirm.md'), 'utf8');
   assert.ok(text.includes('ws_set_confirm_gate'));
   assert.ok(text.includes("gate: 'join'") || text.includes('gate: join'));
   assert.ok(text.includes('join-confirm'));
@@ -85,7 +85,7 @@ test('ws-join-confirm 命令文：自动批准与整条入席自动走完的如�
 });
 
 test('ws-auto-accept-invites 旧命令：方向相反映射到新命令（防把旧 on 写成新 on）', () => {
-  const text = readFileSync(join(repoRoot, 'scripts', 'claude-commands', 'ws-auto-accept-invites.md'), 'utf8');
+  const text = readFileSync(join(repoRoot, 'install', 'claude-commands', 'ws-auto-accept-invites.md'), 'utf8');
   assert.ok(text.includes('ws_set_confirm_gate'));
   assert.ok(text.includes('旧命令') || text.includes('兼容'));
   assert.ok(text.includes('requireConfirmation: false'));
@@ -94,7 +94,7 @@ test('ws-auto-accept-invites 旧命令：方向相反映射到新命令（防把
 });
 
 test('ws-join 命令文：申请 / 批准 / 敲门三路径齐备（防正文漂移）', () => {
-  const text = readFileSync(join(repoRoot, 'scripts', 'claude-commands', 'ws-join.md'), 'utf8');
+  const text = readFileSync(join(repoRoot, 'install', 'claude-commands', 'ws-join.md'), 'utf8');
   assert.ok(text.includes('ws_join'), '必须写明申请入口工具');
   assert.ok(text.includes('ws_approve_join'), '必须写明站长批准入口');
   assert.ok(text.includes('pendingJoins'), '必须写明待批准清单的取数面');
@@ -103,7 +103,7 @@ test('ws-join 命令文：申请 / 批准 / 敲门三路径齐备（防正文漂
 });
 
 test('ws-view 命令文：后台启动/启动验证/停止方法三要素齐备（防正文漂移）', () => {
-  const text = readFileSync(join(repoRoot, 'scripts', 'claude-commands', 'ws-view.md'), 'utf8');
+  const text = readFileSync(join(repoRoot, 'install', 'claude-commands', 'ws-view.md'), 'utf8');
   assert.ok(text.includes('run_in_background'), '必须写明后台/分离启动（前台会挂死会话）');
   assert.ok(text.includes('观察窗已就绪'), '必须写明启动验证的就绪行');
   assert.ok(text.includes('--stop'), '必须写明停止方法');
@@ -112,14 +112,14 @@ test('ws-view 命令文：后台启动/启动验证/停止方法三要素齐备�
 });
 
 test('ws-purge 命令文：先停核心及其拒绝语义、复起路径齐备（防正文漂移）', () => {
-  const text = readFileSync(join(repoRoot, 'scripts', 'claude-commands', 'ws-purge.md'), 'utf8');
+  const text = readFileSync(join(repoRoot, 'install', 'claude-commands', 'ws-purge.md'), 'utf8');
   assert.ok(text.includes('先停止本机核心'), '必须写明执行时会先停核心（单核：核心持有被删目录）');
   assert.ok(text.includes('拒绝清理'), '必须写明核心拒停时的拒绝语义（不得绕过）');
   assert.ok(text.includes('自动拉起新核心'), '必须写明停核后会话下一次工具调用自动拉起新核心');
 });
 
 test('ws-list 命令文：本机行与同机标注规则齐备（防正文漂移）', () => {
-  const text = readFileSync(join(repoRoot, 'scripts', 'claude-commands', 'ws-list.md'), 'utf8');
+  const text = readFileSync(join(repoRoot, 'install', 'claude-commands', 'ws-list.md'), 'utf8');
   assert.ok(text.includes('本机 — '), '必须写明本机行的呈现形态（列表最上方一行）');
   assert.ok(text.includes('活跃终端 0'), '空终端须如实呈现「活跃终端 0」（不省略本机行）');
   assert.ok(text.includes('sameMachine'), '必须写明同机另一数据根的标注判据');

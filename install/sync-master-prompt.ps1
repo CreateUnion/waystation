@@ -20,9 +20,9 @@
 .PARAMETER DryRun
     预览模式：逐段打印将新增/替换/跳过/放弃的计划，不备份不写入。
 .EXAMPLE
-    powershell -File scripts\sync-master-prompt.ps1 -DryRun
+    powershell -File install\sync-master-prompt.ps1 -DryRun
 .EXAMPLE
-    powershell -File scripts\sync-master-prompt.ps1
+    powershell -File install\sync-master-prompt.ps1
 #>
 #Requires -Version 5.1
 [CmdletBinding()]

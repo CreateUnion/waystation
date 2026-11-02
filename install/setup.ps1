@@ -5,7 +5,7 @@
     流程（设计 2026-10-30，docs/superpowers/specs/2026-10-30-waystation-setup-installer-design.md）：
       1) 检测已装 waystation（~\.waystation\app\package.json 的 version）与安装包（仓库）版本：
          未安装→全新安装；已装更低→询问更新（默认 Y）；同版或更高→跳过；版本不可解析→询问重装（默认 Y）。
-         全新安装/更新都委托 scripts\install.ps1（本脚本不改它的行为）。
+         全新安装/更新都委托 install\install.ps1（本脚本不改它的行为）。
       2) 检测 cc-connect（服务 / ~\.cc-connect\config.toml / PATH 或 npm 全局目录，任一命中即存在）：
          不存在→提醒无法自动配置多会话控制；存在→全自动配置 dispatch master 自动化。
     特性与边界：
@@ -23,9 +23,9 @@
     家目录根（默认 $env:USERPROFILE）。waystation 安装目录与 cc-connect 配置均按其解析；
     供测试隔离与自定义布局使用，一般无需指定。
 .EXAMPLE
-    powershell -File scripts\setup.ps1
+    powershell -File install\setup.ps1
 .EXAMPLE
-    powershell -File scripts\setup.ps1 -DryRun
+    powershell -File install\setup.ps1 -DryRun
 #>
 #Requires -Version 5.1
 [CmdletBinding()]
@@ -133,11 +133,11 @@ function Ask-YesNo([string]$Question, [bool]$DefaultYes) {
 # 真正的文件安装/升级全部由 install.ps1 承担；它失败 = 致命失败（不再继续后续步骤）。
 function Invoke-Install {
     if ($DryRun) {
-        Write-Note '（dry-run）将执行：powershell -NoProfile -File scripts\install.ps1'
+        Write-Note '（dry-run）将执行：powershell -NoProfile -File install\install.ps1'
         return
     }
     Write-Note '执行全量安装脚本（install.ps1）……'
-    $run = Invoke-Native -Command 'powershell' -CommandArgs @('-NoProfile', '-File', (Join-Path $RepoRoot 'scripts\install.ps1'))
+    $run = Invoke-Native -Command 'powershell' -CommandArgs @('-NoProfile', '-File', (Join-Path $RepoRoot 'install\install.ps1'))
     if ($run.ExitCode -ne 0) {
         Fail "install.ps1 退出码 $($run.ExitCode)——安装未完成，中止智能安装"
     }
@@ -439,8 +439,8 @@ function Invoke-CcRestart([bool]$Needed) {
 
 # ===== 主流程 =====
 
-if (-not (Test-Path (Join-Path $RepoRoot 'package.json')) -or -not (Test-Path (Join-Path $RepoRoot 'scripts\install.ps1'))) {
-    Fail '本脚本需在完整仓库内运行（缺 package.json 或 scripts\install.ps1）'
+if (-not (Test-Path (Join-Path $RepoRoot 'package.json')) -or -not (Test-Path (Join-Path $RepoRoot 'install\install.ps1'))) {
+    Fail '本脚本需在完整仓库内运行（缺 package.json 或 install\install.ps1）'
 }
 if (-not $HomeDir) { $HomeDir = $env:USERPROFILE }
 

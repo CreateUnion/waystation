@@ -21,10 +21,10 @@
 #   - macOS 暂不在支持范围（随公开发布补齐）。
 #
 # 用法：
-#   bash scripts/install.sh                            安装（重复运行安全）
-#   bash scripts/install.sh --dry-run                  预览：只检测与打印
-#   bash scripts/install.sh --uninstall                卸载（保留数据目录）
-#   bash scripts/install.sh --uninstall --purge-data   卸载并删除数据目录
+#   bash install/install.sh                            安装（重复运行安全）
+#   bash install/install.sh --dry-run                  预览：只检测与打印
+#   bash install/install.sh --uninstall                卸载（保留数据目录）
+#   bash install/install.sh --uninstall --purge-data   卸载并删除数据目录
 
 set -eu
 
@@ -69,11 +69,11 @@ usage() {
 waystation 安装脚本（Linux）
 
 用法：
-  bash scripts/install.sh                            安装（幂等，可重复运行）
-  bash scripts/install.sh --dry-run                  预览：只做只读检测并打印将执行的动作
-  bash scripts/install.sh --uninstall                卸载（先停核心，再注销 MCP、删斜杠命令、删安装目录与可执行；保留数据目录）
-  bash scripts/install.sh --uninstall --purge-data   卸载并删除数据目录（含全部协作数据）
-  bash scripts/install.sh --help                     显示本帮助
+  bash install/install.sh                            安装（幂等，可重复运行）
+  bash install/install.sh --dry-run                  预览：只做只读检测并打印将执行的动作
+  bash install/install.sh --uninstall                卸载（先停核心，再注销 MCP、删斜杠命令、删安装目录与可执行；保留数据目录）
+  bash install/install.sh --uninstall --purge-data   卸载并删除数据目录（含全部协作数据）
+  bash install/install.sh --help                     显示本帮助
 
 脚本不会自动安装 Node，也不修改防火墙；缺失/需要放行时只打印指引。
 （另有 `waystation uninstall [--purge-data]` 命令，由驿站本体提供：默认布局下与脚本开关等价；
@@ -103,7 +103,7 @@ check_repo_tree() {
   [ -f "${REPO_ROOT}/package-lock.json" ] || fail "找不到 ${REPO_ROOT}/package-lock.json（依赖就位需要它）"
   [ -f "${REPO_ROOT}/bin/waystation.js" ] || fail "找不到 ${REPO_ROOT}/bin/waystation.js"
   [ -d "${REPO_ROOT}/src" ] || fail "找不到 ${REPO_ROOT}/src"
-  [ -d "${REPO_ROOT}/scripts/claude-commands" ] || fail "找不到 ${REPO_ROOT}/scripts/claude-commands"
+  [ -d "${REPO_ROOT}/install/claude-commands" ] || fail "找不到 ${REPO_ROOT}/install/claude-commands"
 }
 
 read_engines_node() {
@@ -276,7 +276,7 @@ register_mcp() {
 install_claude_commands() {
   # 受管命令的「哪些文件/怎么判定」全部在 src/claude-commands.js（唯一权威）；本步只调入口并转发输出
   step "5/6" "安装斜杠命令到 ~/.claude/commands/"
-  local source_dir="${REPO_ROOT}/scripts/claude-commands"
+  local source_dir="${REPO_ROOT}/install/claude-commands"
   if ! command -v claude >/dev/null 2>&1; then
     if [ "$DRY_RUN" = 1 ]; then
       note "未找到 claude CLI——真实运行时将跳过安装（不视为失败）并打印手工步骤"
@@ -352,7 +352,7 @@ self_check() {
   # 只核对源集合文件名就位（不判受管标记——标记判定属模块单一权威，不在脚本里复刻）
   local cmd_src="" cmd_name=""
   if command -v claude >/dev/null 2>&1; then
-    for cmd_src in "${REPO_ROOT}"/scripts/claude-commands/*.md; do
+    for cmd_src in "${REPO_ROOT}"/install/claude-commands/*.md; do
       # 源目录为空时 glob 保留字面量 *.md，跳过以免把通配符当文件名误报（与 ps1 臂的 -Filter 零迭代对齐）
       [ -e "$cmd_src" ] || continue
       cmd_name="$(basename "$cmd_src")"

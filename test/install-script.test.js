@@ -46,7 +46,7 @@ function makeClaudeStub(t) {
 
 function runInstallScript(t, args, home = makeTempDir(t), extraEnv = {}) {
   const stubDir = makeClaudeStub(t);
-  const result = spawnSync('bash', [join(repoRoot, 'scripts', 'install.sh'), ...args], {
+  const result = spawnSync('bash', [join(repoRoot, 'install', 'install.sh'), ...args], {
     cwd: repoRoot,
     encoding: 'utf8',
     /* 上限兜底：真实执行路径若挂住（如误选旧入口读 stdin），以失败收场而不是把测试进程拖死。 */
@@ -94,8 +94,8 @@ test('安装脚本 --dry-run：5/6 走到命令行模块（含六个受管文件
 });
 
 test('安装脚本源：两平台文案点（端口单核口径 / 升级指引 / 卸载先停核）＋bin/ 整目录拷贝面', () => {
-  const shText = readFileSync(join(repoRoot, 'scripts', 'install.sh'), 'utf8');
-  const psText = readFileSync(join(repoRoot, 'scripts', 'install.ps1'), 'utf8');
+  const shText = readFileSync(join(repoRoot, 'install', 'install.sh'), 'utf8');
+  const psText = readFileSync(join(repoRoot, 'install', 'install.ps1'), 'utf8');
   assert.ok(shText.includes('cp -R "${REPO_ROOT}/bin"'), 'sh 臂按整目录拷贝 bin/（核心入口自动随行）');
   assert.ok(psText.includes("@('bin', 'src')"), 'ps1 臂按整目录拷贝 bin/ 与 src/（核心入口自动随行）');
   for (const [name, text] of [['install.sh', shText], ['install.ps1', psText]]) {
@@ -118,7 +118,7 @@ test('安装脚本源：两平台文案点（端口单核口径 / 升级指引 /
   assert.ok(psText.includes('WaitForExit(30000)'), 'ps1 臂停核调用应有 30s 上限兜底');
   /* install.ps1 必须保留 UTF-8 BOM：PS 5.1 对无 BOM 文件按系统 ANSI 读，中文注释会被解码成乱码字节、
    * 可能把注释行错拼进代码；抽取该脚本函数做重放验证的工具链同样依赖 BOM 前提。 */
-  assert.equal(readFileSync(join(repoRoot, 'scripts', 'install.ps1')).subarray(0, 3).toString('hex'), 'efbbbf', 'install.ps1 须保留 UTF-8 BOM');
+  assert.equal(readFileSync(join(repoRoot, 'install', 'install.ps1')).subarray(0, 3).toString('hex'), 'efbbbf', 'install.ps1 须保留 UTF-8 BOM');
 });
 
 test('卸载脚本 --uninstall --dry-run：先停核心（1/6）、3/6 走到命令行模块（将删除 + 受管文件名）、零写入', (t) => {
@@ -206,7 +206,7 @@ function makeClaudeCmdStub(t) {
  * 变量（不可赋值），但子进程的 $HOME 由这三个环境变量派生（审查实证 2026-10-15：重定向后真跑
  * -Uninstall 只写临时根、真实家目录零触碰）。PATH 前置 claude 桩目录。 */
 function runPs1Uninstall({ home, dataDir, stubDir }) {
-  return spawnSync('powershell', ['-NoProfile', '-File', join(repoRoot, 'scripts', 'install.ps1'), '-Uninstall'], {
+  return spawnSync('powershell', ['-NoProfile', '-File', join(repoRoot, 'install', 'install.ps1'), '-Uninstall'], {
     cwd: repoRoot,
     encoding: 'utf8',
     timeout: 120000,

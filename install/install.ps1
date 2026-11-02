@@ -31,11 +31,11 @@
     仅与 -Uninstall 连用：连数据目录（含全部协作数据）一起删除。
 
 .EXAMPLE
-    powershell -File scripts\install.ps1
+    powershell -File install\install.ps1
 .EXAMPLE
-    powershell -File scripts\install.ps1 -DryRun
+    powershell -File install\install.ps1 -DryRun
 .EXAMPLE
-    powershell -File scripts\install.ps1 -Uninstall
+    powershell -File install\install.ps1 -Uninstall
     （若本机脚本执行策略拦截，按你的安全策略处理后再运行；脚本可全文审读。
       另有 waystation uninstall 命令（由驿站本体提供）：默认布局下与脚本开关等价，
       自定义 WAYSTATION_HOME 时以该命令为准——本脚本不读该变量）
@@ -106,7 +106,7 @@ function Assert-RepoTree {
     if (-not (Test-Path (Join-Path $RepoRoot 'src'))) {
         Fail "找不到 $(Join-Path $RepoRoot 'src')"
     }
-    $commandsDir = Join-Path $RepoRoot 'scripts\claude-commands'
+    $commandsDir = Join-Path $RepoRoot 'install\claude-commands'
     if (-not (Test-Path $commandsDir)) {
         Fail "找不到 $commandsDir"
     }
@@ -321,7 +321,7 @@ function Register-Mcp {
 function Install-ClaudeCommands {
     # 受管命令的「哪些文件/怎么判定」全部在 src/claude-commands.js（唯一权威）；本步只调入口并转发输出
     Write-Step '5/6' '安装斜杠命令到 ~/.claude/commands/'
-    $commandsSourceDir = Join-Path $RepoRoot 'scripts\claude-commands'
+    $commandsSourceDir = Join-Path $RepoRoot 'install\claude-commands'
     if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
         if ($DryRun) {
             Write-Note '未找到 claude CLI——真实运行时将跳过安装（不视为失败）并打印手工步骤'
@@ -398,7 +398,7 @@ function Invoke-SelfCheck {
     }
     # 只核对源集合文件名就位（不判受管标记——标记判定属模块单一权威，不在脚本里复刻）
     if (Get-Command claude -ErrorAction SilentlyContinue) {
-        $commandsSourceDir = Join-Path $RepoRoot 'scripts\claude-commands'
+        $commandsSourceDir = Join-Path $RepoRoot 'install\claude-commands'
         foreach ($sourceFile in (Get-ChildItem -Path $commandsSourceDir -Filter '*.md' -File)) {
             $commandTarget = Join-Path (Join-Path $HOME '.claude\commands') $sourceFile.Name
             if (Test-Path $commandTarget) {

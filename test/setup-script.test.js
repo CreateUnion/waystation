@@ -58,7 +58,7 @@ function runSetup(t, { args = [], home = makeTempDir(t), seam = '1' } = {}) {
   const entriesBefore = readdirSync(home, { recursive: true }).sort();
   const result = spawnSync(
     'powershell',
-    ['-NoProfile', '-File', join(repoRoot, 'scripts', 'setup.ps1'), '-HomeDir', home, ...args],
+    ['-NoProfile', '-File', join(repoRoot, 'install', 'setup.ps1'), '-HomeDir', home, ...args],
     {
       encoding: 'utf8',
       timeout: 120000,
