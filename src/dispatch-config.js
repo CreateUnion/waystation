@@ -9,11 +9,25 @@ export const DEFAULT_RESOURCE_GUARD_CONFIG = Object.freeze({
   max_slaves: 8,
 });
 
+/* 问题 2-A：dispatch 消息长度上限（字符数）——progress / result / 其他类型 text。
+ * 超限拒绝（不截断），提示把长内容写文件、消息只发摘要 + 路径。 */
+export const DEFAULT_MESSAGE_LIMITS_CONFIG = Object.freeze({
+  progress: 800,
+  result: 3000,
+  text: 4000,
+});
+
+export const DEFAULT_TASK_STALE_MS = 1800000;          // 问题 6-A：默认 30 分钟
+export const DEFAULT_REQUIRE_ACK_DEFAULT = false;      // 问题 6-B：默认仍不强制回执
+
 export const DEFAULT_DISPATCH_CONFIG = Object.freeze({
   persist: true,
   state_path: '',
   master_timeout_ms: 180000,
   resource_guard: DEFAULT_RESOURCE_GUARD_CONFIG,
+  message_limits: DEFAULT_MESSAGE_LIMITS_CONFIG,
+  task_stale_ms: DEFAULT_TASK_STALE_MS,
+  require_ack_default: DEFAULT_REQUIRE_ACK_DEFAULT,
 });
 
 export const DEFAULT_RETENTION_CONFIG = Object.freeze({
@@ -30,6 +44,10 @@ export const RESOURCE_GUARD_MEM_MB_MIN = 256;
 export const RESOURCE_GUARD_MEM_MB_MAX = 65536;
 export const RESOURCE_GUARD_SLAVES_MIN = 1;
 export const RESOURCE_GUARD_SLAVES_MAX = 64;
+export const MESSAGE_LIMIT_MIN_CHARS = 64;
+export const MESSAGE_LIMIT_MAX_CHARS = 20000;
+export const TASK_STALE_MIN_MS = 60000;                // 60 秒
+export const TASK_STALE_MAX_MS = 86400000;             // 24 小时
 export const DISPATCH_HOURS_MAX = 8760;          // 1 年
 export const COLLABS_DAYS_MAX = 3650;            // 10 年
 export const LOGS_DAYS_MAX = 3650;
@@ -91,6 +109,34 @@ export function resourceGuardConfigOf(config) {
       DEFAULT_RESOURCE_GUARD_CONFIG.max_slaves,
     ),
   };
+}
+
+/** 生效的 dispatch 消息长度上限：逐项校验（64–20000），缺失/非法回退默认值。 */
+export function messageLimitsOf(config) {
+  const raw = config?.dispatch?.message_limits;
+  const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  return {
+    progress: integerInRange(
+      source.progress, MESSAGE_LIMIT_MIN_CHARS, MESSAGE_LIMIT_MAX_CHARS, DEFAULT_MESSAGE_LIMITS_CONFIG.progress,
+    ),
+    result: integerInRange(
+      source.result, MESSAGE_LIMIT_MIN_CHARS, MESSAGE_LIMIT_MAX_CHARS, DEFAULT_MESSAGE_LIMITS_CONFIG.result,
+    ),
+    text: integerInRange(
+      source.text, MESSAGE_LIMIT_MIN_CHARS, MESSAGE_LIMIT_MAX_CHARS, DEFAULT_MESSAGE_LIMITS_CONFIG.text,
+    ),
+  };
+}
+
+/** 任务超时提醒阈值（毫秒）：缺失/非法回退 30 分钟。 */
+export function taskStaleMsOf(config) {
+  const value = config?.dispatch?.task_stale_ms;
+  return integerInRange(value, TASK_STALE_MIN_MS, TASK_STALE_MAX_MS, DEFAULT_TASK_STALE_MS);
+}
+
+/** 调度长 task 的 requireAck 缺省值：只有显式 true 生效（缺省 / 非法一律 false，保持兼容）。 */
+export function requireAckDefaultOf(config) {
+  return config?.dispatch?.require_ack_default === true;
 }
 
 /** 生效的保留期配置：逐项校验，缺失/非法回退默认值。 */

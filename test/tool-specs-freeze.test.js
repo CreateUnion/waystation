@@ -167,6 +167,26 @@ test('规格文本与协议 / 服务常量取值一致', async () => {
   assert.ok(SPECS_BY_NAME.ws_send_message.inputSchema.properties.type.description.includes(`缺省 ${defaultType}`));
 });
 
+test('dispatch 机制化参数：report / evidence / acceptance 与长度上限描述齐备', () => {
+  const props = propertiesOf('ws_send_message');
+  assert.equal(props.report?.type, 'object', 'report 为可选对象');
+  assert.deepEqual(Object.keys(props.report.properties).sort(), ['blockers', 'done', 'next', 'summary']);
+  assert.equal(props.evidence?.type, 'object', 'evidence 为可选对象');
+  assert.deepEqual(Object.keys(props.evidence.properties).sort(), ['artifacts', 'commit', 'gates', 'tests']);
+  assert.equal(props.acceptance?.type, 'array', 'acceptance 为可选数组');
+  assert.equal(props.acceptance.items.type, 'string');
+
+  const limits = buildDefaults('本机').dispatch.message_limits;
+  assert.ok(props.text.description.includes(`progress ${limits.progress}`), '正文描述含 progress 上限默认值');
+  assert.ok(props.text.description.includes(`result ${limits.result}`), '正文描述含 result 上限默认值');
+  assert.ok(props.text.description.includes(`text ${limits.text}`), '正文描述含 text 上限默认值');
+  assert.ok(props.text.description.includes('report'), '正文描述说明带 report 时可空');
+  assert.ok(props.requireAck.description.includes('require_ack_default'), 'requireAck 描述指向缺省配置');
+  assert.ok(SPECS_BY_NAME.ws_send_message.description.includes('message-too-long'));
+  assert.ok(SPECS_BY_NAME.ws_send_message.description.includes('dispatch-task-stale'));
+  assert.deepEqual(SPECS_BY_NAME.ws_send_message.inputSchema.required, ['collabId', 'text'], '必填项不缩水');
+});
+
 /* 会话级参与者 0.2.0 的工具面形态（设计 §9）：这些字段是 handler 接线的对前面——缺一个就说明
  * 规格没跟上设计。此处只断言「存在与语义关键词」，措辞变动不红；逐字节面由冻结快照兜底。 */
 test('会话级工具面：双字段定向与确认令牌齐备', () => {
@@ -324,7 +344,12 @@ async function sendMessageDefaultType() {
  * 状态视图与资源提醒（2026-11-02，D/E 组）：ws_status 的 inputSchema 增可选 view（compact 缺省 /
  * full），描述同步 compact/full 口径；ws_dispatch_claim 描述补 warnings 资源提醒（只警告不拒绝）。
  * 工具数、其余 schema 与必填性未动，按同一规程重冻；
- * md5 更新为 971daf2b22c183632ba8fe6589d256d0（23523 字符）。 */
+ * md5 更新为 971daf2b22c183632ba8fe6589d256d0（23523 字符）。
+ * dispatch 机制化（问题 2/5/6，2026-11-02）：ws_send_message 增可选 report / evidence / acceptance
+ * （report 仅 progress/result，evidence 仅 result，acceptance 仅 task；带 report 时 text 可为空串或
+ * 省略），描述补消息长度上限（dispatch.message_limits）、task_stale_ms 超时提醒与
+ * require_ack_default 缺省；工具名、工具数与必填性未动，按同一规程重冻；
+ * md5 更新为 761b5a01cec5612ba02ee5439aa73cb3（27080 字符）。冻结断言未放宽。 */
 const FROZEN_LIST_JSON = `[
   {
     "name": "ws_status",
@@ -699,7 +724,7 @@ const FROZEN_LIST_JSON = `[
   },
   {
     "name": "ws_send_message",
-    "description": "发送协作域消息（发送者须为本机活跃且非 unverified 席位）：星型路由——成员发给站长，站长省略 to 即发全体成员；按目标机器去重、一机一帧，返回逐机器 msgId；席位宽限内断连的帧由本机核心暂存、重连后补投，判离席或冻结期丢弃，不保证送达。返回的 delivery 字段给出逐目标送达态：delivered（已投进目标会话）/ queued（暂存待补投，附 queuedUntil 宽限截止）/ failed（附原因），state 归并为 delivered / queued / failed / partial。to＝目标实例/地址，配可选 toSessionId（会话，短码或完整标识，精确匹配；只给会话参数会被拒绝）。讨论模式为发帖（人人可见、to / toSessionId 一律拒绝）：默认经中继（发起人）投递（成员投稿至中继、由其转达全员），中继不可达时自动降级直投——返回的 route 字段如实标注本机走的路（relay/degraded/fanout）、results 为投稿或直投的受理态，成员级结果经中继聚合捎回、未达者由对方周期对表收敛。调度（dispatch，本机编排；消息流水不落盘、编排状态默认持久化）另走一套：消息只经本机核心投递、不落盘，type 取 task / progress / result / error，定向用 toSessionIds（省略即调度长→全体已收编组员、组员→调度长），可用 taskId 关联任务；不接受 to / toSessionId。requireAck 仅 dispatch 调度长的 task：投递文本附回执指引，目标会话用 ackFor 回执后核心另行通知调度长（delivery.ack.pending 为待确认 msgId）；ackFor 是独立回执动作，不与定向/任务字段并用",
+    "description": "发送协作域消息（发送者须为本机活跃且非 unverified 席位）：星型路由——成员发给站长，站长省略 to 即发全体成员；按目标机器去重、一机一帧，返回逐机器 msgId；席位宽限内断连的帧由本机核心暂存、重连后补投，判离席或冻结期丢弃，不保证送达。返回的 delivery 字段给出逐目标送达态：delivered（已投进目标会话）/ queued（暂存待补投，附 queuedUntil 宽限截止）/ failed（附原因），state 归并为 delivered / queued / failed / partial。to＝目标实例/地址，配可选 toSessionId（会话，短码或完整标识，精确匹配；只给会话参数会被拒绝）。讨论模式为发帖（人人可见、to / toSessionId 一律拒绝）：默认经中继（发起人）投递（成员投稿至中继、由其转达全员），中继不可达时自动降级直投——返回的 route 字段如实标注本机走的路（relay/degraded/fanout）、results 为投稿或直投的受理态，成员级结果经中继聚合捎回、未达者由对方周期对表收敛。调度（dispatch，本机编排；消息流水不落盘、编排状态默认持久化）另走一套：消息只经本机核心投递、不落盘，type 取 task / progress / result / error，定向用 toSessionIds（省略即调度长→全体已收编组员、组员→调度长），可用 taskId 关联任务；不接受 to / toSessionId。调度消息长度受 config.dispatch.message_limits 限制（progress 800 / result 3000 / 其他 text 4000 字符，范围 64–20000，可配置）：超限明确拒绝（code message-too-long）并提示把长内容写文件、消息里只发摘要 + 文件路径，不截断、不静默丢弃。progress / result 可带结构化 report（summary / done / blockers / next），带 report 时 text 可为空串或省略；result 可带 evidence（commit / tests / artifacts / gates），task 可带 acceptance（验收标准 1–20 项）——三者随任务表保存（acceptance / evidenceRef），不强制 evidence。requireAck 仅 dispatch 调度长的 task：投递文本附回执指引，目标会话用 ackFor 回执后核心另行通知调度长（delivery.ack.pending 为待确认 msgId）；未显式给 requireAck 时按 config.dispatch.require_ack_default（默认 false）处理。在途任务超过 config.dispatch.task_stale_ms（默认 30 分钟）无 progress 时，核心向调度长投一次 dispatch-task-stale 提醒（不改任务状态）。ackFor 是独立回执动作，不与定向/任务/结构化字段并用",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -709,11 +734,11 @@ const FROZEN_LIST_JSON = `[
         },
         "text": {
           "type": "string",
-          "description": "消息正文（必填，≤4000 字符）"
+          "description": "消息正文（必填，≤4000 字符；dispatch 按 type 另有可配置上限 progress 800 / result 3000 / text 4000，超限拒绝；带 report 时可传空串或省略，正文由 report 渲染）"
         },
         "type": {
           "type": "string",
-          "description": "消息类型（可选，缺省 reply；managed / forum 可选值：topic / task / progress / issue / stop / reply；dispatch 可选值：task / progress / result / error，省略时 master＝task、slave＝result）"
+          "description": "消息类型（可选，缺省 reply；managed / forum 可选值：topic / task / progress / issue / stop / reply；dispatch 可选值：task / progress / result / error，省略时 master＝task、slave＝result。dispatch 的 report 仅用于 progress / result，evidence 仅用于 result，acceptance 仅用于 task）"
         },
         "to": {
           "type": "string",
@@ -734,13 +759,97 @@ const FROZEN_LIST_JSON = `[
           "type": "string",
           "description": "仅 dispatch：任务关联键（可选，1–64 字符），随消息投递给目标；managed / forum 使用会报错"
         },
+        "report": {
+          "type": "object",
+          "description": "仅 dispatch 的 progress / result：结构化汇报（可选）。summary ≤200 字符；done / blockers / next 各 ≤20 项、单项 ≤200 字符。带 report 时 text 可为空串或省略，正文由 report 渲染（摘要 + 已完成 / 受阻 / 下一步）。其他模式/类型使用会报错（report-not-allowed）",
+          "properties": {
+            "summary": {
+              "type": "string",
+              "description": "一句话摘要（≤200 字符）"
+            },
+            "done": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "已完成（≤20 项，单项 ≤200 字符）"
+            },
+            "blockers": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "受阻（≤20 项，单项 ≤200 字符）"
+            },
+            "next": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "下一步（≤20 项，单项 ≤200 字符）"
+            }
+          }
+        },
+        "evidence": {
+          "type": "object",
+          "description": "仅 dispatch 的 result：完成证据（可选，不强制）。逐项校验形态，随任务表保存为 evidenceRef；其他模式/类型使用会报错（evidence-not-allowed）",
+          "properties": {
+            "commit": {
+              "type": "string",
+              "description": "commit 标识（可选，≤128 字符）"
+            },
+            "tests": {
+              "type": "object",
+              "description": "测试结果（可选）：pass / fail 必填非负整数，command 可选（≤1000 字符）",
+              "properties": {
+                "pass": {
+                  "type": "integer",
+                  "description": "通过数（≥0）"
+                },
+                "fail": {
+                  "type": "integer",
+                  "description": "失败数（≥0）"
+                },
+                "command": {
+                  "type": "string",
+                  "description": "测试命令（可选，≤1000 字符）"
+                }
+              },
+              "required": [
+                "pass",
+                "fail"
+              ]
+            },
+            "artifacts": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "产物路径（可选，≤20 项，单项 ≤500 字符）"
+            },
+            "gates": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "门禁名称（可选，≤20 项，单项 ≤500 字符）"
+            }
+          }
+        },
+        "acceptance": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "仅 dispatch 的 task：验收标准（可选，1–20 项非空字符串），随 task 投递并保存到任务表；其他模式/类型使用会报错（acceptance-not-allowed）"
+        },
         "requireAck": {
           "type": "boolean",
-          "description": "仅 dispatch 调度长发出的 task：要求目标会话回执确认（可选，默认 false）；回执到达时核心另行通知调度长。其他模式/类型使用会报错"
+          "description": "仅 dispatch 调度长发出的 task：要求目标会话回执确认（可选；缺省按 config.dispatch.require_ack_default，默认 false——true 时调度长 task 未显式给值等价于 true，显式 false 仍可关闭）；回执到达时核心另行通知调度长。其他模式/类型使用会报错"
         },
         "ackFor": {
           "type": "string",
-          "description": "仅 dispatch：确认收到的消息 msgId（取自投递文本中的回执指引）；只能由该消息的目标会话回执，不能与 toSessionIds / taskId / requireAck / type 同时使用。managed / forum 使用会报错"
+          "description": "仅 dispatch：确认收到的消息 msgId（取自投递文本中的回执指引）；只能由该消息的目标会话回执，不能与 toSessionIds / taskId / requireAck / type / report / evidence / acceptance 同时使用。managed / forum 使用会报错"
         }
       },
       "required": [

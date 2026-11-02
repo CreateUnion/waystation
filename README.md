@@ -115,7 +115,9 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
 - **自动收编（autoClaim）**：创建时带 `ws_create_collab { mode: 'dispatch', autoClaim: true }`——创建即自动收编一轮，之后随核心节拍**持续补收新出现的可绑定会话**（`role=slave`，或 claim 门 off 的交互式；**门开的交互式绝不自动弹确认**），离线组员超宽限自动移除并通告。适合「调度长常驻、worker 随开随编」的用法；不开 autoClaim 则保持手动 `claim` 语义。
 - **收编纪律包（单一权威源）**：收编通知（绑定知情通知与 pending 确认提示）自动携带 `~/.waystation/dispatch-rules.md`（调度纪律）全文——该文件是调度（dispatch）全员纪律的唯一权威源，收编低频、通知发出时实时读取，**改完即热生效**（无需重启或 reload）；文件缺失/为空时回退内置最简纪律（主动上报 + 权限豁免），并向调度长知会一次。改文件要对**已收编在编会话**立即生效时，调度长调 `ws_dispatch_rules_reload`：核心重读文件并向全体在编成员广播最新纪律包（带内容版本号+时间戳，便于会话识别新旧）。
 - **消息与结束**：复用 `ws_send_message`（调度模式下可带 `toSessionIds` 与 `taskId`，类型限定 task / progress / result / error）与 `ws_end_collab`（调度长结束并通知全员）。调度长定向时在 `toSessionIds` 填 `sessionCode`（或完整 `sessionId`），省略即群发；组员回执默认回调度长并在正文带 `@来源`。消息流水 / 台账 / 收件流水 / 观察窗历史仍不保存（`ws_view_ledger` / `ws_check_inbox` 明确回「不保存历史」）。
-- **编排状态持久化**：调度（dispatch）不写 `collabs/`（不建协作目录、不写 carrier / member / ledger / snapshot / outbox / inbox / invites / joins / seat / recovery / posts）；组员名单、任务表、调度长身份与心跳默认持久化到 `<数据根>/dispatch/state.json`（`config.dispatch.persist=false` 可退回纯内存，`config.dispatch.state_path` 可改相对数据根或绝对路径）。核心重启后恢复并校验调度长在线，离线则标记「待接管」；`dispatch.persist=false` 时行为与旧版一致（重启即丢）。`sessions/<sessionId>.json` 状态栏文件仍照常更新（本机会话状态，不是协作历史）。
+- **消息机制化（长度 / 结构化报告 / 证据 / 验收）**：`config.dispatch.message_limits` 限制调度消息正文（progress 默认 800、result 默认 3000、其他类型 text 默认 4000 字符；范围 64–20000，非法逐项回落默认）——超限**明确拒绝**（`message-too-long`），提示把长内容写文件、消息里只发摘要 + 文件路径，不截断、不静默丢弃；仅 dispatch 生效。`progress` / `result` 可带结构化 `report`（`summary` / `done` / `blockers` / `next`，单项 ≤200 字符、数组 ≤20 项；带 report 时 `text` 可为空串或省略，正文由 report 渲染）；`result` 可带 `evidence`（`commit` / `tests` / `artifacts` / `gates`，逐项校验、不强制）；`task` 可带 `acceptance`（验收标准 1–20 项）。report / evidence / acceptance 随帧投递并写入任务表（`lastProgress` 摘要 / `evidenceRef` / `acceptance`）。
+- **任务超时提醒与默认回执**：sweep 对 `assigned` / `active` 且最后一次 progress 距今 ≥ `config.dispatch.task_stale_ms`（默认 30 分钟，范围 60 秒–24 小时）的任务，向调度长投一次 `dispatch-task-stale`（含 taskId / 负责会话 / 最后进度摘要）；同一任务只提醒一次，有新 progress 才清位，**不改任务状态、不自动失败**。`config.dispatch.require_ack_default`（默认 false）为 true 时，调度长发出的 `task` 未显式给 `requireAck` 按 true 处理（显式 false 仍可关闭）。
+- **编排状态持久化**：调度（dispatch）不写 `collabs/`（不建协作目录、不写 carrier / member / ledger / snapshot / outbox / inbox / invites / joins / seat / recovery / posts）；组员名单、任务表、调度长身份与心跳默认持久化到 `<数据根>/dispatch/state.json`（`config.dispatch.persist=false` 可退回纯内存，`config.dispatch.state_path` 可改相对数据根或绝对路径）。任务表新增 `acceptance` / `evidenceRef` 为 v1 增量字段（schema 版本不升；旧文件缺字段按空处理）。核心重启后恢复并校验调度长在线，离线则标记「待接管」；`dispatch.persist=false` 时行为与旧版一致（重启即丢）。`sessions/<sessionId>.json` 状态栏文件仍照常更新（本机会话状态，不是协作历史）。
 - **资源提醒（建议型，不拒绝）**：`ws_dispatch_claim` 返回 `warnings` 数组——空闲内存低于 `config.dispatch.resource_guard.min_free_mem_mb`（默认 2048 MB）或当前组员数达到 `max_slaves`（默认 8）时，附实测数字与「先释放会话 / 关闭不用的 worker」建议；`enabled=false` 关闭。只提醒，不改收编结果；不做限流拒绝、自动回收会话或跨机资源汇总。
 - **保留期**：`config.retention` 配置完成调度任务（`dispatch_hours`，默认 24h）、已结束协作（`collabs_days`，默认 30 天）、日志（`logs_days`，默认 14 天）与清理周期（`cleanup_interval_h`，默认 6h）；启动时清理一次并周期执行。已结束协作**先 gzip 归档再删除**，活跃 / 在途 / 席位未归档 / recovery / 未知目录永不清理；日志按现有大小轮转与时间上限双条件取先到者；`retention.dry_run=true` 只报告不删除。
 - **微信推送是调度长 / cc-connect 的集成责任**：waystation 不集成 cc-connect / 微信。以下行为仓库内无证据、需真机验证：无用户消息时调度长的输出是否会被 cc-connect 当作 push 转发；推送频率与 `burst_limit` / 24h 额度；`ret=-2` 的失败与重试。
@@ -143,6 +145,10 @@ Windows 与 Linux 各有一键脚本（位于仓库 `scripts/`，从仓库目录
 | `session-not-visible` | 目标会话不在本机注册表 | 确认会话在跑且桥已连接；让该会话调用任意 `ws_*` 工具重连 |
 | `bridge-stale` | 目标会话桥连接已断 / 过期 | 同上；仍不行则重启该会话的 waystation 桥（重开 MCP 连接） |
 | `claim-rejected` | 收编被拒（角色 / 主限 / 非交互） | 看 `message`；只收编 `claimable: true` 的会话 |
+| `message-too-long` | dispatch 消息超过长度上限 | 长内容写文件，只发摘要 + 文件路径；阈值见 `config.dispatch.message_limits` |
+| `report-not-allowed` / `invalid-report` | report 用于非 dispatch progress/result，或形态非法 | report 仅限 dispatch 的 progress / result；按 `summary` / `done` / `blockers` / `next` 修正 |
+| `evidence-not-allowed` / `invalid-evidence` | evidence 用错类型或形态非法 | evidence 仅限 dispatch 的 result；按 `commit` / `tests` / `artifacts` / `gates` 修正 |
+| `acceptance-not-allowed` / `invalid-acceptance` | acceptance 用错类型或形态非法 | acceptance 仅限 dispatch 的 task；1–20 项非空字符串 |
 | `core-unavailable` | 核心不可达或重启中 | 稍后重试；检查 `run/core.json` 与核心日志 |
 | `core-version-unsupported` | 核心版本不支持该能力 | 升级 waystation 并重开会话 |
 | `tool-timeout` | 核心侧工具执行超时 | 用只读工具核实状态，避免立即重复写操作 |
@@ -286,7 +292,7 @@ node ~/.waystation/app/scripts/ws-viewer.js --stop       # 停止正在运行的
 - **机器级投递的边界（0.2.0）**：投递保证按**机器**记账——同一机器一帧；同机某席位离线时，其暂存只在核心存活期内有效，核心崩溃即丢失，发送侧仍显示机器级已送达；暂存有上限，超限丢最旧并计数。不提供远端逐席位终态。
 - **加入申请路径可见（会话级新增）**：加入申请与批准 / 拒绝帧携实例标识与会话短码至对端；按名解析（`join-resolve`）对目标**单播**——对方可见「有人查询某协作名」，名称本身不广播；讨论侧敲门仍是局域网广播、把讨论名播给全网（沿「讨论模式」节披露⑥的既有口径）。同网段伪造申请只能污染对端待批准面——**批准与否由活人把关**。
 - **本机 IPC 面（单核新增）**：桥与核心经本机 IPC（Windows 命名管道 / POSIX 本机套接字，＋每次核心启动轮换的 token）通信；核心另并行监听 **TCP 环回 `127.0.0.1`（ephemeral 端口）**供跨 Session 拨入（服务上下文冷启不再锁死用户会话桥），端点写入 `run/core.json` 的 `ipc.tcp`，桥优先拨入、失败回退旧端点，`WAYSTATION_IPC_TRANSPORT=pipe` 可整体回滚；token 存于数据根 `run/core.json`，**同用户进程可读、可连**并驱动工具面（含同意门 / 裁定类）——沿用「本机同用户进程视为可信」的既有口径；进程身份校验经实现期先验不可行（Node 拿不到对端进程凭据、强做须原生扩展），已按裁定**回落「接受＋如实登记」**（登记见 `docs/编码规范.md`；不构成对同用户恶意进程的防护，是对该边界的如实说明）。
-- **调度状态落盘与接管（本机新增）**：调度（dispatch）的编排状态（组员会话名 / 会话标识、任务表、调度长心跳、最近 progress 摘要）默认写入本机数据根 `dispatch/state.json`——同用户可读，不含消息正文；`dispatch.persist=false` 可关闭。调度长心跳超时后，任何启动期 `WAYSTATION_ROLE=master` 会话都可接管，仍遵循「同机同用户进程视为可信」的既有边界；不做跨用户防护。`requireAck` 的待确认账与补投队列截止仍是内存态，核心重启即丢失（不写入 `dispatch/state.json`）。
+- **调度状态落盘与接管（本机新增）**：调度（dispatch）的编排状态（组员会话名 / 会话标识、任务表含 `acceptance` / `evidenceRef`、调度长心跳、最近 progress 摘要）默认写入本机数据根 `dispatch/state.json`——同用户可读，不含消息正文；`dispatch.persist=false` 可关闭。调度长心跳超时后，任何启动期 `WAYSTATION_ROLE=master` 会话都可接管，仍遵循「同机同用户进程视为可信」的既有边界；不做跨用户防护。`requireAck` 的待确认账与补投队列截止仍是内存态，核心重启即丢失（不写入 `dispatch/state.json`）。
 - **本机权限不被绕过**：跨机指令永远越不过本机的工具授权与本机的人。
 
 成员准入与网络隔离机制不在 v1 范围（上线后按使用情况再评估）；以上是如实的取舍记录，不是可忽略的细节。

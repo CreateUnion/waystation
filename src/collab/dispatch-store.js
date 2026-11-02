@@ -4,6 +4,7 @@ import { MAX_TOPIC_CHARS, ID_PATTERN, isIdentityName, isPresentationText } from 
 import { dispatchStateFilePath } from '../paths.js';
 import { writeJsonAtomic } from '../storage.js';
 import { isValidDispatchStatePath } from '../dispatch-config.js';
+import { validateAcceptance, validateEvidence } from './dispatch-fields.js';
 
 /* 调度状态文件的持久化层（设计 §5.3）：
  *   - 默认 <数据根>/dispatch/state.json；config.dispatch.state_path 可改写（相对数据根 / 绝对路径）；
@@ -151,6 +152,9 @@ function taskStateOf(task, now) {
     status: task.status,
     assigneeSessionId: task.assigneeSessionId ?? null,
     lastProgress: task.lastProgress ?? null,
+    /* 问题 5-C / 5-A：验收标准与最近一次 result 的证据摘要（v1 增量字段，schema 版本不升）。 */
+    acceptance: Array.isArray(task.acceptance) ? [...task.acceptance] : [],
+    evidenceRef: task.evidenceRef ?? null,
     createdAt: isoOf(task.createdAt, now),
     updatedAt: isoOf(task.updatedAt, now),
     completedAt: nullableIsoOf(task.completedAt, now),
@@ -214,7 +218,8 @@ function restoredRecordOf(dispatch, parts) {
     replacedMasterSessionIds: new Set(parts.replaced),
     rulesMissingWarned: false,
     slaves: new Map(parts.slaves.map((slave) => [slave.sessionId, slave])),
-    tasks: new Map(parts.tasks.map((task) => [task.taskId, task])),
+    /* staleNotified 是运行期去重位（问题 6-A），不落盘；恢复后从 false 起算（最多再提醒一次）。 */
+    tasks: new Map(parts.tasks.map((task) => [task.taskId, { ...task, staleNotified: false }])),
     claims: new Map(),
     queues: new Map(),
     /* 运行态两本账不落盘（重启即丢）；恢复时补空 Map，与创建路径保持一致——
@@ -393,13 +398,58 @@ function validateTaskIdentity(entry) {
 function validateTaskExtras(entry) {
   const assigneeSessionId = entry.assigneeSessionId ?? null;
   const lastProgress = entry.lastProgress ?? null;
+  const simple = validateTaskSimpleFields(assigneeSessionId, lastProgress, entry.taskId);
+  if (simple.error !== null) {
+    return simple;
+  }
+  const structured = validateTaskStructuredFields(entry);
+  if (structured.error !== null) {
+    return structured;
+  }
+  return {
+    value: { assigneeSessionId, lastProgress, ...structured.value },
+    error: null,
+  };
+}
+
+function validateTaskSimpleFields(assigneeSessionId, lastProgress, taskId) {
   if (assigneeSessionId !== null && (typeof assigneeSessionId !== 'string' || !ID_PATTERN.test(assigneeSessionId))) {
-    return { value: null, error: `assigneeSessionId 形态非法（${entry.taskId}）` };
+    return { value: null, error: `assigneeSessionId 形态非法（${taskId}）` };
   }
   if (lastProgress !== null && (typeof lastProgress !== 'string' || lastProgress.length > DISPATCH_TASK_SUMMARY_MAX)) {
-    return { value: null, error: `lastProgress 形态非法（${entry.taskId}）` };
+    return { value: null, error: `lastProgress 形态非法（${taskId}）` };
   }
-  return { value: { assigneeSessionId, lastProgress }, error: null };
+  return { value: null, error: null };
+}
+
+function validateTaskStructuredFields(entry) {
+  const acceptance = validateStoredAcceptance(entry.acceptance);
+  if (acceptance.error !== null) {
+    return { value: null, error: `acceptance 形态非法（${entry.taskId}）：${acceptance.error}` };
+  }
+  const evidenceRef = validateStoredEvidenceRef(entry.evidenceRef);
+  if (evidenceRef.error !== null) {
+    return { value: null, error: `evidenceRef 形态非法（${entry.taskId}）：${evidenceRef.error}` };
+  }
+  return { value: { acceptance: acceptance.value, evidenceRef: evidenceRef.value }, error: null };
+}
+
+/* 旧文件（0.2.6 及以前）没有 acceptance / evidenceRef：缺失 / null / 空数组一律按空处理，
+ * 不把旧文件判成损坏（schema 版本仍为 v1）。 */
+function validateStoredAcceptance(raw) {
+  if (raw === undefined || raw === null || (Array.isArray(raw) && raw.length === 0)) {
+    return { value: [], error: null };
+  }
+  const checked = validateAcceptance(raw);
+  return checked.ok ? { value: checked.value, error: null } : { value: null, error: checked.reason };
+}
+
+function validateStoredEvidenceRef(raw) {
+  if (raw === undefined || raw === null) {
+    return { value: null, error: null };
+  }
+  const checked = validateEvidence(raw);
+  return checked.ok ? { value: checked.value, error: null } : { value: null, error: checked.reason };
 }
 
 function validateTaskTimes(entry, taskId) {

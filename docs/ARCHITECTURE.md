@@ -305,7 +305,8 @@ replacer 等旧核退场 10 秒，到期走硬杀防护链；硬杀后有 2 秒�
   通知发出时实时读取，改完即热生效。`ws_dispatch_rules_reload` 重读文件并向全体在编成员广播。
 - **持久化**：编排状态默认持久化到 `<数据根>/dispatch/state.json`（`config.dispatch.persist=false`
   可退回纯内存，`config.dispatch.state_path` 可改位置）。文件只含可重建事实：collabId／名称／主题、
-  调度长会话与最后心跳、组员列表、任务表（taskId → 状态／负责会话／最近 progress 摘要／时间戳）；
+  调度长会话与最后心跳、组员列表、任务表（taskId → 状态／负责会话／最近 progress 摘要／
+  acceptance／evidenceRef／时间戳；后两者是 v1 增量字段，schema 版本不升，旧文件缺字段按空处理）；
   不存消息流水、待确认收编申请、待补投队列等运行态。写盘只在关键节点（创建／收编／释放／
   任务状态变更／接管／待接管与恢复／结束），普通聊天不触发 IO；写失败告警一次并本进程内降级
   纯内存；损坏文件隔离为 `.corrupt-<ts>` 后按无状态启动。核心重启恢复时校验调度长是否在线：
@@ -318,6 +319,22 @@ replacer 等旧核退场 10 秒，到期走硬杀防护链；硬杀后有 2 秒�
 - **消息**：复用 `ws_send_message`（可带 `toSessionIds` 与 `taskId`，类型限定 `task`／`progress`／
   `result`／`error`）与 `ws_end_collab`；投递唯一出口是本机注入路由，失败进有界待补投队列，
   桥重连后补投。
+- **消息长度上限**：`config.dispatch.message_limits`（progress 默认 800／result 默认 3000／
+  其他 text 默认 4000 字符，逐项 64–20000、非法回落默认）按最终投递正文计（report／evidence／
+  acceptance 渲染后同样受限）；超限返回 `message-too-long` 并提示写文件、消息只发摘要 + 路径，
+  不截断、不静默丢弃。其他模式不受影响（managed／forum 仍由协议层 4000 字符上限约束）。
+- **结构化报告与完成证据**：`progress`／`result` 可选 `report`（summary／done／blockers／next；
+  单项 ≤200 字符、数组 ≤20 项；带 report 时 `text` 可为空，正文由 report 渲染）；`result` 可选
+  `evidence`（commit／tests／artifacts／gates，逐项校验、不强制）；`task` 可选 `acceptance`
+  （1–20 项验收标准）。三者随帧投递（人可读渲染 + 帧 payload 原样字段），并写入任务表
+  （lastProgress 摘要／evidenceRef／acceptance）。用错模式或类型明确拒绝（`report-not-allowed`／
+  `evidence-not-allowed`／`acceptance-not-allowed`），不静默忽略。
+- **任务超时提醒**：presence 节拍的 sweep 对 `assigned`／`active` 且最后任务消息距今 ≥
+  `config.dispatch.task_stale_ms`（默认 30 分钟，范围 60 秒–24 小时）的任务，向调度长投一次
+  `dispatch-task-stale`（taskId／负责会话／最后进度摘要）；`staleNotified` 只存内存，有新 progress
+  时清位。只提醒，不改任务状态、不自动失败。
+- **回执缺省值**：`config.dispatch.require_ack_default`（默认 false）为 true 时，调度长发出的
+  `task` 未显式给 `requireAck` 按 true 处理；显式 false 仍可关闭。待确认账仍按既有 10 分钟超时收口。
 
 ### 4.4 模式对照
 
@@ -392,7 +409,8 @@ replacer 等旧核退场 10 秒，到期走硬杀防护链；硬杀后有 2 秒�
   `queued`（暂存待补投，附 `queuedUntil`）或 `failed`（附原因），顶层 `state` 归并为
   `delivered`／`queued`／`failed`／`partial`。协作模式的本机旁路按逐席位注入结果映射；远端机器
   只能确认「已受理入队」，一律如实报 `queued`，不把机器级受理谎报成会话已投递。
-- **调度（dispatch）会话级确认**：`requireAck` 只允许调度长发出的 `task`。投递文本附回执指引
+- **调度（dispatch）会话级确认**：`requireAck` 只允许调度长发出的 `task`；未显式给值时按
+  `config.dispatch.require_ack_default`（默认 false）处理。投递文本附回执指引
   （含本条 `msgId`）；目标会话用 `ws_send_message { ackFor }` 回执后，核心向调度长另行投递
   `dispatch-ack` 通知。发送结果在 `delivery.ack = { required, state: 'pending', pending }` 列出
   待确认 `msgId`；待确认条目默认

@@ -20,6 +20,9 @@ test('buildDefaults：dispatch / retention 默认值齐全', () => {
       min_free_mem_mb: 2048,
       max_slaves: 8,
     },
+    message_limits: { progress: 800, result: 3000, text: 4000 },
+    task_stale_ms: 1800000,
+    require_ack_default: false,
   });
   assert.deepEqual(defaults.retention, {
     dispatch_hours: 24,
@@ -198,4 +201,60 @@ test('resourceGuardConfigOf：缺失 / 非法逐项回落，合法值原样生�
   assert.deepEqual(resourceGuardConfigOf({
     dispatch: { resource_guard: { enabled: false, min_free_mem_mb: 256, max_slaves: 64 } },
   }), { enabled: false, min_free_mem_mb: 256, max_slaves: 64 });
+});
+
+test('dispatch.message_limits / task_stale_ms / require_ack_default：合法值生效、未知子键保留、往返不丢', (t) => {
+  const dir = makeTempDir(t);
+  writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({
+    dispatch: {
+      message_limits: { progress: 128, result: 2048, text: 4096, future: 'keep' },
+      task_stale_ms: 3600000,
+      require_ack_default: true,
+    },
+  }), 'utf8');
+  const warnings = [];
+  const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+  assert.deepEqual(warnings, []);
+  assert.deepEqual(config.dispatch.message_limits, { progress: 128, result: 2048, text: 4096, future: 'keep' });
+  assert.equal(config.dispatch.task_stale_ms, 3600000);
+  assert.equal(config.dispatch.require_ack_default, true);
+  saveConfig(dir, config);
+  assert.deepEqual(loadConfig(dir).config.dispatch, config.dispatch);
+});
+
+test('dispatch.message_limits / task_stale_ms / require_ack_default：非法字段逐项回落默认并各告警一次', (t) => {
+  const dir = makeTempDir(t);
+  writeFileSync(join(dir, CONFIG_FILE_NAME), JSON.stringify({
+    dispatch: {
+      message_limits: { progress: 63, result: 20001, text: 'big' },
+      task_stale_ms: 59999,
+      require_ack_default: 'yes',
+    },
+  }), 'utf8');
+  const warnings = [];
+  const { config } = loadConfig(dir, { warn: (message) => warnings.push(message) });
+  assert.deepEqual(config.dispatch.message_limits, { progress: 800, result: 3000, text: 4000 });
+  assert.equal(config.dispatch.task_stale_ms, 1800000);
+  assert.equal(config.dispatch.require_ack_default, false);
+  assert.equal(warnings.length, 5, `五个非法项各告警一次：${warnings.join(' | ')}`);
+  for (const label of [
+    'dispatch.message_limits.progress', 'dispatch.message_limits.result', 'dispatch.message_limits.text',
+    'dispatch.task_stale_ms', 'dispatch.require_ack_default',
+  ]) {
+    assert.ok(warnings.some((message) => message.includes(label)), label);
+  }
+});
+
+test('dispatch.message_limits / task_stale_ms：边界值合法、超界一格回落', (t) => {
+  const legal = makeTempDir(t);
+  writeFileSync(join(legal, CONFIG_FILE_NAME), JSON.stringify({
+    dispatch: { message_limits: { progress: 64, result: 20000, text: 64 }, task_stale_ms: 60000 },
+  }), 'utf8');
+  const legalConfig = loadConfig(legal).config;
+  assert.deepEqual(legalConfig.dispatch.message_limits, { progress: 64, result: 20000, text: 64 });
+  assert.equal(legalConfig.dispatch.task_stale_ms, 60000);
+
+  const upper = makeTempDir(t);
+  writeFileSync(join(upper, CONFIG_FILE_NAME), JSON.stringify({ dispatch: { task_stale_ms: 86400000 } }), 'utf8');
+  assert.equal(loadConfig(upper).config.dispatch.task_stale_ms, 86400000);
 });

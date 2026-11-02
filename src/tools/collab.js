@@ -1,6 +1,7 @@
 import { isIP } from 'node:net';
 import { COLLAB_MODES, DEFAULT_COLLAB_MODE, ID_PATTERN, MAX_COLLAB_MEMBERS, POST_KINDS, isIdentityName, isPort } from '../net/protocol.js';
 import { DISPATCH_MESSAGE_TYPES } from '../collab/dispatch.js';
+import { validateAcceptance, validateEvidence, validateReport } from '../collab/dispatch-fields.js';
 import { errorOf, errorPayloadOf, errorResultOf } from '../util/errors.js';
 import {
   WS_ALLOW_NEXT_INVITE_SPEC, WS_APPROVE_INVITE_SPEC, WS_CREATE_COLLAB_SPEC, WS_END_COLLAB_SPEC, WS_INVITE_SPEC, WS_LEAVE_COLLAB_SPEC,
@@ -369,6 +370,12 @@ export function sendMessageTool() {
 /* 消息参数归一（正文 / 类型 / 定向）：定向席位 = 实例 + 会话两步，只给 toSessionId 时无法定位
  * 目标机器，工具层先拒（双字段必须成对）；歧义由服务层的 matchSessionByToken 语义兜底。 */
 function sendMessageArgsOf(args) {
+  /* report / evidence / acceptance 是 dispatch 机制化字段：managed / forum 明确拒绝，
+   * 不能静默忽略（调用方会误以为结构化内容已被记录）。 */
+  const structuredRefusal = structuredFieldsRefusalOf(args);
+  if (structuredRefusal !== null) {
+    return structuredRefusal;
+  }
   const basics = messageBasicsOf(args);
   if (basics.error !== undefined) {
     return basics;
@@ -416,6 +423,20 @@ function dispatchOnlyFieldsRefusalOf(args) {
     : null;
 }
 
+/* 结构化字段同样只属于 dispatch；各自用稳定 code 明确拒绝。 */
+function structuredFieldsRefusalOf(args) {
+  if (args.report !== undefined) {
+    return { error: 'report 只用于 dispatch 的 progress / result 消息', code: 'report-not-allowed' };
+  }
+  if (args.evidence !== undefined) {
+    return { error: 'evidence 只用于 dispatch 的 result 消息', code: 'evidence-not-allowed' };
+  }
+  if (args.acceptance !== undefined) {
+    return { error: 'acceptance 只用于 dispatch 的 task 消息', code: 'acceptance-not-allowed' };
+  }
+  return null;
+}
+
 /* requireAck / ackFor 属 dispatch 会话级确认；managed/forum 的机器级 ack 由协议层自动完成，
  * 不接受这两个字段（静默忽略会让调用方误以为拿到了「目标会话确认」）。 */
 function dispatchAckFieldsRefusalOf(args) {
@@ -441,12 +462,20 @@ function dispatchSendArgsOf(args) {
     return requireAck;
   }
   if (ackFor.value !== undefined) {
-    const conflict = ackConflictOf(args);
-    if (conflict !== null) {
-      return { error: conflict, code: 'ack-for-conflict' };
-    }
-    return { value: { text: basics.value.text, ackFor: ackFor.value } };
+    return dispatchAckSendArgsOf(args, basics.value.text, ackFor.value);
   }
+  return dispatchNormalSendArgsOf(args, basics.value.text, requireAck.value);
+}
+
+function dispatchAckSendArgsOf(args, text, ackFor) {
+  const conflict = ackConflictOf(args);
+  if (conflict !== null) {
+    return { error: conflict, code: 'ack-for-conflict' };
+  }
+  return { value: { text, ackFor } };
+}
+
+function dispatchNormalSendArgsOf(args, text, requireAck) {
   const targets = dispatchTargetsArgOf(args.toSessionIds);
   if (targets.error !== undefined) {
     return targets;
@@ -454,12 +483,72 @@ function dispatchSendArgsOf(args) {
   if (args.taskId !== undefined && !isDispatchTaskId(args.taskId)) {
     return { error: 'taskId 非法：需要 1–64 字符的非空白字符串', code: 'invalid-task-id' };
   }
+  const structured = structuredDispatchArgsOf(args);
+  if (structured.error !== undefined) {
+    return structured;
+  }
   return {
     value: {
-      text: basics.value.text, type: args.type, toSessionIds: targets.value,
-      taskId: args.taskId?.trim(), requireAck: requireAck.value,
+      text, type: args.type, toSessionIds: targets.value,
+      taskId: args.taskId?.trim(), requireAck,
+      report: args.report, evidence: args.evidence, acceptance: args.acceptance,
     },
   };
+}
+
+/* 结构化字段：先校验形态，再按显式 type 校验适用范围（type 省略时有效类型由服务层按角色判定）。 */
+function structuredDispatchArgsOf(args) {
+  return reportArgsRefusalOf(args)
+    ?? evidenceArgsRefusalOf(args)
+    ?? acceptanceArgsRefusalOf(args)
+    ?? { error: undefined };
+}
+
+function reportArgsRefusalOf(args) {
+  const report = optionalStructuredFieldOf(args, 'report', validateReport, 'invalid-report');
+  if (report.error !== undefined) {
+    return report;
+  }
+  if (report.value === undefined || reportTypeAllowed(args.type)) {
+    return null;
+  }
+  return { error: 'report 仅用于 dispatch 的 progress / result 消息', code: 'report-not-allowed' };
+}
+
+function evidenceArgsRefusalOf(args) {
+  const evidence = optionalStructuredFieldOf(args, 'evidence', validateEvidence, 'invalid-evidence');
+  if (evidence.error !== undefined) {
+    return evidence;
+  }
+  if (evidence.value === undefined || args.type === undefined || args.type === 'result') {
+    return null;
+  }
+  return { error: 'evidence 仅用于 dispatch 的 result 消息', code: 'evidence-not-allowed' };
+}
+
+function acceptanceArgsRefusalOf(args) {
+  const acceptance = optionalStructuredFieldOf(args, 'acceptance', validateAcceptance, 'invalid-acceptance');
+  if (acceptance.error !== undefined) {
+    return acceptance;
+  }
+  if (acceptance.value === undefined || args.type === undefined || args.type === 'task') {
+    return null;
+  }
+  return { error: 'acceptance 仅用于 dispatch 的 task 消息', code: 'acceptance-not-allowed' };
+}
+
+function optionalStructuredFieldOf(args, name, validate, code) {
+  if (args[name] === undefined) {
+    return { value: undefined };
+  }
+  const checked = validate(args[name]);
+  return checked.ok
+    ? { value: checked.value }
+    : { error: `参数 ${name} 非法：${checked.reason}`, code };
+}
+
+function reportTypeAllowed(type) {
+  return type === undefined || type === 'progress' || type === 'result';
 }
 
 /* 会话级确认必须是原消息 msgId（1–64 位字母数字与连字符），形态不对直接拒绝。 */
@@ -484,16 +573,22 @@ function requireAckArgOf(args) {
 
 /* ackFor 是独立回执动作：不得同时定向/关联任务/再要求确认/声明消息类型——组合语义会分叉。 */
 function ackConflictOf(args) {
-  if (args.toSessionIds !== undefined || args.taskId !== undefined || args.requireAck !== undefined || args.type !== undefined) {
-    return 'ackFor 回执不能与 toSessionIds / taskId / requireAck / type 同时使用';
+  if (args.toSessionIds !== undefined || args.taskId !== undefined || args.requireAck !== undefined
+    || args.type !== undefined || args.report !== undefined || args.evidence !== undefined
+    || args.acceptance !== undefined) {
+    return 'ackFor 回执不能与 toSessionIds / taskId / requireAck / type / report / evidence / acceptance 同时使用';
   }
   return null;
 }
 
 function dispatchBasicsOf(args) {
   const text = trimmedString(args, 'text');
-  if (text === '') {
-    return { error: '参数 text 非法：需要非空白字符串（消息正文）', code: 'invalid-message-text' };
+  if (args.text !== undefined && typeof args.text !== 'string') {
+    return { error: '参数 text 非法：需要字符串（带 report 时可省略或为空串）', code: 'invalid-message-text' };
+  }
+  /* 带 report 时 text 可为空/省略，正文由 report 渲染；否则维持正文必填语义。 */
+  if (text === '' && args.report === undefined) {
+    return { error: '参数 text 非法：需要非空白字符串（消息正文；带 report 时可省略）', code: 'invalid-message-text' };
   }
   if (args.type !== undefined && !DISPATCH_MESSAGE_TYPES.includes(args.type)) {
     return { error: `参数 type 非法：dispatch 可选值为 ${DISPATCH_MESSAGE_TYPES.join(' / ')}`, code: 'invalid-message-type' };

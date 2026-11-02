@@ -6,9 +6,11 @@ import { ANCHOR_PORT, SLOT_COUNT, slotDefaultPort } from './site.js';
 import { CONFIG_FILE_NAME } from './paths.js';
 import { writeJsonAtomic } from './storage.js';
 import {
-  CLEANUP_INTERVAL_MAX_H, COLLABS_DAYS_MAX, DEFAULT_DISPATCH_CONFIG, DEFAULT_RESOURCE_GUARD_CONFIG,
-  DEFAULT_RETENTION_CONFIG, DISPATCH_HOURS_MAX, LOGS_DAYS_MAX, MASTER_TIMEOUT_MAX_MS, MASTER_TIMEOUT_MIN_MS,
+  CLEANUP_INTERVAL_MAX_H, COLLABS_DAYS_MAX, DEFAULT_DISPATCH_CONFIG, DEFAULT_MESSAGE_LIMITS_CONFIG,
+  DEFAULT_RESOURCE_GUARD_CONFIG, DEFAULT_RETENTION_CONFIG, DISPATCH_HOURS_MAX, LOGS_DAYS_MAX,
+  MASTER_TIMEOUT_MAX_MS, MASTER_TIMEOUT_MIN_MS, MESSAGE_LIMIT_MAX_CHARS, MESSAGE_LIMIT_MIN_CHARS,
   RESOURCE_GUARD_MEM_MB_MAX, RESOURCE_GUARD_MEM_MB_MIN, RESOURCE_GUARD_SLAVES_MAX, RESOURCE_GUARD_SLAVES_MIN,
+  TASK_STALE_MAX_MS, TASK_STALE_MIN_MS,
   isValidDispatchStatePath,
 } from './dispatch-config.js';
 
@@ -110,6 +112,30 @@ const NESTED_FIELD_RULES = {
         },
       },
     },
+    /* 问题 2-A：消息长度上限（字符数）——逐项校验，非法项回落默认并告警。 */
+    message_limits: {
+      nestedRules: {
+        progress: {
+          check: (value) => Number.isInteger(value) && value >= MESSAGE_LIMIT_MIN_CHARS && value <= MESSAGE_LIMIT_MAX_CHARS,
+          reason: `需为 ${MESSAGE_LIMIT_MIN_CHARS}–${MESSAGE_LIMIT_MAX_CHARS} 的整数（字符）`,
+        },
+        result: {
+          check: (value) => Number.isInteger(value) && value >= MESSAGE_LIMIT_MIN_CHARS && value <= MESSAGE_LIMIT_MAX_CHARS,
+          reason: `需为 ${MESSAGE_LIMIT_MIN_CHARS}–${MESSAGE_LIMIT_MAX_CHARS} 的整数（字符）`,
+        },
+        text: {
+          check: (value) => Number.isInteger(value) && value >= MESSAGE_LIMIT_MIN_CHARS && value <= MESSAGE_LIMIT_MAX_CHARS,
+          reason: `需为 ${MESSAGE_LIMIT_MIN_CHARS}–${MESSAGE_LIMIT_MAX_CHARS} 的整数（字符）`,
+        },
+      },
+    },
+    /* 问题 6-A：任务超时提醒阈值（默认 30 分钟，范围 60 秒–24 小时）。 */
+    task_stale_ms: {
+      check: (value) => Number.isInteger(value) && value >= TASK_STALE_MIN_MS && value <= TASK_STALE_MAX_MS,
+      reason: `需为 ${TASK_STALE_MIN_MS}–${TASK_STALE_MAX_MS} 的整数（毫秒）`,
+    },
+    /* 问题 6-B：调度长 task 的 requireAck 缺省值（默认 false，保持兼容）。 */
+    require_ack_default: { check: (value) => typeof value === 'boolean', reason: '需为布尔值' },
   },
   retention: {
     dispatch_hours: {
@@ -243,8 +269,12 @@ export function buildDefaults(hostName, options = {}) {
  * 完成调度任务 24h、已结束协作 30 天、日志 14 天、每 6 小时清理一次、非 dry-run。 */
 function persistenceDefaultsOf() {
   return {
-    /* resource_guard 是嵌套对象：显式复制一层，避免默认值对象被调用方意外改写。 */
-    dispatch: { ...DEFAULT_DISPATCH_CONFIG, resource_guard: { ...DEFAULT_RESOURCE_GUARD_CONFIG } },
+    /* resource_guard / message_limits 是嵌套对象：显式复制一层，避免默认值对象被调用方意外改写。 */
+    dispatch: {
+      ...DEFAULT_DISPATCH_CONFIG,
+      resource_guard: { ...DEFAULT_RESOURCE_GUARD_CONFIG },
+      message_limits: { ...DEFAULT_MESSAGE_LIMITS_CONFIG },
+    },
     retention: { ...DEFAULT_RETENTION_CONFIG },
   };
 }

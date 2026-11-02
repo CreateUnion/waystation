@@ -6,8 +6,12 @@ import { errorOf } from '../util/errors.js';
 import { matchSessionByToken, shortSessionId } from '../util/short-id.js';
 import { dispatchStateFilePath } from '../paths.js';
 import {
-  dispatchStatePathOf, masterTimeoutMsOf, persistEnabledOf, resourceGuardConfigOf, retentionConfigOf,
+  dispatchStatePathOf, masterTimeoutMsOf, messageLimitsOf, persistEnabledOf, requireAckDefaultOf,
+  resourceGuardConfigOf, retentionConfigOf, taskStaleMsOf,
 } from '../dispatch-config.js';
+import {
+  renderAcceptance, renderEvidence, renderReport, validateAcceptance, validateEvidence, validateReport,
+} from './dispatch-fields.js';
 import { freeMemMBOf as systemFreeMemMBOf } from '../host-resources.js';
 import {
   DISPATCH_TASK_SUMMARY_MAX, REPLACED_MASTER_MAX, loadDispatchState, migrateDispatchState, quarantineDispatchState,
@@ -48,6 +52,7 @@ export const DISPATCH_RULES_FALLBACK = [
   '5. 已验证坑即入册：有实测证据的坑当轮写入项目知识库（现象-根因-修复-预防），不等批量指令。',
   '6. 全量汇报禁拦截：会话间消息禁止静默拦截或选择性省略，任何到达消息都要如实上报（组员报调度长，调度长转呈用户）。',
   '7. 待批独立成条：需用户拍板的事项独立成条正式提请（事项+事实清单+「现在等你决定」），不附带在进度汇报里，不自行压后审批节奏。',
+  '8. 结构化回报：progress 用 ws_send_message 的 report（summary/done/blockers/next）；result 必须带 evidence（commit/tests/artifacts/gates），无证据按未完成处理；消息超长会被拒——长内容写文件，消息只发摘要+路径。',
 ].join('\n');
 /* 桥断开宽限（与席位宽限同源配置，缺省与 service 的 DEFAULT_SEAT_GRACE_MS 对齐）。 */
 const DISPATCH_GRACE_MS = 60 * 1000;
@@ -1039,7 +1044,9 @@ function releaseSlaveIn(runtime, { sessionId, targetSessionId }) {
  * runtime.notify 的同步受理语义。失败入按目标分桶的有界队列，桥重连（noteBridgeOnline）补投。
  * requireAck 仅 dispatch 的 task（调度长→组员）：登记待确认账并额外通知调度长。
  * 消息不落盘、不经 LAN 出站队列、不做本机席位注入——这是 dispatch 与 managed / forum 的根本差异。 */
-async function sendMessageIn(runtime, { collabId, sessionId, text, type, toSessionIds, taskId, requireAck, ackFor }) {
+async function sendMessageIn(runtime, {
+  collabId, sessionId, text, type, toSessionIds, taskId, requireAck, ackFor, report, evidence, acceptance,
+}) {
   const record = runtime.state.dispatches.get(collabId);
   if (record === undefined) {
     return dispatchLost();
@@ -1052,13 +1059,15 @@ async function sendMessageIn(runtime, { collabId, sessionId, text, type, toSessi
     return errorOf('session-not-visible', '调用会话不在本机注册表内——本会话的桥可能已断开');
   }
   if (ackFor !== undefined) {
-    return ackOnlyIn(runtime, record, sessionId, { ackFor, text, type, toSessionIds, taskId, requireAck });
+    return ackOnlyIn(runtime, record, sessionId, {
+      ackFor, text, type, toSessionIds, taskId, requireAck, report, evidence, acceptance,
+    });
   }
   const targets = sendTargetsOf(record, sessionId, toSessionIds);
   if (targets.error !== undefined) {
     return targets.error;
   }
-  const message = messageOf(record, { text, type, taskId, sessionId, requireAck }, sender);
+  const message = messageOf(record, { text, type, taskId, sessionId, requireAck, report, evidence, acceptance }, sender, runtime.config);
   if (message.error !== undefined) {
     return message.error;
   }
@@ -1096,31 +1105,61 @@ function recordTaskStateIn(runtime, record, message, targets) {
   const next = taskAfterMessage({
     taskId: message.taskId,
     messageType: message.messageType,
-    text: message.text,
+    summary: message.summary,
     assigneeSessionId: senderIsMaster ? defaultAssignee : message.fromSessionId,
     existing,
     at,
+    acceptance: message.acceptance,
+    evidence: message.evidence,
   });
   record.tasks.set(message.taskId, next);
   return { error: undefined };
 }
 
-function taskAfterMessage({ taskId, messageType, text, assigneeSessionId, existing, at }) {
-  const summary = text.trim().slice(0, DISPATCH_TASK_SUMMARY_MAX);
-  const base = existing === undefined
-    ? { taskId, status: 'assigned', assigneeSessionId, lastProgress: null, createdAt: at, updatedAt: at, completedAt: null }
-    : { ...existing, assigneeSessionId: existing.assigneeSessionId ?? assigneeSessionId, updatedAt: at };
+function taskAfterMessage({
+  taskId, messageType, summary, assigneeSessionId, existing, at, acceptance, evidence,
+}) {
+  const lastProgress = summary.trim().slice(0, DISPATCH_TASK_SUMMARY_MAX);
+  const base = taskBaseOf({ taskId, assigneeSessionId, existing, at });
   if (messageType === 'task') {
-    return { ...base, assigneeSessionId, status: 'assigned', lastProgress: summary, completedAt: null };
+    return taskAssignedAfter(base, { assigneeSessionId, lastProgress, acceptance });
   }
   if (messageType === 'progress') {
-    return { ...base, assigneeSessionId, status: 'active', lastProgress: summary, completedAt: null };
+    return { ...base, assigneeSessionId, status: 'active', lastProgress, staleNotified: false, completedAt: null };
   }
+  return taskClosedAfter(base, { messageType, assigneeSessionId, lastProgress, evidence, at });
+}
+
+function taskBaseOf({ taskId, assigneeSessionId, existing, at }) {
+  return existing === undefined
+    ? {
+      taskId, status: 'assigned', assigneeSessionId, lastProgress: null,
+      acceptance: [], evidenceRef: null, staleNotified: false,
+      createdAt: at, updatedAt: at, completedAt: null,
+    }
+    : { ...existing, assigneeSessionId: existing.assigneeSessionId ?? assigneeSessionId, updatedAt: at };
+}
+
+function taskAssignedAfter(base, { assigneeSessionId, lastProgress, acceptance }) {
   return {
     ...base,
     assigneeSessionId,
-    status: messageType === 'result' ? 'done' : 'failed',
-    lastProgress: summary,
+    status: 'assigned',
+    lastProgress,
+    acceptance: acceptance ?? base.acceptance ?? [],
+    staleNotified: false,
+    completedAt: null,
+  };
+}
+
+function taskClosedAfter(base, { messageType, assigneeSessionId, lastProgress, evidence, at }) {
+  const completed = messageType === 'result';
+  return {
+    ...base,
+    assigneeSessionId,
+    status: completed ? 'done' : 'failed',
+    lastProgress,
+    evidenceRef: completed ? (evidence ?? null) : (base.evidenceRef ?? null),
     completedAt: at,
   };
 }
@@ -1144,36 +1183,47 @@ function pruneTasksIn(runtime, record, at) {
   return changed;
 }
 
-/* 正文 / 类型 / taskId / ack 的判定与出站文本组装。slave 的回复带 @来源——master 收到的是多条
- * slave 消息混流，纯文本无法区分说话者。requireAck 只允许调度长的 task：其他组合静默忽略会
- * 造出「要了确认却没有确认」的假象，必须明确拒绝。 */
-function messageOf(record, input, sender) {
-  const rejection = messageRejectionOf(record, input);
+/* 正文 / 类型 / taskId / 结构化字段 / 长度 / ack 的判定与出站文本组装。slave 的回复带 @来源——
+ * master 收到的是多条 slave 消息混流，纯文本无法区分说话者。requireAck 只允许调度长的 task：
+ * 其他组合静默忽略会造出「要了确认却没有确认」的假象，必须明确拒绝。 */
+function messageOf(record, input, sender, config) {
+  const messageType = messageTypeOf(record, input.type, input.sessionId);
+  const rejection = messageRejectionOf(record, input, messageType);
   if (rejection !== null) {
     return { error: rejection };
   }
-  const messageType = messageTypeOf(record, input.type, input.sessionId);
-  const outbound = input.sessionId === record.masterSessionId ? input.text : `@${sender.name} ${input.text}`;
+  const body = composeMessageBody(input, messageType);
+  const lengthRejection = messageLengthRejectionOf(config, messageType, body);
+  if (lengthRejection !== null) {
+    return { error: lengthRejection };
+  }
+  const outbound = input.sessionId === record.masterSessionId ? body : `@${sender.name} ${body}`;
   return {
     value: {
       messageType,
       taskId: input.taskId ?? null,
       outbound,
       /* A 的任务表以正文摘要维护 lastProgress；B 的消息面不含 text 字段，这里显式保留。 */
-      text: input.text.trim(),
+      text: body,
+      summary: messageSummaryOf(input, body),
+      report: input.report ?? null,
+      evidence: input.evidence ?? null,
+      acceptance: input.acceptance ?? null,
       fromSessionId: input.sessionId,
       fromSessionName: sender.name,
-      requireAck: input.requireAck === true,
+      requireAck: resolveRequireAck(record, input, messageType, config),
     },
   };
 }
 
-function messageRejectionOf(record, { text, type, taskId, sessionId, requireAck }) {
+function messageRejectionOf(record, input, messageType) {
+  const { text, type, taskId, sessionId, requireAck, report, evidence, acceptance } = input;
   if (requireAck !== undefined && typeof requireAck !== 'boolean') {
     return errorOf('invalid-require-ack', 'requireAck 非法：需要布尔值');
   }
-  if (typeof text !== 'string' || text.trim() === '') {
-    return errorOf('invalid-message-text', 'text 非法：需要非空白字符串');
+  const textRejection = textInputRejectionOf(text, report);
+  if (textRejection !== null) {
+    return textRejection;
   }
   if (type !== undefined && !DISPATCH_MESSAGE_TYPES.includes(type)) {
     return errorOf('invalid-message-type', `type 非法：dispatch 可取值为 ${DISPATCH_MESSAGE_TYPES.join(' / ')}`);
@@ -1181,7 +1231,115 @@ function messageRejectionOf(record, { text, type, taskId, sessionId, requireAck 
   if (taskId !== undefined && !isDispatchTaskId(taskId)) {
     return errorOf('invalid-task-id', 'taskId 非法：需要 1–64 字符的非空白字符串');
   }
+  const structuredRejection = structuredFieldRejectionOf({ report, evidence, acceptance, messageType });
+  if (structuredRejection !== null) {
+    return structuredRejection;
+  }
   return requireAckRejectionOf(record, { requireAck, sessionId, type });
+}
+
+/* 不带 report 时 text 维持必填语义；带 report 时 text 可为空/省略，正文由 report 渲染。 */
+function textInputRejectionOf(text, report) {
+  if (report !== undefined) {
+    return text === undefined || typeof text === 'string'
+      ? null
+      : errorOf('invalid-message-text', 'text 非法：需要字符串（带 report 时可省略或为空串）');
+  }
+  if (typeof text !== 'string' || text.trim() === '') {
+    return errorOf('invalid-message-text', 'text 非法：需要非空白字符串');
+  }
+  return null;
+}
+
+/* 三个结构化字段的适用范围互不相同：report → progress/result，evidence → result，
+ * acceptance → task。用错类型/模式一律明确拒绝，不静默忽略。 */
+function structuredFieldRejectionOf({ report, evidence, acceptance, messageType }) {
+  return reportRejectionOf(report, messageType)
+    ?? evidenceRejectionOf(evidence, messageType)
+    ?? acceptanceRejectionOf(acceptance, messageType);
+}
+
+function reportRejectionOf(report, messageType) {
+  if (report === undefined) {
+    return null;
+  }
+  if (messageType !== 'progress' && messageType !== 'result') {
+    return errorOf('report-not-allowed', 'report 仅适用于 dispatch 的 progress / result 消息');
+  }
+  const checked = validateReport(report);
+  return checked.ok ? null : errorOf('invalid-report', `report 非法：${checked.reason}`);
+}
+
+function evidenceRejectionOf(evidence, messageType) {
+  if (evidence === undefined) {
+    return null;
+  }
+  if (messageType !== 'result') {
+    return errorOf('evidence-not-allowed', 'evidence 仅适用于 dispatch 的 result 消息');
+  }
+  const checked = validateEvidence(evidence);
+  return checked.ok ? null : errorOf('invalid-evidence', `evidence 非法：${checked.reason}`);
+}
+
+function acceptanceRejectionOf(acceptance, messageType) {
+  if (acceptance === undefined) {
+    return null;
+  }
+  if (messageType !== 'task') {
+    return errorOf('acceptance-not-allowed', 'acceptance 仅适用于 dispatch 的 task 消息');
+  }
+  const checked = validateAcceptance(acceptance);
+  return checked.ok ? null : errorOf('invalid-acceptance', `acceptance 非法：${checked.reason}`);
+}
+
+/* 投递正文：显式 text + report 渲染 + task 的验收标准 + result 的证据，段间空行分隔。 */
+function composeMessageBody(input, messageType) {
+  const sections = [];
+  const text = typeof input.text === 'string' ? input.text.trim() : '';
+  if (text !== '') {
+    sections.push(text);
+  }
+  if (input.report !== undefined) {
+    sections.push(renderReport(input.report));
+  }
+  if (input.acceptance !== undefined && messageType === 'task') {
+    sections.push(renderAcceptance(input.acceptance));
+  }
+  if (input.evidence !== undefined && messageType === 'result') {
+    sections.push(renderEvidence(input.evidence));
+  }
+  return sections.join('\n\n');
+}
+
+/* 任务表的最后进度摘要：结构化报告优先用 summary（一句话），否则退回正文（截断由任务表负责）。 */
+function messageSummaryOf(input, body) {
+  const summary = input.report?.summary;
+  return typeof summary === 'string' && summary.trim() !== '' ? summary.trim() : body;
+}
+
+/* 长度上限按最终投递正文计（report / acceptance / evidence 渲染后同样受限），防止结构化字段绕过限制。 */
+function messageLengthRejectionOf(config, messageType, body) {
+  const limits = messageLimitsOf(config);
+  const limit = messageType === 'progress'
+    ? limits.progress
+    : (messageType === 'result' ? limits.result : limits.text);
+  if (body.length <= limit) {
+    return null;
+  }
+  return errorOf(
+    'message-too-long',
+    `${messageType} 消息超过长度上限 ${limit} 字符（当前 ${body.length}）——请把长内容写文件，消息里只发摘要 + 文件路径`,
+  );
+}
+
+/* requireAck 缺省值：显式值优先；未给时只有调度长的 task 才按配置默认值处理（默认 false 保持兼容）。 */
+function resolveRequireAck(record, input, messageType, config) {
+  if (input.requireAck !== undefined) {
+    return input.requireAck === true;
+  }
+  return requireAckDefaultOf(config)
+    && input.sessionId === record.masterSessionId
+    && messageType === 'task';
 }
 
 function messageTypeOf(record, type, sessionId) {
@@ -1225,6 +1383,15 @@ function messageFrameOf(runtime, record, target, message) {
   frame.payload.taskId = message.taskId;
   frame.payload.fromSessionId = message.fromSessionId;
   frame.payload.fromSessionName = message.fromSessionName;
+  if (message.report !== null) {
+    frame.payload.report = message.report;
+  }
+  if (message.evidence !== null) {
+    frame.payload.evidence = message.evidence;
+  }
+  if (message.acceptance !== null) {
+    frame.payload.acceptance = message.acceptance;
+  }
   if (message.requireAck) {
     frame.payload.requireAck = true;
     frame.payload.text = `${message.outbound}\n\n[需确认] 收到请回执：ws_send_message { collabId: "${record.collabId}", text: "收到", ackFor: "${frame.msgId}" }`;
@@ -1344,12 +1511,18 @@ function overallDeliveryStateOf(counts, total) {
 }
 
 /* ackFor 是独立回执动作（服务层同口径）：形态必须合法，且不得与消息发送字段混用。 */
-function ackOnlyIn(runtime, record, sessionId, { ackFor, text, type, toSessionIds, taskId, requireAck }) {
+function ackOnlyIn(runtime, record, sessionId, {
+  ackFor, text, type, toSessionIds, taskId, requireAck, report, evidence, acceptance,
+}) {
   if (typeof ackFor !== 'string' || !ID_PATTERN.test(ackFor)) {
     return errorOf('invalid-ack-for', 'ackFor 非法：需要消息标识（1–64 位字母数字与连字符）');
   }
-  if (type !== undefined || toSessionIds !== undefined || taskId !== undefined || requireAck !== undefined) {
-    return errorOf('ack-for-conflict', 'ackFor 回执不能与 type / toSessionIds / taskId / requireAck 同时使用');
+  if (type !== undefined || toSessionIds !== undefined || taskId !== undefined || requireAck !== undefined
+    || report !== undefined || evidence !== undefined || acceptance !== undefined) {
+    return errorOf(
+      'ack-for-conflict',
+      'ackFor 回执不能与 type / toSessionIds / taskId / requireAck / report / evidence / acceptance 同时使用',
+    );
   }
   return ackMessageIn(runtime, record, sessionId, ackFor, text);
 }
@@ -1589,6 +1762,7 @@ function sweepDispatchesIn(runtime, at) {
     sweepClaimsOf(runtime, record, at);
     sweepQueuesOf(runtime, record, at);
     sweepAcksOf(runtime, record, at);
+    sweepStaleTasksOf(runtime, record, at);
     sweepGraceOf(runtime, record, at);
     if (record.status === 'active' && record.autoClaim) {
       autoClaimPassIn(runtime, record);
@@ -1678,6 +1852,57 @@ function sweepAcksOf(runtime, record, at) {
       'dispatch-ack-timeout',
     );
   }
+}
+
+/* 任务超时提醒（问题 6-A）：assigned / active 且最后进度距今 ≥ task_stale_ms 的任务，
+ * 向调度长投一次 dispatch-task-stale（含 taskId / 负责会话 / 最后进度摘要）。
+ * 同一任务只提醒一次（staleNotified），有新 progress 时由任务状态机清位；不改任务状态、不自动失败。 */
+function sweepStaleTasksOf(runtime, record, at) {
+  const staleMs = taskStaleMsOf(runtime.config);
+  for (const task of record.tasks.values()) {
+    if (isStaleTaskCandidate(task, at, staleMs)) {
+      notifyStaleTask(runtime, record, task, at);
+    }
+  }
+}
+
+function isStaleTaskCandidate(task, at, staleMs) {
+  if (!isOpenTaskStatus(task.status)) {
+    return false;
+  }
+  if (task.staleNotified === true) {
+    return false;
+  }
+  const last = Number.isFinite(task.updatedAt) ? task.updatedAt : task.createdAt;
+  return Number.isFinite(last) && at - last >= staleMs;
+}
+
+function isOpenTaskStatus(status) {
+  return status === 'assigned' || status === 'active';
+}
+
+function notifyStaleTask(runtime, record, task, at) {
+  task.staleNotified = true;
+  const last = Number.isFinite(task.updatedAt) ? task.updatedAt : task.createdAt;
+  const minutes = Math.floor((at - last) / 60000);
+  sendNotice(
+    runtime,
+    record,
+    record.masterSessionId,
+    `任务超时无进展：${task.taskId}（负责会话：${staleAssigneeOf(record, task)}）——最后进度：${staleProgressOf(task)}（已 ${minutes} 分钟无 progress）`,
+    'dispatch-task-stale',
+  );
+}
+
+function staleAssigneeOf(record, task) {
+  if (task.assigneeSessionId === null || task.assigneeSessionId === undefined) {
+    return '未指派';
+  }
+  return targetNameOf(record, task.assigneeSessionId);
+}
+
+function staleProgressOf(task) {
+  return typeof task.lastProgress === 'string' && task.lastProgress !== '' ? task.lastProgress : '（无）';
 }
 
 /* 目标队列回收：只清队列、补投截止与待确认账（不碰 grace/成员关系——宽限超时后仍由
