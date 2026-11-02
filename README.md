@@ -328,6 +328,16 @@ waystation 不集成微信或 QQ。远程指挥是调度长和 cc-connect 的集
 
 master 提示词的唯一编辑入口是仓库里的 `templates/master-prompt.md`。改完之后用 `scripts/sync-master-prompt.ps1` 同步到运行版 `config.toml`：脚本会先备份为 `config.toml.bak-sync-<时间戳>`，再整体替换注入值；`-DryRun` 可以预览。改完 cc-connect 配置后需要重启服务或新开会话才生效。
 
+调度长空闲时不会主动调用 ws 工具。核心把“心跳”定义为任意一次 ws 工具调用（或桥重连），`dispatch.master_timeout_ms` 默认 3 分钟、最长可配到 1 小时；超过这个时间没有调用，就会被判为待接管，组员和任务表保留，调度长下一次调用工具即恢复。如果调度长需要长期待命，可以再挂一个 cc-connect 定时任务，每 20 分钟让它调一次轻量工具续心跳。让调度长只回复 `NO_REPLY`，cc-connect 会把这条回复静默掉，不会发到微信 / QQ：
+
+```bash
+cc-connect cron add -p <项目名> -s <会话键> -c "*/20 * * * *" \
+  --prompt "这是内部心跳任务，不是用户消息。只调用一次 mcp__waystation__ws_status，然后只回复 NO_REPLY（单独一行）。不要向用户发消息，不要做其他操作。" \
+  --desc "dispatch 心跳续期" --silent --timeout-mins 5
+```
+
+`cc-connect cron list` 查看任务，`cc-connect cron del <任务标识>` 删除。定时任务的目标是“会话键当前的活动会话”，如果切换了活动会话，记得把任务改到调度长所在的会话。
+
 拉起 worker 的常见做法：
 
 ```bash
