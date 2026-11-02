@@ -336,7 +336,7 @@ cc-connect cron add -p <项目名> -s <会话键> -c "*/20 * * * *" \
   --desc "dispatch 心跳续期" --silent --timeout-mins 5
 ```
 
-`cc-connect cron list` 查看任务，`cc-connect cron del <任务标识>` 删除。定时任务的目标是“会话键当前的活动会话”，如果切换了活动会话，记得把任务改到调度长所在的会话。
+`cc-connect cron list` 查看任务，`cc-connect cron del <任务标识>` 删除。定时任务每次执行时按会话键取当前的活动会话，所以切换活动会话后会自动打到新会话，不用重建任务；但它只认活动会话，不会自己找调度长——如果活动会话不是调度长，续心跳不会生效，需要切回调度长所在的会话。
 
 拉起 worker 的常见做法：
 
